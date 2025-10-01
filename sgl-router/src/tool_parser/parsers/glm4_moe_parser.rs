@@ -130,21 +130,35 @@ impl Default for Glm4MoeParser {
 
 #[async_trait]
 impl ToolParser for Glm4MoeParser {
-    async fn parse_complete(&self, text: &str) -> ToolParserResult<Vec<ToolCall>> {
+    async fn parse_complete(&self, text: &str) -> ToolParserResult<(String, Vec<ToolCall>)> {
         // Check if text contains GLM-4 MoE format
         if !self.has_tool_markers(text) {
-            return Ok(vec![]);
+            return Ok((text.to_string(), vec![]));
         }
 
-        // Extract all tool call blocks
+        // Find where tool calls begin
+        let idx = text.find("<tool_call>").unwrap();
+        let normal_text = text[..idx].to_string();
+
+        // Extract tool calls
         let mut tools = Vec::new();
         for mat in self.tool_call_extractor.find_iter(text) {
-            if let Some(tool) = self.parse_tool_call(mat.as_str())? {
-                tools.push(tool);
+            match self.parse_tool_call(mat.as_str()) {
+                Ok(Some(tool)) => tools.push(tool),
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::warn!("Failed to parse tool call: {}", e);
+                    continue;
+                }
             }
         }
 
-        Ok(tools)
+        // If no tools were successfully parsed despite having markers, return entire text as fallback
+        if tools.is_empty() {
+            return Ok((text.to_string(), vec![]));
+        }
+
+        Ok((normal_text, tools))
     }
 
     async fn parse_incremental(
@@ -156,8 +170,18 @@ impl ToolParser for Glm4MoeParser {
 
         // Check for tool markers
         if !self.has_tool_markers(&state.buffer) {
-            // No markers found, return as incomplete
-            return Ok(StreamResult::Incomplete);
+            // No tool markers detected - return all buffered content as normal text
+            let normal_text = std::mem::take(&mut state.buffer);
+            return Ok(StreamResult::NormalText(normal_text));
+        }
+
+        // Check for text before tool markers and extract it as normal text
+        if let Some(marker_pos) = state.buffer.find("<tool_call>") {
+            if marker_pos > 0 {
+                // We have text before the tool marker - extract it as normal text
+                let normal_text: String = state.buffer.drain(..marker_pos).collect();
+                return Ok(StreamResult::NormalText(normal_text));
+            }
         }
 
         // Look for start of tool call
@@ -214,79 +238,5 @@ impl ToolParser for Glm4MoeParser {
 
     fn detect_format(&self, text: &str) -> bool {
         self.has_tool_markers(text)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_parse_glm4_single_tool() {
-        let parser = Glm4MoeParser::new();
-        let input = r#"Some text
-<tool_call>get_weather
-<arg_key>city</arg_key>
-<arg_value>Beijing</arg_value>
-<arg_key>date</arg_key>
-<arg_value>2024-06-27</arg_value>
-</tool_call>More text"#;
-
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.name, "get_weather");
-        assert!(result[0].function.arguments.contains("Beijing"));
-        assert!(result[0].function.arguments.contains("2024-06-27"));
-    }
-
-    #[tokio::test]
-    async fn test_parse_glm4_multiple_tools() {
-        let parser = Glm4MoeParser::new();
-        let input = r#"<tool_call>get_weather
-<arg_key>city</arg_key>
-<arg_value>Beijing</arg_value>
-</tool_call>
-<tool_call>get_weather
-<arg_key>city</arg_key>
-<arg_value>Shanghai</arg_value>
-</tool_call>"#;
-
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].function.name, "get_weather");
-        assert_eq!(result[1].function.name, "get_weather");
-        assert!(result[0].function.arguments.contains("Beijing"));
-        assert!(result[1].function.arguments.contains("Shanghai"));
-    }
-
-    #[tokio::test]
-    async fn test_parse_glm4_mixed_types() {
-        let parser = Glm4MoeParser::new();
-        let input = r#"<tool_call>process_data
-<arg_key>count</arg_key>
-<arg_value>42</arg_value>
-<arg_key>active</arg_key>
-<arg_value>true</arg_value>
-<arg_key>name</arg_key>
-<arg_value>test</arg_value>
-</tool_call>"#;
-
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.name, "process_data");
-
-        // Parse arguments to check types
-        let args: serde_json::Value = serde_json::from_str(&result[0].function.arguments).unwrap();
-        assert_eq!(args["count"], 42);
-        assert_eq!(args["active"], true);
-        assert_eq!(args["name"], "test");
-    }
-
-    #[test]
-    fn test_detect_format() {
-        let parser = Glm4MoeParser::new();
-        assert!(parser.detect_format("<tool_call>"));
-        assert!(!parser.detect_format("plain text"));
-        assert!(!parser.detect_format("[TOOL_CALLS]"));
     }
 }

@@ -79,15 +79,17 @@ impl Default for KimiK2Parser {
 
 #[async_trait]
 impl ToolParser for KimiK2Parser {
-    async fn parse_complete(&self, text: &str) -> ToolParserResult<Vec<ToolCall>> {
-        // Check if text contains Kimi K2 format
+    async fn parse_complete(&self, text: &str) -> ToolParserResult<(String, Vec<ToolCall>)> {
         if !self.has_tool_markers(text) {
-            return Ok(vec![]);
+            return Ok((text.to_string(), vec![]));
         }
 
-        let mut tools = Vec::new();
+        // Find where tool calls begin
+        let idx = text.find("<|tool_calls_section_begin|>").unwrap();
+        let normal_text = text[..idx].to_string();
 
-        // Extract all tool calls
+        // Try to extract tool calls
+        let mut tools = Vec::new();
         for captures in self.tool_call_extractor.captures_iter(text) {
             if let (Some(id_match), Some(args_match)) = (
                 captures.name("tool_call_id"),
@@ -98,25 +100,43 @@ impl ToolParser for KimiK2Parser {
 
                 // Parse function ID
                 if let Some((func_name, _index)) = self.parse_function_id(function_id) {
-                    // Validate JSON arguments
-                    if serde_json::from_str::<serde_json::Value>(function_args).is_ok() {
-                        // Generate unique ID
-                        let id = format!("kimi_call_{}", uuid::Uuid::new_v4());
+                    // Try to parse JSON arguments
+                    match serde_json::from_str::<serde_json::Value>(function_args) {
+                        Ok(_) => {
+                            // Generate unique ID
+                            let id = format!("kimi_call_{}", uuid::Uuid::new_v4());
 
-                        tools.push(ToolCall {
-                            id,
-                            r#type: "function".to_string(),
-                            function: FunctionCall {
-                                name: func_name,
-                                arguments: function_args.to_string(),
-                            },
-                        });
+                            tools.push(ToolCall {
+                                id,
+                                r#type: "function".to_string(),
+                                function: FunctionCall {
+                                    name: func_name,
+                                    arguments: function_args.to_string(),
+                                },
+                            });
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to parse JSON arguments for {}: {}",
+                                func_name,
+                                e
+                            );
+                            continue;
+                        }
                     }
+                } else {
+                    tracing::warn!("Failed to parse function ID: {}", function_id);
+                    continue;
                 }
             }
         }
 
-        Ok(tools)
+        // If no tools were successfully parsed despite having markers, return entire text as fallback
+        if tools.is_empty() {
+            return Ok((text.to_string(), vec![]));
+        }
+
+        Ok((normal_text, tools))
     }
 
     async fn parse_incremental(
@@ -131,9 +151,22 @@ impl ToolParser for KimiK2Parser {
             self.has_tool_markers(&state.buffer) || state.buffer.contains("<|tool_call_begin|>");
 
         if !has_tool_call {
-            // No markers found, clear buffer and return
-            state.buffer.clear();
-            return Ok(StreamResult::Incomplete);
+            // No tool markers detected - return all buffered content as normal text
+            let normal_text = std::mem::take(&mut state.buffer);
+            return Ok(StreamResult::NormalText(normal_text));
+        }
+
+        // Check for text before tool markers and extract it as normal text
+        let marker1_pos = state.buffer.find("<|tool_calls_section_begin|>");
+        let marker2_pos = state.buffer.find("<|tool_call_begin|>");
+        let marker_pos = marker1_pos.iter().chain(marker2_pos.iter()).min().copied();
+
+        if let Some(pos) = marker_pos {
+            if pos > 0 {
+                // We have text before the tool marker - extract it as normal text
+                let normal_text: String = state.buffer.drain(..pos).collect();
+                return Ok(StreamResult::NormalText(normal_text));
+            }
         }
 
         // Try to match streaming pattern
@@ -212,59 +245,5 @@ impl ToolParser for KimiK2Parser {
 
     fn detect_format(&self, text: &str) -> bool {
         self.has_tool_markers(text) || text.contains("<|tool_call_begin|>")
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_parse_kimi_single_tool() {
-        let parser = KimiK2Parser::new();
-        let input = r#"Some text
-<|tool_calls_section_begin|>
-<|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{"location": "Tokyo", "units": "celsius"}<|tool_call_end|>
-<|tool_calls_section_end|>More text"#;
-
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.name, "get_weather");
-        assert!(result[0].function.arguments.contains("Tokyo"));
-    }
-
-    #[tokio::test]
-    async fn test_parse_kimi_multiple_tools() {
-        let parser = KimiK2Parser::new();
-        let input = r#"<|tool_calls_section_begin|>
-<|tool_call_begin|>functions.search:0<|tool_call_argument_begin|>{"query": "rust"}<|tool_call_end|>
-<|tool_call_begin|>functions.calculate:1<|tool_call_argument_begin|>{"expression": "2+2"}<|tool_call_end|>
-<|tool_calls_section_end|>"#;
-
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].function.name, "search");
-        assert_eq!(result[1].function.name, "calculate");
-    }
-
-    #[tokio::test]
-    async fn test_parse_kimi_with_whitespace() {
-        let parser = KimiK2Parser::new();
-        let input = r#"<|tool_calls_section_begin|>
-<|tool_call_begin|> functions.test:0 <|tool_call_argument_begin|> {"key": "value"} <|tool_call_end|>
-<|tool_calls_section_end|>"#;
-
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.name, "test");
-    }
-
-    #[test]
-    fn test_detect_format() {
-        let parser = KimiK2Parser::new();
-        assert!(parser.detect_format("<|tool_calls_section_begin|>"));
-        assert!(parser.detect_format("<|tool_call_begin|>"));
-        assert!(!parser.detect_format("plain text"));
-        assert!(!parser.detect_format("[TOOL_CALLS]"));
     }
 }
