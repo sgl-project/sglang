@@ -81,7 +81,6 @@ class ModelConfig:
             if not os.path.isdir(self.model_path):
                 info = model_info(self.model_path, revision=self.revision)
                 self.hf_tags = info.tags
-                print(f"{self.hf_tags=}")
         except (GatedRepoError, RepositoryNotFoundError):
             logger.warning(
                 f"Cannot find model info for '{self.model_path}'. "
@@ -149,9 +148,8 @@ class ModelConfig:
             self.hf_config.architectures, is_embedding
         )
         self.is_multimodal = enable_multimodal and (
-            # is_multimodal_model(self.hf_config.architectures)
-            # or
-            self._has_multimodal_tag()
+            is_multimodal_model(self.hf_config.architectures)
+            or self._has_multimodal_tag()
         )
         self.is_multimodal_gen = enable_multimodal and is_multimodal_gen_model(
             self.hf_config.architectures
