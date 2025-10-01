@@ -1,6 +1,8 @@
 // These modules are used by tests and benchmarks
 #![allow(dead_code)]
 
+pub mod mock_mcp_server;
+pub mod mock_openai_server;
 pub mod mock_worker;
 pub mod test_app;
 
@@ -12,11 +14,15 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 /// Helper function to create AppContext for tests
 pub fn create_test_context(config: RouterConfig) -> Arc<AppContext> {
-    Arc::new(AppContext::new(
-        config.clone(),
-        reqwest::Client::new(),
-        config.max_concurrent_requests,
-    ))
+    Arc::new(
+        AppContext::new(
+            config.clone(),
+            reqwest::Client::new(),
+            config.max_concurrent_requests,
+            config.rate_limit_tokens_per_second,
+        )
+        .expect("Failed to create AppContext in test"),
+    )
 }
 
 // Tokenizer download configuration
@@ -65,7 +71,6 @@ pub fn ensure_tokenizer_cached() -> PathBuf {
 
         let content = response.bytes().expect("Failed to read tokenizer content");
 
-        // Verify we got actual JSON content
         if content.len() < 100 {
             panic!("Downloaded content too small: {} bytes", content.len());
         }
