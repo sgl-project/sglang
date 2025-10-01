@@ -1162,6 +1162,56 @@ impl OpenAIRouter {
         Ok(payload)
     }
 
+    /// Helper function to build mcp_call items from executed tool calls in conversation history
+    fn build_executed_mcp_call_items(
+        conversation_history: &[Value],
+        server_label: &str,
+    ) -> Vec<Value> {
+        let mut mcp_call_items = Vec::new();
+        
+        for item in conversation_history {
+            if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
+                let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
+                let tool_name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let args = item
+                    .get("arguments")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("{}");
+
+                // Find corresponding output
+                let output_item = conversation_history.iter().find(|o| {
+                    o.get("type").and_then(|t| t.as_str()) == Some("function_call_output")
+                        && o.get("call_id").and_then(|c| c.as_str()) == Some(call_id)
+                });
+
+                let output_str = output_item
+                    .and_then(|o| o.get("output").and_then(|v| v.as_str()))
+                    .unwrap_or("{}");
+
+                // Check if output contains error by parsing JSON
+                let is_error = serde_json::from_str::<serde_json::Value>(output_str)
+                    .map(|v| v.get("error").is_some())
+                    .unwrap_or(false);
+
+                let mcp_call_item = Self::build_mcp_call_item(
+                    tool_name,
+                    args,
+                    output_str,
+                    server_label,
+                    !is_error,
+                    if is_error {
+                        Some("Tool execution failed")
+                    } else {
+                        None
+                    },
+                );
+                mcp_call_items.push(mcp_call_item);
+            }
+        }
+        
+        mcp_call_items
+    }
+
     /// Build an incomplete response when limits are exceeded
     fn build_incomplete_response(
         mut response: Value,
@@ -1220,43 +1270,16 @@ impl OpenAIRouter {
                 let list_tools_item = Self::build_mcp_list_tools_item(active_mcp, server_label);
                 output_array.insert(0, list_tools_item);
 
-                // Add mcp_call items for executed calls
+                // Add mcp_call items for executed calls using helper
+                let executed_items = Self::build_executed_mcp_call_items(
+                    &state.conversation_history,
+                    server_label,
+                );
+                
                 let mut insert_pos = 1;
-                for item in &state.conversation_history {
-                    if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
-                        let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
-                        let tool_name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                        let args = item
-                            .get("arguments")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("{}");
-
-                        let output_item = state.conversation_history.iter().find(|o| {
-                            o.get("type").and_then(|t| t.as_str()) == Some("function_call_output")
-                                && o.get("call_id").and_then(|c| c.as_str()) == Some(call_id)
-                        });
-
-                        let output_str = output_item
-                            .and_then(|o| o.get("output").and_then(|v| v.as_str()))
-                            .unwrap_or("{}");
-
-                        let is_error = output_str.contains("\"error\"");
-
-                        let mcp_call_item = Self::build_mcp_call_item(
-                            tool_name,
-                            args,
-                            output_str,
-                            server_label,
-                            !is_error,
-                            if is_error {
-                                Some("Tool execution failed")
-                            } else {
-                                None
-                            },
-                        );
-                        output_array.insert(insert_pos, mcp_call_item);
-                        insert_pos += 1;
-                    }
+                for item in executed_items {
+                    output_array.insert(insert_pos, item);
+                    insert_pos += 1;
                 }
 
                 // Add incomplete mcp_call items
@@ -1349,30 +1372,27 @@ impl OpenAIRouter {
                     state.iteration, tool_name, call_id
                 );
 
-                // Check limits: both max_tool_calls (API) and max_iterations (safety)
-                // Check user-specified limit first (if set)
-                if let Some(max) = max_tool_calls {
-                    if state.total_calls > max {
-                        warn!("Reached max_tool_calls limit: {}", max);
-                        return Self::build_incomplete_response(
-                            response_json,
-                            state,
-                            "max_tool_calls",
-                            active_mcp,
-                            original_body,
-                        );
+                // Check combined limit: use minimum of user's max_tool_calls (if set) and safety max_iterations
+                let effective_limit = match max_tool_calls {
+                    Some(user_max) => user_max.min(config.max_iterations),
+                    None => config.max_iterations,
+                };
+                
+                if state.total_calls > effective_limit {
+                    if let Some(user_max) = max_tool_calls {
+                        if state.total_calls > user_max {
+                            warn!("Reached user-specified max_tool_calls limit: {}", user_max);
+                        } else {
+                            warn!("Reached safety max_iterations limit: {}", config.max_iterations);
+                        }
+                    } else {
+                        warn!("Reached safety max_iterations limit: {}", config.max_iterations);
                     }
-                }
-                // Always check safety iteration limit
-                if state.iteration > config.max_iterations {
-                    warn!(
-                        "Reached safety max_iterations limit: {}",
-                        config.max_iterations
-                    );
+                    
                     return Self::build_incomplete_response(
                         response_json,
                         state,
-                        "max_completion_tokens",
+                        "max_tool_calls",
                         active_mcp,
                         original_body,
                     );
@@ -1427,53 +1447,17 @@ impl OpenAIRouter {
                     {
                         output_array.insert(0, list_tools_item);
 
-                        // Also add mcp_call items for each tool execution
-                        let mut mcp_call_items = Vec::new();
-                        for item in &state.conversation_history {
-                            if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
-                                let call_id =
-                                    item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
-                                let tool_name =
-                                    item.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                                let args = item
-                                    .get("arguments")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("{}");
+                        // Build mcp_call items using helper function
+                        let mcp_call_items = Self::build_executed_mcp_call_items(
+                            &state.conversation_history,
+                            server_label,
+                        );
 
-                                // Find corresponding output
-                                let output_item = state.conversation_history.iter().find(|o| {
-                                    o.get("type").and_then(|t| t.as_str())
-                                        == Some("function_call_output")
-                                        && o.get("call_id").and_then(|c| c.as_str())
-                                            == Some(call_id)
-                                });
-
-                                let output_str = output_item
-                                    .and_then(|o| o.get("output").and_then(|v| v.as_str()))
-                                    .unwrap_or("{}");
-
-                                // Check if output contains error
-                                let is_error = output_str.contains("\"error\"");
-
-                                let mcp_call_item = Self::build_mcp_call_item(
-                                    tool_name,
-                                    args,
-                                    output_str,
-                                    server_label,
-                                    !is_error,
-                                    if is_error {
-                                        Some("Tool execution failed")
-                                    } else {
-                                        None
-                                    },
-                                );
-                                mcp_call_items.push(mcp_call_item);
-                            }
-                        }
-
-                        // Insert mcp_call items after mcp_list_tools
-                        for (idx, item) in mcp_call_items.into_iter().enumerate() {
-                            output_array.insert(1 + idx, item);
+                        // Insert mcp_call items after mcp_list_tools using mutable position
+                        let mut insert_pos = 1;
+                        for item in mcp_call_items {
+                            output_array.insert(insert_pos, item);
+                            insert_pos += 1;
                         }
                     }
                 }
