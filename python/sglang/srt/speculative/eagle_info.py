@@ -714,7 +714,7 @@ class EagleDraftInput(SpecInput):
             self.hidden_states = self.hidden_states[new_indices]
             self.verified_id = self.verified_id[new_indices]
 
-    def merge_batch(self, spec_info: EagleDraftInput):
+    def merge_batch(self, spec_info: "EagleDraftInput"):
         if self.hidden_states is None:
             self.hidden_states = spec_info.hidden_states
             self.verified_id = spec_info.verified_id
