@@ -268,7 +268,7 @@ class NativeSparseAttnBackend(AttentionBackend):
                 cu_seqlens_q = torch.arange(
                     0, batch_size + 1, dtype=torch.int32, device=device
                 )
-            seqlens_expanded = cache_seqlens_int32  # Maybe not right?
+            seqlens_expanded = cache_seqlens_int32
         elif forward_batch.forward_mode.is_target_verify():
             cache_seqlens_int32 = (
                 forward_batch.seq_lens + self.speculative_num_draft_tokens
@@ -289,8 +289,26 @@ class NativeSparseAttnBackend(AttentionBackend):
             page_table = forward_batch.req_to_token_pool.req_to_token[
                 forward_batch.req_pool_indices, :max_seqlen_k
             ]
-            extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
-            seqlens_expanded = cache_seqlens_int32  # Maybe not right?
+            extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * batch_size
+            seqlens_int32_cpu = [
+                self.speculative_num_draft_tokens + kv_len
+                for kv_len in forward_batch.seq_lens_cpu.tolist()
+            ]
+            seqlens_expanded = torch.cat(
+                [
+                    torch.arange(
+                        kv_len - qo_len + 1,
+                        kv_len + 1,
+                        dtype=torch.int32,
+                        device=device,
+                    )
+                    for qo_len, kv_len in zip(
+                        extend_seq_lens_cpu,
+                        seqlens_int32_cpu,
+                        strict=True,
+                    )
+                ]
+            )
         elif forward_batch.forward_mode.is_extend():
             assert (
                 forward_batch.extend_seq_lens_cpu is not None
