@@ -2045,7 +2045,13 @@ class Scheduler(
                     bid,
                     num_accepted_tokens,
                     can_run_cuda_graph,
-                ) = forward_batch_output
+                ) = (
+                    forward_batch_output.logits_output,
+                    forward_batch_output.next_token_ids,
+                    forward_batch_output.bid,
+                    forward_batch_output.num_accepted_tokens,
+                    forward_batch_output.can_run_cuda_graph,
+                )
                 bs = batch.batch_size()
                 self.spec_num_total_accepted_tokens += num_accepted_tokens + bs
                 self.spec_num_total_forward_ct += bs
