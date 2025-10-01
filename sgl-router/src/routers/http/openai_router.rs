@@ -26,7 +26,6 @@ use std::{
     collections::HashMap,
     io,
     sync::{atomic::AtomicBool, Arc},
-    time::SystemTime,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -54,6 +53,77 @@ impl std::fmt::Debug for OpenAIRouter {
             .field("base_url", &self.base_url)
             .field("healthy", &self.healthy)
             .finish()
+    }
+}
+
+/// Configuration for MCP tool calling loops
+#[derive(Debug, Clone)]
+struct McpLoopConfig {
+    /// Maximum iterations as safety limit (internal only, default: 10)
+    /// Prevents infinite loops when max_tool_calls is not set
+    max_iterations: usize,
+    /// Per-tool timeout in seconds (default: 30)
+    tool_timeout_secs: u64,
+}
+
+impl Default for McpLoopConfig {
+    fn default() -> Self {
+        Self {
+            max_iterations: 10,
+            tool_timeout_secs: 30,
+        }
+    }
+}
+
+/// State for tracking multi-turn tool calling loop
+struct ToolLoopState {
+    /// Current iteration number (starts at 0, increments with each tool call)
+    iteration: usize,
+    /// Total number of tool calls executed
+    total_calls: usize,
+    /// Accumulated MCP call items for metadata
+    all_mcp_items: Vec<Value>,
+    /// Conversation history (function_call and function_call_output items)
+    conversation_history: Vec<Value>,
+    /// Original user input (preserved for building resume payloads)
+    original_input: ResponseInput,
+}
+
+impl ToolLoopState {
+    fn new(original_input: ResponseInput) -> Self {
+        Self {
+            iteration: 0,
+            total_calls: 0,
+            all_mcp_items: Vec::new(),
+            conversation_history: Vec::new(),
+            original_input,
+        }
+    }
+
+    /// Record a tool call in the loop state
+    fn record_call(
+        &mut self,
+        call_id: String,
+        tool_name: String,
+        args_json_str: String,
+        output_str: String,
+    ) {
+        // Add function_call item to history
+        let func_item = json!({
+            "type": "function_call",
+            "call_id": call_id,
+            "name": tool_name,
+            "arguments": args_json_str
+        });
+        self.conversation_history.push(func_item);
+
+        // Add function_call_output item to history
+        let output_item = json!({
+            "type": "function_call_output",
+            "call_id": call_id,
+            "output": output_str
+        });
+        self.conversation_history.push(output_item);
     }
 }
 
@@ -388,139 +458,44 @@ impl OpenAIRouter {
                             obj.insert("store".to_string(), Value::Bool(original_body.store));
                         }
 
-                        let mut final_response_json = openai_response_json;
-
-                        if let Some(mcp) = active_mcp {
-                            if let Some((call_id, tool_name, args_json_str)) =
-                                Self::extract_function_call(&final_response_json)
-                            {
-                                info!(
-                                    "Detected function call: name={}, call_id={}, args={}",
-                                    tool_name, call_id, args_json_str
-                                );
-
-                                let call_started = SystemTime::now();
-                                let call_result =
-                                    Self::execute_mcp_call(mcp, &tool_name, &args_json_str).await;
-                                let call_duration_ms =
-                                    call_started.elapsed().unwrap_or_default().as_millis();
-
-                                let (output_payload, call_ok, call_error) = match call_result {
-                                    Ok((server, out)) => {
-                                        info!(
-                                            call_id = %call_id,
-                                            tool_name = %tool_name,
-                                            server = %server,
-                                            duration_ms = call_duration_ms,
-                                            "MCP tool call succeeded"
-                                        );
-                                        (out, true, None)
-                                    }
+                        // If MCP is active and we detect a function call, enter the tool loop
+                        let mut final_response_json = if let Some(mcp) = active_mcp {
+                            if Self::extract_function_call(&openai_response_json).is_some() {
+                                // Use the loop to handle potentially multiple tool calls
+                                let loop_config = McpLoopConfig::default();
+                                match self.execute_tool_loop(
+                                    &url,
+                                    headers,
+                                    payload.clone(),
+                                    original_body,
+                                    mcp,
+                                    &loop_config,
+                                ).await {
+                                    Ok(loop_result) => loop_result,
                                     Err(err) => {
-                                        warn!(
-                                            call_id = %call_id,
-                                            tool_name = %tool_name,
-                                            duration_ms = call_duration_ms,
-                                            error = %err,
-                                            "MCP tool call failed"
-                                        );
-                                        (
-                                            serde_json::json!({
-                                                "error": err
-                                            })
-                                            .to_string(),
-                                            false,
-                                            Some(err),
-                                        )
-                                    }
-                                };
-
-                                match self
-                                    .resume_with_tool_result(ResumeWithToolArgs {
-                                        url: &url,
-                                        headers,
-                                        original_payload: &payload,
-                                        call_id: &call_id,
-                                        tool_name: &tool_name,
-                                        args_json_str: &args_json_str,
-                                        output_str: &output_payload,
-                                        original_body,
-                                    })
-                                    .await
-                                {
-                                    Ok(mut resumed_json) => {
-                                        // Inject MCP output items (mcp_list_tools and mcp_call)
-                                        let server_label = original_body
-                                            .tools
-                                            .iter()
-                                            .find(|t| matches!(t.r#type, ResponseToolType::Mcp))
-                                            .and_then(|t| t.server_label.as_deref())
-                                            .unwrap_or("mcp");
-
-                                        if let Err(inject_err) = Self::inject_mcp_output_items(
-                                            &mut resumed_json,
-                                            mcp,
-                                            McpOutputItemsArgs {
-                                                tool_name: &tool_name,
-                                                args_json: &args_json_str,
-                                                output: &output_payload,
-                                                server_label,
-                                                success: call_ok,
-                                                error: call_error.as_deref(),
-                                            },
-                                        ) {
-                                            warn!(
-                                                "Failed to inject MCP output items: {}",
-                                                inject_err
-                                            );
-                                        }
-
-                                        if !call_ok {
-                                            if let Some(obj) = resumed_json.as_object_mut() {
-                                                let metadata_value =
-                                                    obj.entry("metadata").or_insert_with(|| {
-                                                        Value::Object(serde_json::Map::new())
-                                                    });
-                                                if let Some(metadata) =
-                                                    metadata_value.as_object_mut()
-                                                {
-                                                    if let Some(err_msg) = call_error.as_ref() {
-                                                        metadata.insert(
-                                                            "mcp_error".to_string(),
-                                                            Value::String(err_msg.clone()),
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        final_response_json = resumed_json;
-                                    }
-                                    Err(err) => {
-                                        warn!("Failed to resume with tool result: {}", err);
+                                        warn!("Tool loop failed: {}", err);
                                         let error_body = json!({
                                             "error": {
-                                                "message": format!(
-                                                    "Failed to resume with tool result: {}",
-                                                    err
-                                                ),
+                                                "message": format!("Tool loop failed: {}", err),
                                                 "type": "internal_error",
                                             }
-                                        })
-                                        .to_string();
-
+                                        }).to_string();
                                         return (
                                             StatusCode::INTERNAL_SERVER_ERROR,
                                             [("content-type", "application/json")],
                                             error_body,
-                                        )
-                                            .into_response();
+                                        ).into_response();
                                     }
                                 }
                             } else {
-                                info!("No function call found in upstream response; skipping MCP");
+                                // No function call detected, use response as-is
+                                openai_response_json
                             }
-                        }
+                        } else {
+                            openai_response_json
+                        };
 
+                        // Mask tools back to MCP format for client
                         Self::mask_tools_as_mcp(&mut final_response_json, original_body);
                         if original_body.store {
                             if let Err(e) = self
@@ -1148,6 +1123,362 @@ impl OpenAIRouter {
         let output_str = serde_json::to_string(&result)
             .map_err(|e| format!("Failed to serialize tool result: {}", e))?;
         Ok((server_name, output_str))
+    }
+
+    /// Build a resume payload with conversation history
+    fn build_resume_payload(
+        base_payload: &Value,
+        conversation_history: &[Value],
+        original_input: &ResponseInput,
+        tools_json: &Value,
+    ) -> Result<Value, String> {
+        // Clone the base payload which already has cleaned fields
+        let mut payload = base_payload.clone();
+
+        let obj = payload
+            .as_object_mut()
+            .ok_or_else(|| "payload not an object".to_string())?;
+
+        // Build input array: start with original user input
+        let mut input_array = Vec::new();
+
+        // Add original user message
+        // For structured input, serialize the original input items
+        match original_input {
+            ResponseInput::Text(text) => {
+                let user_item = json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": text }]
+                });
+                input_array.push(user_item);
+            }
+            ResponseInput::Items(items) => {
+                // Items are already structured ResponseInputOutputItem, convert to JSON
+                if let Ok(items_value) = serde_json::to_value(items) {
+                    if let Some(items_arr) = items_value.as_array() {
+                        input_array.extend_from_slice(items_arr);
+                    }
+                }
+            }
+        }
+
+        // Add all conversation history (function calls and outputs)
+        input_array.extend_from_slice(conversation_history);
+
+        obj.insert("input".to_string(), Value::Array(input_array));
+
+        // Use the transformed tools (function tools, not MCP tools)
+        if let Some(tools_arr) = tools_json.as_array() {
+            if !tools_arr.is_empty() {
+                obj.insert("tools".to_string(), tools_json.clone());
+            }
+        }
+
+        // Ensure non-streaming and no store to upstream
+        obj.insert("stream".to_string(), Value::Bool(false));
+        obj.insert("store".to_string(), Value::Bool(false));
+
+        // Note: SGLang-specific fields were already removed from base_payload
+        // before it was passed to execute_tool_loop (see route_responses lines 1935-1946)
+
+        Ok(payload)
+    }
+
+    /// Build an incomplete response when limits are exceeded
+    fn build_incomplete_response(
+        mut response: Value,
+        state: ToolLoopState,
+        reason: &str,
+        active_mcp: &Arc<crate::mcp::McpClientManager>,
+        original_body: &ResponsesRequest,
+    ) -> Result<Value, String> {
+        let obj = response
+            .as_object_mut()
+            .ok_or_else(|| "response not an object".to_string())?;
+
+        // Set status to completed (not failed - partial success)
+        obj.insert(
+            "status".to_string(),
+            Value::String("completed".to_string()),
+        );
+
+        // Set incomplete_details
+        obj.insert(
+            "incomplete_details".to_string(),
+            json!({ "reason": reason }),
+        );
+
+        // Convert any function_call in output to mcp_call format
+        if let Some(output_array) = obj.get_mut("output").and_then(|v| v.as_array_mut()) {
+            let server_label = original_body
+                .tools
+                .iter()
+                .find(|t| matches!(t.r#type, ResponseToolType::Mcp))
+                .and_then(|t| t.server_label.as_deref())
+                .unwrap_or("mcp");
+
+            // Find any function_call items and convert them to mcp_call (incomplete)
+            let mut mcp_call_items = Vec::new();
+            for item in output_array.iter() {
+                if item.get("type").and_then(|t| t.as_str()) == Some("function_tool_call") {
+                    let tool_name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    let args = item.get("arguments").and_then(|v| v.as_str()).unwrap_or("{}");
+                    
+                    // Mark as incomplete - not executed
+                    let mcp_call_item = Self::build_mcp_call_item(
+                        tool_name,
+                        args,
+                        "",  // No output - wasn't executed
+                        server_label,
+                        false,  // Not successful
+                        Some("Not executed - response stopped due to limit"),
+                    );
+                    mcp_call_items.push(mcp_call_item);
+                }
+            }
+
+            // Add mcp_list_tools and executed mcp_call items at the beginning
+            if state.total_calls > 0 || !mcp_call_items.is_empty() {
+                let list_tools_item = Self::build_mcp_list_tools_item(active_mcp, server_label);
+                output_array.insert(0, list_tools_item);
+
+                // Add mcp_call items for executed calls
+                let mut insert_pos = 1;
+                for item in &state.conversation_history {
+                    if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
+                        let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
+                        let tool_name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                        let args = item.get("arguments").and_then(|v| v.as_str()).unwrap_or("{}");
+                        
+                        let output_item = state.conversation_history.iter().find(|o| {
+                            o.get("type").and_then(|t| t.as_str()) == Some("function_call_output")
+                                && o.get("call_id").and_then(|c| c.as_str()) == Some(call_id)
+                        });
+                        
+                        let output_str = output_item
+                            .and_then(|o| o.get("output").and_then(|v| v.as_str()))
+                            .unwrap_or("{}");
+                        
+                        let is_error = output_str.contains("\"error\"");
+                        
+                        let mcp_call_item = Self::build_mcp_call_item(
+                            tool_name,
+                            args,
+                            output_str,
+                            server_label,
+                            !is_error,
+                            if is_error { Some("Tool execution failed") } else { None },
+                        );
+                        output_array.insert(insert_pos, mcp_call_item);
+                        insert_pos += 1;
+                    }
+                }
+
+                // Add incomplete mcp_call items
+                for item in mcp_call_items {
+                    output_array.insert(insert_pos, item);
+                    insert_pos += 1;
+                }
+            }
+        }
+
+        // Add warning to metadata
+        if let Some(metadata_val) = obj.get_mut("metadata") {
+            if let Some(metadata_obj) = metadata_val.as_object_mut() {
+                if let Some(mcp_val) = metadata_obj.get_mut("mcp") {
+                    if let Some(mcp_obj) = mcp_val.as_object_mut() {
+                        mcp_obj.insert(
+                            "truncation_warning".to_string(),
+                            Value::String(format!(
+                                "Loop terminated at {} iterations, {} total calls (reason: {})",
+                                state.iteration, state.total_calls, reason
+                            )),
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok(response)
+    }
+
+    /// Execute the tool calling loop
+    async fn execute_tool_loop(
+        &self,
+        url: &str,
+        headers: Option<&HeaderMap>,
+        initial_payload: Value,
+        original_body: &ResponsesRequest,
+        active_mcp: &Arc<crate::mcp::McpClientManager>,
+        config: &McpLoopConfig,
+    ) -> Result<Value, String> {
+        let mut state = ToolLoopState::new(original_body.input.clone());
+        
+        // Get max_tool_calls from request (None means no user-specified limit)
+        let max_tool_calls = original_body.max_tool_calls.map(|n| n as usize);
+
+        // Keep initial_payload as base template (already has fields cleaned)
+        let base_payload = initial_payload.clone();
+        let tools_json = base_payload.get("tools").cloned().unwrap_or(json!([]));
+        let mut current_payload = initial_payload;
+
+        info!(
+            "Starting tool loop: max_tool_calls={:?}, max_iterations={}",
+            max_tool_calls, config.max_iterations
+        );
+
+        loop {
+            // Make request to upstream
+            let request_builder = self.client.post(url).json(&current_payload);
+            let request_builder = if let Some(headers) = headers {
+                apply_request_headers(headers, request_builder, true)
+            } else {
+                request_builder
+            };
+
+            let response = request_builder
+                .send()
+                .await
+                .map_err(|e| format!("upstream request failed: {}", e))?;
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                return Err(format!("upstream error {}: {}", status, body));
+            }
+
+            let mut response_json = response
+                .json::<Value>()
+                .await
+                .map_err(|e| format!("parse response: {}", e))?;
+
+            // Check for function call
+            if let Some((call_id, tool_name, args_json_str)) =
+                Self::extract_function_call(&response_json)
+            {
+                state.iteration += 1;
+                state.total_calls += 1;
+
+                info!(
+                    "Tool loop iteration {}: calling {} (call_id: {})",
+                    state.iteration, tool_name, call_id
+                );
+
+                // Check limits: both max_tool_calls (API) and max_iterations (safety)
+                // Check user-specified limit first (if set)
+                if let Some(max) = max_tool_calls {
+                    if state.total_calls > max {
+                        warn!("Reached max_tool_calls limit: {}", max);
+                        return Self::build_incomplete_response(
+                            response_json,
+                            state,
+                            "max_tool_calls",
+                            active_mcp,
+                            original_body,
+                        );
+                    }
+                }
+                // Always check safety iteration limit
+                if state.iteration > config.max_iterations {
+                    warn!("Reached safety max_iterations limit: {}", config.max_iterations);
+                    return Self::build_incomplete_response(
+                        response_json,
+                        state,
+                        "max_completion_tokens",
+                        active_mcp,
+                        original_body,
+                    );
+                }
+
+                // Execute tool
+                let call_result = Self::execute_mcp_call(active_mcp, &tool_name, &args_json_str).await;
+
+                let output_str = match call_result {
+                    Ok((_, output)) => output,
+                    Err(err) => {
+                        warn!("Tool execution failed: {}", err);
+                        // Return error as output, let model decide how to proceed
+                        json!({ "error": err }).to_string()
+                    }
+                };
+
+                // Record the call
+                state.record_call(call_id, tool_name, args_json_str, output_str);
+
+                // Build resume payload
+                current_payload = Self::build_resume_payload(
+                    &base_payload,
+                    &state.conversation_history,
+                    &state.original_input,
+                    &tools_json,
+                )?;
+            } else {
+                // No more tool calls, we're done
+                info!(
+                    "Tool loop completed: {} iterations, {} total calls",
+                    state.iteration, state.total_calls
+                );
+                
+                // Inject MCP output items if we executed any tools
+                if state.total_calls > 0 {
+                    let server_label = original_body
+                        .tools
+                        .iter()
+                        .find(|t| matches!(t.r#type, ResponseToolType::Mcp))
+                        .and_then(|t| t.server_label.as_deref())
+                        .unwrap_or("mcp");
+                    
+                    // Build mcp_list_tools item
+                    let list_tools_item = Self::build_mcp_list_tools_item(active_mcp, server_label);
+                    
+                    // Insert at beginning of output array
+                    if let Some(output_array) = response_json.get_mut("output").and_then(|v| v.as_array_mut()) {
+                        output_array.insert(0, list_tools_item);
+                        
+                        // Also add mcp_call items for each tool execution
+                        let mut mcp_call_items = Vec::new();
+                        for item in &state.conversation_history {
+                            if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
+                                let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
+                                let tool_name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                                let args = item.get("arguments").and_then(|v| v.as_str()).unwrap_or("{}");
+                                
+                                // Find corresponding output
+                                let output_item = state.conversation_history.iter().find(|o| {
+                                    o.get("type").and_then(|t| t.as_str()) == Some("function_call_output")
+                                        && o.get("call_id").and_then(|c| c.as_str()) == Some(call_id)
+                                });
+                                
+                                let output_str = output_item
+                                    .and_then(|o| o.get("output").and_then(|v| v.as_str()))
+                                    .unwrap_or("{}");
+                                
+                                // Check if output contains error
+                                let is_error = output_str.contains("\"error\"");
+                                
+                                let mcp_call_item = Self::build_mcp_call_item(
+                                    tool_name,
+                                    args,
+                                    output_str,
+                                    server_label,
+                                    !is_error,
+                                    if is_error { Some("Tool execution failed") } else { None },
+                                );
+                                mcp_call_items.push(mcp_call_item);
+                            }
+                        }
+                        
+                        // Insert mcp_call items after mcp_list_tools
+                        for (idx, item) in mcp_call_items.into_iter().enumerate() {
+                            output_array.insert(1 + idx, item);
+                        }
+                    }
+                }
+                
+                return Ok(response_json);
+            }
+        }
     }
 
     /// Generate a unique ID for MCP output items (similar to OpenAI format)
