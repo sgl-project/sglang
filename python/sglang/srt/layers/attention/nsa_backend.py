@@ -290,6 +290,8 @@ class NativeSparseAttnBackend(AttentionBackend):
                 forward_batch.req_pool_indices, :max_seqlen_k
             ]
             extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * batch_size
+            forward_batch.extend_seq_lens_cpu = extend_seq_lens_cpu
+
             seqlens_int32_cpu = [
                 self.speculative_num_draft_tokens + kv_len
                 for kv_len in forward_batch.seq_lens_cpu.tolist()
@@ -323,14 +325,26 @@ class NativeSparseAttnBackend(AttentionBackend):
                 forward_batch.req_pool_indices, :max_seqlen_k
             ]
             extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+            print(
+                f"init_forward_metadata forward_batch.mode: {forward_batch.forward_mode.name}, extend_seq_lens_cpu: {extend_seq_lens_cpu}, extend_seq_lens: {forward_batch.extend_seq_lens}"
+            )
             assert forward_batch.extend_seq_lens is not None
             if (
                 any(forward_batch.extend_prefix_lens_cpu)
                 or forward_batch.forward_mode == ForwardMode.DRAFT_EXTEND
             ):
+                # Hack here, just to test the following path, change it later
+                print(
+                    f"init_forward_metadata forward_batch.mode: {forward_batch.forward_mode.name}, accept_length_cpu: {forward_batch.spec_info.accept_length_cpu}"
+                )
+                extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * batch_size
+                forward_batch.extend_seq_lens_cpu = extend_seq_lens_cpu
                 max_seqlen_q = max(extend_seq_lens_cpu)
                 cu_seqlens_q = compute_cu_seqlens(
                     forward_batch.extend_seq_lens.to(torch.int32)
+                )
+                print(
+                    f"init_forward_metadata forward_batch.mode: {forward_batch.forward_mode.name}, max_seqlen_q: {max_seqlen_q}, forward_batch.extend_seq_lens_cpu: {forward_batch.extend_seq_lens_cpu}"
                 )
             else:
                 max_seqlen_q = max_seqlen_k
@@ -568,10 +582,6 @@ class NativeSparseAttnBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        assert (
-            not forward_batch.forward_mode.is_target_verify()
-            and not forward_batch.forward_mode.is_draft_extend()
-        ), "NSA backend doesn't support speculative decoding"
         if k is not None:
             assert v is not None
             if save_kv_cache:

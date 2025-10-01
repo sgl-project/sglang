@@ -373,6 +373,9 @@ class Indexer(CustomOp):
                 block_tables[i],
             )
             extend_seq_len = forward_batch.extend_seq_lens_cpu[i]
+            print(
+                f"forward_batch.mode: {forward_batch.forward_mode.name}, extend_seq_len: {extend_seq_len}"
+            )
             ks = torch.full((extend_seq_len,), offset, dtype=torch.int32, device="cuda")
             k_fp8_list.append(k_fp8)
             k_scale_list.append(k_scale)
@@ -385,7 +388,9 @@ class Indexer(CustomOp):
         ks = torch.cat(ks_list, dim=0)
         seq_lens_expanded = metadata.get_seqlens_expanded()
         ke = ks + seq_lens_expanded
-
+        print(
+            f"forward_batch.mode: {forward_batch.forward_mode.name}, q_fp8.shape: {q_fp8.shape}, ks.shape: {ks.shape}, ke.shape: {ke.shape}"
+        )
         logits = deep_gemm.fp8_mqa_logits(
             q_fp8,
             kv_fp8,
@@ -571,9 +576,12 @@ class Indexer(CustomOp):
                     forward_batch, layer_id, q_fp8, weights, metadata
                 )
             else:
-                topk_result = self._get_topk_ragged(
-                    forward_batch, layer_id, q_fp8, weights, metadata
+                print(
+                    f"indexer forward_batch.mode: {forward_batch.forward_mode.name}, forward_batch.extend_seq_lens_cpu: {forward_batch.extend_seq_lens_cpu}"
                 )
+            topk_result = self._get_topk_ragged(
+                forward_batch, layer_id, q_fp8, weights, metadata
+            )
         else:
             topk_result = self.forward_indexer(
                 q_fp8.contiguous(),
