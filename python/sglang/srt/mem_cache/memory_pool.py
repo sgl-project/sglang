@@ -445,32 +445,45 @@ class MHATokenToKVPool(KVCache):
 
         self.device_module = torch.get_device_module(self.device)
         self.alt_stream = self.device_module.Stream() if _is_cuda else None
-        
+
         if enable_kv_cache_copy:
             self._init_kv_copy_and_warmup()
         else:
             self._kv_copy_config = None
-        
+
         self._finalize_allocation_log(size)
 
     def _init_kv_copy_and_warmup(self):
+        # Heuristics for KV copy tiling
+        _KV_COPY_STRIDE_THRESHOLD_LARGE = 8192
+        _KV_COPY_STRIDE_THRESHOLD_MEDIUM = 4096
+        _KV_COPY_TILE_SIZE_LARGE = 512
+        _KV_COPY_TILE_SIZE_MEDIUM = 256
+        _KV_COPY_TILE_SIZE_SMALL = 128
+        _KV_COPY_NUM_WARPS_LARGE_TILE = 8
+        _KV_COPY_NUM_WARPS_SMALL_TILE = 4
+
         stride_bytes = int(self.data_strides[0].item())
-        if stride_bytes >= 8192:
-            bytes_per_tile = 512
-        elif stride_bytes >= 4096:
-            bytes_per_tile = 256
+        if stride_bytes >= _KV_COPY_STRIDE_THRESHOLD_LARGE:
+            bytes_per_tile = _KV_COPY_TILE_SIZE_LARGE
+        elif stride_bytes >= _KV_COPY_STRIDE_THRESHOLD_MEDIUM:
+            bytes_per_tile = _KV_COPY_TILE_SIZE_MEDIUM
         else:
-            bytes_per_tile = 128
-        
+            bytes_per_tile = _KV_COPY_TILE_SIZE_SMALL
+
         self._kv_copy_config = {
-            'bytes_per_tile': bytes_per_tile,
-            'byte_tiles': (stride_bytes + bytes_per_tile - 1) // bytes_per_tile,
-            'num_warps': 4 if bytes_per_tile <= 256 else 8,
+            "bytes_per_tile": bytes_per_tile,
+            "byte_tiles": (stride_bytes + bytes_per_tile - 1) // bytes_per_tile,
+            "num_warps": (
+                _KV_COPY_NUM_WARPS_SMALL_TILE
+                if bytes_per_tile <= _KV_COPY_TILE_SIZE_MEDIUM
+                else _KV_COPY_NUM_WARPS_LARGE_TILE
+            ),
         }
-        
+
         dummy_loc = torch.zeros(1, dtype=torch.int32, device=self.device)
-        grid = (self.data_ptrs.numel(), self._kv_copy_config['byte_tiles'])
-        
+        grid = (self.data_ptrs.numel(), self._kv_copy_config["byte_tiles"])
+
         copy_all_layer_kv_cache_tiled[grid](
             self.data_ptrs,
             self.data_strides,
@@ -478,8 +491,8 @@ class MHATokenToKVPool(KVCache):
             dummy_loc,
             1,
             1,
-            BYTES_PER_TILE=self._kv_copy_config['bytes_per_tile'],
-            num_warps=self._kv_copy_config['num_warps'],
+            BYTES_PER_TILE=self._kv_copy_config["bytes_per_tile"],
+            num_warps=self._kv_copy_config["num_warps"],
             num_stages=2,
         )
 
@@ -680,15 +693,15 @@ class MHATokenToKVPool(KVCache):
         N = tgt_loc.numel()
         if N == 0:
             return
-        
-        assert self._kv_copy_config is not None, (
-            "KV copy not initialized. Set enable_kv_cache_copy=True in __init__"
-        )
-        
+
+        assert (
+            self._kv_copy_config is not None
+        ), "KV copy not initialized. Set enable_kv_cache_copy=True in __init__"
+
         cfg = self._kv_copy_config
-        N_upper = 1 << (N - 1).bit_length() if N > 0 else 1
-        grid = (self.data_ptrs.numel(), cfg['byte_tiles'])
-        
+        N_upper = next_power_of_2(N)
+        grid = (self.data_ptrs.numel(), cfg["byte_tiles"])
+
         copy_all_layer_kv_cache_tiled[grid](
             self.data_ptrs,
             self.data_strides,
@@ -696,8 +709,8 @@ class MHATokenToKVPool(KVCache):
             src_loc,
             N,
             N_upper,
-            BYTES_PER_TILE=cfg['bytes_per_tile'],
-            num_warps=cfg['num_warps'],
+            BYTES_PER_TILE=cfg["bytes_per_tile"],
+            num_warps=cfg["num_warps"],
             num_stages=2,
         )
 
