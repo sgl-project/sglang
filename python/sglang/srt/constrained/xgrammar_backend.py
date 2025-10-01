@@ -217,7 +217,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         except (RuntimeError, json.decoder.JSONDecodeError) as e:
             logging.error(f"Hit invalid json_schema: {key_string=}, {e=}")
             return INVALID_GRAMMAR_OBJ
-        return self._from_context(ctx, key_string, GrammarStats())
+        return self._from_context(ctx, key_string, GrammarStats(dispatch_type="json"))
 
     def dispatch_ebnf(self, key_string: str) -> Optional[XGrammarGrammar]:
         try:
@@ -225,7 +225,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         except RuntimeError as e:
             logging.error(f"Hit invalid ebnf: {key_string=}, {e=}")
             return INVALID_GRAMMAR_OBJ
-        return self._from_context(ctx, key_string, GrammarStats())
+        return self._from_context(ctx, key_string, GrammarStats(dispatch_type="ebnf"))
 
     def dispatch_regex(self, key_string: str) -> Optional[XGrammarGrammar]:
         try:
@@ -233,7 +233,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         except RuntimeError as e:
             logging.error(f"Hit invalid regex: {key_string=}, {e=}")
             return INVALID_GRAMMAR_OBJ
-        return self._from_context(ctx, key_string, GrammarStats())
+        return self._from_context(ctx, key_string, GrammarStats(dispatch_type="regex"))
 
     def dispatch_structural_tag(self, key_string: str) -> Optional[XGrammarGrammar]:
         try:
@@ -252,7 +252,9 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         except (RuntimeError, json.decoder.JSONDecodeError) as e:
             logging.error(f"Hit invalid structural_tag: {key_string=}, {e=}")
             return INVALID_GRAMMAR_OBJ
-        return self._from_context(ctx, key_string, GrammarStats())
+        return self._from_context(
+            ctx, key_string, GrammarStats(dispatch_type="structural_tag")
+        )
 
     def reset(self):
         self.grammar_compiler.clear_cache()
