@@ -409,7 +409,7 @@ fn bench_concurrent_parsing(c: &mut Criterion) {
                                     let result =
                                         rt.block_on(async { parser.parse_complete(input).await });
 
-                                    if let Ok(tools) = result {
+                                    if let Ok((_normal_text, tools)) = result {
                                         total_p.fetch_add(tools.len() as u64, Ordering::Relaxed);
                                     }
                                 }

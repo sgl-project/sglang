@@ -20,8 +20,6 @@ async fn test_policy_registry_with_router_manager() {
     // Create RouterManager with shared registries
     let _router_manager = RouterManager::new(worker_registry.clone());
 
-    // Test adding workers with different models and policies
-
     // Add first worker for llama-3 with cache_aware policy hint
     let mut labels1 = HashMap::new();
     labels1.insert("policy".to_string(), "cache_aware".to_string());
@@ -44,7 +42,6 @@ async fn test_policy_registry_with_router_manager() {
     // This would normally connect to a real worker, but for testing we'll just verify the structure
     // In a real test, we'd need to mock the worker or use a test server
 
-    // Verify PolicyRegistry has the correct policy for llama-3
     let _llama_policy = policy_registry.get_policy("llama-3");
     // After first worker is added, llama-3 should have a policy
 
@@ -88,10 +85,8 @@ async fn test_policy_registry_with_router_manager() {
         chat_template: None,
     };
 
-    // Verify gpt-4 has random policy
     let _gpt_policy = policy_registry.get_policy("gpt-4");
 
-    // Test removing workers
     // When we remove both llama-3 workers, the policy should be cleaned up
 
     println!("PolicyRegistry integration test structure created");
@@ -113,7 +108,6 @@ fn test_policy_registry_cleanup() {
     let policy2 = registry.on_worker_added("model-1", Some("random"));
     assert_eq!(policy2.name(), "cache_aware"); // Should still be cache_aware
 
-    // Verify policy exists
     assert!(registry.get_policy("model-1").is_some());
 
     // Remove first worker - policy should remain
@@ -143,7 +137,6 @@ fn test_policy_registry_multiple_models() {
     assert_eq!(gpt_policy.name(), "random");
     assert_eq!(mistral_policy.name(), "round_robin"); // Default
 
-    // Verify all policies are stored
     assert!(registry.get_policy("llama-3").is_some());
     assert!(registry.get_policy("gpt-4").is_some());
     assert!(registry.get_policy("mistral").is_some());

@@ -537,10 +537,6 @@ pub trait ValidatableRequest:
     }
 }
 
-// ==================================================================
-// =            OPENAI CHAT COMPLETION VALIDATION                   =
-// ==================================================================
-
 impl SamplingOptionsProvider for ChatCompletionRequest {
     fn get_temperature(&self) -> Option<f32> {
         self.temperature
@@ -909,7 +905,6 @@ mod tests {
         fn test_chat_cross_parameter_conflicts() {
             let mut request = create_valid_chat_request();
 
-            // Test 1: max_tokens vs max_completion_tokens conflict
             request.max_tokens = Some(100);
             request.max_completion_tokens = Some(200);
             assert!(
@@ -921,7 +916,6 @@ mod tests {
             request.max_tokens = None;
             request.max_completion_tokens = None;
 
-            // Test 2: tools vs functions conflict (deprecated)
             request.tools = Some(vec![]);
             request.functions = Some(vec![]);
             assert!(
@@ -929,7 +923,6 @@ mod tests {
                 "Should reject both tools and functions"
             );
 
-            // Test 3: logprobs=true without top_logprobs should be valid
             let mut request = create_valid_chat_request();
             request.logprobs = true;
             request.top_logprobs = None;
@@ -938,7 +931,6 @@ mod tests {
                 "logprobs=true without top_logprobs should be valid"
             );
 
-            // Test 4: top_logprobs without logprobs=true should fail (OpenAI rule)
             let mut request = create_valid_chat_request();
             request.logprobs = false;
             request.top_logprobs = Some(5);
@@ -967,7 +959,6 @@ mod tests {
         fn test_parameter_ranges() {
             let mut request = create_valid_chat_request();
 
-            // Test temperature range (0.0 to 2.0)
             request.temperature = Some(1.5);
             assert!(request.validate().is_ok());
             request.temperature = Some(-0.1);
@@ -975,7 +966,6 @@ mod tests {
             request.temperature = Some(3.0);
             assert!(request.validate().is_err());
 
-            // Test top_p range (0.0 to 1.0)
             request.temperature = Some(1.0); // Reset
             request.top_p = Some(0.9);
             assert!(request.validate().is_ok());
@@ -984,7 +974,6 @@ mod tests {
             request.top_p = Some(1.5);
             assert!(request.validate().is_err());
 
-            // Test frequency_penalty range (-2.0 to 2.0)
             request.top_p = Some(0.9); // Reset
             request.frequency_penalty = Some(1.5);
             assert!(request.validate().is_ok());
@@ -993,7 +982,6 @@ mod tests {
             request.frequency_penalty = Some(3.0);
             assert!(request.validate().is_err());
 
-            // Test presence_penalty range (-2.0 to 2.0)
             request.frequency_penalty = Some(0.0); // Reset
             request.presence_penalty = Some(-1.5);
             assert!(request.validate().is_ok());
@@ -1002,7 +990,6 @@ mod tests {
             request.presence_penalty = Some(2.5);
             assert!(request.validate().is_err());
 
-            // Test repetition_penalty range (0.0 to 2.0)
             request.presence_penalty = Some(0.0); // Reset
             request.repetition_penalty = Some(1.2);
             assert!(request.validate().is_ok());
@@ -1011,7 +998,6 @@ mod tests {
             request.repetition_penalty = Some(2.1);
             assert!(request.validate().is_err());
 
-            // Test min_p range (0.0 to 1.0)
             request.repetition_penalty = Some(1.0); // Reset
             request.min_p = Some(0.5);
             assert!(request.validate().is_ok());

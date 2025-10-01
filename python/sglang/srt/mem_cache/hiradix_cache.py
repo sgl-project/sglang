@@ -48,9 +48,9 @@ class HiRadixCache(RadixCache):
 
         if hicache_io_backend == "direct":
             if hicache_mem_layout == "page_first":
-                hicache_mem_layout = "layer_first"
+                hicache_mem_layout = "page_first_direct"
                 logger.warning(
-                    "Page first layout is not supported with direct IO backend, switching to layer first layout"
+                    "Page first layout is not supported with direct IO backend, switching to page first direct layout"
                 )
 
         self.kv_cache = token_to_kv_pool_allocator.get_kvcache()
@@ -305,7 +305,7 @@ class HiRadixCache(RadixCache):
 
     def _evict_backuped(self, node: TreeNode):
         # evict a node already written to host
-        num_evicted = self.cache_controller.evict_device(node.value, node.host_value)
+        num_evicted = self.cache_controller.evict_device(node.value)
         assert num_evicted > 0
         self.evictable_size_ -= num_evicted
         node.value = None
@@ -576,8 +576,6 @@ class HiRadixCache(RadixCache):
             written_indices,
             hash_value[: min_completed_tokens // self.page_size],
         )
-        if len(written_indices):
-            self.cache_controller.mem_pool_host.update_prefetch(written_indices)
 
         self.cache_controller.mem_pool_host.free(host_indices[:matched_length])
         self.cache_controller.append_host_mem_release(
@@ -775,7 +773,6 @@ class HiRadixCache(RadixCache):
                     # change the reference if the node is evicted
                     # this often happens in the case of KV cache recomputation
                     node.value = value[:prefix_len]
-                    self.token_to_kv_pool_host.update_synced(node.host_value)
                     self.evictable_size_ += len(node.value)
                 else:
                     self._inc_hit_count(node, chunked)
@@ -785,7 +782,6 @@ class HiRadixCache(RadixCache):
                 new_node = self._split_node(node.key, node, prefix_len)
                 if new_node.evicted:
                     new_node.value = value[:prefix_len]
-                    self.token_to_kv_pool_host.update_synced(new_node.host_value)
                     self.evictable_size_ += len(new_node.value)
                 else:
                     self._inc_hit_count(new_node, chunked)

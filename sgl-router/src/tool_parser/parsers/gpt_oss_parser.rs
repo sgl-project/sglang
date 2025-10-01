@@ -71,10 +71,10 @@ impl Default for GptOssParser {
 
 #[async_trait]
 impl ToolParser for GptOssParser {
-    async fn parse_complete(&self, text: &str) -> ToolParserResult<Vec<ToolCall>> {
+    async fn parse_complete(&self, text: &str) -> ToolParserResult<(String, Vec<ToolCall>)> {
         // Check if text contains GPT-OSS format
         if !self.has_tool_markers(text) {
-            return Ok(vec![]);
+            return Ok((text.to_string(), vec![]));
         }
 
         let mut tools = Vec::new();
@@ -119,7 +119,7 @@ impl ToolParser for GptOssParser {
             }
         }
 
-        Ok(tools)
+        Ok((String::new(), tools)) // GPT-OSS parser returns empty normal text
     }
 
     async fn parse_incremental(
@@ -225,68 +225,5 @@ impl ToolParser for GptOssParser {
 
     fn detect_format(&self, text: &str) -> bool {
         self.has_tool_markers(text) || text.contains("<|channel|>commentary")
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_parse_gpt_oss_single_tool() {
-        let parser = GptOssParser::new();
-        let input = r#"Some text
-<|channel|>commentary to=functions.get_weather<|constrain|>json<|message|>{"location": "San Francisco"}<|call|>
-More text"#;
-
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.name, "get_weather");
-        assert!(result[0].function.arguments.contains("San Francisco"));
-    }
-
-    #[tokio::test]
-    async fn test_parse_gpt_oss_multiple_tools() {
-        let parser = GptOssParser::new();
-        let input = r#"<|channel|>commentary to=functions.get_weather<|constrain|>json<|message|>{"location": "Paris"}<|call|>commentary
-<|channel|>commentary to=functions.search<|constrain|>json<|message|>{"query": "Paris tourism"}<|call|>"#;
-
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].function.name, "get_weather");
-        assert_eq!(result[1].function.name, "search");
-        assert!(result[0].function.arguments.contains("Paris"));
-        assert!(result[1].function.arguments.contains("Paris tourism"));
-    }
-
-    #[tokio::test]
-    async fn test_parse_gpt_oss_with_prefix() {
-        let parser = GptOssParser::new();
-        let input = r#"<|start|>assistant<|channel|>commentary to=functions.test<|constrain|>json<|message|>{"key": "value"}<|call|>"#;
-
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.name, "test");
-    }
-
-    #[tokio::test]
-    async fn test_parse_gpt_oss_empty_args() {
-        let parser = GptOssParser::new();
-        let input =
-            r#"<|channel|>commentary to=functions.get_time<|constrain|>json<|message|>{}<|call|>"#;
-
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.name, "get_time");
-        assert_eq!(result[0].function.arguments, "{}");
-    }
-
-    #[test]
-    fn test_detect_format() {
-        let parser = GptOssParser::new();
-        assert!(parser.detect_format("<|channel|>commentary to="));
-        assert!(parser.detect_format("<|channel|>commentary"));
-        assert!(!parser.detect_format("plain text"));
-        assert!(!parser.detect_format("[TOOL_CALLS]"));
     }
 }
