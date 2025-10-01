@@ -973,14 +973,7 @@ def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = N
         if child.pid == skip_pid:
             continue
         try:
-            # First try to terminate gracefully
-            child.terminate()
-            # Wait up to 1 second for the process to exit
-            try:
-                child.wait(timeout=1.0)
-            except psutil.TimeoutExpired:
-                # If it didn't exit, kill it
-                child.kill()
+            child.kill()
         except psutil.NoSuchProcess:
             pass
 
