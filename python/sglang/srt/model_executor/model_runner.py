@@ -350,7 +350,6 @@ class ModelRunner:
 
         if config := self.mambaish_config:
             class_name = config.__class__.__name__
-            self.server_args.attention_backend = "hybrid_linear_attn"
             logger.warning(f"{class_name} model detected, disable radix cache")
             self.server_args.disable_radix_cache = True
             if self.server_args.max_mamba_cache_size is None:

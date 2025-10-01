@@ -1,10 +1,9 @@
 from dataclasses import astuple, dataclass
 from functools import lru_cache
-from typing import Optional, TypeVar, Union
+from typing import Optional, Union
 
 import torch
 import torch.nn.functional as F
-from typing_extensions import Generic
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
@@ -29,6 +28,7 @@ from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.models.qwen3_next import fused_gdn_gating
+from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import is_cuda, is_npu
 
@@ -65,6 +65,40 @@ class MambaAttnBackendBase(AttentionBackend):
         self.query_start_loc_list = []
         self.cached_cuda_graph_decode_query_start_loc: torch.Tensor = None
         self.cached_cuda_graph_verify_query_start_loc: torch.Tensor = None
+
+    def _forward_metadata(self, forward_batch: ForwardBatch):
+        bs = forward_batch.batch_size
+        if forward_batch.forward_mode.is_decode_or_idle():
+            query_start_loc = torch.arange(
+                0, bs + 1, dtype=torch.int32, device=self.device
+            )
+        elif forward_batch.forward_mode.is_extend():
+            if forward_batch.forward_mode.is_target_verify():
+                query_start_loc = torch.arange(
+                    0,
+                    forward_batch.input_ids.shape[0] + 1,
+                    step=forward_batch.spec_info.draft_token_num,
+                    dtype=torch.int32,
+                    device=forward_batch.input_ids.device,
+                )
+            else:
+                query_start_loc = torch.empty(
+                    (bs + 1,), dtype=torch.int32, device=self.device
+                )
+                query_start_loc[:bs] = forward_batch.extend_start_loc
+                query_start_loc[bs] = (
+                    forward_batch.extend_start_loc[-1]
+                    + forward_batch.extend_seq_lens[-1]
+                )
+        else:
+            raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode=}")
+        mamba_cache_indices = self.req_to_token_pool.get_mamba_indices(
+            forward_batch.req_pool_indices
+        )
+        return ForwardMetadata(
+            query_start_loc=query_start_loc,
+            mamba_cache_indices=mamba_cache_indices,
+        )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         self.forward_metadata = self._forward_metadata(forward_batch)
@@ -121,16 +155,6 @@ class MambaAttnBackendBase(AttentionBackend):
             step=verify_step,
             dtype=torch.int32,
             device=self.device,
-        )
-
-    def _forward_metadata(self, forward_batch: ForwardBatch):
-        query_start_loc = forward_batch.query_start_loc(device=self.device)
-        mamba_cache_indices = self.req_to_token_pool.get_mamba_indices(
-            forward_batch.req_pool_indices
-        )
-        return ForwardMetadata(
-            query_start_loc=query_start_loc,
-            mamba_cache_indices=mamba_cache_indices,
         )
 
     def _capture_metadata(

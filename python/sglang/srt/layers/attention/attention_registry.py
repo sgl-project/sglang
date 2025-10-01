@@ -178,35 +178,32 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         runner.is_hybrid_gdn and runner.use_mla_backend
     ), "hybrid_gdn can only be used with non-MLA models."
 
-    # wrap for hybrid GDN models
-    if runner.is_hybrid_gdn:
-        from sglang.srt.utils import is_blackwell, is_npu
-
-        if is_blackwell():
-            assert (
-                runner.server_args.attention_backend == "triton"
-            ), "triton backend is the only supported backend on Blackwell GPUs for hybrid GDN models, use --attention-backend triton to specify the backend."
-        if is_npu():
-            assert (
-                runner.server_args.attention_backend == "ascend"
-            ), "ascend backend is the only supported backend on NPU for hybrid GDN models, use --attention-backend ascend to specify the backend."
-        logger.info(f"Using hybrid linear attention backend for hybrid GDN models.")
+    if cfg := runner.mambaish_config:
         from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
             GDNAttnBackend,
             HybridLinearAttnBackend,
             Mamba2AttnBackend,
         )
+        from sglang.srt.utils import is_blackwell, is_npu
 
         if runner.is_hybrid_gdn:
+            if is_blackwell():
+                assert (
+                    runner.server_args.attention_backend == "triton"
+                ), "triton backend is the only supported backend on Blackwell GPUs for hybrid GDN models, use --attention-backend triton to specify the backend."
+            if is_npu():
+                assert (
+                    runner.server_args.attention_backend == "ascend"
+                ), "ascend backend is the only supported backend on NPU for hybrid GDN models, use --attention-backend ascend to specify the backend."
+            logger.info(f"Using hybrid linear attention backend for hybrid GDN models.")
             linear_attn_backend = GDNAttnBackend(runner)
         elif runner.is_nemotron_h:
             linear_attn_backend = Mamba2AttnBackend(runner)
         else:
             raise ValueError(
-                "hybrid_linear_attn backend requires either hybrid GDN or NemotronH models."
+                "Expected hybrid GDN or NemotronH models, but got unknown model."
             )
-
-        full_attn_layers = runner.model_config.hf_config.full_attention_layer_ids
+        full_attn_layers = cfg.full_attention_layer_ids
         return HybridLinearAttnBackend(
             full_attn_backend, linear_attn_backend, full_attn_layers
         )

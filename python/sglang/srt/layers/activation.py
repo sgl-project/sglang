@@ -144,18 +144,15 @@ class NewGELU(CustomOp):
         return self.forward_native(x)
 
 
-class ReLU2(CustomOp):
+class ReLU2(nn.Module):
     """
     Applies the squared Rectified Linear Unit function.
     y = max(0, x)^2
     """
 
-    def forward_native(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = F.relu(x)
         return x * x
-
-    def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
-        return self.forward_native(x)
 
 
 class QuickGELU(CustomOp):
