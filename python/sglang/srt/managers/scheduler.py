@@ -403,6 +403,12 @@ class Scheduler(
         else:
             self.draft_worker = None
 
+        # Dispatch the model worker
+        if self.spec_algorithm.is_none():
+            self.model_worker = self.tp_worker
+        else:
+            self.model_worker = self.draft_worker
+
         # Get token and memory info from the model worker
         (
             self.max_total_num_tokens,
@@ -2024,7 +2030,7 @@ class Scheduler(
                 # FIXME(lsyin): remove this if and finally unify the abstraction
                 batch_or_worker_batch = batch.get_model_worker_batch()
 
-            forward_batch_output = self.tp_worker.forward_batch_generation(
+            forward_batch_output = self.model_worker.forward_batch_generation(
                 batch_or_worker_batch
             )
 
