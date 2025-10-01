@@ -7,7 +7,7 @@ use crate::tool_parser::{
     partial_json::PartialJson,
     state::ParseState,
     traits::ToolParser,
-    types::{FunctionCall, StreamResult, StreamingParseResult, ToolCall},
+    types::{FunctionCall, StreamingParseResult, ToolCall, ToolCallItem},
 };
 
 /// Qwen format parser for tool calls
@@ -162,9 +162,35 @@ impl ToolParser for QwenParser {
         chunk: &str,
         state: &mut ParseState,
     ) -> ToolParserResult<StreamingParseResult> {
-        // Call the existing implementation and convert result
-        let result = self.parse_incremental_legacy(chunk, state).await?;
-        Ok(super::helpers::convert_stream_result(result))
+        state.buffer.push_str(chunk);
+        let mut result = StreamingParseResult::new();
+
+        // Check for partial end token
+        if self.ends_with_partial_token(&state.buffer).is_some() {
+            return Ok(result);
+        }
+
+        // Phase 1: Check for normal text before tool markers
+        if !state.in_tool_section {
+            if let Some(marker_pos) = state.buffer.find("<tool_call>") {
+                if marker_pos > 0 {
+                    result.normal_text = state.buffer.drain(..marker_pos).collect();
+                    state.in_tool_section = true;
+                    return Ok(result);
+                }
+                state.in_tool_section = true;
+            } else if !self.has_partial_marker(&state.buffer) {
+                result.normal_text = std::mem::take(&mut state.buffer);
+                return Ok(result);
+            }
+        }
+
+        // Phase 2: Process tool calls
+        if state.in_tool_section {
+            self.process_tool_calls(state, &mut result)?;
+        }
+
+        Ok(result)
     }
 
     fn detect_format(&self, text: &str) -> bool {
@@ -173,103 +199,161 @@ impl ToolParser for QwenParser {
 }
 
 impl QwenParser {
-    async fn parse_incremental_legacy(
+    fn has_partial_marker(&self, buffer: &str) -> bool {
+        // Check if buffer ends with partial tool marker
+        buffer.ends_with("<tool") ||
+        buffer.ends_with("<tool_") ||
+        buffer.ends_with("<tool_c") ||
+        buffer.ends_with("<tool_ca") ||
+        buffer.ends_with("<tool_cal")
+    }
+
+    fn process_tool_calls(
         &self,
-        chunk: &str,
         state: &mut ParseState,
-    ) -> ToolParserResult<StreamResult> {
-        state.buffer.push_str(chunk);
+        result: &mut StreamingParseResult,
+    ) -> ToolParserResult<()> {
+        let start_marker = "<tool_call>\n";
+        let end_marker = "\n</tool_call>";
 
-        // Check for partial token at end of buffer
-        if let Some(_partial_len) = self.ends_with_partial_token(&state.buffer) {
-            // Hold back the partial token
-            return Ok(StreamResult::Incomplete);
-        }
+        if let Some(start_pos) = state.buffer.find(start_marker) {
+            let json_start = start_pos + start_marker.len();
 
-        // Check if we have the start marker
-        if !self.has_tool_markers(&state.buffer) {
-            // No tool markers detected - return all buffered content as normal text
-            let normal_text = std::mem::take(&mut state.buffer);
-            return Ok(StreamResult::NormalText(normal_text));
-        }
+            if let Some(end_pos) = state.buffer[json_start..].find(end_marker) {
+                // Complete tool call found
+                let json_str = state.buffer[json_start..json_start + end_pos].to_string();
 
-        // Check for text before tool markers and extract it as normal text
-        if let Some(marker_pos) = state.buffer.find("<tool_call>") {
-            if marker_pos > 0 {
-                // We have text before the tool marker - extract it as normal text
-                let normal_text: String = state.buffer.drain(..marker_pos).collect();
-                return Ok(StreamResult::NormalText(normal_text));
-            }
-        }
-
-        // Find start and end positions
-        if let Some(start_pos) = self.find_tool_start(&state.buffer) {
-            // Check if we have the complete tool call
-            if let Some(end_pos) = self.find_tool_end(&state.buffer, start_pos) {
-                // Extract the JSON content
-                let json_start = start_pos + "<tool_call>\n".len();
-                let json_end = end_pos - "\n</tool_call>".len();
-                let json_str = &state.buffer[json_start..json_end];
-
-                // Parse the complete JSON
-                match serde_json::from_str::<Value>(json_str.trim()) {
+                match serde_json::from_str::<Value>(&json_str) {
                     Ok(value) => {
-                        if let Some(tool) = self.parse_single_object(&value, 0)? {
-                            // Clear the consumed part from buffer using drain for efficiency
-                            state.buffer.drain(..end_pos);
-                            return Ok(StreamResult::ToolComplete(tool));
-                        }
+                        let index = state.partial_tools.len();
+                        self.process_tool_json(&value, index, state, result)?;
+                        state.buffer.drain(..json_start + end_pos + end_marker.len());
                     }
                     Err(_) => {
-                        // JSON parsing failed, might be incomplete or malformed
-                        // If we have what looks like a complete tool call block, treat as normal text
-                        if state.buffer[start_pos..end_pos].contains("\n</tool_call>") {
-                            let malformed_text: String = state.buffer.drain(..end_pos).collect();
-                            return Ok(StreamResult::NormalText(malformed_text));
-                        }
+                        // Malformed JSON, treat as text
+                        let text: String = state.buffer.drain(
+                            ..json_start + end_pos + end_marker.len()
+                        ).collect();
+                        result.normal_text = text;
                     }
                 }
             } else {
-                // We have start but no end yet - try partial parsing
-                let json_start = start_pos + "<tool_call>\n".len();
-                let partial_json = &state.buffer[json_start..];
+                // Incomplete tool call, try partial parsing
+                let partial_json = state.buffer[json_start..].to_string();
+                self.process_partial_json(&partial_json, state, result)?;
+            }
+        }
 
-                // Remove trailing newline if present (might be start of end token)
-                let partial_json = partial_json.trim_end();
+        Ok(())
+    }
 
-                // Try to parse with partial JSON parser
-                match self.partial_json.parse_value(partial_json) {
-                    Ok((value, _consumed)) => {
-                        // Extract tool name if available
-                        if let Some(name) = value.get("name").and_then(|v| v.as_str()) {
-                            // Check if we've already sent the name
-                            if !state.in_string {
-                                state.in_string = true; // Use as flag for "name sent"
-                                return Ok(StreamResult::ToolName {
-                                    index: 0,
-                                    name: name.to_string(),
-                                });
-                            }
+    fn process_tool_json(
+        &self,
+        value: &Value,
+        index: usize,
+        state: &mut ParseState,
+        result: &mut StreamingParseResult,
+    ) -> ToolParserResult<()> {
+        // Ensure we have partial tool entry
+        let partial = state.ensure_partial_tool(index);
 
-                            // Check for arguments
-                            if let Some(args) = value.get("arguments") {
-                                if let Ok(args_str) = serde_json::to_string(args) {
-                                    return Ok(StreamResult::ToolArguments {
-                                        index: 0,
-                                        arguments: args_str,
-                                    });
-                                }
-                            }
-                        }
-                    }
-                    Err(_) => {
-                        // Failed to parse even as partial JSON
-                        // Keep buffering
-                    }
+        // Extract and send tool name if not sent
+        if !partial.name_sent {
+            if let Some(name) = value.get("name").and_then(|v| v.as_str()) {
+                partial.name = Some(name.to_string());
+                partial.id = Some(format!("qwen_call_{}", uuid::Uuid::new_v4()));
+                partial.name_sent = true;
+
+                result.tool_calls.push(ToolCallItem {
+                    tool_index: index,
+                    id: partial.id.clone(),
+                    name: partial.name.clone(),
+                    arguments_delta: String::new(),
+                });
+                return Ok(());
+            }
+        }
+
+        // Stream arguments
+        if partial.name_sent {
+            if let Some(args) = value.get("arguments") {
+                let args_str = serde_json::to_string(args)?;
+
+                if args_str.len() > partial.streamed_arguments.len() {
+                    let delta = &args_str[partial.streamed_arguments.len()..];
+
+                    result.tool_calls.push(ToolCallItem {
+                        tool_index: index,
+                        id: None,
+                        name: None,
+                        arguments_delta: delta.to_string(),
+                    });
+
+                    partial.streamed_arguments = args_str;
                 }
             }
         }
 
-        Ok(StreamResult::Incomplete)
+        Ok(())
     }
+
+    fn process_partial_json(
+        &self,
+        partial_json: &str,
+        state: &mut ParseState,
+        result: &mut StreamingParseResult,
+    ) -> ToolParserResult<()> {
+        // Remove trailing newline if present (might be start of end token)
+        let partial_json = partial_json.trim_end();
+
+        // Try to parse with partial JSON parser
+        match self.partial_json.parse_value(partial_json) {
+            Ok((value, _consumed)) => {
+                let index = state.partial_tools.len();
+
+                // Ensure we have partial tool entry
+                let partial = state.ensure_partial_tool(index);
+
+                // Extract tool name if available
+                if let Some(name) = value.get("name").and_then(|v| v.as_str()) {
+                    if !partial.name_sent {
+                        partial.name = Some(name.to_string());
+                        partial.id = Some(format!("qwen_call_{}", uuid::Uuid::new_v4()));
+                        partial.name_sent = true;
+
+                        result.tool_calls.push(ToolCallItem {
+                            tool_index: index,
+                            id: partial.id.clone(),
+                            name: partial.name.clone(),
+                            arguments_delta: String::new(),
+                        });
+                    }
+
+                    // Check for arguments
+                    if let Some(args) = value.get("arguments") {
+                        if let Ok(args_str) = serde_json::to_string(args) {
+                            if args_str.len() > partial.streamed_arguments.len() {
+                                let delta = &args_str[partial.streamed_arguments.len()..];
+
+                                result.tool_calls.push(ToolCallItem {
+                                    tool_index: index,
+                                    id: None,
+                                    name: None,
+                                    arguments_delta: delta.to_string(),
+                                });
+
+                                partial.streamed_arguments = args_str;
+                            }
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                // Failed to parse even as partial JSON - keep buffering
+            }
+        }
+
+        Ok(())
+    }
+
 }

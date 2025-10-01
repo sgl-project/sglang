@@ -6,7 +6,7 @@ use crate::tool_parser::{
     errors::{ToolParserError, ToolParserResult},
     state::ParseState,
     traits::ToolParser,
-    types::{FunctionCall, StreamResult, StreamingParseResult, ToolCall},
+    types::{FunctionCall, StreamingParseResult, ToolCall, ToolCallItem},
 };
 
 /// Step3 format parser for tool calls
@@ -192,9 +192,30 @@ impl ToolParser for Step3Parser {
         chunk: &str,
         state: &mut ParseState,
     ) -> ToolParserResult<StreamingParseResult> {
-        // Call the existing implementation and convert result
-        let result = self.parse_incremental_legacy(chunk, state).await?;
-        Ok(super::helpers::convert_stream_result(result))
+        state.buffer.push_str(chunk);
+        let mut result = StreamingParseResult::new();
+
+        // Phase 1: Check for normal text before tool markers
+        if !state.in_tool_section {
+            if let Some(marker_pos) = state.buffer.find("<｜tool_calls_begin｜>") {
+                if marker_pos > 0 {
+                    result.normal_text = state.buffer.drain(..marker_pos).collect();
+                    state.in_tool_section = true;
+                    return Ok(result);
+                }
+                state.in_tool_section = true;
+            } else if !self.has_partial_marker(&state.buffer) {
+                result.normal_text = std::mem::take(&mut state.buffer);
+                return Ok(result);
+            }
+        }
+
+        // Phase 2: Process tool calls
+        if state.in_tool_section {
+            self.process_tool_calls(state, &mut result)?;
+        }
+
+        Ok(result)
     }
 
     fn detect_format(&self, text: &str) -> bool {
@@ -203,88 +224,158 @@ impl ToolParser for Step3Parser {
 }
 
 impl Step3Parser {
-    async fn parse_incremental_legacy(
-        &self,
-        chunk: &str,
-        state: &mut ParseState,
-    ) -> ToolParserResult<StreamResult> {
-        state.buffer.push_str(chunk);
-
-        // Check for tool markers
-        if !self.has_tool_markers(&state.buffer) {
-            // No tool markers detected - return all buffered content as normal text
-            let normal_text = std::mem::take(&mut state.buffer);
-            return Ok(StreamResult::NormalText(normal_text));
+    fn has_partial_marker(&self, buffer: &str) -> bool {
+        // Check if buffer ends with partial tool marker
+        let markers = ["<｜", "<｜tool", "<｜tool_", "<｜tool_calls", "<｜tool_calls_"];
+        for marker in &markers {
+            if buffer.ends_with(marker) {
+                return true;
+            }
         }
+        false
+    }
 
-        // Check for text before tool markers and extract it as normal text
-        if let Some(marker_pos) = state.buffer.find("<｜tool_calls_begin｜>") {
-            if marker_pos > 0 {
-                // We have text before the tool marker - extract it as normal text
-                let normal_text: String = state.buffer.drain(..marker_pos).collect();
-                return Ok(StreamResult::NormalText(normal_text));
+    fn process_tool_calls(
+        &self,
+        state: &mut ParseState,
+        result: &mut StreamingParseResult,
+    ) -> ToolParserResult<()> {
+        let call_start = "<｜tool_call_begin｜>";
+        let call_end = "<｜tool_call_end｜>";
+
+        while let Some(start_pos) = state.buffer.find(call_start) {
+            let content_start = start_pos + call_start.len();
+
+            if let Some(end_pos) = state.buffer[content_start..].find(call_end) {
+                // Extract tool content first (owned string to avoid borrow issues)
+                let tool_content = state.buffer[content_start..content_start + end_pos].to_string();
+
+                // Process this tool call
+                if let Some(sep_pos) = tool_content.find("<｜tool_sep｜>") {
+                    if tool_content[..sep_pos].contains("function") {
+                        let invoke_content = tool_content[sep_pos + "<｜tool_sep｜>".len()..].to_string();
+                        self.process_steptml_invoke(&invoke_content, state, result)?;
+                    }
+                }
+
+                // Remove processed portion
+                state.buffer.drain(..content_start + end_pos + call_end.len());
+            } else {
+                // Incomplete tool call
+                let partial_content = &state.buffer[content_start..].to_string();
+                self.process_partial_steptml(&partial_content, state, result)?;
+                break;
             }
         }
 
-        // Look for start of tool calls
-        if let Some(start_pos) = state.buffer.find("<｜tool_calls_begin｜>") {
-            let search_from = start_pos + "<｜tool_calls_begin｜>".len();
+        Ok(())
+    }
 
-            // Look for individual tool call start
-            if let Some(call_start) = state.buffer[search_from..].find("<｜tool_call_begin｜>") {
-                let call_start_abs = search_from + call_start;
+    fn process_steptml_invoke(
+        &self,
+        invoke_content: &str,
+        state: &mut ParseState,
+        result: &mut StreamingParseResult,
+    ) -> ToolParserResult<()> {
+        // Parse steptml:invoke format
+        if let Some(captures) = self.invoke_extractor.captures(invoke_content) {
+            let func_name = captures.get(1).map_or("", |m| m.as_str()).trim();
+            let params_text = captures.get(2).map_or("", |m| m.as_str());
 
-                // Look for the end of this tool call
-                let search_end_from = call_start_abs + "<｜tool_call_begin｜>".len();
-                if let Some(call_end) = state.buffer[search_end_from..].find("<｜tool_call_end｜>")
-                {
-                    let call_end_abs = search_end_from + call_end + "<｜tool_call_end｜>".len();
+            let index = state.partial_tools.len();
 
-                    // Extract and parse the complete tool call
-                    let tool_call_text = &state.buffer[call_start_abs..call_end_abs];
+            // Create partial tool if needed
+            let partial = state.ensure_partial_tool(index);
 
-                    if let Some(tool) = self.parse_tool_call(tool_call_text)? {
-                        // Remove the processed part from buffer
-                        state.buffer.drain(..call_end_abs);
+            // Send name if not sent
+            if !partial.name_sent && !func_name.is_empty() {
+                partial.name = Some(func_name.to_string());
+                partial.id = Some(format!("step3_call_{}", uuid::Uuid::new_v4()));
+                partial.name_sent = true;
 
-                        return Ok(StreamResult::ToolComplete(tool));
-                    }
-                } else {
-                    // Tool call not complete yet, try to extract partial info
-                    let partial = &state.buffer[search_end_from..];
+                result.tool_calls.push(ToolCallItem {
+                    tool_index: index,
+                    id: partial.id.clone(),
+                    name: partial.name.clone(),
+                    arguments_delta: String::new(),
+                });
+            }
 
-                    // Check for tool separator
-                    if let Some(sep_pos) = partial.find("<｜tool_sep｜>") {
-                        // Check if it's a function
-                        if partial[..sep_pos].contains("function") {
-                            let after_sep = &partial[sep_pos + "<｜tool_sep｜>".len()..];
+            // Parse and stream parameters
+            if partial.name_sent {
+                let parameters = self.parse_steptml_parameters(params_text)?;
+                let args_str = serde_json::to_string(&parameters)?;
 
-                            // Try to extract function name from steptml:invoke
-                            if let Some(name_match) = self.invoke_extractor.captures(after_sep) {
-                                let func_name = name_match.get(1).map_or("", |m| m.as_str()).trim();
+                if args_str.len() > partial.streamed_arguments.len() {
+                    let delta = &args_str[partial.streamed_arguments.len()..];
 
-                                if !state.in_string && !func_name.is_empty() {
-                                    state.in_string = true; // Mark name as sent
-                                    return Ok(StreamResult::ToolName {
-                                        index: 0,
-                                        name: func_name.to_string(),
+                    result.tool_calls.push(ToolCallItem {
+                        tool_index: index,
+                        id: None,
+                        name: None,
+                        arguments_delta: delta.to_string(),
+                    });
+
+                    partial.streamed_arguments = args_str;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn process_partial_steptml(
+        &self,
+        partial_content: &str,
+        state: &mut ParseState,
+        result: &mut StreamingParseResult,
+    ) -> ToolParserResult<()> {
+        // Try to extract partial tool information
+        if let Some(sep_pos) = partial_content.find("<｜tool_sep｜>") {
+            if partial_content[..sep_pos].contains("function") {
+                let after_sep = &partial_content[sep_pos + "<｜tool_sep｜>".len()..];
+
+                // Try to extract function name from steptml:invoke
+                if let Some(name_match) = self.invoke_extractor.captures(after_sep) {
+                    let func_name = name_match.get(1).map_or("", |m| m.as_str()).trim();
+
+                    if !func_name.is_empty() {
+                        let index = state.partial_tools.len();
+
+                        // Ensure we have partial tool entry
+                        let partial = state.ensure_partial_tool(index);
+
+                        if !partial.name_sent {
+                            partial.name = Some(func_name.to_string());
+                            partial.id = Some(format!("step3_call_{}", uuid::Uuid::new_v4()));
+                            partial.name_sent = true;
+
+                            result.tool_calls.push(ToolCallItem {
+                                tool_index: index,
+                                id: partial.id.clone(),
+                                name: partial.name.clone(),
+                                arguments_delta: String::new(),
+                            });
+                        }
+
+                        // Try to extract partial parameters
+                        if let Some(params_text) = name_match.get(2) {
+                            let parameters = self.parse_steptml_parameters(params_text.as_str())?;
+
+                            if !parameters.is_empty() {
+                                let args_str = serde_json::to_string(&parameters)?;
+
+                                if args_str.len() > partial.streamed_arguments.len() {
+                                    let delta = &args_str[partial.streamed_arguments.len()..];
+
+                                    result.tool_calls.push(ToolCallItem {
+                                        tool_index: index,
+                                        id: None,
+                                        name: None,
+                                        arguments_delta: delta.to_string(),
                                     });
-                                }
 
-                                // Try to extract partial parameters
-                                if let Some(params_text) = name_match.get(2) {
-                                    let parameters =
-                                        self.parse_steptml_parameters(params_text.as_str())?;
-
-                                    if !parameters.is_empty() {
-                                        let args_str = serde_json::to_string(&parameters)
-                                            .unwrap_or_else(|_| "{}".to_string());
-
-                                        return Ok(StreamResult::ToolArguments {
-                                            index: 0,
-                                            arguments: args_str,
-                                        });
-                                    }
+                                    partial.streamed_arguments = args_str;
                                 }
                             }
                         }
@@ -293,6 +384,7 @@ impl Step3Parser {
             }
         }
 
-        Ok(StreamResult::Incomplete)
+        Ok(())
     }
+
 }

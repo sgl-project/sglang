@@ -15,12 +15,15 @@ pub mod parsers;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod test_simple;
+
 // Re-export commonly used types
 pub use errors::{ToolParserError, ToolParserResult};
 pub use registry::ParserRegistry;
-pub use state::{ParsePhase, ParseState};
+pub use state::{ParseMode, ParseState};
 pub use traits::{PartialJsonParser, ToolParser};
-pub use types::{FunctionCall, PartialToolCall, StreamResult, StreamingParseResult, ToolCall, ToolCallItem};
+pub use types::{FunctionCall, PartialToolCall, StreamingParseResult, ToolCall, ToolCallItem};
 
 // Re-export parsers for convenience
 pub use parsers::{
