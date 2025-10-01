@@ -2029,7 +2029,7 @@ class Scheduler(
                 ) = (
                     forward_batch_output.logits_output,
                     forward_batch_output.next_token_ids,
-                    forward_batch_output.pp_proxy_tensors,
+                    forward_batch_output.pp_proxy_tensors.tensors,
                     forward_batch_output.can_run_cuda_graph,
                 )
                 bid = model_worker_batch.bid
