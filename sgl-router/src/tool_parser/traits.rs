@@ -1,7 +1,7 @@
 use crate::tool_parser::{
     errors::ToolParserResult,
     state::ParseState,
-    types::{StreamResult, StreamingParseResult, ToolCall, ToolCallItem},
+    types::{StreamResult, ToolCall},
 };
 use async_trait::async_trait;
 
@@ -12,13 +12,12 @@ pub trait ToolParser: Send + Sync {
     /// Returns (remaining_normal_text, tool_calls) tuple
     async fn parse_complete(&self, output: &str) -> ToolParserResult<(String, Vec<ToolCall>)>;
 
-    /// Parse tool calls from model output (streaming) - vLLM style
-    /// Returns both normal text and tool calls in same response, following Python pattern
+    /// Parse tool calls from model output (streaming)
     async fn parse_incremental(
         &self,
         chunk: &str,
         state: &mut ParseState,
-    ) -> ToolParserResult<StreamingParseResult>;
+    ) -> ToolParserResult<StreamResult>;
 
     /// Check if text contains tool calls in this parser's format
     fn detect_format(&self, text: &str) -> bool;

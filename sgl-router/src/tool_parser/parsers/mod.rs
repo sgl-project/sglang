@@ -2,9 +2,6 @@
 ///
 /// This module contains concrete parser implementations for various model-specific
 /// tool/function call formats.
-// Helper modules
-pub mod helpers;
-
 // Individual parser modules
 pub mod deepseek_parser;
 pub mod glm4_moe_parser;

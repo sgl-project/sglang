@@ -6,7 +6,7 @@ use crate::tool_parser::{
     errors::{ToolParserError, ToolParserResult},
     state::ParseState,
     traits::ToolParser,
-    types::{FunctionCall, StreamResult, StreamingParseResult, ToolCall},
+    types::{FunctionCall, StreamResult, ToolCall},
 };
 
 /// GLM-4 MoE format parser for tool calls
@@ -165,22 +165,6 @@ impl ToolParser for Glm4MoeParser {
         &self,
         chunk: &str,
         state: &mut ParseState,
-    ) -> ToolParserResult<StreamingParseResult> {
-        // Call the existing implementation and convert result
-        let result = self.parse_incremental_legacy(chunk, state).await?;
-        Ok(super::helpers::convert_stream_result(result))
-    }
-
-    fn detect_format(&self, text: &str) -> bool {
-        self.has_tool_markers(text)
-    }
-}
-
-impl Glm4MoeParser {
-    async fn parse_incremental_legacy(
-        &self,
-        chunk: &str,
-        state: &mut ParseState,
     ) -> ToolParserResult<StreamResult> {
         state.buffer.push_str(chunk);
 
@@ -250,5 +234,9 @@ impl Glm4MoeParser {
         }
 
         Ok(StreamResult::Incomplete)
+    }
+
+    fn detect_format(&self, text: &str) -> bool {
+        self.has_tool_markers(text)
     }
 }
