@@ -218,9 +218,6 @@ impl WasmThreadPool {
         // create independent wasmtime engine for each worker thread
         let mut wasmtime_config = Config::new();
         wasmtime_config.async_stack_size(config.max_stack_size);
-        if config.enable_wasi {
-            wasmtime_config.wasm_component_model(false);
-        }
 
         let engine = match Engine::new(&wasmtime_config) {
             Ok(engine) => {
@@ -367,6 +364,7 @@ mod tests {
 
         let mut config = Config::new();
         config.async_stack_size(1024 * 1024);
+        config.async_support(true);
         let engine = Engine::new(&config).unwrap();
 
         let module = Module::new(&engine, wasm_bytes).unwrap();

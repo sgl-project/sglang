@@ -13,11 +13,18 @@ pub struct WasmModule {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum WasmModuleAddResult {
+    Success(Uuid),
+    Error(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WasmModuleDescriptor {
     pub name: String,
     pub file_path: String,
     pub module_type: WasmModuleType,
     pub attach_points: HashMap<WasmModuleAttachPoint, Vec<String>>,
+    pub add_result: Option<WasmModuleAddResult>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,4 +62,19 @@ pub enum MiddlewareAttachPoint {
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, Hash)]
 pub enum WasmModuleAttachPoint {
     Middleware(MiddlewareAttachPoint),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WasmModuleAddRequest {
+    pub modules: Vec<WasmModuleDescriptor>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WasmModuleAddResponse {
+    pub modules: Vec<WasmModuleDescriptor>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WasmModuleListResponse {
+    pub modules: Vec<WasmModule>,
 }

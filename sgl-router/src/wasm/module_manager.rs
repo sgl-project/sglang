@@ -16,7 +16,7 @@ use wasmtime::Val;
 
 use crate::wasm::{
     config::WasmRuntimeConfig,
-    errors::{Result, WasmError, WasmManagerError, WasmModuleError},
+    errors::{Result, WasmError, WasmManagerError, WasmModuleError, WasmRuntimeError},
     module::{WasmModule, WasmModuleAttachPoint, WasmModuleDescriptor, WasmModuleMeta},
     runtime::WasmRuntime,
 };
@@ -169,6 +169,14 @@ impl WasmModuleManager {
             .read()
             .map_err(|e| WasmManagerError::LockFailed(e.to_string()))?;
         Ok(modules.get(&module_uuid).cloned())
+    }
+
+    pub fn get_modules(&self) -> Result<Vec<WasmModule>> {
+        let modules = self
+            .modules
+            .read()
+            .map_err(|e| WasmManagerError::LockFailed(e.to_string()))?;
+        Ok(modules.values().cloned().collect())
     }
 
     /// get modules by attach point
