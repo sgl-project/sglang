@@ -313,6 +313,9 @@ def _handle_output_by_index(output, i):
             ),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
+            cache_hit_rate=(
+                [output.cache_hit_rate[i]] if len(output.cache_hit_rate) > i else None
+            ),
         )
     elif isinstance(output, BatchMultimodalOut):
         new_output = BatchMultimodalOut(

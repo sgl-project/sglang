@@ -144,6 +144,11 @@ class ReqState:
     output_token_ids_logprobs_val: List = dataclasses.field(default_factory=list)
     output_token_ids_logprobs_idx: List = dataclasses.field(default_factory=list)
 
+    # Prefix cache hit rate
+    cache_hit_rate: Optional[float] = None
+    # Whether the cache hit rate was sent in the response for streaming requests.
+    cache_hit_rate_sent: bool = False
+
 
 class TokenizerManager(TokenizerCommunicatorMixin):
     """TokenizerManager is a process that tokenizes the text."""
@@ -1415,6 +1420,10 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 "weight_version": self.server_args.weight_version,
             }
 
+            if state.cache_hit_rate is None:
+                state.cache_hit_rate = recv_obj.cache_hit_rate[i]
+                meta_info["cache_hit_rate"] = state.cache_hit_rate
+
             if getattr(state.obj, "return_logprob", False):
                 self.convert_logprob_style(
                     meta_info,
@@ -1477,6 +1486,8 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
             state.finished = recv_obj.finished_reasons[i] is not None
             if state.finished:
+                if state.cache_hit_rate is not None:
+                    meta_info["cache_hit_rate"] = recv_obj.cache_hit_rate[i]
                 if self.server_args.speculative_algorithm:
                     meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
                 state.finished_time = time.time()

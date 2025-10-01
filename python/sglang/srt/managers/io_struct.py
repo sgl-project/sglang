@@ -845,6 +845,9 @@ class BatchTokenIDOut:
     placeholder_tokens_idx: List[Optional[List[int]]]
     placeholder_tokens_val: List[Optional[List[int]]]
 
+    # Prefix cache hit rate
+    cache_hit_rate: List[Optional[float]]
+
 
 @dataclass
 class BatchMultimodalDecodeReq:
@@ -912,6 +915,9 @@ class BatchStrOut:
     placeholder_tokens_idx: List[Optional[List[int]]]
     placeholder_tokens_val: List[Optional[List[int]]]
 
+    # Prefix cache hit rate
+    cache_hit_rate: List[Optional[float]]
+
 
 @dataclass
 class BatchMultimodalOut:
@@ -954,6 +960,9 @@ class BatchEmbeddingOut:
     # Placeholder token info
     placeholder_tokens_idx: List[Optional[List[int]]]
     placeholder_tokens_val: List[Optional[List[int]]]
+
+    # Prefix cache hit rate
+    cache_hit_rate: List[Optional[float]]
 
 
 @dataclass

@@ -626,6 +626,9 @@ class Req:
         # This is used to compute the average acceptance length per request.
         self.spec_verify_ct = 0
 
+        # The prefix cache hit rate for this request.
+        self.cache_hit_rate = 0
+
         # For metrics
         self.metrics_collector = metrics_collector
         self.time_stats: TimeStats = TimeStats()
