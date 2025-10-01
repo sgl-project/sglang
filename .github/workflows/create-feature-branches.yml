@@ -34,7 +34,7 @@ jobs:
             BASE_VERSION=$(echo "$TAG" | sed -E 's/[\.-]?(rc|alpha|beta|pre|dev)[0-9]*$//')
 
             # Check if corresponding full release exists
-            if git ls-remote --tags origin | grep -q "refs/tags/$BASE_VERSION$"; then
+            if git ls-remote --tags https://${{ secrets.ORG_ADMIN_TOKEN || secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git | grep -q "refs/tags/$BASE_VERSION$"; then
               echo "::notice::Skipping pre-release tag $TAG because full release $BASE_VERSION exists"
               echo "is_prerelease=true" >> $GITHUB_OUTPUT
               echo "tag=$TAG" >> $GITHUB_OUTPUT
