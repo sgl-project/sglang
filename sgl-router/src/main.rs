@@ -344,6 +344,9 @@ struct CliArgs {
 
     #[arg(long)]
     mcp_config_path: Option<String>,
+
+    #[arg(long, default_value_t = false)]
+    enable_wasm: bool,
 }
 
 enum OracleConnectSource {
@@ -636,6 +639,7 @@ impl CliArgs {
             .dp_aware(self.dp_aware)
             .retries(!self.disable_retries)
             .circuit_breaker(!self.disable_circuit_breaker)
+            .enable_wasm(self.enable_wasm)
             .igw(self.enable_igw);
 
         builder.build()
