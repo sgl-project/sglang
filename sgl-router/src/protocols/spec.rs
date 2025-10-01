@@ -410,6 +410,21 @@ impl GenerationRequest for ChatCompletionRequest {
     }
 }
 
+impl ChatCompletionRequest {
+    /// Normalize tool_choice according to OpenAI spec:
+    /// - "none" is the default when no tools are present
+    /// - "auto" is the default if tools are present
+    pub fn normalize_tool_choice(&mut self) {
+        if self.tool_choice.is_none() {
+            self.tool_choice = Some(if self.tools.is_some() {
+                ToolChoice::Value(ToolChoiceValue::Auto)
+            } else {
+                ToolChoice::Value(ToolChoiceValue::None)
+            });
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChatCompletionResponse {
     pub id: String,

@@ -9,6 +9,7 @@ use crate::protocols::spec::{
     ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateRequest, RerankRequest,
     ResponsesGetParams, ResponsesRequest, StringOrArray, UserMessageContent,
 };
+use crate::protocols::validation::ValidatableRequest;
 use crate::routers::header_utils;
 use crate::routers::RouterTrait;
 use async_trait::async_trait;
@@ -1104,6 +1105,13 @@ impl RouterTrait for PDRouter {
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
+        let mut normalized_body = body.clone();
+        normalized_body.normalize_tool_choice();
+        if let Err(e) = normalized_body.validate() {
+            return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+        }
+        let body = &normalized_body;
+
         let is_stream = body.stream;
         let return_logprob = body.logprobs;
 
