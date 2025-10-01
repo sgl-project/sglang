@@ -36,6 +36,8 @@ class _Dumper:
         self._forward_pass_id = 0
 
     def on_forward_pass_start(self):
+        """This should be called on all ranks."""
+
         if not self._enable:
             return
 
