@@ -1,6 +1,5 @@
 import asyncio
 import itertools
-import time
 import unittest
 
 import requests
