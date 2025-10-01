@@ -55,7 +55,7 @@ class LoRAMemoryPool:
         max_lora_rank: int,
         target_modules: Set[str],
         base_model: torch.nn.Module,
-        eviction_policy: str = "fifo",
+        eviction_policy: str,
     ):
         self.base_hf_config: AutoConfig = base_hf_config
         self.num_layer: int = base_hf_config.num_hidden_layers

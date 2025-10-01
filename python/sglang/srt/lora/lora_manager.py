@@ -69,11 +69,7 @@ class LoRAManager:
         self.tp_rank: int = tp_rank
 
         # Store eviction policy from server args
-        self.eviction_policy = (
-            getattr(server_args, "lora_eviction_policy", "lru")
-            if server_args
-            else "lru"
-        )
+        self.eviction_policy = server_args.lora_eviction_policy
 
         # LoRA backend for running sgemm kernels
         logger.info(f"Using {lora_backend} as backend of LoRA kernels.")

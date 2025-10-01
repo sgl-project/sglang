@@ -65,7 +65,7 @@ class LRUEvictionPolicy(EvictionPolicy):
         """Select the least recently used adapter from candidates."""
         # Iterate through access_order (oldest first) to find LRU victim
         for uid in list(self.access_order.keys()):
-            if uid in candidates and uid is not None:
+            if uid in candidates:
                 logger.debug(f"Selected LoRA {uid} for eviction (LRU)")
                 self.eviction_count += 1
                 return uid
@@ -85,7 +85,7 @@ class FIFOEvictionPolicy(EvictionPolicy):
         self.eviction_count = 0
 
     def mark_used(self, uid: Optional[str]) -> None:
-        """For FIFO, we only track insertion, not usage."""
+        """For FIFO, we only track insertion (timestamp)"""
         if uid is not None and uid not in self.insertion_order:
             self.insertion_order[uid] = time.monotonic()
 
