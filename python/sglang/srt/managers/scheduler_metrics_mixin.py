@@ -187,9 +187,7 @@ class SchedulerMetricsMixin:
 
         self.num_generated_tokens = 0
         num_running_reqs = len(batch.reqs)
-        num_running_reqs_offline_batch = sum(
-            1 for req in batch.reqs if req.label == "batch"
-        )
+        num_running_reqs_offline_batch = 0
 
         # TODO: generalize this for various memory pools
         if self.is_hybrid:
