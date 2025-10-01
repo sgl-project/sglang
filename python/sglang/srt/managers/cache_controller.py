@@ -250,7 +250,7 @@ class HiCacheController:
         storage_backend: Optional[str] = None,
         prefetch_threshold: int = 256,
         model_name: Optional[str] = None,
-        storage_backend_extra_config: Optional[str] = None,
+        storage_backend_extra_config: Optional[dict] = None,
     ):
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
         self.mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
@@ -361,7 +361,7 @@ class HiCacheController:
     def _generate_storage_config(
         self,
         model_name: Optional[str] = None,
-        storage_backend_extra_config: Optional[str] = None,
+        storage_backend_extra_config: Optional[dict] = None,
     ):
 
         if is_dp_attention_enabled():
@@ -376,23 +376,13 @@ class HiCacheController:
         # Currently, AscendMLAPagedTokenToKVPool is the subclass of MLATokenToKVPool.
         is_mla_backend = isinstance(self.mem_pool_device, MLATokenToKVPool)
 
-        # Parse extra config JSON if provided
-        extra_config = None
-        if storage_backend_extra_config:
-            try:
-                import json
-
-                extra_config = json.loads(storage_backend_extra_config)
-            except Exception as e:
-                logger.error(f"Invalid backend extra config JSON: {e}")
-
         return HiCacheStorageConfig(
             tp_rank=self.tp_rank,
             tp_size=self.tp_size,
             is_mla_model=is_mla_backend,
             is_page_first_layout=self.mem_pool_host.layout == "page_first",
             model_name=model_name,
-            extra_config=extra_config,
+            extra_config=storage_backend_extra_config,
         )
 
     def reset(self):
