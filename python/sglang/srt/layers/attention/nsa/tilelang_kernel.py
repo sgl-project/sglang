@@ -4,6 +4,8 @@ import tilelang
 import tilelang.language as T
 import torch
 
+from sglang.srt.utils import is_hip
+
 tilelang.set_log_level("WARNING")
 
 pass_configs = {
@@ -15,6 +17,8 @@ pass_configs = {
 BF16 = "bfloat16"
 FP8 = "float8_e4m3"
 FP32 = "float32"
+
+_is_hip = is_hip()
 
 
 def fast_log2_ceil(x):
@@ -112,7 +116,7 @@ def act_quant(
 
 
 @tilelang.jit(out_idx=[4], pass_configs=pass_configs)
-def fp8_index_kernel(h: int, d: int):
+def fp8_index_kernel(h: int, d: int, clear_accum=True):
     b = T.symbolic("b")
     m = T.symbolic("m")
     n = T.symbolic("n")
@@ -149,7 +153,7 @@ def fp8_index_kernel(h: int, d: int):
                     logits,
                     transpose_A=False,
                     transpose_B=True,
-                    clear_accum=True,
+                    clear_accum=clear_accum,
                 )
 
                 for i_h, i3_n in T.Parallel(h, blk_n2):
@@ -186,7 +190,10 @@ def fp8_index(
         fp32 logits -> fp32 logits_sum
         fp32 logits_sum * k_s (e8m0) -> fp32 index_score
     """
-    return fp8_index_kernel(q.shape[2], q.shape[3])(q, q_s, k, k_s)
+    if _is_hip:
+        return fp8_index_kernel(q.shape[2], q.shape[3], False)(q, q_s, k, k_s)
+    else:
+        return fp8_index_kernel(q.shape[2], q.shape[3])(q, q_s, k, k_s)
 
 
 @tilelang.jit(
@@ -767,8 +774,12 @@ def tilelang_sparse_fwd(
     tail_dim = dim - d_v
     topk = indices.shape[-1]
     assert topk == 2048
-    # NOTE(dark): v2 offers better performance than v1
-    kernel = sparse_attention_fwd_kernel_v2(
-        num_heads, d_v, tail_dim, topk, sm_scale=sm_scale
-    )
+    if _is_hip:
+        kernel = sparse_attention_fwd_kernel_v1(
+            num_heads, d_v, tail_dim, topk, sm_scale=sm_scale, num_stages=1
+        )
+    else:
+        kernel = sparse_attention_fwd_kernel_v2(
+            num_heads, d_v, tail_dim, topk, sm_scale=sm_scale
+        )
     return kernel(q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0))  # type: ignore
