@@ -960,7 +960,7 @@ def run_score_benchmark(
             }
             test_requests.append(score_data)
 
-        start_time = time.time()
+        start_time = time.monotonic()
         successful_requests = 0
         total_latency = 0
         latencies = []
@@ -968,7 +968,7 @@ def run_score_benchmark(
         async with aiohttp.ClientSession() as session:
             for request_data in test_requests:
                 try:
-                    request_start = time.time()
+                    request_start = time.monotonic()
                     async with session.post(
                         f"{base_url}/v1/score",
                         json=request_data,
@@ -976,7 +976,7 @@ def run_score_benchmark(
                     ) as response:
                         if response.status == 200:
                             response_data = await response.json()
-                            request_end = time.time()
+                            request_end = time.monotonic()
 
                             if "scores" in response_data or "logprobs" in response_data:
                                 latency_ms = (request_end - request_start) * 1000
@@ -986,7 +986,7 @@ def run_score_benchmark(
                 except Exception:
                     continue
 
-        end_time = time.time()
+        end_time = time.monotonic()
         total_time = end_time - start_time
 
         if successful_requests > 0:
