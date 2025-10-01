@@ -548,3 +548,346 @@ def redundant_attention(
         pl, pr = b_start_loc[i] + b_seq_len_prefix[i], b_start_loc[i] + b_seq_len[i]
         o_extend[pt : pt + cur_seq_len_extend] = o_buffer[pl:pr]
         pt += cur_seq_len_extend
+
+
+@triton.jit
+def _fwd_kernel_unified(
+    Q,
+    O,
+    K_Buffer,
+    V_Buffer,
+    qo_indptr,
+    kv_indptr,
+    kv_indices,
+    prefix_lens,
+    sm_scale,
+    kv_group_num,
+    stride_qbs,
+    stride_qh,
+    stride_obs,
+    stride_oh,
+    stride_buf_kbs,
+    stride_buf_kh,
+    stride_buf_vbs,
+    stride_buf_vh,
+    SLIDING_WINDOW_SIZE: tl.constexpr,
+    logit_cap: tl.constexpr,
+    xai_temperature_len: tl.constexpr,
+    Lq: tl.constexpr,
+    Lv: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
+    BLOCK_DPE: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    HAS_SINK: tl.constexpr,
+):
+    """
+    Unified 1-stage kernel for deterministic extend attention.
+    Both prefix and extend KV are accessed through the unified kv_indices.
+    """
+    cur_seq = tl.program_id(0)
+    cur_head = tl.program_id(1)
+    cur_block_m = tl.program_id(2)
+    cur_kv_head = cur_head // kv_group_num
+
+    # Load sequence information
+    cur_seq_q_start_idx = tl.load(qo_indptr + cur_seq)
+    cur_seq_q_len = tl.load(qo_indptr + cur_seq + 1) - cur_seq_q_start_idx
+    cur_seq_kv_start_idx = tl.load(kv_indptr + cur_seq)
+    cur_seq_kv_len = tl.load(kv_indptr + cur_seq + 1) - cur_seq_kv_start_idx
+    cur_seq_prefix_len = tl.load(prefix_lens + cur_seq)
+
+    offs_d = tl.arange(0, BLOCK_DMODEL)
+    offs_dv = tl.arange(0, BLOCK_DV)
+    offs_m = tl.arange(0, BLOCK_M)
+    mask_m = (cur_block_m * BLOCK_M + offs_m) < cur_seq_q_len
+    mask_d = offs_d < Lq
+    mask_dv = offs_dv < Lv
+
+    # XAI temperature handling
+    if xai_temperature_len > 0:
+        offs_qidx = cur_seq_prefix_len + cur_block_m * BLOCK_M + offs_m
+        xai_temperature_reg = tl.where(
+            offs_qidx < xai_temperature_len,
+            1.0,
+            xai_temperature_len / (offs_qidx + 1.0),
+        )
+
+    # Load Q
+    offs_q = (
+        (cur_seq_q_start_idx + cur_block_m * BLOCK_M + offs_m[:, None])
+        * stride_qbs
+        + cur_head * stride_qh
+        + offs_d[None, :]
+    )
+    q = tl.load(
+        Q + offs_q, mask=(mask_m[:, None]) & (mask_d[None, :]), other=0.0
+    )
+
+    if BLOCK_DPE > 0:
+        offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
+        offs_qpe = (
+            (cur_seq_q_start_idx + cur_block_m * BLOCK_M + offs_m[:, None])
+            * stride_qbs
+            + cur_head * stride_qh
+            + offs_dpe[None, :]
+        )
+        qpe = tl.load(Q + offs_qpe, mask=mask_m[:, None], other=0.0)
+
+    # Initialize accumulators
+    offs_n = tl.arange(0, BLOCK_N)
+    acc = tl.zeros([BLOCK_M, BLOCK_DV], dtype=tl.float32)
+    deno = tl.zeros([BLOCK_M], dtype=tl.float32)
+    e_max = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
+
+    # Unified loop: process all KV tokens (prefix + extend)
+    for start_n in range(0, cur_seq_kv_len, BLOCK_N):
+        start_n = tl.multiple_of(start_n, BLOCK_N)
+        mask_n = (start_n + offs_n) < cur_seq_kv_len
+
+        # Compute mask
+        final_mask = mask_m[:, None] & mask_n[None, :]
+        
+        # Apply causal mask for extend part
+        if IS_CAUSAL:
+            # Determine if current KV block is in extend region
+            # Only apply causal mask when both Q and K are in extend region
+            q_idx = cur_block_m * BLOCK_M + offs_m[:, None]
+            k_idx_in_total = start_n + offs_n[None, :]
+            
+            # Causal mask: q_idx >= (k_idx - prefix_len) when k_idx >= prefix_len
+            # For prefix region (k_idx < prefix_len), no causal mask
+            k_is_extend = k_idx_in_total >= cur_seq_prefix_len
+            k_idx_in_extend = k_idx_in_total - cur_seq_prefix_len
+            causal_mask = tl.where(
+                k_is_extend,
+                q_idx >= k_idx_in_extend,
+                True,  # No causal mask for prefix
+            )
+            final_mask &= causal_mask
+
+        if SLIDING_WINDOW_SIZE > 0:
+            # Sliding window mask
+            q_abs_idx = cur_seq_prefix_len + cur_block_m * BLOCK_M + offs_m[:, None]
+            window_mask = q_abs_idx <= (start_n + offs_n[None, :] + SLIDING_WINDOW_SIZE)
+            final_mask &= window_mask
+
+        # Check if we can skip this tile
+        SKIP_TILE = tl.max(tl.max(final_mask.to(tl.int32), axis=1), axis=0) == 0
+
+        if not SKIP_TILE:
+            # Load KV indices
+            offs_kv_loc = tl.load(
+                kv_indices + cur_seq_kv_start_idx + start_n + offs_n,
+                mask=mask_n,
+                other=0,
+            )
+
+            # Load K
+            offs_buf_k = (
+                offs_kv_loc[None, :] * stride_buf_kbs
+                + cur_kv_head * stride_buf_kh
+                + offs_d[:, None]
+            )
+            k = tl.load(
+                K_Buffer + offs_buf_k,
+                mask=(mask_n[None, :]) & (mask_d[:, None]),
+                other=0.0,
+            )
+
+            # Compute QK
+            qk = tl.dot(q.to(k.dtype), k)
+            if BLOCK_DPE > 0:
+                offs_kpe = (
+                    offs_kv_loc[None, :] * stride_buf_kbs
+                    + cur_kv_head * stride_buf_kh
+                    + offs_dpe[:, None]
+                )
+                kpe = tl.load(
+                    K_Buffer + offs_kpe,
+                    mask=mask_n[None, :],
+                    other=0.0,
+                )
+                qk += tl.dot(qpe.to(kpe.dtype), kpe)
+            
+            qk *= sm_scale
+
+            if logit_cap > 0:
+                qk = logit_cap * tanh(qk / logit_cap)
+
+            if xai_temperature_len > 0:
+                qk *= xai_temperature_reg[:, None]
+
+            qk = tl.where(final_mask, qk, float("-inf"))
+
+            # Online softmax
+            row_max = tl.max(qk, 1)
+            row_max_fixed = tl.where(row_max == float("-inf"), -1e20, row_max)
+            n_e_max = tl.maximum(row_max_fixed, e_max)
+
+            re_scale = tl.exp(e_max - n_e_max)
+            p = tl.exp(qk - n_e_max[:, None])
+            deno = deno * re_scale + tl.sum(p, 1)
+
+            # Load V
+            offs_buf_v = (
+                offs_kv_loc[:, None] * stride_buf_vbs
+                + cur_kv_head * stride_buf_vh
+                + offs_dv[None, :]
+            )
+            v = tl.load(
+                V_Buffer + offs_buf_v,
+                mask=mask_n[:, None] & mask_dv[None, :],
+                other=0.0,
+            )
+            p = p.to(v.dtype)
+            acc = acc * re_scale[:, None] + tl.dot(p, v)
+
+            e_max = n_e_max
+
+    # Store output
+    offs_o = (
+        (cur_seq_q_start_idx + cur_block_m * BLOCK_M + offs_m[:, None])
+        * stride_obs
+        + cur_head * stride_oh
+        + offs_dv[None, :]
+    )
+    tl.store(
+        O + offs_o,
+        acc / deno[:, None],
+        mask=mask_m[:, None] & mask_dv[None, :],
+    )
+
+
+def extend_attention_fwd_unified(
+    q,
+    o,
+    k_buffer,
+    v_buffer,
+    qo_indptr,
+    kv_indptr,
+    kv_indices,
+    prefix_lens,
+    max_len_extend,
+    sm_scale=None,
+    logit_cap=0.0,
+    is_causal=True,
+    sliding_window_size=-1,
+    sinks=None,
+    xai_temperature_len=-1,
+):
+    """
+    Unified 1-stage extend attention for deterministic inference.
+    
+    Args:
+        q: Query tensor [num_tokens, num_heads, head_dim]
+        o: Output tensor [num_tokens, num_heads, head_dim]
+        k_buffer: Key cache buffer
+        v_buffer: Value cache buffer
+        qo_indptr: Query offsets [batch_size + 1]
+        kv_indptr: KV offsets [batch_size + 1] (includes both prefix and extend)
+        kv_indices: Unified KV indices (both prefix and extend)
+        prefix_lens: Prefix length for each sequence [batch_size]
+        max_len_extend: Maximum extend length
+        sm_scale: Softmax scale
+        logit_cap: Logit capping value
+        is_causal: Whether to apply causal mask
+        sliding_window_size: Sliding window size (-1 for no sliding window)
+        sinks: Sink tokens
+        xai_temperature_len: XAI temperature length
+    """
+    Lq, Lv = q.shape[-1], v_buffer.shape[-1]
+
+    if Lq == 576:
+        BLOCK_DMODEL = 512
+        BLOCK_DPE = 64
+    elif Lq == 288:
+        BLOCK_DMODEL = 256
+        BLOCK_DPE = 32
+    elif Lq == 192:
+        BLOCK_DMODEL = 128
+        BLOCK_DPE = 64
+    else:
+        BLOCK_DMODEL = triton.next_power_of_2(Lq)
+        BLOCK_DPE = 0
+    BLOCK_DV = triton.next_power_of_2(Lv)
+
+    if _is_hip:
+        BLOCK_M, BLOCK_N = (64, 64)
+        num_warps = 4
+    else:
+        if _is_cuda and CUDA_CAPABILITY[0] >= 9:
+            if Lq <= 256:
+                BLOCK_M, BLOCK_N = (128, 64)
+            else:
+                BLOCK_M, BLOCK_N = (32, 64)
+        elif _is_cuda and CUDA_CAPABILITY[0] >= 8:
+            if CUDA_CAPABILITY[1] == 9 or CUDA_CAPABILITY[1] == 6:
+                if Lq <= 128:
+                    BLOCK_M, BLOCK_N = (64, 128)
+                elif Lq <= 256:
+                    BLOCK_M, BLOCK_N = (64, 64)
+                else:
+                    BLOCK_M, BLOCK_N = (32, 32)
+            else:
+                if Lq <= 128:
+                    BLOCK_M, BLOCK_N = (128, 128)
+                elif Lq <= 256:
+                    BLOCK_M, BLOCK_N = (64, 64)
+                else:
+                    BLOCK_M, BLOCK_N = (32, 64)
+        else:
+            BLOCK_M, BLOCK_N = (64, 64) if Lq <= 128 else (32, 32)
+
+        num_warps = 4 if Lq <= 64 else 8
+
+    sm_scale = sm_scale or 1.0 / (Lq**0.5)
+    batch_size, head_num = qo_indptr.shape[0] - 1, q.shape[1]
+    kv_group_num = q.shape[1] // k_buffer.shape[1]
+
+    HAS_SINK = sinks is not None
+
+    grid = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
+    num_stages = 1
+
+    extra_kargs = {}
+    if _is_hip:
+        extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
+
+    _fwd_kernel_unified[grid](
+        q,
+        o,
+        k_buffer,
+        v_buffer,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        prefix_lens,
+        sm_scale,
+        kv_group_num,
+        q.stride(0),
+        q.stride(1),
+        o.stride(0),
+        o.stride(1),
+        k_buffer.stride(0),
+        k_buffer.stride(1),
+        v_buffer.stride(0),
+        v_buffer.stride(1),
+        SLIDING_WINDOW_SIZE=sliding_window_size,
+        logit_cap=logit_cap,
+        xai_temperature_len=xai_temperature_len,
+        BLOCK_DMODEL=BLOCK_DMODEL,
+        BLOCK_DPE=BLOCK_DPE,
+        BLOCK_DV=BLOCK_DV,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        Lq=Lq,
+        Lv=Lv,
+        IS_CAUSAL=is_causal,
+        HAS_SINK=HAS_SINK,
+        num_warps=num_warps,
+        num_stages=num_stages,
+        **extra_kargs,
+    )
