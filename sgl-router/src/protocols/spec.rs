@@ -416,10 +416,7 @@ impl ChatCompletionRequest {
     /// - "auto" is the default if tools are present
     pub fn normalize_tool_choice(&mut self) {
         if self.tool_choice.is_none() {
-            let has_tools = self
-                .tools
-                .as_ref()
-                .map_or(false, |tools| !tools.is_empty());
+            let has_tools = self.tools.as_ref().is_some_and(|tools| !tools.is_empty());
             self.tool_choice = Some(if has_tools {
                 ToolChoice::Value(ToolChoiceValue::Auto)
             } else {

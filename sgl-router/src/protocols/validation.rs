@@ -670,7 +670,7 @@ impl ChatCompletionRequest {
     /// Validate tool_choice according to OpenAI spec
     pub fn validate_tool_choice(&self) -> Result<(), ValidationError> {
         if let Some(tool_choice) = &self.tool_choice {
-            let has_tools = self.tools.as_ref().map_or(false, |tools| !tools.is_empty());
+            let has_tools = self.tools.as_ref().is_some_and(|tools| !tools.is_empty());
             match tool_choice {
                 ToolChoice::Value(choice) => {
                     // If tools are not provided (or empty), only "none" is allowed

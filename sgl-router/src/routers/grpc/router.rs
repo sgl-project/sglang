@@ -1513,7 +1513,8 @@ impl RouterTrait for GrpcRouter {
         if let Err(e) = normalized_body.validate() {
             return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
         }
-        self.route_chat_impl(headers, &normalized_body, model_id).await
+        self.route_chat_impl(headers, &normalized_body, model_id)
+            .await
     }
 
     async fn route_completion(
