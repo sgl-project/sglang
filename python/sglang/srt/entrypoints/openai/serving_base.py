@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+import jinja2
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Optional, Union
 
@@ -45,9 +46,14 @@ class OpenAIServingBase(ABC):
                 return self.create_error_response(error_msg)
 
             # Convert to internal format
-            adapted_request, processed_request = self._convert_to_internal_request(
-                request, raw_request
-            )
+            try:
+                adapted_request, processed_request = self._convert_to_internal_request(
+                    request, raw_request
+                )
+            except jinja2.exceptions.TemplateError as exc:
+                return self.create_error_response(
+                    message=str(exc), err_type="400", status_code=400
+                )
 
             # Note(Xinyuan): raw_request below is only used for detecting the connection of the client
             if hasattr(request, "stream") and request.stream:
