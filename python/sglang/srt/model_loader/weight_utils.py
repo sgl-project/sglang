@@ -242,11 +242,8 @@ def find_local_hf_snapshot_dir(
     allow_patterns: List[str],
     revision: Optional[str] = None,
 ) -> Optional[str]:
-    """If the weights are already local, skip downloading and returns the path
-
-    Only applied in ci
-    """
-    if not is_in_ci() or os.path.isdir(model_name_or_path):
+    """If the weights are already local, skip downloading and returns the path."""
+    if os.path.isdir(model_name_or_path):
         return None
 
     found_local_snapshot_dir = None
@@ -347,11 +344,14 @@ def download_weights_from_hf(
         str: The path to the downloaded model weights.
     """
 
-    path = find_local_hf_snapshot_dir(
-        model_name_or_path, cache_dir, allow_patterns, revision
-    )
-    if path is not None:
-        return path
+    if is_in_ci():
+        # If the weights are already local, skip downloading and returns the path.
+        # This is used to skip too-many Huggingface API calls in CI.
+        path = find_local_hf_snapshot_dir(
+            model_name_or_path, cache_dir, allow_patterns, revision
+        )
+        if path is not None:
+            return path
 
     if not huggingface_hub.constants.HF_HUB_OFFLINE:
         # Before we download we look at that is available:
