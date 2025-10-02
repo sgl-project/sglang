@@ -54,7 +54,7 @@ def rebalance_experts(
             num_groups=num_groups,
             num_nodes=num_nodes,
             num_gpus=num_physical_experts // num_local_physical_experts,
-            enable_hierarchical=algorithm == EplbAlgorithm.deepseek_hierarchical,
+            enable_hierarchical=True,
             active_ranks=get_elastic_ep_state().active_ranks,
         )
 
