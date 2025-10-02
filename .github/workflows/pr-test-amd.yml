@@ -41,11 +41,8 @@ jobs:
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
-      - name: Clean up GPU memory
-        run: bash scripts/killall_sglang.sh rocm
-
-      - name: Verify VRAM is clear
-        run: bash scripts/check_vram_clear.sh rocm
+      - name: Ensure VRAM is clear
+        run: bash scripts/ensure_vram_clear.sh rocm
 
       - name: Install dependencies
         run: bash scripts/ci/amd_ci_install_dependency.sh
@@ -73,11 +70,8 @@ jobs:
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
-      - name: Clean up GPU memory
-        run: bash scripts/killall_sglang.sh rocm
-
-      - name: Verify VRAM is clear
-        run: bash scripts/check_vram_clear.sh rocm
+      - name: Ensure VRAM is clear
+        run: bash scripts/ensure_vram_clear.sh rocm
 
       - name: Install dependencies
         run: bash scripts/ci/amd_ci_install_dependency.sh
@@ -103,11 +97,8 @@ jobs:
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
-      - name: Clean up GPU memory
-        run: bash scripts/killall_sglang.sh rocm
-
-      - name: Verify VRAM is clear
-        run: bash scripts/check_vram_clear.sh rocm
+      - name: Ensure VRAM is clear
+        run: bash scripts/ensure_vram_clear.sh rocm
 
       - name: Install dependencies
         run: bash scripts/ci/amd_ci_install_dependency.sh
@@ -133,11 +124,8 @@ jobs:
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
-      - name: Clean up GPU memory
-        run: bash scripts/killall_sglang.sh rocm
-
-      - name: Verify VRAM is clear
-        run: bash scripts/check_vram_clear.sh rocm
+      - name: Ensure VRAM is clear
+        run: bash scripts/ensure_vram_clear.sh rocm
 
       - name: Install dependencies
         run: bash scripts/ci/amd_ci_install_dependency.sh
@@ -179,11 +167,8 @@ jobs:
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
-      - name: Clean up GPU memory
-        run: bash scripts/killall_sglang.sh rocm
-
-      - name: Verify VRAM is clear
-        run: bash scripts/check_vram_clear.sh rocm
+      - name: Ensure VRAM is clear
+        run: bash scripts/ensure_vram_clear.sh rocm
 
       - name: Install dependencies
         run: bash scripts/ci/amd_ci_install_dependency.sh
@@ -219,11 +204,8 @@ jobs:
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
-      - name: Clean up GPU memory
-        run: bash scripts/killall_sglang.sh rocm
-
-      - name: Verify VRAM is clear
-        run: bash scripts/check_vram_clear.sh rocm
+      - name: Ensure VRAM is clear
+        run: bash scripts/ensure_vram_clear.sh rocm
 
       - name: Install dependencies
         run: bash scripts/ci/amd_ci_install_dependency.sh
@@ -270,11 +252,8 @@ jobs:
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
-      - name: Clean up GPU memory
-        run: bash scripts/killall_sglang.sh rocm
-
-      - name: Verify VRAM is clear
-        run: bash scripts/check_vram_clear.sh rocm
+      - name: Ensure VRAM is clear
+        run: bash scripts/ensure_vram_clear.sh rocm
 
       - name: Install dependencies
         run: bash scripts/ci/amd_ci_install_dependency.sh
@@ -300,11 +279,8 @@ jobs:
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
-      - name: Clean up GPU memory
-        run: bash scripts/killall_sglang.sh rocm
-
-      - name: Verify VRAM is clear
-        run: bash scripts/check_vram_clear.sh rocm
+      - name: Ensure VRAM is clear
+        run: bash scripts/ensure_vram_clear.sh rocm
 
       - name: Install dependencies
         run: bash scripts/ci/amd_ci_install_dependency.sh
@@ -330,11 +306,8 @@ jobs:
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
-      - name: Clean up GPU memory
-        run: bash scripts/killall_sglang.sh rocm
-
-      - name: Verify VRAM is clear
-        run: bash scripts/check_vram_clear.sh rocm
+      - name: Ensure VRAM is clear
+        run: bash scripts/ensure_vram_clear.sh rocm
 
       - name: Install dependencies
         run: bash scripts/ci/amd_ci_install_dependency.sh
@@ -360,11 +333,8 @@ jobs:
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
-      - name: Clean up GPU memory
-        run: bash scripts/killall_sglang.sh rocm
-
-      - name: Verify VRAM is clear
-        run: bash scripts/check_vram_clear.sh rocm
+      - name: Ensure VRAM is clear
+        run: bash scripts/ensure_vram_clear.sh rocm
 
       - name: Install dependencies
         run: |
