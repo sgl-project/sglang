@@ -1088,7 +1088,10 @@ class ServerArgs:
                 and self.attention_backend != "flashinfer"
             ):
                 raise ValueError(
-                    "speculative_eagle_topk > 1 with page_size > 1 is unstable and produces incorrect results for paged attention backends. This combination is only supported for the 'flashinfer' backend."
+                    f"speculative_eagle_topk({self.speculative_eagle_topk}) > 1 "
+                    f"with page_size({self.page_size}) > 1 is unstable "
+                    "and produces incorrect results for paged attention backends. "
+                    "This combination is only supported for the 'flashinfer' backend."
                 )
             if self.enable_dp_attention:
                 # TODO: support dp attention for ngram speculative decoding
@@ -2261,7 +2264,7 @@ class ServerArgs:
         parser.add_argument(
             "--hicache-storage-backend",
             type=str,
-            choices=["file", "mooncake", "hf3fs", "nixl", "aibrix", "dynamic"],
+            choices=["file", "mooncake", "hf3fs", "nixl", "aibrix", "dynamic", "eic"],
             default=ServerArgs.hicache_storage_backend,
             help="The storage backend for hierarchical KV cache. "
             "Built-in backends: file, mooncake, hf3fs, nixl, aibrix. "
