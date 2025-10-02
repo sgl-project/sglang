@@ -52,7 +52,7 @@ class TestDisaggregationDPAttention(TestDisaggregationBase):
             "2",
             "--dp",
             "2",
-            "--enable-dp-attention"
+            "--enable-dp-attention",
             "--disaggregation-ib-device",
             "mlx5_roce0,mlx5_roce1",
         ]
@@ -73,7 +73,7 @@ class TestDisaggregationDPAttention(TestDisaggregationBase):
             "2",
             "--dp",
             "2",
-            "--enable-dp-attention"
+            "--enable-dp-attention",
             "--base-gpu-id",
             "2",
             "--disaggregation-ib-device",
