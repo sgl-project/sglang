@@ -659,6 +659,20 @@ async fn responses_handler(
                         .to_string(),
                     ),
                 ),
+                // response.in_progress
+                Ok(Event::default().event("response.in_progress").data(
+                    json!({
+                        "type": "response.in_progress",
+                        "response": {
+                            "id": rid.clone(),
+                            "object": "response",
+                            "created_at": timestamp,
+                            "model": "mock-model",
+                            "status": "in_progress"
+                        }
+                    })
+                    .to_string(),
+                )),
                 // response.output_item.added with function_tool_call
                 Ok(Event::default().event("response.output_item.added").data(
                     json!({
@@ -792,6 +806,20 @@ async fn responses_handler(
                         .to_string(),
                     ),
                 ),
+                // response.in_progress
+                Ok(Event::default().event("response.in_progress").data(
+                    json!({
+                        "type": "response.in_progress",
+                        "response": {
+                            "id": rid.clone(),
+                            "object": "response",
+                            "created_at": timestamp,
+                            "model": "mock-model",
+                            "status": "in_progress"
+                        }
+                    })
+                    .to_string(),
+                )),
                 // response.output_item.added with message
                 Ok(Event::default().event("response.output_item.added").data(
                     json!({

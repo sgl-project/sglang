@@ -1471,24 +1471,12 @@ impl OpenAIRouter {
                     return;
                 }
 
-                // Send mcp_list_tools events at the start (only once)
-                if !mcp_list_tools_sent {
-                    if !OpenAIRouter::send_mcp_list_tools_events(
-                        &tx,
-                        &active_mcp_clone,
-                        server_label,
-                    ) {
-                        // Client disconnected
-                        return;
-                    }
-                    mcp_list_tools_sent = true;
-                }
-
                 // Stream events and check for tool calls
                 let mut upstream_stream = response.bytes_stream();
                 let mut handler = StreamingToolHandler::new();
                 let mut pending = String::new();
                 let mut tool_calls_detected = false;
+                let mut seen_in_progress = false;
 
                 while let Some(chunk_result) = upstream_stream.next().await {
                     match chunk_result {
@@ -1520,6 +1508,7 @@ impl OpenAIRouter {
 
                                 match action {
                                     StreamAction::Forward => {
+                                        // Forward the event first
                                         if !Self::forward_streaming_event(
                                             &raw_block,
                                             event_name,
@@ -1532,6 +1521,26 @@ impl OpenAIRouter {
                                         ) {
                                             // Client disconnected
                                             return;
+                                        }
+
+                                        // After forwarding response.in_progress, send mcp_list_tools events (once)
+                                        if !seen_in_progress {
+                                            if let Ok(parsed) = serde_json::from_str::<Value>(data.as_ref()) {
+                                                if parsed.get("type").and_then(|v| v.as_str()) == Some("response.in_progress") {
+                                                    seen_in_progress = true;
+                                                    if !mcp_list_tools_sent {
+                                                        if !OpenAIRouter::send_mcp_list_tools_events(
+                                                            &tx,
+                                                            &active_mcp_clone,
+                                                            server_label,
+                                                        ) {
+                                                            // Client disconnected
+                                                            return;
+                                                        }
+                                                        mcp_list_tools_sent = true;
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                     StreamAction::Buffer => {
@@ -1699,31 +1708,64 @@ impl OpenAIRouter {
         mcp: &Arc<crate::mcp::McpClientManager>,
         server_label: &str,
     ) -> bool {
-        let tools_item = Self::build_mcp_list_tools_item(mcp, server_label);
+        let tools_item_full = Self::build_mcp_list_tools_item(mcp, server_label);
+        let item_id = tools_item_full.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        
+        // Create empty tools version for the initial added event
+        let mut tools_item_empty = tools_item_full.clone();
+        if let Some(obj) = tools_item_empty.as_object_mut() {
+            obj.insert("tools".to_string(), json!([]));
+        }
 
-        // Event 1: response.output_item.added (mcp_list_tools)
+        // Event 1: response.output_item.added with empty tools
         let event1 = format!(
             "event: response.output_item.added\ndata: {}\n\n",
             json!({
                 "type": "response.output_item.added",
                 "output_index": 0,
-                "item": tools_item
+                "item": tools_item_empty
             })
         );
         if tx.send(Ok(Bytes::from(event1))).is_err() {
             return false; // Client disconnected
         }
 
-        // Event 2: response.output_item.done (mcp_list_tools)
+        // Event 2: response.mcp_list_tools.in_progress
         let event2 = format!(
+            "event: response.mcp_list_tools.in_progress\ndata: {}\n\n",
+            json!({
+                "type": "response.mcp_list_tools.in_progress",
+                "output_index": 0,
+                "item_id": item_id
+            })
+        );
+        if tx.send(Ok(Bytes::from(event2))).is_err() {
+            return false;
+        }
+
+        // Event 3: response.mcp_list_tools.completed
+        let event3 = format!(
+            "event: response.mcp_list_tools.completed\ndata: {}\n\n",
+            json!({
+                "type": "response.mcp_list_tools.completed",
+                "output_index": 0,
+                "item_id": item_id
+            })
+        );
+        if tx.send(Ok(Bytes::from(event3))).is_err() {
+            return false;
+        }
+
+        // Event 4: response.output_item.done with full tools list
+        let event4 = format!(
             "event: response.output_item.done\ndata: {}\n\n",
             json!({
                 "type": "response.output_item.done",
                 "output_index": 0,
-                "item": tools_item
+                "item": tools_item_full
             })
         );
-        tx.send(Ok(Bytes::from(event2))).is_ok()
+        tx.send(Ok(Bytes::from(event4))).is_ok()
     }
 
     /// Send mcp_call completion events after tool execution

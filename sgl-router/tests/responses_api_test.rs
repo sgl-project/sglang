@@ -963,6 +963,8 @@ async fn test_streaming_with_mcp_tool_calls() {
 
     // Track which events we've seen
     let mut found_mcp_list_tools = false;
+    let mut found_mcp_list_tools_in_progress = false;
+    let mut found_mcp_list_tools_completed = false;
     let mut found_response_created = false;
     let mut found_mcp_call_added = false;
     let mut found_mcp_call_in_progress = false;
@@ -979,9 +981,9 @@ async fn test_streaming_with_mcp_tool_calls() {
                 if let Some(item) = data.get("item") {
                     if item.get("type").and_then(|v| v.as_str()) == Some("mcp_list_tools") {
                         found_mcp_list_tools = true;
-                        println!("✓ Found mcp_list_tools event");
+                        println!("✓ Found mcp_list_tools added event");
 
-                        // Verify tools array is present
+                        // Verify tools array is present (should be empty in added event)
                         assert!(
                             item.get("tools").is_some(),
                             "mcp_list_tools should have tools array"
@@ -999,6 +1001,34 @@ async fn test_streaming_with_mcp_tool_calls() {
                         );
                     }
                 }
+            }
+            "response.mcp_list_tools.in_progress" => {
+                found_mcp_list_tools_in_progress = true;
+                println!("✓ Found mcp_list_tools.in_progress event");
+
+                // Verify it has output_index and item_id
+                assert!(
+                    data.get("output_index").is_some(),
+                    "mcp_list_tools.in_progress should have output_index"
+                );
+                assert!(
+                    data.get("item_id").is_some(),
+                    "mcp_list_tools.in_progress should have item_id"
+                );
+            }
+            "response.mcp_list_tools.completed" => {
+                found_mcp_list_tools_completed = true;
+                println!("✓ Found mcp_list_tools.completed event");
+
+                // Verify it has output_index and item_id
+                assert!(
+                    data.get("output_index").is_some(),
+                    "mcp_list_tools.completed should have output_index"
+                );
+                assert!(
+                    data.get("item_id").is_some(),
+                    "mcp_list_tools.completed should have item_id"
+                );
             }
             "response.mcp_call.in_progress" => {
                 found_mcp_call_in_progress = true;
@@ -1058,7 +1088,9 @@ async fn test_streaming_with_mcp_tool_calls() {
 
     // Verify key events were present
     println!("\n=== Event Summary ===");
-    println!("MCP list_tools: {}", found_mcp_list_tools);
+    println!("MCP list_tools added: {}", found_mcp_list_tools);
+    println!("MCP list_tools in_progress: {}", found_mcp_list_tools_in_progress);
+    println!("MCP list_tools completed: {}", found_mcp_list_tools_completed);
     println!("Response created: {}", found_response_created);
     println!("MCP call added: {}", found_mcp_call_added);
     println!("MCP call in_progress: {}", found_mcp_call_in_progress);
@@ -1072,7 +1104,15 @@ async fn test_streaming_with_mcp_tool_calls() {
     // Assert critical events are present
     assert!(
         found_mcp_list_tools,
-        "Should send mcp_list_tools event at the start"
+        "Should send mcp_list_tools added event at the start"
+    );
+    assert!(
+        found_mcp_list_tools_in_progress,
+        "Should send mcp_list_tools.in_progress event"
+    );
+    assert!(
+        found_mcp_list_tools_completed,
+        "Should send mcp_list_tools.completed event"
     );
     assert!(found_response_created, "Should send response.created event");
     assert!(found_mcp_call_added, "Should send mcp_call added event");
