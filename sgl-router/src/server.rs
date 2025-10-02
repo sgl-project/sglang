@@ -15,7 +15,7 @@ use crate::{
         },
         worker_spec::{WorkerApiResponse, WorkerConfigRequest, WorkerErrorResponse},
     },
-    reasoning_parser::ParserFactory,
+    reasoning_parser::ReasoningParserFactory,
     routers::{router_manager::RouterManager, RouterTrait},
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
     tokenizer::{factory as tokenizer_factory, traits::Tokenizer},
@@ -45,7 +45,7 @@ pub struct AppContext {
     pub router_config: RouterConfig,
     pub rate_limiter: Arc<TokenBucket>,
     pub tokenizer: Option<Arc<dyn Tokenizer>>,
-    pub reasoning_parser_factory: Option<ParserFactory>,
+    pub reasoning_parser_factory: Option<ReasoningParserFactory>,
     pub tool_parser_factory: Option<ToolParserFactory>,
     pub worker_registry: Arc<WorkerRegistry>,
     pub policy_registry: Arc<PolicyRegistry>,
@@ -79,7 +79,7 @@ impl AppContext {
                     tokenizer_factory::create_tokenizer(&tokenizer_path)
                         .map_err(|e| format!("Failed to create tokenizer: {e}"))?,
                 );
-                let reasoning_parser_factory = Some(ParserFactory::new());
+                let reasoning_parser_factory = Some(ReasoningParserFactory::new());
                 let tool_parser_factory = Some(ToolParserFactory::new());
 
                 (tokenizer, reasoning_parser_factory, tool_parser_factory)
