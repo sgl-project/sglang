@@ -818,29 +818,6 @@ impl OpenAIRouter {
         let req_mcp_manager = Self::mcp_manager_from_request_tools(&original_body.tools).await;
         let active_mcp = req_mcp_manager.as_ref().or(self.mcp_manager.as_ref());
 
-        // Use unified handler that handles both simple and MCP-aware streaming
-        self.handle_streaming_response_with_mcp(
-            url,
-            headers,
-            payload,
-            original_body,
-            original_previous_response_id,
-            active_mcp,
-        )
-        .await
-    }
-
-    /// Handle streaming response with optional MCP tool call interception
-    /// When active_mcp is None, this acts as a simple pass-through streamer
-    async fn handle_streaming_response_with_mcp(
-        &self,
-        url: String,
-        headers: Option<&HeaderMap>,
-        payload: Value,
-        original_body: &ResponsesRequest,
-        original_previous_response_id: Option<String>,
-        active_mcp: Option<&Arc<crate::mcp::McpClientManager>>,
-    ) -> Response {
         // If no MCP is active, use simple pass-through streaming
         if active_mcp.is_none() {
             return self
