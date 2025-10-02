@@ -63,7 +63,7 @@ is required to enable SGLang service with CPU engine.
 conda create -n sgl-cpu python=3.12 -y
 conda activate sgl-cpu
 
-# Optional: Set PyTorch CPU as primary pip install channel to avoid installing CUDA version
+# Set PyTorch CPU as primary pip install channel to avoid installing the larger CUDA-enabled version and prevent potential runtime issues.
 pip config set global.index-url https://download.pytorch.org/whl/cpu
 pip config set global.extra-index-url https://pypi.org/simple
 
@@ -81,16 +81,18 @@ git clone https://github.com/sgl-project/sglang.git
 cd sglang
 git checkout <YOUR-DESIRED-VERSION>
 
+# Use dedicated toml file
+cp python/pyproject_other.toml python/pyproject.toml
 # Install SGLang dependent libs, and build SGLang main package
 pip install --upgrade pip setuptools
 conda install -y libsqlite==3.48.0 gperftools tbb libnuma numactl
-pip install intel-openmp
 pip install -e "python[all_cpu]"
+pip install torch==2.7.1 torchvision==0.22.1 triton==3.3.1 --force-reinstall
 
 # Build the CPU backend kernels
 cd sgl-kernel
 cp pyproject_cpu.toml pyproject.toml
-pip install -v .
+pip install .
 
 # Other required environment variables
 # Recommend to set these in ~/.bashrc in order not to set every time in a new terminal
@@ -134,8 +136,18 @@ Notes:
     export SGLANG_CPU_OMP_THREADS_BIND="0-39|43-82|86-125|128-167|171-210|214-253"
     ```
 
-3. A warmup step is automatically triggered when the service is started.
-The server is ready when you see the log `The server is fired up and ready to roll!`.
+    Please beware that with SGLANG_CPU_OMP_THREADS_BIND set,
+    the available memory amounts of the ranks may not be determined in prior.
+    You may need to set proper `--max-total-tokens` to avoid the out-of-memory error.
+
+3. For optimizing decoding with torch.compile, please add the flag `--enable-torch-compile`.
+    To specify the maximum batch size when using `torch.compile`, set the flag `--torch-compile-max-bs`.
+    For example, `--enable-torch-compile --torch-compile-max-bs 4` means using `torch.compile`
+    and setting the maximum batch size to 4. Currently the maximum applicable batch size
+    for optimizing with `torch.compile` is 16.
+
+4. A warmup step is automatically triggered when the service is started.
+    The server is ready when you see the log `The server is fired up and ready to roll!`.
 
 ## Benchmarking with Requests
 
@@ -159,7 +171,7 @@ python -m sglang.bench_serving -h
 ```
 
 Additionally, the requests can be formed with
-[OpenAI Completions API](https://docs.sglang.ai/backend/openai_api_completions.html)
+[OpenAI Completions API](https://docs.sglang.ai/basic_usage/openai_api_completions.html)
 and sent via the command line (e.g. using `curl`) or via your own script.
 
 ## Example: Running DeepSeek-R1
@@ -175,7 +187,8 @@ python -m sglang.launch_server                 \
     --quantization w8a8_int8                   \
     --host 0.0.0.0                             \
     --mem-fraction-static 0.8                  \
-    --max-total-token 65536                    \
+    --enable-torch-compile                     \
+    --torch-compile-max-bs 4                   \
     --tp 6
 ```
 
@@ -189,9 +202,13 @@ python -m sglang.launch_server                 \
     --device cpu                               \
     --host 0.0.0.0                             \
     --mem-fraction-static 0.8                  \
-    --max-total-token 65536                    \
+    --enable-torch-compile                     \
+    --torch-compile-max-bs 4                   \
     --tp 6
 ```
+
+Note: Please set `--torch-compile-max-bs` to the maximum desired batch size for your deployment,
+which can be up to 16. The value `4` in the examples is illustrative.
 
 Then you can test with `bench_serving` command or construct your own command or script
 following [the benchmarking example](#benchmarking-with-requests).

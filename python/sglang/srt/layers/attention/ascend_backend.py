@@ -5,13 +5,15 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 import torch_npu
-from torch.nn.functional import scaled_dot_product_attention
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.npu_ops.mla_preprocess import is_mla_preprocess_enabled
 from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
+from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import get_bool_env_var
 
 if TYPE_CHECKING:
@@ -33,6 +35,7 @@ class ForwardMetadata:
     extend_seq_lens_cpu_int: Optional[torch.Tensor] = None
     seq_lens_cpu_int: Optional[torch.Tensor] = None
     seq_lens_cpu_list: Optional[List[int]] = None
+    seq_lens_list_cumsum: Optional[List[int]] = None
 
 
 class AscendAttnBackend(AttentionBackend):
@@ -83,6 +86,7 @@ class AscendAttnBackend(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
+        tp_size = get_attention_tp_size()
         self.forward_metadata = ForwardMetadata()
 
         self.forward_metadata.block_tables = (
@@ -96,9 +100,13 @@ class AscendAttnBackend(AttentionBackend):
                 forward_batch.extend_seq_lens.cpu().int()
             )
         self.forward_metadata.seq_lens_cpu_int = forward_batch.seq_lens_cpu.int()
-        self.forward_metadata.seq_lens_list_cumsum = np.cumsum(
-            forward_batch.extend_seq_lens_cpu
-        )
+
+        seq_lens_list_cumsum = np.cumsum(forward_batch.extend_seq_lens_cpu)
+        if forward_batch.is_extend_in_batch:
+            seq_lens_list_cumsum[-1] = (
+                (seq_lens_list_cumsum[-1] - 1) // tp_size + 1
+            ) * tp_size
+        self.forward_metadata.seq_lens_list_cumsum = seq_lens_list_cumsum
 
         self.graph_mode = False
 
@@ -119,7 +127,7 @@ class AscendAttnBackend(AttentionBackend):
         seq_lens: torch.Tensor,
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        spec_info: Optional[SpecInput],
     ):
         metadata = ForwardMetadata()
 
@@ -139,7 +147,7 @@ class AscendAttnBackend(AttentionBackend):
         seq_lens_sum: int,
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
         metadata = self.graph_metadata[bs]
@@ -368,7 +376,7 @@ class AscendAttnBackend(AttentionBackend):
                 -1, layer.tp_v_head_num, self.page_size, self.kv_lora_rank
             )
 
-            q_nope = q.view(-1, layer.tp_q_head_num, 1, self.kv_lora_rank)
+            q_nope = q.view(-1, layer.tp_q_head_num, 1, self.kv_lora_rank).contiguous()
             q_rope = q_rope.view(-1, layer.tp_q_head_num, 1, self.qk_rope_head_dim)
             if self.forward_metadata.seq_lens_cpu_int is None:
                 actual_seq_len_kv = self.forward_metadata.seq_lens_cpu_list
@@ -394,7 +402,7 @@ class AscendAttnBackend(AttentionBackend):
                 antiquant_scale=None,
                 sparse_mode=0,
             )
-            output = torch.zeros_like(q_nope, dtype=q.dtype, device=q.device)
+            output = torch.empty_like(q_nope, dtype=q.dtype, device=q.device)
             softmax_lse = torch.empty(1, dtype=q.dtype, device=q.device)
 
             torch_npu.npu_fused_infer_attention_score.out(
@@ -430,6 +438,10 @@ class AscendAttnBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
     ):
+        if is_mla_preprocess_enabled():
+            # MLAPO does saving kv_cache
+            save_kv_cache = False
+
         if self.graph_mode:
             return self.forward_decode_graph(
                 q,

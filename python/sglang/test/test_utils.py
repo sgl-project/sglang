@@ -14,10 +14,12 @@ import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import datetime
 from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Awaitable, Callable, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, List, Optional, Tuple
+from urllib.parse import quote
 
 import aiohttp
 import numpy as np
@@ -42,7 +44,8 @@ DEFAULT_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.1-8B-Instruct"
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.2-1B-Instruct"
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE = "meta-llama/Llama-3.2-1B"
 DEFAULT_MOE_MODEL_NAME_FOR_TEST = "mistralai/Mixtral-8x7B-Instruct-v0.1"
-DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST = "Qwen/Qwen1.5-MoE-A2.7B"
+DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_BASE = "Qwen/Qwen1.5-MoE-A2.7B"
+DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT = "Qwen/Qwen1.5-MoE-A2.7B-Chat"
 
 # MLA test models
 DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST = "Alibaba-NLP/gte-Qwen2-1.5B-instruct"
@@ -51,6 +54,9 @@ DEFAULT_MLA_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
 DEFAULT_MLA_FP8_MODEL_NAME_FOR_TEST = "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8"
 DEFAULT_MODEL_NAME_FOR_TEST_MLA = "lmsys/sglang-ci-dsv3-test"
 DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN = "lmsys/sglang-ci-dsv3-test-NextN"
+
+# NVFP4 models
+DEFAULT_DEEPSEEK_NVFP4_MODEL_FOR_TEST = "nvidia/DeepSeek-R1-0528-FP4"
 
 # FP8 models
 DEFAULT_MODEL_NAME_FOR_TEST_FP8 = "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8"
@@ -71,7 +77,13 @@ DEFAULT_MODEL_NAME_FOR_TEST_W8A8_WITH_MOE = "nytopop/Qwen3-30B-A3B.w8a8"
 # EAGLE
 DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST = "meta-llama/Llama-2-7b-chat-hf"
 DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST = "lmsys/sglang-EAGLE-llama2-chat-7B"
-DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3 = "jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B"
+DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST_EAGLE3 = "meta-llama/Llama-3.1-8B-Instruct"
+DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3 = "lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B"
+DEFAULT_STANDALONE_SPECULATIVE_TARGET_MODEL_FOR_TEST = (
+    "meta-llama/Llama-3.1-8B-Instruct"
+)
+DEFAULT_STANDALONE_SPECULATIVE_DRAFT_MODEL_FOR_TEST = "meta-llama/Llama-3.2-1B-Instruct"
+DEFAULT_NGRAM_SPECULATIVE_TARGET_MODEL_FOR_TEST = "Qwen/Qwen2.5-Coder-7B-Instruct"
 
 # Other use cases
 DEFAULT_MODEL_NAME_FOR_TEST_LOCAL_ATTENTION = (
@@ -1382,6 +1394,41 @@ async def send_concurrent_generate_requests(
     return await asyncio.gather(*tasks)
 
 
+async def send_concurrent_generate_requests_with_custom_params(
+    base_url: str,
+    custom_params: List[dict[str, Any]],
+) -> Tuple[int, Any]:
+    """Sends generate request concurrently with custom parameters and returns status code and response json tuple. Max concurrency is num_requests."""
+
+    base_payload = {
+        "text": """
+                System: You are a helpful assistant.
+                User: What is the capital of France?
+                Assistant: The capital of France is
+                """,
+        "sampling_params": {
+            "temperature": 0,
+            "max_new_tokens": 50,
+        },
+    }
+
+    async def async_generate_with_priority(req):
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{base_url}/generate",
+                json=req,
+            ) as response:
+                resp_json = await response.json()
+                return (response.status, resp_json)
+
+    tasks = []
+    for c in custom_params:
+        req = base_payload.copy()
+        req.update(c)
+        tasks.append(asyncio.create_task(async_generate_with_priority(req)))
+    return await asyncio.gather(*tasks)
+
+
 class CustomTestCase(unittest.TestCase):
     def _callTestMethod(self, method):
         max_retry = int(
@@ -1423,3 +1470,146 @@ def dump_bench_raw_result(
 def _ensure_remove_suffix(text: str, suffix: str):
     assert text.endswith(suffix)
     return text.removesuffix(suffix)
+
+
+class ModelDeploySetup:
+    def __init__(self, model_path: str, extra_args: List[str] = []):
+        self.model_path = model_path
+        if "--enable-multimodal" not in extra_args:
+            extra_args.append("--enable-multimodal")
+        if "--trust-remote-code" not in extra_args:
+            extra_args.append("--trust-remote-code")
+
+        self.extra_args = extra_args
+
+
+class ModelEvalMetrics:
+    def __init__(self, accuracy: float, eval_time: float):
+        self.accuracy = accuracy
+        self.eval_time = eval_time
+
+
+def extract_trace_link_from_bench_one_batch_server_output(output: str) -> str:
+    match = re.search(r"\[Profile\]\((.*?)\)", output)
+    if match:
+        trace_link = match.group(1)
+        return trace_link
+    return None
+
+
+def parse_models(model_string: str):
+    return [model.strip() for model in model_string.split(",") if model.strip()]
+
+
+def check_evaluation_test_results(
+    results,
+    test_name,
+    model_accuracy_thresholds,
+    model_latency_thresholds=None,
+    model_count=None,
+):
+    """
+    results: list of tuple of (model_path, accuracy, latency)
+    """
+    failed_models = []
+    if model_latency_thresholds is not None:
+        summary = " | model | status | score | score_threshold | latency | latency_threshold | \n"
+        summary += "| ----- | ------ | ----- | --------------- | ------- | ----------------- | \n"
+    else:
+        summary = " | model | status | score | score_threshold | \n"
+        summary += "| ----- | ------ | ----- | --------------- | \n"
+
+    results_dict = {res[0]: (res[1], res[2]) for res in results}
+
+    for model, accuracy_threshold in sorted(model_accuracy_thresholds.items()):
+        latency_threshold = (
+            model_latency_thresholds.get(model)
+            if model_latency_thresholds is not None
+            else 1e9
+        )
+
+        if model in results_dict:
+            accuracy, latency = results_dict[model]
+            is_success = accuracy >= accuracy_threshold and latency <= latency_threshold
+            status_emoji = "✅" if is_success else "❌"
+
+            if not is_success:
+                if accuracy < accuracy_threshold:
+                    failed_models.append(
+                        f"\nScore Check Failed: {model}\n"
+                        f"Model {model} score ({accuracy:.4f}) is below threshold ({accuracy_threshold:.4f})"
+                    )
+                if latency > latency_threshold:
+                    failed_models.append(
+                        f"\nLatency Check Failed: {model}\n"
+                        f"Model {model} latency ({latency:.4f}) is above threshold ({latency_threshold:.4f})"
+                    )
+
+            if model_latency_thresholds is not None:
+                line = f"| {model} | {status_emoji} | {accuracy} | {accuracy_threshold} | {latency} | {latency_threshold}\n"
+            else:
+                line = (
+                    f"| {model} | {status_emoji} | {accuracy} | {accuracy_threshold}\n"
+                )
+        else:
+            status_emoji = "❌"
+            failed_models.append(f"Model failed to launch or be evaluated: {model}")
+            if model_latency_thresholds is not None:
+                line = f"| {model} | {status_emoji} | N/A | {accuracy_threshold} | N/A | {latency_threshold}\n"
+            else:
+                line = f"| {model} | {status_emoji} | N/A | {accuracy_threshold}\n"
+
+        summary += line
+
+    print(summary)
+
+    if is_in_ci():
+        write_github_step_summary(f"## {test_name}\n{summary}")
+
+    if failed_models:
+        print("Some models failed the evaluation.")
+        raise AssertionError("\n".join(failed_models))
+
+
+# Bench knobs for bench_one_batch_server (override by env)
+def _parse_int_list_env(name: str, default_val: str):
+    val = os.environ.get(name, default_val)
+    return [int(x) for x in val.split(",") if x]
+
+
+# Return filenames
+def find_traces_under_path(path: str) -> List[str]:
+    results = []
+    for _, dirs, files in os.walk(path):
+        for file in files:
+            if file.endswith(".trace.json.gz"):
+                results.append(f"{file}")
+    return results
+
+
+def write_results_to_json(model, metrics, mode="a"):
+    result = {
+        "timestamp": datetime.now().isoformat(),
+        "model": model,
+        "metrics": metrics,
+        "score": metrics["score"],
+    }
+
+    if "latency" in metrics:
+        result["latency"] = (metrics.get("latency"),)
+
+    existing_results = []
+    if mode == "a" and os.path.exists("results.json"):
+        try:
+            with open("results.json", "r") as f:
+                existing_results = json.load(f)
+        except json.JSONDecodeError:
+            existing_results = []
+
+    if isinstance(existing_results, list):
+        existing_results.append(result)
+    else:
+        existing_results = [result]
+
+    with open("results.json", "w") as f:
+        json.dump(existing_results, f, indent=2)

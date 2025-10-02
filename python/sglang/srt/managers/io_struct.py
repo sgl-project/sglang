@@ -36,6 +36,7 @@ else:
     Image = Any
 
 
+# Parameters for a session
 @dataclass
 class BaseReq(ABC):
     rid: Optional[Union[str, List[str]]] = field(default=None, kw_only=True)
@@ -142,12 +143,33 @@ class GenerateReqInput(BaseReq):
     bootstrap_host: Optional[Union[List[str], str]] = None
     bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
     bootstrap_room: Optional[Union[List[int], int]] = None
+    bootstrap_pair_key: Optional[Union[List[str], str]] = None
 
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
 
     # For background responses (OpenAI responses API)
     background: bool = False
+
+    # Conversation id used for tracking requests
+    conversation_id: Optional[str] = None
+
+    # Priority for the request
+    priority: Optional[int] = None
+
+    # Extra key for classifying the request (e.g. cache_salt)
+    extra_key: Optional[Union[List[str], str]] = None
+
+    # Whether to disallow logging for this request (e.g. due to ZDR)
+    no_logs: bool = False
+
+    # For custom metric labels
+    custom_labels: Optional[Dict[str, str]] = None
+
+    # (Deprecated, please use custom_labels) Label for the request
+    label: Optional[str] = None
+    # (Internal) Whether to return bytes for image generation
+    return_bytes: bool = False
 
     def contains_mm_input(self) -> bool:
         return (
@@ -279,6 +301,7 @@ class GenerateReqInput(BaseReq):
         self._normalize_sampling_params(num)
         self._normalize_logprob_params(num)
         self._normalize_custom_logit_processor(num)
+        self._normalize_bootstrap_params(num)
 
     def _expand_inputs(self, num):
         """Expand the main inputs (text, input_ids, input_embeds) for parallel sampling."""
@@ -318,6 +341,11 @@ class GenerateReqInput(BaseReq):
             self.image_data = [[self.image_data]] * num
             self.modalities = ["image"] * num
         elif isinstance(self.image_data, list):
+            # Handle empty list case - treat as no images
+            if len(self.image_data) == 0:
+                self.image_data = [None] * num
+                return
+
             if len(self.image_data) != self.batch_size:
                 raise ValueError(
                     "The length of image_data should be equal to the batch size."
@@ -442,6 +470,40 @@ class GenerateReqInput(BaseReq):
                 "Cannot use list custom_logit_processor with parallel_sample_num > 1"
             )
 
+    def _normalize_bootstrap_params(self, num):
+        """Normalize bootstrap parameters for batch processing."""
+        # Normalize bootstrap_host
+        if self.bootstrap_host is None:
+            self.bootstrap_host = [None] * num
+        elif not isinstance(self.bootstrap_host, list):
+            self.bootstrap_host = [self.bootstrap_host] * num
+        elif isinstance(self.bootstrap_host, list):
+            self.bootstrap_host = self.bootstrap_host * self.parallel_sample_num
+
+        # Normalize bootstrap_port
+        if self.bootstrap_port is None:
+            self.bootstrap_port = [None] * num
+        elif not isinstance(self.bootstrap_port, list):
+            self.bootstrap_port = [self.bootstrap_port] * num
+        elif isinstance(self.bootstrap_port, list):
+            self.bootstrap_port = self.bootstrap_port * self.parallel_sample_num
+
+        # Normalize bootstrap_room
+        if self.bootstrap_room is None:
+            self.bootstrap_room = [None] * num
+        elif not isinstance(self.bootstrap_room, list):
+            self.bootstrap_room = [self.bootstrap_room + i for i in range(num)]
+        elif isinstance(self.bootstrap_room, list):
+            self.bootstrap_room = self.bootstrap_room * self.parallel_sample_num
+
+        # Normalize bootstrap_pair_key
+        if self.bootstrap_pair_key is None:
+            self.bootstrap_pair_key = [None] * num
+        elif not isinstance(self.bootstrap_pair_key, list):
+            self.bootstrap_pair_key = [self.bootstrap_pair_key] * num
+        elif isinstance(self.bootstrap_pair_key, list):
+            self.bootstrap_pair_key = self.bootstrap_pair_key * self.parallel_sample_num
+
     def _validate_session_params(self):
         """Validate that session parameters are properly formatted."""
         if self.session_params is not None:
@@ -469,18 +531,19 @@ class GenerateReqInput(BaseReq):
             return_text_in_logprobs=self.return_text_in_logprobs,
             stream=self.stream,
             log_metrics=self.log_metrics,
+            return_hidden_states=(
+                self.return_hidden_states[i]
+                if isinstance(self.return_hidden_states, list)
+                else self.return_hidden_states
+            ),
             modalities=self.modalities[i] if self.modalities else None,
+            session_params=self.session_params,
             lora_path=self.lora_path[i] if self.lora_path is not None else None,
             lora_id=self.lora_id[i] if self.lora_id is not None else None,
             custom_logit_processor=(
                 self.custom_logit_processor[i]
                 if self.custom_logit_processor is not None
                 else None
-            ),
-            return_hidden_states=(
-                self.return_hidden_states[i]
-                if isinstance(self.return_hidden_states, list)
-                else self.return_hidden_states
             ),
             # if `__getitem__` is called, the bootstrap_host, bootstrap_port, bootstrap_room must be a list
             bootstrap_host=(
@@ -492,9 +555,21 @@ class GenerateReqInput(BaseReq):
             bootstrap_room=(
                 self.bootstrap_room[i] if self.bootstrap_room is not None else None
             ),
+            bootstrap_pair_key=(
+                self.bootstrap_pair_key[i]
+                if self.bootstrap_pair_key is not None
+                else None
+            ),
             data_parallel_rank=(
                 self.data_parallel_rank if self.data_parallel_rank is not None else None
             ),
+            conversation_id=self.conversation_id,
+            priority=self.priority,
+            extra_key=self.extra_key,
+            no_logs=self.no_logs,
+            custom_labels=self.custom_labels,
+            label=self.label,
+            return_bytes=self.return_bytes,
         )
 
 
@@ -519,32 +594,51 @@ class TokenizedGenerateReqInput(BaseReq):
     # Whether to stream output
     stream: bool
 
-    # LoRA related
-    lora_id: Optional[str] = None  # None means just use the base model
+    # Whether to return hidden states
+    return_hidden_states: bool = False
+
     # The input embeds
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
 
     # Session info for continual prompting
     session_params: Optional[SessionParams] = None
 
+    # LoRA related
+    lora_id: Optional[str] = None  # None means just use the base model
+
     # Custom logit processor for advanced sampling control. Must be a serialized instance
     # of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py
     # Use the processor's `to_str()` method to generate the serialized string.
     custom_logit_processor: Optional[str] = None
 
-    # Whether to return hidden states
-    return_hidden_states: bool = False
-
     # For disaggregated inference
     bootstrap_host: Optional[str] = None
     bootstrap_port: Optional[int] = None
     bootstrap_room: Optional[int] = None
+    bootstrap_pair_key: Optional[str] = None
 
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
 
     # For dp balance
     dp_balance_id: int = -1
+
+    # Priority for the request
+    priority: Optional[int] = None
+
+    # Extra key for classifying the request (e.g. cache_salt)
+    extra_key: Optional[str] = None
+
+    # Whether to disallow logging for this request (e.g. due to ZDR)
+    no_logs: bool = False
+
+    # tracing context
+    trace_context: Optional[Dict] = None
+
+    # (Deprecated, please use custom_labels) Label for the request
+    label: Optional[str] = None
+    # (Internal) Whether to return bytes for image generation
+    return_bytes: bool = False
 
 
 @dataclass
@@ -589,9 +683,14 @@ class EmbeddingReqInput(BaseReq):
     modalities: Optional[List[str]] = None
     # For cross-encoder requests
     is_cross_encoder_request: bool = False
+    # Priority for the request
+    priority: Optional[int] = None
 
     # For background responses (OpenAI responses API)
     background: bool = False
+
+    # tracing context
+    trace_context: Optional[Dict] = None
 
     def normalize_batch_and_arguments(self):
         # at least one of text, input_ids, or image should be provided
@@ -687,6 +786,8 @@ class TokenizedEmbeddingReqInput(BaseReq):
     data_parallel_rank: Optional[int] = None
     # For dp balance
     dp_balance_id: int = -1
+    # Priority for the request
+    priority: Optional[int] = None
 
 
 @dataclass
@@ -742,15 +843,38 @@ class BatchTokenIDOut(BaseBatchReq):
     # Hidden states
     output_hidden_states: List[List[float]]
 
+    # The information of placeholder tokens (e.g., image token)
+    # idx is the index of the token in the prompt after expansion.
+    # val is the length of padded tokens after expansion.
+    placeholder_tokens_idx: List[Optional[List[int]]]
+    placeholder_tokens_val: List[Optional[List[int]]]
+
 
 @dataclass
 class BatchMultimodalDecodeReq(BaseBatchReq):
+    decoded_ids: List[int]
+    input_token_logprobs_val: List[float]
+    input_token_logprobs_idx: List[int]
+    output_token_logprobs_val: List[float]
+    output_token_logprobs_idx: List[int]
+    read_offsets: List[int]
+    skip_special_tokens: List[bool]
+    spaces_between_special_tokens: List[bool]
+    image_resolutions: List[List[int]]
+    resize_image_resolutions: List[List[int]]
+
     finished_reasons: List[BaseFinishReason]
 
     # Token counts
     prompt_tokens: List[int]
     completion_tokens: List[int]
     cached_tokens: List[int]
+
+    # Placeholder token info
+    placeholder_tokens_idx: List[Optional[List[int]]]
+    placeholder_tokens_val: List[Optional[List[int]]]
+
+    return_bytes: bool = False
 
 
 @dataclass
@@ -785,18 +909,33 @@ class BatchStrOut(BaseBatchReq):
     # Hidden states
     output_hidden_states: List[List[float]]
 
+    placeholder_tokens_idx: List[Optional[List[int]]]
+    placeholder_tokens_val: List[Optional[List[int]]]
+
 
 @dataclass
 class BatchMultimodalOut(BaseBatchReq):
     # The finish reason
     finished_reasons: List[dict]
+    decoded_ids: List[List[int]]
     # The outputs
-    outputs: List[List[Dict]]
+    outputs: Union[List[str | bytes], List[List[Dict]]]
+
+    # probability values for input tokens and output tokens
+    input_token_logprobs_val: List[List[float]]
+    input_token_logprobs_idx: List[List[int]]
+    output_token_logprobs_val: List[List[float]]
+    output_token_logprobs_idx: List[List[int]]
 
     # Token counts
     prompt_tokens: List[int]
     completion_tokens: List[int]
     cached_tokens: List[int]
+
+    placeholder_tokens_idx: List[Optional[List[int]]]
+    placeholder_tokens_val: List[Optional[List[int]]]
+
+    return_bytes: List[bool]
 
 
 @dataclass
@@ -808,6 +947,9 @@ class BatchEmbeddingOut(BaseBatchReq):
     # Token counts
     prompt_tokens: List[int]
     cached_tokens: List[int]
+    # Placeholder token info
+    placeholder_tokens_idx: List[Optional[List[int]]]
+    placeholder_tokens_val: List[Optional[List[int]]]
 
 
 @dataclass
@@ -840,6 +982,12 @@ class UpdateWeightFromDiskReqInput(BaseReq):
     abort_all_requests: bool = False
     # Optional: Update weight version along with weights
     weight_version: Optional[str] = None
+    # Whether to update weights asynchronously
+    is_async: bool = False
+    # Whether to empty torch cache
+    torch_empty_cache: bool = False
+    # Whether to keep the scheduler paused after weight update
+    keep_pause: bool = False
 
 
 @dataclass
@@ -897,6 +1045,44 @@ class UpdateWeightsFromTensorReqOutput(BaseReq):
 
 
 @dataclass
+class InitWeightsSendGroupForRemoteInstanceReqInput:
+    # The master address
+    master_address: str
+    # The ports for each rank's communication group
+    ports: str
+    # The rank in the communication group
+    group_rank: int
+    # The world size
+    world_size: int
+    # The group name
+    group_name: str = "weight_send_group"
+    # The backend
+    backend: str = "nccl"
+
+
+@dataclass
+class InitWeightsSendGroupForRemoteInstanceReqOutput:
+    success: bool
+    message: str
+
+
+@dataclass
+class SendWeightsToRemoteInstanceReqInput:
+    # The master address
+    master_address: str
+    # The ports for each rank's communication group
+    ports: str
+    # The group name
+    group_name: str = "weight_send_group"
+
+
+@dataclass
+class SendWeightsToRemoteInstanceReqOutput:
+    success: bool
+    message: str
+
+
+@dataclass
 class InitWeightsUpdateGroupReqInput(BaseReq):
     # The master address
     master_address: str
@@ -914,6 +1100,17 @@ class InitWeightsUpdateGroupReqInput(BaseReq):
 
 @dataclass
 class InitWeightsUpdateGroupReqOutput(BaseReq):
+    success: bool
+    message: str
+
+
+@dataclass
+class DestroyWeightsUpdateGroupReqInput:
+    group_name: str = "weight_update_group"
+
+
+@dataclass
+class DestroyWeightsUpdateGroupReqOutput:
     success: bool
     message: str
 
@@ -977,6 +1174,7 @@ class AbortReq(BaseReq):
     abort_all: bool = False
     # The finished reason data
     finished_reason: Optional[Dict[str, Any]] = None
+    abort_reason: Optional[str] = None
 
     def __post_init__(self):
         # FIXME: This is a hack to keep the same with the old code
@@ -1055,6 +1253,7 @@ class ConfigureLoggingReq(BaseReq):
     log_requests_level: Optional[int] = None
     dump_requests_folder: Optional[str] = None
     dump_requests_threshold: Optional[int] = None
+    crash_dump_folder: Optional[str] = None
 
 
 @dataclass
@@ -1201,3 +1400,21 @@ class BlockReqType(Enum):
 @dataclass
 class BlockReqInput(BaseReq):
     type: BlockReqType
+
+
+@dataclass
+class GetLoadReqInput:
+    pass
+
+
+@dataclass
+class GetLoadReqOutput:
+    dp_rank: int
+    num_reqs: int
+    num_waiting_reqs: int
+    num_tokens: int
+
+
+@dataclass
+class WatchLoadUpdateReq:
+    loads: List[GetLoadReqOutput]

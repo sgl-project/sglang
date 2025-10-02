@@ -17,7 +17,7 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import is_layer_skipped
-from sglang.srt.utils import set_weight_attrs
+from sglang.srt.utils import is_npu, set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe import MoeRunnerConfig

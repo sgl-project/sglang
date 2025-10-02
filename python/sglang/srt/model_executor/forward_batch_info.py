@@ -45,13 +45,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     set_dp_buffer_len,
 )
-from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
-from sglang.srt.utils import (
-    flatten_nested_list,
-    get_compiler_backend,
-    is_npu,
-    support_triton,
-)
+from sglang.srt.utils import get_compiler_backend, is_npu, support_triton
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -60,8 +54,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-    from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
-    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+    from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
 _is_npu = is_npu()
 
@@ -131,6 +124,9 @@ class ForwardMode(IntEnum):
             or self == ForwardMode.TARGET_VERIFY
             or self == ForwardMode.IDLE
         )
+
+    def is_cpu_graph(self):
+        return self == ForwardMode.DECODE
 
     def is_dummy_first(self):
         return self == ForwardMode.DUMMY_FIRST
@@ -290,7 +286,7 @@ class ForwardBatch:
     global_forward_mode: Optional[ForwardMode] = None
 
     # Speculative decoding
-    spec_info: Optional[Union[EagleVerifyInput, EagleDraftInput]] = None
+    spec_info: Optional[SpecInput] = None
     spec_algorithm: SpeculativeAlgorithm = None
     capture_hidden_mode: CaptureHiddenMode = None
 
@@ -361,33 +357,14 @@ class ForwardBatch:
 
         # For MLP sync
         if batch.global_num_tokens is not None:
-            from sglang.srt.speculative.eagle_utils import (
-                EagleDraftInput,
-                EagleVerifyInput,
-            )
-
             assert batch.global_num_tokens_for_logprob is not None
+
             # process global_num_tokens and global_num_tokens_for_logprob
             if batch.spec_info is not None:
-                if isinstance(batch.spec_info, EagleDraftInput):
-                    global_num_tokens = [
-                        x * batch.spec_info.num_tokens_per_batch
-                        for x in batch.global_num_tokens
-                    ]
-                    global_num_tokens_for_logprob = [
-                        x * batch.spec_info.num_tokens_for_logprob_per_batch
-                        for x in batch.global_num_tokens_for_logprob
-                    ]
-                else:
-                    assert isinstance(batch.spec_info, EagleVerifyInput)
-                    global_num_tokens = [
-                        x * batch.spec_info.draft_token_num
-                        for x in batch.global_num_tokens
-                    ]
-                    global_num_tokens_for_logprob = [
-                        x * batch.spec_info.draft_token_num
-                        for x in batch.global_num_tokens_for_logprob
-                    ]
+                spec_info: SpecInput = batch.spec_info
+                global_num_tokens, global_num_tokens_for_logprob = (
+                    spec_info.get_spec_adjusted_global_num_tokens(batch)
+                )
             else:
                 global_num_tokens = batch.global_num_tokens
                 global_num_tokens_for_logprob = batch.global_num_tokens_for_logprob
@@ -441,7 +418,13 @@ class ForwardBatch:
             ret.extend_logprob_start_lens_cpu = batch.extend_logprob_start_lens
 
         if model_runner.model_is_mrope:
-            ret._compute_mrope_positions(model_runner, batch)
+            if (
+                ret.spec_info is not None
+                and getattr(ret.spec_info, "positions", None) is not None
+            ):
+                ret._compute_spec_mrope_positions(model_runner, batch)
+            else:
+                ret._compute_mrope_positions(model_runner, batch)
 
         # Init lora information
         if model_runner.server_args.enable_lora:
@@ -506,6 +489,52 @@ class ForwardBatch:
             or self.contains_video_inputs()
             or self.contains_image_inputs()
         )
+
+    def _compute_spec_mrope_positions(
+        self, model_runner: ModelRunner, batch: ModelWorkerBatch
+    ):
+        # TODO support batched deltas
+        batch_size = self.seq_lens.shape[0]
+        device = model_runner.device
+        mm_inputs = batch.multimodal_inputs
+
+        if batch.forward_mode.is_draft_extend():  # draft_extend_after_decode
+            mrope_deltas = []
+            extend_lens = []
+            for batch_idx in range(batch_size):
+                extend_seq_len = batch.extend_seq_lens[batch_idx]
+                extend_lens.append(extend_seq_len)
+                mrope_delta = (
+                    torch.zeros(1, dtype=torch.int64)
+                    if mm_inputs[batch_idx] is None
+                    else mm_inputs[batch_idx].mrope_position_delta.squeeze(0)
+                )
+                mrope_deltas.append(mrope_delta.to(device=device))
+            position_chunks = torch.split(batch.spec_info.positions, extend_lens)
+            mrope_positions_list = [
+                pos_chunk + delta
+                for pos_chunk, delta in zip(position_chunks, mrope_deltas)
+            ]
+            next_input_positions = (
+                torch.cat(mrope_positions_list, dim=0).unsqueeze(0).repeat(3, 1)
+            )
+
+        else:  # target_verify or draft_decode
+            seq_positions = batch.spec_info.positions.view(batch_size, -1)
+            mrope_deltas = [
+                (
+                    torch.tensor([0], dtype=torch.int64)
+                    if mm_inputs[i] is None
+                    else mm_inputs[i].mrope_position_delta.squeeze(0)
+                )
+                for i in range(batch_size)
+            ]
+            mrope_delta_tensor = torch.stack(mrope_deltas, dim=0).to(device=device)
+            next_input_positions = (
+                (seq_positions + mrope_delta_tensor).flatten().unsqueeze(0).repeat(3, 1)
+            )
+
+        self.mrope_positions = next_input_positions
 
     def _compute_mrope_positions(
         self, model_runner: ModelRunner, batch: ModelWorkerBatch
@@ -614,9 +643,6 @@ class ForwardBatch:
             )
 
     def prepare_mlp_sync_batch(self, model_runner: ModelRunner):
-
-        from sglang.srt.speculative.eagle_utils import EagleDraftInput
-
         assert self.global_num_tokens_cpu is not None
         assert self.global_num_tokens_for_logprob_cpu is not None
 
@@ -631,7 +657,9 @@ class ForwardBatch:
                 (global_num_tokens[i] - 1) // attn_tp_size + 1
             ) * attn_tp_size
 
-        dp_padding_mode = DpPaddingMode.get_dp_padding_mode(global_num_tokens)
+        dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
+            self.is_extend_in_batch, global_num_tokens
+        )
         self.dp_padding_mode = dp_padding_mode
 
         if dp_padding_mode.is_max_len():
@@ -711,7 +739,8 @@ class ForwardBatch:
         if self.extend_seq_lens is not None:
             self.extend_seq_lens = self._pad_tensor_to_size(self.extend_seq_lens, bs)
 
-        if self.spec_info is not None and isinstance(self.spec_info, EagleDraftInput):
+        if self.spec_info is not None and self.spec_info.is_draft_input():
+            # FIXME(lsyin): remove this isinstance logic
             spec_info = self.spec_info
             self.output_cache_loc_backup = self.out_cache_loc
             self.hidden_states_backup = spec_info.hidden_states

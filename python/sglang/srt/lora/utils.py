@@ -10,19 +10,22 @@ from sglang.srt.hf_transformers_utils import AutoConfig
 
 @dataclass
 class LoRABatchInfo:
+    # The forward mode is using CUDA Graph.
+    use_cuda_graph: bool
+
     # Batch size
     bs: int
 
-    # Lengths of each sequence in shape (bs,)
-    seg_lens: torch.Tensor
+    # Number of segments. For triton backend, it is equal to batch size.
+    num_segments: int
 
-    # Indice pointers of each sequence in shape (bs + 1, )
-    seg_indptr: torch.Tensor
-
-    # Maximum sequence length of current batch
+    # Maximum segment length of current batch
     max_len: int
 
-    # The index of lora adapter used by each sequence, in shape (bs,)
+    # Indice pointers of each segment in shape (num_segments + 1, )
+    seg_indptr: torch.Tensor
+
+    # The index of lora adapter used by each segment, in shape (num_segments,)
     weight_indices: torch.Tensor
 
     # ranks of each lora adapter, in shape (lora_num,)
@@ -30,6 +33,12 @@ class LoRABatchInfo:
 
     # scaling of each lora adapter, in shape (lora_num,)
     scalings: torch.Tensor
+
+    # Lengths of each segments in shape (num_segments,)
+    seg_lens: Optional[torch.Tensor]
+
+    # The logical (re)ordering of input rows (tokens), in shape (num_tokens,)
+    permutation: Optional[torch.Tensor]
 
 
 class LoRAType(Enum):
@@ -89,6 +98,7 @@ def get_normalized_target_modules(
 ) -> set[str]:
     """
     Mapping a list of target module name to names of the normalized LoRA weights.
+    Handles both base module names (e.g., "gate_proj") and prefixed module names (e.g., "feed_forward.gate_proj").
     """
     params_mapping = {
         "q_proj": "qkv_proj",
@@ -100,7 +110,8 @@ def get_normalized_target_modules(
 
     result = set()
     for name in target_modules:
-        normalized_name = params_mapping.get(name, name)
+        base_name = name.split(".")[-1]
+        normalized_name = params_mapping.get(base_name, base_name)
         result.add(normalized_name)
     return result
 

@@ -1104,10 +1104,10 @@ def ep_gather(
     input_index: torch.Tensor,
     output_tensor: torch.Tensor,
 ):
-    BLOCK_D = 1024 if not is_in_ci() else 128  # block size of quantization
     num_warps = 2
     num_tokens = output_tensor.shape[0]
     hidden_size = input_tensor.shape[1]
+    BLOCK_D = 128 if hidden_size % 1024 != 0 else 1024  # block size of quantization
     assert hidden_size % BLOCK_D == 0
     grid = (triton.cdiv(hidden_size, BLOCK_D), min(num_tokens, 1024))
     _fwd_kernel_ep_gather[grid](
@@ -1416,7 +1416,7 @@ def zero_experts_compute_triton(
         zero_expert_scales[zero_expert_mask] = 0.0
 
     normal_expert_mask = expert_indices >= num_experts
-    expert_indices[normal_expert_mask] = 0
+    expert_indices[normal_expert_mask] = -1
     expert_scales[normal_expert_mask] = 0.0
 
     output = torch.zeros_like(hidden_states).to(hidden_states.device)
