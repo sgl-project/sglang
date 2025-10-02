@@ -39,7 +39,6 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import run_scheduler_process
-from sglang.srt.managers.utils import DPBalanceMeta
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import (
@@ -108,15 +107,9 @@ class DPBudget:
 class DataParallelController:
     """A controller that dispatches requests to multiple data parallel workers."""
 
-    def __init__(
-        self,
-        server_args: ServerArgs,
-        port_args: PortArgs,
-        dp_balance_meta: DPBalanceMeta,
-    ) -> None:
+    def __init__(self, server_args: ServerArgs, port_args: PortArgs) -> None:
         # for dp balance
         self.global_balance_id = 0
-        self.balance_meta = dp_balance_meta
 
         # Parse args
         self.max_total_num_tokens = None
@@ -370,31 +363,7 @@ class DataParallelController:
         if self.maybe_external_dp_rank_routing(req):
             return
 
-        # This variable corresponds to the balance_id in TokenizedGenerateReqInput.
-        # We use it to to control the number of onfly tokens (requests dispatched to workers but not yet received).
-        def get_next_global_balance_id() -> int:
-            INT32_MAX = 2147483647
-            current_id = self.global_balance_id
-            self.global_balance_id = (self.global_balance_id + 1) % INT32_MAX
-            return current_id
-
-        req.dp_balance_id = get_next_global_balance_id()
-        with self.balance_meta.mutex:
-            # 1. local_tokens represents the tokens currently inferring on the worker,
-            #  while onfly refers to the requests dispatched by the dispatcher but not yet received by the scheduler.
-            onfly_info = self.balance_meta.get_shared_onfly()
-            local_tokens = self.balance_meta.get_shared_local_tokens()
-            total_tokens = [
-                local_token + sum(onfly_dict.values())
-                for local_token, onfly_dict in zip(local_tokens, onfly_info)
-            ]
-            target_worker = total_tokens.index(min(total_tokens))
-            onfly_info[target_worker][req.dp_balance_id] = len(req.input_ids)
-            # 2. write the new onfly info to the shm
-            self.balance_meta.set_shared_onfly_info(onfly_info)
-
-        # logger.info(f"dp workers {local_tokens=}, {onfly_info=}, {target_worker=}")
-        self.workers[target_worker].send_pyobj(req)
+        raise NotImplementedError()
 
     def event_loop(self):
         while True:
@@ -416,12 +385,9 @@ def run_data_parallel_controller_process(
     faulthandler.enable()
     configure_logger(server_args)
     parent_process = psutil.Process().parent()
-    balance_meta = DPBalanceMeta(server_args.dp_size)
 
     try:
-        controller = DataParallelController(
-            server_args, port_args, dp_balance_meta=balance_meta
-        )
+        controller = DataParallelController(server_args, port_args)
         pipe_writer.send(
             {
                 "status": "ready",
