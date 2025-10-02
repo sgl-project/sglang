@@ -26,16 +26,6 @@ from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
-try:
-    import deep_gemm_v32
-except ImportError as e:
-    print("Error when importing deep_gemm_v32, try deep_gemm")
-    try:
-        import deep_gemm as deep_gemm_v32
-    except ImportError as e:
-        print("Error when importing deep_gemm, skip")
-
-
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
 
@@ -299,7 +289,7 @@ class Indexer(CustomOp):
             assert isinstance(forward_batch.token_to_kv_pool, NSATokenToKVPool)
 
         page_size = forward_batch.token_to_kv_pool.page_size
-        # NOTE(dark): blocksize = 64 is hardcoded in deep_gemm_v32
+        # NOTE(dark): blocksize = 64 is hardcoded in deep_gemm
         assert page_size == 64, "only support page size 64"
 
         # NOTE(dark): this support extend/decode/decode+graph
@@ -313,7 +303,7 @@ class Indexer(CustomOp):
         blocksize = page_size
         seqlens_32 = metadata.get_seqlens_int32()
         # NOTE(dark): 132 is SM count on H200/B200, not magic number
-        schedule_metadata = deep_gemm_v32.get_paged_mqa_logits_metadata(
+        schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
             seqlens_32, blocksize, self.sm_count
         )
 
@@ -329,7 +319,7 @@ class Indexer(CustomOp):
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
 
-        logits = deep_gemm_v32.fp8_paged_mqa_logits(
+        logits = deep_gemm.fp8_paged_mqa_logits(
             q_fp8,
             kv_cache_fp8,
             weights,
@@ -398,7 +388,7 @@ class Indexer(CustomOp):
         seq_lens_expanded = metadata.get_seqlens_expanded()
         ke = ks + seq_lens_expanded
 
-        logits = deep_gemm_v32.fp8_mqa_logits(
+        logits = deep_gemm.fp8_mqa_logits(
             q_fp8,
             kv_fp8,
             weights,
@@ -426,7 +416,7 @@ class Indexer(CustomOp):
         assert len(weights.shape) == 3
         weights = weights.squeeze(-1)
 
-        # logits = deep_gemm_v32.fp8_mqa_logits(q_fp8, kv_fp8, weights, ks, ke)
+        # logits = deep_gemm.fp8_mqa_logits(q_fp8, kv_fp8, weights, ks, ke)
         k_fp8_list = []
         k_scale_list = []
 
