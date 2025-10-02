@@ -181,7 +181,6 @@ fn test_chatml_template() {
             content: Some("Hi there!".to_string()),
             name: None,
             tool_calls: None,
-            function_call: None,
             reasoning_content: None,
         },
         spec::ChatMessage::User {
