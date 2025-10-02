@@ -560,8 +560,9 @@ class DeepseekV2MoE(nn.Module):
                 prefix=add_prefix("shared_experts", prefix),
                 **(
                     dict(tp_rank=0, tp_size=1)
-                    if get_moe_a2a_backend().is_deepep()
+                    if get_moe_a2a_backend().is_deepep()  # TODO: dense(no tp) for shared_expert for mori too?
                     or should_use_flashinfer_cutlass_moe_fp4_allgather()
+                    or get_moe_a2a_backend().is_mori()
                     else {}
                 ),
             )
@@ -591,6 +592,7 @@ class DeepseekV2MoE(nn.Module):
 
         self.top_k = config.num_experts_per_tok
 
+        # below will be refactored(removed) by Cheng Wan, so ignore below
         if get_moe_a2a_backend().is_deepep():
             # TODO: we will support tp < ep in the future
             self.ep_size = get_moe_expert_parallel_world_size()
@@ -621,6 +623,7 @@ class DeepseekV2MoE(nn.Module):
             )
 
         self._enable_deepep_moe = get_moe_a2a_backend().is_deepep()
+        self._enable_moriep_moe = get_moe_a2a_backend().is_mori()
 
     def get_moe_weights(self):
         return [
@@ -637,7 +640,7 @@ class DeepseekV2MoE(nn.Module):
         use_reduce_scatter: bool = False,
         gemm_output_zero_allocator: BumpAllocator = None,
     ) -> torch.Tensor:
-        if not self._enable_deepep_moe:
+        if not (self._enable_deepep_moe or self._enable_moriep_moe):
             DUAL_STREAM_TOKEN_THRESHOLD = 1024
             if (
                 self.alt_stream is not None
@@ -799,10 +802,14 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
 
+    # NOTE: We need to change the func name because it supports deepep and mori both.
     def forward_deepep(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
         shared_output = None
+        is_deepep = get_moe_a2a_backend().is_deepep()
+        is_mori = get_moe_a2a_backend().is_mori()
+
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
@@ -810,9 +817,15 @@ class DeepseekV2MoE(nn.Module):
             topk_weights, topk_idx, _ = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=forward_batch.num_token_non_padded,
-                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                    layer_id=self.layer_id,
+                num_token_non_padded=(
+                    forward_batch.num_token_non_padded if is_deepep else None
+                ),
+                expert_location_dispatch_info=(
+                    ExpertLocationDispatchInfo.init_new(
+                        layer_id=self.layer_id,
+                    )
+                    if is_deepep
+                    else None
                 ),
             )
         else:
@@ -827,16 +840,22 @@ class DeepseekV2MoE(nn.Module):
             forward_batch=forward_batch,
         )
 
-        if shared_output is not None:
-            x = shared_output
-            if self.experts.should_fuse_routed_scaling_factor_in_topk():
-                x.add_(final_hidden_states)
+        if is_deepep:
+            if shared_output is not None:
+                x = shared_output
+                if self.experts.should_fuse_routed_scaling_factor_in_topk():
+                    x.add_(final_hidden_states)
+                else:
+                    x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
+                final_hidden_states = x
             else:
-                x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
-            final_hidden_states = x
+                if not self.experts.should_fuse_routed_scaling_factor_in_topk():
+                    final_hidden_states *= self.routed_scaling_factor
+        elif is_mori:
+            if shared_output is not None:
+                final_hidden_states = shared_output + final_hidden_states
         else:
-            if not self.experts.should_fuse_routed_scaling_factor_in_topk():
-                final_hidden_states *= self.routed_scaling_factor
+            raise RuntimeError(f"Not supported a2a backend: {get_moe_a2a_backend()}")
 
         return final_hidden_states
 

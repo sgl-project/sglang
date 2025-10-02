@@ -31,6 +31,7 @@ from sglang.srt.utils import (
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
     configure_ipv6,
+    get_bool_env_var,
     get_device,
     get_device_memory_capacity,
     is_cuda,
@@ -48,6 +49,9 @@ from sglang.srt.utils import (
     parse_connector_type,
 )
 from sglang.utils import is_in_ci
+
+_is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 logger = logging.getLogger(__name__)
 
@@ -297,7 +301,7 @@ class ServerArgs:
 
     # Expert parallelism
     ep_size: int = 1
-    moe_a2a_backend: Literal["none", "deepep"] = "none"
+    moe_a2a_backend: Literal["none", "deepep", "mori"] = "none"
     moe_runner_backend: Literal[
         "auto",
         "triton",
@@ -309,6 +313,7 @@ class ServerArgs:
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
     enable_flashinfer_allreduce_fusion: bool = False
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
+    moriep_mode: Literal["auto", "normal", "low_latency"] = "auto"
     ep_num_redundant_experts: int = 0
     ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
     init_expert_location: str = "trivial"
@@ -472,6 +477,7 @@ class ServerArgs:
         # Handle MoE configurations.
         self._handle_moe_kernel_config()
         self._handle_deepep_moe()
+        self._handle_mori_moe()
         self._handle_eplb_and_dispatch()
         self._handle_expert_distribution_metrics()
 
@@ -922,6 +928,28 @@ class ServerArgs:
                 "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
             )
 
+    def _handle_mori_moe(self):
+        # TODO : support eplb/expert distribution recording when MoRI
+        # MoRI MoE
+        if self.moe_a2a_backend == "mori":
+            if not _use_aiter:
+                self.moe_a2a_backend = "none"
+                logger.warning(
+                    "MoRI A2A backend requires aiter, but SGLANG_USE_AITER is not given. MoRI is disabled."
+                )
+            else:
+                self.expert_distribution_recorder_mode = None
+                self.enable_eplb = False
+                logger.warning("MoRI does not support EPLB for now.")
+
+            assert (
+                self.moriep_mode == "low_latency"
+            ), f"Currently MoRI supports low_latency only."
+
+            assert (
+                not self.enable_two_batch_overlap
+            ), f"Currently MoRI does not support TBO."
+
     def _handle_deepep_moe(self):
         if self.moe_a2a_backend == "deepep":
             if self.deepep_mode == "normal":
@@ -929,7 +957,7 @@ class ServerArgs:
                 self.disable_cuda_graph = True
             self.ep_size = self.tp_size
             logger.warning(
-                f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
+                f"DeepEP/MoRI MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
 
     def _handle_eplb_and_dispatch(self):
@@ -2081,7 +2109,7 @@ class ServerArgs:
         parser.add_argument(
             "--moe-a2a-backend",
             type=str,
-            choices=["none", "deepep"],
+            choices=["none", "deepep", "mori"],
             default=ServerArgs.moe_a2a_backend,
             help="Choose the backend for MoE A2A.",
         )
@@ -2118,6 +2146,13 @@ class ServerArgs:
             choices=["normal", "low_latency", "auto"],
             default="auto",
             help="Select the mode when enable DeepEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch.",
+        )
+        parser.add_argument(
+            "--moriep-mode",
+            type=str,
+            choices=["normal", "low_latency", "auto"],
+            default="auto",
+            help="Select the mode when enable MoRIEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch. Currently, 'low_latency' is supported.",
         )
         parser.add_argument(
             "--ep-num-redundant-experts",
@@ -2449,6 +2484,7 @@ class ServerArgs:
             action="store_true",
             help="Enable vocabulary parallel across the attention TP group to avoid all-gather across DP groups, optimizing performance under DP attention.",
         )
+        # NOTE: Disable this argument until implementing tbo on mori backend.
         parser.add_argument(
             "--enable-two-batch-overlap",
             action="store_true",
