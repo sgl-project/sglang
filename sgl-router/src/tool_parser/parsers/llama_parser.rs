@@ -243,4 +243,8 @@ impl ToolParser for LlamaParser {
         text.contains("<|python_tag|>")
             || (text.trim_start().starts_with('{') && text.contains(r#""name""#))
     }
+
+    fn get_unstreamed_tool_args(&self) -> Option<Vec<crate::tool_parser::types::ToolCallItem>> {
+        helpers::get_unstreamed_args(&self.prev_tool_call_arr, &self.streamed_args_for_tool)
+    }
 }

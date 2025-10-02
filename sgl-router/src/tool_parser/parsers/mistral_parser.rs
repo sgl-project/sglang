@@ -266,4 +266,8 @@ impl ToolParser for MistralParser {
     fn detect_format(&self, text: &str) -> bool {
         self.has_tool_markers(text)
     }
+
+    fn get_unstreamed_tool_args(&self) -> Option<Vec<crate::tool_parser::types::ToolCallItem>> {
+        helpers::get_unstreamed_args(&self.prev_tool_call_arr, &self.streamed_args_for_tool)
+    }
 }

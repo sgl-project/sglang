@@ -339,4 +339,8 @@ impl ToolParser for KimiK2Parser {
     fn detect_format(&self, text: &str) -> bool {
         self.has_tool_markers(text) || text.contains("<|tool_call_begin|>")
     }
+
+    fn get_unstreamed_tool_args(&self) -> Option<Vec<ToolCallItem>> {
+        helpers::get_unstreamed_args(&self.prev_tool_call_arr, &self.streamed_args_for_tool)
+    }
 }

@@ -8,7 +8,7 @@ use crate::tool_parser::{
     parsers::helpers,
     partial_json::PartialJson,
     traits::ToolParser,
-    types::{FunctionCall, StreamingParseResult, ToolCall},
+    types::{FunctionCall, StreamingParseResult, ToolCall, ToolCallItem},
 };
 
 /// JSON format parser for tool calls
@@ -273,5 +273,9 @@ impl ToolParser for JsonParser {
     fn detect_format(&self, text: &str) -> bool {
         let trimmed = text.trim();
         (trimmed.starts_with('[') || trimmed.starts_with('{')) && trimmed.contains(r#""name""#)
+    }
+
+    fn get_unstreamed_tool_args(&self) -> Option<Vec<ToolCallItem>> {
+        helpers::get_unstreamed_args(&self.prev_tool_call_arr, &self.streamed_args_for_tool)
     }
 }
