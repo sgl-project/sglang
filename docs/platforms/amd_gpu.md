@@ -54,7 +54,7 @@ python setup_rocm.py install
 
 # Install sglang python package
 cd ../python
-rm -r pyproject.toml && mv pyproject_other.toml pyproject.toml
+rm -f pyproject.toml && mv pyproject_other.toml pyproject.toml
 cd ..
 pip install -e "python[all_hip]"
 ```
