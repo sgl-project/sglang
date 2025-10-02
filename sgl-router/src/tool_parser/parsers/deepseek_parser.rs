@@ -1,13 +1,12 @@
 use async_trait::async_trait;
 use regex::Regex;
 use serde_json::Value;
-use std::collections::HashMap;
 
 use crate::protocols::spec::Tool;
 
 use crate::tool_parser::{
     errors::{ToolParserError, ToolParserResult},
-    partial_json::PartialJson,
+    parsers::helpers,
     traits::ToolParser,
     types::{FunctionCall, StreamingParseResult, ToolCall, ToolCallItem},
 };
@@ -22,8 +21,6 @@ use crate::tool_parser::{
 /// - JSON arguments in code blocks
 /// - Support for multiple sequential tool calls
 pub struct DeepSeekParser {
-    /// Parser for handling incomplete JSON during streaming
-    partial_json: PartialJson,
     /// Regex for extracting complete tool calls
     tool_call_extractor: Regex,
     /// Regex for extracting function details
@@ -47,9 +44,6 @@ pub struct DeepSeekParser {
 
     /// Tracks raw JSON string content streamed to client for each tool's arguments
     streamed_args_for_tool: Vec<String>,
-
-    /// Tracks the last arguments sent for incremental diffing
-    last_arguments: String,
 }
 
 impl DeepSeekParser {
@@ -71,7 +65,6 @@ impl DeepSeekParser {
         let tool_call_end_pattern = Regex::new(end_pattern).expect("Valid regex pattern");
 
         Self {
-            partial_json: PartialJson::default(),
             tool_call_extractor,
             func_detail_extractor,
             partial_tool_call_regex,
@@ -81,7 +74,6 @@ impl DeepSeekParser {
             current_tool_id: -1,
             current_tool_name_sent: false,
             streamed_args_for_tool: Vec::new(),
-            last_arguments: String::new(),
         }
     }
 
@@ -144,38 +136,7 @@ impl DeepSeekParser {
         })
     }
 
-    /// Get a mapping of tool names to their indices
-    fn get_tool_indices(&self, tools: &[Tool]) -> HashMap<String, usize> {
-        tools
-            .iter()
-            .enumerate()
-            .map(|(i, tool)| (tool.function.name.clone(), i))
-            .collect()
-    }
 
-    /// Ensure arrays have enough capacity for current_tool_id
-    fn ensure_capacity(&mut self) {
-        if self.current_tool_id < 0 {
-            return;
-        }
-
-        let needed_len = (self.current_tool_id + 1) as usize;
-
-        if self.prev_tool_call_arr.len() < needed_len {
-            self.prev_tool_call_arr
-                .resize_with(needed_len, || Value::Null);
-        }
-
-        if self.streamed_args_for_tool.len() < needed_len {
-            self.streamed_args_for_tool
-                .resize_with(needed_len, String::new);
-        }
-    }
-
-    /// Check if JSON is complete (basic check - just validates it parses)
-    fn is_complete_json(&self, json_str: &str) -> bool {
-        serde_json::from_str::<Value>(json_str).is_ok()
-    }
 }
 
 impl Default for DeepSeekParser {
@@ -224,8 +185,8 @@ impl ToolParser for DeepSeekParser {
         let current_text = &self.buffer.clone();
 
         // Check if we have a tool call (either the start token or individual tool call)
-        let has_tool_call = self.has_tool_markers(current_text)
-            || current_text.contains("<｜tool▁call▁begin｜>");
+        let has_tool_call =
+            self.has_tool_markers(current_text) || current_text.contains("<｜tool▁call▁begin｜>");
 
         if !has_tool_call {
             // No tool markers detected - return all buffered content as normal text
@@ -241,7 +202,7 @@ impl ToolParser for DeepSeekParser {
         }
 
         // Build tool indices for validation
-        let tool_indices = self.get_tool_indices(tools);
+        let tool_indices = helpers::get_tool_indices(tools);
 
         let mut calls: Vec<ToolCallItem> = Vec::new();
 
@@ -249,6 +210,19 @@ impl ToolParser for DeepSeekParser {
         if let Some(captures) = self.partial_tool_call_regex.captures(current_text) {
             let func_name = captures.get(2).map_or("", |m| m.as_str()).trim();
             let func_args_raw = captures.get(3).map_or("", |m| m.as_str()).trim();
+
+            // Validate tool name
+            if !tool_indices.contains_key(func_name) {
+                // Invalid tool name - skip this tool, preserve indexing for next tool
+                tracing::warn!("Invalid tool name '{}' - skipping", func_name);
+                helpers::reset_current_tool_state(
+                    &mut self.buffer,
+                    &mut self.current_tool_name_sent,
+                    &mut self.streamed_args_for_tool,
+                    &self.prev_tool_call_arr,
+                );
+                return Ok(StreamingParseResult::default());
+            }
 
             // Initialize state if this is the first tool call
             if self.current_tool_id == -1 {
@@ -258,7 +232,11 @@ impl ToolParser for DeepSeekParser {
             }
 
             // Ensure we have enough entries in our tracking arrays
-            self.ensure_capacity();
+            helpers::ensure_capacity(
+                self.current_tool_id,
+                &mut self.prev_tool_call_arr,
+                &mut self.streamed_args_for_tool,
+            );
 
             // Send tool name if not sent yet
             if !self.current_tool_name_sent {
@@ -272,7 +250,8 @@ impl ToolParser for DeepSeekParser {
                 // Store the tool call info for serving layer completions endpoint
                 let tool_id = self.current_tool_id as usize;
                 if self.prev_tool_call_arr.len() <= tool_id {
-                    self.prev_tool_call_arr.resize_with(tool_id + 1, || Value::Null);
+                    self.prev_tool_call_arr
+                        .resize_with(tool_id + 1, || Value::Null);
                 }
                 self.prev_tool_call_arr[tool_id] = serde_json::json!({
                     "name": func_name,
@@ -280,27 +259,32 @@ impl ToolParser for DeepSeekParser {
                 });
             } else {
                 // Compute incremental diff
-                let argument_diff = if func_args_raw.starts_with(&self.last_arguments) {
-                    &func_args_raw[self.last_arguments.len()..]
+                let tool_id = self.current_tool_id as usize;
+                let last_sent = self
+                    .streamed_args_for_tool
+                    .get(tool_id)
+                    .map(|s| s.as_str())
+                    .unwrap_or("");
+
+                let argument_diff = if func_args_raw.starts_with(last_sent) {
+                    &func_args_raw[last_sent.len()..]
                 } else {
                     func_args_raw
                 };
 
                 if !argument_diff.is_empty() {
                     calls.push(ToolCallItem {
-                        tool_index: self.current_tool_id as usize,
+                        tool_index: tool_id,
                         name: None,
                         parameters: argument_diff.to_string(),
                     });
-                    self.last_arguments.push_str(argument_diff);
-                    let tool_id = self.current_tool_id as usize;
                     if tool_id < self.streamed_args_for_tool.len() {
                         self.streamed_args_for_tool[tool_id].push_str(argument_diff);
                     }
                 }
 
                 // Check if JSON is complete
-                if self.is_complete_json(func_args_raw) {
+                if helpers::is_complete_json(func_args_raw) {
                     // Update the stored arguments
                     if let Ok(parsed_args) = serde_json::from_str::<Value>(func_args_raw) {
                         let tool_id = self.current_tool_id as usize;
@@ -325,7 +309,6 @@ impl ToolParser for DeepSeekParser {
                     };
 
                     self.current_tool_id += 1;
-                    self.last_arguments.clear();
                     self.current_tool_name_sent = false;
                     return Ok(result);
                 }
@@ -336,15 +319,6 @@ impl ToolParser for DeepSeekParser {
             normal_text: String::new(),
             calls,
         })
-    }
-
-    fn reset(&mut self) {
-        self.buffer.clear();
-        self.prev_tool_call_arr.clear();
-        self.current_tool_id = -1;
-        self.current_tool_name_sent = false;
-        self.streamed_args_for_tool.clear();
-        self.last_arguments.clear();
     }
 
     fn detect_format(&self, text: &str) -> bool {

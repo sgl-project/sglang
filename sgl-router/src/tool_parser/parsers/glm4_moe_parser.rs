@@ -6,6 +6,7 @@ use crate::protocols::spec::Tool;
 
 use crate::tool_parser::{
     errors::{ToolParserError, ToolParserResult},
+    parsers::helpers,
     traits::ToolParser,
     types::{FunctionCall, StreamingParseResult, ToolCall, ToolCallItem},
 };
@@ -145,57 +146,24 @@ impl Glm4MoeParser {
     }
 
     /// Parse and return StreamingParseResult (mirrors Python's detect_and_parse)
-    fn detect_and_parse(&self, text: &str, _tools: &[Tool]) -> ToolParserResult<StreamingParseResult> {
-        let idx = text.find(self.bot_token);
-        let normal_text = if let Some(pos) = idx {
-            text[..pos].trim().to_string()
-        } else {
-            text.to_string()
-        };
+    /// Parse all tool calls from text (shared logic for complete and incremental parsing)
+    fn parse_tool_calls_from_text(&self, text: &str) -> ToolParserResult<Vec<ToolCall>> {
+        let mut tools = Vec::new();
 
-        if !self.has_tool_markers(text) {
-            return Ok(StreamingParseResult {
-                normal_text,
-                calls: vec![],
-            });
-        }
-
-        let mut calls = Vec::new();
-        let match_result_list: Vec<_> = self.tool_call_extractor.find_iter(text).collect();
-
-        for mat in match_result_list {
-            // Get function name
-            if let Ok(Some(tool_call)) = self.parse_tool_call(mat.as_str()) {
-                // Extract just the name and parameters for ToolCallItem
-                calls.push(ToolCallItem {
-                    tool_index: 0, // Will be set by caller
-                    name: Some(tool_call.function.name.clone()),
-                    parameters: tool_call.function.arguments,
-                });
+        for mat in self.tool_call_extractor.find_iter(text) {
+            match self.parse_tool_call(mat.as_str()) {
+                Ok(Some(tool)) => tools.push(tool),
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::warn!("Failed to parse tool call: {}", e);
+                    continue;
+                }
             }
         }
 
-        Ok(StreamingParseResult { normal_text, calls })
+        Ok(tools)
     }
 
-    /// Ensure arrays have enough capacity for current_tool_id
-    fn ensure_capacity(&mut self) {
-        if self.current_tool_id < 0 {
-            return;
-        }
-
-        let needed_len = (self.current_tool_id + 1) as usize;
-
-        if self.prev_tool_call_arr.len() < needed_len {
-            self.prev_tool_call_arr
-                .resize_with(needed_len, || Value::Null);
-        }
-
-        if self.streamed_args_for_tool.len() < needed_len {
-            self.streamed_args_for_tool
-                .resize_with(needed_len, String::new);
-        }
-    }
 }
 
 impl Default for Glm4MoeParser {
@@ -216,18 +184,8 @@ impl ToolParser for Glm4MoeParser {
         let idx = text.find("<tool_call>").unwrap();
         let normal_text = text[..idx].to_string();
 
-        // Extract tool calls
-        let mut tools = Vec::new();
-        for mat in self.tool_call_extractor.find_iter(text) {
-            match self.parse_tool_call(mat.as_str()) {
-                Ok(Some(tool)) => tools.push(tool),
-                Ok(None) => continue,
-                Err(e) => {
-                    tracing::warn!("Failed to parse tool call: {}", e);
-                    continue;
-                }
-            }
-        }
+        // Parse all tool calls using shared helper
+        let tools = self.parse_tool_calls_from_text(text)?;
 
         // If no tools were successfully parsed despite having markers, return entire text as fallback
         if tools.is_empty() {
@@ -275,45 +233,79 @@ impl ToolParser for Glm4MoeParser {
             }
 
             // Ensure we have enough entries in our tracking arrays
-            self.ensure_capacity();
+            helpers::ensure_capacity(
+                self.current_tool_id,
+                &mut self.prev_tool_call_arr,
+                &mut self.streamed_args_for_tool,
+            );
 
-            // Parse the complete block using detect_and_parse
+            // Parse the complete block using shared helper
             let block_end = end_pos + self.eot_token.len();
-            let mut result = self.detect_and_parse(&current_text[..block_end], tools)?;
+            let parsed_tools = self.parse_tool_calls_from_text(&current_text[..block_end])?;
 
-            if !result.calls.is_empty() {
-                // Take the first call and set its tool_index
-                let call = &mut result.calls[0];
-                call.tool_index = self.current_tool_id as usize;
+            // Extract normal text before tool calls
+            let idx = current_text.find(self.bot_token);
+            let normal_text = if let Some(pos) = idx {
+                current_text[..pos].trim().to_string()
+            } else {
+                String::new()
+            };
+
+            // Build tool indices for validation
+            let tool_indices = helpers::get_tool_indices(tools);
+
+            let mut calls = Vec::new();
+
+            if !parsed_tools.is_empty() {
+                // Take the first tool and convert to ToolCallItem
+                let tool_call = &parsed_tools[0];
+                let tool_id = self.current_tool_id as usize;
+
+                // Validate tool name
+                if !tool_indices.contains_key(&tool_call.function.name) {
+                    // Invalid tool name - skip this tool, preserve indexing for next tool
+                    tracing::warn!("Invalid tool name '{}' - skipping", tool_call.function.name);
+                    helpers::reset_current_tool_state(
+                        &mut self.buffer,
+                        &mut false, // glm4_moe doesn't track name_sent per tool
+                        &mut self.streamed_args_for_tool,
+                        &self.prev_tool_call_arr,
+                    );
+                    return Ok(StreamingParseResult::default());
+                }
+
+                calls.push(ToolCallItem {
+                    tool_index: tool_id,
+                    name: Some(tool_call.function.name.clone()),
+                    parameters: tool_call.function.arguments.clone(),
+                });
 
                 // Store in tracking arrays
-                let tool_id = self.current_tool_id as usize;
                 if self.prev_tool_call_arr.len() <= tool_id {
-                    self.prev_tool_call_arr.resize_with(tool_id + 1, || Value::Null);
+                    self.prev_tool_call_arr
+                        .resize_with(tool_id + 1, || Value::Null);
                 }
 
                 // Parse parameters as JSON and store
-                if let (Some(name), params) = (call.name.as_ref(), &call.parameters) {
-                    if let Ok(args) = serde_json::from_str::<Value>(params) {
-                        self.prev_tool_call_arr[tool_id] = serde_json::json!({
-                            "name": name,
-                            "arguments": args,
-                        });
-                    }
+                if let Ok(args) = serde_json::from_str::<Value>(&tool_call.function.arguments) {
+                    self.prev_tool_call_arr[tool_id] = serde_json::json!({
+                        "name": tool_call.function.name,
+                        "arguments": args,
+                    });
                 }
 
                 if self.streamed_args_for_tool.len() <= tool_id {
                     self.streamed_args_for_tool
                         .resize_with(tool_id + 1, String::new);
                 }
-                self.streamed_args_for_tool[tool_id] = call.parameters.clone();
+                self.streamed_args_for_tool[tool_id] = tool_call.function.arguments.clone();
 
                 self.current_tool_id += 1;
             }
 
             // Remove processed portion from buffer
             self.buffer = current_text[block_end..].to_string();
-            return Ok(result);
+            return Ok(StreamingParseResult { normal_text, calls });
         }
 
         // No complete tool call yet - return normal text before start token
@@ -325,13 +317,6 @@ impl ToolParser for Glm4MoeParser {
             normal_text,
             calls: vec![],
         })
-    }
-
-    fn reset(&mut self) {
-        self.buffer.clear();
-        self.prev_tool_call_arr.clear();
-        self.current_tool_id = -1;
-        self.streamed_args_for_tool.clear();
     }
 
     fn detect_format(&self, text: &str) -> bool {

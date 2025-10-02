@@ -1,13 +1,12 @@
 use async_trait::async_trait;
 use regex::Regex;
 use serde_json::Value;
-use std::collections::HashMap;
 
 use crate::protocols::spec::Tool;
 
 use crate::tool_parser::{
     errors::ToolParserResult,
-    partial_json::PartialJson,
+    parsers::helpers,
     traits::ToolParser,
     types::{FunctionCall, StreamingParseResult, ToolCall, ToolCallItem},
 };
@@ -22,8 +21,6 @@ use crate::tool_parser::{
 /// - Function calls with explicit indexing
 /// - JSON arguments
 pub struct KimiK2Parser {
-    /// Parser for handling incomplete JSON during streaming
-    partial_json: PartialJson,
     /// Regex for extracting complete tool calls
     tool_call_extractor: Regex,
     /// Regex for extracting partial tool calls (streaming)
@@ -72,7 +69,6 @@ impl KimiK2Parser {
         let tool_call_id_regex = Regex::new(id_pattern).expect("Valid regex pattern");
 
         Self {
-            partial_json: PartialJson::default(),
             tool_call_extractor,
             stream_tool_call_extractor,
             tool_call_end_pattern,
@@ -102,38 +98,6 @@ impl KimiK2Parser {
         }
     }
 
-    /// Get a mapping of tool names to their indices
-    fn get_tool_indices(&self, tools: &[Tool]) -> HashMap<String, usize> {
-        tools
-            .iter()
-            .enumerate()
-            .map(|(i, tool)| (tool.function.name.clone(), i))
-            .collect()
-    }
-
-    /// Ensure arrays have enough capacity for current_tool_id
-    fn ensure_capacity(&mut self) {
-        if self.current_tool_id < 0 {
-            return;
-        }
-
-        let needed_len = (self.current_tool_id + 1) as usize;
-
-        if self.prev_tool_call_arr.len() < needed_len {
-            self.prev_tool_call_arr
-                .resize_with(needed_len, || Value::Null);
-        }
-
-        if self.streamed_args_for_tool.len() < needed_len {
-            self.streamed_args_for_tool
-                .resize_with(needed_len, String::new);
-        }
-    }
-
-    /// Check if JSON is complete (basic check - just validates it parses)
-    fn is_complete_json(&self, json_str: &str) -> bool {
-        serde_json::from_str::<Value>(json_str).is_ok()
-    }
 }
 
 impl Default for KimiK2Parser {
@@ -230,7 +194,7 @@ impl ToolParser for KimiK2Parser {
         }
 
         // Build tool indices for validation
-        let tool_indices = self.get_tool_indices(tools);
+        let tool_indices = helpers::get_tool_indices(tools);
 
         let mut calls: Vec<ToolCallItem> = Vec::new();
 
@@ -245,6 +209,19 @@ impl ToolParser for KimiK2Parser {
 
                 // Parse function ID
                 if let Some((func_name, _index)) = self.parse_function_id(function_id) {
+                    // Validate tool name
+                    if !tool_indices.contains_key(&func_name) {
+                        // Invalid tool name - skip this tool, preserve indexing for next tool
+                        tracing::warn!("Invalid tool name '{}' - skipping", func_name);
+                        helpers::reset_current_tool_state(
+                            &mut self.buffer,
+                            &mut self.current_tool_name_sent,
+                            &mut self.streamed_args_for_tool,
+                            &self.prev_tool_call_arr,
+                        );
+                        return Ok(StreamingParseResult::default());
+                    }
+
                     // Initialize state if this is the first tool call
                     if self.current_tool_id == -1 {
                         self.current_tool_id = 0;
@@ -253,7 +230,11 @@ impl ToolParser for KimiK2Parser {
                     }
 
                     // Ensure we have enough entries in our tracking arrays
-                    self.ensure_capacity();
+                    helpers::ensure_capacity(
+                        self.current_tool_id,
+                        &mut self.prev_tool_call_arr,
+                        &mut self.streamed_args_for_tool,
+                    );
 
                     // Send tool name if not sent yet
                     if !self.current_tool_name_sent {
@@ -267,7 +248,8 @@ impl ToolParser for KimiK2Parser {
                         // Store the tool call info for serving layer completions endpoint
                         let tool_id = self.current_tool_id as usize;
                         if self.prev_tool_call_arr.len() <= tool_id {
-                            self.prev_tool_call_arr.resize_with(tool_id + 1, || Value::Null);
+                            self.prev_tool_call_arr
+                                .resize_with(tool_id + 1, || Value::Null);
                         }
                         self.prev_tool_call_arr[tool_id] = serde_json::json!({
                             "name": func_name,
@@ -282,11 +264,12 @@ impl ToolParser for KimiK2Parser {
                         };
 
                         // Split by end token before sending (like Python does)
-                        let parsed_args_diff = if let Some(pos) = argument_diff.find("<|tool_call_end|>") {
-                            &argument_diff[..pos]
-                        } else {
-                            argument_diff
-                        };
+                        let parsed_args_diff =
+                            if let Some(pos) = argument_diff.find("<|tool_call_end|>") {
+                                &argument_diff[..pos]
+                            } else {
+                                argument_diff
+                            };
 
                         if !parsed_args_diff.is_empty() {
                             calls.push(ToolCallItem {
@@ -303,18 +286,23 @@ impl ToolParser for KimiK2Parser {
                         }
 
                         // Check completeness - split by end token first
-                        let parsed_args = if let Some(pos) = function_args.find("<|tool_call_end|>") {
+                        let parsed_args = if let Some(pos) = function_args.find("<|tool_call_end|>")
+                        {
                             &function_args[..pos]
                         } else {
                             function_args
                         };
 
-                        if self.is_complete_json(parsed_args) {
+                        if helpers::is_complete_json(parsed_args) {
                             // Update the stored arguments
-                            if let Ok(parsed_args_value) = serde_json::from_str::<Value>(parsed_args) {
+                            if let Ok(parsed_args_value) =
+                                serde_json::from_str::<Value>(parsed_args)
+                            {
                                 let tool_id = self.current_tool_id as usize;
                                 if tool_id < self.prev_tool_call_arr.len() {
-                                    if let Some(obj) = self.prev_tool_call_arr[tool_id].as_object_mut() {
+                                    if let Some(obj) =
+                                        self.prev_tool_call_arr[tool_id].as_object_mut()
+                                    {
                                         obj.insert("arguments".to_string(), parsed_args_value);
                                     }
                                 }
@@ -347,15 +335,6 @@ impl ToolParser for KimiK2Parser {
             normal_text: String::new(),
             calls,
         })
-    }
-
-    fn reset(&mut self) {
-        self.buffer.clear();
-        self.prev_tool_call_arr.clear();
-        self.current_tool_id = -1;
-        self.current_tool_name_sent = false;
-        self.streamed_args_for_tool.clear();
-        self.last_arguments.clear();
     }
 
     fn detect_format(&self, text: &str) -> bool {
