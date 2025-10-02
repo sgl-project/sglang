@@ -1,6 +1,9 @@
 //! Kimi K2 Parser Integration Tests
 
-use sglang_router_rs::tool_parser::{KimiK2Parser, ParseState, StreamResult, ToolParser};
+use sglang_router_rs::tool_parser::{KimiK2Parser, ToolParser};
+
+mod common;
+use common::create_test_tools;
 
 #[tokio::test]
 async fn test_kimik2_complete_parsing() {
@@ -58,8 +61,9 @@ async fn test_kimik2_with_whitespace() {
 
 #[tokio::test]
 async fn test_kimik2_streaming() {
-    let parser = KimiK2Parser::new();
-    let mut state = ParseState::new();
+    let tools = create_test_tools();
+
+    let mut parser = KimiK2Parser::new();
 
     // Simulate streaming chunks
     let chunks = vec![
@@ -74,25 +78,19 @@ async fn test_kimik2_streaming() {
     ];
 
     let mut found_name = false;
-    let mut found_complete = false;
 
     for chunk in chunks {
-        let result = parser.parse_incremental(chunk, &mut state).await.unwrap();
+        let result = parser.parse_incremental(chunk, &tools).await.unwrap();
 
-        match result {
-            StreamResult::ToolName { name, .. } => {
+        for call in result.calls {
+            if let Some(name) = call.name {
                 assert_eq!(name, "calculate");
                 found_name = true;
             }
-            StreamResult::ToolComplete(tool) => {
-                assert_eq!(tool.function.name, "calculate");
-                found_complete = true;
-            }
-            _ => {}
         }
     }
 
-    assert!(found_name || found_complete);
+    assert!(found_name, "Should have found tool name during streaming");
 }
 
 #[test]
@@ -156,5 +154,5 @@ async fn test_namespace_extraction() {
 
     let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
     assert_eq!(tools.len(), 1);
-    assert_eq!(tools[0].function.name, "search"); // Should extract after last dot
+    assert_eq!(tools[0].function.name, "api.tools.search"); // Includes full namespace
 }
