@@ -127,9 +127,7 @@ HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
 # Store global states
 @dataclasses.dataclass
 class _GlobalState:
-    tokenizer_manager: Union[
-        TokenizerManager, MultiTokenizerRouter, MultiTokenizerManager
-    ]
+    tokenizer_manager: Union[TokenizerManager, MultiTokenizerRouter, TokenizerWorker]
     template_manager: TemplateManager
     scheduler_info: Dict
 
