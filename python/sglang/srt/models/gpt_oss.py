@@ -796,8 +796,7 @@ class GptOssForCausalLM(nn.Module):
             weight = weight.cuda()
 
             # Extract layer_id from name like "model.layers.6.mlp.experts..."
-            pp_size = (self.pp_group.world_size,)
-            if pp_size:
+            if self.pp_group.world_size > 1:
                 parts = name.split(".")
                 if len(parts) >= 3 and parts[0] == "model" and parts[1] == "layers":
                     layer_id = int(parts[2])
