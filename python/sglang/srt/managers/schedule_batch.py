@@ -632,8 +632,6 @@ class Req:
         self.metrics_collector = metrics_collector
         self.time_stats: TimeStats = TimeStats(disagg_mode=disagg_mode)
         self.has_log_time_stats: bool = False
-        self.prefill_start_time = None
-        self.prefill_end_time = None
         self.last_tic = time.monotonic()
 
         # For disaggregation

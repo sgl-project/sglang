@@ -633,19 +633,21 @@ class SchedulerOutputProcessorMixin:
                 queue_times.append(req.time_stats.get_queueing_time())
                 inference_start_times.append(req.time_stats.forward_entry_time)
 
-                if req.prefill_start_time is not None:
+                if req.time_stats.prefill_start_time > 0.0:
                     prefill_delays.append(
-                        req.prefill_start_time - req.time_stats.forward_entry_time
+                        req.time_stats.prefill_start_time
+                        - req.time_stats.forward_entry_time
                     )
                 else:
                     prefill_delays.append(None)
 
                 if (
-                    req.prefill_start_time is not None
-                    and req.prefill_end_time is not None
+                    req.time_stats.prefill_start_time > 0.0
+                    and req.time_stats.prefill_end_time > 0.0
                 ):
                     prefill_latencies.append(
-                        req.prefill_end_time - req.prefill_start_time
+                        req.time_stats.prefill_end_time
+                        - req.time_stats.prefill_start_time
                     )
                 else:
                     prefill_latencies.append(None)
@@ -797,19 +799,21 @@ class SchedulerOutputProcessorMixin:
                 queue_times.append(req.time_stats.get_queueing_time())
                 inference_start_times.append(req.time_stats.forward_entry_time)
 
-                if req.prefill_start_time is not None:
+                if req.time_stats.prefill_start_time > 0.0:
                     prefill_delays.append(
-                        req.prefill_start_time - req.time_stats.forward_entry_time
+                        req.time_stats.prefill_start_time
+                        - req.time_stats.forward_entry_time
                     )
                 else:
                     prefill_delays.append(None)
 
                 if (
-                    req.prefill_start_time is not None
-                    and req.prefill_end_time is not None
+                    req.time_stats.prefill_start_time > 0.0
+                    and req.time_stats.prefill_end_time > 0.0
                 ):
                     prefill_latencies.append(
-                        req.prefill_end_time - req.prefill_start_time
+                        req.time_stats.prefill_end_time
+                        - req.time_stats.prefill_start_time
                     )
                 else:
                     prefill_latencies.append(None)
