@@ -28,7 +28,7 @@ class TestHiCache(CustomTestCase):
                 "--mem-fraction-static",
                 0.7,
                 "--hicache-size",
-                100 if not _is_hip else 170,
+                100 if not _is_hip else 200,
             ],
         )
 
