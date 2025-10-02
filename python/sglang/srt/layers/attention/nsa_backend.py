@@ -126,18 +126,13 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
             return fast_topk_impl(logits, self.get_seqlens_expanded(), topk)
 
         # NOTE(dark): if fused, we return a transformed page table directly
-        dst_page_table = torch.empty(
-            (logits.shape[0], topk), dtype=torch.int32, device=logits.device
-        )
-        fast_topk_transform_fused_cuda(
+        return fast_topk_transform_fused_cuda(
             input=logits,
             seq_lens=self.get_seqlens_expanded(),
             topk=topk,
-            dst_page_table=dst_page_table,
             src_page_table=self.attn_metadata.page_table_1,
             cu_seqlens_q=self.attn_metadata.cu_seqlens_q,
         )
-        return dst_page_table
 
 
 def compute_cu_seqlens(seqlens: torch.Tensor) -> torch.Tensor:

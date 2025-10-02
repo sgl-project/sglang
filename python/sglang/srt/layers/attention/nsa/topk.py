@@ -48,7 +48,6 @@ def fast_topk_transform_fused_cuda(
     input: torch.Tensor,
     seq_lens: torch.Tensor,
     topk: int,
-    dst_page_table: torch.Tensor,
     src_page_table: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     alignment: int = _TOPK_ALIGNMENT,
@@ -56,10 +55,13 @@ def fast_topk_transform_fused_cuda(
     from sglang.srt.layers.attention.nsa.cuda import fast_topk_transform
 
     assert topk == 2048 and topk % alignment == 0
+    dst_page_table = torch.empty(
+        (input.shape[0], topk), dtype=torch.int32, device=input.device
+    )
     return fast_topk_transform(
         score=input,
         lengths=seq_lens,
         dst_page_table=dst_page_table,
         src_page_table=src_page_table,
-        cu_seqlens=cu_seqlens_q,
+        cu_seqlens_q=cu_seqlens_q,
     )

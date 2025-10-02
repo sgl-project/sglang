@@ -814,7 +814,7 @@ class ServerArgs:
                 self.page_size = 64
                 logger.warning("Setting page size to 64 for DeepSeek NSA.")
 
-                self.max_prefill_bs = 1
+                # self.max_prefill_bs = 1
                 logger.warning(
                     "Setting maximum prefill batch size to 1 for DeepSeek NSA."
                 )
