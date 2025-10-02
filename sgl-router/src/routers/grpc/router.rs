@@ -25,8 +25,8 @@ use crate::protocols::spec::{
     ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse,
     ChatCompletionStreamResponse, ChatMessageDelta, ChatStreamChoice, CompletionRequest,
     EmbeddingRequest, FunctionCallDelta, FunctionCallResponse, GenerateRequest, RerankRequest,
-    ResponsesGetParams, ResponsesRequest, StringOrArray, Tool, ToolCall, ToolCallDelta,
-    ToolChoice, ToolChoiceValue, Usage,
+    ResponsesGetParams, ResponsesRequest, StringOrArray, Tool, ToolCall, ToolCallDelta, ToolChoice,
+    ToolChoiceValue, Usage,
 };
 use crate::reasoning_parser::{ParserResult, ReasoningParserFactory};
 use crate::routers::RouterTrait;
@@ -972,7 +972,7 @@ impl GrpcRouter {
             format!("functions.{}:{}", tool_name, history_count + tool_index)
         } else {
             // Standard OpenAI format: call_{24-char-uuid}
-            format!("call_{}", uuid::Uuid::new_v4().simple().to_string()[..24].to_string())
+            format!("call_{}", &Uuid::new_v4().simple().to_string()[..24])
         }
     }
 
@@ -1024,10 +1024,9 @@ impl GrpcRouter {
         created: u64,
     ) -> (String, Option<ChatCompletionStreamResponse>) {
         // Get or create parser for this index
-        if !reasoning_parsers.contains_key(&index) {
-            let pooled = self.reasoning_parser_factory.get_pooled(model);
-            reasoning_parsers.insert(index, pooled);
-        }
+        reasoning_parsers
+            .entry(index)
+            .or_insert_with(|| self.reasoning_parser_factory.get_pooled(model));
 
         if let Some(pooled_parser) = reasoning_parsers.get(&index) {
             let parse_result = {
@@ -1077,6 +1076,7 @@ impl GrpcRouter {
 
     /// Helper: Process tool calls in streaming mode
     /// Returns (should_skip_content, chunks_to_emit)
+    #[allow(clippy::too_many_arguments)]
     async fn process_tool_calls_stream(
         &self,
         delta: &str,
@@ -1095,10 +1095,9 @@ impl GrpcRouter {
         let mut chunks = Vec::new();
 
         // Get or create parser for this index
-        if !tool_parsers.contains_key(&index) {
-            let pooled = self.tool_parser_factory.get_pooled(model);
-            tool_parsers.insert(index, pooled);
-        }
+        tool_parsers
+            .entry(index)
+            .or_insert_with(|| self.tool_parser_factory.get_pooled(model));
 
         if let Some(pooled_parser) = tool_parsers.get(&index) {
             let mut parser = pooled_parser.lock().await;
@@ -1347,7 +1346,7 @@ impl GrpcRouter {
                         };
 
                         // Initialize stream buffer if first time
-                        let stream_buffer = stream_buffers.entry(index).or_insert_with(String::new);
+                        let stream_buffer = stream_buffers.entry(index).or_default();
 
                         // Send first chunk with role
                         if is_firsts.get(&index).copied().unwrap_or(true) {
@@ -1441,7 +1440,7 @@ impl GrpcRouter {
                         if let SequenceDecoderOutput::Text(text) = stop_decoder.flush() {
                             if !text.is_empty() {
                                 let index = complete.index;
-                                let stream_buffer = stream_buffers.entry(index).or_insert_with(String::new);
+                                let stream_buffer = stream_buffers.entry(index).or_default();
                                 stream_buffer.push_str(&text);
 
                                 let content_chunk = ChatCompletionStreamResponse {
