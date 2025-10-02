@@ -227,6 +227,25 @@ class GenerationBatchResult:
             can_run_cuda_graph=forward_batch_output.can_run_cuda_graph,
         )
 
+    @classmethod
+    def from_pp_proxy(
+        cls, logits_output, next_pp_outputs: PPProxyTensors, can_run_cuda_graph
+    ):
+        # TODO(lsyin): also simplify this logic
+        # Current PP implementation in scheduler is not compatible with ForwardBatchOutput
+        # Maybe introduce a ProxyBatchOutput for PP and the original ForwardBatchOutput for TP
+        proxy_dict = next_pp_outputs.tensors
+        return cls(
+            logits_output=logits_output,
+            pp_hidden_states_proxy_tensors=None,
+            next_token_ids=next_pp_outputs["next_token_ids"],
+            extend_input_len_per_req=proxy_dict.get("extend_input_len_per_req", None),
+            extend_logprob_start_len_per_req=proxy_dict.get(
+                "extend_logprob_start_len_per_req", None
+            ),
+            can_run_cuda_graph=can_run_cuda_graph,
+        )
+
 
 @dataclass
 class EmbeddingBatchResult:
@@ -984,7 +1003,6 @@ class Scheduler(
         self.running_mbs = [
             ScheduleBatch(reqs=[], batch_is_full=False) for _ in range(self.pp_size)
         ]
-        bids = [None] * self.pp_size
         pp_outputs: Optional[PPProxyTensors] = None
         while True:
             server_is_idle = True
@@ -1053,16 +1071,10 @@ class Scheduler(
                         logits_output = LogitsProcessorOutput(**logits_output_args)
                     else:
                         logits_output = None
-                    output_result = GenerationBatchResult(
+
+                    output_result = GenerationBatchResult.from_pp_proxy(
                         logits_output=logits_output,
-                        pp_hidden_states_proxy_tensors=None,
-                        next_token_ids=next_pp_outputs["next_token_ids"],
-                        extend_input_len_per_req=next_pp_outputs.tensors.get(
-                            "extend_input_len_per_req", None
-                        ),
-                        extend_logprob_start_len_per_req=next_pp_outputs.tensors.get(
-                            "extend_logprob_start_len_per_req", None
-                        ),
+                        next_pp_outputs=next_pp_outputs,
                         can_run_cuda_graph=result.can_run_cuda_graph,
                     )
                     self.process_batch_result(mbs[next_mb_id], output_result)
