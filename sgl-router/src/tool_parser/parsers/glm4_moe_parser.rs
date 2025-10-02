@@ -2,11 +2,12 @@ use async_trait::async_trait;
 use regex::Regex;
 use serde_json::Value;
 
+use crate::protocols::spec::Tool;
+
 use crate::tool_parser::{
     errors::{ToolParserError, ToolParserResult},
-    state::ParseState,
     traits::ToolParser,
-    types::{FunctionCall, StreamResult, ToolCall},
+    types::{FunctionCall, StreamingParseResult, ToolCall, ToolCallItem},
 };
 
 /// GLM-4 MoE format parser for tool calls
@@ -25,6 +26,22 @@ pub struct Glm4MoeParser {
     func_detail_extractor: Regex,
     /// Regex for extracting argument key-value pairs
     arg_extractor: Regex,
+
+    /// Buffer for accumulating incomplete patterns across chunks
+    buffer: String,
+
+    /// Stores complete tool call info (name and arguments) for each tool being parsed
+    prev_tool_call_arr: Vec<Value>,
+
+    /// Index of currently streaming tool call (-1 means no active tool)
+    current_tool_id: i32,
+
+    /// Tracks raw JSON string content streamed to client for each tool's arguments
+    streamed_args_for_tool: Vec<String>,
+
+    /// Token configuration
+    bot_token: &'static str,
+    eot_token: &'static str,
 }
 
 impl Glm4MoeParser {
@@ -44,12 +61,18 @@ impl Glm4MoeParser {
             tool_call_extractor,
             func_detail_extractor,
             arg_extractor,
+            buffer: String::new(),
+            prev_tool_call_arr: Vec::new(),
+            current_tool_id: -1,
+            streamed_args_for_tool: Vec::new(),
+            bot_token: "<tool_call>",
+            eot_token: "</tool_call>",
         }
     }
 
     /// Check if text contains GLM-4 MoE tool markers
     fn has_tool_markers(&self, text: &str) -> bool {
-        text.contains("<tool_call>")
+        text.contains(self.bot_token)
     }
 
     /// Parse arguments from key-value pairs
@@ -120,6 +143,59 @@ impl Glm4MoeParser {
             Ok(None)
         }
     }
+
+    /// Parse and return StreamingParseResult (mirrors Python's detect_and_parse)
+    fn detect_and_parse(&self, text: &str, _tools: &[Tool]) -> ToolParserResult<StreamingParseResult> {
+        let idx = text.find(self.bot_token);
+        let normal_text = if let Some(pos) = idx {
+            text[..pos].trim().to_string()
+        } else {
+            text.to_string()
+        };
+
+        if !self.has_tool_markers(text) {
+            return Ok(StreamingParseResult {
+                normal_text,
+                calls: vec![],
+            });
+        }
+
+        let mut calls = Vec::new();
+        let match_result_list: Vec<_> = self.tool_call_extractor.find_iter(text).collect();
+
+        for mat in match_result_list {
+            // Get function name
+            if let Ok(Some(tool_call)) = self.parse_tool_call(mat.as_str()) {
+                // Extract just the name and parameters for ToolCallItem
+                calls.push(ToolCallItem {
+                    tool_index: 0, // Will be set by caller
+                    name: Some(tool_call.function.name.clone()),
+                    parameters: tool_call.function.arguments,
+                });
+            }
+        }
+
+        Ok(StreamingParseResult { normal_text, calls })
+    }
+
+    /// Ensure arrays have enough capacity for current_tool_id
+    fn ensure_capacity(&mut self) {
+        if self.current_tool_id < 0 {
+            return;
+        }
+
+        let needed_len = (self.current_tool_id + 1) as usize;
+
+        if self.prev_tool_call_arr.len() < needed_len {
+            self.prev_tool_call_arr
+                .resize_with(needed_len, || Value::Null);
+        }
+
+        if self.streamed_args_for_tool.len() < needed_len {
+            self.streamed_args_for_tool
+                .resize_with(needed_len, String::new);
+        }
+    }
 }
 
 impl Default for Glm4MoeParser {
@@ -162,78 +238,100 @@ impl ToolParser for Glm4MoeParser {
     }
 
     async fn parse_incremental(
-        &self,
+        &mut self,
         chunk: &str,
-        state: &mut ParseState,
-    ) -> ToolParserResult<StreamResult> {
-        state.buffer.push_str(chunk);
+        tools: &[Tool],
+    ) -> ToolParserResult<StreamingParseResult> {
+        // Python logic: Wait for complete tool call, then parse it all at once
+        self.buffer.push_str(chunk);
+        let current_text = &self.buffer.clone();
 
-        // Check for tool markers
-        if !self.has_tool_markers(&state.buffer) {
-            // No tool markers detected - return all buffered content as normal text
-            let normal_text = std::mem::take(&mut state.buffer);
-            return Ok(StreamResult::NormalText(normal_text));
-        }
-
-        // Check for text before tool markers and extract it as normal text
-        if let Some(marker_pos) = state.buffer.find("<tool_call>") {
-            if marker_pos > 0 {
-                // We have text before the tool marker - extract it as normal text
-                let normal_text: String = state.buffer.drain(..marker_pos).collect();
-                return Ok(StreamResult::NormalText(normal_text));
-            }
-        }
-
-        // Look for start of tool call
-        if let Some(start_pos) = state.buffer.find("<tool_call>") {
-            // Look for the end of this tool call
-            let search_from = start_pos + "<tool_call>".len();
-            if let Some(end_pos) = state.buffer[search_from..].find("</tool_call>") {
-                let end_abs = search_from + end_pos + "</tool_call>".len();
-
-                // Extract and parse the complete tool call
-                let tool_call_text = &state.buffer[start_pos..end_abs];
-
-                if let Some(tool) = self.parse_tool_call(tool_call_text)? {
-                    // Remove the processed part from buffer
-                    state.buffer.drain(..end_abs);
-
-                    return Ok(StreamResult::ToolComplete(tool));
-                }
+        // Check if we have bot_token
+        let start = current_text.find(self.bot_token);
+        if start.is_none() {
+            self.buffer.clear();
+            // If we're in the middle of streaming (current_tool_id > 0), don't return text
+            let normal_text = if self.current_tool_id > 0 {
+                String::new()
             } else {
-                // Tool call not complete yet, try to extract partial info
-                let partial = &state.buffer[search_from..];
+                current_text.clone()
+            };
+            return Ok(StreamingParseResult {
+                normal_text,
+                calls: vec![],
+            });
+        }
 
-                // Try to extract function name (first line after <tool_call>)
-                if let Some(name_end) = partial.find('\n') {
-                    let func_name = partial[..name_end].trim();
+        // Check if we have eot_token (end of tool call)
+        let end = current_text.find(self.eot_token);
+        if let Some(end_pos) = end {
+            // We have a complete tool call!
 
-                    if !func_name.is_empty() && !state.in_string {
-                        state.in_string = true; // Mark name as sent
-                        return Ok(StreamResult::ToolName {
-                            index: 0,
-                            name: func_name.to_string(),
-                        });
-                    }
+            // Initialize state if this is the first tool call
+            if self.current_tool_id == -1 {
+                self.current_tool_id = 0;
+                self.prev_tool_call_arr = Vec::new();
+                self.streamed_args_for_tool = vec![String::new()];
+            }
 
-                    // Try to extract partial arguments
-                    let args_text = &partial[name_end + 1..];
-                    let partial_args = self.parse_arguments(args_text)?;
+            // Ensure we have enough entries in our tracking arrays
+            self.ensure_capacity();
 
-                    if !partial_args.is_empty() {
-                        let args_str = serde_json::to_string(&partial_args)
-                            .unwrap_or_else(|_| "{}".to_string());
+            // Parse the complete block using detect_and_parse
+            let block_end = end_pos + self.eot_token.len();
+            let mut result = self.detect_and_parse(&current_text[..block_end], tools)?;
 
-                        return Ok(StreamResult::ToolArguments {
-                            index: 0,
-                            arguments: args_str,
+            if !result.calls.is_empty() {
+                // Take the first call and set its tool_index
+                let call = &mut result.calls[0];
+                call.tool_index = self.current_tool_id as usize;
+
+                // Store in tracking arrays
+                let tool_id = self.current_tool_id as usize;
+                if self.prev_tool_call_arr.len() <= tool_id {
+                    self.prev_tool_call_arr.resize_with(tool_id + 1, || Value::Null);
+                }
+
+                // Parse parameters as JSON and store
+                if let (Some(name), params) = (call.name.as_ref(), &call.parameters) {
+                    if let Ok(args) = serde_json::from_str::<Value>(params) {
+                        self.prev_tool_call_arr[tool_id] = serde_json::json!({
+                            "name": name,
+                            "arguments": args,
                         });
                     }
                 }
+
+                if self.streamed_args_for_tool.len() <= tool_id {
+                    self.streamed_args_for_tool
+                        .resize_with(tool_id + 1, String::new);
+                }
+                self.streamed_args_for_tool[tool_id] = call.parameters.clone();
+
+                self.current_tool_id += 1;
             }
+
+            // Remove processed portion from buffer
+            self.buffer = current_text[block_end..].to_string();
+            return Ok(result);
         }
 
-        Ok(StreamResult::Incomplete)
+        // No complete tool call yet - return normal text before start token
+        let start_pos = start.unwrap();
+        let normal_text = current_text[..start_pos].to_string();
+        self.buffer = current_text[start_pos..].to_string();
+
+        Ok(StreamingParseResult {
+            normal_text,
+            calls: vec![],
+        })
+    }
+
+    fn reset(&mut self) {
+        self.buffer.clear();
+        self.prev_tool_call_arr.clear();
+        self.current_tool_id = -1;
+        self.streamed_args_for_tool.clear();
     }
 
     fn detect_format(&self, text: &str) -> bool {

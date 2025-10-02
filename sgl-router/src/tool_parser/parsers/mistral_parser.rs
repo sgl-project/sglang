@@ -1,12 +1,14 @@
 use async_trait::async_trait;
 use serde_json::Value;
+use std::collections::HashMap;
+
+use crate::protocols::spec::Tool;
 
 use crate::tool_parser::{
     errors::{ToolParserError, ToolParserResult},
     partial_json::PartialJson,
-    state::ParseState,
     traits::ToolParser,
-    types::{FunctionCall, StreamResult, ToolCall},
+    types::{FunctionCall, StreamingParseResult, ToolCall, ToolCallItem},
 };
 
 /// Mistral format parser for tool calls
@@ -21,6 +23,26 @@ use crate::tool_parser::{
 pub struct MistralParser {
     /// Parser for handling incomplete JSON during streaming
     partial_json: PartialJson,
+
+    /// Buffer for accumulating incomplete patterns across chunks
+    buffer: String,
+
+    /// Stores complete tool call info (name and arguments) for each tool being parsed
+    prev_tool_call_arr: Vec<Value>,
+
+    /// Index of currently streaming tool call (-1 means no active tool)
+    current_tool_id: i32,
+
+    /// Flag for whether current tool's name has been sent to client
+    current_tool_name_sent: bool,
+
+    /// Tracks raw JSON string content streamed to client for each tool's arguments
+    streamed_args_for_tool: Vec<String>,
+
+    /// Token configuration
+    bot_token: &'static str,
+    eot_token: &'static str,
+    tool_call_separator: &'static str,
 }
 
 impl MistralParser {
@@ -28,6 +50,14 @@ impl MistralParser {
     pub fn new() -> Self {
         Self {
             partial_json: PartialJson::default(),
+            buffer: String::new(),
+            prev_tool_call_arr: Vec::new(),
+            current_tool_id: -1,
+            current_tool_name_sent: false,
+            streamed_args_for_tool: Vec::new(),
+            bot_token: "[TOOL_CALLS] [",
+            eot_token: "]",
+            tool_call_separator: ", ",
         }
     }
 
@@ -148,6 +178,50 @@ impl MistralParser {
     fn has_tool_markers(&self, text: &str) -> bool {
         text.contains("[TOOL_CALLS]")
     }
+
+    /// Get a mapping of tool names to their indices
+    fn get_tool_indices(&self, tools: &[Tool]) -> HashMap<String, usize> {
+        tools
+            .iter()
+            .enumerate()
+            .map(|(i, tool)| (tool.function.name.clone(), i))
+            .collect()
+    }
+
+    /// Check if buffer ends with a partial bot_token
+    fn ends_with_partial_token(&self, buffer: &str, bot_token: &str) -> bool {
+        if bot_token.is_empty() {
+            return false;
+        }
+
+        for i in 1..=buffer.len().min(bot_token.len()) {
+            if let Some(buffer_end) = buffer.get(buffer.len() - i..) {
+                if bot_token.starts_with(buffer_end) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Ensure arrays have enough capacity for current_tool_id
+    fn ensure_capacity(&mut self) {
+        if self.current_tool_id < 0 {
+            return;
+        }
+
+        let needed_len = (self.current_tool_id + 1) as usize;
+
+        if self.prev_tool_call_arr.len() < needed_len {
+            self.prev_tool_call_arr
+                .resize_with(needed_len, || Value::Null);
+        }
+
+        if self.streamed_args_for_tool.len() < needed_len {
+            self.streamed_args_for_tool
+                .resize_with(needed_len, String::new);
+        }
+    }
 }
 
 impl Default for MistralParser {
@@ -188,95 +262,217 @@ impl ToolParser for MistralParser {
     }
 
     async fn parse_incremental(
-        &self,
+        &mut self,
         chunk: &str,
-        state: &mut ParseState,
-    ) -> ToolParserResult<StreamResult> {
-        state.buffer.push_str(chunk);
+        tools: &[Tool],
+    ) -> ToolParserResult<StreamingParseResult> {
+        // Append new text to buffer
+        self.buffer.push_str(chunk);
+        let current_text = &self.buffer.clone();
 
-        // Check if we have the start marker
-        if !self.has_tool_markers(&state.buffer) {
-            // No tool markers detected - return all buffered content as normal text
-            let normal_text = std::mem::take(&mut state.buffer);
-            return Ok(StreamResult::NormalText(normal_text));
-        }
+        // Check if current_text has tool_call
+        let has_tool_start = self.has_tool_markers(current_text)
+            || (self.current_tool_id >= 0
+                && current_text.starts_with(self.tool_call_separator));
 
-        // Check for text before [TOOL_CALLS] and extract it as normal text
-        if let Some(marker_pos) = state.buffer.find("[TOOL_CALLS]") {
-            if marker_pos > 0 {
-                // We have text before the tool marker - extract it as normal text
-                let normal_text: String = state.buffer.drain(..marker_pos).collect();
-                return Ok(StreamResult::NormalText(normal_text));
+        if !has_tool_start {
+            // Only clear buffer if we're sure no tool call is starting
+            if !self.ends_with_partial_token(&self.buffer, self.bot_token) {
+                let normal_text = self.buffer.clone();
+                self.buffer.clear();
+
+                // Remove eot_token if present
+                let normal_text = if !self.eot_token.is_empty() {
+                    normal_text.replace(self.eot_token, "")
+                } else {
+                    normal_text
+                };
+
+                return Ok(StreamingParseResult {
+                    normal_text,
+                    calls: vec![],
+                });
+            } else {
+                // Might be partial bot_token, keep buffering
+                return Ok(StreamingParseResult::default());
             }
         }
 
-        // Try to extract complete JSON array
-        if let Some(json_array) = self.extract_json_array(&state.buffer) {
-            // Parse with partial JSON to handle incomplete content
-            match self.partial_json.parse_value(json_array) {
-                Ok((value, consumed)) => {
-                    // Check if we have a complete JSON structure
-                    if consumed == json_array.len() {
-                        // Complete JSON, parse tool calls
-                        let tools = if let Value::Array(arr) = value {
-                            let mut result = Vec::new();
-                            for (index, item) in arr.iter().enumerate() {
-                                if let Some(tool) = self.parse_single_object(item, index)? {
-                                    result.push(tool);
-                                }
-                            }
-                            result
-                        } else {
-                            vec![]
-                        };
+        // Build tool indices
+        let tool_indices = self.get_tool_indices(tools);
 
-                        if !tools.is_empty() {
-                            // Clear buffer since we consumed everything
-                            state.buffer.clear();
+        // Determine start index for JSON parsing
+        let start_idx = if let Some(pos) = current_text.find(self.bot_token) {
+            pos + self.bot_token.len()
+        } else if self.current_tool_id >= 0
+            && current_text.starts_with(self.tool_call_separator)
+        {
+            self.tool_call_separator.len()
+        } else {
+            0
+        };
 
-                            // Return the first tool (simplified for Phase 3)
-                            // Full multi-tool streaming will be implemented later
-                            if let Some(tool) = tools.into_iter().next() {
-                                return Ok(StreamResult::ToolComplete(tool));
-                            }
-                        }
-                    } else {
-                        // Partial JSON - try to extract tool name for streaming
-                        if let Value::Array(arr) = value {
-                            if let Some(first_tool) = arr.first() {
-                                if let Some(name) = first_tool.get("name").and_then(|v| v.as_str())
-                                {
-                                    // Check if we've already sent the name
-                                    if !state.in_string {
-                                        state.in_string = true; // Use as flag for "name sent"
-                                        return Ok(StreamResult::ToolName {
-                                            index: 0,
-                                            name: name.to_string(),
-                                        });
-                                    }
+        if start_idx >= current_text.len() {
+            return Ok(StreamingParseResult::default());
+        }
 
-                                    // Check for arguments
-                                    if let Some(args) = first_tool.get("arguments") {
-                                        if let Ok(args_str) = serde_json::to_string(args) {
-                                            return Ok(StreamResult::ToolArguments {
-                                                index: 0,
-                                                arguments: args_str,
-                                            });
-                                        }
-                                    }
-                                }
-                            }
-                        }
+        // Parse partial JSON
+        let json_str = &current_text[start_idx..];
+
+        let (obj, end_idx) = match self.partial_json.parse_value(json_str) {
+            Ok(result) => result,
+            Err(_) => {
+                return Ok(StreamingParseResult::default());
+            }
+        };
+
+        // Check if JSON is complete
+        let is_complete =
+            end_idx == json_str.len() && serde_json::from_str::<Value>(json_str).is_ok();
+
+        // Validate tool name if present
+        if let Some(name) = obj.get("name").and_then(|v| v.as_str()) {
+            if !tool_indices.contains_key(name) {
+                // Invalid tool name - reset state
+                self.buffer.clear();
+                self.current_tool_id = -1;
+                self.current_tool_name_sent = false;
+                if !self.streamed_args_for_tool.is_empty() {
+                    self.streamed_args_for_tool.pop();
+                }
+                return Ok(StreamingParseResult::default());
+            }
+        }
+
+        // Handle parameters/arguments aliasing
+        let current_tool_call = if obj.get("arguments").is_none() {
+            if let Some(params) = obj.get("parameters") {
+                let mut cloned = obj.clone();
+                if let Value::Object(ref mut map) = cloned {
+                    map.insert("arguments".to_string(), params.clone());
+                }
+                cloned
+            } else {
+                obj.clone()
+            }
+        } else {
+            obj.clone()
+        };
+
+        let mut result = StreamingParseResult::default();
+
+        // Case 1: Handle tool name streaming
+        if !self.current_tool_name_sent {
+            if let Some(function_name) = current_tool_call.get("name").and_then(|v| v.as_str()) {
+                if tool_indices.contains_key(function_name) {
+                    // Initialize if first tool
+                    if self.current_tool_id == -1 {
+                        self.current_tool_id = 0;
+                        self.streamed_args_for_tool.push(String::new());
+                    } else if self.current_tool_id as usize >= self.streamed_args_for_tool.len() {
+                        // Ensure capacity for subsequent tools
+                        self.ensure_capacity();
+                    }
+
+                    // Send tool name with empty parameters
+                    self.current_tool_name_sent = true;
+                    result.calls.push(ToolCallItem {
+                        tool_index: self.current_tool_id as usize,
+                        name: Some(function_name.to_string()),
+                        parameters: String::new(),
+                    });
+                }
+            }
+        }
+        // Case 2: Handle streaming arguments
+        else {
+            if let Some(cur_arguments) = current_tool_call.get("arguments") {
+                let tool_id = self.current_tool_id as usize;
+                let sent = self
+                    .streamed_args_for_tool
+                    .get(tool_id)
+                    .map(|s| s.len())
+                    .unwrap_or(0);
+                let cur_args_json = serde_json::to_string(cur_arguments)
+                    .map_err(|e| ToolParserError::ParsingFailed(e.to_string()))?;
+
+                let prev_arguments = self
+                    .prev_tool_call_arr
+                    .get(tool_id)
+                    .and_then(|v| v.get("arguments"));
+
+                let mut argument_diff: Option<String> = None;
+
+                // If JSON is complete, send all remaining arguments
+                if is_complete {
+                    argument_diff = Some(cur_args_json[sent..].to_string());
+
+                    // Remove processed portion, keep unprocessed content
+                    self.buffer = current_text[start_idx + end_idx..].to_string();
+
+                    // Clear completed tool data
+                    if tool_id < self.prev_tool_call_arr.len() {
+                        self.prev_tool_call_arr[tool_id] = Value::Null;
+                    }
+                    self.current_tool_name_sent = false;
+                    if tool_id < self.streamed_args_for_tool.len() {
+                        self.streamed_args_for_tool[tool_id].clear();
+                    }
+                    self.current_tool_id += 1;
+                }
+                // If still parsing, send incremental changes
+                else if let Some(prev_args) = prev_arguments {
+                    let prev_args_json = serde_json::to_string(prev_args)
+                        .map_err(|e| ToolParserError::ParsingFailed(e.to_string()))?;
+
+                    if cur_args_json != prev_args_json {
+                        // Find common prefix
+                        let prefix: String = prev_args_json
+                            .chars()
+                            .zip(cur_args_json.chars())
+                            .take_while(|(c1, c2)| c1 == c2)
+                            .map(|(c, _)| c)
+                            .collect();
+                        argument_diff = Some(prefix[sent..].to_string());
                     }
                 }
-                Err(_) => {
-                    // Failed to parse even as partial JSON
-                    // Keep buffering
+
+                // Send the argument diff if there's something new
+                if let Some(diff) = argument_diff {
+                    if !diff.is_empty() {
+                        if !is_complete && tool_id < self.streamed_args_for_tool.len() {
+                            self.streamed_args_for_tool[tool_id].push_str(&diff);
+                        }
+
+                        result.calls.push(ToolCallItem {
+                            tool_index: tool_id,
+                            name: None,
+                            parameters: diff,
+                        });
+                    }
                 }
             }
         }
 
-        Ok(StreamResult::Incomplete)
+        // Update prev_tool_call_arr with current state
+        if self.current_tool_id >= 0 {
+            self.ensure_capacity();
+            let tool_id = self.current_tool_id as usize;
+
+            if tool_id < self.prev_tool_call_arr.len() {
+                self.prev_tool_call_arr[tool_id] = current_tool_call;
+            }
+        }
+
+        Ok(result)
+    }
+
+    fn reset(&mut self) {
+        self.buffer.clear();
+        self.prev_tool_call_arr.clear();
+        self.current_tool_id = -1;
+        self.current_tool_name_sent = false;
+        self.streamed_args_for_tool.clear();
     }
 
     fn detect_format(&self, text: &str) -> bool {
