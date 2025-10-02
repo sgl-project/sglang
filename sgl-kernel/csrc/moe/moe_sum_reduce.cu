@@ -27,20 +27,20 @@ __device__ __forceinline__ T from_acc(opmath_t<T> x) {
 
 template <>
 __device__ __forceinline__ opmath_t<at::Half> to_acc<at::Half>(at::Half x) {
-  return static_cast<float>(x);
+  return __half2float(__nv_half(x));
 }
 template <>
 __device__ __forceinline__ at::Half from_acc<at::Half>(opmath_t<at::Half> x) {
-  return static_cast<at::Half>(x);
+  return __float2half_rn(x);
 }
 
 template <>
 __device__ __forceinline__ opmath_t<at::BFloat16> to_acc<at::BFloat16>(at::BFloat16 x) {
-  return static_cast<float>(x);
+  return __bfloat162float(__nv_bfloat16(x));
 }
 template <>
 __device__ __forceinline__ at::BFloat16 from_acc<at::BFloat16>(opmath_t<at::BFloat16> x) {
-  return static_cast<at::BFloat16>(x);
+  return __float2bfloat16_rn(x);
 }
 
 template <typename T>
@@ -292,66 +292,50 @@ void moe_sum_reduce(at::Tensor& input, at::Tensor& output, double routed_scaling
     dim3 block(block_size);
     dim3 grid(static_cast<unsigned>(grid_x), static_cast<unsigned>(grid_y));
 
+#define LAUNCH_SMALL_TOKEN_KERNEL(TOPK)                               \
+  moe_sum_reduce_kernel<scalar_t_, TOPK><<<grid, block, 0, stream>>>( \
+      input.data_ptr<scalar_t_>(),                                    \
+      output.data_ptr<scalar_t_>(),                                   \
+      token_num,                                                      \
+      hidden_dim,                                                     \
+      in_stride_token,                                                \
+      in_stride_topk,                                                 \
+      out_stride_token,                                               \
+      scale);
+
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::kHalf, at::kBFloat16, input.scalar_type(), "moe_sum_reduce_cuda_small_token", [&] {
           using scalar_t_ = scalar_t;
           using acc_t_ = opmath_t<scalar_t_>;
           const acc_t_ scale = static_cast<acc_t_>(routed_scaling_factor);
 
-          if (topk_num == 2) {
-            moe_sum_reduce_kernel<scalar_t_, 2><<<grid, block, 0, stream>>>(
-                input.data_ptr<scalar_t_>(),
-                output.data_ptr<scalar_t_>(),
-                token_num,
-                hidden_dim,
-                in_stride_token,
-                in_stride_topk,
-                out_stride_token,
-                scale);
-          } else if (topk_num == 4) {
-            moe_sum_reduce_kernel<scalar_t_, 4><<<grid, block, 0, stream>>>(
-                input.data_ptr<scalar_t_>(),
-                output.data_ptr<scalar_t_>(),
-                token_num,
-                hidden_dim,
-                in_stride_token,
-                in_stride_topk,
-                out_stride_token,
-                scale);
-          } else if (topk_num == 8) {
-            moe_sum_reduce_kernel<scalar_t_, 8><<<grid, block, 0, stream>>>(
-                input.data_ptr<scalar_t_>(),
-                output.data_ptr<scalar_t_>(),
-                token_num,
-                hidden_dim,
-                in_stride_token,
-                in_stride_topk,
-                out_stride_token,
-                scale);
-          } else if (topk_num == 9) {
-            moe_sum_reduce_kernel<scalar_t_, 9><<<grid, block, 0, stream>>>(
-                input.data_ptr<scalar_t_>(),
-                output.data_ptr<scalar_t_>(),
-                token_num,
-                hidden_dim,
-                in_stride_token,
-                in_stride_topk,
-                out_stride_token,
-                scale);
-          } else {
-            // --- general-topk fallback ---
-            moe_sum_reduce_kernel_general<scalar_t_><<<grid, block, 0, stream>>>(
-                input.data_ptr<scalar_t_>(),
-                output.data_ptr<scalar_t_>(),
-                token_num,
-                hidden_dim,
-                in_stride_token,
-                in_stride_topk,
-                out_stride_token,
-                static_cast<int>(topk_num),
-                scale);
+          switch (topk_num) {
+            case 2:
+              LAUNCH_SMALL_TOKEN_KERNEL(2);
+              break;
+            case 4:
+              LAUNCH_SMALL_TOKEN_KERNEL(4);
+              break;
+            case 8:
+              LAUNCH_SMALL_TOKEN_KERNEL(8);
+              break;
+            case 9:
+              LAUNCH_SMALL_TOKEN_KERNEL(9);
+              break;
+            default:  // launch general kernel
+              moe_sum_reduce_kernel_general<scalar_t_><<<grid, block, 0, stream>>>(
+                  input.data_ptr<scalar_t_>(),
+                  output.data_ptr<scalar_t_>(),
+                  token_num,
+                  hidden_dim,
+                  in_stride_token,
+                  in_stride_topk,
+                  out_stride_token,
+                  static_cast<int>(topk_num),
+                  scale);
           }
         });
+#undef LAUNCH_SMALL_TOKEN_KERNEL
 
     TORCH_CHECK(cudaGetLastError() == cudaSuccess, "moe_sum_reduce CUDA kernel (small-token) launch failed");
 
@@ -369,69 +353,51 @@ void moe_sum_reduce(at::Tensor& input, at::Tensor& output, double routed_scaling
     dim3 block(THREADS);
     dim3 grid(static_cast<unsigned>(gx), static_cast<unsigned>(gy));
 
+#define LAUNCH_WARP_PER_TOKEN_KERNEL(TOPK)                                                             \
+  moe_sum_reduce_kernel_warp_token_topk<scalar_t_, TOPK, WARPS_PER_BLOCK><<<grid, block, 0, stream>>>( \
+      input.data_ptr<scalar_t_>(),                                                                     \
+      output.data_ptr<scalar_t_>(),                                                                    \
+      token_num,                                                                                       \
+      hidden_dim,                                                                                      \
+      in_stride_token,                                                                                 \
+      in_stride_topk,                                                                                  \
+      out_stride_token,                                                                                \
+      scale);
+
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::kHalf, at::kBFloat16, input.scalar_type(), "moe_sum_reduce_cuda_large_token", [&] {
           using scalar_t_ = scalar_t;
           using acc_t_ = opmath_t<scalar_t_>;
           const acc_t_ scale = static_cast<acc_t_>(routed_scaling_factor);
 
-          if (topk_num == 2) {
-            moe_sum_reduce_kernel_warp_token_topk<scalar_t_, 2, WARPS_PER_BLOCK><<<grid, block, 0, stream>>>(
-                input.data_ptr<scalar_t_>(),
-                output.data_ptr<scalar_t_>(),
-                token_num,
-                hidden_dim,
-                in_stride_token,
-                in_stride_topk,
-                out_stride_token,
-                scale);
-          } else if (topk_num == 4) {
-            moe_sum_reduce_kernel_warp_token_topk<scalar_t_, 4, WARPS_PER_BLOCK><<<grid, block, 0, stream>>>(
-                input.data_ptr<scalar_t_>(),
-                output.data_ptr<scalar_t_>(),
-                token_num,
-                hidden_dim,
-                in_stride_token,
-                in_stride_topk,
-                out_stride_token,
-                scale);
-          } else if (topk_num == 8) {
-            moe_sum_reduce_kernel_warp_token_topk<scalar_t_, 8, WARPS_PER_BLOCK><<<grid, block, 0, stream>>>(
-                input.data_ptr<scalar_t_>(),
-                output.data_ptr<scalar_t_>(),
-                token_num,
-                hidden_dim,
-                in_stride_token,
-                in_stride_topk,
-                out_stride_token,
-                scale);
-          } else if (topk_num == 9) {
-            moe_sum_reduce_kernel_warp_token_topk<scalar_t_, 9, WARPS_PER_BLOCK><<<grid, block, 0, stream>>>(
-                input.data_ptr<scalar_t_>(),
-                output.data_ptr<scalar_t_>(),
-                token_num,
-                hidden_dim,
-                in_stride_token,
-                in_stride_topk,
-                out_stride_token,
-                scale);
-          } else {
-            // --- general-topk fallback ---
-            moe_sum_reduce_kernel_warp_token_general<scalar_t_, WARPS_PER_BLOCK><<<grid, block, 0, stream>>>(
-                input.data_ptr<scalar_t_>(),
-                output.data_ptr<scalar_t_>(),
-                token_num,
-                hidden_dim,
-                in_stride_token,
-                in_stride_topk,
-                out_stride_token,
-                static_cast<int>(topk_num),
-                scale);
+          switch (topk_num) {
+            case 2:
+              LAUNCH_WARP_PER_TOKEN_KERNEL(2);
+              break;
+            case 4:
+              LAUNCH_WARP_PER_TOKEN_KERNEL(4);
+              break;
+            case 8:
+              LAUNCH_WARP_PER_TOKEN_KERNEL(8);
+              break;
+            case 9:
+              LAUNCH_WARP_PER_TOKEN_KERNEL(9);
+              break;
+            default:  // launch general kernel
+              moe_sum_reduce_kernel_warp_token_general<scalar_t_, WARPS_PER_BLOCK><<<grid, block, 0, stream>>>(
+                  input.data_ptr<scalar_t_>(),
+                  output.data_ptr<scalar_t_>(),
+                  token_num,
+                  hidden_dim,
+                  in_stride_token,
+                  in_stride_topk,
+                  out_stride_token,
+                  static_cast<int>(topk_num),
+                  scale);
           }
         });
+#undef LAUNCH_WARP_PER_TOKEN_KERNEL
 
     TORCH_CHECK(cudaGetLastError() == cudaSuccess, "moe_sum_reduce CUDA kernel (warp-token) launch failed");
   }
-
-  TORCH_CHECK(cudaGetLastError() == cudaSuccess, "CUDA kernel launch failed");
 }

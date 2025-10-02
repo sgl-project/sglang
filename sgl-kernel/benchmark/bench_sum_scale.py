@@ -1,8 +1,16 @@
+import os
+
 import torch
 import triton
 import triton.language as tl
 from sgl_kernel import moe_sum_reduce as moe_sum_reduce_cuda
 from triton.testing import do_bench
+
+# CI environment detection
+IS_CI = (
+    os.getenv("CI", "false").lower() == "true"
+    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
+)
 
 
 @triton.jit
@@ -226,6 +234,12 @@ def verify_correctness(num_tokens=1024, dtype=torch.bfloat16):
 if __name__ == "__main__":
     print("Running correctness verification for bfloat16...")
     verify_correctness(dtype=torch.bfloat16)
+
+    # CI environment uses simplified parameters
+    if not IS_CI:
+        print("Running correctness verification for float64...")
+        verify_correctness(dtype=torch.float64)
+
     print("Running correctness verification for float64...")
     verify_correctness(dtype=torch.float64)
 
