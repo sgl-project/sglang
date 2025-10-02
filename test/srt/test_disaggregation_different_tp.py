@@ -18,7 +18,7 @@ from sglang.test.test_utils import (
 class TestDisaggregationMooncakePrefillLargerTP(TestDisaggregationBase):
     @classmethod
     def setUpClass(cls):
-        super.setUpClass()
+        super().setUpClass()
         # Temporarily disable JIT DeepGEMM
         cls.original_jit_deepgemm = os.environ.get("SGL_ENABLE_JIT_DEEPGEMM")
         os.environ["SGL_ENABLE_JIT_DEEPGEMM"] = "false"
@@ -92,7 +92,7 @@ class TestDisaggregationMooncakePrefillLargerTP(TestDisaggregationBase):
 class TestDisaggregationMooncakeDecodeLargerTP(TestDisaggregationBase):
     @classmethod
     def setUpClass(cls):
-        super.setUpClass()
+        super().setUpClass()
         # Temporarily disable JIT DeepGEMM
         cls.original_jit_deepgemm = os.environ.get("SGL_ENABLE_JIT_DEEPGEMM")
         os.environ["SGL_ENABLE_JIT_DEEPGEMM"] = "false"
@@ -166,7 +166,7 @@ class TestDisaggregationMooncakeDecodeLargerTP(TestDisaggregationBase):
 class TestDisaggregationMooncakeMHAPrefillLargerTP(TestDisaggregationBase):
     @classmethod
     def setUpClass(cls):
-        super.setUpClass()
+        super().setUpClass()
         # Temporarily disable JIT DeepGEMM
         cls.original_jit_deepgemm = os.environ.get("SGL_ENABLE_JIT_DEEPGEMM")
         os.environ["SGL_ENABLE_JIT_DEEPGEMM"] = "false"
@@ -240,7 +240,7 @@ class TestDisaggregationMooncakeMHAPrefillLargerTP(TestDisaggregationBase):
 class TestDisaggregationMooncakeMHADecodeLargerTP(TestDisaggregationBase):
     @classmethod
     def setUpClass(cls):
-        super.setUpClass()
+        super().setUpClass()
         # Temporarily disable JIT DeepGEMM
         cls.original_jit_deepgemm = os.environ.get("SGL_ENABLE_JIT_DEEPGEMM")
         os.environ["SGL_ENABLE_JIT_DEEPGEMM"] = "false"

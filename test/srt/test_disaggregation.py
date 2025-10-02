@@ -22,7 +22,7 @@ from sglang.test.test_utils import (
 class TestDisaggregationAccuracy(TestDisaggregationBase):
     @classmethod
     def setUpClass(cls):
-        super.setUpClass()
+        super().setUpClass()
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
 
         # Non blocking start servers
@@ -235,7 +235,7 @@ class TestDisaggregationMooncakeSpec(TestDisaggregationBase):
 
     @classmethod
     def setUpClass(cls):
-        super.setUpClass()
+        super().setUpClass()
         cls.model = DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST
         cls.draft_model = DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST
         cls.spec_args = [

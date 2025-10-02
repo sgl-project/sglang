@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
 class TestDisaggregationPPAccuracy(TestDisaggregationBase):
     @classmethod
     def setUpClass(cls):
-        super.setUpClass()
+        super().setUpClass()
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
 
         # Non blocking start servers
