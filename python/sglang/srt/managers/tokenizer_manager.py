@@ -1342,8 +1342,11 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     {
                         "completion_tokens": recv_obj.completion_tokens[i],
                         "cached_tokens": recv_obj.cached_tokens[i],
+                        "total_retractions": recv_obj.retraction_counts[i],
                     }
                 )
+            else:
+                meta_info["total_preemptions"] = recv_obj.retraction_counts[i]
 
             if getattr(recv_obj, "output_hidden_states", None):
                 meta_info["hidden_states"] = recv_obj.output_hidden_states[i]

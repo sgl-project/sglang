@@ -536,6 +536,7 @@ class SchedulerOutputProcessorMixin:
         completion_tokens = []
         cached_tokens = []
         spec_verify_ct = []
+        retraction_counts = []
         output_hidden_states = None
 
         if return_logprob:
@@ -624,6 +625,8 @@ class SchedulerOutputProcessorMixin:
                 prompt_tokens.append(len(req.origin_input_ids))
                 completion_tokens.append(len(req.output_ids))
                 cached_tokens.append(req.cached_tokens)
+
+                retraction_counts.append(req.retraction_count)
 
                 if not self.spec_algorithm.is_none():
                     spec_verify_ct.append(req.spec_verify_ct)
@@ -743,6 +746,7 @@ class SchedulerOutputProcessorMixin:
                     output_hidden_states,
                     placeholder_tokens_idx=None,
                     placeholder_tokens_val=None,
+                    retraction_counts=retraction_counts,
                 )
             )
 
@@ -753,6 +757,7 @@ class SchedulerOutputProcessorMixin:
         embeddings = []
         prompt_tokens = []
         cached_tokens = []
+        retraction_counts = []
         for req in reqs:
             if req.finished():
                 rids.append(req.rid)
@@ -760,6 +765,7 @@ class SchedulerOutputProcessorMixin:
                 embeddings.append(req.embedding)
                 prompt_tokens.append(len(req.origin_input_ids))
                 cached_tokens.append(req.cached_tokens)
+                retraction_counts.append(req.retraction_count)
         self.send_to_detokenizer.send_pyobj(
             BatchEmbeddingOut(
                 rids,
@@ -769,5 +775,6 @@ class SchedulerOutputProcessorMixin:
                 cached_tokens,
                 placeholder_tokens_idx=None,
                 placeholder_tokens_val=None,
+                retraction_counts=retraction_counts,
             )
         )

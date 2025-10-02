@@ -313,6 +313,11 @@ def _handle_output_by_index(output, i):
             ),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
+            retraction_counts=(
+                [output.retraction_counts[i]]
+                if len(output.retraction_counts) > i
+                else None
+            ),
         )
     elif isinstance(output, BatchMultimodalOut):
         new_output = BatchMultimodalOut(
