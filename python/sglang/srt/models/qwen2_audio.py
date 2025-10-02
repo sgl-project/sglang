@@ -39,7 +39,7 @@ from transformers.models.qwen2_audio.modeling_qwen2_audio import (
     Qwen2AudioMultiModalProjector,
 )
 
-from sglang.srt.hf_transformers_utils import get_processor
+from sglang.srt.utils.hf_transformers_utils import get_processor
 from sglang.srt.layers.activation import QuickGELU
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear

@@ -4,7 +4,7 @@ import requests
 import torch
 
 import sglang as sgl
-from sglang.srt.hf_transformers_utils import get_tokenizer
+from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,

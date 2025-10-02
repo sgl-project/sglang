@@ -7,7 +7,7 @@ from pathlib import Path
 import torch
 import triton
 
-from sglang.srt.bench_utils import bench_kineto
+from sglang.srt.utils.bench_utils import bench_kineto
 from sglang.srt.layers.quantization.fp8_kernel import (
     create_per_token_group_quant_fp8_output_scale,
 )

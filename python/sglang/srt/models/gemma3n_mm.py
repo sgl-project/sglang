@@ -14,7 +14,7 @@ from transformers import (
 )
 from transformers.models.auto.modeling_auto import AutoModel
 
-from sglang.srt.hf_transformers_utils import get_processor
+from sglang.srt.utils.hf_transformers_utils import get_processor
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor

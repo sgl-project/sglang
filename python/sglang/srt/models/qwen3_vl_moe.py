@@ -34,7 +34,7 @@ from sglang.srt.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
 )
-from sglang.srt.hf_transformers_utils import get_processor
+from sglang.srt.utils.hf_transformers_utils import get_processor
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.pooler import Pooler, PoolingType

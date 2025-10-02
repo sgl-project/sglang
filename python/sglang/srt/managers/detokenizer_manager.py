@@ -24,7 +24,7 @@ import psutil
 import setproctitle
 import zmq
 
-from sglang.srt.hf_transformers_utils import get_tokenizer
+from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOut,
     BatchMultimodalDecodeReq,
