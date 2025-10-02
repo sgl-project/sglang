@@ -969,6 +969,7 @@ async fn test_streaming_with_mcp_tool_calls() {
     let mut found_mcp_call_added = false;
     let mut found_mcp_call_in_progress = false;
     let mut found_mcp_call_arguments = false;
+    let mut found_mcp_call_arguments_done = false;
     let mut found_mcp_call_done = false;
     let mut found_response_completed = false;
 
@@ -1047,6 +1048,21 @@ async fn test_streaming_with_mcp_tool_calls() {
             "response.mcp_call_arguments.delta" => {
                 found_mcp_call_arguments = true;
                 println!("✓ Found mcp_call_arguments.delta event");
+
+                // Delta should include arguments payload
+                assert!(
+                    data.get("delta").is_some(),
+                    "mcp_call_arguments.delta should include delta text"
+                );
+            }
+            "response.mcp_call_arguments.done" => {
+                found_mcp_call_arguments_done = true;
+                println!("✓ Found mcp_call_arguments.done event");
+
+                assert!(
+                    data.get("arguments").is_some(),
+                    "mcp_call_arguments.done should include full arguments"
+                );
             }
             "response.output_item.done" => {
                 if let Some(item) = data.get("item") {
@@ -1089,15 +1105,19 @@ async fn test_streaming_with_mcp_tool_calls() {
     // Verify key events were present
     println!("\n=== Event Summary ===");
     println!("MCP list_tools added: {}", found_mcp_list_tools);
-    println!("MCP list_tools in_progress: {}", found_mcp_list_tools_in_progress);
-    println!("MCP list_tools completed: {}", found_mcp_list_tools_completed);
+    println!(
+        "MCP list_tools in_progress: {}",
+        found_mcp_list_tools_in_progress
+    );
+    println!(
+        "MCP list_tools completed: {}",
+        found_mcp_list_tools_completed
+    );
     println!("Response created: {}", found_response_created);
     println!("MCP call added: {}", found_mcp_call_added);
     println!("MCP call in_progress: {}", found_mcp_call_in_progress);
-    println!(
-        "MCP call arguments: {} (optional - router may buffer)",
-        found_mcp_call_arguments
-    );
+    println!("MCP call arguments delta: {}", found_mcp_call_arguments);
+    println!("MCP call arguments done: {}", found_mcp_call_arguments_done);
     println!("MCP call done: {}", found_mcp_call_done);
     println!("Response completed: {}", found_response_completed);
 
@@ -1122,8 +1142,14 @@ async fn test_streaming_with_mcp_tool_calls() {
     );
     assert!(found_mcp_call_done, "Should send mcp_call done event");
 
-    // Note: mcp_call_arguments.delta events are optional because the router
-    // may buffer function_call_arguments and send them all at once in the completed event
+    assert!(
+        found_mcp_call_arguments,
+        "Should send mcp_call_arguments.delta event"
+    );
+    assert!(
+        found_mcp_call_arguments_done,
+        "Should send mcp_call_arguments.done event"
+    );
 
     // Verify no error events
     let has_error = body_text.contains("event: error");

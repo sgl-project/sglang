@@ -166,6 +166,7 @@ struct FunctionCallInProgress {
     name: String,
     arguments_buffer: String,
     output_index: usize,
+    last_obfuscation: Option<String>,
 }
 
 impl FunctionCallInProgress {
@@ -175,6 +176,7 @@ impl FunctionCallInProgress {
             name: String::new(),
             arguments_buffer: String::new(),
             output_index,
+            last_obfuscation: None,
         }
     }
 
@@ -284,6 +286,11 @@ impl StreamingToolHandler {
                             .find(|c| c.output_index == output_index)
                         {
                             call.arguments_buffer.push_str(delta);
+                            if let Some(obfuscation) =
+                                parsed.get("obfuscation").and_then(|v| v.as_str())
+                            {
+                                call.last_obfuscation = Some(obfuscation.to_string());
+                            }
                         }
                     }
                 }
@@ -347,6 +354,10 @@ impl StreamingToolHandler {
                 call.arguments_buffer.push_str(args);
             }
 
+            if let Some(obfuscation) = delta.get("obfuscation").and_then(|v| v.as_str()) {
+                call.last_obfuscation = Some(obfuscation.to_string());
+            }
+
             // Buffer this event, don't forward to client
             return StreamAction::Buffer;
         }
@@ -378,8 +389,13 @@ impl StreamingToolHandler {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        self.pending_calls
-            .push(FunctionCallInProgress::new(call_id, output_index));
+
+        let mut call = FunctionCallInProgress::new(call_id, output_index);
+        if let Some(obfuscation) = delta.get("obfuscation").and_then(|v| v.as_str()) {
+            call.last_obfuscation = Some(obfuscation.to_string());
+        }
+
+        self.pending_calls.push(call);
         self.pending_calls
             .last_mut()
             .expect("Just pushed to pending_calls, must have at least one element")
@@ -1194,33 +1210,58 @@ impl OpenAIRouter {
                     .iter()
                     .find(|c| c.output_index == output_index)
                 {
-                    if !call.arguments_buffer.is_empty() {
-                        // Get item_id and transform it
-                        let item_id = parsed_data
-                            .get("item_id")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        let mcp_item_id = if let Some(stripped) = item_id.strip_prefix("fc_") {
-                            format!("mcp_{}", stripped)
-                        } else {
-                            item_id.to_string()
-                        };
+                    let arguments_value = if call.arguments_buffer.is_empty() {
+                        "{}".to_string()
+                    } else {
+                        call.arguments_buffer.clone()
+                    };
 
-                        let delta_event = json!({
-                            "type": event_types::MCP_CALL_ARGUMENTS_DELTA,
-                            "output_index": output_index,
-                            "item_id": mcp_item_id,
-                            "delta": call.arguments_buffer
-                        });
-                        let delta_block = format!(
-                            "event: {}\ndata: {}\n\n",
-                            event_types::MCP_CALL_ARGUMENTS_DELTA,
-                            delta_event
-                        );
-                        if tx.send(Ok(Bytes::from(delta_block))).is_err() {
-                            return false;
+                    // Make sure the done event carries full arguments
+                    parsed_data["arguments"] = Value::String(arguments_value.clone());
+
+                    // Get item_id and transform it
+                    let item_id = parsed_data
+                        .get("item_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let mcp_item_id = if let Some(stripped) = item_id.strip_prefix("fc_") {
+                        format!("mcp_{}", stripped)
+                    } else {
+                        item_id.to_string()
+                    };
+
+                    // Emit a synthetic MCP arguments delta event before the done event
+                    let mut delta_event = json!({
+                        "type": event_types::MCP_CALL_ARGUMENTS_DELTA,
+                        "sequence_number": *sequence_number,
+                        "output_index": output_index,
+                        "item_id": mcp_item_id,
+                        "delta": arguments_value,
+                    });
+
+                    if let Some(obfuscation) = call.last_obfuscation.as_ref() {
+                        if let Some(obj) = delta_event.as_object_mut() {
+                            obj.insert(
+                                "obfuscation".to_string(),
+                                Value::String(obfuscation.clone()),
+                            );
+                        }
+                    } else if let Some(obfuscation) = parsed_data.get("obfuscation").cloned() {
+                        if let Some(obj) = delta_event.as_object_mut() {
+                            obj.insert("obfuscation".to_string(), obfuscation);
                         }
                     }
+
+                    let delta_block = format!(
+                        "event: {}\ndata: {}\n\n",
+                        event_types::MCP_CALL_ARGUMENTS_DELTA,
+                        delta_event
+                    );
+                    if tx.send(Ok(Bytes::from(delta_block))).is_err() {
+                        return false;
+                    }
+
+                    *sequence_number += 1;
                 }
             }
         }
@@ -1584,6 +1625,20 @@ impl OpenAIRouter {
                                         // Don't forward, just buffer
                                     }
                                     StreamAction::ExecuteTools => {
+                                        if !Self::forward_streaming_event(
+                                            &raw_block,
+                                            event_name,
+                                            data.as_ref(),
+                                            &handler,
+                                            &tx,
+                                            server_label,
+                                            &original_request,
+                                            previous_response_id.as_deref(),
+                                            &mut sequence_number,
+                                        ) {
+                                            // Client disconnected
+                                            return;
+                                        }
                                         tool_calls_detected = true;
                                         break; // Exit stream processing to execute tools
                                     }
@@ -1821,7 +1876,7 @@ impl OpenAIRouter {
         server_label: &str,
         success: bool,
         error_msg: Option<&str>,
-        _sequence_number: &mut u64,
+        sequence_number: &mut u64,
     ) -> bool {
         // Build mcp_call item (reuse existing function)
         let mcp_call_item = Self::build_mcp_call_item(
@@ -1840,26 +1895,34 @@ impl OpenAIRouter {
             .unwrap_or("");
 
         // Event 1: response.mcp_call.completed
+        let completed_payload = json!({
+            "type": "response.mcp_call.completed",
+            "sequence_number": *sequence_number,
+            "output_index": call.output_index,
+            "item_id": item_id
+        });
+        *sequence_number += 1;
+
         let completed_event = format!(
             "event: response.mcp_call.completed\ndata: {}\n\n",
-            json!({
-                "type": "response.mcp_call.completed",
-                "output_index": call.output_index,
-                "item_id": item_id
-            })
+            completed_payload
         );
         if tx.send(Ok(Bytes::from(completed_event))).is_err() {
             return false;
         }
 
         // Event 2: response.output_item.done (with completed mcp_call)
+        let done_payload = json!({
+            "type": "response.output_item.done",
+            "sequence_number": *sequence_number,
+            "output_index": call.output_index,
+            "item": mcp_call_item
+        });
+        *sequence_number += 1;
+
         let done_event = format!(
             "event: response.output_item.done\ndata: {}\n\n",
-            json!({
-                "type": "response.output_item.done",
-                "output_index": call.output_index,
-                "item": mcp_call_item
-            })
+            done_payload
         );
         tx.send(Ok(Bytes::from(done_event))).is_ok()
     }
