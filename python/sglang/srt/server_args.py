@@ -64,6 +64,7 @@ LOAD_FORMAT_CHOICES = [
     "layered",
     "remote",
     "remote_instance",
+    "ckpt_engine",
 ]
 
 QUANTIZATION_CHOICES = [
