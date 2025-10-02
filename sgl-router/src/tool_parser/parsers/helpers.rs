@@ -160,8 +160,7 @@ pub fn handle_json_tool_streaming(
     };
 
     // Check if JSON is complete
-    let is_complete =
-        end_idx == json_str.len() && serde_json::from_str::<Value>(json_str).is_ok();
+    let is_complete = end_idx == json_str.len() && serde_json::from_str::<Value>(json_str).is_ok();
 
     // Validate tool name if present
     if let Some(name) = obj.get("name").and_then(|v| v.as_str()) {
@@ -272,14 +271,8 @@ mod tests {
     #[test]
     fn test_ends_with_partial_token() {
         assert!(ends_with_partial_token("hello <|py", "<|python_tag|>").is_some());
-        assert!(ends_with_partial_token(
-            "hello <|python_tag",
-            "<|python_tag|>"
-        ).is_some());
-        assert!(ends_with_partial_token(
-            "hello <|python_tag|>",
-            "<|python_tag|>"
-        ).is_none());
+        assert!(ends_with_partial_token("hello <|python_tag", "<|python_tag|>").is_some());
+        assert!(ends_with_partial_token("hello <|python_tag|>", "<|python_tag|>").is_none());
         assert!(ends_with_partial_token("", "<|python_tag|>").is_none());
         assert!(ends_with_partial_token("hello world", "<|python_tag|>").is_none());
     }

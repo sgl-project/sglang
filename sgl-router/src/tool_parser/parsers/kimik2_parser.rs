@@ -97,7 +97,6 @@ impl KimiK2Parser {
             None
         }
     }
-
 }
 
 impl Default for KimiK2Parser {

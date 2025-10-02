@@ -226,12 +226,17 @@ impl ToolParser for QwenParser {
             let end_token_without_newline = &self.eot_token[1..]; // "</tool_call>"
             if self.normal_text_buffer.contains(end_token_without_newline) {
                 // Complete end token found - clean it and return
-                let cleaned_text = self.normal_text_buffer.replace(end_token_without_newline, "");
+                let cleaned_text = self
+                    .normal_text_buffer
+                    .replace(end_token_without_newline, "");
                 self.normal_text_buffer.clear();
                 result.normal_text = cleaned_text;
             } else {
                 // Check if buffer might contain partial end token at the end
-                if let Some(partial_match_len) = helpers::ends_with_partial_token(&self.normal_text_buffer, end_token_without_newline) {
+                if let Some(partial_match_len) = helpers::ends_with_partial_token(
+                    &self.normal_text_buffer,
+                    end_token_without_newline,
+                ) {
                     // Keep potential partial match in buffer, return the rest
                     let split_point = self.normal_text_buffer.len() - partial_match_len;
                     result.normal_text = self.normal_text_buffer[..split_point].to_string();

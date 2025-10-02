@@ -163,7 +163,6 @@ impl Glm4MoeParser {
 
         Ok(tools)
     }
-
 }
 
 impl Default for Glm4MoeParser {
