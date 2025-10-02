@@ -100,7 +100,6 @@ ATTENTION_BACKEND_CHOICES = [
     "trtllm_mla",
     "trtllm_mha",
     "dual_chunk_flash_attn",
-    "hybrid_linear_attn",
     # AMD specific
     "aiter",
     "wave",
@@ -168,6 +167,7 @@ class ServerArgs:
     quantization: Optional[str] = None
     quantization_param_path: Optional[str] = None
     kv_cache_dtype: str = "auto"
+    enable_fp32_lm_head: bool = False
 
     # Memory and scheduling
     mem_fraction_static: Optional[float] = None
@@ -639,7 +639,7 @@ class ServerArgs:
                 if self.cuda_graph_max_bs > 300:
                     reserved_mem += self.cuda_graph_max_bs * self.dp_size * 1.5
 
-            if gpu_mem > 60 * 1024:
+            if gpu_mem is not None and gpu_mem > 60 * 1024:
                 reserved_mem = max(reserved_mem, 10 * 1024)
 
             if self.speculative_algorithm is not None:
@@ -650,7 +650,11 @@ class ServerArgs:
                     # eagle draft models and cuda graphs
                     reserved_mem += 2 * 1024
 
-            self.mem_fraction_static = round((gpu_mem - reserved_mem) / gpu_mem, 3)
+            self.mem_fraction_static = (
+                round((gpu_mem - reserved_mem) / gpu_mem, 3)
+                if gpu_mem is not None
+                else 0.88
+            )
 
             # Lazy init to avoid circular import
             # Multimodal models need more memory for the image processor
@@ -801,7 +805,7 @@ class ServerArgs:
                 self.speculative_algorithm is None
             ), "Speculative decoding is currently not supported with Flex Attention backend"
 
-        if is_npu() and self.attention_backend in ["ascend", "hybrid_linear_attn"]:
+        if is_npu() and self.attention_backend in ["ascend"]:
             logger.warning(
                 "At this moment Ascend attention backend only supports a page_size of 128, change page_size to 128."
             )
@@ -912,7 +916,7 @@ class ServerArgs:
         if self.moe_runner_backend == "flashinfer_trtllm":
             assert (
                 self.quantization == "modelopt_fp4" or self.quantization == "fp8"
-            ), "modelopt_fp4 quantization is required for Flashinfer TRTLLM MoE"
+            ), "modelopt_fp4 or fp8 quantization is required for Flashinfer TRTLLM MoE"
             self.disable_shared_experts_fusion = True
             logger.warning(
                 "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
@@ -1392,6 +1396,11 @@ class ServerArgs:
             default=ServerArgs.kv_cache_dtype,
             choices=["auto", "fp8_e5m2", "fp8_e4m3"],
             help='Data type for kv cache storage. "auto" will use model data type. "fp8_e5m2" and "fp8_e4m3" is supported for CUDA 11.8+.',
+        )
+        parser.add_argument(
+            "--enable-fp32-lm-head",
+            action="store_true",
+            help="If set, the LM head outputs (logits) are in FP32.",
         )
 
         # Memory and scheduling
@@ -2251,7 +2260,7 @@ class ServerArgs:
         parser.add_argument(
             "--hicache-storage-backend",
             type=str,
-            choices=["file", "mooncake", "hf3fs", "nixl", "aibrix", "dynamic"],
+            choices=["file", "mooncake", "hf3fs", "nixl", "aibrix", "dynamic", "eic"],
             default=ServerArgs.hicache_storage_backend,
             help="The storage backend for hierarchical KV cache. "
             "Built-in backends: file, mooncake, hf3fs, nixl, aibrix. "
