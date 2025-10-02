@@ -578,7 +578,7 @@ class GrpcRequestManager:
                         batch_out.cached_tokens[i] if batch_out.cached_tokens else 0
                     ),
                     "finish_reason": (
-                        str(batch_out.finished_reasons[i])
+                        batch_out.finished_reasons[i]
                         if batch_out.finished_reasons[i]
                         else None
                     ),

@@ -14,6 +14,48 @@ pub fn get_tool_indices(tools: &[Tool]) -> HashMap<String, usize> {
         .collect()
 }
 
+/// Get unstreamed tool call arguments
+/// Returns tool call items for arguments that have been parsed but not yet streamed
+/// This ensures tool calls are properly completed even if the model generates final arguments in the last chunk
+pub fn get_unstreamed_args(
+    prev_tool_call_arr: &[Value],
+    streamed_args_for_tool: &[String],
+) -> Option<Vec<ToolCallItem>> {
+    // Check if we have tool calls being tracked
+    if prev_tool_call_arr.is_empty() || streamed_args_for_tool.is_empty() {
+        return None;
+    }
+
+    // Get the last tool call that was being processed
+    let tool_index = prev_tool_call_arr.len() - 1;
+    if tool_index >= streamed_args_for_tool.len() {
+        return None;
+    }
+
+    // Get expected vs actual arguments
+    let expected_args = prev_tool_call_arr[tool_index].get("arguments")?;
+    let expected_str = serde_json::to_string(expected_args).ok()?;
+    let actual_str = &streamed_args_for_tool[tool_index];
+
+    // Check if there are remaining arguments to send
+    let remaining = if expected_str.starts_with(actual_str) {
+        &expected_str[actual_str.len()..]
+    } else {
+        return None;
+    };
+
+    if remaining.is_empty() {
+        return None;
+    }
+
+    // Return the remaining arguments as a ToolCallItem
+    Some(vec![ToolCallItem {
+        tool_index,
+        name: None, // No name for argument deltas
+        parameters: remaining.to_string(),
+    }])
+}
+
 /// Check if a buffer ends with a partial occurrence of a token
 /// Returns Some(length) if there's a partial match, None otherwise
 pub fn ends_with_partial_token(buffer: &str, token: &str) -> Option<usize> {
