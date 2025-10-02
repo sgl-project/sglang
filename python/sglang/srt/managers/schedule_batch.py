@@ -685,11 +685,18 @@ class Req:
         # Whether request reached finished condition
         return self.finished_reason is not None
 
-    def init_next_round_input(
-        self,
-        tree_cache: Optional[BasePrefixCache] = None,
-    ):
+    def init_next_round_input(self, tree_cache: Optional[BasePrefixCache] = None):
         self.fill_ids = self.origin_input_ids + self.output_ids
+        input_len = len(self.fill_ids)
+        # FIXME: To work around some bugs in logprob computation, we need to ensure each
+        # request has at least one token. Later, we can relax this requirement and use `input_len`.
+        max_prefix_len = input_len - 1
+        if self.return_logprob:
+            max_prefix_len = min(max_prefix_len, self.logprob_start_len)
+        max_prefix_len = max(max_prefix_len, 0)
+        self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
+        token_ids = self.fill_ids[:max_prefix_len]
+
         if tree_cache is not None:
             (
                 self.prefix_indices,
@@ -697,30 +704,9 @@ class Req:
                 self.last_host_node,
                 self.host_hit_length,
             ) = tree_cache.match_prefix(
-                key=RadixKey(
-                    token_ids=self.adjust_max_prefix_ids(), extra_key=self.extra_key
-                ),
+                key=RadixKey(token_ids=token_ids, extra_key=self.extra_key)
             )
             self.last_matched_prefix_len = len(self.prefix_indices)
-        self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
-
-    def adjust_max_prefix_ids(self):
-        self.fill_ids = self.origin_input_ids + self.output_ids
-        input_len = len(self.fill_ids)
-
-        # FIXME: To work around some bugs in logprob computation, we need to ensure each
-        # request has at least one token. Later, we can relax this requirement and use `input_len`.
-        max_prefix_len = input_len - 1
-
-        if self.sampling_params.max_new_tokens > 0:
-            # Need at least one token to compute logits
-            max_prefix_len = min(max_prefix_len, input_len - 1)
-
-        if self.return_logprob:
-            max_prefix_len = min(max_prefix_len, self.logprob_start_len)
-
-        max_prefix_len = max(max_prefix_len, 0)
-        return self.fill_ids[:max_prefix_len]
 
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
     def init_incremental_detokenize(self):
