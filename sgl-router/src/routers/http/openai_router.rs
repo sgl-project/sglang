@@ -1435,6 +1435,7 @@ impl OpenAIRouter {
             let base_payload = payload_clone.clone();
             let mut current_payload = payload_clone;
             let mut mcp_list_tools_sent = false;
+            let mut is_first_iteration = true;
 
             let server_label = original_request
                 .tools
@@ -1508,19 +1509,35 @@ impl OpenAIRouter {
 
                                 match action {
                                     StreamAction::Forward => {
-                                        // Forward the event first
-                                        if !Self::forward_streaming_event(
-                                            &raw_block,
-                                            event_name,
-                                            data.as_ref(),
-                                            &handler,
-                                            &tx,
-                                            server_label,
-                                            &original_request,
-                                            previous_response_id.as_deref(),
-                                        ) {
-                                            // Client disconnected
-                                            return;
+                                        // Skip response.created and response.in_progress on subsequent iterations
+                                        let should_skip = if !is_first_iteration {
+                                            if let Ok(parsed) = serde_json::from_str::<Value>(data.as_ref()) {
+                                                matches!(
+                                                    parsed.get("type").and_then(|v| v.as_str()),
+                                                    Some("response.created") | Some("response.in_progress")
+                                                )
+                                            } else {
+                                                false
+                                            }
+                                        } else {
+                                            false
+                                        };
+
+                                        if !should_skip {
+                                            // Forward the event
+                                            if !Self::forward_streaming_event(
+                                                &raw_block,
+                                                event_name,
+                                                data.as_ref(),
+                                                &handler,
+                                                &tx,
+                                                server_label,
+                                                &original_request,
+                                                previous_response_id.as_deref(),
+                                            ) {
+                                                // Client disconnected
+                                                return;
+                                            }
                                         }
 
                                         // After forwarding response.in_progress, send mcp_list_tools events (once)
@@ -1652,6 +1669,8 @@ impl OpenAIRouter {
                 ) {
                     Ok(resume_payload) => {
                         current_payload = resume_payload;
+                        // Mark that we're no longer on the first iteration
+                        is_first_iteration = false;
                         // Continue loop to make next streaming request
                     }
                     Err(e) => {
