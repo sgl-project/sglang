@@ -179,7 +179,7 @@ impl ToolParser for QwenParser {
 
         if !has_tool_start {
             // Only clear buffer if we're sure no tool call is starting
-            if !helpers::ends_with_partial_token(&self.buffer, self.bot_token) {
+            if helpers::ends_with_partial_token(&self.buffer, self.bot_token).is_none() {
                 let normal_text = self.buffer.clone();
                 self.buffer.clear();
 
@@ -231,19 +231,7 @@ impl ToolParser for QwenParser {
                 result.normal_text = cleaned_text;
             } else {
                 // Check if buffer might contain partial end token at the end
-                let partial_match_len = {
-                    let mut len = 0;
-                    for i in 1..end_token_without_newline.len().min(self.normal_text_buffer.len()) + 1 {
-                        if let Some(buffer_end) = self.normal_text_buffer.get(self.normal_text_buffer.len() - i..) {
-                            if end_token_without_newline.starts_with(buffer_end) {
-                                len = i;
-                            }
-                        }
-                    }
-                    len
-                };
-
-                if partial_match_len > 0 {
+                if let Some(partial_match_len) = helpers::ends_with_partial_token(&self.normal_text_buffer, end_token_without_newline) {
                     // Keep potential partial match in buffer, return the rest
                     let split_point = self.normal_text_buffer.len() - partial_match_len;
                     result.normal_text = self.normal_text_buffer[..split_point].to_string();

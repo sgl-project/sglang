@@ -236,7 +236,7 @@ impl ToolParser for MistralParser {
 
         if !has_tool_start {
             // Only clear buffer if we're sure no tool call is starting
-            if !helpers::ends_with_partial_token(&self.buffer, self.bot_token) {
+            if helpers::ends_with_partial_token(&self.buffer, self.bot_token).is_none() {
                 let normal_text = self.buffer.clone();
                 self.buffer.clear();
 

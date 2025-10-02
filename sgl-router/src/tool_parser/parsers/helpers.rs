@@ -12,17 +12,18 @@ pub fn get_tool_indices(tools: &[Tool]) -> HashMap<String, usize> {
 }
 
 /// Check if a buffer ends with a partial occurrence of a token
-pub fn ends_with_partial_token(buffer: &str, token: &str) -> bool {
+/// Returns Some(length) if there's a partial match, None otherwise
+pub fn ends_with_partial_token(buffer: &str, token: &str) -> Option<usize> {
     if buffer.is_empty() || token.is_empty() {
-        return false;
+        return None;
     }
 
     for i in 1..token.len() {
         if buffer.ends_with(&token[..i]) {
-            return true;
+            return Some(i);
         }
     }
-    false
+    None
 }
 
 /// Reset state for the current tool being parsed (used when skipping invalid tools).
@@ -270,17 +271,17 @@ mod tests {
 
     #[test]
     fn test_ends_with_partial_token() {
-        assert!(ends_with_partial_token("hello <|py", "<|python_tag|>"));
+        assert!(ends_with_partial_token("hello <|py", "<|python_tag|>").is_some());
         assert!(ends_with_partial_token(
             "hello <|python_tag",
             "<|python_tag|>"
-        ));
-        assert!(!ends_with_partial_token(
+        ).is_some());
+        assert!(ends_with_partial_token(
             "hello <|python_tag|>",
             "<|python_tag|>"
-        ));
-        assert!(!ends_with_partial_token("", "<|python_tag|>"));
-        assert!(!ends_with_partial_token("hello world", "<|python_tag|>"));
+        ).is_none());
+        assert!(ends_with_partial_token("", "<|python_tag|>").is_none());
+        assert!(ends_with_partial_token("hello world", "<|python_tag|>").is_none());
     }
 
     #[test]

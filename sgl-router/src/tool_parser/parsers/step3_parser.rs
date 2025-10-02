@@ -489,8 +489,7 @@ impl ToolParser for Step3Parser {
                 });
             } else {
                 // Check if we might have a partial bot_token
-                let partial_len = helpers::ends_with_partial_token(&self.buffer, self.bot_token);
-                if partial_len > 0 {
+                if helpers::ends_with_partial_token(&self.buffer, self.bot_token).is_some() {
                     return Ok(StreamingParseResult::default()); // Wait for more text
                 } else {
                     let normal_text = std::mem::take(&mut self.buffer);
