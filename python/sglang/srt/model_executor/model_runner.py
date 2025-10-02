@@ -31,7 +31,6 @@ import requests
 import torch
 import torch.distributed as dist
 
-from sglang.srt.utils import slow_rank_detector
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
@@ -118,7 +117,6 @@ from sglang.srt.offloader import (
     get_offloader,
     set_offloader,
 )
-from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -145,7 +143,9 @@ from sglang.srt.utils import (
     monkey_patch_vllm_gguf_config,
     parse_connector_type,
     set_cuda_arch,
+    slow_rank_detector,
 )
+from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorBucket,
     FlattenedTensorMetadata,
