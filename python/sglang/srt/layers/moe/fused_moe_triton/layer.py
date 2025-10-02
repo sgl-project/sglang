@@ -827,9 +827,12 @@ class FusedMoE(torch.nn.Module):
             # NOTE: Aiter's fused_moe does not support '-1' value which is broadly used to represent the invalid expert id.
             # If '-1' is given to gpu kernel, it may cause memory access fault.
             if TopKOutputChecker.format_is_standard(topk_output):
-                temp_topk_ids = topk_output.topk_ids
-                temp_topk_ids[temp_topk_ids == -1] = self.num_local_experts
-                topk_output = topk_output._replace(topk_ids=temp_topk_ids)
+                new_topk_ids = torch.where(
+                    topk_output.topk_ids == -1,
+                    self.num_local_experts,
+                    topk_output.topk_ids,
+                )
+                topk_output = topk_output._replace(topk_ids=new_topk_ids)
 
         dispatch_output = self.dispatcher.dispatch(
             hidden_states=hidden_states, topk_output=topk_output
