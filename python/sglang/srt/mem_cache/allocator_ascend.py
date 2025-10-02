@@ -69,7 +69,9 @@ class AscendPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
     def alloc_extend(
         self,
         prefix_lens: torch.Tensor,
+        prefix_lens_cpu: torch.Tensor,
         seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,
         extend_num_tokens: int,
     ):
@@ -80,8 +82,8 @@ class AscendPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
 
         num_new_pages = (
             (
-                (seq_lens + self.page_size - 1) // self.page_size
-                - (prefix_lens + self.page_size - 1) // self.page_size
+                (seq_lens_cpu + self.page_size - 1) // self.page_size
+                - (prefix_lens_cpu + self.page_size - 1) // self.page_size
             )
             .sum()
             .item()
@@ -115,6 +117,7 @@ class AscendPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
     def alloc_decode(
         self,
         seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,
     ):
         if self.debug_mode:
@@ -123,7 +126,8 @@ class AscendPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             )
 
         need_new_pages = (seq_lens % self.page_size == 1).int()
-        num_new_pages = need_new_pages.sum().item()
+        need_new_pages_cpu = (seq_lens_cpu % self.page_size == 1).int()
+        num_new_pages = need_new_pages_cpu.sum().item()
 
         if num_new_pages > len(self.free_pages):
             self.merge_and_sort_free()
