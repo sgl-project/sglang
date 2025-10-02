@@ -2026,30 +2026,22 @@ class Scheduler(
                 batch_or_worker_batch
             )
 
-            if self.spec_algorithm.is_none():
-                (
-                    logits_output,
-                    next_token_ids,
-                    pp_hidden_states_proxy_tensors,
-                    can_run_cuda_graph,
-                ) = (
-                    forward_batch_output.logits_output,
-                    forward_batch_output.next_token_ids,
-                    forward_batch_output.pp_proxy_tensors,
-                    forward_batch_output.can_run_cuda_graph,
-                )
-            else:
-                (
-                    logits_output,
-                    next_token_ids,
-                    num_accepted_tokens,
-                    can_run_cuda_graph,
-                ) = (
-                    forward_batch_output.logits_output,
-                    forward_batch_output.next_token_ids,
-                    forward_batch_output.num_accepted_tokens,
-                    forward_batch_output.can_run_cuda_graph,
-                )
+            (
+                logits_output,
+                next_token_ids,
+                num_accepted_tokens,
+                pp_hidden_states_proxy_tensors,
+                can_run_cuda_graph,
+            ) = (
+                forward_batch_output.logits_output,
+                forward_batch_output.next_token_ids,
+                forward_batch_output.num_accepted_tokens,
+                forward_batch_output.pp_proxy_tensors,
+                forward_batch_output.can_run_cuda_graph,
+            )
+
+            if not self.spec_algorithm.is_none():
+                # TODO(lsyin): unify this logic, move into some metric collector class
                 bs = batch.batch_size()
                 self.spec_num_total_accepted_tokens += num_accepted_tokens + bs
                 self.spec_num_total_forward_ct += bs
