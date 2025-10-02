@@ -639,7 +639,7 @@ class ServerArgs:
                 if self.cuda_graph_max_bs > 300:
                     reserved_mem += self.cuda_graph_max_bs * self.dp_size * 1.5
 
-            if gpu_mem > 60 * 1024:
+            if gpu_mem is not None and gpu_mem > 60 * 1024:
                 reserved_mem = max(reserved_mem, 10 * 1024)
 
             if self.speculative_algorithm is not None:
@@ -650,7 +650,11 @@ class ServerArgs:
                     # eagle draft models and cuda graphs
                     reserved_mem += 2 * 1024
 
-            self.mem_fraction_static = round((gpu_mem - reserved_mem) / gpu_mem, 3)
+            self.mem_fraction_static = (
+                round((gpu_mem - reserved_mem) / gpu_mem, 3)
+                if gpu_mem is not None
+                else 0.88
+            )
 
             # Lazy init to avoid circular import
             # Multimodal models need more memory for the image processor
@@ -912,7 +916,7 @@ class ServerArgs:
         if self.moe_runner_backend == "flashinfer_trtllm":
             assert (
                 self.quantization == "modelopt_fp4" or self.quantization == "fp8"
-            ), "modelopt_fp4 quantization is required for Flashinfer TRTLLM MoE"
+            ), "modelopt_fp4 or fp8 quantization is required for Flashinfer TRTLLM MoE"
             self.disable_shared_experts_fusion = True
             logger.warning(
                 "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
@@ -1083,7 +1087,10 @@ class ServerArgs:
                 and self.attention_backend != "flashinfer"
             ):
                 raise ValueError(
-                    "speculative_eagle_topk > 1 with page_size > 1 is unstable and produces incorrect results for paged attention backends. This combination is only supported for the 'flashinfer' backend."
+                    f"speculative_eagle_topk({self.speculative_eagle_topk}) > 1 "
+                    f"with page_size({self.page_size}) > 1 is unstable "
+                    "and produces incorrect results for paged attention backends. "
+                    "This combination is only supported for the 'flashinfer' backend."
                 )
             if self.enable_dp_attention:
                 # TODO: support dp attention for ngram speculative decoding
@@ -2256,7 +2263,7 @@ class ServerArgs:
         parser.add_argument(
             "--hicache-storage-backend",
             type=str,
-            choices=["file", "mooncake", "hf3fs", "nixl", "aibrix", "dynamic"],
+            choices=["file", "mooncake", "hf3fs", "nixl", "aibrix", "dynamic", "eic"],
             default=ServerArgs.hicache_storage_backend,
             help="The storage backend for hierarchical KV cache. "
             "Built-in backends: file, mooncake, hf3fs, nixl, aibrix. "
