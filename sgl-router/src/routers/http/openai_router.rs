@@ -344,7 +344,9 @@ impl StreamingToolHandler {
             .to_string();
         self.pending_calls
             .push(FunctionCallInProgress::new(call_id, output_index));
-        self.pending_calls.last_mut().unwrap()
+        self.pending_calls
+            .last_mut()
+            .expect("Just pushed to pending_calls, must have at least one element")
     }
 
     fn has_complete_calls(&self) -> bool {
@@ -1130,7 +1132,14 @@ impl OpenAIRouter {
 
                 // Send mcp_list_tools events at the start (only once)
                 if !mcp_list_tools_sent {
-                    OpenAIRouter::send_mcp_list_tools_events(&tx, &active_mcp_clone, server_label);
+                    if !OpenAIRouter::send_mcp_list_tools_events(
+                        &tx,
+                        &active_mcp_clone,
+                        server_label,
+                    ) {
+                        // Client disconnected
+                        return;
+                    }
                     mcp_list_tools_sent = true;
                 }
 
@@ -1171,26 +1180,29 @@ impl OpenAIRouter {
                                 match action {
                                     StreamAction::Forward => {
                                         // First, rewrite basic response fields (store, previous_response_id, tools masking)
-                                        let mut block_to_send = if let Some(modified) =
+                                        let block_cow = if let Some(modified) =
                                             Self::rewrite_streaming_block(
                                                 &raw_block,
                                                 &original_request,
                                                 previous_response_id.as_deref(),
                                             ) {
-                                            modified
+                                            Cow::Owned(modified)
                                         } else {
-                                            raw_block.clone()
+                                            Cow::Borrowed(raw_block.as_str())
                                         };
 
                                         // Then, apply event transformation (function_call → mcp_call)
-                                        if let Some(transformed) = Self::transform_streaming_event(
-                                            &block_to_send,
-                                            server_label,
-                                        ) {
-                                            block_to_send = transformed;
-                                        }
+                                        let final_block = if let Some(transformed) =
+                                            Self::transform_streaming_event(
+                                                &block_cow,
+                                                server_label,
+                                            ) {
+                                            Cow::Owned(transformed)
+                                        } else {
+                                            block_cow
+                                        };
 
-                                        let chunk_to_send = format!("{}\n\n", block_to_send);
+                                        let chunk_to_send = format!("{}\n\n", final_block);
                                         if tx.send(Ok(Bytes::from(chunk_to_send))).is_err() {
                                             return;
                                         }
@@ -1303,22 +1315,26 @@ impl OpenAIRouter {
                         &call.arguments_buffer,
                     )
                     .await;
-                    let (output_str, success) = match call_result {
-                        Ok((_, output)) => (output, true),
+                    let (output_str, success, error_msg) = match call_result {
+                        Ok((_, output)) => (output, true, None),
                         Err(err) => {
                             warn!("Tool execution failed during streaming: {}", err);
-                            (json!({ "error": err }).to_string(), false)
+                            (json!({ "error": &err }).to_string(), false, Some(err))
                         }
                     };
 
                     // Send mcp_call completion event to client
-                    OpenAIRouter::send_mcp_call_completion_events(
+                    if !OpenAIRouter::send_mcp_call_completion_events_with_error(
                         &tx,
                         &call,
                         &output_str,
                         server_label,
                         success,
-                    );
+                        error_msg.as_deref(),
+                    ) {
+                        // Client disconnected, no point continuing tool execution
+                        return;
+                    }
 
                     // Record the call
                     state.record_call(call.call_id, call.name, call.arguments_buffer, output_str);
@@ -1435,11 +1451,12 @@ impl OpenAIRouter {
     }
 
     /// Send mcp_list_tools events to client at the start of streaming
+    /// Returns false if client disconnected
     fn send_mcp_list_tools_events(
         tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
         mcp: &Arc<crate::mcp::McpClientManager>,
         server_label: &str,
-    ) {
+    ) -> bool {
         let tools_item = Self::build_mcp_list_tools_item(mcp, server_label);
 
         // Event 1: response.output_item.added (mcp_list_tools)
@@ -1451,7 +1468,9 @@ impl OpenAIRouter {
                 "item": tools_item
             })
         );
-        let _ = tx.send(Ok(Bytes::from(event1)));
+        if tx.send(Ok(Bytes::from(event1))).is_err() {
+            return false; // Client disconnected
+        }
 
         // Event 2: response.output_item.done (mcp_list_tools)
         let event2 = format!(
@@ -1462,17 +1481,19 @@ impl OpenAIRouter {
                 "item": tools_item
             })
         );
-        let _ = tx.send(Ok(Bytes::from(event2)));
+        tx.send(Ok(Bytes::from(event2))).is_ok()
     }
 
     /// Send mcp_call completion events after tool execution
-    fn send_mcp_call_completion_events(
+    /// Returns false if client disconnected
+    fn send_mcp_call_completion_events_with_error(
         tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
         call: &FunctionCallInProgress,
         output: &str,
         server_label: &str,
         success: bool,
-    ) {
+        error_msg: Option<&str>,
+    ) -> bool {
         // Build mcp_call item (reuse existing function)
         let mcp_call_item = Self::build_mcp_call_item(
             &call.name,
@@ -1480,11 +1501,7 @@ impl OpenAIRouter {
             output,
             server_label,
             success,
-            if success {
-                None
-            } else {
-                Some("Tool execution failed")
-            },
+            error_msg,
         );
 
         // Event: response.output_item.done (with completed mcp_call)
@@ -1496,7 +1513,7 @@ impl OpenAIRouter {
                 "item": mcp_call_item
             })
         );
-        let _ = tx.send(Ok(Bytes::from(event)));
+        tx.send(Ok(Bytes::from(event))).is_ok()
     }
 
     /// Inject MCP metadata into a streaming response
