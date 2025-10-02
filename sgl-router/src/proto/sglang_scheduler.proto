@@ -120,11 +120,8 @@ message GenerateRequest {
   // Data parallel routing
   int32 data_parallel_rank = 16;
 
-  // For load balancing
-  int32 dp_balance_id = 17;
-
   // Whether client wants streaming response
-  bool stream = 18;
+  bool stream = 17;
 }
 
 message TokenizedInput {

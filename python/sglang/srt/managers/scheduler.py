@@ -145,7 +145,7 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
 from sglang.srt.managers.session_controller import Session
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient
-from sglang.srt.managers.utils import DPBalanceMeta, validate_input_length
+from sglang.srt.managers.utils import validate_input_length
 from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
@@ -271,7 +271,6 @@ class Scheduler(
         moe_ep_rank: int,
         pp_rank: int,
         dp_rank: Optional[int],
-        dp_balance_meta: Optional[DPBalanceMeta] = None,
     ):
         # Parse args
         self.server_args = server_args
@@ -600,7 +599,6 @@ class Scheduler(
 
         # Init metrics stats
         self.init_metrics(tp_rank, pp_rank, dp_rank)
-        self.init_dp_balance(dp_balance_meta)
 
         if self.enable_kv_cache_events:
             self.init_kv_events(server_args.kv_events_config)
@@ -1270,8 +1268,6 @@ class Scheduler(
         self,
         recv_req: TokenizedGenerateReqInput,
     ):
-        self.maybe_update_dp_balance_data(recv_req)
-
         # Create a new request
         if (
             recv_req.session_params is None
@@ -1797,7 +1793,6 @@ class Scheduler(
 
         # Handle DP attention
         if need_dp_attn_preparation:
-            self.maybe_handle_dp_balance_data()
             ret = self.prepare_mlp_sync_batch(ret)
 
         return ret
@@ -2803,7 +2798,6 @@ def run_scheduler_process(
     pp_rank: int,
     dp_rank: Optional[int],
     pipe_writer,
-    balance_meta: Optional[DPBalanceMeta] = None,
 ):
     # Generate the logger prefix
     prefix = ""
@@ -2852,7 +2846,6 @@ def run_scheduler_process(
             moe_ep_rank,
             pp_rank,
             dp_rank,
-            dp_balance_meta=balance_meta,
         )
         pipe_writer.send(
             {
