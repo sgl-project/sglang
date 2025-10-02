@@ -388,6 +388,8 @@ class EagleVerifyInput(SpecInput):
         evict_mask = torch.full_like(self.draft_token, True, dtype=torch.bool)
         evict_mask[accept_index] = False
         accept_length_cpu = accept_length.cpu()
+        # FIXME: this `tolist()` fixes the numerical calculation consistency
+        # try to unify the tensor representation and list representation
         accept_length_list = accept_length_cpu.tolist()
 
         if page_size == 1:
