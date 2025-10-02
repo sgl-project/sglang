@@ -1,13 +1,8 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 import torch
 
 from sglang.srt.mem_cache.allocator import PagedTokenToKVPoolAllocator
-
-if TYPE_CHECKING:
-    from sglang.srt.mem_cache.memory_pool import KVCache
 
 
 def alloc_extend_kernel_ascend(
