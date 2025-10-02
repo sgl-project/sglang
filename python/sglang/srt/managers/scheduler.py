@@ -2066,8 +2066,8 @@ class Scheduler(
                     batch.batch_size(), forward_batch_output.num_accepted_tokens
                 )
 
-            if self.pp_group.is_last_rank:
-                batch.output_ids = forward_batch_output.next_token_ids
+            # update batch's output ids
+            batch.output_ids = forward_batch_output.next_token_ids
 
             # These 2 values are needed for processing the output, but the values can be
             # modified by overlap schedule. So we have to copy them here so that
