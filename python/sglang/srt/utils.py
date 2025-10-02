@@ -3265,13 +3265,8 @@ def get_num_new_pages(
     num_pages_after = (seq_lens + page_size - 1) // page_size
     num_pages_before = (prefix_lens + page_size - 1) // page_size
     num_new_pages = num_pages_after - num_pages_before
-    extend_lens = seq_lens - prefix_lens
     sum_num_new_pages = torch.sum(num_new_pages).to(torch.int64)
-    if decode:
-        return sum_num_new_pages.item()
-    merged_value = (sum_num_new_pages) << 32 | torch.sum(extend_lens).to(torch.int64)
-
-    return merged_value.item() >> 32
+    return sum_num_new_pages.item()
 
 
 class CachedKernel:
