@@ -1165,6 +1165,7 @@ impl OpenAIRouter {
         server_label: &str,
         original_request: &ResponsesRequest,
         previous_response_id: Option<&str>,
+        sequence_number: &mut u64,
     ) -> bool {
         // Skip individual function_call_arguments.delta events - we'll send them as one
         if event_name == Some(event_types::FUNCTION_CALL_ARGUMENTS_DELTA) {
@@ -1231,6 +1232,12 @@ impl OpenAIRouter {
             original_request,
             previous_response_id,
         );
+
+        // Update sequence number if present in the event
+        if parsed_data.get("sequence_number").is_some() {
+            parsed_data["sequence_number"] = json!(*sequence_number);
+            *sequence_number += 1;
+        }
 
         // Serialize once
         let final_data = match serde_json::to_string(&parsed_data) {
@@ -1307,6 +1314,7 @@ impl OpenAIRouter {
         tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
         state: &mut ToolLoopState,
         server_label: &str,
+        sequence_number: &mut u64,
     ) -> bool {
         // Execute all pending tool calls (sequential, as PR3 is skipped)
         for call in pending_calls {
@@ -1348,6 +1356,7 @@ impl OpenAIRouter {
                 server_label,
                 success,
                 error_msg.as_deref(),
+                sequence_number,
             ) {
                 // Client disconnected, no point continuing tool execution
                 return false;
@@ -1436,6 +1445,7 @@ impl OpenAIRouter {
             let mut current_payload = payload_clone;
             let mut mcp_list_tools_sent = false;
             let mut is_first_iteration = true;
+            let mut sequence_number: u64 = 0; // Track global sequence number across all iterations
 
             let server_label = original_request
                 .tools
@@ -1510,11 +1520,15 @@ impl OpenAIRouter {
                                 match action {
                                     StreamAction::Forward => {
                                         // Skip response.created and response.in_progress on subsequent iterations
+                                        // Do NOT consume their sequence numbers - we want continuous numbering
                                         let should_skip = if !is_first_iteration {
-                                            if let Ok(parsed) = serde_json::from_str::<Value>(data.as_ref()) {
+                                            if let Ok(parsed) =
+                                                serde_json::from_str::<Value>(data.as_ref())
+                                            {
                                                 matches!(
                                                     parsed.get("type").and_then(|v| v.as_str()),
-                                                    Some("response.created") | Some("response.in_progress")
+                                                    Some("response.created")
+                                                        | Some("response.in_progress")
                                                 )
                                             } else {
                                                 false
@@ -1534,6 +1548,7 @@ impl OpenAIRouter {
                                                 server_label,
                                                 &original_request,
                                                 previous_response_id.as_deref(),
+                                                &mut sequence_number,
                                             ) {
                                                 // Client disconnected
                                                 return;
@@ -1542,14 +1557,19 @@ impl OpenAIRouter {
 
                                         // After forwarding response.in_progress, send mcp_list_tools events (once)
                                         if !seen_in_progress {
-                                            if let Ok(parsed) = serde_json::from_str::<Value>(data.as_ref()) {
-                                                if parsed.get("type").and_then(|v| v.as_str()) == Some("response.in_progress") {
+                                            if let Ok(parsed) =
+                                                serde_json::from_str::<Value>(data.as_ref())
+                                            {
+                                                if parsed.get("type").and_then(|v| v.as_str())
+                                                    == Some("response.in_progress")
+                                                {
                                                     seen_in_progress = true;
                                                     if !mcp_list_tools_sent {
                                                         if !OpenAIRouter::send_mcp_list_tools_events(
                                                             &tx,
                                                             &active_mcp_clone,
                                                             server_label,
+                                                            &mut sequence_number,
                                                         ) {
                                                             // Client disconnected
                                                             return;
@@ -1652,6 +1672,7 @@ impl OpenAIRouter {
                     &tx,
                     &mut state,
                     server_label,
+                    &mut sequence_number,
                 )
                 .await
                 {
@@ -1726,17 +1747,21 @@ impl OpenAIRouter {
         tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
         mcp: &Arc<crate::mcp::McpClientManager>,
         server_label: &str,
+        _sequence_number: &mut u64,
     ) -> bool {
         let tools_item_full = Self::build_mcp_list_tools_item(mcp, server_label);
-        let item_id = tools_item_full.get("id").and_then(|v| v.as_str()).unwrap_or("");
-        
+        let item_id = tools_item_full
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
         // Create empty tools version for the initial added event
         let mut tools_item_empty = tools_item_full.clone();
         if let Some(obj) = tools_item_empty.as_object_mut() {
             obj.insert("tools".to_string(), json!([]));
         }
 
-        // Event 1: response.output_item.added with empty tools
+        // Event 1: response.output_item.added with empty tools (no sequence_number - not in OpenAI spec)
         let event1 = format!(
             "event: response.output_item.added\ndata: {}\n\n",
             json!({
@@ -1749,7 +1774,7 @@ impl OpenAIRouter {
             return false; // Client disconnected
         }
 
-        // Event 2: response.mcp_list_tools.in_progress
+        // Event 2: response.mcp_list_tools.in_progress (no sequence_number - MCP-specific)
         let event2 = format!(
             "event: response.mcp_list_tools.in_progress\ndata: {}\n\n",
             json!({
@@ -1762,7 +1787,7 @@ impl OpenAIRouter {
             return false;
         }
 
-        // Event 3: response.mcp_list_tools.completed
+        // Event 3: response.mcp_list_tools.completed (no sequence_number - MCP-specific)
         let event3 = format!(
             "event: response.mcp_list_tools.completed\ndata: {}\n\n",
             json!({
@@ -1775,7 +1800,7 @@ impl OpenAIRouter {
             return false;
         }
 
-        // Event 4: response.output_item.done with full tools list
+        // Event 4: response.output_item.done with full tools list (no sequence_number - not in OpenAI spec)
         let event4 = format!(
             "event: response.output_item.done\ndata: {}\n\n",
             json!({
@@ -1796,6 +1821,7 @@ impl OpenAIRouter {
         server_label: &str,
         success: bool,
         error_msg: Option<&str>,
+        _sequence_number: &mut u64,
     ) -> bool {
         // Build mcp_call item (reuse existing function)
         let mcp_call_item = Self::build_mcp_call_item(
