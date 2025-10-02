@@ -150,7 +150,11 @@ from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
-from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatchOutput,
+    ForwardMode,
+    PPProxyTensors,
+)
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -175,7 +179,6 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_int_env_var,
     get_zmq_socket,
-    is_cpu,
     kill_itself_when_parent_died,
     numa_bind_to_node,
     point_to_point_pyobj,
@@ -194,17 +197,35 @@ logger = logging.getLogger(__name__)
 TEST_RETRACT = get_bool_env_var("SGLANG_TEST_RETRACT")
 GRAMMAR_TIMEOUT = float(os.environ.get("SGLANG_GRAMMAR_TIMEOUT", 300))
 
-_is_cpu = is_cpu()
-
 
 @dataclass
 class GenerationBatchResult:
     logits_output: Optional[LogitsProcessorOutput]
     pp_hidden_states_proxy_tensors: Optional[PPProxyTensors]
     next_token_ids: Optional[List[int]]
+    can_run_cuda_graph: bool
+
+    # For output processing
     extend_input_len_per_req: List[int]
     extend_logprob_start_len_per_req: List[int]
-    can_run_cuda_graph: bool
+
+    @classmethod
+    def from_forward_batch_output(
+        cls,
+        forward_batch_output: ForwardBatchOutput,
+        extend_input_len_per_req: List[int],
+        extend_logprob_start_len_per_req: List[int],
+    ):
+        # TODO(lsyin): remove this workaround logic and try to unify output classes
+
+        return cls(
+            logits_output=forward_batch_output.logits_output,
+            pp_hidden_states_proxy_tensors=forward_batch_output.pp_proxy_tensors,
+            next_token_ids=forward_batch_output.next_token_ids,
+            extend_input_len_per_req=extend_input_len_per_req,
+            extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
+            can_run_cuda_graph=forward_batch_output.can_run_cuda_graph,
+        )
 
 
 @dataclass
@@ -2027,26 +2048,14 @@ class Scheduler(
                 batch_or_worker_batch
             )
 
-            (
-                logits_output,
-                next_token_ids,
-                num_accepted_tokens,
-                pp_hidden_states_proxy_tensors,
-                can_run_cuda_graph,
-            ) = (
-                forward_batch_output.logits_output,
-                forward_batch_output.next_token_ids,
-                forward_batch_output.num_accepted_tokens,
-                forward_batch_output.pp_proxy_tensors,
-                forward_batch_output.can_run_cuda_graph,
-            )
-
             if not self.spec_algorithm.is_none():
                 # TODO(lsyin): unify this metric-updating logic with non-spec, and move it to decode processing
-                self.udpate_spec_metrics(batch.batch_size(), num_accepted_tokens)
+                self.udpate_spec_metrics(
+                    batch.batch_size(), forward_batch_output.num_accepted_tokens
+                )
 
             if self.pp_group.is_last_rank:
-                batch.output_ids = next_token_ids
+                batch.output_ids = forward_batch_output.next_token_ids
 
             # These 2 values are needed for processing the output, but the values can be
             # modified by overlap schedule. So we have to copy them here so that
@@ -2063,18 +2072,10 @@ class Scheduler(
             else:
                 extend_logprob_start_len_per_req = None
 
-            ret = GenerationBatchResult(
-                logits_output=logits_output if self.pp_group.is_last_rank else None,
-                # TODO(lsyin): remove this if and all similar ifs
-                pp_hidden_states_proxy_tensors=(
-                    pp_hidden_states_proxy_tensors
-                    if not self.pp_group.is_last_rank
-                    else None
-                ),
-                next_token_ids=next_token_ids if self.pp_group.is_last_rank else None,
+            return GenerationBatchResult.from_forward_batch_output(
+                forward_batch_output=forward_batch_output,
                 extend_input_len_per_req=extend_input_len_per_req,
                 extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
-                can_run_cuda_graph=can_run_cuda_graph,
             )
         else:  # embedding or reward model
             model_worker_batch = batch.get_model_worker_batch()
