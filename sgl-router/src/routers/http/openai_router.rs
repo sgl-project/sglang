@@ -243,22 +243,28 @@ impl StreamingToolHandler {
                 if let Some(item) = parsed.get("item") {
                     if let Some(item_type) = item.get("type").and_then(|v| v.as_str()) {
                         if item_type == "function_call" || item_type == "function_tool_call" {
-                            let output_index = parsed
-                                .get("output_index")
-                                .and_then(|v| v.as_u64())
-                                .map(|v| v as usize)
-                                .unwrap_or(0);
+                            match parsed.get("output_index").and_then(|v| v.as_u64()) {
+                                Some(idx) => {
+                                    let output_index = idx as usize;
+                                    let call_id =
+                                        item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
+                                    let name =
+                                        item.get("name").and_then(|v| v.as_str()).unwrap_or("");
 
-                            let call_id =
-                                item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
-                            let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                                    // Create or update the function call
+                                    let call = self.get_or_create_call(output_index, item);
+                                    call.call_id = call_id.to_string();
+                                    call.name = name.to_string();
 
-                            // Create or update the function call
-                            let call = self.get_or_create_call(output_index, item);
-                            call.call_id = call_id.to_string();
-                            call.name = name.to_string();
-
-                            self.in_function_call = true;
+                                    self.in_function_call = true;
+                                }
+                                None => {
+                                    tracing::warn!(
+                                        "Missing output_index in function_call added event, \
+                                         forwarding without processing for tool execution"
+                                    );
+                                }
+                            }
                         }
                     }
                 }
@@ -1510,14 +1516,14 @@ impl OpenAIRouter {
                                 }
 
                                 // Process through handler
-                                let action = handler.process_event(event_name.as_deref(), &data);
+                                let action = handler.process_event(event_name, data.as_ref());
 
                                 match action {
                                     StreamAction::Forward => {
                                         if !Self::forward_streaming_event(
                                             &raw_block,
-                                            event_name.as_deref(),
-                                            &data,
+                                            event_name,
+                                            data.as_ref(),
                                             &handler,
                                             &tx,
                                             server_label,
@@ -1659,19 +1665,27 @@ impl OpenAIRouter {
     }
 
     /// Parse an SSE block into event name and data
-    fn parse_sse_block(block: &str) -> (Option<String>, String) {
-        let mut event_name: Option<String> = None;
-        let mut data_lines: Vec<String> = Vec::new();
+    ///
+    /// Returns borrowed strings when possible to avoid allocations in hot paths.
+    /// Only allocates when multiple data lines need to be joined.
+    fn parse_sse_block(block: &str) -> (Option<&str>, std::borrow::Cow<'_, str>) {
+        let mut event_name: Option<&str> = None;
+        let mut data_lines: Vec<&str> = Vec::new();
 
         for line in block.lines() {
             if let Some(rest) = line.strip_prefix("event:") {
-                event_name = Some(rest.trim().to_string());
+                event_name = Some(rest.trim());
             } else if let Some(rest) = line.strip_prefix("data:") {
-                data_lines.push(rest.trim_start().to_string());
+                data_lines.push(rest.trim_start());
             }
         }
 
-        let data = data_lines.join("\n");
+        let data = if data_lines.len() == 1 {
+            std::borrow::Cow::Borrowed(data_lines[0])
+        } else {
+            std::borrow::Cow::Owned(data_lines.join("\n"))
+        };
+
         (event_name, data)
     }
 
@@ -2001,29 +2015,6 @@ impl OpenAIRouter {
                         Value::String(prev_id.to_string()),
                     );
                     changed = true;
-                }
-            }
-
-            // Mask tools from function to MCP format for streaming events
-            // Check if this response has tools that need masking
-            if response_obj.get("tools").is_some() {
-                let requested_mcp = original_body
-                    .tools
-                    .iter()
-                    .any(|t| matches!(t.r#type, ResponseToolType::Mcp));
-
-                if requested_mcp {
-                    // Create a temporary response value to pass to mask_tools_as_mcp
-                    let mut temp_response = Value::Object(response_obj.clone());
-                    Self::mask_tools_as_mcp(&mut temp_response, original_body);
-
-                    // Copy back the masked tools
-                    if let Some(masked_obj) = temp_response.as_object() {
-                        if let Some(masked_tools) = masked_obj.get("tools") {
-                            response_obj.insert("tools".to_string(), masked_tools.clone());
-                            changed = true;
-                        }
-                    }
                 }
             }
         }
