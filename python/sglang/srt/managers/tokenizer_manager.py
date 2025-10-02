@@ -1127,6 +1127,40 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         logging.info(f"Config logging: {obj=}")
         self.log_request_metadata = self.get_log_request_metadata()
 
+    def _create_request_metrics_exporters(self) -> List[RequestMetricsExporter]:
+        """Create and configure RequestMetricsExporter based on server args."""
+        metrics_exporters = []
+
+        # For metrics exporting, skip the same names from `self.log_request_metadata` config
+        # used in stdout output filtering to maintain consistency.
+        _, obj_skip_names, out_skip_names = self.log_request_metadata
+
+        from sglang.srt.managers.request_metrics_exporter import (
+            create_request_metrics_exporters,
+        )
+
+        metrics_exporters.extend(
+            create_request_metrics_exporters(
+                self.server_args, obj_skip_names, out_skip_names
+            )
+        )
+
+        # Import additional RequestMetricsExporter from private fork if available; skip otherwise.
+        try:
+            from sglang.private.managers.request_metrics_exporter_factory import (
+                create_request_metrics_exporter,
+            )
+
+            metrics_exporters.extend(
+                create_request_metrics_exporter(
+                    self.server_args, obj_skip_names, out_skip_names
+                )
+            )
+        except ImportError:
+            pass
+
+        return metrics_exporters
+
     async def freeze_gc(self):
         """Send a freeze_gc message to the scheduler first, then freeze locally."""
         self.send_to_scheduler.send_pyobj(FreezeGCReq())
