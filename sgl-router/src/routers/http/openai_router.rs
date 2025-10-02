@@ -41,6 +41,7 @@ mod event_types {
     // Output item events
     pub const OUTPUT_ITEM_ADDED: &str = "response.output_item.added";
     pub const OUTPUT_ITEM_DONE: &str = "response.output_item.done";
+    pub const OUTPUT_ITEM_DELTA: &str = "response.output_item.delta";
 
     // Function call events
     pub const FUNCTION_CALL_ARGUMENTS_DELTA: &str = "response.function_call_arguments.delta";
@@ -50,11 +51,15 @@ mod event_types {
     pub const MCP_CALL_ARGUMENTS_DELTA: &str = "response.mcp_call_arguments.delta";
     pub const MCP_CALL_ARGUMENTS_DONE: &str = "response.mcp_call_arguments.done";
     pub const MCP_CALL_IN_PROGRESS: &str = "response.mcp_call.in_progress";
+    pub const MCP_CALL_COMPLETED: &str = "response.mcp_call.completed";
+    pub const MCP_LIST_TOOLS_IN_PROGRESS: &str = "response.mcp_list_tools.in_progress";
+    pub const MCP_LIST_TOOLS_COMPLETED: &str = "response.mcp_list_tools.completed";
 
     // Item types
     pub const ITEM_TYPE_FUNCTION_CALL: &str = "function_call";
     pub const ITEM_TYPE_FUNCTION_TOOL_CALL: &str = "function_tool_call";
     pub const ITEM_TYPE_MCP_CALL: &str = "mcp_call";
+    pub const ITEM_TYPE_FUNCTION: &str = "function";
 }
 
 /// Router for OpenAI backend
@@ -128,7 +133,7 @@ impl ToolLoopState {
     ) {
         // Add function_call item to history
         let func_item = json!({
-            "type": "function_call",
+            "type": event_types::ITEM_TYPE_FUNCTION_CALL,
             "call_id": call_id,
             "name": tool_name,
             "arguments": args_json_str
@@ -303,7 +308,7 @@ impl StreamingToolHandler {
             .unwrap_or_default();
 
         match event_type.as_str() {
-            "response.output_item.added" => {
+            event_types::OUTPUT_ITEM_ADDED => {
                 if let Some(idx) = parsed.get("output_index").and_then(|v| v.as_u64()) {
                     self.ensure_output_index(idx as usize);
                 }
@@ -311,7 +316,9 @@ impl StreamingToolHandler {
                 // Check if this is a function_call item being added
                 if let Some(item) = parsed.get("item") {
                     if let Some(item_type) = item.get("type").and_then(|v| v.as_str()) {
-                        if item_type == "function_call" || item_type == "function_tool_call" {
+                        if item_type == event_types::ITEM_TYPE_FUNCTION_CALL
+                            || item_type == event_types::ITEM_TYPE_FUNCTION_TOOL_CALL
+                        {
                             match parsed.get("output_index").and_then(|v| v.as_u64()) {
                                 Some(idx) => {
                                     let output_index = idx as usize;
@@ -341,7 +348,7 @@ impl StreamingToolHandler {
                 }
                 StreamAction::Forward
             }
-            "response.function_call_arguments.delta" => {
+            event_types::FUNCTION_CALL_ARGUMENTS_DELTA => {
                 // Accumulate arguments for the function call
                 if let Some(output_index) = parsed
                     .get("output_index")
@@ -369,7 +376,7 @@ impl StreamingToolHandler {
                 }
                 StreamAction::Forward
             }
-            "response.function_call_arguments.done" => {
+            event_types::FUNCTION_CALL_ARGUMENTS_DONE => {
                 // Function call arguments complete - check if ready to execute
                 if let Some(output_index) = parsed
                     .get("output_index")
@@ -394,8 +401,8 @@ impl StreamingToolHandler {
                     StreamAction::Forward
                 }
             }
-            "response.output_item.delta" => self.process_output_delta(&parsed),
-            "response.output_item.done" => {
+            event_types::OUTPUT_ITEM_DELTA => self.process_output_delta(&parsed),
+            event_types::OUTPUT_ITEM_DONE => {
                 // Check if we have complete function calls ready to execute
                 if let Some(output_index) = parsed
                     .get("output_index")
@@ -433,7 +440,9 @@ impl StreamingToolHandler {
         // Check if this is a function call delta
         let item_type = delta.get("type").and_then(|v| v.as_str());
 
-        if item_type == Some("function_tool_call") || item_type == Some("function_call") {
+        if item_type == Some(event_types::ITEM_TYPE_FUNCTION_TOOL_CALL)
+            || item_type == Some(event_types::ITEM_TYPE_FUNCTION_CALL)
+        {
             self.in_function_call = true;
 
             // Get or create function call for this output index
@@ -586,17 +595,17 @@ impl StreamingResponseAccumulator {
             .unwrap_or_default();
 
         match event_type.as_str() {
-            "response.created" => {
+            event_types::RESPONSE_CREATED => {
                 if let Some(response) = parsed.get("response") {
                     self.initial_response = Some(response.clone());
                 }
             }
-            "response.completed" => {
+            event_types::RESPONSE_COMPLETED => {
                 if let Some(response) = parsed.get("response") {
                     self.completed_response = Some(response.clone());
                 }
             }
-            "response.output_item.done" => {
+            event_types::OUTPUT_ITEM_DONE => {
                 if let (Some(index), Some(item)) = (
                     parsed
                         .get("output_index")
@@ -1451,9 +1460,11 @@ impl OpenAIRouter {
                     ) {
                         let in_progress_event = json!({
                             "type": event_types::MCP_CALL_IN_PROGRESS,
+                            "sequence_number": *sequence_number,
                             "output_index": output_index,
                             "item_id": item_id
                         });
+                        *sequence_number += 1;
                         let in_progress_block = format!(
                             "event: {}\ndata: {}\n\n",
                             event_types::MCP_CALL_IN_PROGRESS,
@@ -1544,7 +1555,7 @@ impl OpenAIRouter {
                     arr.retain(|item| {
                         item.get("type")
                             .and_then(|v| v.as_str())
-                            .map(|s| s == "function")
+                            .map(|s| s == event_types::ITEM_TYPE_FUNCTION)
                             .unwrap_or(false)
                     });
                 }
@@ -1560,7 +1571,7 @@ impl OpenAIRouter {
                     "additionalProperties": false
                 }));
                 let tool = serde_json::json!({
-                    "type": "function",
+                    "type": event_types::ITEM_TYPE_FUNCTION,
                     "name": t.name,
                     "description": t.description,
                     "parameters": parameters
@@ -1692,8 +1703,8 @@ impl OpenAIRouter {
                                             {
                                                 matches!(
                                                     parsed.get("type").and_then(|v| v.as_str()),
-                                                    Some("response.created")
-                                                        | Some("response.in_progress")
+                                                    Some(event_types::RESPONSE_CREATED)
+                                                        | Some(event_types::RESPONSE_IN_PROGRESS)
                                                 )
                                             } else {
                                                 false
@@ -1726,7 +1737,7 @@ impl OpenAIRouter {
                                                 serde_json::from_str::<Value>(data.as_ref())
                                             {
                                                 if parsed.get("type").and_then(|v| v.as_str())
-                                                    == Some("response.in_progress")
+                                                    == Some(event_types::RESPONSE_IN_PROGRESS)
                                                 {
                                                     seen_in_progress = true;
                                                     if !mcp_list_tools_sent {
@@ -1948,14 +1959,15 @@ impl OpenAIRouter {
 
         // Event 1: response.output_item.added with empty tools
         let event1_payload = json!({
-            "type": "response.output_item.added",
+            "type": event_types::OUTPUT_ITEM_ADDED,
             "sequence_number": *sequence_number,
             "output_index": output_index,
             "item": tools_item_empty
         });
         *sequence_number += 1;
         let event1 = format!(
-            "event: response.output_item.added\ndata: {}\n\n",
+            "event: {}\ndata: {}\n\n",
+            event_types::OUTPUT_ITEM_ADDED,
             event1_payload
         );
         if tx.send(Ok(Bytes::from(event1))).is_err() {
@@ -1964,14 +1976,15 @@ impl OpenAIRouter {
 
         // Event 2: response.mcp_list_tools.in_progress
         let event2_payload = json!({
-            "type": "response.mcp_list_tools.in_progress",
+            "type": event_types::MCP_LIST_TOOLS_IN_PROGRESS,
             "sequence_number": *sequence_number,
             "output_index": output_index,
             "item_id": item_id
         });
         *sequence_number += 1;
         let event2 = format!(
-            "event: response.mcp_list_tools.in_progress\ndata: {}\n\n",
+            "event: {}\ndata: {}\n\n",
+            event_types::MCP_LIST_TOOLS_IN_PROGRESS,
             event2_payload
         );
         if tx.send(Ok(Bytes::from(event2))).is_err() {
@@ -1980,14 +1993,15 @@ impl OpenAIRouter {
 
         // Event 3: response.mcp_list_tools.completed
         let event3_payload = json!({
-            "type": "response.mcp_list_tools.completed",
+            "type": event_types::MCP_LIST_TOOLS_COMPLETED,
             "sequence_number": *sequence_number,
             "output_index": output_index,
             "item_id": item_id
         });
         *sequence_number += 1;
         let event3 = format!(
-            "event: response.mcp_list_tools.completed\ndata: {}\n\n",
+            "event: {}\ndata: {}\n\n",
+            event_types::MCP_LIST_TOOLS_COMPLETED,
             event3_payload
         );
         if tx.send(Ok(Bytes::from(event3))).is_err() {
@@ -1996,14 +2010,15 @@ impl OpenAIRouter {
 
         // Event 4: response.output_item.done with full tools list
         let event4_payload = json!({
-            "type": "response.output_item.done",
+            "type": event_types::OUTPUT_ITEM_DONE,
             "sequence_number": *sequence_number,
             "output_index": output_index,
             "item": tools_item_full
         });
         *sequence_number += 1;
         let event4 = format!(
-            "event: response.output_item.done\ndata: {}\n\n",
+            "event: {}\ndata: {}\n\n",
+            event_types::OUTPUT_ITEM_DONE,
             event4_payload
         );
         tx.send(Ok(Bytes::from(event4))).is_ok()
@@ -2040,7 +2055,7 @@ impl OpenAIRouter {
 
         // Event 1: response.mcp_call.completed
         let completed_payload = json!({
-            "type": "response.mcp_call.completed",
+            "type": event_types::MCP_CALL_COMPLETED,
             "sequence_number": *sequence_number,
             "output_index": effective_output_index,
             "item_id": item_id
@@ -2048,7 +2063,8 @@ impl OpenAIRouter {
         *sequence_number += 1;
 
         let completed_event = format!(
-            "event: response.mcp_call.completed\ndata: {}\n\n",
+            "event: {}\ndata: {}\n\n",
+            event_types::MCP_CALL_COMPLETED,
             completed_payload
         );
         if tx.send(Ok(Bytes::from(completed_event))).is_err() {
@@ -2057,7 +2073,7 @@ impl OpenAIRouter {
 
         // Event 2: response.output_item.done (with completed mcp_call)
         let done_payload = json!({
-            "type": "response.output_item.done",
+            "type": event_types::OUTPUT_ITEM_DONE,
             "sequence_number": *sequence_number,
             "output_index": effective_output_index,
             "item": mcp_call_item
@@ -2065,7 +2081,8 @@ impl OpenAIRouter {
         *sequence_number += 1;
 
         let done_event = format!(
-            "event: response.output_item.done\ndata: {}\n\n",
+            "event: {}\ndata: {}\n\n",
+            event_types::OUTPUT_ITEM_DONE,
             done_payload
         );
         tx.send(Ok(Bytes::from(done_event))).is_ok()
@@ -2282,7 +2299,9 @@ impl OpenAIRouter {
 
         let should_patch = matches!(
             event_type,
-            "response.created" | "response.in_progress" | "response.completed"
+            event_types::RESPONSE_CREATED
+                | event_types::RESPONSE_IN_PROGRESS
+                | event_types::RESPONSE_COMPLETED
         );
 
         if !should_patch {
@@ -2374,7 +2393,9 @@ impl OpenAIRouter {
         for item in output {
             let obj = item.as_object()?;
             let t = obj.get("type")?.as_str()?;
-            if t == "function_tool_call" || t == "function_call" {
+            if t == event_types::ITEM_TYPE_FUNCTION_TOOL_CALL
+                || t == event_types::ITEM_TYPE_FUNCTION_CALL
+            {
                 let call_id = obj
                     .get("call_id")
                     .and_then(|v| v.as_str())
@@ -2561,7 +2582,9 @@ impl OpenAIRouter {
         let mut mcp_call_items = Vec::new();
 
         for item in conversation_history {
-            if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
+            if item.get("type").and_then(|t| t.as_str())
+                == Some(event_types::ITEM_TYPE_FUNCTION_CALL)
+            {
                 let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
                 let tool_name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
                 let args = item
@@ -2636,7 +2659,9 @@ impl OpenAIRouter {
             // Find any function_call items and convert them to mcp_call (incomplete)
             let mut mcp_call_items = Vec::new();
             for item in output_array.iter() {
-                if item.get("type").and_then(|t| t.as_str()) == Some("function_tool_call") {
+                if item.get("type").and_then(|t| t.as_str())
+                    == Some(event_types::ITEM_TYPE_FUNCTION_TOOL_CALL)
+                {
                     let tool_name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
                     let args = item
                         .get("arguments")
