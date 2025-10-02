@@ -113,12 +113,7 @@ impl ToolParser for GptOssParser {
                     }
                 };
 
-                // Generate unique ID
-                let id = format!("gpt_oss_call_{}", uuid::Uuid::new_v4());
-
                 tools.push(ToolCall {
-                    id,
-                    r#type: "function".to_string(),
                     function: FunctionCall {
                         name: function_name,
                         arguments,

@@ -32,6 +32,12 @@ pub trait ToolParser: Send + Sync {
     fn as_token_parser(&self) -> Option<&dyn TokenToolParser> {
         None
     }
+
+    /// Get unstreamed tool call arguments
+    /// Returns tool call items for arguments that have been parsed but not yet streamed
+    fn get_unstreamed_tool_args(&self) -> Option<Vec<crate::tool_parser::types::ToolCallItem>> {
+        None
+    }
 }
 
 /// Trait for partial JSON parsing

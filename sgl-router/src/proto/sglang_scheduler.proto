@@ -179,6 +179,9 @@ message GenerateStreamChunk {
 
   // Input logprobs (if requested) - only in first chunk
   InputLogProbs input_logprobs = 7;
+
+  // Index for ordering when n>1 (for parallel request multiplexing)
+  uint32 index = 8;
 }
 
 message GenerateComplete {
@@ -207,6 +210,9 @@ message GenerateComplete {
 
   // Input logprobs if requested (for prompt tokens)
   InputLogProbs input_logprobs = 10;
+
+  // Index for ordering when n>1 (for parallel request multiplexing)
+  uint32 index = 11;
 }
 
 message GenerateError {
