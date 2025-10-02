@@ -2042,11 +2042,8 @@ class Scheduler(
             )
 
             if not self.spec_algorithm.is_none():
-                # TODO(lsyin): unify this logic, move into some metric collector class
-                bs = batch.batch_size()
-                self.spec_num_total_accepted_tokens += num_accepted_tokens + bs
-                self.spec_num_total_forward_ct += bs
-                self.num_generated_tokens += num_accepted_tokens
+                # TODO(lsyin): unify this metric-updating logic with non-spec, and move it to decode processing
+                self.udpate_spec_metrics(batch.batch_size(), num_accepted_tokens)
 
             if self.pp_group.is_last_rank:
                 batch.output_ids = next_token_ids
