@@ -16,20 +16,21 @@ Options:
     --proto-file    Specify proto file (default: sglang_scheduler.proto)
 
 ### Install Dependencies
-pip install grpcio grpcio-tools
+pip install "grpcio==1.74.0" "grpcio-tools==1.74.0"
 
 ### Run Script
 cd python/sglang/srt/grpc
 python compile_proto.py
 """
 
+
 import argparse
-import os
-import sys
 import subprocess
-import time
+import sys
+from importlib.metadata import version
 from pathlib import Path
-from typing import List, Optional
+
+GRPC_VERSION = "1.74.0"
 
 
 def get_file_mtime(path: Path) -> float:
@@ -72,17 +73,28 @@ def compile_proto(proto_file: Path, output_dir: Path, verbose: bool = True) -> b
         import grpc_tools.protoc
     except ImportError:
         print("Error: grpcio-tools not installed")
-        print("Install with: pip install grpcio-tools")
+        print(
+            f'Install with: pip install "grpcio-tools=={GRPC_VERSION}" "grpcio=={GRPC_VERSION}"'
+        )
         return False
+
+    grpc_tools_version = version("grpcio-tools")
+    grpc_version = version("grpcio")
+    if grpc_tools_version != GRPC_VERSION or grpc_version != GRPC_VERSION:
+        raise RuntimeError(
+            f"Error: grpcio-tools version {grpc_tools_version} and grpcio version {grpc_version} detected, but {GRPC_VERSION} is required."
+        )
 
     # Compile command
     cmd = [
-        sys.executable, "-m", "grpc_tools.protoc",
+        sys.executable,
+        "-m",
+        "grpc_tools.protoc",
         f"-I{proto_file.parent}",
         f"--python_out={output_dir}",
         f"--grpc_python_out={output_dir}",
         f"--pyi_out={output_dir}",  # Generate type stubs
-        str(proto_file.name)
+        str(proto_file.name),
     ]
 
     if verbose:
@@ -102,7 +114,7 @@ def compile_proto(proto_file: Path, output_dir: Path, verbose: bool = True) -> b
     generated_files = [
         f"{proto_file.stem}_pb2.py",
         f"{proto_file.stem}_pb2_grpc.py",
-        f"{proto_file.stem}_pb2.pyi"
+        f"{proto_file.stem}_pb2.pyi",
     ]
 
     missing_files = []
@@ -149,10 +161,7 @@ def add_generation_header(output_dir: Path, proto_stem: str) -> None:
 
 """
 
-    files_to_update = [
-        f"{proto_stem}_pb2.py",
-        f"{proto_stem}_pb2_grpc.py"
-    ]
+    files_to_update = [f"{proto_stem}_pb2.py", f"{proto_stem}_pb2_grpc.py"]
 
     for filename in files_to_update:
         file_path = output_dir / filename
@@ -167,33 +176,32 @@ def main():
     parser = argparse.ArgumentParser(
         description="Compile protobuf files for SGLang gRPC server",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__
+        epilog=__doc__,
     )
 
     parser.add_argument(
         "--check",
         action="store_true",
-        help="Check if regeneration is needed (exit 1 if needed)"
+        help="Check if regeneration is needed (exit 1 if needed)",
     )
 
     parser.add_argument(
         "--proto-file",
         type=str,
         default="sglang_scheduler.proto",
-        help="Proto file to compile (default: sglang_scheduler.proto)"
+        help="Proto file to compile (default: sglang_scheduler.proto)",
     )
 
     parser.add_argument(
-        "-v", "--verbose",
+        "-v",
+        "--verbose",
         action="store_true",
         default=True,
-        help="Verbose output (default: True)"
+        help="Verbose output (default: True)",
     )
 
     parser.add_argument(
-        "-q", "--quiet",
-        action="store_true",
-        help="Quiet mode (overrides verbose)"
+        "-q", "--quiet", action="store_true", help="Quiet mode (overrides verbose)"
     )
 
     args = parser.parse_args()
