@@ -12,8 +12,13 @@ from typing import Any, List, Optional, Tuple
 
 import torch
 
-from sglang.srt.mem_cache.hicache_storage import HiCacheStorage, HiCacheStorageConfig
-from sglang.srt.mem_cache.storage.hf3fs.client_hf3fs import Hf3fsClient
+from sglang.srt.mem_cache.hicache_storage import (
+    HiCacheStorage,
+    HiCacheStorageConfig,
+    HiCacheStorageExtraInfo,
+)
+from sglang.srt.mem_cache.memory_pool_host import HostKVCache
+from sglang.srt.mem_cache.storage.hf3fs.hf3fs_client import Hf3fsClient
 from sglang.srt.metrics.collector import StorageMetrics
 
 logger = logging.getLogger(__name__)
@@ -114,6 +119,33 @@ def synchronized():
     return _decorator
 
 
+def create_hf3fs_client(
+    path: str, size: int, bytes_per_page: int, entries: int, use_mock: bool = False
+) -> Hf3fsClient:
+    """Factory function to create appropriate HF3FS client.
+
+    Args:
+        path: File path for storage
+        size: Total size of storage file
+        bytes_per_page: Bytes per page
+        entries: Number of entries for batch operations
+        use_mock: Whether to use mock client instead of real usrbio client
+
+    Returns:
+    """
+    if use_mock:
+        from sglang.srt.mem_cache.storage.hf3fs.hf3fs_client import Hf3fsMockClient
+
+        logger.info(f"[Rank Using Hf3fsMockClient for testing")
+        return Hf3fsMockClient(path, size, bytes_per_page, entries)
+    else:
+        from sglang.srt.mem_cache.storage.hf3fs.hf3fs_usrbio_client import (
+            Hf3fsUsrBioClient,
+        )
+
+        return Hf3fsUsrBioClient(path, size, bytes_per_page, entries)
+
+
 class HiCacheHF3FS(HiCacheStorage):
     """HiCache backend that stores KV cache pages in HF3FS files."""
 
@@ -131,6 +163,7 @@ class HiCacheHF3FS(HiCacheStorage):
         metadata_client: Hf3fsMetadataInterface,
         is_mla_model: bool = False,
         is_page_first_layout: bool = False,
+        use_mock_client: bool = False,
     ):
         self.rank = rank
         self.file_path = file_path
@@ -150,17 +183,24 @@ class HiCacheHF3FS(HiCacheStorage):
             self.skip_backup = True
             self.rank = 0
 
+        self.is_zero_copy = False
+
         logger.info(
             f"[Rank {self.rank}] HiCacheHF3FS Client Initializing: "
             f"file_path={self.file_path}, "
             f"file_size={self.file_size / (2 ** 30):.2f} GB, "
-            f"num_pages={self.num_pages}"
+            f"num_pages={self.num_pages}, "
+            f"is_mla_model={self.is_mla_model}"
         )
 
         self.ac = AtomicCounter(self.numjobs)
         self.clients = [
-            Hf3fsClient(
-                self.file_path, self.file_size, self.bytes_per_page, self.entries
+            create_hf3fs_client(
+                self.file_path,
+                self.file_size,
+                self.bytes_per_page,
+                self.entries,
+                use_mock_client,
             )
             for _ in range(numjobs)
         ]
@@ -202,14 +242,24 @@ class HiCacheHF3FS(HiCacheStorage):
             Hf3fsLocalMetadataClient,
         )
 
+        use_mock_client = False
         if storage_config is not None:
             rank, is_mla_model, is_page_first_layout = (
                 storage_config.tp_rank,
                 storage_config.is_mla_model,
                 storage_config.is_page_first_layout,
             )
+
+            if storage_config.extra_config is not None:
+                use_mock_client = storage_config.extra_config.get(
+                    "use_mock_hf3fs_client", False
+                )
         else:
-            rank, is_mla_model, is_page_first_layout = 0, False, False
+            rank, is_mla_model, is_page_first_layout = (
+                0,
+                False,
+                False,
+            )
 
         mla_unsupported_msg = f"MLA model is not supported without global metadata server, please refer to https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/mem_cache/storage/hf3fs/docs/deploy_sglang_3fs_multinode.md"
 
@@ -228,6 +278,7 @@ class HiCacheHF3FS(HiCacheStorage):
                 dtype=dtype,
                 metadata_client=Hf3fsLocalMetadataClient(),
                 is_page_first_layout=is_page_first_layout,
+                use_mock_client=use_mock_client,
             )
 
         try:
@@ -277,27 +328,15 @@ class HiCacheHF3FS(HiCacheStorage):
             metadata_client=metadata_client,
             is_mla_model=is_mla_model,
             is_page_first_layout=is_page_first_layout,
+            use_mock_client=use_mock_client,
         )
 
-    def get(
-        self,
-        key: str,
-        target_location: Optional[Any] = None,
-        target_sizes: Optional[Any] = None,
-    ) -> torch.Tensor | None:
-        return self.batch_get(
-            [key],
-            [target_location] if target_location is not None else None,
-            [target_sizes] if target_sizes is not None else None,
-        )[0]
-
     @synchronized()
-    def batch_get(
+    def _batch_get(
         self,
         keys: List[str],
-        target_locations: Optional[Any] = None,
-        target_sizes: Optional[Any] = None,
-    ) -> List[torch.Tensor | None]:
+        values: List[torch.Tensor],
+    ) -> List[bool]:
         page_indices = self.metadata_client.get_page_indices(self.rank, keys)
 
         batch_indices, file_offsets = [], []
@@ -306,15 +345,9 @@ class HiCacheHF3FS(HiCacheStorage):
                 batch_indices.append(i)
                 file_offsets.append(page_index * self.bytes_per_page)
 
-        if target_locations is not None:
-            for target_location in target_locations:
-                assert target_location.is_contiguous()
-            file_results = target_locations
-        else:
-            file_results = [
-                torch.empty(self.numel, dtype=self.dtype)
-                for _ in range(len(batch_indices))
-            ]
+        for target_location in values:
+            assert target_location.is_contiguous()
+        file_results = values
 
         start_time = time.perf_counter()
 
@@ -335,12 +368,10 @@ class HiCacheHF3FS(HiCacheStorage):
             ionum / (end_time - start_time) * self.gb_per_page
         )
 
-        results = [None] * len(keys)
-        for batch_index, file_result, read_result in zip(
-            batch_indices, file_results, read_results
-        ):
+        results = [False] * len(keys)
+        for batch_index, read_result in zip(batch_indices, read_results):
             if read_result == self.bytes_per_page:
-                results[batch_index] = file_result
+                results[batch_index] = True
             else:
                 logger.error(
                     f"[Rank {self.rank}] HiCacheHF3FS get {keys[batch_index]} failed"
@@ -348,28 +379,12 @@ class HiCacheHF3FS(HiCacheStorage):
 
         return results
 
-    def set(
-        self,
-        key: str,
-        value: Optional[Any] = None,
-        target_location: Optional[Any] = None,
-        target_sizes: Optional[Any] = None,
-    ) -> bool:
-        return self.batch_set(
-            [key],
-            [value] if value is not None else None,
-            [target_location] if target_location is not None else None,
-            [target_sizes] if target_sizes is not None else None,
-        )
-
     @synchronized()
-    def batch_set(
+    def _batch_set(
         self,
         keys: List[str],
         values: Optional[Any] = None,
-        target_locations: Optional[Any] = None,
-        target_sizes: Optional[Any] = None,
-    ) -> bool:
+    ) -> List[bool]:
         # In MLA backend, only one rank needs to backup the KV cache
         if self.skip_backup:
             return True
@@ -430,7 +445,7 @@ class HiCacheHF3FS(HiCacheStorage):
                 self.rank, written_keys_to_confirm, pages_to_release
             )
 
-        return all(results)
+        return results
 
     def delete(self, key: str) -> None:
         self.metadata_client.delete_keys(self.rank, [key])
@@ -440,21 +455,25 @@ class HiCacheHF3FS(HiCacheStorage):
         return result[0] if result else False
 
     def batch_exists(self, keys: List[str]) -> int:
+        factor = 1
+        if self.is_zero_copy and not self.is_mla_model:
+            keys = self._get_mha_zero_copy_keys(keys)
+            factor = 2
+
         results = self.metadata_client.exists(self.rank, keys)
-        for i in range(len(keys)):
-            if not results[i]:
-                return i
 
-        return len(keys)
+        i = 0
+        while i < len(keys) and results[i]:
+            i += 1
 
-    def clear(self) -> bool:
+        return i // factor
+
+    def clear(self) -> None:
         try:
             self.metadata_client.clear(self.rank)
             logger.info(f"Cleared HiCacheHF3FS for rank {self.rank}")
-            return True
         except Exception as e:
             logger.error(f"Failed to clear HiCacheHF3FS: {e}")
-            return False
 
     def close(self) -> None:
         try:
@@ -477,3 +496,139 @@ class HiCacheHF3FS(HiCacheStorage):
         self.prefetch_bandwidth.clear()
         self.backup_bandwidth.clear()
         return storage_metrics
+
+    def register_mem_pool_host(self, mem_pool_host: HostKVCache):
+        super().register_mem_pool_host(mem_pool_host)
+        self.is_zero_copy = self.mem_pool_host.layout == "page_first"
+        logger.info(f"{self.is_zero_copy=}")
+
+    def _get_mha_zero_copy_keys(self, keys: List[str]) -> List[str]:
+        _keys = []
+        for k in keys:
+            _keys.append(f"{k}-k")
+            _keys.append(f"{k}-v")
+        return _keys
+
+    def _get_mha_zero_copy_values(
+        self, values: List[torch.Tensor]
+    ) -> List[torch.Tensor]:
+        _values = []
+        for value in values:
+            _values.append(value[0])
+            _values.append(value[1])
+        return _values
+
+    def _batch_get_preprocess(self, keys, host_indices):
+        page_num = len(host_indices) // self.mem_pool_host.page_size
+        # host_indices to kv_buffer
+        flat = not self.is_zero_copy
+        values = (
+            [
+                self.mem_pool_host.get_data_page(host_indices[i * page_num], flat=flat)
+                for i in range(page_num)
+            ]
+            if self.is_zero_copy
+            else [
+                self.mem_pool_host.get_dummy_flat_data_page() for _ in range(page_num)
+            ]
+        )
+
+        if self.is_zero_copy and not self.is_mla_model:
+            keys = self._get_mha_zero_copy_keys(keys)
+            values = self._get_mha_zero_copy_values(values)
+
+        return keys, values
+
+    def _batch_get_postprocess(self, host_indices, values, results):
+        page_num = len(host_indices) // self.mem_pool_host.page_size
+
+        if self.is_zero_copy:
+            if not self.is_mla_model:
+                results = [
+                    (results[2 * i] and results[2 * i + 1]) for i in range(page_num)
+                ]
+                results = results[:page_num]
+            return results
+
+        for i in range(page_num):
+            if not results[i]:
+                break
+            self.mem_pool_host.set_from_flat_data_page(
+                host_indices[i * self.mem_pool_host.page_size], values[i]
+            )
+
+        return results
+
+    def batch_get_v1(
+        self,
+        keys: List[str],
+        host_indices: torch.Tensor,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> List[bool]:
+        keys, values = self._batch_get_preprocess(keys, host_indices)
+        results = self._batch_get(keys, values)
+        return self._batch_get_postprocess(host_indices, values, results)
+
+    def _batch_set_preprocess(self, keys, host_indices):
+        page_num = len(host_indices) // self.mem_pool_host.page_size
+        # host_indices to kv_buffer
+        flat = not self.is_zero_copy
+        values = [
+            self.mem_pool_host.get_data_page(host_indices[i * page_num], flat=flat)
+            for i in range(page_num)
+        ]
+
+        if self.is_zero_copy and not self.is_mla_model:
+            keys = self._get_mha_zero_copy_keys(keys)
+            values = self._get_mha_zero_copy_values(values)
+
+        return keys, values
+
+    def batch_set_v1(
+        self,
+        keys: List[str],
+        host_indices: torch.Tensor,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> List[bool]:
+        len_keys = len(keys)
+        keys, values = self._batch_set_preprocess(keys, host_indices)
+        results = self._batch_set(keys, values)
+        return results
+
+    # Deprecated
+    def get(
+        self,
+        key: str,
+        target_location: Optional[Any] = None,
+        target_sizes: Optional[Any] = None,
+    ) -> torch.Tensor | None:
+        pass
+
+    # Deprecated
+    def batch_get(
+        self,
+        keys: List[str],
+        target_locations: Optional[Any] = None,
+        target_sizes: Optional[Any] = None,
+    ) -> List[torch.Tensor | None] | int:
+        pass
+
+    # Deprecated
+    def set(
+        self,
+        key: str,
+        value: Optional[Any] = None,
+        target_location: Optional[Any] = None,
+        target_sizes: Optional[Any] = None,
+    ) -> bool:
+        pass
+
+    # Deprecated
+    def batch_set(
+        self,
+        keys: List[str],
+        values: Optional[Any] = None,
+        target_locations: Optional[Any] = None,
+        target_sizes: Optional[Any] = None,
+    ) -> bool:
+        pass

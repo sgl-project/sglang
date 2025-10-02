@@ -27,9 +27,9 @@ import tempfile
 import threading
 import time
 from http import HTTPStatus
-from typing import Any, AsyncIterator, Callable, Dict, List, Optional
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Union
 
-import setproctitle
+from sglang.srt.tracing.trace import process_tracing_init, trace_set_thread_info
 
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
@@ -70,9 +70,11 @@ from sglang.srt.managers.io_struct import (
     AbortReq,
     CloseSessionReqInput,
     ConfigureLoggingReq,
+    DestroyWeightsUpdateGroupReqInput,
     EmbeddingReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
+    InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterReqInput,
     OpenSessionReqInput,
@@ -80,6 +82,7 @@ from sglang.srt.managers.io_struct import (
     ProfileReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
+    SendWeightsToRemoteInstanceReqInput,
     SeparateReasoningReqInput,
     SetInternalStateReq,
     SlowDownReqInput,
@@ -92,8 +95,9 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiTokenizerManager,
-    deserialize_data,
+    MultiTokenizerRouter,
     get_main_process_id,
+    monkey_patch_uvicorn_multiprocessing,
     read_from_shared_memory,
     write_data_for_multi_tokenizer,
 )
@@ -123,7 +127,9 @@ HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
 # Store global states
 @dataclasses.dataclass
 class _GlobalState:
-    tokenizer_manager: TokenizerManager
+    tokenizer_manager: Union[
+        TokenizerManager, MultiTokenizerRouter, MultiTokenizerManager
+    ]
     template_manager: TemplateManager
     scheduler_info: Dict
 
@@ -136,21 +142,6 @@ def set_global_state(global_state: _GlobalState):
     _global_state = global_state
 
 
-# Function to set up all middlewares for multi-tokenizer compatibility
-def setup_middlewares(api_key: Optional[str], enable_metrics: bool):
-    """Setup all middlewares for both single and multi-process modes"""
-    worker_pid = os.getpid()
-
-    if api_key:
-        add_api_key_middleware(app, api_key)
-        logger.info(f"Worker {worker_pid} added API key middleware")
-
-    if enable_metrics:
-        add_prometheus_middleware(app)
-        enable_func_timer()
-        logger.info(f"Worker {worker_pid} added prometheus middleware")
-
-
 async def init_multi_tokenizer() -> ServerArgs:
     """Read args information from shm and init tokenizer manager for current process"""
     pid = os.getpid()
@@ -158,11 +149,15 @@ async def init_multi_tokenizer() -> ServerArgs:
     logger.info(f"current worker_id: {pid}, main processID: {main_pid}")
 
     # Read configuration from shared memory
-    port_args_data = read_from_shared_memory(f"port_args_{main_pid}")
-    server_args_data = read_from_shared_memory(f"server_args_{main_pid}")
-    scheduler_info_data = read_from_shared_memory(f"scheduler_info_{main_pid}")
-    port_args, server_args = deserialize_data(port_args_data, server_args_data)
-    scheduler_info = scheduler_info_data
+    port_args, server_args, scheduler_info = read_from_shared_memory(
+        f"multi_tokenizer_args_{main_pid}"
+    )
+    server_args: ServerArgs
+
+    # API key authentication is not supported in multi-tokenizer mode
+    assert (
+        server_args.api_key is None
+    ), "API key is not supported in multi-tokenizer mode"
 
     port_args.tokenizer_ipc_name = (
         f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
@@ -188,18 +183,29 @@ async def init_multi_tokenizer() -> ServerArgs:
             scheduler_info=scheduler_info,
         )
     )
+
+    if server_args.enable_trace:
+        process_tracing_init(server_args.oltp_traces_endpoint, "sglang")
+        if server_args.disaggregation_mode == "null":
+            thread_label = f"MultiTokenizer-{tokenizer_manager.worker_id}"
+            trace_set_thread_info(thread_label)
+
     return server_args
 
 
 @asynccontextmanager
 async def lifespan(fast_api_app: FastAPI):
-    server_args = getattr(fast_api_app, "server_args", None)
-    if server_args is None:
+    if not getattr(fast_api_app, "is_single_tokenizer_mode", False):
         # Initialize multi-tokenizer support for worker processes
-        fast_api_app.server_args = await init_multi_tokenizer()
-        setup_middlewares(
-            fast_api_app.server_args.api_key, fast_api_app.server_args.enable_metrics
-        )
+        fast_api_app.server_args: ServerArgs = await init_multi_tokenizer()
+
+        # only metrics middleware is supported in multi-tokenizer mode
+        worker_pid = os.getpid()
+        if fast_api_app.server_args.enable_metrics:
+            add_prometheus_middleware(app)
+            enable_func_timer()
+
+        logger.info(f"Worker {worker_pid} added prometheus middleware")
         fast_api_app.warmup_thread = threading.Thread(
             target=_wait_and_warmup,
             args=(
@@ -677,6 +683,38 @@ async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: R
         )
 
 
+@app.post("/init_weights_send_group_for_remote_instance")
+async def init_weights_send_group_for_remote_instance(
+    obj: InitWeightsSendGroupForRemoteInstanceReqInput, request: Request
+):
+    success, message = (
+        await _global_state.tokenizer_manager.init_weights_send_group_for_remote_instance(
+            obj, request
+        )
+    )
+    content = {"success": success, "message": message}
+    if success:
+        return ORJSONResponse(content, status_code=200)
+    else:
+        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
+@app.post("/send_weights_to_remote_instance")
+async def send_weights_to_remote_instance(
+    obj: SendWeightsToRemoteInstanceReqInput, request: Request
+):
+    success, message = (
+        await _global_state.tokenizer_manager.send_weights_to_remote_instance(
+            obj, request
+        )
+    )
+    content = {"success": success, "message": message}
+    if success:
+        return ORJSONResponse(content, status_code=200)
+    else:
+        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
 @app.post("/init_weights_update_group")
 async def init_weights_update_group(
     obj: InitWeightsUpdateGroupReqInput, request: Request
@@ -690,6 +728,20 @@ async def init_weights_update_group(
         return ORJSONResponse(content, status_code=200)
     else:
         return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
+@app.post("/destroy_weights_update_group")
+async def destroy_weights_update_group(
+    obj: DestroyWeightsUpdateGroupReqInput, request: Request
+):
+    """Destroy the parameter update group."""
+    success, message = (
+        await _global_state.tokenizer_manager.destroy_weights_update_group(obj, request)
+    )
+    content = {"success": success, "message": message}
+    return ORJSONResponse(
+        content, status_code=200 if success else HTTPStatus.BAD_REQUEST
+    )
 
 
 @app.post("/update_weights_from_tensor")
@@ -1164,7 +1216,6 @@ def launch_server(
     2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
     if server_args.tokenizer_worker_num > 1:
-        setproctitle.setproctitle(f"sglang::http_server/multi_tokenizer_router")
         port_args = PortArgs.init_new(server_args)
         port_args.tokenizer_worker_ipc_name = (
             f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
@@ -1173,10 +1224,15 @@ def launch_server(
             server_args=server_args, port_args=port_args
         )
     else:
-        setproctitle.setproctitle(f"sglang::http_server/tokenizer_manager")
         tokenizer_manager, template_manager, scheduler_info = _launch_subprocesses(
             server_args=server_args,
         )
+
+        if server_args.enable_trace:
+            process_tracing_init(server_args.oltp_traces_endpoint, "sglang")
+            if server_args.disaggregation_mode == "null":
+                thread_label = "Tokenizer"
+                trace_set_thread_info(thread_label)
 
     set_global_state(
         _GlobalState(
@@ -1187,12 +1243,10 @@ def launch_server(
     )
 
     if server_args.tokenizer_worker_num > 1:
-        port_args_shm, server_args_shm, scheduler_info_shm = (
-            write_data_for_multi_tokenizer(
-                port_args,
-                server_args,
-                scheduler_info,
-            )
+        multi_tokenizer_args_shm = write_data_for_multi_tokenizer(
+            port_args,
+            server_args,
+            scheduler_info,
         )
     else:
         # Add api key authorization
@@ -1229,6 +1283,9 @@ def launch_server(
                 "level": "INFO",
                 "propagate": False,
             }
+
+            monkey_patch_uvicorn_multiprocessing()
+
             uvicorn.run(
                 "sglang.srt.entrypoints.http_server:app",
                 host=server_args.host,
@@ -1239,6 +1296,7 @@ def launch_server(
                 workers=server_args.tokenizer_worker_num,
             )
         else:
+            app.is_single_tokenizer_mode = True
             uvicorn.run(
                 app,
                 host=server_args.host,
@@ -1249,10 +1307,8 @@ def launch_server(
             )
     finally:
         if server_args.tokenizer_worker_num > 1:
-            port_args_shm.unlink()
-            server_args_shm.unlink()
-            scheduler_info_shm.unlink()
-            _global_state.tokenizer_manager.clear_tokenizer_mapping()
+            multi_tokenizer_args_shm.unlink()
+            _global_state.tokenizer_manager.socket_mapping.clear_all_sockets()
         else:
             warmup_thread.join()
 

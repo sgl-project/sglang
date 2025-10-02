@@ -373,7 +373,6 @@ mod tests {
         // Both should use the same passthrough parser instance
         assert!(Arc::ptr_eq(&parser1, &parser2));
 
-        // Verify it's actually a passthrough parser
         let parser = parser1.lock().unwrap();
         assert_eq!(parser.model_type(), "passthrough");
     }
@@ -456,7 +455,6 @@ mod tests {
 
                     match p.detect_and_parse_reasoning(&input) {
                         Ok(result) => {
-                            // Verify parsing worked correctly with substantial content
                             // Note: Some parsers with stream_reasoning=true won't accumulate reasoning text
                             assert!(result
                                 .normal_text
