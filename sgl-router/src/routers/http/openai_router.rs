@@ -153,7 +153,8 @@ impl FunctionCallInProgress {
     }
 
     fn is_complete(&self) -> bool {
-        !self.name.is_empty() && !self.arguments_buffer.is_empty()
+        // A tool call is complete if it has a name
+        !self.name.is_empty()
     }
 }
 
@@ -1003,17 +1004,195 @@ impl OpenAIRouter {
         response
     }
 
-    /// Handle streaming WITH MCP tool call interception and execution
-    async fn handle_streaming_with_tool_interception(
-        &self,
-        url: String,
-        headers: Option<&HeaderMap>,
-        mut payload: Value,
-        original_body: &ResponsesRequest,
-        original_previous_response_id: Option<String>,
+    /// Forward and transform a streaming event to the client
+    /// Returns false if client disconnected
+    fn forward_streaming_event(
+        raw_block: &str,
+        event_name: Option<&str>,
+        data: &str,
+        handler: &StreamingToolHandler,
+        tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
+        server_label: &str,
+        original_request: &ResponsesRequest,
+        previous_response_id: Option<&str>,
+    ) -> bool {
+        // Skip individual function_call_arguments.delta events - we'll send them as one
+        if event_name == Some("response.function_call_arguments.delta") {
+            return true;
+        }
+
+        // First, rewrite basic response fields (store, previous_response_id, tools masking)
+        let block_cow = if let Some(modified) =
+            Self::rewrite_streaming_block(raw_block, original_request, previous_response_id)
+        {
+            Cow::Owned(modified)
+        } else {
+            Cow::Borrowed(raw_block)
+        };
+
+        // Check if this is function_call_arguments.done - need to send buffered args first
+        if event_name == Some("response.function_call_arguments.done") {
+            // Parse the event data to get output_index and item_id
+            if let Ok(event_data) = serde_json::from_str::<Value>(data) {
+                // Send the complete arguments as a single delta event
+                if let Some(output_index) = event_data
+                    .get("output_index")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize)
+                {
+                    if let Some(call) = handler
+                        .pending_calls
+                        .iter()
+                        .find(|c| c.output_index == output_index)
+                    {
+                        if !call.arguments_buffer.is_empty() {
+                            // Get item_id and transform it
+                            let item_id = event_data
+                                .get("item_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            let mcp_item_id = if let Some(stripped) = item_id.strip_prefix("fc_") {
+                                format!("mcp_{}", stripped)
+                            } else {
+                                item_id.to_string()
+                            };
+
+                            let delta_event = json!({
+                                "type": "response.mcp_call_arguments.delta",
+                                "output_index": output_index,
+                                "item_id": mcp_item_id,
+                                "delta": call.arguments_buffer
+                            });
+                            let delta_block = format!(
+                                "event: response.mcp_call_arguments.delta\ndata: {}\n\n",
+                                delta_event
+                            );
+                            if tx.send(Ok(Bytes::from(delta_block))).is_err() {
+                                return false;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Then, apply event transformation (function_call → mcp_call)
+        let final_block =
+            if let Some(transformed) = Self::transform_streaming_event(&block_cow, server_label) {
+                Cow::Owned(transformed)
+            } else {
+                block_cow
+            };
+
+        let chunk_to_send = format!("{}\n\n", final_block);
+        if tx.send(Ok(Bytes::from(chunk_to_send))).is_err() {
+            return false;
+        }
+
+        // After sending output_item.added for mcp_call, inject mcp_call.in_progress event
+        if event_name == Some("response.output_item.added") {
+            if let Ok(event_data) = serde_json::from_str::<Value>(data) {
+                if let Some(item) = event_data.get("item") {
+                    if item.get("type").and_then(|v| v.as_str()) == Some("function_call")
+                        || item.get("type").and_then(|v| v.as_str()) == Some("function_tool_call")
+                    {
+                        // Get item_id and output_index
+                        if let (Some(item_id), Some(output_index)) = (
+                            item.get("id").and_then(|v| v.as_str()),
+                            event_data.get("output_index").and_then(|v| v.as_u64()),
+                        ) {
+                            let mcp_item_id = if let Some(stripped) = item_id.strip_prefix("fc_") {
+                                format!("mcp_{}", stripped)
+                            } else {
+                                item_id.to_string()
+                            };
+
+                            let in_progress_event = json!({
+                                "type": "response.mcp_call.in_progress",
+                                "output_index": output_index,
+                                "item_id": mcp_item_id
+                            });
+                            let in_progress_block = format!(
+                                "event: response.mcp_call.in_progress\ndata: {}\n\n",
+                                in_progress_event
+                            );
+                            if tx.send(Ok(Bytes::from(in_progress_block))).is_err() {
+                                return false;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        true
+    }
+
+    /// Execute detected tool calls and send completion events to client
+    /// Returns false if client disconnected during execution
+    async fn execute_streaming_tool_calls(
+        pending_calls: Vec<FunctionCallInProgress>,
         active_mcp: &Arc<crate::mcp::McpClientManager>,
-    ) -> Response {
-        // Transform MCP tools to function tools in payload (like non-streaming)
+        tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
+        state: &mut ToolLoopState,
+        server_label: &str,
+    ) -> bool {
+        // Execute all pending tool calls (sequential, as PR3 is skipped)
+        for call in pending_calls {
+            // Skip if name is empty (invalid call)
+            if call.name.is_empty() {
+                warn!(
+                    "Skipping incomplete tool call: name is empty, args_len={}",
+                    call.arguments_buffer.len()
+                );
+                continue;
+            }
+
+            info!(
+                "Executing tool call during streaming: {} ({})",
+                call.name, call.call_id
+            );
+
+            // Use empty JSON object if arguments_buffer is empty
+            let args_str = if call.arguments_buffer.is_empty() {
+                "{}"
+            } else {
+                &call.arguments_buffer
+            };
+
+            let call_result = Self::execute_mcp_call(active_mcp, &call.name, args_str).await;
+            let (output_str, success, error_msg) = match call_result {
+                Ok((_, output)) => (output, true, None),
+                Err(err) => {
+                    warn!("Tool execution failed during streaming: {}", err);
+                    (json!({ "error": &err }).to_string(), false, Some(err))
+                }
+            };
+
+            // Send mcp_call completion event to client
+            if !OpenAIRouter::send_mcp_call_completion_events_with_error(
+                tx,
+                &call,
+                &output_str,
+                server_label,
+                success,
+                error_msg.as_deref(),
+            ) {
+                // Client disconnected, no point continuing tool execution
+                return false;
+            }
+
+            // Record the call
+            state.record_call(call.call_id, call.name, call.arguments_buffer, output_str);
+        }
+        true
+    }
+
+    /// Transform payload to replace MCP tools with function tools for streaming
+    fn prepare_mcp_payload_for_streaming(
+        payload: &mut Value,
+        active_mcp: &Arc<crate::mcp::McpClientManager>,
+    ) {
         if let Some(obj) = payload.as_object_mut() {
             // Remove any non-function tools from outgoing payload
             if let Some(v) = obj.get_mut("tools") {
@@ -1049,6 +1228,20 @@ impl OpenAIRouter {
                 obj.insert("tool_choice".to_string(), Value::String("auto".to_string()));
             }
         }
+    }
+
+    /// Handle streaming WITH MCP tool call interception and execution
+    async fn handle_streaming_with_tool_interception(
+        &self,
+        url: String,
+        headers: Option<&HeaderMap>,
+        mut payload: Value,
+        original_body: &ResponsesRequest,
+        original_previous_response_id: Option<String>,
+        active_mcp: &Arc<crate::mcp::McpClientManager>,
+    ) -> Response {
+        // Transform MCP tools to function tools in payload
+        Self::prepare_mcp_payload_for_streaming(&mut payload, active_mcp);
 
         let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, io::Error>>();
         let should_store = original_body.store;
@@ -1156,141 +1349,18 @@ impl OpenAIRouter {
 
                                 match action {
                                     StreamAction::Forward => {
-                                        // Skip individual function_call_arguments.delta events - we'll send them as one
-                                        if event_name.as_deref()
-                                            == Some("response.function_call_arguments.delta")
-                                        {
-                                            continue;
-                                        }
-
-                                        // First, rewrite basic response fields (store, previous_response_id, tools masking)
-                                        let block_cow = if let Some(modified) =
-                                            Self::rewrite_streaming_block(
-                                                &raw_block,
-                                                &original_request,
-                                                previous_response_id.as_deref(),
-                                            ) {
-                                            Cow::Owned(modified)
-                                        } else {
-                                            Cow::Borrowed(raw_block.as_str())
-                                        };
-
-                                        // Check if this is function_call_arguments.done - need to send buffered args first
-                                        if event_name.as_deref()
-                                            == Some("response.function_call_arguments.done")
-                                        {
-                                            // Parse the event data to get output_index and item_id
-                                            if let Ok(event_data) =
-                                                serde_json::from_str::<Value>(&data)
-                                            {
-                                                // Send the complete arguments as a single delta event
-                                                if let Some(output_index) = event_data
-                                                    .get("output_index")
-                                                    .and_then(|v| v.as_u64())
-                                                    .map(|v| v as usize)
-                                                {
-                                                    if let Some(call) = handler
-                                                        .pending_calls
-                                                        .iter()
-                                                        .find(|c| c.output_index == output_index)
-                                                    {
-                                                        if !call.arguments_buffer.is_empty() {
-                                                            // Get item_id and transform it
-                                                            let item_id = event_data
-                                                                .get("item_id")
-                                                                .and_then(|v| v.as_str())
-                                                                .unwrap_or("");
-                                                            let mcp_item_id =
-                                                                if let Some(stripped) =
-                                                                    item_id.strip_prefix("fc_")
-                                                                {
-                                                                    format!("mcp_{}", stripped)
-                                                                } else {
-                                                                    item_id.to_string()
-                                                                };
-
-                                                            let delta_event = json!({
-                                                                "type": "response.mcp_call_arguments.delta",
-                                                                "output_index": output_index,
-                                                                "item_id": mcp_item_id,
-                                                                "delta": call.arguments_buffer
-                                                            });
-                                                            let delta_block = format!("event: response.mcp_call_arguments.delta\ndata: {}\n\n", delta_event);
-                                                            if tx
-                                                                .send(Ok(Bytes::from(delta_block)))
-                                                                .is_err()
-                                                            {
-                                                                return;
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-
-                                        // Then, apply event transformation (function_call → mcp_call)
-                                        let final_block = if let Some(transformed) =
-                                            Self::transform_streaming_event(
-                                                &block_cow,
-                                                server_label,
-                                            ) {
-                                            Cow::Owned(transformed)
-                                        } else {
-                                            block_cow
-                                        };
-
-                                        let chunk_to_send = format!("{}\n\n", final_block);
-                                        if tx.send(Ok(Bytes::from(chunk_to_send))).is_err() {
+                                        if !Self::forward_streaming_event(
+                                            &raw_block,
+                                            event_name.as_deref(),
+                                            &data,
+                                            &handler,
+                                            &tx,
+                                            server_label,
+                                            &original_request,
+                                            previous_response_id.as_deref(),
+                                        ) {
+                                            // Client disconnected
                                             return;
-                                        }
-
-                                        // After sending output_item.added for mcp_call, inject mcp_call.in_progress event
-                                        if event_name.as_deref()
-                                            == Some("response.output_item.added")
-                                        {
-                                            if let Ok(event_data) =
-                                                serde_json::from_str::<Value>(&data)
-                                            {
-                                                if let Some(item) = event_data.get("item") {
-                                                    if item.get("type").and_then(|v| v.as_str())
-                                                        == Some("function_call")
-                                                        || item.get("type").and_then(|v| v.as_str())
-                                                            == Some("function_tool_call")
-                                                    {
-                                                        // Get item_id and output_index
-                                                        if let (Some(item_id), Some(output_index)) = (
-                                                            item.get("id").and_then(|v| v.as_str()),
-                                                            event_data
-                                                                .get("output_index")
-                                                                .and_then(|v| v.as_u64()),
-                                                        ) {
-                                                            let mcp_item_id =
-                                                                if let Some(stripped) =
-                                                                    item_id.strip_prefix("fc_")
-                                                                {
-                                                                    format!("mcp_{}", stripped)
-                                                                } else {
-                                                                    item_id.to_string()
-                                                                };
-
-                                                            let in_progress_event = json!({
-                                                                "type": "response.mcp_call.in_progress",
-                                                                "output_index": output_index,
-                                                                "item_id": mcp_item_id
-                                                            });
-                                                            let in_progress_block = format!("event: response.mcp_call.in_progress\ndata: {}\n\n", in_progress_event);
-                                                            if tx
-                                                                .send(Ok(Bytes::from(
-                                                                    in_progress_block,
-                                                                )))
-                                                                .is_err()
-                                                            {
-                                                                return;
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
                                         }
                                     }
                                     StreamAction::Buffer => {
@@ -1378,52 +1448,18 @@ impl OpenAIRouter {
                     return;
                 }
 
-                // Execute all pending tool calls (sequential, as PR3 is skipped)
-                for call in pending_calls {
-                    // Skip if name or arguments are empty (invalid call)
-                    if call.name.is_empty() || call.arguments_buffer.is_empty() {
-                        warn!(
-                            "Skipping incomplete tool call: name={}, args_len={}",
-                            call.name,
-                            call.arguments_buffer.len()
-                        );
-                        continue;
-                    }
-
-                    info!(
-                        "Executing tool call during streaming: {} ({})",
-                        call.name, call.call_id
-                    );
-
-                    let call_result = Self::execute_mcp_call(
-                        &active_mcp_clone,
-                        &call.name,
-                        &call.arguments_buffer,
-                    )
-                    .await;
-                    let (output_str, success, error_msg) = match call_result {
-                        Ok((_, output)) => (output, true, None),
-                        Err(err) => {
-                            warn!("Tool execution failed during streaming: {}", err);
-                            (json!({ "error": &err }).to_string(), false, Some(err))
-                        }
-                    };
-
-                    // Send mcp_call completion event to client
-                    if !OpenAIRouter::send_mcp_call_completion_events_with_error(
-                        &tx,
-                        &call,
-                        &output_str,
-                        server_label,
-                        success,
-                        error_msg.as_deref(),
-                    ) {
-                        // Client disconnected, no point continuing tool execution
-                        return;
-                    }
-
-                    // Record the call
-                    state.record_call(call.call_id, call.name, call.arguments_buffer, output_str);
+                // Execute all pending tool calls
+                if !Self::execute_streaming_tool_calls(
+                    pending_calls,
+                    &active_mcp_clone,
+                    &tx,
+                    &mut state,
+                    server_label,
+                )
+                .await
+                {
+                    // Client disconnected during tool execution
+                    return;
                 }
 
                 // Build resume payload
