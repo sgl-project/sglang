@@ -123,12 +123,7 @@ impl DeepSeekParser {
         let arguments = serde_json::to_string(&args)
             .map_err(|e| ToolParserError::ParsingFailed(e.to_string()))?;
 
-        // Generate ID
-        let id = format!("deepseek_call_{}", uuid::Uuid::new_v4());
-
         Ok(ToolCall {
-            id,
-            r#type: "function".to_string(),
             function: FunctionCall {
                 name: func_name.to_string(),
                 arguments,

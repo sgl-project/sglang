@@ -780,10 +780,11 @@ impl GrpcRouter {
     }
 
     /// Parse tool calls using model-specific parser
-    async fn parse_with_model_parser(
+    async fn parse_tool_calls(
         &self,
         processed_text: &str,
         model: &str,
+        history_tool_calls_count: usize,
     ) -> (Option<Vec<ToolCall>>, String) {
         // Get pooled parser for this model
         let pooled_parser = self.tool_parser_factory.get_pooled(model);
@@ -814,16 +815,26 @@ impl GrpcRouter {
 
                 let spec_tool_calls = parsed_tool_calls
                     .into_iter()
-                    .map(|tc| ToolCall {
-                        id: tc.id,
-                        tool_type: "function".to_string(),
-                        function: FunctionCallResponse {
-                            name: tc.function.name,
-                            arguments: Some(
-                                serde_json::to_string(&tc.function.arguments)
-                                    .unwrap_or_else(|_| "{}".to_string()),
-                            ),
-                        },
+                    .enumerate()
+                    .map(|(index, tc)| {
+                        // Generate ID for this tool call
+                        let id = Self::generate_tool_call_id(
+                            model,
+                            &tc.function.name,
+                            index,
+                            history_tool_calls_count,
+                        );
+                        ToolCall {
+                            id,
+                            tool_type: "function".to_string(),
+                            function: FunctionCallResponse {
+                                name: tc.function.name,
+                                arguments: Some(
+                                    serde_json::to_string(&tc.function.arguments)
+                                        .unwrap_or_else(|_| "{}".to_string()),
+                                ),
+                            },
+                        }
                     })
                     .collect();
                 (Some(spec_tool_calls), normal_text)
@@ -924,6 +935,47 @@ impl GrpcRouter {
         builder.build()
     }
 
+    /// Count the number of tool calls in the request message history
+    /// This is used for KimiK2 format which needs globally unique indices
+    fn get_history_tool_calls_count(request: &ChatCompletionRequest) -> usize {
+        request
+            .messages
+            .iter()
+            .filter_map(|msg| {
+                if let ChatMessage::Assistant { tool_calls, .. } = msg {
+                    tool_calls.as_ref().map(|calls| calls.len())
+                } else {
+                    None
+                }
+            })
+            .sum()
+    }
+
+    /// Generate a tool call ID based on model format
+    ///
+    /// # Arguments
+    /// * `model` - Model name to determine ID format
+    /// * `tool_name` - Name of the tool being called
+    /// * `tool_index` - Index of this tool call within the current message
+    /// * `history_count` - Number of tool calls in previous messages
+    ///
+    /// # Returns
+    /// A unique ID string. KimiK2 uses `functions.{name}:{global_index}`, others use `call_{uuid}`
+    fn generate_tool_call_id(
+        model: &str,
+        tool_name: &str,
+        tool_index: usize,
+        history_count: usize,
+    ) -> String {
+        if model.to_lowercase().contains("kimi") {
+            // KimiK2 format: functions.{name}:{global_index}
+            format!("functions.{}:{}", tool_name, history_count + tool_index)
+        } else {
+            // Standard OpenAI format: call_{24-char-uuid}
+            format!("call_{}", uuid::Uuid::new_v4().simple().to_string()[..24].to_string())
+        }
+    }
+
     /// Process a chunk of tokens through the stop decoder
     fn process_chunk_tokens(
         stop_decoder: &mut StopSequenceDecoder,
@@ -977,6 +1029,7 @@ impl GrpcRouter {
         let separate_reasoning = original_request.separate_reasoning;
         let tool_choice = original_request.tool_choice.clone();
         let tools = original_request.tools.clone();
+        let history_tool_calls_count = Self::get_history_tool_calls_count(original_request);
 
         // Start the gRPC stream
         let mut grpc_stream = match client.generate(request).await {
@@ -1209,9 +1262,21 @@ impl GrpcRouter {
                                         for tool_call_item in calls {
                                             has_tool_calls.insert(index, true);
 
+                                            // Generate ID only when name is present (first chunk for this tool call)
+                                            let tool_call_id = if let Some(ref name) = tool_call_item.name {
+                                                Some(Self::generate_tool_call_id(
+                                                    &model,
+                                                    name,
+                                                    tool_call_item.tool_index,
+                                                    history_tool_calls_count,
+                                                ))
+                                            } else {
+                                                None
+                                            };
+
                                             let tool_call_delta = ToolCallDelta {
                                                 index: tool_call_item.tool_index as u32,
-                                                id: None,
+                                                id: tool_call_id,
                                                 tool_type: if tool_call_item.name.is_some() { Some("function".to_string()) } else { None },
                                                 function: Some(FunctionCallDelta {
                                                     name: tool_call_item.name,
@@ -1555,10 +1620,17 @@ impl GrpcRouter {
         }
 
         // Process each response into a ChatChoice
+        let history_tool_calls_count = Self::get_history_tool_calls_count(original_request);
         let mut choices = Vec::new();
         for (index, complete) in all_responses.iter().enumerate() {
             match self
-                .process_single_choice(complete, index, original_request, &mut stop_decoder)
+                .process_single_choice(
+                    complete,
+                    index,
+                    original_request,
+                    &mut stop_decoder,
+                    history_tool_calls_count,
+                )
                 .await
             {
                 Ok(choice) => choices.push(choice),
@@ -1802,6 +1874,7 @@ impl GrpcRouter {
         index: usize,
         original_request: &ChatCompletionRequest,
         stop_decoder: &mut StopSequenceDecoder,
+        history_tool_calls_count: usize,
     ) -> Result<ChatChoice, String> {
         stop_decoder.reset();
         // Decode tokens
@@ -1879,7 +1952,11 @@ impl GrpcRouter {
                     self.parse_json_schema_response(&processed_text, &original_request.tool_choice);
             } else {
                 (tool_calls, processed_text) = self
-                    .parse_with_model_parser(&processed_text, &original_request.model)
+                    .parse_tool_calls(
+                        &processed_text,
+                        &original_request.model,
+                        history_tool_calls_count,
+                    )
                     .await;
             }
         }

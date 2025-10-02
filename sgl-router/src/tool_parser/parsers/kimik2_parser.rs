@@ -131,12 +131,7 @@ impl ToolParser for KimiK2Parser {
                     // Try to parse JSON arguments
                     match serde_json::from_str::<serde_json::Value>(function_args) {
                         Ok(_) => {
-                            // Generate unique ID
-                            let id = format!("kimi_call_{}", uuid::Uuid::new_v4());
-
                             tools.push(ToolCall {
-                                id,
-                                r#type: "function".to_string(),
                                 function: FunctionCall {
                                     name: func_name,
                                     arguments: function_args.to_string(),

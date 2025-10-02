@@ -129,12 +129,7 @@ impl Glm4MoeParser {
             let arguments_str = serde_json::to_string(&arguments)
                 .map_err(|e| ToolParserError::ParsingFailed(e.to_string()))?;
 
-            // Generate ID
-            let id = format!("glm4_call_{}", uuid::Uuid::new_v4());
-
             Ok(Some(ToolCall {
-                id,
-                r#type: "function".to_string(),
                 function: FunctionCall {
                     name: func_name.to_string(),
                     arguments: arguments_str,

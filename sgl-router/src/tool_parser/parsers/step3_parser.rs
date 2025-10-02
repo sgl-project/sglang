@@ -400,12 +400,7 @@ impl Step3Parser {
             let arguments_str = serde_json::to_string(&parameters)
                 .map_err(|e| ToolParserError::ParsingFailed(e.to_string()))?;
 
-            // Generate ID
-            let id = format!("step3_call_{}", uuid::Uuid::new_v4());
-
             Ok(Some(ToolCall {
-                id,
-                r#type: "function".to_string(),
                 function: FunctionCall {
                     name: func_name.to_string(),
                     arguments: arguments_str,

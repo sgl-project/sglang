@@ -136,16 +136,7 @@ impl JsonParser {
             let arguments = serde_json::to_string(args)
                 .map_err(|e| ToolParserError::ParsingFailed(e.to_string()))?;
 
-            // Generate a unique ID if not provided
-            let id = obj
-                .get("id")
-                .and_then(|v| v.as_str())
-                .map(String::from)
-                .unwrap_or_else(|| format!("call_{}", uuid::Uuid::new_v4()));
-
             Ok(Some(ToolCall {
-                id,
-                r#type: "function".to_string(),
                 function: FunctionCall {
                     name: name.to_string(),
                     arguments,
