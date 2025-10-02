@@ -7,7 +7,7 @@ use crate::policies::PolicyRegistry;
 use crate::reasoning_parser::ParserFactory;
 use crate::routers::RouterTrait;
 use crate::tokenizer::traits::Tokenizer;
-use crate::tool_parser::ParserRegistry;
+use crate::tool_parser::ToolParserFactory;
 use async_trait::async_trait;
 use axum::{
     body::Body,
@@ -25,7 +25,7 @@ pub struct GrpcPDRouter {
     policy_registry: Arc<PolicyRegistry>,
     tokenizer: Arc<dyn Tokenizer>,
     reasoning_parser_factory: ParserFactory,
-    tool_parser_registry: &'static ParserRegistry,
+    tool_parser_factory: ToolParserFactory,
 
     dp_aware: bool,
     api_key: Option<String>,
@@ -50,9 +50,11 @@ impl GrpcPDRouter {
             .as_ref()
             .ok_or_else(|| "gRPC PD router requires reasoning parser factory".to_string())?
             .clone();
-        let tool_parser_registry = ctx
-            .tool_parser_registry
-            .ok_or_else(|| "gRPC PD router requires tool parser registry".to_string())?;
+        let tool_parser_factory = ctx
+            .tool_parser_factory
+            .as_ref()
+            .ok_or_else(|| "gRPC PD router requires tool parser factory".to_string())?
+            .clone();
 
         // Get prefill and decode workers from registry - they should have been created by WorkerManager
         let prefill_workers = worker_registry.get_workers_filtered(
@@ -86,7 +88,7 @@ impl GrpcPDRouter {
             policy_registry,
             tokenizer,
             reasoning_parser_factory,
-            tool_parser_registry,
+            tool_parser_factory,
             dp_aware: ctx.router_config.dp_aware,
             api_key: ctx.router_config.api_key.clone(),
             retry_config: ctx.router_config.effective_retry_config(),

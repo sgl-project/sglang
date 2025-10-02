@@ -19,7 +19,7 @@ use crate::{
     routers::{router_manager::RouterManager, RouterTrait},
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
     tokenizer::{factory as tokenizer_factory, traits::Tokenizer},
-    tool_parser::ParserRegistry,
+    tool_parser::ToolParserFactory,
 };
 use axum::{
     extract::{Path, Query, Request, State},
@@ -46,7 +46,7 @@ pub struct AppContext {
     pub rate_limiter: Arc<TokenBucket>,
     pub tokenizer: Option<Arc<dyn Tokenizer>>,
     pub reasoning_parser_factory: Option<ParserFactory>,
-    pub tool_parser_registry: Option<&'static ParserRegistry>,
+    pub tool_parser_factory: Option<ToolParserFactory>,
     pub worker_registry: Arc<WorkerRegistry>,
     pub policy_registry: Arc<PolicyRegistry>,
     pub router_manager: Option<Arc<RouterManager>>,
@@ -64,7 +64,7 @@ impl AppContext {
         let rate_limit_tokens = rate_limit_tokens_per_second.unwrap_or(max_concurrent_requests);
         let rate_limiter = Arc::new(TokenBucket::new(max_concurrent_requests, rate_limit_tokens));
 
-        let (tokenizer, reasoning_parser_factory, tool_parser_registry) =
+        let (tokenizer, reasoning_parser_factory, tool_parser_factory) =
             if router_config.connection_mode == ConnectionMode::Grpc {
                 let tokenizer_path = router_config
                     .tokenizer_path
@@ -80,9 +80,9 @@ impl AppContext {
                         .map_err(|e| format!("Failed to create tokenizer: {e}"))?,
                 );
                 let reasoning_parser_factory = Some(ParserFactory::new());
-                let tool_parser_registry = Some(ParserRegistry::new());
+                let tool_parser_factory = Some(ToolParserFactory::new());
 
-                (tokenizer, reasoning_parser_factory, tool_parser_registry)
+                (tokenizer, reasoning_parser_factory, tool_parser_factory)
             } else {
                 (None, None, None)
             };
@@ -121,7 +121,7 @@ impl AppContext {
             rate_limiter,
             tokenizer,
             reasoning_parser_factory,
-            tool_parser_registry,
+            tool_parser_factory,
             worker_registry,
             policy_registry,
             router_manager,

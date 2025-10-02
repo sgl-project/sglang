@@ -34,7 +34,7 @@ use crate::tokenizer::stop::{
 };
 use crate::tokenizer::traits::Tokenizer;
 use crate::tokenizer::HuggingFaceTokenizer;
-use crate::tool_parser::ParserRegistry;
+use crate::tool_parser::ToolParserFactory;
 use proto::generate_response::Response::{Chunk, Complete, Error};
 use serde_json::{json, Map, Value};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -56,7 +56,7 @@ pub struct GrpcRouter {
     policy_registry: Arc<PolicyRegistry>,
     tokenizer: Arc<dyn Tokenizer>,
     reasoning_parser_factory: ParserFactory,
-    tool_parser_registry: &'static ParserRegistry,
+    tool_parser_factory: ToolParserFactory,
     dp_aware: bool,
     api_key: Option<String>,
     retry_config: RetryConfig,
@@ -76,9 +76,11 @@ impl GrpcRouter {
             .as_ref()
             .ok_or_else(|| "gRPC router requires reasoning parser factory".to_string())?
             .clone();
-        let tool_parser_registry = ctx
-            .tool_parser_registry
-            .ok_or_else(|| "gRPC router requires tool parser registry".to_string())?;
+        let tool_parser_factory = ctx
+            .tool_parser_factory
+            .as_ref()
+            .ok_or_else(|| "gRPC router requires tool parser factory".to_string())?
+            .clone();
 
         let worker_registry = ctx.worker_registry.clone();
         let policy_registry = ctx.policy_registry.clone();
@@ -98,7 +100,7 @@ impl GrpcRouter {
             policy_registry,
             tokenizer,
             reasoning_parser_factory,
-            tool_parser_registry,
+            tool_parser_factory,
             dp_aware: ctx.router_config.dp_aware,
             api_key: ctx.router_config.api_key.clone(),
             retry_config: ctx.router_config.effective_retry_config(),
@@ -779,15 +781,28 @@ impl GrpcRouter {
         processed_text: &str,
         model: &str,
     ) -> (Option<Vec<ToolCall>>, String) {
-        let Some(parser) = self.tool_parser_registry.get_parser(model) else {
-            return (None, processed_text.to_string());
+        // Get pooled parser for this model
+        let pooled_parser = self.tool_parser_factory.get_pooled(model);
+
+        // Check format detection first
+        let can_parse = {
+            let parser = pooled_parser.lock().await;
+            parser.detect_format(processed_text)
+            // Lock is dropped here
         };
 
-        if !parser.detect_format(processed_text) {
+        if !can_parse {
             return (None, processed_text.to_string());
         }
 
-        match parser.parse_complete(processed_text).await {
+        // Lock again for async parsing
+        let result = {
+            let parser = pooled_parser.lock().await;
+            parser.parse_complete(processed_text).await
+            // Lock is dropped here
+        };
+
+        match result {
             Ok((normal_text, parsed_tool_calls)) => {
                 if parsed_tool_calls.is_empty() {
                     return (None, normal_text);

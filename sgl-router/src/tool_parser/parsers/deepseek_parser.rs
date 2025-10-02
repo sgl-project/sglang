@@ -2,12 +2,13 @@ use async_trait::async_trait;
 use regex::Regex;
 use serde_json::Value;
 
+use crate::protocols::spec::Tool;
+
 use crate::tool_parser::{
     errors::{ToolParserError, ToolParserResult},
-    partial_json::PartialJson,
-    state::ParseState,
+    parsers::helpers,
     traits::ToolParser,
-    types::{FunctionCall, StreamResult, ToolCall},
+    types::{FunctionCall, StreamingParseResult, ToolCall, ToolCallItem},
 };
 
 /// DeepSeek V3 format parser for tool calls
@@ -20,12 +21,29 @@ use crate::tool_parser::{
 /// - JSON arguments in code blocks
 /// - Support for multiple sequential tool calls
 pub struct DeepSeekParser {
-    /// Parser for handling incomplete JSON during streaming
-    partial_json: PartialJson,
     /// Regex for extracting complete tool calls
     tool_call_extractor: Regex,
     /// Regex for extracting function details
     func_detail_extractor: Regex,
+    /// Regex for matching partial tool calls during streaming
+    partial_tool_call_regex: Regex,
+    /// Regex pattern for removing completed tool calls from buffer
+    tool_call_end_pattern: Regex,
+
+    /// Buffer for accumulating incomplete patterns across chunks
+    buffer: String,
+
+    /// Stores complete tool call info (name and arguments) for each tool being parsed
+    prev_tool_call_arr: Vec<Value>,
+
+    /// Index of currently streaming tool call (-1 means no active tool)
+    current_tool_id: i32,
+
+    /// Flag for whether current tool's name has been sent to client
+    current_tool_name_sent: bool,
+
+    /// Tracks raw JSON string content streamed to client for each tool's arguments
+    streamed_args_for_tool: Vec<String>,
 }
 
 impl DeepSeekParser {
@@ -38,10 +56,24 @@ impl DeepSeekParser {
         let func_detail_pattern = r"(?s)<｜tool▁call▁begin｜>(.*?)<｜tool▁sep｜>(.*?)\n```json\n(.*?)\n```<｜tool▁call▁end｜>";
         let func_detail_extractor = Regex::new(func_detail_pattern).expect("Valid regex pattern");
 
+        // Partial pattern for streaming - uses .* (greedy) not .*? to match all partial content
+        let partial_pattern = r"(?s)<｜tool▁call▁begin｜>(.*)<｜tool▁sep｜>(.*)\n```json\n(.*)";
+        let partial_tool_call_regex = Regex::new(partial_pattern).expect("Valid regex pattern");
+
+        // Pattern for removing completed tool calls
+        let end_pattern = r"(?s)<｜tool▁call▁begin｜>.*?<｜tool▁call▁end｜>";
+        let tool_call_end_pattern = Regex::new(end_pattern).expect("Valid regex pattern");
+
         Self {
-            partial_json: PartialJson::default(),
             tool_call_extractor,
             func_detail_extractor,
+            partial_tool_call_regex,
+            tool_call_end_pattern,
+            buffer: String::new(),
+            prev_tool_call_arr: Vec::new(),
+            current_tool_id: -1,
+            current_tool_name_sent: false,
+            streamed_args_for_tool: Vec::new(),
         }
     }
 
@@ -143,107 +175,146 @@ impl ToolParser for DeepSeekParser {
     }
 
     async fn parse_incremental(
-        &self,
+        &mut self,
         chunk: &str,
-        state: &mut ParseState,
-    ) -> ToolParserResult<StreamResult> {
-        state.buffer.push_str(chunk);
+        tools: &[Tool],
+    ) -> ToolParserResult<StreamingParseResult> {
+        self.buffer.push_str(chunk);
+        let current_text = &self.buffer.clone();
 
-        // Check for tool markers
-        if !self.has_tool_markers(&state.buffer) {
+        // Check if we have a tool call (either the start token or individual tool call)
+        let has_tool_call =
+            self.has_tool_markers(current_text) || current_text.contains("<｜tool▁call▁begin｜>");
+
+        if !has_tool_call {
             // No tool markers detected - return all buffered content as normal text
-            let normal_text = std::mem::take(&mut state.buffer);
-            return Ok(StreamResult::NormalText(normal_text));
-        }
-
-        // Check for text before tool markers and extract it as normal text
-        if let Some(marker_pos) = state.buffer.find("<｜tool▁calls▁begin｜>") {
-            if marker_pos > 0 {
-                // We have text before the tool marker - extract it as normal text
-                let normal_text: String = state.buffer.drain(..marker_pos).collect();
-                return Ok(StreamResult::NormalText(normal_text));
+            // Strip out end tokens if present
+            let mut normal_text = std::mem::take(&mut self.buffer);
+            for e_token in ["<｜tool▁calls▁end｜>", "```", "<｜tool▁call▁end｜>"] {
+                normal_text = normal_text.replace(e_token, "");
             }
+            return Ok(StreamingParseResult {
+                normal_text,
+                calls: vec![],
+            });
         }
 
-        // Look for start of tool calls
-        if let Some(start_pos) = state.buffer.find("<｜tool▁calls▁begin｜>") {
-            // Look for individual tool call start
-            let search_from = start_pos + "<｜tool▁calls▁begin｜>".len();
-            if let Some(call_start) = state.buffer[search_from..].find("<｜tool▁call▁begin｜>")
-            {
-                let call_start_abs = search_from + call_start;
+        // Build tool indices for validation
+        let tool_indices = helpers::get_tool_indices(tools);
 
-                // Look for the end of this tool call
-                let search_end_from = call_start_abs + "<｜tool▁call▁begin｜>".len();
-                if let Some(call_end) = state.buffer[search_end_from..].find("<｜tool▁call▁end｜>")
-                {
-                    let call_end_abs = search_end_from + call_end + "<｜tool▁call▁end｜>".len();
+        let mut calls: Vec<ToolCallItem> = Vec::new();
 
-                    // Extract and parse the complete tool call
-                    let tool_call_text = &state.buffer[call_start_abs..call_end_abs];
+        // Try to match the partial tool call pattern
+        if let Some(captures) = self.partial_tool_call_regex.captures(current_text) {
+            let func_name = captures.get(2).map_or("", |m| m.as_str()).trim();
+            let func_args_raw = captures.get(3).map_or("", |m| m.as_str()).trim();
 
-                    match self.parse_tool_call(tool_call_text) {
-                        Ok(tool) => {
-                            // Remove the processed part from buffer
-                            state.buffer.drain(..call_end_abs);
-                            return Ok(StreamResult::ToolComplete(tool));
-                        }
-                        Err(_) => {
-                            // Parsing failed, skip this tool call
-                            state.buffer.drain(..call_end_abs);
-                        }
+            // Validate tool name
+            if !tool_indices.contains_key(func_name) {
+                // Invalid tool name - skip this tool, preserve indexing for next tool
+                tracing::warn!("Invalid tool name '{}' - skipping", func_name);
+                helpers::reset_current_tool_state(
+                    &mut self.buffer,
+                    &mut self.current_tool_name_sent,
+                    &mut self.streamed_args_for_tool,
+                    &self.prev_tool_call_arr,
+                );
+                return Ok(StreamingParseResult::default());
+            }
+
+            // Initialize state if this is the first tool call
+            if self.current_tool_id == -1 {
+                self.current_tool_id = 0;
+                self.prev_tool_call_arr = Vec::new();
+                self.streamed_args_for_tool = vec![String::new()];
+            }
+
+            // Ensure we have enough entries in our tracking arrays
+            helpers::ensure_capacity(
+                self.current_tool_id,
+                &mut self.prev_tool_call_arr,
+                &mut self.streamed_args_for_tool,
+            );
+
+            // Send tool name if not sent yet
+            if !self.current_tool_name_sent {
+                calls.push(ToolCallItem {
+                    tool_index: self.current_tool_id as usize,
+                    name: Some(func_name.to_string()),
+                    parameters: String::new(),
+                });
+                self.current_tool_name_sent = true;
+
+                // Store the tool call info for serving layer completions endpoint
+                let tool_id = self.current_tool_id as usize;
+                if self.prev_tool_call_arr.len() <= tool_id {
+                    self.prev_tool_call_arr
+                        .resize_with(tool_id + 1, || Value::Null);
+                }
+                self.prev_tool_call_arr[tool_id] = serde_json::json!({
+                    "name": func_name,
+                    "arguments": {},
+                });
+            } else {
+                // Compute incremental diff
+                let tool_id = self.current_tool_id as usize;
+                let last_sent = self
+                    .streamed_args_for_tool
+                    .get(tool_id)
+                    .map(|s| s.as_str())
+                    .unwrap_or("");
+
+                let argument_diff = func_args_raw
+                    .strip_prefix(last_sent)
+                    .unwrap_or(func_args_raw);
+
+                if !argument_diff.is_empty() {
+                    calls.push(ToolCallItem {
+                        tool_index: tool_id,
+                        name: None,
+                        parameters: argument_diff.to_string(),
+                    });
+                    if tool_id < self.streamed_args_for_tool.len() {
+                        self.streamed_args_for_tool[tool_id].push_str(argument_diff);
                     }
-                } else {
-                    // Tool call not complete yet, try to extract partial info
-                    let partial = &state.buffer[search_end_from..];
+                }
 
-                    // Try to extract function name
-                    if let Some(sep_pos) = partial.find("<｜tool▁sep｜>") {
-                        if let Some(_func_start) = partial[..sep_pos].rfind("function") {
-                            // We have the function type marker
-                            let after_sep = &partial[sep_pos + "<｜tool▁sep｜>".len()..];
-
-                            // Look for function name (ends at newline before ```json)
-                            if let Some(name_end) = after_sep.find("\n```json\n") {
-                                let func_name = after_sep[..name_end].trim();
-
-                                if !state.in_string {
-                                    state.in_string = true; // Mark name as sent
-                                    return Ok(StreamResult::ToolName {
-                                        index: 0,
-                                        name: func_name.to_string(),
-                                    });
-                                }
-
-                                // Try to extract partial arguments
-                                let args_start = name_end + "\n```json\n".len();
-                                let partial_args = &after_sep[args_start..];
-
-                                // Check if we can parse partial JSON
-                                if !partial_args.is_empty() {
-                                    match self.partial_json.parse_value(partial_args) {
-                                        Ok((value, _consumed)) => {
-                                            let args_str = serde_json::to_string(&value)
-                                                .unwrap_or_else(|_| "{}".to_string());
-
-                                            return Ok(StreamResult::ToolArguments {
-                                                index: 0,
-                                                arguments: args_str,
-                                            });
-                                        }
-                                        Err(_) => {
-                                            // Can't parse yet, continue waiting for more data
-                                        }
-                                    }
-                                }
+                // Check if JSON is complete
+                if helpers::is_complete_json(func_args_raw) {
+                    // Update the stored arguments
+                    if let Ok(parsed_args) = serde_json::from_str::<Value>(func_args_raw) {
+                        let tool_id = self.current_tool_id as usize;
+                        if tool_id < self.prev_tool_call_arr.len() {
+                            if let Some(obj) = self.prev_tool_call_arr[tool_id].as_object_mut() {
+                                obj.insert("arguments".to_string(), parsed_args);
                             }
                         }
                     }
+
+                    // Find the end of the current tool call and remove only that part from buffer
+                    if let Some(mat) = self.tool_call_end_pattern.find(current_text) {
+                        // Remove the completed tool call from buffer, keep any remaining content
+                        self.buffer = current_text[mat.end()..].to_string();
+                    } else {
+                        self.buffer.clear();
+                    }
+
+                    let result = StreamingParseResult {
+                        normal_text: String::new(),
+                        calls,
+                    };
+
+                    self.current_tool_id += 1;
+                    self.current_tool_name_sent = false;
+                    return Ok(result);
                 }
             }
         }
 
-        Ok(StreamResult::Incomplete)
+        Ok(StreamingParseResult {
+            normal_text: String::new(),
+            calls,
+        })
     }
 
     fn detect_format(&self, text: &str) -> bool {
