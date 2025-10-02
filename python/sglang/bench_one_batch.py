@@ -328,6 +328,7 @@ def extend(reqs, model_runner, static_ctx: Optional[PrefillStaticCtx] = None):
     _maybe_prepare_mlp_sync_batch(batch, model_runner)
     model_worker_batch = batch.get_model_worker_batch()
     forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
+    print(f"forward_batch: {forward_batch}")
 
     # ---------- Hard-coded prefill static ctx: (bs=1, il=256) ----------
     if static_ctx is not None:

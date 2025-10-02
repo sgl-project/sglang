@@ -57,22 +57,6 @@ class TorchCompileWrapperWithCustomDispatcher:
     def forward(self, *args, **kwargs): ...
 
     def init_backend(self) -> Union[str, Callable]:
-
-        # from torch._dynamo.backends.registry import list_backends
-        # torch_backends = list_backends(exclude_tags=tuple())
-        # if self.level in [
-        #         CompilationLevel.DYNAMO_AS_IS, CompilationLevel.DYNAMO_ONCE
-        # ]:
-        #     if self.backend == "":
-        #         return "eager"
-        #     if self.backend in torch_backends:
-        #         return self.backend
-        #     return resolve_obj_by_qualname(self.backend)
-
-        # TODO: pass user-specified backend to piecewise compilation
-        # merge with the config use_inductor
-        # assert self.level == CompilationLevel.PIECEWISE
-
         from sglang.srt.model_executor.compilation.backend import SGLangBackend
 
         return SGLangBackend()

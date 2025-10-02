@@ -109,36 +109,20 @@ class RadixAttention(nn.Module):
             else:
                 k = k.view(-1, self.tp_k_head_num, self.v_head_dim)
 
-        # return forward_batch.attn_backend.forward(
-        #     q,
-        #     k,
-        #     v,
-        #     self,
-        #     forward_batch,
-        #     save_kv_cache,
-        #     **kwargs,
-        # )
-        # if forward_batch.forward_mode.is_extend():
-        #     return torch.ops.sglang.unified_attention_with_output(
-        #         q,
-        #         k,
-        #         v,
-        #         save_kv_cache,
-        #         self.layer_id
-        #     )
-        # else:
-        #     return forward_batch.attn_backend.forward(
-        #         q,
-        #         k,
-        #         v,
-        #         self,
-        #         forward_batch,
-        #         save_kv_cache,
-        #         **kwargs,
-        #     )
-        return torch.ops.sglang.unified_attention_with_output(
-            q, k, v, save_kv_cache, self.layer_id
-        )
+        if forward_batch.forward_mode.is_extend():
+            return torch.ops.sglang.unified_attention_with_output(
+                q, k, v, save_kv_cache, self.layer_id
+            )
+        else:
+            return forward_batch.attn_backend.forward(
+                q,
+                k,
+                v,
+                self,
+                forward_batch,
+                save_kv_cache,
+                **kwargs,
+            )
 
 
 def unified_attention_with_output(

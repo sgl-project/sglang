@@ -354,6 +354,9 @@ class FlashAttentionBackend(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
+        if forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
+            print(f"FORWARD EXTEND")
+            print(f"forward batch: {forward_batch}")
         metadata = FlashAttentionMetadata()
         seqlens_in_batch = forward_batch.seq_lens
         batch_size = forward_batch.batch_size
@@ -753,6 +756,11 @@ class FlashAttentionBackend(AttentionBackend):
                 cache_seqlens = metadata.encoder_lens_int32
                 cu_seqlens_k = metadata.encoder_cu_seqlens_k
                 window_size = (-1, -1)
+
+            print(f"q: {q.shape}, k: {k.shape}, v: {v.shape}")
+            print(
+                f"page_table: {page_table.shape}, cache_seqlens: {cache_seqlens.shape}, cu_seqlens_q: {cu_seqlens_q.shape}, cu_seqlens_k: {cu_seqlens_k.shape}, max_seqlen_q: {max_seqlen_q}"
+            )
 
             result = flash_attn_with_kvcache(
                 q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),

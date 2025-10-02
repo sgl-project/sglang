@@ -361,6 +361,7 @@ class ServerArgs:
     enable_two_batch_overlap: bool = False
     tbo_token_distribution_threshold: float = 0.48
     enable_torch_compile: bool = False
+    enable_piecewise_cuda_graph: bool = False
     torch_compile_max_bs: int = 32
     torchao_config: str = ""
     enable_nan_detection: bool = False
@@ -2102,6 +2103,11 @@ class ServerArgs:
             "--enable-torch-compile",
             action="store_true",
             help="Optimize the model with torch.compile. Experimental feature.",
+        )
+        parser.add_argument(
+            "--enable-piecewise-cuda-graph",
+            action="store_true",
+            help="Optimize the model with piecewise cuda graph. Experimental feature.",
         )
         parser.add_argument(
             "--torch-compile-max-bs",

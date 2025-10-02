@@ -442,12 +442,6 @@ class SGLangBackend:
         self._called = True
         return self.split_gm
 
-        if (
-            not self.compilation_config.use_cudagraph
-            or not self.compilation_config.cudagraph_copy_inputs
-        ):
-            return self.split_gm
-
         from torch._guards import detect_fake_mode
 
         fake_mode = detect_fake_mode()
@@ -475,5 +469,12 @@ class SGLangBackend:
                 runtime_tensor = list_args[index]
                 runtime_shape = runtime_tensor.shape[0]
                 static_tensor = self.input_buffers[i][:runtime_shape]
+
+                # copy the tensor to the static buffer
+                static_tensor.copy_(runtime_tensor)
+
+                # replace the tensor in the list_args to the static buffer
+                list_args[index] = static_tensor
+            return self.split_gm(*list_args)
 
         return copy_and_call

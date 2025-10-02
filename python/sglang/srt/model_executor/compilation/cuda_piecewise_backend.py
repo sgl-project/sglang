@@ -297,6 +297,22 @@ class CUDAPiecewiseBackend:
             # manage the memory during cuda graph capture
             return output
 
+        print(f"Replaying a cudagraph for shape {runtime_shape}")
+
+        print("--- Replay-time Argument Inspection ---")
+        current_tensor_idx = 0
+        for i, arg in enumerate(args):
+            if isinstance(arg, torch.Tensor):
+                print(
+                    f"args[{i}] (Tensor #{current_tensor_idx}): "
+                    f"shape={arg.shape}, dtype={arg.dtype}, device={arg.device}, "
+                    f"address={arg.data_ptr()}"
+                )
+                current_tensor_idx += 1
+            else:
+                print(f"args[{i}]: type={type(arg)}, value={arg}")
+        print("--- End Inspection ---")
+
         if self.is_debugging_mode:
             # check if the input addresses are the same
             new_input_addresses = [
@@ -306,6 +322,6 @@ class CUDAPiecewiseBackend:
                 "Input addresses for cudagraphs are different during replay."
                 f" Expected {entry.input_addresses}, got {new_input_addresses}"
             )
-        print(f"Replaying a cudagraph for shape {runtime_shape}")
+
         entry.cudagraph.replay()
         return entry.output

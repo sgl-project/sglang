@@ -22,6 +22,7 @@ import os
 import socket
 import threading
 import time
+import types
 from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -105,6 +106,10 @@ from sglang.srt.model_executor.compilation.compilation_config import Compilation
 from sglang.srt.model_executor.compilation.compilation_counter import (
     compilation_counter,
 )
+from sglang.srt.model_executor.compilation.decorators import (
+    install_torch_compiled,
+    set_compiled,
+)
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import (
@@ -113,6 +118,9 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.model_executor.npu_graph_runner import NPUGraphRunner
+from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
+    PiecewiseCudaGraphRunner,
+)
 from sglang.srt.model_loader import get_model
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.utils import set_default_torch_dtype
@@ -281,30 +289,34 @@ class ModelRunner:
         self._model_update_group = {}
         self._weights_send_group = {}
 
+        if self.server_args.enable_piecewise_cuda_graph:
+            install_torch_compiled(
+                self.model.model,
+                fullgraph=True,
+                dynamic_arg_dims=None,
+            )
+            with set_compiled(True):
+                self.capture_model()
+            self.piecewise_cuda_graph_runner = PiecewiseCudaGraphRunner(self)
+
     def capture_model(self) -> None:
+        """Warm up (largest→smallest) using the same packing/forward path as the benchmark.
+        No manual attention pre-init here; let ModelRunner.forward wire everything correctly.
+        """
+        import gc
+        import time
+        from contextlib import contextmanager
+
         compilation_counter.num_gpu_runner_capture_triggers += 1
 
         start_time = time.perf_counter()
         start_free_gpu_memory = torch.cuda.mem_get_info()[0]
 
-        self.max_num_tokens = 1024
-        with torch.device("cuda"):
-            self.input_ids = torch.zeros(
-                self.max_num_tokens, dtype=torch.int64, device=self.device
-            )
-            self.positions = torch.zeros(
-                self.max_num_tokens, dtype=torch.int64, device=self.device
-            )
-            self.out_cache_loc = torch.zeros((self.max_num_tokens,), dtype=torch.int64)
-            self.req_pool_indices = torch.ones((1,), dtype=torch.int32)
-            self.seq_lens = torch.full((1,), 0, dtype=torch.int32)
-            self.num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
+        # Ensure a sane upper bound for constructing dummy reqs
+        self.max_num_tokens = max(getattr(self, "max_num_tokens", 0), 1024)
 
         @contextmanager
         def freeze_gc():
-            # Optimize garbage collection during CUDA graph capture.
-            # Clean up, then freeze all remaining objects from being included
-            # in future collections.
             gc.collect()
             should_freeze = True
             if should_freeze:
@@ -315,191 +327,43 @@ class ModelRunner:
                 if should_freeze:
                     gc.unfreeze()
 
-        # Trigger CUDA graph capture for specific shapes.
-        # Capture the large shapes first so that the smaller shapes
-        # can reuse the memory pool allocated for the large shapes.
+        # Warm up largest → smallest so smaller buckets can reuse pools/allocations
         with freeze_gc():
-            # Only rank 0 should print progress bar during capture
-            self.cudagraph_batch_sizes = [512, 256, 128, 64, 32, 16, 8, 4, 2, 1]
-            compilation_cases = reversed(self.cudagraph_batch_sizes)
-            from tqdm import tqdm
+            self.cudagraph_batch_sizes = [256, 128, 64, 32, 16, 8, 4, 2, 1]
+            compilation_cases = self.cudagraph_batch_sizes
 
-            for num_tokens in tqdm(compilation_cases):
-                # We skip EPLB here since we don't want to record dummy metrics
-                for _ in range(1):
-                    self._dummy_run(
-                        num_tokens, capture_attn_cudagraph=False, skip_eplb=True
-                    )
-                self._dummy_run(
-                    num_tokens, capture_attn_cudagraph=False, skip_eplb=True
-                )
-
-        end_time = time.perf_counter()
-        end_free_gpu_memory = torch.cuda.mem_get_info()[0]
-        elapsed_time = end_time - start_time
-        cuda_graph_size = start_free_gpu_memory - end_free_gpu_memory
-        # This usually takes 5~20 seconds.
-        logger.info(
-            "Graph capturing finished in %.0f secs, took %.2f GiB",
-            elapsed_time,
-            cuda_graph_size / (1 << 30),
-        )
-
-    @torch.inference_mode()
-    def _dummy_run(
-        self,
-        num_tokens: int,
-        capture_attn_cudagraph: bool = False,
-        skip_eplb: bool = False,
-        is_profile: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-
-        # Set num_scheduled_tokens based on num_tokens and max_num_seqs
-        # for dummy run with LoRA so that the num_reqs collectively
-        # has num_tokens in total.
-        max_num_reqs = 1024
-        num_reqs = min(num_tokens, max_num_reqs)
-        min_tokens_per_req = num_tokens // num_reqs
-        num_scheduled_tokens_list = [min_tokens_per_req] * num_reqs
-        num_scheduled_tokens_list[-1] += num_tokens % num_reqs
-        assert sum(num_scheduled_tokens_list) == num_tokens
-        assert len(num_scheduled_tokens_list) == num_reqs
-        num_scheduled_tokens = np.array(num_scheduled_tokens_list, dtype=np.int32)
-
-        attn_metadata: Optional[dict[str, Any]] = None
-
-        model = self.model
-        # if self.is_multimodal_model:
-        #     model_kwargs = self._init_model_kwargs_for_multimodal_model(
-        #         num_reqs=num_reqs)
-        #     input_ids = None
-        #     inputs_embeds = self.inputs_embeds[:num_tokens]
-        # else:
-        input_ids = self.input_ids[:num_tokens]
-        inputs_embeds = None
-        model_kwargs = {}
-
-        # if self.uses_mrope:
-        #     positions = self.mrope_positions[:, :num_tokens]
-        # else:
-        positions = self.positions[:num_tokens]
-        req_pool_indices = self.req_pool_indices
-
-        # if get_pp_group().is_first_rank:
-        #     intermediate_tensors = None
-        # else:
-        #     if self.intermediate_tensors is None:
-        #         self.intermediate_tensors = (
-        #             self.model.make_empty_intermediate_tensors(
-        #                 batch_size=self.max_num_tokens,
-        #                 dtype=self.model_config.dtype,
-        #                 device=self.device))
-
-        #     intermediate_tensors = self.sync_and_slice_intermediate_tensors(
-        #         num_tokens, None, False)
-        intermediate_tensors = None
-
-        forward_batch = ForwardBatch(
-            forward_mode=ForwardMode.EXTEND,
-            batch_size=1,
-            input_ids=input_ids,
-            req_pool_indices=req_pool_indices,
-            seq_lens=self.seq_lens,
-            req_to_token_pool=self.req_to_token_pool,
-            token_to_kv_pool=self.token_to_kv_pool,
-            attn_backend=self.attn_backend,
-            out_cache_loc=self.out_cache_loc,
-            seq_lens_sum=self.seq_lens.sum().item(),
-            encoder_lens=None,
-            return_logprob=False,
-            positions=positions,
-            global_num_tokens_gpu=num_tokens,
-            global_num_tokens_for_logprob_gpu=num_tokens,
-        )
-
-        self.attn_backend.init_forward_metadata_capture_cuda_graph(
-            1,
-            num_tokens,
-            req_pool_indices,
-            self.seq_lens,
-            None,
-            forward_batch.forward_mode,
-            None,
-        )
-
-        with set_forward_context(forward_batch, self.attention_layers):
-            outputs = model(
-                input_ids=forward_batch.input_ids,
-                positions=forward_batch.positions,
-                forward_batch=forward_batch,
-            )
-
-        if self.use_aux_hidden_state_outputs:
-            hidden_states, _ = outputs
-        else:
-            hidden_states = outputs
-
-    def capture_model(self) -> None:
-        compilation_counter.num_gpu_runner_capture_triggers += 1
-
-        start_time = time.perf_counter()
-        start_free_gpu_memory = torch.cuda.mem_get_info()[0]
-
-        self.max_num_tokens = 1024
-        with torch.device("cuda"):
-            self.input_ids = torch.zeros(
-                self.max_num_tokens, dtype=torch.int64, device=self.device
-            )
-            self.positions = torch.zeros(
-                self.max_num_tokens, dtype=torch.int64, device=self.device
-            )
-            self.out_cache_loc = torch.zeros((self.max_num_tokens,), dtype=torch.int64)
-            self.req_pool_indices = torch.ones((1,), dtype=torch.int32)
-            self.seq_lens = torch.full((1,), 0, dtype=torch.int32)
-            self.num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
-
-        @contextmanager
-        def freeze_gc():
-            # Optimize garbage collection during CUDA graph capture.
-            # Clean up, then freeze all remaining objects from being included
-            # in future collections.
-            gc.collect()
-            should_freeze = True
-            if should_freeze:
-                gc.freeze()
             try:
-                yield
-            finally:
-                if should_freeze:
-                    gc.unfreeze()
+                from tqdm import tqdm
 
-        # Trigger CUDA graph capture for specific shapes.
-        # Capture the large shapes first so that the smaller shapes
-        # can reuse the memory pool allocated for the large shapes.
-        with freeze_gc():
-            # Only rank 0 should print progress bar during capture
-            self.cudagraph_batch_sizes = [512, 256, 128, 64, 32, 16, 8, 4, 2, 1]
-            compilation_cases = reversed(self.cudagraph_batch_sizes)
-            from tqdm import tqdm
+                iterator = (
+                    tqdm(compilation_cases)
+                    if getattr(self, "tp_rank", 0) == 0
+                    else compilation_cases
+                )
+            except Exception:
+                iterator = compilation_cases
 
-            for num_tokens in tqdm(compilation_cases):
-                # We skip EPLB here since we don't want to record dummy metrics
-                for _ in range(1):
+            for num_tokens in iterator:
+                # a couple of dry runs to steady allocator/pools
+                for _ in range(2):
                     self._dummy_run(
-                        num_tokens, capture_attn_cudagraph=False, skip_eplb=True
+                        num_tokens=num_tokens,
+                        capture_attn_cudagraph=False,
+                        skip_eplb=True,
                     )
+                    return
+                # one more for good measure
                 self._dummy_run(
-                    num_tokens, capture_attn_cudagraph=False, skip_eplb=True
+                    num_tokens=num_tokens,
+                    capture_attn_cudagraph=False,
+                    skip_eplb=True,
                 )
 
-        end_time = time.perf_counter()
-        end_free_gpu_memory = torch.cuda.mem_get_info()[0]
-        elapsed_time = end_time - start_time
-        cuda_graph_size = start_free_gpu_memory - end_free_gpu_memory
-        # This usually takes 5~20 seconds.
+        elapsed = time.perf_counter() - start_time
+        cuda_graph_size = start_free_gpu_memory - torch.cuda.mem_get_info()[0]
         logger.info(
             "Graph capturing finished in %.0f secs, took %.2f GiB",
-            elapsed_time,
+            elapsed,
             cuda_graph_size / (1 << 30),
         )
 
@@ -510,92 +374,95 @@ class ModelRunner:
         capture_attn_cudagraph: bool = False,
         skip_eplb: bool = False,
         is_profile: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor] | tuple[torch.Tensor, torch.Tensor]:
+        """Build ScheduleBatch → ForwardBatch exactly like the benchmark and call self.forward()."""
 
-        # Set num_scheduled_tokens based on num_tokens and max_num_seqs
-        # for dummy run with LoRA so that the num_reqs collectively
-        # has num_tokens in total.
-        max_num_reqs = 1024
-        num_reqs = min(num_tokens, max_num_reqs)
-        min_tokens_per_req = num_tokens // num_reqs
-        num_scheduled_tokens_list = [min_tokens_per_req] * num_reqs
-        num_scheduled_tokens_list[-1] += num_tokens % num_reqs
-        assert sum(num_scheduled_tokens_list) == num_tokens
-        assert len(num_scheduled_tokens_list) == num_reqs
-        num_scheduled_tokens = np.array(num_scheduled_tokens_list, dtype=np.int32)
+        # ---------- 0) Reset pools/backends to avoid stale KV mappings ----------
+        if hasattr(self, "req_to_token_pool"):
+            self.req_to_token_pool.clear()
+        if hasattr(self, "token_to_kv_pool_allocator"):
+            self.token_to_kv_pool_allocator.clear()
+        if hasattr(self, "token_to_kv_pool") and hasattr(
+            self.token_to_kv_pool, "clear"
+        ):
+            self.token_to_kv_pool.clear()
+        if hasattr(self, "attn_backend") and hasattr(self.attn_backend, "reset"):
+            self.attn_backend.reset()
 
-        attn_metadata: Optional[dict[str, Any]] = None
+        # ---------- 1) Split num_tokens into synthetic prefill reqs ----------
+        per_req = [num_tokens]
 
-        model = self.model
-        # if self.is_multimodal_model:
-        #     model_kwargs = self._init_model_kwargs_for_multimodal_model(
-        #         num_reqs=num_reqs)
-        #     input_ids = None
-        #     inputs_embeds = self.inputs_embeds[:num_tokens]
-        # else:
-        input_ids = self.input_ids[:num_tokens]
-        inputs_embeds = None
-        model_kwargs = {}
+        from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+        from sglang.srt.managers.scheduler import Scheduler
+        from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+        from sglang.srt.sampling.sampling_params import SamplingParams
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+        from sglang.srt.utils import require_mlp_sync, require_mlp_tp_gather
 
-        # if self.uses_mrope:
-        #     positions = self.mrope_positions[:, :num_tokens]
-        # else:
-        positions = self.positions[:num_tokens]
-        req_pool_indices = self.req_pool_indices
+        reqs: list[Req] = []
+        for rid, t in enumerate(per_req):
+            r = Req(
+                rid=rid,
+                origin_input_text="",
+                origin_input_ids=[1] * t,  # dummy valid token ids
+                sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+            )
+            r.prefix_indices = []  # pure prefill
+            r.fill_ids = r.origin_input_ids
+            r.extend_input_len = len(r.fill_ids)
+            r.logprob_start_len = 0
+            reqs.append(r)
 
-        # if get_pp_group().is_first_rank:
-        #     intermediate_tensors = None
-        # else:
-        #     if self.intermediate_tensors is None:
-        #         self.intermediate_tensors = (
-        #             self.model.make_empty_intermediate_tensors(
-        #                 batch_size=self.max_num_tokens,
-        #                 dtype=self.model_config.dtype,
-        #                 device=self.device))
-
-        #     intermediate_tensors = self.sync_and_slice_intermediate_tensors(
-        #         num_tokens, None, False)
-        intermediate_tensors = None
-
-        forward_batch = ForwardBatch(
-            forward_mode=ForwardMode.EXTEND,
-            batch_size=1,
-            input_ids=input_ids,
-            req_pool_indices=req_pool_indices,
-            seq_lens=self.seq_lens,
+        # ---------- 2) Build ScheduleBatch → ForwardBatch (same as bench_one_batch) ----------
+        batch = ScheduleBatch.init_new(
+            reqs=reqs,
             req_to_token_pool=self.req_to_token_pool,
-            token_to_kv_pool=self.token_to_kv_pool,
-            attn_backend=self.attn_backend,
-            out_cache_loc=self.out_cache_loc,
-            seq_lens_sum=self.seq_lens.sum().item(),
-            encoder_lens=None,
-            return_logprob=False,
-            positions=positions,
-            global_num_tokens_gpu=num_tokens,
-            global_num_tokens_for_logprob_gpu=num_tokens,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            tree_cache=None,
+            model_config=self.model_config,
+            enable_overlap=False,
+            spec_algorithm=SpeculativeAlgorithm.NONE,
         )
+        batch.prepare_for_extend()
 
-        self.attn_backend.init_forward_metadata_capture_cuda_graph(
-            1,
-            num_tokens,
-            req_pool_indices,
-            self.seq_lens,
-            None,
-            forward_batch.forward_mode,
-            None,
-        )
-
-        with set_forward_context(forward_batch, self.attention_layers):
-            outputs = model(
-                input_ids=forward_batch.input_ids,
-                positions=forward_batch.positions,
-                forward_batch=forward_batch,
+        if require_mlp_sync(self.server_args):
+            Scheduler.prepare_mlp_sync_batch_raw(
+                batch,
+                dp_size=self.server_args.dp_size,
+                attn_tp_size=1,
+                tp_group=self.tp_group,
+                get_idle_batch=None,
+                disable_cuda_graph=self.server_args.disable_cuda_graph,
+                spec_algorithm=SpeculativeAlgorithm.NONE,
+                speculative_num_draft_tokens=None,
+                require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),
+                disable_overlap_schedule=self.server_args.disable_overlap_schedule,
             )
 
-        if self.use_aux_hidden_state_outputs:
-            hidden_states, _ = outputs
-        else:
-            hidden_states = outputs
+        model_worker_batch = batch.get_model_worker_batch()
+        forward_batch = ForwardBatch.init_new(model_worker_batch, self)
+
+        # ---------- 3) Warmup call via ModelRunner.forward (matches benchmark) ----------
+        # Do NOT pre-init attention metadata here; let forward() wire Q/KV batch consistently.
+        with set_forward_context(forward_batch, self.attention_layers):
+            _ = self.model.forward(
+                forward_batch.input_ids,
+                forward_batch.positions,
+                forward_batch,
+            )
+
+        # If you truly need to pre-init for a later CG capture, derive from forward_batch:
+        # B = int(forward_batch.seq_lens.shape[0])
+        # total_tokens = int(forward_batch.seq_lens.sum().item())
+        # self.attn_backend.init_forward_metadata_capture_cuda_graph(
+        #     B,
+        #     total_tokens,
+        #     forward_batch.req_pool_indices,
+        #     forward_batch.seq_lens,
+        #     None,
+        #     forward_batch.forward_mode,
+        #     None,
+        # )
 
     def initialize(self, min_per_gpu_memory: float):
         server_args = self.server_args
@@ -723,8 +590,7 @@ class ModelRunner:
         if self.device == "cuda":
             self.init_cublas()
             self.init_attention_backend()
-            # self.init_device_graphs()
-            self.graph_runner = None
+            self.init_device_graphs()
         elif self.device in ["npu", "cpu"]:
             self.init_attention_backend()
             self.init_device_graphs()
@@ -2330,12 +2196,15 @@ class ModelRunner:
         if not self.is_generation:
             kwargs["get_embedding"] = True
 
-        return self.model.forward(
-            forward_batch.input_ids,
-            forward_batch.positions,
-            forward_batch,
-            **kwargs,
-        )
+        if self.server_args.enable_piecewise_cuda_graph:
+            return self.piecewise_cuda_graph_runner.replay(forward_batch, **kwargs)
+        else:
+            return self.model.forward(
+                forward_batch.input_ids,
+                forward_batch.positions,
+                forward_batch,
+                **kwargs,
+            )
 
     def forward_idle(
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None
