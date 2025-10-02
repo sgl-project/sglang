@@ -1004,8 +1004,118 @@ impl OpenAIRouter {
         response
     }
 
+    /// Apply all transformations to event data in-place (rewrite + transform)
+    /// Optimized to parse JSON only once instead of multiple times
+    /// Returns true if any changes were made
+    fn apply_event_transformations_inplace(
+        parsed_data: &mut Value,
+        server_label: &str,
+        original_request: &ResponsesRequest,
+        previous_response_id: Option<&str>,
+    ) -> bool {
+        let mut changed = false;
+
+        // 1. Apply rewrite_streaming_block logic (store, previous_response_id, tools masking)
+        let event_type = parsed_data
+            .get("type")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+
+        let should_patch = matches!(
+            event_type.as_str(),
+            "response.created" | "response.in_progress" | "response.completed"
+        );
+
+        if should_patch {
+            if let Some(response_obj) = parsed_data
+                .get_mut("response")
+                .and_then(|v| v.as_object_mut())
+            {
+                let desired_store = Value::Bool(original_request.store);
+                if response_obj.get("store") != Some(&desired_store) {
+                    response_obj.insert("store".to_string(), desired_store);
+                    changed = true;
+                }
+
+                if let Some(prev_id) = previous_response_id {
+                    let needs_previous = response_obj
+                        .get("previous_response_id")
+                        .map(|v| v.is_null() || v.as_str().map(|s| s.is_empty()).unwrap_or(false))
+                        .unwrap_or(true);
+
+                    if needs_previous {
+                        response_obj.insert(
+                            "previous_response_id".to_string(),
+                            Value::String(prev_id.to_string()),
+                        );
+                        changed = true;
+                    }
+                }
+
+                // Mask tools from function to MCP format
+                if response_obj.get("tools").is_some() {
+                    let requested_mcp = original_request
+                        .tools
+                        .iter()
+                        .any(|t| matches!(t.r#type, ResponseToolType::Mcp));
+
+                    if requested_mcp {
+                        let mut temp_response = Value::Object(response_obj.clone());
+                        Self::mask_tools_as_mcp(&mut temp_response, original_request);
+                        if let Some(masked_obj) = temp_response.as_object() {
+                            *response_obj = masked_obj.clone();
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Apply transform_streaming_event logic (function_call → mcp_call)
+        match event_type.as_str() {
+            "response.output_item.added" | "response.output_item.done" => {
+                if let Some(item) = parsed_data.get_mut("item") {
+                    if let Some(item_type) = item.get("type").and_then(|v| v.as_str()) {
+                        if item_type == "function_call" || item_type == "function_tool_call" {
+                            item["type"] = json!("mcp_call");
+                            item["server_label"] = json!(server_label);
+
+                            // Transform ID from fc_* to mcp_*
+                            if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
+                                if let Some(stripped) = id.strip_prefix("fc_") {
+                                    let new_id = format!("mcp_{}", stripped);
+                                    item["id"] = json!(new_id);
+                                }
+                            }
+
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            "response.function_call_arguments.done" => {
+                parsed_data["type"] = json!("response.mcp_call_arguments.done");
+
+                // Transform item_id from fc_* to mcp_*
+                if let Some(item_id) = parsed_data.get("item_id").and_then(|v| v.as_str()) {
+                    if let Some(stripped) = item_id.strip_prefix("fc_") {
+                        let new_id = format!("mcp_{}", stripped);
+                        parsed_data["item_id"] = json!(new_id);
+                    }
+                }
+
+                changed = true;
+            }
+            _ => {}
+        }
+
+        changed
+    }
+
     /// Forward and transform a streaming event to the client
     /// Returns false if client disconnected
+    #[allow(clippy::too_many_arguments)]
     fn forward_streaming_event(
         raw_block: &str,
         event_name: Option<&str>,
@@ -1021,68 +1131,89 @@ impl OpenAIRouter {
             return true;
         }
 
-        // First, rewrite basic response fields (store, previous_response_id, tools masking)
-        let block_cow = if let Some(modified) =
-            Self::rewrite_streaming_block(raw_block, original_request, previous_response_id)
-        {
-            Cow::Owned(modified)
-        } else {
-            Cow::Borrowed(raw_block)
+        // Parse JSON data once (optimized!)
+        let mut parsed_data: Value = match serde_json::from_str(data) {
+            Ok(v) => v,
+            Err(_) => {
+                // If parsing fails, forward raw block as-is
+                let chunk_to_send = format!("{}\n\n", raw_block);
+                return tx.send(Ok(Bytes::from(chunk_to_send))).is_ok();
+            }
         };
 
         // Check if this is function_call_arguments.done - need to send buffered args first
         if event_name == Some("response.function_call_arguments.done") {
-            // Parse the event data to get output_index and item_id
-            if let Ok(event_data) = serde_json::from_str::<Value>(data) {
-                // Send the complete arguments as a single delta event
-                if let Some(output_index) = event_data
-                    .get("output_index")
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as usize)
+            if let Some(output_index) = parsed_data
+                .get("output_index")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+            {
+                if let Some(call) = handler
+                    .pending_calls
+                    .iter()
+                    .find(|c| c.output_index == output_index)
                 {
-                    if let Some(call) = handler
-                        .pending_calls
-                        .iter()
-                        .find(|c| c.output_index == output_index)
-                    {
-                        if !call.arguments_buffer.is_empty() {
-                            // Get item_id and transform it
-                            let item_id = event_data
-                                .get("item_id")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
-                            let mcp_item_id = if let Some(stripped) = item_id.strip_prefix("fc_") {
-                                format!("mcp_{}", stripped)
-                            } else {
-                                item_id.to_string()
-                            };
+                    if !call.arguments_buffer.is_empty() {
+                        // Get item_id and transform it
+                        let item_id = parsed_data
+                            .get("item_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let mcp_item_id = if let Some(stripped) = item_id.strip_prefix("fc_") {
+                            format!("mcp_{}", stripped)
+                        } else {
+                            item_id.to_string()
+                        };
 
-                            let delta_event = json!({
-                                "type": "response.mcp_call_arguments.delta",
-                                "output_index": output_index,
-                                "item_id": mcp_item_id,
-                                "delta": call.arguments_buffer
-                            });
-                            let delta_block = format!(
-                                "event: response.mcp_call_arguments.delta\ndata: {}\n\n",
-                                delta_event
-                            );
-                            if tx.send(Ok(Bytes::from(delta_block))).is_err() {
-                                return false;
-                            }
+                        let delta_event = json!({
+                            "type": "response.mcp_call_arguments.delta",
+                            "output_index": output_index,
+                            "item_id": mcp_item_id,
+                            "delta": call.arguments_buffer
+                        });
+                        let delta_block = format!(
+                            "event: response.mcp_call_arguments.delta\ndata: {}\n\n",
+                            delta_event
+                        );
+                        if tx.send(Ok(Bytes::from(delta_block))).is_err() {
+                            return false;
                         }
                     }
                 }
             }
         }
 
-        // Then, apply event transformation (function_call → mcp_call)
-        let final_block =
-            if let Some(transformed) = Self::transform_streaming_event(&block_cow, server_label) {
-                Cow::Owned(transformed)
+        // Apply all transformations in-place (single parse/serialize!)
+        Self::apply_event_transformations_inplace(
+            &mut parsed_data,
+            server_label,
+            original_request,
+            previous_response_id,
+        );
+
+        // Serialize once
+        let final_data = match serde_json::to_string(&parsed_data) {
+            Ok(s) => s,
+            Err(_) => {
+                // Serialization failed, forward original
+                let chunk_to_send = format!("{}\n\n", raw_block);
+                return tx.send(Ok(Bytes::from(chunk_to_send))).is_ok();
+            }
+        };
+
+        // Rebuild SSE block with potentially transformed event name
+        let mut final_block = String::new();
+        if let Some(evt) = event_name {
+            // Update event name for function_call_arguments events
+            if evt == "response.function_call_arguments.delta" {
+                final_block.push_str("event: response.mcp_call_arguments.delta\n");
+            } else if evt == "response.function_call_arguments.done" {
+                final_block.push_str("event: response.mcp_call_arguments.done\n");
             } else {
-                block_cow
-            };
+                final_block.push_str(&format!("event: {}\n", evt));
+            }
+        }
+        final_block.push_str(&format!("data: {}", final_data));
 
         let chunk_to_send = format!("{}\n\n", final_block);
         if tx.send(Ok(Bytes::from(chunk_to_send))).is_err() {
@@ -1091,34 +1222,24 @@ impl OpenAIRouter {
 
         // After sending output_item.added for mcp_call, inject mcp_call.in_progress event
         if event_name == Some("response.output_item.added") {
-            if let Ok(event_data) = serde_json::from_str::<Value>(data) {
-                if let Some(item) = event_data.get("item") {
-                    if item.get("type").and_then(|v| v.as_str()) == Some("function_call")
-                        || item.get("type").and_then(|v| v.as_str()) == Some("function_tool_call")
-                    {
-                        // Get item_id and output_index
-                        if let (Some(item_id), Some(output_index)) = (
-                            item.get("id").and_then(|v| v.as_str()),
-                            event_data.get("output_index").and_then(|v| v.as_u64()),
-                        ) {
-                            let mcp_item_id = if let Some(stripped) = item_id.strip_prefix("fc_") {
-                                format!("mcp_{}", stripped)
-                            } else {
-                                item_id.to_string()
-                            };
-
-                            let in_progress_event = json!({
-                                "type": "response.mcp_call.in_progress",
-                                "output_index": output_index,
-                                "item_id": mcp_item_id
-                            });
-                            let in_progress_block = format!(
-                                "event: response.mcp_call.in_progress\ndata: {}\n\n",
-                                in_progress_event
-                            );
-                            if tx.send(Ok(Bytes::from(in_progress_block))).is_err() {
-                                return false;
-                            }
+            if let Some(item) = parsed_data.get("item") {
+                if item.get("type").and_then(|v| v.as_str()) == Some("mcp_call") {
+                    // Already transformed to mcp_call
+                    if let (Some(item_id), Some(output_index)) = (
+                        item.get("id").and_then(|v| v.as_str()),
+                        parsed_data.get("output_index").and_then(|v| v.as_u64()),
+                    ) {
+                        let in_progress_event = json!({
+                            "type": "response.mcp_call.in_progress",
+                            "output_index": output_index,
+                            "item_id": item_id
+                        });
+                        let in_progress_block = format!(
+                            "event: response.mcp_call.in_progress\ndata: {}\n\n",
+                            in_progress_event
+                        );
+                        if tx.send(Ok(Bytes::from(in_progress_block))).is_err() {
+                            return false;
                         }
                     }
                 }
@@ -1510,105 +1631,8 @@ impl OpenAIRouter {
         (event_name, data)
     }
 
-    /// Transform a streaming event from function_call format to mcp_call format
-    fn transform_streaming_event(raw_block: &str, server_label: &str) -> Option<String> {
-        // Parse the SSE block
-        let (event_name, data) = Self::parse_sse_block(raw_block);
-
-        let mut parsed: Value = match serde_json::from_str(&data) {
-            Ok(v) => v,
-            Err(_) => return None,
-        };
-
-        let event_type = event_name
-            .as_deref()
-            .or_else(|| parsed.get("type").and_then(|v| v.as_str()));
-
-        let mut changed = false;
-
-        match event_type {
-            Some("response.output_item.added") => {
-                // Transform function_call items to mcp_call
-                if let Some(item) = parsed.get_mut("item") {
-                    if let Some(item_type) = item.get("type").and_then(|v| v.as_str()) {
-                        if item_type == "function_call" || item_type == "function_tool_call" {
-                            item["type"] = json!("mcp_call");
-                            item["server_label"] = json!(server_label);
-
-                            // Transform ID from fc_* to mcp_*
-                            if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
-                                if let Some(stripped) = id.strip_prefix("fc_") {
-                                    let new_id = format!("mcp_{}", stripped);
-                                    item["id"] = json!(new_id);
-                                }
-                            }
-
-                            changed = true;
-                        }
-                    }
-                }
-            }
-            Some("response.output_item.done") => {
-                // Transform function_call items to mcp_call
-                if let Some(item) = parsed.get_mut("item") {
-                    if let Some(item_type) = item.get("type").and_then(|v| v.as_str()) {
-                        if item_type == "function_call" || item_type == "function_tool_call" {
-                            item["type"] = json!("mcp_call");
-                            item["server_label"] = json!(server_label);
-
-                            // Transform ID from fc_* to mcp_*
-                            if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
-                                if let Some(stripped) = id.strip_prefix("fc_") {
-                                    let new_id = format!("mcp_{}", stripped);
-                                    item["id"] = json!(new_id);
-                                }
-                            }
-
-                            changed = true;
-                        }
-                    }
-                }
-            }
-            Some("response.function_call_arguments.done") => {
-                // Change event type to mcp_call_arguments.done
-                parsed["type"] = json!("response.mcp_call_arguments.done");
-
-                // Transform item_id from fc_* to mcp_*
-                if let Some(item_id) = parsed.get("item_id").and_then(|v| v.as_str()) {
-                    if let Some(stripped) = item_id.strip_prefix("fc_") {
-                        let new_id = format!("mcp_{}", stripped);
-                        parsed["item_id"] = json!(new_id);
-                    }
-                }
-
-                // The arguments field should already be in the event from upstream
-                // Just ensure it's present
-
-                changed = true;
-            }
-            _ => {}
-        }
-
-        if !changed {
-            return None;
-        }
-
-        // Rebuild the SSE block
-        let new_data = serde_json::to_string(&parsed).ok()?;
-        let mut result = String::new();
-        if let Some(evt) = event_name {
-            // For function_call_arguments events, update the event name too
-            if evt == "response.function_call_arguments.delta" {
-                result.push_str("event: response.mcp_call_arguments.delta\n");
-            } else if evt == "response.function_call_arguments.done" {
-                result.push_str("event: response.mcp_call_arguments.done\n");
-            } else {
-                result.push_str(&format!("event: {}\n", evt));
-            }
-        }
-        result.push_str(&format!("data: {}", new_data));
-        Some(result)
-    }
+    // Note: transform_streaming_event has been replaced by apply_event_transformations_inplace
+    // which is more efficient (parses JSON only once instead of twice)
 
     /// Send mcp_list_tools events to client at the start of streaming
     /// Returns false if client disconnected
