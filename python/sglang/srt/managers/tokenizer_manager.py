@@ -1496,19 +1496,19 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                         # Calculate per-request acceptance rate and average acceptance length.
                         if total_draft_tokens > 0:
                             # Calculate acceptance rate: accepted / (steps * lookahead)
-                            meta_info["spec_acceptance_rate"] = (
+                            meta_info["spec_accept_rate"] = (
                                 accepted_tokens / total_draft_tokens
                             )
-                            meta_info["spec_acceptance_len_avg"] = (
+                            meta_info["spec_accept_length"] = (
                                 recv_obj.completion_tokens[i]
                                 / recv_obj.spec_verify_ct[i]
                             )
                         else:
-                            meta_info["spec_acceptance_rate"] = 0.0
-                            meta_info["spec_acceptance_len_avg"] = 0
+                            meta_info["spec_accept_rate"] = 0.0
+                            meta_info["spec_accept_length"] = 0
                     else:
                         meta_info["spec_acceptance_rate"] = 0.0
-                        meta_info["spec_acceptance_len_avg"] = 0
+                        meta_info["spec_accept_length"] = 0
                 state.finished_time = time.time()
                 meta_info["e2e_latency"] = state.finished_time - state.created_time
 
