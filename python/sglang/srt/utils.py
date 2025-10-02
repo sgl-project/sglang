@@ -3250,6 +3250,25 @@ def get_extend_input_len_swa_limit(
     return page_size + 2 * max(sliding_window_size, chunked_prefill_size)
 
 
+def get_num_new_pages(
+    prefix_lens: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_size: int,
+    decode: bool = False,
+) -> torch.Tensor:
+    """
+    Get the number of new pages for the given prefix and sequence lengths. We use cpu tensors to avoid blocking kernel launch.
+    """
+    cpu_device = torch.device("cpu")
+    assert prefix_lens.device == cpu_device
+    assert seq_lens.device == cpu_device
+    num_pages_after = (seq_lens + page_size - 1) // page_size
+    num_pages_before = (prefix_lens + page_size - 1) // page_size
+    num_new_pages = num_pages_after - num_pages_before
+    sum_num_new_pages = torch.sum(num_new_pages).to(torch.int64)
+    return sum_num_new_pages.item()
+
+
 class CachedKernel:
     """
     Wrapper that allows kernel[grid](...) syntax with caching based on a key function.

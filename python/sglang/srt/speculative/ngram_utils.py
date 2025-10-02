@@ -77,15 +77,23 @@ class NgramVerifyInput(SpecInput):
             batch.out_cache_loc = batch.alloc_token_slots(len(batch.input_ids))
             end_offset = batch.seq_lens + self.draft_token_num
         else:
+            # TODO(lsyin): add prefix lens cpu here to support page size > 1
             prefix_lens = batch.seq_lens
+            prefix_lens_cpu = batch.seq_lens_cpu
             end_offset = prefix_lens + self.draft_token_num
+            end_offset_cpu = prefix_lens_cpu + self.draft_token_num
             last_loc = get_last_loc(
                 batch.req_to_token_pool.req_to_token,
                 batch.req_pool_indices,
                 prefix_lens,
             )
             batch.out_cache_loc = batch.alloc_paged_token_slots_extend(
-                prefix_lens, end_offset, last_loc, len(batch.input_ids)
+                prefix_lens,
+                prefix_lens_cpu,
+                end_offset,
+                end_offset_cpu,
+                last_loc,
+                len(batch.input_ids),
             )
             self.last_loc = last_loc
 
@@ -405,10 +413,13 @@ class NgramVerifyInput(SpecInput):
         self._fill_requests(batch, logits_output)
         self._free_cache(batch, page_size)
 
-        batch.seq_lens.add_(self.accept_length + 1)
-        batch.seq_lens_sum = torch.sum(batch.seq_lens).item()
+        accept_length_cpu = self.accept_length.cpu()
+        num_accepted_tokens = accept_length_cpu.sum().item()
 
-        return logits_output, self.verified_id, self.accept_length.sum().item()
+        batch.seq_lens.add_(self.accept_length + 1)
+        batch.seq_lens_cpu.add_(accept_length_cpu + 1)
+
+        return logits_output, self.verified_id, num_accepted_tokens
 
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
         pass

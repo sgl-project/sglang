@@ -31,7 +31,7 @@ DEFAULT_SERVER_ARGS = [
 ]
 
 
-class TestStandaloneSpeculativeDecodingBase(CustomTestCase):
+class TestNgramSpeculativeDecodingBase(CustomTestCase):
 
     model = DEFAULT_NGRAM_SPECULATIVE_TARGET_MODEL_FOR_TEST
     base_url = DEFAULT_URL_FOR_TEST
@@ -88,19 +88,29 @@ class TestStandaloneSpeculativeDecodingBase(CustomTestCase):
         self.assertGreater(avg_spec_accept_length, self.spec_decode_threshold)
 
 
-class TestStandaloneSpeculativeDecodingTriton(TestStandaloneSpeculativeDecodingBase):
+class TestNgramSpeculativeDecodingTriton(TestNgramSpeculativeDecodingBase):
 
     @classmethod
     def get_server_args(cls):
         return DEFAULT_SERVER_ARGS + ["--attention-backend", "triton"]
 
 
-class TestStandaloneSpeculativeDecodingFlashinfer(
-    TestStandaloneSpeculativeDecodingBase
-):
+class TestNgramSpeculativeDecodingFlashinfer(TestNgramSpeculativeDecodingBase):
     @classmethod
     def get_server_args(cls):
         return DEFAULT_SERVER_ARGS + ["--attention-backend", "flashinfer"]
+
+
+class TestNgramSpeculativeDecodingPaged(TestNgramSpeculativeDecodingBase):
+
+    @classmethod
+    def get_server_args(cls):
+        return DEFAULT_SERVER_ARGS + [
+            "--attention-backend",
+            "flashinfer",
+            "--page-size",
+            "64",
+        ]
 
 
 if __name__ == "__main__":
