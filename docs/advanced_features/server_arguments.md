@@ -8,6 +8,23 @@ You can find all arguments by `python3 -m sglang.launch_server --help`
 
 ## Common launch commands
 
+- To use a configuration file, create a YAML file with your server arguments and specify it with `--config`. CLI arguments will override config file values.
+
+  ```bash
+  # Create config.yaml
+  cat > config.yaml << EOF
+  model-path: meta-llama/Meta-Llama-3-8B-Instruct
+  host: 0.0.0.0
+  port: 30000
+  tensor-parallel-size: 2
+  enable-metrics: true
+  log-requests: true
+  EOF
+
+  # Launch server with config file
+  python -m sglang.launch_server --config config.yaml
+  ```
+
 - To enable multi-GPU tensor parallelism, add `--tp 2`. If it reports the error "peer access is not supported between these two devices", add `--enable-p2p-check` to the server launch command.
 
   ```bash
@@ -65,6 +82,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 
 | Arguments | Description | Defaults |
 |-----------|-------------|----------|
+| `--config` | Path to a YAML configuration file containing server arguments. Arguments in the config file will be merged with command-line arguments, with CLI arguments taking precedence. | None |
 | `--model-path` | The path of the model weights. This can be a local folder or a Hugging Face repo ID. | None |
 | `--tokenizer-path` | The path of the tokenizer. | None |
 | `--tokenizer-mode` | Tokenizer mode. 'auto' will use the fast tokenizer if available, and 'slow' will always use the slow tokenizer. | auto |
@@ -95,6 +113,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--quantization` | The quantization method. | None |
 | `--quantization-param-path` | Path to the JSON file containing the KV cache scaling factors. This should generally be supplied, when KV cache dtype is FP8. Otherwise, KV cache scaling factors default to 1.0, which may cause accuracy issues. | None |
 | `--kv-cache-dtype` | Data type for kv cache storage. 'auto' will use model data type. 'fp8_e5m2' and 'fp8_e4m3' is supported for CUDA 11.8+. | auto |
+| `--enable-fp32-lm-head` | If set, the LM head outputs (logits) are in FP32. | False |
 
 ## Memory and scheduling
 
@@ -146,8 +165,8 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--kv-events-config`                  | Config in json format for NVIDIA dynamo KV event publishing. Publishing will be enabled if this flag is used.                                                                                                                                                                                                                                                                                | None     |
 | `--decode-log-interval`               | The log interval of decode batch.                                                                                                                                                                                                                                                                                                                                                            | 40       |
 | `--enable-request-time-stats-logging` | Enable per request time stats logging.                                                                                                                                                                                                                                                                                                                                                       | False    |
-| `--prompt-tokens-buckets`             | The buckets rule of prompt tokens. Supports 3 rule types: 'default' uses predefined buckets; 'tse <middle> <base> <count>' generates two sides exponential distributed buckets (e.g., 'tse 1000 2 8' generates buckets [984.0, 992.0, 996.0, 998.0, 1000.0, 1002.0, 1004.0, 1008.0, 1016.0]).); 'customer <value1> <value2> ...' uses custom bucket values (e.g., 'customer 10 50 100 500'). | None     |
-| `--generation-tokens-buckets`         | The buckets rule of prompt tokens. Supports 3 rule types: 'default' uses predefined buckets; 'tse <middle> <base> <count>' generates two sides exponential distributed buckets (e.g., 'tse 1000 2 8' generates buckets [984.0, 992.0, 996.0, 998.0, 1000.0, 1002.0, 1004.0, 1008.0, 1016.0]).); 'customer <value1> <value2> ...' uses custom bucket values (e.g., 'customer 10 50 100 500'). | None     |
+| `--prompt-tokens-buckets`             | The buckets rule of prompt tokens. Supports 3 rule types: 'default' uses predefined buckets; 'tse <middle> <base> <count>' generates two sides exponential distributed buckets (e.g., 'tse 1000 2 8' generates buckets [984.0, 992.0, 996.0, 998.0, 1000.0, 1002.0, 1004.0, 1008.0, 1016.0]).); 'custom <value1> <value2> ...' uses custom bucket values (e.g., 'custom 10 50 100 500'). | None     |
+| `--generation-tokens-buckets`         | The buckets rule of generation tokens. Supports 3 rule types: 'default' uses predefined buckets; 'tse <middle> <base> <count>' generates two sides exponential distributed buckets (e.g., 'tse 1000 2 8' generates buckets [984.0, 992.0, 996.0, 998.0, 1000.0, 1002.0, 1004.0, 1008.0, 1016.0]).); 'custom <value1> <value2> ...' uses custom bucket values (e.g., 'custom 10 50 100 500'). | None     |
 
 ## API related
 
@@ -275,6 +294,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--enable-dp-lm-head` | Enable vocabulary parallel across the attention TP group to avoid all-gather across DP groups, optimizing performance under DP attention. | False |
 | `--enable-two-batch-overlap` | Enabling two micro batches to overlap. | False |
 | `--tbo-token-distribution-threshold` | The threshold of token distribution between two batches in micro-batch-overlap, determines whether to two-batch-overlap or two-chunk-overlap. Set to 0 denote disable two-chunk-overlap. | 0.48 |
+| `--enable-single-batch-overlap` | Enabling single batch overlap. | False |
 | `--enable-torch-compile` | Optimize the model with torch.compile. Experimental feature. | False |
 | `--torch-compile-max-bs` | Set the maximum batch size when using torch compile. | 32 |
 | `--torchao-config` | Optimize the model with torchao. Experimental feature. Current choices are: int8dq, int8wo, int4wo-<group_size>, fp8wo, fp8dq-per_tensor, fp8dq-per_row. |  |

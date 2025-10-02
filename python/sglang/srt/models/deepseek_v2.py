@@ -28,6 +28,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt import single_batch_overlap
 from sglang.srt.configs.model_config import (
     get_nsa_index_head_dim,
     get_nsa_index_n_heads,
@@ -109,6 +110,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.single_batch_overlap import SboFlags
 from sglang.srt.two_batch_overlap import (
     MaybeTboDeepEPDispatcher,
     model_forward_maybe_tbo,
@@ -833,7 +835,8 @@ class DeepseekV2MoE(nn.Module):
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
-            shared_output = self._forward_shared_experts(hidden_states)
+            if not SboFlags.fuse_shared_experts_inside_sbo():
+                shared_output = self._forward_shared_experts(hidden_states)
             topk_weights, topk_idx, _ = self.topk(
                 hidden_states,
                 router_logits,
@@ -847,12 +850,18 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states.device
             )
 
-        final_hidden_states = self.experts(
+        final_hidden_states, sbo_shared_output = single_batch_overlap.execute_sbo(
             hidden_states=hidden_states,
             topk_idx=topk_idx,
             topk_weights=topk_weights,
             forward_batch=forward_batch,
+            # SBO args
+            forward_shared_experts=lambda: self._forward_shared_experts(hidden_states),
+            experts=self.experts,
+            alt_stream=self.alt_stream,
         )
+        if sbo_shared_output is not None:
+            shared_output = sbo_shared_output
 
         if shared_output is not None:
             x = shared_output
@@ -870,7 +879,7 @@ class DeepseekV2MoE(nn.Module):
     def _forward_shared_experts(
         self, hidden_states, gemm_output_zero_allocator: BumpAllocator = None
     ):
-        if self.num_fused_shared_experts == 0:
+        if (hidden_states.shape[0] > 0) and (self.num_fused_shared_experts == 0):
             return self.shared_experts(
                 hidden_states, gemm_output_zero_allocator=gemm_output_zero_allocator
             )
@@ -923,6 +932,7 @@ class DeepseekV2MoE(nn.Module):
         if self.ep_size > 1:
             self.experts.deepep_dispatcher.dispatch_a(
                 hidden_states=state.hidden_states_mlp_input,
+                input_global_scale=None,
                 topk_idx=state.pop("topk_idx_local"),
                 topk_weights=state.pop("topk_weights_local"),
                 forward_batch=state.forward_batch,
@@ -1452,7 +1462,10 @@ class DeepseekV2AttentionMLA(nn.Module):
         """
         return (
             self.current_attention_backend == "trtllm_mla"
-            and forward_batch.forward_mode.is_decode_or_idle()
+            and (
+                forward_batch.forward_mode.is_decode_or_idle()
+                or forward_batch.forward_mode.is_target_verify()
+            )
             and forward_batch.attn_backend.data_type == torch.float8_e4m3fn
         )
 
@@ -2273,6 +2286,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             tmp_lse = torch.empty_like(accum_lse)
             merge_state_v2(output, lse, accum_output, accum_lse, tmp_output, tmp_lse)
             accum_output, accum_lse = tmp_output, tmp_lse
+            del kv, k, v, output, lse, tmp_output, tmp_lse
 
         return accum_output
 

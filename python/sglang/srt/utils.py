@@ -22,6 +22,7 @@ import ctypes
 import dataclasses
 import functools
 import importlib
+import inspect
 import io
 import ipaddress
 import itertools
@@ -194,7 +195,7 @@ _warned_bool_env_var_keys = set()
 
 
 def get_bool_env_var(name: str, default: str = "false") -> bool:
-    # FIXME: move your environment variable to sglang.environ
+    # FIXME: move your environment variable to sglang.srt.environ
     value = os.getenv(name, default)
     value = value.lower()
 
@@ -212,7 +213,7 @@ def get_bool_env_var(name: str, default: str = "false") -> bool:
 
 
 def get_int_env_var(name: str, default: int = 0) -> int:
-    # FIXME: move your environment variable to sglang.environ
+    # FIXME: move your environment variable to sglang.srt.environ
     value = os.getenv(name)
     if value is None or not value.strip():
         return default
@@ -515,6 +516,50 @@ def make_layers(
     if pp_rank is None or pp_size is None:
         return modules
     return modules, start_layer, end_layer
+
+
+cmo_stream = None
+
+
+def get_cmo_stream():
+    """
+    Cache Management Operation(CMO).
+    Launch a new stream to prefetch the weight of matmul when running other
+    AIV or communication kernels, aiming to overlap the memory access time.
+    """
+    global cmo_stream
+    if cmo_stream is None:
+        cmo_stream = torch.get_device_module().Stream()
+    return cmo_stream
+
+
+def prepare_weight_cache(handle, cache):
+    import torch_npu
+
+    NPU_PREFETCH_MAX_SIZE_BYTES = (
+        1000000000  # 1GB, a large value to prefetch entire weight
+    )
+    stream = get_cmo_stream()
+    stream.wait_stream(torch.npu.current_stream())
+    with torch.npu.stream(stream):
+        if isinstance(cache, list):
+            for weight in cache:
+                torch_npu.npu_prefetch(
+                    weight,
+                    handle,
+                    NPU_PREFETCH_MAX_SIZE_BYTES,
+                )
+        else:
+            torch_npu.npu_prefetch(
+                cache,
+                handle,
+                NPU_PREFETCH_MAX_SIZE_BYTES,
+            )
+
+
+def wait_cmo_stream():
+    cur_stream = torch.get_device_module().current_stream()
+    cur_stream.wait_stream(get_cmo_stream())
 
 
 def set_random_seed(seed: int) -> None:
@@ -1462,6 +1507,32 @@ def get_npu_memory_capacity():
         raise ImportError("torch_npu is required when run on npu device.")
 
 
+def get_cpu_memory_capacity():
+    # Per-rank memory capacity cannot be determined for customized core settings
+    if os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", ""):
+        return None
+    n_numa_node: int = len(get_cpu_ids_by_node())
+    if n_numa_node == 0:
+        # Cannot determine NUMA config, fallback to total memory and avoid ZeroDivisionError.
+        return float(psutil.virtual_memory().total // (1 << 20))
+    try:
+        numa_mem_list = list()
+        file_prefix = "/sys/devices/system/node/"
+        for numa_id in range(n_numa_node):
+            file_meminfo = f"node{numa_id}/meminfo"
+            with open(os.path.join(file_prefix, file_meminfo), "r") as f:
+                # 1st line contains 'MemTotal'
+                line = f.read().split("\n")[0]
+                numa_mem_list.append(int(line.split()[3]))
+        # Retrieved value in KB, need MB
+        numa_mem = float(min(numa_mem_list) // 1024)
+        return numa_mem
+    except FileNotFoundError:
+        numa_mem = psutil.virtual_memory().total / n_numa_node
+        # Retrieved value in Byte, need MB
+        return float(numa_mem // (1 << 20))
+
+
 def get_device_memory_capacity(device: str = None):
     if is_cuda():
         gpu_mem = get_nvgpu_memory_capacity()
@@ -1471,6 +1542,8 @@ def get_device_memory_capacity(device: str = None):
         gpu_mem = get_hpu_memory_capacity()
     elif device == "npu":
         gpu_mem = get_npu_memory_capacity()
+    elif device == "cpu":
+        gpu_mem = get_cpu_memory_capacity()
     else:
         # GPU memory is not known yet or no GPU is available.
         gpu_mem = None
@@ -2009,13 +2082,6 @@ def set_uvicorn_logging_configs():
     LOGGING_CONFIG["formatters"]["access"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
 
 
-def get_ip() -> Optional[str]:
-    host_ip = os.getenv("SGLANG_HOST_IP", "") or os.getenv("HOST_IP", "")
-    if host_ip:
-        return host_ip
-    return None
-
-
 def get_open_port() -> int:
     port = os.getenv("SGLANG_PORT")
     if port is not None:
@@ -2355,8 +2421,10 @@ def get_local_ip_auto(fallback: str = None) -> str:
         2. Network interface enumeration via get_local_ip_by_nic()
         3. Remote connection method via get_local_ip_by_remote()
     """
-    if ip := get_ip():
-        return ip
+    # Try environment variable
+    host_ip = os.getenv("SGLANG_HOST_IP", "") or os.getenv("HOST_IP", "")
+    if host_ip:
+        return host_ip
     logger.debug("get_ip failed")
     # Fallback
     if ip := get_local_ip_by_nic():
@@ -2420,7 +2488,7 @@ class BumpAllocator:
 def log_info_on_rank0(logger, msg):
     from sglang.srt.distributed import get_tensor_model_parallel_rank
 
-    if get_tensor_model_parallel_rank() == 0:
+    if torch.distributed.is_initialized() and get_tensor_model_parallel_rank() == 0:
         logger.info(msg)
 
 
@@ -3180,3 +3248,146 @@ def get_extend_input_len_swa_limit(
     #    and we can only free out-of-sliding-window kv indices after each prefill.
     # 3. page_size is because we want to have 1 token extra for generated tokens.
     return page_size + 2 * max(sliding_window_size, chunked_prefill_size)
+
+
+def get_num_new_pages(
+    seq_lens: torch.Tensor,
+    page_size: int,
+    prefix_lens: Optional[torch.Tensor] = None,
+    decode: bool = False,
+) -> torch.Tensor:
+    """
+    Get the number of new pages for the given prefix and sequence lengths.
+    We use cpu tensors to avoid blocking kernel launch.
+    """
+    cpu_device = torch.device("cpu")
+    assert seq_lens.device == cpu_device
+
+    if prefix_lens is None or decode:
+        # NOTE: Special case for handling decode, which prefix lens is `seq_lens - 1`.
+        assert decode
+        return (seq_lens % page_size == 1).int().sum().item()
+
+    assert prefix_lens.device == cpu_device
+    num_pages_after = (seq_lens + page_size - 1) // page_size
+    num_pages_before = (prefix_lens + page_size - 1) // page_size
+    num_new_pages = num_pages_after - num_pages_before
+    sum_num_new_pages = torch.sum(num_new_pages).to(torch.int64)
+    return sum_num_new_pages.item()
+
+
+class CachedKernel:
+    """
+    Wrapper that allows kernel[grid](...) syntax with caching based on a key function.
+
+    This wrapper caches compiled Triton kernels based on keys extracted by a
+    user-provided key function to avoid redundant compilations.
+    """
+
+    def __init__(self, fn, key_fn=None):
+        self.fn = fn
+        assert isinstance(fn, triton.runtime.jit.JITFunction)
+
+        original_fn = fn.fn
+        self.signature = inspect.signature(original_fn)
+        self.param_names = tuple(self.signature.parameters.keys())
+        self.num_args = len(self.param_names)
+
+        # Check that no parameters have default values
+        for name, param in self.signature.parameters.items():
+            assert (
+                param.default is inspect.Parameter.empty
+            ), f"Parameter '{name}' has a default value. Default parameters are not supported in cached kernels."
+
+        functools.update_wrapper(self, original_fn)
+        self.kernel_cache = {}
+
+        # Store the key function
+        self.key_fn = key_fn
+
+    def __getitem__(self, grid):
+        """
+        Index with grid to get a launcher function.
+        Returns a launcher that will handle caching based on the key function.
+        """
+        assert (
+            isinstance(grid, tuple) and len(grid) <= 3
+        ), "Grid must be a tuple with at most 3 dimensions."
+
+        # Normalize grid once
+        if len(grid) < 3:
+            grid = grid + (1,) * (3 - len(grid))
+
+        def launcher(*args, **kwargs):
+            cache_key = self.key_fn(args, kwargs)
+
+            cached_kernel = self.kernel_cache.get(cache_key)
+
+            if cached_kernel is None:
+                # First time: compile and cache the kernel
+                cached_kernel = self.fn[grid](*args, **kwargs)
+                self.kernel_cache[cache_key] = cached_kernel
+                return cached_kernel
+            else:
+                # Use cached kernel
+                all_args = self._build_args(args, kwargs)
+                cached_kernel[grid](*all_args)
+                return cached_kernel
+
+        return launcher
+
+    def _build_args(self, args, kwargs):
+        """
+        Build the complete argument list for kernel invocation.
+        """
+        complete_args = list(args)
+
+        for i in range(len(args), self.num_args):
+            name = self.param_names[i]
+            value = kwargs.get(name, inspect.Parameter.empty)
+            if value is not inspect.Parameter.empty:
+                complete_args.append(value)
+            else:
+                raise ValueError(f"Missing argument: {name}")
+
+        return complete_args
+
+    def _clear_cache(self):
+        """
+        Clear the kernel cache for testing purposes.
+        """
+        self.kernel_cache.clear()
+
+
+def cached_triton_kernel(key_fn=None):
+    """
+    Decorator that enables key-based caching for Triton kernels using a key function.
+
+    It essentially bypasses Triton's built-in caching mechanism, allowing users to
+    define their own caching strategy based on kernel parameters. This helps reduce
+    the heavy overheads of Triton kernel launch when the kernel specialization dispatch
+    is simple.
+
+    Usage:
+        @cached_triton_kernel(key_fn=lambda args, kwargs: kwargs.get('BLOCK_SIZE', 1024))
+        @triton.jit
+        def my_kernel(x_ptr, y_ptr, BLOCK_SIZE: tl.constexpr):
+            ...
+
+        # Invoke normally
+        my_kernel[grid](x, y, BLOCK_SIZE=1024)
+
+    Args:
+        key_fn: A function that takes (args, kwargs) and returns the cache key(s).
+                The key can be a single value or a tuple of values.
+
+    Returns:
+        A decorator that wraps the kernel with caching functionality.
+
+    Note: Kernels with default parameter values are not supported and will raise an assertion error.
+    """
+
+    def decorator(fn):
+        return CachedKernel(fn, key_fn)
+
+    return decorator
