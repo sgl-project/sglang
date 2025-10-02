@@ -1212,7 +1212,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         extend_lens = [r.extend_input_len for r in reqs]
 
         # For matryoshka embeddings
-        if self.model_config.is_matryoshka:
+        if self.model_config.is_matryoshka and any(r.dimensions is not None for r in reqs):
             self.dimensions = [r.dimensions if r.dimensions else self.model_config.hidden_size for r in reqs]
 
         token_type_ids = [

@@ -679,7 +679,8 @@ class EmbeddingReqInput:
 
     # tracing context
     trace_context: Optional[Dict] = None
-    # The number of dimensions the resulting output embeddings should have.
+
+    # The number of dimensions the resulting output embeddings should have. It is applicable for Matryoshka Embeddings.
     dimensions: Optional[int] = None
 
     def normalize_batch_and_arguments(self):
@@ -785,6 +786,8 @@ class TokenizedEmbeddingReqInput:
     dp_balance_id: int = -1
     # Priority for the request
     priority: Optional[int] = None
+    # The number of dimensions the resulting output embeddings should have. It is applicable for Matryoshka Embeddings.
+    dimensions: Optional[int] = None
 
 
 @dataclass
@@ -800,8 +803,6 @@ class BatchTokenizedEmbeddingReqInput:
 
     def __iter__(self):
         return iter(self.batch)
-    # For Matryoshka Embeddings
-    dimensions: Optional[int] = None
 
 
 @dataclass

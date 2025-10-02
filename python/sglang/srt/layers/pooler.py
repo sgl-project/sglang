@@ -21,7 +21,7 @@ class PoolingType(IntEnum):
 @dataclass
 class EmbeddingPoolerOutput:
     # Pooler can return list[tensor] instead of tensor if the dimension of each tensor in the batch is different
-    # due to different per-request to matryoshka dim truncation
+    # due to different per-request matryoshka dim truncation
     embeddings: torch.Tensor | list[torch.Tensor]
 
 
@@ -61,15 +61,13 @@ class Pooler(nn.Module):
             if all_same_dimensions:
                 pooled_data = pooled_data[..., : forward_batch.dimensions[0]]
             else:
-                pooled_data = [
-                    pooled_data[..., : dim] for dim in forward_batch.dimensions
-                ]
+                pooled_data = [tensor[..., : dim] for tensor, dim in zip(pooled_data, forward_batch.dimensions)]
 
         if self.normalize:
             if isinstance(pooled_data, list):
-                pooled_data = [nn.functional.normalize(tensor, p=2, dim=1) for tensor in pooled_data]
+                pooled_data = [nn.functional.normalize(tensor, p=2, dim=-1) for tensor in pooled_data]
             else:
-                pooled_data = nn.functional.normalize(pooled_data, p=2, dim=1)
+                pooled_data = nn.functional.normalize(pooled_data, p=2, dim=-1)
 
         return EmbeddingPoolerOutput(embeddings=pooled_data)
 
