@@ -919,10 +919,7 @@ async fn test_streaming_with_mcp_tool_calls() {
 
     // Check for [DONE] marker
     let has_done_marker = body_text.contains("data: [DONE]");
-    assert!(
-        has_done_marker,
-        "Stream should end with [DONE] marker"
-    );
+    assert!(has_done_marker, "Stream should end with [DONE] marker");
 
     // Try to parse one of the data events
     let mut found_response_created = false;
@@ -1042,9 +1039,7 @@ async fn test_streaming_multi_turn_with_mcp() {
     assert_eq!(response.status(), axum::http::StatusCode::OK);
 
     use axum::body::to_bytes;
-    let body_bytes = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
+    let body_bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let body_text = String::from_utf8_lossy(&body_bytes);
 
     println!("Multi-turn streaming response:\n{}", body_text);
@@ -1054,7 +1049,10 @@ async fn test_streaming_multi_turn_with_mcp() {
     assert!(!body_text.contains("event: error"));
 
     // Count events
-    let event_count = body_text.split("\n\n").filter(|s| !s.trim().is_empty()).count();
+    let event_count = body_text
+        .split("\n\n")
+        .filter(|s| !s.trim().is_empty())
+        .count();
     println!("Total events in multi-turn stream: {}", event_count);
 
     assert!(event_count > 0, "Should have received streaming events");

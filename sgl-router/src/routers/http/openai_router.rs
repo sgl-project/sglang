@@ -189,7 +189,9 @@ impl StreamingToolHandler {
         // Always feed to accumulator for storage
         self.accumulator.ingest_block(&format!(
             "{}data: {}",
-            event_name.map(|n| format!("event: {}\n", n)).unwrap_or_default(),
+            event_name
+                .map(|n| format!("event: {}\n", n))
+                .unwrap_or_default(),
             data
         ));
 
@@ -214,23 +216,21 @@ impl StreamingToolHandler {
                 if let Some(item) = parsed.get("item") {
                     if let Some(item_type) = item.get("type").and_then(|v| v.as_str()) {
                         if item_type == "function_call" || item_type == "function_tool_call" {
-                            let output_index = parsed.get("output_index")
+                            let output_index = parsed
+                                .get("output_index")
                                 .and_then(|v| v.as_u64())
                                 .map(|v| v as usize)
                                 .unwrap_or(0);
-                            
-                            let call_id = item.get("call_id")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
-                            let name = item.get("name")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
-                            
+
+                            let call_id =
+                                item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
+                            let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+
                             // Create or update the function call
                             let call = self.get_or_create_call(output_index, item);
                             call.call_id = call_id.to_string();
                             call.name = name.to_string();
-                            
+
                             self.in_function_call = true;
                         }
                     }
@@ -239,9 +239,17 @@ impl StreamingToolHandler {
             }
             "response.function_call_arguments.delta" => {
                 // Accumulate arguments for the function call
-                if let Some(output_index) = parsed.get("output_index").and_then(|v| v.as_u64()).map(|v| v as usize) {
+                if let Some(output_index) = parsed
+                    .get("output_index")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize)
+                {
                     if let Some(delta) = parsed.get("delta").and_then(|v| v.as_str()) {
-                        if let Some(call) = self.pending_calls.iter_mut().find(|c| c.output_index == output_index) {
+                        if let Some(call) = self
+                            .pending_calls
+                            .iter_mut()
+                            .find(|c| c.output_index == output_index)
+                        {
                             call.arguments_buffer.push_str(delta);
                         }
                     }
@@ -256,9 +264,7 @@ impl StreamingToolHandler {
                     StreamAction::Forward
                 }
             }
-            "response.output_item.delta" => {
-                self.process_output_delta(&parsed)
-            }
+            "response.output_item.delta" => self.process_output_delta(&parsed),
             "response.output_item.done" => {
                 // Check if we have complete function calls ready to execute
                 if self.has_complete_calls() {
@@ -286,7 +292,7 @@ impl StreamingToolHandler {
 
         // Check if this is a function call delta
         let item_type = delta.get("type").and_then(|v| v.as_str());
-        
+
         if item_type == Some("function_tool_call") || item_type == Some("function_call") {
             self.in_function_call = true;
 
@@ -316,9 +322,17 @@ impl StreamingToolHandler {
         StreamAction::Forward
     }
 
-    fn get_or_create_call(&mut self, output_index: usize, delta: &Value) -> &mut FunctionCallInProgress {
+    fn get_or_create_call(
+        &mut self,
+        output_index: usize,
+        delta: &Value,
+    ) -> &mut FunctionCallInProgress {
         // Find existing call for this output index
-        if let Some(pos) = self.pending_calls.iter().position(|c| c.output_index == output_index) {
+        if let Some(pos) = self
+            .pending_calls
+            .iter()
+            .position(|c| c.output_index == output_index)
+        {
             return &mut self.pending_calls[pos];
         }
 
@@ -328,7 +342,8 @@ impl StreamingToolHandler {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        self.pending_calls.push(FunctionCallInProgress::new(call_id, output_index));
+        self.pending_calls
+            .push(FunctionCallInProgress::new(call_id, output_index));
         self.pending_calls.last_mut().unwrap()
     }
 
@@ -826,13 +841,15 @@ impl OpenAIRouter {
     ) -> Response {
         // If no MCP is active, use simple pass-through streaming
         if active_mcp.is_none() {
-            return self.handle_simple_streaming_passthrough(
-                url,
-                headers,
-                payload,
-                original_body,
-                original_previous_response_id,
-            ).await;
+            return self
+                .handle_simple_streaming_passthrough(
+                    url,
+                    headers,
+                    payload,
+                    original_body,
+                    original_previous_response_id,
+                )
+                .await;
         }
 
         let active_mcp = active_mcp.unwrap();
@@ -845,7 +862,8 @@ impl OpenAIRouter {
             original_body,
             original_previous_response_id,
             active_mcp,
-        ).await
+        )
+        .await
     }
 
     /// Simple pass-through streaming without MCP interception
@@ -1061,7 +1079,7 @@ impl OpenAIRouter {
 
         let client = self.client.clone();
         let url_clone = url.clone();
-        let headers_opt = headers.map(|h| h.clone());
+        let headers_opt = headers.cloned();
         let payload_clone = payload.clone();
         let active_mcp_clone = Arc::clone(active_mcp);
 
@@ -1074,9 +1092,7 @@ impl OpenAIRouter {
             let base_payload = payload_clone.clone();
             let mut current_payload = payload_clone;
             let mut mcp_list_tools_sent = false;
-            // Track output_index for mcp_call items (starts at 1, after mcp_list_tools at 0)
-            let mut next_mcp_call_output_index = 1;
-            
+
             let server_label = original_request
                 .tools
                 .iter()
@@ -1095,7 +1111,10 @@ impl OpenAIRouter {
                 let response = match request_builder.send().await {
                     Ok(r) => r,
                     Err(e) => {
-                        let error_event = format!("event: error\ndata: {{\"error\": {{\"message\": \"{}\"}}}}\n\n", e);
+                        let error_event = format!(
+                            "event: error\ndata: {{\"error\": {{\"message\": \"{}\"}}}}\n\n",
+                            e
+                        );
                         let _ = tx.send(Ok(Bytes::from(error_event)));
                         return;
                     }
@@ -1141,7 +1160,7 @@ impl OpenAIRouter {
 
                                 // Parse event
                                 let (event_name, data) = Self::parse_sse_block(&raw_block);
-                                
+
                                 if data.is_empty() {
                                     continue;
                                 }
@@ -1152,18 +1171,22 @@ impl OpenAIRouter {
                                 match action {
                                     StreamAction::Forward => {
                                         // First, rewrite basic response fields (store, previous_response_id, tools masking)
-                                        let mut block_to_send = if let Some(modified) = Self::rewrite_streaming_block(
-                                            &raw_block,
-                                            &original_request,
-                                            previous_response_id.as_deref(),
-                                        ) {
+                                        let mut block_to_send = if let Some(modified) =
+                                            Self::rewrite_streaming_block(
+                                                &raw_block,
+                                                &original_request,
+                                                previous_response_id.as_deref(),
+                                            ) {
                                             modified
                                         } else {
                                             raw_block.clone()
                                         };
 
                                         // Then, apply event transformation (function_call → mcp_call)
-                                        if let Some(transformed) = Self::transform_streaming_event(&block_to_send, server_label) {
+                                        if let Some(transformed) = Self::transform_streaming_event(
+                                            &block_to_send,
+                                            server_label,
+                                        ) {
                                             block_to_send = transformed;
                                         }
 
@@ -1211,26 +1234,32 @@ impl OpenAIRouter {
 
                             // Mask tools back to MCP format
                             Self::mask_tools_as_mcp(&mut response_json, &original_request);
-                            
+
                             Self::patch_streaming_response_json(
                                 &mut response_json,
                                 &original_request,
                                 previous_response_id.as_deref(),
                             );
 
-                            if let Err(err) = Self::store_response_impl(&storage, &response_json, &original_request).await {
+                            if let Err(err) = Self::store_response_impl(
+                                &storage,
+                                &response_json,
+                                &original_request,
+                            )
+                            .await
+                            {
                                 warn!("Failed to store streaming response: {}", err);
                             }
                         }
                     }
-                    
+
                     let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
                     return;
                 }
 
                 // Execute tools
                 let pending_calls = handler.take_pending_calls();
-                
+
                 // Check iteration limit
                 state.iteration += 1;
                 state.total_calls += pending_calls.len();
@@ -1241,8 +1270,11 @@ impl OpenAIRouter {
                 };
 
                 if state.total_calls > effective_limit {
-                    warn!("Reached tool call limit during streaming: {}", effective_limit);
-                    let error_event = format!("event: error\ndata: {{\"error\": {{\"message\": \"Exceeded max_tool_calls limit\"}}}}\n\n");
+                    warn!(
+                        "Reached tool call limit during streaming: {}",
+                        effective_limit
+                    );
+                    let error_event = "event: error\ndata: {\"error\": {\"message\": \"Exceeded max_tool_calls limit\"}}\n\n".to_string();
                     let _ = tx.send(Ok(Bytes::from(error_event)));
                     let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
                     return;
@@ -1252,13 +1284,25 @@ impl OpenAIRouter {
                 for call in pending_calls {
                     // Skip if name or arguments are empty (invalid call)
                     if call.name.is_empty() || call.arguments_buffer.is_empty() {
-                        warn!("Skipping incomplete tool call: name={}, args_len={}", call.name, call.arguments_buffer.len());
+                        warn!(
+                            "Skipping incomplete tool call: name={}, args_len={}",
+                            call.name,
+                            call.arguments_buffer.len()
+                        );
                         continue;
                     }
 
-                    info!("Executing tool call during streaming: {} ({})", call.name, call.call_id);
+                    info!(
+                        "Executing tool call during streaming: {} ({})",
+                        call.name, call.call_id
+                    );
 
-                    let call_result = Self::execute_mcp_call(&active_mcp_clone, &call.name, &call.arguments_buffer).await;
+                    let call_result = Self::execute_mcp_call(
+                        &active_mcp_clone,
+                        &call.name,
+                        &call.arguments_buffer,
+                    )
+                    .await;
                     let (output_str, success) = match call_result {
                         Ok((_, output)) => (output, true),
                         Err(err) => {
@@ -1270,15 +1314,11 @@ impl OpenAIRouter {
                     // Send mcp_call completion event to client
                     OpenAIRouter::send_mcp_call_completion_events(
                         &tx,
-                        &call.call_id,
-                        &call.name,
-                        &call.arguments_buffer,
+                        &call,
                         &output_str,
                         server_label,
-                        next_mcp_call_output_index,
                         success,
                     );
-                    next_mcp_call_output_index += 1;
 
                     // Record the call
                     state.record_call(call.call_id, call.name, call.arguments_buffer, output_str);
@@ -1308,7 +1348,9 @@ impl OpenAIRouter {
         let body_stream = UnboundedReceiverStream::new(rx);
         let mut response = Response::new(Body::from_stream(body_stream));
         *response.status_mut() = StatusCode::OK;
-        response.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+        response
+            .headers_mut()
+            .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
         response
     }
 
@@ -1330,24 +1372,21 @@ impl OpenAIRouter {
     }
 
     /// Transform a streaming event from function_call format to mcp_call format
-    fn transform_streaming_event(
-        raw_block: &str,
-        server_label: &str,
-    ) -> Option<String> {
+    fn transform_streaming_event(raw_block: &str, server_label: &str) -> Option<String> {
         // Parse the SSE block
         let (event_name, data) = Self::parse_sse_block(raw_block);
-        
+
         let mut parsed: Value = match serde_json::from_str(&data) {
             Ok(v) => v,
             Err(_) => return None,
         };
-        
-        let event_type = event_name.as_deref().or_else(|| {
-            parsed.get("type").and_then(|v| v.as_str())
-        });
-        
+
+        let event_type = event_name
+            .as_deref()
+            .or_else(|| parsed.get("type").and_then(|v| v.as_str()));
+
         let mut changed = false;
-        
+
         match event_type {
             Some("response.output_item.added") | Some("response.output_item.done") => {
                 // Transform function_call items to mcp_call
@@ -1373,11 +1412,11 @@ impl OpenAIRouter {
             }
             _ => {}
         }
-        
+
         if !changed {
             return None;
         }
-        
+
         // Rebuild the SSE block
         let new_data = serde_json::to_string(&parsed).ok()?;
         let mut result = String::new();
@@ -1402,7 +1441,7 @@ impl OpenAIRouter {
         server_label: &str,
     ) {
         let tools_item = Self::build_mcp_list_tools_item(mcp, server_label);
-        
+
         // Event 1: response.output_item.added (mcp_list_tools)
         let event1 = format!(
             "event: response.output_item.added\ndata: {}\n\n",
@@ -1413,7 +1452,7 @@ impl OpenAIRouter {
             })
         );
         let _ = tx.send(Ok(Bytes::from(event1)));
-        
+
         // Event 2: response.output_item.done (mcp_list_tools)
         let event2 = format!(
             "event: response.output_item.done\ndata: {}\n\n",
@@ -1429,30 +1468,31 @@ impl OpenAIRouter {
     /// Send mcp_call completion events after tool execution
     fn send_mcp_call_completion_events(
         tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
-        _call_id: &str,
-        tool_name: &str,
-        arguments: &str,
+        call: &FunctionCallInProgress,
         output: &str,
         server_label: &str,
-        output_index: usize,
         success: bool,
     ) {
         // Build mcp_call item (reuse existing function)
         let mcp_call_item = Self::build_mcp_call_item(
-            tool_name,
-            arguments,
+            &call.name,
+            &call.arguments_buffer,
             output,
             server_label,
             success,
-            if success { None } else { Some("Tool execution failed") },
+            if success {
+                None
+            } else {
+                Some("Tool execution failed")
+            },
         );
-        
+
         // Event: response.output_item.done (with completed mcp_call)
         let event = format!(
             "event: response.output_item.done\ndata: {}\n\n",
             json!({
                 "type": "response.output_item.done",
-                "output_index": output_index,
+                "output_index": call.output_index,
                 "item": mcp_call_item
             })
         );
@@ -1472,7 +1512,8 @@ impl OpenAIRouter {
             output_array.insert(0, list_tools_item);
 
             // Add mcp_call items for executed calls
-            let mcp_call_items = Self::build_executed_mcp_call_items(&state.conversation_history, server_label);
+            let mcp_call_items =
+                Self::build_executed_mcp_call_items(&state.conversation_history, server_label);
             let mut insert_pos = 1;
             for item in mcp_call_items {
                 output_array.insert(insert_pos, item);
@@ -1706,12 +1747,12 @@ impl OpenAIRouter {
                     .tools
                     .iter()
                     .any(|t| matches!(t.r#type, ResponseToolType::Mcp));
-                
+
                 if requested_mcp {
                     // Create a temporary response value to pass to mask_tools_as_mcp
                     let mut temp_response = Value::Object(response_obj.clone());
                     Self::mask_tools_as_mcp(&mut temp_response, original_body);
-                    
+
                     // Copy back the masked tools
                     if let Some(masked_obj) = temp_response.as_object() {
                         if let Some(masked_tools) = masked_obj.get("tools") {
