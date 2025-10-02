@@ -77,7 +77,9 @@ class AscendPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             )
 
         num_new_pages = get_num_new_pages(
-            prefix_lens=prefix_lens_cpu, seq_lens=seq_lens_cpu, page_size=self.page_size
+            seq_lens=seq_lens_cpu,
+            page_size=self.page_size,
+            prefix_lens=prefix_lens_cpu,
         )
         if self.need_sort and num_new_pages > len(self.free_pages):
             self.merge_and_sort_free()
@@ -116,8 +118,11 @@ class AscendPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
                 (last_loc + 2) % self.page_size == seq_lens % self.page_size
             )
 
-        need_new_pages_cpu = (seq_lens_cpu % self.page_size == 1).int()
-        num_new_pages = need_new_pages_cpu.sum().item()
+        num_new_pages = get_num_new_pages(
+            seq_lens=seq_lens_cpu,
+            page_size=self.page_size,
+            decode=True,
+        )
 
         if num_new_pages > len(self.free_pages):
             self.merge_and_sort_free()
