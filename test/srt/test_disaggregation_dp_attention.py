@@ -13,6 +13,7 @@ from sglang.test.test_utils import (
     popen_launch_pd_server,
 )
 
+
 class TestDisaggregationDPAttention(TestDisaggregationBase):
     @classmethod
     def setUpClass(cls):
