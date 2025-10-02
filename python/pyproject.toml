@@ -49,6 +49,7 @@ dependencies = [
   "pynvml",
   "python-multipart",
   "pyzmq>=25.1.2",
+  "ray",
   "requests",
   "scipy",
   "sentencepiece",

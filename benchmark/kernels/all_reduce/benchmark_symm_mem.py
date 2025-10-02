@@ -1,4 +1,4 @@
-"""For Now, SYMM_MEM is only supported on TP16 and TP8 case
+"""For Now, SYMM_MEM is only supported on TP8 case
 
 export WORLD_SIZE=1
 export RANK=0
@@ -9,7 +9,7 @@ torchrun --nproc_per_node gpu \
 --nnodes $WORLD_SIZE \
 --node_rank $RANK \
 --master_addr $MASTER_ADDR \
---master_port $MASTER_PORT benchmark_symm_mem.py
+--master_port $MASTER_PORT ./benchmark/kernels/all_reduce/benchmark_symm_mem.py
 """
 
 import os
@@ -28,6 +28,12 @@ from sglang.srt.distributed.parallel_state import (
     graph_capture,
     initialize_model_parallel,
     set_symm_mem_all_reduce,
+)
+
+# CI environment detection
+IS_CI = (
+    os.getenv("CI", "false").lower() == "true"
+    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
 )
 
 
@@ -182,7 +188,11 @@ if __name__ == "__main__":
     result = []
 
     with ctx:
-        for i in range(10, 20):
+        if IS_CI:
+            i_range = range(10, 11)
+        else:
+            i_range = range(10, 20)
+        for i in i_range:
             sz = 2**i
             if sz * dtype.itemsize > 2**24:
                 break
