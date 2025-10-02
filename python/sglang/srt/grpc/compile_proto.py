@@ -25,8 +25,8 @@ python compile_proto.py
 
 import argparse
 import os
-import sys
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import List, Optional
@@ -77,12 +77,14 @@ def compile_proto(proto_file: Path, output_dir: Path, verbose: bool = True) -> b
 
     # Compile command
     cmd = [
-        sys.executable, "-m", "grpc_tools.protoc",
+        sys.executable,
+        "-m",
+        "grpc_tools.protoc",
         f"-I{proto_file.parent}",
         f"--python_out={output_dir}",
         f"--grpc_python_out={output_dir}",
         f"--pyi_out={output_dir}",  # Generate type stubs
-        str(proto_file.name)
+        str(proto_file.name),
     ]
 
     if verbose:
@@ -102,7 +104,7 @@ def compile_proto(proto_file: Path, output_dir: Path, verbose: bool = True) -> b
     generated_files = [
         f"{proto_file.stem}_pb2.py",
         f"{proto_file.stem}_pb2_grpc.py",
-        f"{proto_file.stem}_pb2.pyi"
+        f"{proto_file.stem}_pb2.pyi",
     ]
 
     missing_files = []
@@ -149,10 +151,7 @@ def add_generation_header(output_dir: Path, proto_stem: str) -> None:
 
 """
 
-    files_to_update = [
-        f"{proto_stem}_pb2.py",
-        f"{proto_stem}_pb2_grpc.py"
-    ]
+    files_to_update = [f"{proto_stem}_pb2.py", f"{proto_stem}_pb2_grpc.py"]
 
     for filename in files_to_update:
         file_path = output_dir / filename
@@ -167,33 +166,32 @@ def main():
     parser = argparse.ArgumentParser(
         description="Compile protobuf files for SGLang gRPC server",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__
+        epilog=__doc__,
     )
 
     parser.add_argument(
         "--check",
         action="store_true",
-        help="Check if regeneration is needed (exit 1 if needed)"
+        help="Check if regeneration is needed (exit 1 if needed)",
     )
 
     parser.add_argument(
         "--proto-file",
         type=str,
         default="sglang_scheduler.proto",
-        help="Proto file to compile (default: sglang_scheduler.proto)"
+        help="Proto file to compile (default: sglang_scheduler.proto)",
     )
 
     parser.add_argument(
-        "-v", "--verbose",
+        "-v",
+        "--verbose",
         action="store_true",
         default=True,
-        help="Verbose output (default: True)"
+        help="Verbose output (default: True)",
     )
 
     parser.add_argument(
-        "-q", "--quiet",
-        action="store_true",
-        help="Quiet mode (overrides verbose)"
+        "-q", "--quiet", action="store_true", help="Quiet mode (overrides verbose)"
     )
 
     args = parser.parse_args()
