@@ -16,20 +16,21 @@ Options:
     --proto-file    Specify proto file (default: sglang_scheduler.proto)
 
 ### Install Dependencies
-pip install grpcio grpcio-tools
+pip install "grpcio==1.74.0" "grpcio-tools==1.74.0"
 
 ### Run Script
 cd python/sglang/srt/grpc
 python compile_proto.py
 """
 
+
 import argparse
-import os
 import subprocess
 import sys
-import time
+from importlib.metadata import version
 from pathlib import Path
-from typing import List, Optional
+
+GRPC_VERSION = "1.74.0"
 
 
 def get_file_mtime(path: Path) -> float:
@@ -72,8 +73,17 @@ def compile_proto(proto_file: Path, output_dir: Path, verbose: bool = True) -> b
         import grpc_tools.protoc
     except ImportError:
         print("Error: grpcio-tools not installed")
-        print("Install with: pip install grpcio-tools")
+        print(
+            f'Install with: pip install "grpcio-tools=={GRPC_VERSION}" "grpcio=={GRPC_VERSION}"'
+        )
         return False
+
+    grpc_tools_version = version("grpcio-tools")
+    grpc_version = version("grpcio")
+    if grpc_tools_version != GRPC_VERSION or grpc_version != GRPC_VERSION:
+        raise RuntimeError(
+            f"Error: grpcio-tools version {grpc_tools_version} and grpcio version {grpc_version} detected, but {GRPC_VERSION} is required."
+        )
 
     # Compile command
     cmd = [
