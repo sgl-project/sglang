@@ -31,6 +31,7 @@ import requests
 import torch
 import torch.distributed as dist
 
+from sglang.srt import slow_rank_detector
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
@@ -282,6 +283,9 @@ class ModelRunner:
 
         # CPU offload
         set_offloader(create_offloader_from_server_args(server_args, dp_rank=dp_rank))
+
+        if get_bool_env_var("SGLANG_DETECT_SLOW_RANK"):
+            slow_rank_detector.execute()
 
         # Update deep gemm configure
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
@@ -1293,6 +1297,7 @@ class ModelRunner:
         return self.model_config.hf_config.architectures[0] in [
             "Qwen3NextForCausalLM",
             "Qwen3NextForCausalLMMTP",
+            "FalconH1ForCausalLM",
         ]
 
     def set_num_token_hybrid(self):
@@ -1615,7 +1620,7 @@ class ModelRunner:
                 )
             elif self.is_hybrid_gdn:
                 self.token_to_kv_pool = HybridLinearKVPool(
-                    page_size=self.page_size if _is_npu else 1,
+                    page_size=self.page_size,
                     size=self.max_total_num_tokens,
                     dtype=self.kv_cache_dtype,
                     head_num=self.model_config.get_num_kv_heads(

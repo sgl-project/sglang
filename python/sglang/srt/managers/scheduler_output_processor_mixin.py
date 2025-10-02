@@ -91,7 +91,7 @@ class SchedulerOutputProcessorMixin:
 
                     if req.finished():
                         self.tree_cache.cache_finished_req(req)
-                        req.time_stats.completion_time = time.time()
+                        req.time_stats.completion_time = time.perf_counter()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         # This updates radix so others can match
                         self.tree_cache.cache_unfinished_req(req)
@@ -173,7 +173,7 @@ class SchedulerOutputProcessorMixin:
             self.set_next_batch_sampling_info_done(batch)
 
         else:  # embedding or reward model
-            embeddings, bid = result.embeddings, result.bid
+            embeddings = result.embeddings
 
             if isinstance(embeddings, torch.Tensor):
                 embeddings = embeddings.tolist()
@@ -261,7 +261,7 @@ class SchedulerOutputProcessorMixin:
                 else:
                     self.tree_cache.cache_finished_req(req)
 
-                req.time_stats.completion_time = time.time()
+                req.time_stats.completion_time = time.perf_counter()
 
             if req.return_logprob and batch.spec_algorithm.is_none():
                 # speculative worker handles logprob in speculative decoding
