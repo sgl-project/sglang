@@ -209,6 +209,53 @@ impl StreamingToolHandler {
             .unwrap_or_default();
 
         match event_type.as_str() {
+            "response.output_item.added" => {
+                // Check if this is a function_call item being added
+                if let Some(item) = parsed.get("item") {
+                    if let Some(item_type) = item.get("type").and_then(|v| v.as_str()) {
+                        if item_type == "function_call" || item_type == "function_tool_call" {
+                            let output_index = parsed.get("output_index")
+                                .and_then(|v| v.as_u64())
+                                .map(|v| v as usize)
+                                .unwrap_or(0);
+                            
+                            let call_id = item.get("call_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            let name = item.get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            
+                            // Create or update the function call
+                            let call = self.get_or_create_call(output_index, item);
+                            call.call_id = call_id.to_string();
+                            call.name = name.to_string();
+                            
+                            self.in_function_call = true;
+                        }
+                    }
+                }
+                StreamAction::Forward
+            }
+            "response.function_call_arguments.delta" => {
+                // Accumulate arguments for the function call
+                if let Some(output_index) = parsed.get("output_index").and_then(|v| v.as_u64()).map(|v| v as usize) {
+                    if let Some(delta) = parsed.get("delta").and_then(|v| v.as_str()) {
+                        if let Some(call) = self.pending_calls.iter_mut().find(|c| c.output_index == output_index) {
+                            call.arguments_buffer.push_str(delta);
+                        }
+                    }
+                }
+                StreamAction::Forward
+            }
+            "response.function_call_arguments.done" => {
+                // Function call arguments complete - check if ready to execute
+                if self.has_complete_calls() {
+                    StreamAction::ExecuteTools
+                } else {
+                    StreamAction::Forward
+                }
+            }
             "response.output_item.delta" => {
                 self.process_output_delta(&parsed)
             }
@@ -772,7 +819,7 @@ impl OpenAIRouter {
         &self,
         url: String,
         headers: Option<&HeaderMap>,
-        mut payload: Value,
+        payload: Value,
         original_body: &ResponsesRequest,
         original_previous_response_id: Option<String>,
         active_mcp: Option<&Arc<crate::mcp::McpClientManager>>,
@@ -1026,6 +1073,9 @@ impl OpenAIRouter {
             let tools_json = payload_clone.get("tools").cloned().unwrap_or(json!([]));
             let base_payload = payload_clone.clone();
             let mut current_payload = payload_clone;
+            let mut mcp_list_tools_sent = false;
+            // Track output_index for mcp_call items (starts at 1, after mcp_list_tools at 0)
+            let mut next_mcp_call_output_index = 1;
             
             let server_label = original_request
                 .tools
@@ -1057,6 +1107,12 @@ impl OpenAIRouter {
                     let error_event = format!("event: error\ndata: {{\"error\": {{\"message\": \"Upstream error {}: {}\"}}}}\n\n", status, body);
                     let _ = tx.send(Ok(Bytes::from(error_event)));
                     return;
+                }
+
+                // Send mcp_list_tools events at the start (only once)
+                if !mcp_list_tools_sent {
+                    OpenAIRouter::send_mcp_list_tools_events(&tx, &active_mcp_clone, server_label);
+                    mcp_list_tools_sent = true;
                 }
 
                 // Stream events and check for tool calls
@@ -1095,16 +1151,21 @@ impl OpenAIRouter {
 
                                 match action {
                                     StreamAction::Forward => {
-                                        // Rewrite and forward to client
-                                        let block_to_send = if let Some(modified) = Self::rewrite_streaming_block(
+                                        // First, rewrite basic response fields (store, previous_response_id, tools masking)
+                                        let mut block_to_send = if let Some(modified) = Self::rewrite_streaming_block(
                                             &raw_block,
                                             &original_request,
                                             previous_response_id.as_deref(),
                                         ) {
                                             modified
                                         } else {
-                                            raw_block
+                                            raw_block.clone()
                                         };
+
+                                        // Then, apply event transformation (function_call → mcp_call)
+                                        if let Some(transformed) = Self::transform_streaming_event(&block_to_send, server_label) {
+                                            block_to_send = transformed;
+                                        }
 
                                         let chunk_to_send = format!("{}\n\n", block_to_send);
                                         if tx.send(Ok(Bytes::from(chunk_to_send))).is_err() {
@@ -1189,16 +1250,35 @@ impl OpenAIRouter {
 
                 // Execute all pending tool calls (sequential, as PR3 is skipped)
                 for call in pending_calls {
+                    // Skip if name or arguments are empty (invalid call)
+                    if call.name.is_empty() || call.arguments_buffer.is_empty() {
+                        warn!("Skipping incomplete tool call: name={}, args_len={}", call.name, call.arguments_buffer.len());
+                        continue;
+                    }
+
                     info!("Executing tool call during streaming: {} ({})", call.name, call.call_id);
 
                     let call_result = Self::execute_mcp_call(&active_mcp_clone, &call.name, &call.arguments_buffer).await;
-                    let output_str = match call_result {
-                        Ok((_, output)) => output,
+                    let (output_str, success) = match call_result {
+                        Ok((_, output)) => (output, true),
                         Err(err) => {
                             warn!("Tool execution failed during streaming: {}", err);
-                            json!({ "error": err }).to_string()
+                            (json!({ "error": err }).to_string(), false)
                         }
                     };
+
+                    // Send mcp_call completion event to client
+                    OpenAIRouter::send_mcp_call_completion_events(
+                        &tx,
+                        &call.call_id,
+                        &call.name,
+                        &call.arguments_buffer,
+                        &output_str,
+                        server_label,
+                        next_mcp_call_output_index,
+                        success,
+                    );
+                    next_mcp_call_output_index += 1;
 
                     // Record the call
                     state.record_call(call.call_id, call.name, call.arguments_buffer, output_str);
@@ -1247,6 +1327,136 @@ impl OpenAIRouter {
 
         let data = data_lines.join("\n");
         (event_name, data)
+    }
+
+    /// Transform a streaming event from function_call format to mcp_call format
+    fn transform_streaming_event(
+        raw_block: &str,
+        server_label: &str,
+    ) -> Option<String> {
+        // Parse the SSE block
+        let (event_name, data) = Self::parse_sse_block(raw_block);
+        
+        let mut parsed: Value = match serde_json::from_str(&data) {
+            Ok(v) => v,
+            Err(_) => return None,
+        };
+        
+        let event_type = event_name.as_deref().or_else(|| {
+            parsed.get("type").and_then(|v| v.as_str())
+        });
+        
+        let mut changed = false;
+        
+        match event_type {
+            Some("response.output_item.added") | Some("response.output_item.done") => {
+                // Transform function_call items to mcp_call
+                if let Some(item) = parsed.get_mut("item") {
+                    if let Some(item_type) = item.get("type").and_then(|v| v.as_str()) {
+                        if item_type == "function_call" || item_type == "function_tool_call" {
+                            item["type"] = json!("mcp_call");
+                            item["server_label"] = json!(server_label);
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            Some("response.function_call_arguments.delta") => {
+                // Change event type to mcp_call_arguments.delta
+                parsed["type"] = json!("response.mcp_call_arguments.delta");
+                changed = true;
+            }
+            Some("response.function_call_arguments.done") => {
+                // Change event type to mcp_call_arguments.done
+                parsed["type"] = json!("response.mcp_call_arguments.done");
+                changed = true;
+            }
+            _ => {}
+        }
+        
+        if !changed {
+            return None;
+        }
+        
+        // Rebuild the SSE block
+        let new_data = serde_json::to_string(&parsed).ok()?;
+        let mut result = String::new();
+        if let Some(evt) = event_name {
+            // For function_call_arguments events, update the event name too
+            if evt == "response.function_call_arguments.delta" {
+                result.push_str("event: response.mcp_call_arguments.delta\n");
+            } else if evt == "response.function_call_arguments.done" {
+                result.push_str("event: response.mcp_call_arguments.done\n");
+            } else {
+                result.push_str(&format!("event: {}\n", evt));
+            }
+        }
+        result.push_str(&format!("data: {}", new_data));
+        Some(result)
+    }
+
+    /// Send mcp_list_tools events to client at the start of streaming
+    fn send_mcp_list_tools_events(
+        tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
+        mcp: &Arc<crate::mcp::McpClientManager>,
+        server_label: &str,
+    ) {
+        let tools_item = Self::build_mcp_list_tools_item(mcp, server_label);
+        
+        // Event 1: response.output_item.added (mcp_list_tools)
+        let event1 = format!(
+            "event: response.output_item.added\ndata: {}\n\n",
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": tools_item
+            })
+        );
+        let _ = tx.send(Ok(Bytes::from(event1)));
+        
+        // Event 2: response.output_item.done (mcp_list_tools)
+        let event2 = format!(
+            "event: response.output_item.done\ndata: {}\n\n",
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": tools_item
+            })
+        );
+        let _ = tx.send(Ok(Bytes::from(event2)));
+    }
+
+    /// Send mcp_call completion events after tool execution
+    fn send_mcp_call_completion_events(
+        tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
+        _call_id: &str,
+        tool_name: &str,
+        arguments: &str,
+        output: &str,
+        server_label: &str,
+        output_index: usize,
+        success: bool,
+    ) {
+        // Build mcp_call item (reuse existing function)
+        let mcp_call_item = Self::build_mcp_call_item(
+            tool_name,
+            arguments,
+            output,
+            server_label,
+            success,
+            if success { None } else { Some("Tool execution failed") },
+        );
+        
+        // Event: response.output_item.done (with completed mcp_call)
+        let event = format!(
+            "event: response.output_item.done\ndata: {}\n\n",
+            json!({
+                "type": "response.output_item.done",
+                "output_index": output_index,
+                "item": mcp_call_item
+            })
+        );
+        let _ = tx.send(Ok(Bytes::from(event)));
     }
 
     /// Inject MCP metadata into a streaming response
@@ -1486,6 +1696,29 @@ impl OpenAIRouter {
                         Value::String(prev_id.to_string()),
                     );
                     changed = true;
+                }
+            }
+
+            // Mask tools from function to MCP format for streaming events
+            // Check if this response has tools that need masking
+            if response_obj.get("tools").is_some() {
+                let requested_mcp = original_body
+                    .tools
+                    .iter()
+                    .any(|t| matches!(t.r#type, ResponseToolType::Mcp));
+                
+                if requested_mcp {
+                    // Create a temporary response value to pass to mask_tools_as_mcp
+                    let mut temp_response = Value::Object(response_obj.clone());
+                    Self::mask_tools_as_mcp(&mut temp_response, original_body);
+                    
+                    // Copy back the masked tools
+                    if let Some(masked_obj) = temp_response.as_object() {
+                        if let Some(masked_tools) = masked_obj.get("tools") {
+                            response_obj.insert("tools".to_string(), masked_tools.clone());
+                            changed = true;
+                        }
+                    }
                 }
             }
         }
