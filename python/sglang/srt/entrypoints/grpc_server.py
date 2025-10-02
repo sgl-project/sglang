@@ -415,7 +415,11 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             mm_inputs=None,  # TODO: implement mm support
             sampling_params=sampling_params,
             return_logprob=grpc_req.return_logprob,
-            logprob_start_len=grpc_req.logprob_start_len or -1,
+            logprob_start_len=(
+                grpc_req.logprob_start_len
+                if grpc_req.logprob_start_len is not None
+                else -1
+            ),
             top_logprobs_num=grpc_req.top_logprobs_num or 0,
             stream=grpc_req.stream or False,
             lora_id=grpc_req.lora_id if grpc_req.lora_id else None,
@@ -486,10 +490,10 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             ignore_eos=grpc_params.ignore_eos,
         )
 
-    def _convert_logprobs_to_proto(
+    def _convert_output_logprobs_to_proto(
         self, logprobs_data: Dict
-    ) -> Optional[sglang_scheduler_pb2.LogProbs]:
-        """Convert logprobs dict to proto LogProbs format (transport RAW data only)."""
+    ) -> Optional[sglang_scheduler_pb2.OutputLogProbs]:
+        """Convert output logprobs dict to proto (no None values, plain floats)."""
         if not logprobs_data:
             return None
 
@@ -509,8 +513,47 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                     )
                 )
 
-        return sglang_scheduler_pb2.LogProbs(
-            token_logprobs=token_logprobs_val,
+        return sglang_scheduler_pb2.OutputLogProbs(
+            token_logprobs=token_logprobs_val,  # Plain float array
+            token_ids=token_logprobs_idx,
+            top_logprobs=top_logprobs_proto,
+        )
+
+    def _convert_input_logprobs_to_proto(
+        self, logprobs_data: Dict
+    ) -> Optional[sglang_scheduler_pb2.InputLogProbs]:
+        """Convert input logprobs dict to proto (first token is None, wrapped in InputTokenLogProb)."""
+        if not logprobs_data:
+            return None
+
+        token_logprobs_val = logprobs_data.get("token_logprobs_val", [])
+        token_logprobs_idx = logprobs_data.get("token_logprobs_idx", [])
+        top_logprobs_val = logprobs_data.get("top_logprobs_val", [])
+        top_logprobs_idx = logprobs_data.get("top_logprobs_idx", [])
+
+        # Wrap values in InputTokenLogProb (None for first token, value for others)
+        token_logprobs_wrapped = [
+            (
+                sglang_scheduler_pb2.InputTokenLogProb()
+                if x is None
+                else sglang_scheduler_pb2.InputTokenLogProb(value=x)
+            )
+            for x in token_logprobs_val
+        ]
+
+        # Build TopLogProbs entries
+        top_logprobs_proto = []
+        if top_logprobs_val and top_logprobs_idx:
+            for val_list, idx_list in zip(top_logprobs_val, top_logprobs_idx):
+                top_logprobs_proto.append(
+                    sglang_scheduler_pb2.TopLogProbs(
+                        values=val_list,
+                        token_ids=idx_list,
+                    )
+                )
+
+        return sglang_scheduler_pb2.InputLogProbs(
+            token_logprobs=token_logprobs_wrapped,
             token_ids=token_logprobs_idx,
             top_logprobs=top_logprobs_proto,
         )
@@ -522,12 +565,12 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         meta_info = output.get("meta_info", {})
 
         # Convert output logprobs if present
-        output_logprobs_proto = self._convert_logprobs_to_proto(
+        output_logprobs_proto = self._convert_output_logprobs_to_proto(
             output.get("output_logprobs")
         )
 
         # Convert input logprobs if present (only in first chunk)
-        input_logprobs_proto = self._convert_logprobs_to_proto(
+        input_logprobs_proto = self._convert_input_logprobs_to_proto(
             output.get("input_logprobs")
         )
 
@@ -576,12 +619,12 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 matched_stop_kwargs["matched_stop_str"] = matched
 
         # Convert output logprobs if present
-        output_logprobs_proto = self._convert_logprobs_to_proto(
+        output_logprobs_proto = self._convert_output_logprobs_to_proto(
             output.get("output_logprobs")
         )
 
         # Convert input logprobs if present
-        input_logprobs_proto = self._convert_logprobs_to_proto(
+        input_logprobs_proto = self._convert_input_logprobs_to_proto(
             output.get("input_logprobs")
         )
 
@@ -750,6 +793,28 @@ def main():
     # Logging
     parser.add_argument("--log-level", type=str, default="INFO", help="Logging level")
 
+    # Disaggregation mode arguments
+    parser.add_argument(
+        "--disaggregation-mode",
+        type=str,
+        default="null",
+        choices=["null", "prefill", "decode"],
+        help='Only used for PD disaggregation. "prefill" for prefill-only server, and "decode" for decode-only server. If not specified, it is not PD disaggregated',
+    )
+    parser.add_argument(
+        "--disaggregation-transfer-backend",
+        type=str,
+        default="mooncake",
+        choices=["mooncake", "nixl", "ascend", "fake"],
+        help="The backend for disaggregation transfer. Default is mooncake.",
+    )
+    parser.add_argument(
+        "--disaggregation-bootstrap-port",
+        type=int,
+        default=8998,
+        help="Bootstrap server port on the prefill server. Default is 8998.",
+    )
+
     args = parser.parse_args()
 
     # Convert to ServerArgs with gRPC host and port
@@ -765,7 +830,9 @@ def main():
         attention_backend=args.attention_backend,
         lora_paths=args.lora_paths.split(",") if args.lora_paths else None,
         log_level=args.log_level,
-        # Override with gRPC server host and port
+        disaggregation_mode=args.disaggregation_mode,
+        disaggregation_transfer_backend=args.disaggregation_transfer_backend,
+        disaggregation_bootstrap_port=args.disaggregation_bootstrap_port,
         host=args.host,
         port=args.port,
     )

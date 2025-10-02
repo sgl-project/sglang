@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import copy
 import logging
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import triton
@@ -13,6 +13,7 @@ from dataclasses import dataclass
 
 import torch.nn.functional as F
 
+from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import (
@@ -21,10 +22,10 @@ from sglang.srt.managers.schedule_batch import (
     global_server_args_dict,
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.speculative.eagle_utils import (
+from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
+from sglang.srt.speculative.spec_utils import (
     TREE_SPEC_KERNEL_AVAILABLE,
     assign_req_to_token_pool,
-    create_flashinfer_kv_indices_triton,
     get_src_tgt_cache_loc,
     get_target_cache_loc,
 )
@@ -42,7 +43,7 @@ elif is_hip():
 
 
 @dataclass
-class NgramVerifyInput:
+class NgramVerifyInput(SpecInput):
     def __init__(
         self,
         draft_token: torch.Tensor,
@@ -53,6 +54,7 @@ class NgramVerifyInput:
         retrive_next_sibling: torch.Tensor,
         draft_token_num: int,
     ):
+        super().__init__(SpecInputType.NGRAM_VERIFY)
         self.draft_token = draft_token
         self.custom_mask = tree_mask
         self.positions = positions
@@ -61,6 +63,9 @@ class NgramVerifyInput:
         self.retrive_next_sibling = retrive_next_sibling
         self.draft_token_num = draft_token_num
         self.device = self.custom_mask.device
+
+    def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
+        return self.draft_token_num, self.draft_token_num
 
     def prepare_for_verify(self, batch: ScheduleBatch, page_size: int):
         if batch.forward_mode.is_idle():
@@ -72,15 +77,23 @@ class NgramVerifyInput:
             batch.out_cache_loc = batch.alloc_token_slots(len(batch.input_ids))
             end_offset = batch.seq_lens + self.draft_token_num
         else:
+            # TODO(lsyin): add prefix lens cpu here to support page size > 1
             prefix_lens = batch.seq_lens
+            prefix_lens_cpu = batch.seq_lens_cpu
             end_offset = prefix_lens + self.draft_token_num
+            end_offset_cpu = prefix_lens_cpu + self.draft_token_num
             last_loc = get_last_loc(
                 batch.req_to_token_pool.req_to_token,
                 batch.req_pool_indices,
                 prefix_lens,
             )
             batch.out_cache_loc = batch.alloc_paged_token_slots_extend(
-                prefix_lens, end_offset, last_loc, len(batch.input_ids)
+                prefix_lens,
+                prefix_lens_cpu,
+                end_offset,
+                end_offset_cpu,
+                last_loc,
+                len(batch.input_ids),
             )
             self.last_loc = last_loc
 
@@ -400,10 +413,13 @@ class NgramVerifyInput:
         self._fill_requests(batch, logits_output)
         self._free_cache(batch, page_size)
 
-        batch.seq_lens.add_(self.accept_length + 1)
-        batch.seq_lens_sum = torch.sum(batch.seq_lens).item()
+        accept_length_cpu = self.accept_length.cpu()
+        num_accepted_tokens = accept_length_cpu.sum().item()
 
-        return logits_output, self.verified_id, self.accept_length.sum().item()
+        batch.seq_lens.add_(self.accept_length + 1)
+        batch.seq_lens_cpu.add_(accept_length_cpu + 1)
+
+        return logits_output, self.verified_id, num_accepted_tokens
 
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
         pass
