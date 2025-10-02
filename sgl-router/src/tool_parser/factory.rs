@@ -265,7 +265,8 @@ impl ToolParserFactory {
                 let best_match = mapping
                     .iter()
                     .filter(|(pattern, _)| {
-                        pattern.ends_with('*') && model_id.starts_with(&pattern[..pattern.len() - 1])
+                        pattern.ends_with('*')
+                            && model_id.starts_with(&pattern[..pattern.len() - 1])
                     })
                     .max_by_key(|(pattern, _)| pattern.len());
 
