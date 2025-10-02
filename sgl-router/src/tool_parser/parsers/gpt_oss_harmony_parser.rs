@@ -1,10 +1,11 @@
 use async_trait::async_trait;
 
+use crate::protocols::spec::Tool;
+
 use crate::tool_parser::{
     errors::ToolParserResult,
-    state::ParseState,
     traits::{TokenToolParser, ToolParser},
-    types::{StreamResult, ToolCall},
+    types::{StreamingParseResult, ToolCall},
 };
 
 /// Placeholder for the Harmony-backed GPT-OSS parser.
@@ -29,12 +30,12 @@ impl ToolParser for GptOssHarmonyParser {
     }
 
     async fn parse_incremental(
-        &self,
+        &mut self,
         _chunk: &str,
-        _state: &mut ParseState,
-    ) -> ToolParserResult<StreamResult> {
+        _tools: &[Tool],
+    ) -> ToolParserResult<StreamingParseResult> {
         // Temporary stub until the Harmony streaming pipeline is implemented.
-        Ok(StreamResult::Incomplete)
+        Ok(StreamingParseResult::default())
     }
 
     fn detect_format(&self, text: &str) -> bool {
@@ -61,10 +62,10 @@ impl TokenToolParser for GptOssHarmonyParser {
     }
 
     async fn parse_incremental_tokens(
-        &self,
+        &mut self,
         _tokens: &[u32],
-        _state: &mut ParseState,
-    ) -> ToolParserResult<StreamResult> {
-        Ok(StreamResult::Incomplete)
+        _tools: &[Tool],
+    ) -> ToolParserResult<StreamingParseResult> {
+        Ok(StreamingParseResult::default())
     }
 }
