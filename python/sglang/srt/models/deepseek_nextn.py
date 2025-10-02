@@ -33,9 +33,12 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV3ForCausalLM
-from sglang.srt.utils import BumpAllocator, add_prefix
+from sglang.srt.utils import BumpAllocator, add_prefix, is_cuda
 
 logger = logging.getLogger(__name__)
+
+
+_is_cuda = is_cuda()
 
 
 class DeepseekModelNextN(nn.Module):
@@ -66,12 +69,14 @@ class DeepseekModelNextN(nn.Module):
 
         self.eh_proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
 
+        self.alt_stream = torch.cuda.Stream() if _is_cuda else None
         self.decoder = DeepseekV2DecoderLayer(
             config,
             0,
             quant_config=quant_config,
             is_nextn=True,
             prefix=add_prefix("decoder", prefix),
+            alt_stream=self.alt_stream,
         )
 
         self.shared_head = nn.Module()
