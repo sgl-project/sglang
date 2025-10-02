@@ -167,6 +167,7 @@ struct FunctionCallInProgress {
     arguments_buffer: String,
     output_index: usize,
     last_obfuscation: Option<String>,
+    assigned_output_index: Option<usize>,
 }
 
 impl FunctionCallInProgress {
@@ -177,12 +178,59 @@ impl FunctionCallInProgress {
             arguments_buffer: String::new(),
             output_index,
             last_obfuscation: None,
+            assigned_output_index: None,
         }
     }
 
     fn is_complete(&self) -> bool {
         // A tool call is complete if it has a name
         !self.name.is_empty()
+    }
+
+    fn effective_output_index(&self) -> usize {
+        self.assigned_output_index.unwrap_or(self.output_index)
+    }
+}
+
+#[derive(Debug, Default)]
+struct OutputIndexMapper {
+    next_index: usize,
+    // Map upstream output_index -> remapped output_index
+    assigned: HashMap<usize, usize>,
+}
+
+impl OutputIndexMapper {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn with_start(next_index: usize) -> Self {
+        Self {
+            next_index,
+            assigned: HashMap::new(),
+        }
+    }
+
+    fn ensure_mapping(&mut self, upstream_index: usize) -> usize {
+        *self.assigned.entry(upstream_index).or_insert_with(|| {
+            let assigned = self.next_index;
+            self.next_index += 1;
+            assigned
+        })
+    }
+
+    fn lookup(&self, upstream_index: usize) -> Option<usize> {
+        self.assigned.get(&upstream_index).copied()
+    }
+
+    fn allocate_synthetic(&mut self) -> usize {
+        let assigned = self.next_index;
+        self.next_index += 1;
+        assigned
+    }
+
+    fn next_index(&self) -> usize {
+        self.next_index
     }
 }
 
@@ -202,6 +250,8 @@ struct StreamingToolHandler {
     pending_calls: Vec<FunctionCallInProgress>,
     /// Track if we're currently in a function call
     in_function_call: bool,
+    /// Manage output_index remapping so they increment per item
+    output_index_mapper: OutputIndexMapper,
 }
 
 impl StreamingToolHandler {
@@ -210,7 +260,33 @@ impl StreamingToolHandler {
             accumulator: StreamingResponseAccumulator::new(),
             pending_calls: Vec::new(),
             in_function_call: false,
+            output_index_mapper: OutputIndexMapper::new(),
         }
+    }
+
+    fn with_starting_index(start: usize) -> Self {
+        Self {
+            accumulator: StreamingResponseAccumulator::new(),
+            pending_calls: Vec::new(),
+            in_function_call: false,
+            output_index_mapper: OutputIndexMapper::with_start(start),
+        }
+    }
+
+    fn ensure_output_index(&mut self, upstream_index: usize) -> usize {
+        self.output_index_mapper.ensure_mapping(upstream_index)
+    }
+
+    fn mapped_output_index(&self, upstream_index: usize) -> Option<usize> {
+        self.output_index_mapper.lookup(upstream_index)
+    }
+
+    fn allocate_synthetic_output_index(&mut self) -> usize {
+        self.output_index_mapper.allocate_synthetic()
+    }
+
+    fn next_output_index(&self) -> usize {
+        self.output_index_mapper.next_index()
     }
 
     /// Process an SSE event and determine what action to take
@@ -241,6 +317,10 @@ impl StreamingToolHandler {
 
         match event_type.as_str() {
             "response.output_item.added" => {
+                if let Some(idx) = parsed.get("output_index").and_then(|v| v.as_u64()) {
+                    self.ensure_output_index(idx as usize);
+                }
+
                 // Check if this is a function_call item being added
                 if let Some(item) = parsed.get("item") {
                     if let Some(item_type) = item.get("type").and_then(|v| v.as_str()) {
@@ -248,6 +328,7 @@ impl StreamingToolHandler {
                             match parsed.get("output_index").and_then(|v| v.as_u64()) {
                                 Some(idx) => {
                                     let output_index = idx as usize;
+                                    let assigned_index = self.ensure_output_index(output_index);
                                     let call_id =
                                         item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
                                     let name =
@@ -257,6 +338,7 @@ impl StreamingToolHandler {
                                     let call = self.get_or_create_call(output_index, item);
                                     call.call_id = call_id.to_string();
                                     call.name = name.to_string();
+                                    call.assigned_output_index = Some(assigned_index);
 
                                     self.in_function_call = true;
                                 }
@@ -279,6 +361,7 @@ impl StreamingToolHandler {
                     .and_then(|v| v.as_u64())
                     .map(|v| v as usize)
                 {
+                    let assigned_index = self.ensure_output_index(output_index);
                     if let Some(delta) = parsed.get("delta").and_then(|v| v.as_str()) {
                         if let Some(call) = self
                             .pending_calls
@@ -291,6 +374,9 @@ impl StreamingToolHandler {
                             {
                                 call.last_obfuscation = Some(obfuscation.to_string());
                             }
+                            if call.assigned_output_index.is_none() {
+                                call.assigned_output_index = Some(assigned_index);
+                            }
                         }
                     }
                 }
@@ -298,6 +384,23 @@ impl StreamingToolHandler {
             }
             "response.function_call_arguments.done" => {
                 // Function call arguments complete - check if ready to execute
+                if let Some(output_index) = parsed
+                    .get("output_index")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize)
+                {
+                    let assigned_index = self.ensure_output_index(output_index);
+                    if let Some(call) = self
+                        .pending_calls
+                        .iter_mut()
+                        .find(|c| c.output_index == output_index)
+                    {
+                        if call.assigned_output_index.is_none() {
+                            call.assigned_output_index = Some(assigned_index);
+                        }
+                    }
+                }
+
                 if self.has_complete_calls() {
                     StreamAction::ExecuteTools
                 } else {
@@ -307,6 +410,14 @@ impl StreamingToolHandler {
             "response.output_item.delta" => self.process_output_delta(&parsed),
             "response.output_item.done" => {
                 // Check if we have complete function calls ready to execute
+                if let Some(output_index) = parsed
+                    .get("output_index")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize)
+                {
+                    self.ensure_output_index(output_index);
+                }
+
                 if self.has_complete_calls() {
                     StreamAction::ExecuteTools
                 } else {
@@ -325,6 +436,8 @@ impl StreamingToolHandler {
             .map(|v| v as usize)
             .unwrap_or(0);
 
+        let assigned_index = self.ensure_output_index(output_index);
+
         let delta = match event.get("delta") {
             Some(d) => d,
             None => return StreamAction::Forward,
@@ -338,6 +451,7 @@ impl StreamingToolHandler {
 
             // Get or create function call for this output index
             let call = self.get_or_create_call(output_index, delta);
+            call.assigned_output_index = Some(assigned_index);
 
             // Accumulate call_id if present
             if let Some(call_id) = delta.get("call_id").and_then(|v| v.as_str()) {
@@ -1199,12 +1313,19 @@ impl OpenAIRouter {
         };
 
         // Check if this is function_call_arguments.done - need to send buffered args first
+        let mut mapped_output_index: Option<usize> = None;
+
         if event_name == Some(event_types::FUNCTION_CALL_ARGUMENTS_DONE) {
             if let Some(output_index) = parsed_data
                 .get("output_index")
                 .and_then(|v| v.as_u64())
                 .map(|v| v as usize)
             {
+                let assigned_index = handler
+                    .mapped_output_index(output_index)
+                    .unwrap_or(output_index);
+                mapped_output_index = Some(assigned_index);
+
                 if let Some(call) = handler
                     .pending_calls
                     .iter()
@@ -1234,7 +1355,7 @@ impl OpenAIRouter {
                     let mut delta_event = json!({
                         "type": event_types::MCP_CALL_ARGUMENTS_DELTA,
                         "sequence_number": *sequence_number,
-                        "output_index": output_index,
+                        "output_index": assigned_index,
                         "item_id": mcp_item_id,
                         "delta": arguments_value,
                     });
@@ -1264,6 +1385,21 @@ impl OpenAIRouter {
                     *sequence_number += 1;
                 }
             }
+        }
+
+        // Remap output_index (if present) so downstream sees sequential indices
+        if mapped_output_index.is_none() {
+            if let Some(output_index) = parsed_data
+                .get("output_index")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+            {
+                mapped_output_index = handler.mapped_output_index(output_index);
+            }
+        }
+
+        if let Some(mapped) = mapped_output_index {
+            parsed_data["output_index"] = json!(mapped);
         }
 
         // Apply all transformations in-place (single parse/serialize!)
@@ -1487,6 +1623,7 @@ impl OpenAIRouter {
             let mut mcp_list_tools_sent = false;
             let mut is_first_iteration = true;
             let mut sequence_number: u64 = 0; // Track global sequence number across all iterations
+            let mut next_output_index: usize = 0;
 
             let server_label = original_request
                 .tools
@@ -1525,7 +1662,7 @@ impl OpenAIRouter {
 
                 // Stream events and check for tool calls
                 let mut upstream_stream = response.bytes_stream();
-                let mut handler = StreamingToolHandler::new();
+                let mut handler = StreamingToolHandler::with_starting_index(next_output_index);
                 let mut pending = String::new();
                 let mut tool_calls_detected = false;
                 let mut seen_in_progress = false;
@@ -1606,10 +1743,13 @@ impl OpenAIRouter {
                                                 {
                                                     seen_in_progress = true;
                                                     if !mcp_list_tools_sent {
+                                                        let list_tools_index = handler
+                                                            .allocate_synthetic_output_index();
                                                         if !OpenAIRouter::send_mcp_list_tools_events(
                                                             &tx,
                                                             &active_mcp_clone,
                                                             server_label,
+                                                            list_tools_index,
                                                             &mut sequence_number,
                                                         ) {
                                                             // Client disconnected
@@ -1656,6 +1796,8 @@ impl OpenAIRouter {
                         }
                     }
                 }
+
+                next_output_index = handler.next_output_index();
 
                 // If no tool calls, we're done - stream is complete
                 if !tool_calls_detected {
@@ -1802,7 +1944,8 @@ impl OpenAIRouter {
         tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
         mcp: &Arc<crate::mcp::McpClientManager>,
         server_label: &str,
-        _sequence_number: &mut u64,
+        output_index: usize,
+        sequence_number: &mut u64,
     ) -> bool {
         let tools_item_full = Self::build_mcp_list_tools_item(mcp, server_label);
         let item_id = tools_item_full
@@ -1816,53 +1959,65 @@ impl OpenAIRouter {
             obj.insert("tools".to_string(), json!([]));
         }
 
-        // Event 1: response.output_item.added with empty tools (no sequence_number - not in OpenAI spec)
+        // Event 1: response.output_item.added with empty tools
+        let event1_payload = json!({
+            "type": "response.output_item.added",
+            "sequence_number": *sequence_number,
+            "output_index": output_index,
+            "item": tools_item_empty
+        });
+        *sequence_number += 1;
         let event1 = format!(
             "event: response.output_item.added\ndata: {}\n\n",
-            json!({
-                "type": "response.output_item.added",
-                "output_index": 0,
-                "item": tools_item_empty
-            })
+            event1_payload
         );
         if tx.send(Ok(Bytes::from(event1))).is_err() {
             return false; // Client disconnected
         }
 
-        // Event 2: response.mcp_list_tools.in_progress (no sequence_number - MCP-specific)
+        // Event 2: response.mcp_list_tools.in_progress
+        let event2_payload = json!({
+            "type": "response.mcp_list_tools.in_progress",
+            "sequence_number": *sequence_number,
+            "output_index": output_index,
+            "item_id": item_id
+        });
+        *sequence_number += 1;
         let event2 = format!(
             "event: response.mcp_list_tools.in_progress\ndata: {}\n\n",
-            json!({
-                "type": "response.mcp_list_tools.in_progress",
-                "output_index": 0,
-                "item_id": item_id
-            })
+            event2_payload
         );
         if tx.send(Ok(Bytes::from(event2))).is_err() {
             return false;
         }
 
-        // Event 3: response.mcp_list_tools.completed (no sequence_number - MCP-specific)
+        // Event 3: response.mcp_list_tools.completed
+        let event3_payload = json!({
+            "type": "response.mcp_list_tools.completed",
+            "sequence_number": *sequence_number,
+            "output_index": output_index,
+            "item_id": item_id
+        });
+        *sequence_number += 1;
         let event3 = format!(
             "event: response.mcp_list_tools.completed\ndata: {}\n\n",
-            json!({
-                "type": "response.mcp_list_tools.completed",
-                "output_index": 0,
-                "item_id": item_id
-            })
+            event3_payload
         );
         if tx.send(Ok(Bytes::from(event3))).is_err() {
             return false;
         }
 
-        // Event 4: response.output_item.done with full tools list (no sequence_number - not in OpenAI spec)
+        // Event 4: response.output_item.done with full tools list
+        let event4_payload = json!({
+            "type": "response.output_item.done",
+            "sequence_number": *sequence_number,
+            "output_index": output_index,
+            "item": tools_item_full
+        });
+        *sequence_number += 1;
         let event4 = format!(
             "event: response.output_item.done\ndata: {}\n\n",
-            json!({
-                "type": "response.output_item.done",
-                "output_index": 0,
-                "item": tools_item_full
-            })
+            event4_payload
         );
         tx.send(Ok(Bytes::from(event4))).is_ok()
     }
@@ -1878,6 +2033,8 @@ impl OpenAIRouter {
         error_msg: Option<&str>,
         sequence_number: &mut u64,
     ) -> bool {
+        let effective_output_index = call.effective_output_index();
+
         // Build mcp_call item (reuse existing function)
         let mcp_call_item = Self::build_mcp_call_item(
             &call.name,
@@ -1898,7 +2055,7 @@ impl OpenAIRouter {
         let completed_payload = json!({
             "type": "response.mcp_call.completed",
             "sequence_number": *sequence_number,
-            "output_index": call.output_index,
+            "output_index": effective_output_index,
             "item_id": item_id
         });
         *sequence_number += 1;
@@ -1915,7 +2072,7 @@ impl OpenAIRouter {
         let done_payload = json!({
             "type": "response.output_item.done",
             "sequence_number": *sequence_number,
-            "output_index": call.output_index,
+            "output_index": effective_output_index,
             "item": mcp_call_item
         });
         *sequence_number += 1;
