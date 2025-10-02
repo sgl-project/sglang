@@ -52,9 +52,41 @@ ensure_vram_clear() {
     # Failed after all retries
     echo "=== FAILED: VRAM cleanup unsuccessful after $max_retries attempts ==="
     echo "Final GPU status:"
-    rocm-smi --showmemuse
+    timeout 30 rocm-smi --showmemuse || echo "rocm-smi timed out"
     echo "Processes using GPU:"
     lsof /dev/kfd 2>/dev/null || echo "No processes found using /dev/kfd"
+
+    # Print detailed information about suspicious processes
+    echo "=== Detailed Process Information ==="
+    if command -v rocm-smi >/dev/null 2>&1; then
+        # For AMD GPUs, get processes from lsof /dev/kfd
+        kfd_pids=$(lsof /dev/kfd 2>/dev/null | awk 'NR>1 {print $2}' | sort -u)
+        if [ -n "$kfd_pids" ]; then
+            echo "Processes accessing /dev/kfd (AMD GPU device):"
+            for pid in $kfd_pids; do
+                if ps -p $pid -o pid,ppid,cmd --no-headers 2>/dev/null; then
+                    echo "  └─ Command line: $(ps -p $pid -o cmd --no-headers 2>/dev/null | head -1)"
+                else
+                    echo "  └─ PID $pid: Process not found or already terminated"
+                fi
+            done
+        else
+            echo "No processes found accessing /dev/kfd"
+        fi
+    fi
+
+    # Check for any remaining sglang-related processes
+    echo "Checking for any remaining sglang-related processes:"
+    sglang_procs=$(pgrep -f 'sglang::|sglang\.launch_server|sglang\.bench|sglang\.data_parallel|sglang\.srt' 2>/dev/null)
+    if [ -n "$sglang_procs" ]; then
+        echo "Found sglang processes still running:"
+        for pid in $sglang_procs; do
+            ps -p $pid -o pid,ppid,cmd --no-headers 2>/dev/null || echo "PID $pid not found"
+        done
+    else
+        echo "No sglang-related processes found."
+    fi
+
     echo "=================================================================="
     return 1
 }
