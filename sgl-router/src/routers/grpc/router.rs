@@ -7,10 +7,14 @@ use async_trait::async_trait;
 use axum::{
     body::Body,
     extract::Request,
-    http::{HeaderMap, StatusCode},
+    http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
+use bytes::Bytes;
+use std::io;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, info, warn};
 
 use crate::config::types::RetryConfig;
@@ -21,9 +25,9 @@ use crate::policies::PolicyRegistry;
 use crate::protocols::spec::ChatMessage;
 use crate::protocols::spec::{
     ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse,
-    CompletionRequest, EmbeddingRequest, FunctionCallResponse, GenerateRequest, RerankRequest,
-    ResponsesGetParams, ResponsesRequest, StringOrArray, Tool, ToolCall, ToolChoice,
-    ToolChoiceValue, Usage,
+    ChatCompletionStreamResponse, ChatMessageDelta, ChatStreamChoice, CompletionRequest,
+    EmbeddingRequest, FunctionCallResponse, GenerateRequest, RerankRequest, ResponsesGetParams,
+    ResponsesRequest, StringOrArray, Tool, ToolCall, ToolChoice, ToolChoiceValue, Usage,
 };
 use crate::reasoning_parser::ParserFactory;
 use crate::routers::RouterTrait;
@@ -960,14 +964,13 @@ impl GrpcRouter {
         request: proto::GenerateRequest,
         original_request: &ChatCompletionRequest,
     ) -> Response {
-        let mut stop_decoder = self.create_stop_decoder(
-            original_request.stop.as_ref(),
-            original_request.stop_token_ids.as_ref(),
-            original_request.skip_special_tokens,
-            original_request.no_stop_trim,
-        );
+        let request_id = request.rid.clone();
+        let model = original_request.model.clone();
 
-        // Process streaming tokens
+        // Create channel for SSE streaming
+        let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, io::Error>>();
+
+        // Start the gRPC stream
         let mut grpc_stream = match client.generate(request).await {
             Ok(stream) => stream,
             Err(e) => {
@@ -980,49 +983,556 @@ impl GrpcRouter {
             }
         };
 
-        let mut decoded_text = String::new();
+        let stop_params = (
+            original_request.stop.clone(),
+            original_request.stop_token_ids.clone(),
+            original_request.skip_special_tokens,
+            original_request.no_stop_trim,
+        );
 
+        // Spawn processing task
+        let self_clone = self.clone_for_streaming();
+        tokio::spawn(async move {
+            let result = Self::process_streaming_chunks(
+                &self_clone,
+                &mut grpc_stream,
+                request_id,
+                model,
+                stop_params,
+                original_request,
+                &tx,
+            )
+            .await;
+
+            if let Err(e) = result {
+                let error_chunk = format!("data: {}\n\n",
+                    serde_json::json!({
+                        "error": {
+                            "message": e,
+                            "type": "internal_error"
+                        }
+                    })
+                );
+                let _ = tx.send(Ok(Bytes::from(error_chunk)));
+            }
+
+            // Send DONE marker
+            let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
+        });
+
+        // Create response with SSE headers
+        let stream = UnboundedReceiverStream::new(rx);
+        let mut response = Response::new(Body::from_stream(stream));
+        *response.status_mut() = StatusCode::OK;
+        response
+            .headers_mut()
+            .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+        response
+            .headers_mut()
+            .insert("Cache-Control", HeaderValue::from_static("no-cache"));
+        response
+            .headers_mut()
+            .insert("Connection", HeaderValue::from_static("keep-alive"));
+        response
+    }
+
+    /// Helper to clone necessary components for streaming
+    fn clone_for_streaming(&self) -> Self {
+        GrpcRouter {
+            worker_registry: self.worker_registry.clone(),
+            policy_registry: self.policy_registry.clone(),
+            tokenizer: self.tokenizer.clone(),
+            reasoning_parser_factory: self.reasoning_parser_factory.clone(),
+            tool_parser_factory: self.tool_parser_factory.clone(),
+            dp_aware: self.dp_aware,
+            api_key: self.api_key.clone(),
+            retry_config: self.retry_config.clone(),
+        }
+    }
+
+    /// Process streaming chunks and send SSE events
+    async fn process_streaming_chunks(
+        router: &GrpcRouter,
+        grpc_stream: &mut impl Stream<Item = Result<proto::GenerateResponse, tonic::Status>> + Unpin,
+        request_id: String,
+        model: String,
+        stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool),
+        original_request: &ChatCompletionRequest,
+        tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
+    ) -> Result<(), String> {
+        // Phase 1: Initialize state tracking (per-index for n>1 support)
+        let mut is_firsts: HashMap<u32, bool> = HashMap::new();
+        let mut stream_buffers: HashMap<u32, String> = HashMap::new();
+        let mut finish_reasons: HashMap<u32, String> = HashMap::new();
+        let mut matched_stops: HashMap<u32, Option<Value>> = HashMap::new();
+        let mut prompt_tokens: HashMap<u32, u32> = HashMap::new();
+        let mut completion_tokens: HashMap<u32, u32> = HashMap::new();
+        let mut cached_tokens: HashMap<u32, u32> = HashMap::new();
+
+        // Parser state (lazy initialization per index)
+        // For reasoning: we'll get pooled parsers from the factory as needed
+        type PooledReasoningParser = Arc<tokio::sync::Mutex<Box<dyn crate::reasoning_parser::ReasoningParser + Send>>>;
+        let mut reasoning_parsers: HashMap<u32, PooledReasoningParser> = HashMap::new();
+
+        // For tool calls: we'll get pooled parsers from the factory as needed
+        type PooledToolParser = Arc<tokio::sync::Mutex<Box<dyn crate::tool_parser::ToolParser + Send>>>;
+        let mut tool_parsers: HashMap<u32, PooledToolParser> = HashMap::new();
+        let mut has_tool_calls: HashMap<u32, bool> = HashMap::new();
+
+        // Create stop decoder
+        let (stop, stop_token_ids, skip_special_tokens, no_stop_trim) = stop_params;
+        let mut stop_decoder = router.create_stop_decoder(
+            stop.as_ref(),
+            stop_token_ids.as_ref(),
+            skip_special_tokens,
+            no_stop_trim,
+        );
+
+        let created = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // Phase 2: Main streaming loop
         while let Some(response) = grpc_stream.next().await {
-            let gen_response = match response {
-                Ok(resp) => resp,
-                Err(e) => {
-                    error!("Stream error: {}", e);
-                    break;
-                }
-            };
+            let gen_response = response.map_err(|e| format!("Stream error: {}", e))?;
 
             match gen_response.response {
                 Some(Chunk(chunk)) => {
-                    // Process tokens and check if we should stop
-                    let (chunk_text, should_stop) =
+                    // For now, use index 0 (will support n>1 later)
+                    let index = 0u32;
+
+                    // Process tokens through stop decoder
+                    let (chunk_text, _should_stop) =
                         Self::process_chunk_tokens(&mut stop_decoder, &chunk.token_ids);
-                    decoded_text.push_str(&chunk_text);
-                    if should_stop {
-                        break;
+
+                    if chunk_text.is_empty() {
+                        continue;
                     }
-                    continue;
+
+                    // Process logprobs if present and requested
+                    // Note: gRPC chunks already contain incremental logprobs (not cumulative)
+                    let choice_logprobs = if let Some(ref proto_logprobs) = chunk.output_logprobs {
+                        match router.convert_proto_to_openai_logprobs(proto_logprobs) {
+                            Ok(logprobs) => Some(logprobs),
+                            Err(e) => {
+                                warn!("Failed to process logprobs: {}", e);
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+
+                    // Initialize stream buffer if first time
+                    let stream_buffer = stream_buffers.entry(index).or_insert_with(String::new);
+
+                    // Step 1: Send first chunk with role if this is the first chunk for this index
+                    if is_firsts.get(&index).copied().unwrap_or(true) {
+                        let first_chunk = ChatCompletionStreamResponse {
+                            id: request_id.clone(),
+                            object: "chat.completion.chunk".to_string(),
+                            created,
+                            model: model.clone(),
+                            system_fingerprint: None,
+                            choices: vec![ChatStreamChoice {
+                                index,
+                                delta: ChatMessageDelta {
+                                    role: Some("assistant".to_string()),
+                                    content: None,
+                                    tool_calls: None,
+                                    function_call: None,
+                                    reasoning_content: None,
+                                },
+                                logprobs: None,
+                                finish_reason: None,
+                                matched_stop: None,
+                            }],
+                            usage: None,
+                        };
+
+                        let sse_chunk = format!(
+                            "data: {}\n\n",
+                            serde_json::to_string(&first_chunk).map_err(|e| e.to_string())?
+                        );
+                        tx.send(Ok(Bytes::from(sse_chunk)))
+                            .map_err(|_| "Failed to send chunk")?;
+
+                        is_firsts.insert(index, false);
+                    }
+
+                    // Step 2: Calculate delta from stream buffer
+                    let mut delta = chunk_text;
+                    stream_buffer.push_str(&delta);
+
+                    // Step 3: Reasoning content handling (parse and stream before tool calls)
+                    if original_request.separate_reasoning {
+                        // Lazily get pooled parser for this index
+                        if !reasoning_parsers.contains_key(&index) {
+                            let pooled = router.reasoning_parser_factory.get_pooled(&model);
+                            reasoning_parsers.insert(index, pooled);
+                        }
+
+                        if let Some(pooled_parser) = reasoning_parsers.get(&index) {
+                            let mut parser = pooled_parser.lock().await;
+                            match parser.parse_stream_chunk(&delta) {
+                                Ok((reasoning_text, remaining_delta)) => {
+                                    // Send reasoning content chunk if any
+                                    if !reasoning_text.is_empty() {
+                                        let reasoning_chunk = ChatCompletionStreamResponse {
+                                            id: request_id.clone(),
+                                            object: "chat.completion.chunk".to_string(),
+                                            created,
+                                            model: model.clone(),
+                                            system_fingerprint: None,
+                                            choices: vec![ChatStreamChoice {
+                                                index,
+                                                delta: ChatMessageDelta {
+                                                    role: None,
+                                                    content: None,
+                                                    tool_calls: None,
+                                                    function_call: None,
+                                                    reasoning_content: Some(reasoning_text),
+                                                },
+                                                logprobs: choice_logprobs.clone(),
+                                                finish_reason: None,
+                                                matched_stop: None,
+                                            }],
+                                            usage: None,
+                                        };
+
+                                        let sse_chunk = format!(
+                                            "data: {}\n\n",
+                                            serde_json::to_string(&reasoning_chunk)
+                                                .map_err(|e| e.to_string())?
+                                        );
+                                        tx.send(Ok(Bytes::from(sse_chunk)))
+                                            .map_err(|_| "Failed to send reasoning chunk")?;
+                                    }
+
+                                    // Update delta to be the remaining text after reasoning extraction
+                                    delta = remaining_delta;
+                                }
+                                Err(e) => {
+                                    // Log error but don't fail the entire stream
+                                    warn!("Reasoning parsing error: {}", e);
+                                }
+                            }
+                        }
+                    }
+
+                    // Step 4: Tool call handling (parse and stream after reasoning)
+                    let tool_choice_enabled = !matches!(
+                        &original_request.tool_choice,
+                        Some(ToolChoice::Value(ToolChoiceValue::None))
+                    );
+
+                    if tool_choice_enabled && original_request.tools.is_some() {
+                        // Lazily get pooled parser for this index
+                        if !tool_parsers.contains_key(&index) {
+                            let pooled = router.tool_parser_factory.get_pooled(&model);
+                            tool_parsers.insert(index, pooled);
+                        }
+
+                        if let Some(pooled_parser) = tool_parsers.get(&index) {
+                            let mut parser = pooled_parser.lock().await;
+                            match parser.parse_stream_chunk(&delta).await {
+                                Ok((normal_text, tool_call_deltas)) => {
+                                    // Emit normal text if any (before tool calls)
+                                    if !normal_text.is_empty() {
+                                        let text_chunk = ChatCompletionStreamResponse {
+                                            id: request_id.clone(),
+                                            object: "chat.completion.chunk".to_string(),
+                                            created,
+                                            model: model.clone(),
+                                            system_fingerprint: None,
+                                            choices: vec![ChatStreamChoice {
+                                                index,
+                                                delta: ChatMessageDelta {
+                                                    role: None,
+                                                    content: Some(normal_text),
+                                                    tool_calls: None,
+                                                    function_call: None,
+                                                    reasoning_content: None,
+                                                },
+                                                logprobs: choice_logprobs.clone(),
+                                                finish_reason: None,
+                                                matched_stop: None,
+                                            }],
+                                            usage: None,
+                                        };
+
+                                        let sse_chunk = format!(
+                                            "data: {}\n\n",
+                                            serde_json::to_string(&text_chunk)
+                                                .map_err(|e| e.to_string())?
+                                        );
+                                        tx.send(Ok(Bytes::from(sse_chunk)))
+                                            .map_err(|_| "Failed to send text chunk")?;
+                                    }
+
+                                    // Emit tool call chunks
+                                    for tool_call_delta in tool_call_deltas {
+                                        // Mark that this index has tool calls
+                                        has_tool_calls.insert(index, true);
+
+                                        let tool_chunk = ChatCompletionStreamResponse {
+                                            id: request_id.clone(),
+                                            object: "chat.completion.chunk".to_string(),
+                                            created,
+                                            model: model.clone(),
+                                            system_fingerprint: None,
+                                            choices: vec![ChatStreamChoice {
+                                                index,
+                                                delta: ChatMessageDelta {
+                                                    role: None,
+                                                    content: None,
+                                                    tool_calls: Some(vec![tool_call_delta]),
+                                                    function_call: None,
+                                                    reasoning_content: None,
+                                                },
+                                                logprobs: None,
+                                                finish_reason: None,
+                                                matched_stop: None,
+                                            }],
+                                            usage: None,
+                                        };
+
+                                        let sse_chunk = format!(
+                                            "data: {}\n\n",
+                                            serde_json::to_string(&tool_chunk)
+                                                .map_err(|e| e.to_string())?
+                                        );
+                                        tx.send(Ok(Bytes::from(sse_chunk)))
+                                            .map_err(|_| "Failed to send tool call chunk")?;
+                                    }
+
+                                    // Skip regular content emission since we handled it above
+                                    continue;
+                                }
+                                Err(e) => {
+                                    // Log error but don't fail the entire stream
+                                    warn!("Tool call parsing error: {}", e);
+                                    // Fall through to regular content emission
+                                }
+                            }
+                        }
+                    }
+
+                    // Step 5: Regular content emission (when not handling tools)
+                    if !delta.is_empty() {
+                        let content_chunk = ChatCompletionStreamResponse {
+                            id: request_id.clone(),
+                            object: "chat.completion.chunk".to_string(),
+                            created,
+                            model: model.clone(),
+                            system_fingerprint: None,
+                            choices: vec![ChatStreamChoice {
+                                index,
+                                delta: ChatMessageDelta {
+                                    role: None,
+                                    content: Some(delta),
+                                    tool_calls: None,
+                                    function_call: None,
+                                    reasoning_content: None,
+                                },
+                                logprobs: choice_logprobs.clone(),
+                                finish_reason: None,
+                                matched_stop: None,
+                            }],
+                            usage: None,
+                        };
+
+                        let sse_chunk = format!(
+                            "data: {}\n\n",
+                            serde_json::to_string(&content_chunk).map_err(|e| e.to_string())?
+                        );
+                        tx.send(Ok(Bytes::from(sse_chunk)))
+                            .map_err(|_| "Failed to send chunk")?;
+                    }
                 }
-                Some(Complete(_complete)) => {
+                Some(Complete(complete)) => {
                     // Flush any remaining text
                     if let SequenceDecoderOutput::Text(text) = stop_decoder.flush() {
                         if !text.is_empty() {
-                            decoded_text.push_str(&text);
-                            debug!("Flushed text: {}", text);
+                            let index = 0u32;
+                            let stream_buffer = stream_buffers.entry(index).or_insert_with(String::new);
+                            stream_buffer.push_str(&text);
+
+                            let content_chunk = ChatCompletionStreamResponse {
+                                id: request_id.clone(),
+                                object: "chat.completion.chunk".to_string(),
+                                created,
+                                model: model.clone(),
+                                system_fingerprint: None,
+                                choices: vec![ChatStreamChoice {
+                                    index,
+                                    delta: ChatMessageDelta {
+                                        role: None,
+                                        content: Some(text),
+                                        tool_calls: None,
+                                        function_call: None,
+                                        reasoning_content: None,
+                                    },
+                                    logprobs: None,
+                                    finish_reason: None,
+                                    matched_stop: None,
+                                }],
+                                usage: None,
+                            };
+
+                            let sse_chunk = format!(
+                                "data: {}\n\n",
+                                serde_json::to_string(&content_chunk).map_err(|e| e.to_string())?
+                            );
+                            tx.send(Ok(Bytes::from(sse_chunk)))
+                                .map_err(|_| "Failed to send chunk")?;
                         }
                     }
+
+                    // Store metadata
+                    let index = 0u32;
+                    prompt_tokens.insert(index, complete.prompt_tokens as u32);
+                    completion_tokens.insert(index, complete.completion_tokens as u32);
+                    cached_tokens.insert(index, complete.cached_tokens as u32);
+                    finish_reasons.insert(index, complete.finish_reason.clone());
+
+                    // Extract matched_stop information
+                    let matched_stop_value = match &complete.matched_stop {
+                        Some(proto::generate_complete::MatchedStop::MatchedTokenId(token_id)) => {
+                            Some(Value::Number(serde_json::Number::from(*token_id)))
+                        }
+                        Some(proto::generate_complete::MatchedStop::MatchedStopStr(stop_str)) => {
+                            Some(Value::String(stop_str.clone()))
+                        }
+                        None => None,
+                    };
+                    matched_stops.insert(index, matched_stop_value);
+
                     break;
                 }
                 Some(Error(error)) => {
-                    error!("Generation error: {}", error.message);
-                    break;
+                    return Err(format!("Generation error: {}", error.message));
                 }
                 None => continue,
             }
         }
 
-        // TODO: Replace with proper SSE streaming response
-        // For now, return the complete decoded text
-        (StatusCode::OK, format!("Decoded text: {}", decoded_text)).into_response()
+        // Phase 3: Check for unstreamed tool args and send finish reason chunks
+        // First, check if there are any remaining tool arguments that need to be streamed
+        for (index, pooled_parser) in tool_parsers.iter() {
+            if has_tool_calls.get(index).copied().unwrap_or(false) {
+                let parser = pooled_parser.lock().await;
+                if let Some(remaining_chunks) = parser.get_unstreamed_tool_args() {
+                    for tool_call_delta in remaining_chunks {
+                        let tool_chunk = ChatCompletionStreamResponse {
+                            id: request_id.clone(),
+                            object: "chat.completion.chunk".to_string(),
+                            created,
+                            model: model.clone(),
+                            system_fingerprint: None,
+                            choices: vec![ChatStreamChoice {
+                                index: *index,
+                                delta: ChatMessageDelta {
+                                    role: None,
+                                    content: None,
+                                    tool_calls: Some(vec![tool_call_delta]),
+                                    function_call: None,
+                                    reasoning_content: None,
+                                },
+                                logprobs: None,
+                                finish_reason: None,
+                                matched_stop: None,
+                            }],
+                            usage: None,
+                        };
+
+                        let sse_chunk = format!(
+                            "data: {}\n\n",
+                            serde_json::to_string(&tool_chunk).map_err(|e| e.to_string())?
+                        );
+                        tx.send(Ok(Bytes::from(sse_chunk)))
+                            .map_err(|_| "Failed to send remaining tool args")?;
+                    }
+                }
+            }
+        }
+
+        // Now send finish reason chunks with tool_calls override and matched_stop
+        for (index, finish_reason) in finish_reasons.iter() {
+            // Change finish_reason to "tool_calls" if we had tool calls and stopped naturally
+            let final_finish_reason = if has_tool_calls.get(index).copied().unwrap_or(false)
+                && finish_reason == "stop"
+            {
+                "tool_calls".to_string()
+            } else {
+                finish_reason.clone()
+            };
+
+            // Get matched_stop for this index
+            let matched_stop_value = matched_stops.get(index).and_then(|v| v.clone());
+
+            let finish_chunk = ChatCompletionStreamResponse {
+                id: request_id.clone(),
+                object: "chat.completion.chunk".to_string(),
+                created,
+                model: model.clone(),
+                system_fingerprint: None,
+                choices: vec![ChatStreamChoice {
+                    index: *index,
+                    delta: ChatMessageDelta {
+                        role: None,
+                        content: None,
+                        tool_calls: None,
+                        function_call: None,
+                        reasoning_content: None,
+                    },
+                    logprobs: None,
+                    finish_reason: Some(final_finish_reason),
+                    matched_stop: matched_stop_value,
+                }],
+                usage: None,
+            };
+
+            let sse_chunk = format!(
+                "data: {}\n\n",
+                serde_json::to_string(&finish_chunk).map_err(|e| e.to_string())?
+            );
+            tx.send(Ok(Bytes::from(sse_chunk)))
+                .map_err(|_| "Failed to send finish chunk")?;
+        }
+
+        // Phase 4: Send usage chunk if requested
+        if let Some(stream_options) = &original_request.stream_options {
+            if stream_options.include_usage {
+                let total_prompt: u32 = prompt_tokens.values().sum();
+                let total_completion: u32 = completion_tokens.values().sum();
+
+                let usage_chunk = ChatCompletionStreamResponse {
+                    id: request_id.clone(),
+                    object: "chat.completion.chunk".to_string(),
+                    created,
+                    model: model.clone(),
+                    system_fingerprint: None,
+                    choices: vec![],
+                    usage: Some(Usage {
+                        prompt_tokens: total_prompt,
+                        completion_tokens: total_completion,
+                        total_tokens: total_prompt + total_completion,
+                        completion_tokens_details: None,
+                    }),
+                };
+
+                let sse_chunk = format!(
+                    "data: {}\n\n",
+                    serde_json::to_string(&usage_chunk).map_err(|e| e.to_string())?
+                );
+                tx.send(Ok(Bytes::from(sse_chunk)))
+                    .map_err(|_| "Failed to send usage chunk")?;
+            }
+        }
+
+        Ok(())
     }
 
     /// Submit request and handle non-streaming response for chat completions route

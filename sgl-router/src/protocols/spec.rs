@@ -473,6 +473,8 @@ pub struct ChatStreamChoice {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logprobs: Option<ChatLogProbs>,
     pub finish_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched_stop: Option<Value>,
 }
 
 // Completions API request types (v1/completions) - DEPRECATED but still supported
