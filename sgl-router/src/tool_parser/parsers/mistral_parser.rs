@@ -1,11 +1,11 @@
 use async_trait::async_trait;
 use serde_json::Value;
-use std::collections::HashMap;
 
 use crate::protocols::spec::Tool;
 
 use crate::tool_parser::{
     errors::{ToolParserError, ToolParserResult},
+    parsers::helpers,
     partial_json::PartialJson,
     traits::ToolParser,
     types::{FunctionCall, StreamingParseResult, ToolCall, ToolCallItem},
@@ -158,8 +158,12 @@ impl MistralParser {
             let arguments = serde_json::to_string(args)
                 .map_err(|e| ToolParserError::ParsingFailed(e.to_string()))?;
 
-            // Generate ID with index for multiple tools
-            let id = format!("mistral_call_{}", index);
+            // Generate unique ID
+            let id = obj
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .unwrap_or_else(|| format!("mistral_call_{}", uuid::Uuid::new_v4()));
 
             Ok(Some(ToolCall {
                 id,
@@ -177,50 +181,6 @@ impl MistralParser {
     /// Check if text contains Mistral tool markers
     fn has_tool_markers(&self, text: &str) -> bool {
         text.contains("[TOOL_CALLS]")
-    }
-
-    /// Get a mapping of tool names to their indices
-    fn get_tool_indices(&self, tools: &[Tool]) -> HashMap<String, usize> {
-        tools
-            .iter()
-            .enumerate()
-            .map(|(i, tool)| (tool.function.name.clone(), i))
-            .collect()
-    }
-
-    /// Check if buffer ends with a partial bot_token
-    fn ends_with_partial_token(&self, buffer: &str, bot_token: &str) -> bool {
-        if bot_token.is_empty() {
-            return false;
-        }
-
-        for i in 1..=buffer.len().min(bot_token.len()) {
-            if let Some(buffer_end) = buffer.get(buffer.len() - i..) {
-                if bot_token.starts_with(buffer_end) {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
-    /// Ensure arrays have enough capacity for current_tool_id
-    fn ensure_capacity(&mut self) {
-        if self.current_tool_id < 0 {
-            return;
-        }
-
-        let needed_len = (self.current_tool_id + 1) as usize;
-
-        if self.prev_tool_call_arr.len() < needed_len {
-            self.prev_tool_call_arr
-                .resize_with(needed_len, || Value::Null);
-        }
-
-        if self.streamed_args_for_tool.len() < needed_len {
-            self.streamed_args_for_tool
-                .resize_with(needed_len, String::new);
-        }
     }
 }
 
@@ -272,12 +232,11 @@ impl ToolParser for MistralParser {
 
         // Check if current_text has tool_call
         let has_tool_start = self.has_tool_markers(current_text)
-            || (self.current_tool_id >= 0
-                && current_text.starts_with(self.tool_call_separator));
+            || (self.current_tool_id >= 0 && current_text.starts_with(self.tool_call_separator));
 
         if !has_tool_start {
             // Only clear buffer if we're sure no tool call is starting
-            if !self.ends_with_partial_token(&self.buffer, self.bot_token) {
+            if !helpers::ends_with_partial_token(&self.buffer, self.bot_token) {
                 let normal_text = self.buffer.clone();
                 self.buffer.clear();
 
@@ -299,14 +258,12 @@ impl ToolParser for MistralParser {
         }
 
         // Build tool indices
-        let tool_indices = self.get_tool_indices(tools);
+        let tool_indices = helpers::get_tool_indices(tools);
 
         // Determine start index for JSON parsing
         let start_idx = if let Some(pos) = current_text.find(self.bot_token) {
             pos + self.bot_token.len()
-        } else if self.current_tool_id >= 0
-            && current_text.starts_with(self.tool_call_separator)
-        {
+        } else if self.current_tool_id >= 0 && current_text.starts_with(self.tool_call_separator) {
             self.tool_call_separator.len()
         } else {
             0
@@ -333,31 +290,20 @@ impl ToolParser for MistralParser {
         // Validate tool name if present
         if let Some(name) = obj.get("name").and_then(|v| v.as_str()) {
             if !tool_indices.contains_key(name) {
-                // Invalid tool name - reset state
-                self.buffer.clear();
-                self.current_tool_id = -1;
-                self.current_tool_name_sent = false;
-                if !self.streamed_args_for_tool.is_empty() {
-                    self.streamed_args_for_tool.pop();
-                }
+                // Invalid tool name - skip this tool, preserve indexing for next tool
+                tracing::warn!("Invalid tool name '{}' - skipping", name);
+                helpers::reset_current_tool_state(
+                    &mut self.buffer,
+                    &mut self.current_tool_name_sent,
+                    &mut self.streamed_args_for_tool,
+                    &self.prev_tool_call_arr,
+                );
                 return Ok(StreamingParseResult::default());
             }
         }
 
         // Handle parameters/arguments aliasing
-        let current_tool_call = if obj.get("arguments").is_none() {
-            if let Some(params) = obj.get("parameters") {
-                let mut cloned = obj.clone();
-                if let Value::Object(ref mut map) = cloned {
-                    map.insert("arguments".to_string(), params.clone());
-                }
-                cloned
-            } else {
-                obj.clone()
-            }
-        } else {
-            obj.clone()
-        };
+        let current_tool_call = helpers::normalize_arguments_field(obj.clone());
 
         let mut result = StreamingParseResult::default();
 
@@ -371,7 +317,11 @@ impl ToolParser for MistralParser {
                         self.streamed_args_for_tool.push(String::new());
                     } else if self.current_tool_id as usize >= self.streamed_args_for_tool.len() {
                         // Ensure capacity for subsequent tools
-                        self.ensure_capacity();
+                        helpers::ensure_capacity(
+                            self.current_tool_id,
+                            &mut self.prev_tool_call_arr,
+                            &mut self.streamed_args_for_tool,
+                        );
                     }
 
                     // Send tool name with empty parameters
@@ -396,17 +346,25 @@ impl ToolParser for MistralParser {
                 let cur_args_json = serde_json::to_string(cur_arguments)
                     .map_err(|e| ToolParserError::ParsingFailed(e.to_string()))?;
 
-                let prev_arguments = self
-                    .prev_tool_call_arr
-                    .get(tool_id)
-                    .and_then(|v| v.get("arguments"));
+                // Compute diff: everything after what we've already sent
+                let diff = cur_args_json[sent..].to_string();
 
-                let mut argument_diff: Option<String> = None;
+                // Send diff if there's new content
+                if !diff.is_empty() {
+                    // Only accumulate if not complete
+                    if !is_complete && tool_id < self.streamed_args_for_tool.len() {
+                        self.streamed_args_for_tool[tool_id].push_str(&diff);
+                    }
 
-                // If JSON is complete, send all remaining arguments
+                    result.calls.push(ToolCallItem {
+                        tool_index: tool_id,
+                        name: None,
+                        parameters: diff,
+                    });
+                }
+
+                // If JSON is complete, advance to next tool
                 if is_complete {
-                    argument_diff = Some(cur_args_json[sent..].to_string());
-
                     // Remove processed portion, keep unprocessed content
                     self.buffer = current_text[start_idx + end_idx..].to_string();
 
@@ -420,43 +378,16 @@ impl ToolParser for MistralParser {
                     }
                     self.current_tool_id += 1;
                 }
-                // If still parsing, send incremental changes
-                else if let Some(prev_args) = prev_arguments {
-                    let prev_args_json = serde_json::to_string(prev_args)
-                        .map_err(|e| ToolParserError::ParsingFailed(e.to_string()))?;
-
-                    if cur_args_json != prev_args_json {
-                        // Find common prefix
-                        let prefix: String = prev_args_json
-                            .chars()
-                            .zip(cur_args_json.chars())
-                            .take_while(|(c1, c2)| c1 == c2)
-                            .map(|(c, _)| c)
-                            .collect();
-                        argument_diff = Some(prefix[sent..].to_string());
-                    }
-                }
-
-                // Send the argument diff if there's something new
-                if let Some(diff) = argument_diff {
-                    if !diff.is_empty() {
-                        if !is_complete && tool_id < self.streamed_args_for_tool.len() {
-                            self.streamed_args_for_tool[tool_id].push_str(&diff);
-                        }
-
-                        result.calls.push(ToolCallItem {
-                            tool_index: tool_id,
-                            name: None,
-                            parameters: diff,
-                        });
-                    }
-                }
             }
         }
 
         // Update prev_tool_call_arr with current state
         if self.current_tool_id >= 0 {
-            self.ensure_capacity();
+            helpers::ensure_capacity(
+                self.current_tool_id,
+                &mut self.prev_tool_call_arr,
+                &mut self.streamed_args_for_tool,
+            );
             let tool_id = self.current_tool_id as usize;
 
             if tool_id < self.prev_tool_call_arr.len() {
@@ -465,14 +396,6 @@ impl ToolParser for MistralParser {
         }
 
         Ok(result)
-    }
-
-    fn reset(&mut self) {
-        self.buffer.clear();
-        self.prev_tool_call_arr.clear();
-        self.current_tool_id = -1;
-        self.current_tool_name_sent = false;
-        self.streamed_args_for_tool.clear();
     }
 
     fn detect_format(&self, text: &str) -> bool {
