@@ -64,10 +64,8 @@ def run_eval(args):
         from sglang.test.simple_eval_longbench_v2 import LongBenchV2Eval
 
         # Default to HuggingFace dataset, can be overridden with --dataset-path
-        data_source = getattr(args, "dataset_path", "THUDM/LongBench-v2")
-        categories = getattr(args, "categories", None)
-        if categories:
-            categories = categories.split(",")
+        data_source = args.dataset_path
+        categories = args.categories.split(",") if args.categories else None
 
         eval_obj = LongBenchV2Eval(
             data_source=data_source,
@@ -153,22 +151,24 @@ if __name__ == "__main__":
     parser.add_argument(
         "--dataset-path",
         type=str,
+        default="THUDM/LongBench-v2",
         help="Path to dataset file or HuggingFace dataset name for LongBench-v2",
     )
     parser.add_argument(
         "--categories",
         type=str,
+        default=None,
         help="Comma-separated list of categories to evaluate for LongBench-v2",
     )
     parser.add_argument(
         "--max-context-length",
         type=int,
-        help="Maximum context length in tokens for LongBench-v2",
+        help="Maximum context length in characters for LongBench-v2",
     )
     parser.add_argument(
         "--min-context-length",
         type=int,
-        help="Minimum context length in tokens for LongBench-v2",
+        help="Minimum context length in characters for LongBench-v2",
     )
 
     args = parser.parse_args()

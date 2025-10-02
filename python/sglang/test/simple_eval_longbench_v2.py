@@ -9,7 +9,6 @@ https://arxiv.org/abs/2412.15204
 import csv
 import json
 import os
-import random
 import re
 from typing import Any, Dict, List, Optional
 
@@ -107,7 +106,7 @@ class LongBenchV2Eval(Eval):
 
     def __init__(
         self,
-        data_source: str = "THUDM/LongBench-v2",
+        data_source: str = DEFAULT_DATASET,
         num_examples: Optional[int] = None,
         num_threads: int = 1,
         n_repeats: int = 1,
@@ -124,8 +123,8 @@ class LongBenchV2Eval(Eval):
             num_threads: Number of threads for parallel processing
             n_repeats: Number of times to repeat evaluation for error bars
             categories: List of task categories to include (None for all)
-            max_context_length: Maximum context length in tokens
-            min_context_length: Minimum context length in tokens
+            max_context_length: Maximum context length in characters
+            min_context_length: Minimum context length in characters
         """
         # Load dataset based on data source type
         examples = self._load_dataset(data_source)
@@ -140,10 +139,9 @@ class LongBenchV2Eval(Eval):
             )
 
         # Sample examples if specified
-        rng = random.Random(0)
         if num_examples:
             assert n_repeats == 1, "n_repeats only supported when not sampling examples"
-            examples = rng.sample(examples, min(num_examples, len(examples)))
+            examples = examples[: min(num_examples, len(examples))]
 
         # Repeat examples for multiple runs
         examples = examples * n_repeats
@@ -162,7 +160,7 @@ class LongBenchV2Eval(Eval):
             print(f"Filtered to categories: {categories}")
         if min_context_length or max_context_length:
             print(
-                f"Context length filter: {min_context_length}-{max_context_length} tokens"
+                f"Context length filter: {min_context_length}-{max_context_length} characters"
             )
 
     def _load_dataset(self, data_source: str) -> List[Dict[str, Any]]:
@@ -254,16 +252,15 @@ class LongBenchV2Eval(Eval):
         min_length: Optional[int],
         max_length: Optional[int],
     ) -> List[Dict[str, Any]]:
-        """Filter examples by context length."""
+        """Filter examples by context length measured in characters."""
         filtered = []
         for example in examples:
             context = example.get("context", "")
-            # Rough token count approximation (4 chars per token)
-            token_count = len(context) // 4
+            context_length = len(context)
 
-            if min_length and token_count < min_length:
+            if min_length is not None and context_length < min_length:
                 continue
-            if max_length and token_count > max_length:
+            if max_length is not None and context_length > max_length:
                 continue
 
             filtered.append(example)
@@ -318,6 +315,10 @@ class LongBenchV2Eval(Eval):
             category = row.get("category", row.get("domain", "unknown"))
             if category in TASK_CATEGORIES:
                 metrics[category] = score
+
+            difficulty = row.get("difficulty")
+            if isinstance(difficulty, str) and difficulty:
+                metrics[f"difficulty_{difficulty.lower()}"] = score
 
             return SingleEvalResult(
                 html=html,

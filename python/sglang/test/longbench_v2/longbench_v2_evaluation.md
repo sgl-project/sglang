@@ -91,8 +91,8 @@ eval_obj = LongBenchV2Eval(
 # Focus on medium-length contexts
 eval_obj = LongBenchV2Eval(
     data_source="THUDM/LongBench-v2",
-    min_context_length=32000,  # tokens
-    max_context_length=128000  # tokens
+    min_context_length=32000,  # characters
+    max_context_length=128000  # characters
 )
 ```
 
@@ -159,9 +159,10 @@ Each task category gets its own metric:
 
 ### Context Length Metrics
 
-- `short_context`: Accuracy on contexts < 32k tokens
-- `medium_context`: Accuracy on contexts 32k-128k tokens
-- `long_context`: Accuracy on contexts > 128k tokens
+- `short_context`: Accuracy on contexts < 32k characters
+- `medium_context`: Accuracy on contexts 32k-128k characters
+- `long_context`: Accuracy on contexts > 128k characters
+- `difficulty_easy` / `difficulty_hard`: Accuracy grouped by dataset difficulty labels
 
 ## Performance Considerations
 
@@ -191,7 +192,6 @@ LongBench-v2 contains very long contexts (up to 2M words). Consider:
 
 ```bash
 pip install datasets  # For HuggingFace dataset support
-pip install pandas    # For CSV file support
 ```
 
 ## Example Results

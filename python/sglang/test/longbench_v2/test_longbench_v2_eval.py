@@ -160,6 +160,63 @@ def test_category_filtering():
         os.unlink(temp_file)
 
 
+def test_difficulty_metrics():
+    """Validate that difficulty-specific metrics are recorded."""
+
+    sample_data = [
+        {
+            "_id": "easy_001",
+            "domain": "single_document_qa",
+            "difficulty": "easy",
+            "question": "Easy question?",
+            "choice_A": "Correct",
+            "choice_B": "Wrong",
+            "choice_C": "Wrong",
+            "choice_D": "Wrong",
+            "answer": "A",
+            "context": "Easy context",
+        },
+        {
+            "_id": "hard_001",
+            "domain": "single_document_qa",
+            "difficulty": "hard",
+            "question": "Hard question?",
+            "choice_A": "Wrong",
+            "choice_B": "Correct",
+            "choice_C": "Wrong",
+            "choice_D": "Wrong",
+            "answer": "B",
+            "context": "Hard context",
+        },
+    ]
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(sample_data, f)
+        temp_file = f.name
+
+    class FixedSampler:  # noqa: D401 - simple helper
+        """Mock sampler returning the correct answer based on question text."""
+
+        def _pack_message(self, content: str, role: str):
+            return {"content": content, "role": role}
+
+        def __call__(self, messages):
+            prompt = messages[0]["content"]
+            if "Easy question" in prompt:
+                return "The correct answer is (A)"
+            return "The correct answer is (B)"
+
+    try:
+        eval_instance = LongBenchV2Eval(data_source=temp_file, num_threads=1)
+        result = eval_instance(FixedSampler())
+
+        assert result.metrics.get("difficulty_easy") == 1.0
+        assert result.metrics.get("difficulty_hard") == 1.0
+        print("✓ Difficulty metrics recorded correctly")
+    finally:
+        os.unlink(temp_file)
+
+
 def main():
     """Run all tests."""
     print("Testing simplified LongBench-v2 evaluation utility...\n")
@@ -168,6 +225,7 @@ def main():
     test_extract_longbench_v2_answer()
     test_longbench_v2_eval_initialization()
     test_category_filtering()
+    test_difficulty_metrics()
 
     print("\n" + "=" * 50)
     print("✅ ALL TESTS PASSED!")
