@@ -41,7 +41,7 @@ class _Dumper:
         if not self._enable:
             return
 
-        # Users may want to `dump` only on some ranks, thus we negotiate the name here
+        # Users may want to `dump` only on some ranks, thus determine name here
         if self._partial_name is None:
             self._partial_name = _get_partial_name()
 
