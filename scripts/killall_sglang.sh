@@ -1,29 +1,8 @@
 #!/bin/bash
 
-check_vram_clear() {
-    if command -v rocm-smi >/dev/null 2>&1; then
-        # Check if any GPU has VRAM allocated
-        if rocm-smi --showmemuse | grep -q "GPU Memory Allocated (VRAM%): [1-9]"; then
-            echo "Warning: VRAM is still allocated on some GPUs"
-            return 1
-        else
-            echo "VRAM is clear on all GPUs"
-            return 0
-        fi
-    elif command -v nvidia-smi >/dev/null 2>&1; then
-        # Check NVIDIA GPU memory usage
-        if nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | grep -q "^[1-9]"; then
-            echo "Warning: GPU memory is still allocated on some GPUs"
-            return 1
-        else
-            echo "GPU memory is clear on all GPUs"
-            return 0
-        fi
-    else
-        echo "No GPU monitoring tool found"
-        return 0
-    fi
-}
+# Source the VRAM checking function
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/check_vram_clear.sh"
 
 if [ "$1" = "rocm" ]; then
     echo "Running in ROCm mode"
