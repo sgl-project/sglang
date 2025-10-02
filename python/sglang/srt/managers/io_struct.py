@@ -1045,7 +1045,7 @@ class UpdateWeightsFromTensorReqOutput(BaseReq):
 
 
 @dataclass
-class InitWeightsSendGroupForRemoteInstanceReqInput:
+class InitWeightsSendGroupForRemoteInstanceReqInput(BaseReq):
     # The master address
     master_address: str
     # The ports for each rank's communication group
@@ -1061,13 +1061,13 @@ class InitWeightsSendGroupForRemoteInstanceReqInput:
 
 
 @dataclass
-class InitWeightsSendGroupForRemoteInstanceReqOutput:
+class InitWeightsSendGroupForRemoteInstanceReqOutput(BaseReq):
     success: bool
     message: str
 
 
 @dataclass
-class SendWeightsToRemoteInstanceReqInput:
+class SendWeightsToRemoteInstanceReqInput(BaseReq):
     # The master address
     master_address: str
     # The ports for each rank's communication group
@@ -1077,7 +1077,7 @@ class SendWeightsToRemoteInstanceReqInput:
 
 
 @dataclass
-class SendWeightsToRemoteInstanceReqOutput:
+class SendWeightsToRemoteInstanceReqOutput(BaseReq):
     success: bool
     message: str
 
@@ -1105,12 +1105,12 @@ class InitWeightsUpdateGroupReqOutput(BaseReq):
 
 
 @dataclass
-class DestroyWeightsUpdateGroupReqInput:
+class DestroyWeightsUpdateGroupReqInput(BaseReq):
     group_name: str = "weight_update_group"
 
 
 @dataclass
-class DestroyWeightsUpdateGroupReqOutput:
+class DestroyWeightsUpdateGroupReqOutput(BaseReq):
     success: bool
     message: str
 
@@ -1388,6 +1388,7 @@ class MultiTokenizerRegisterReq(BaseBatchReq):
 
 @dataclass
 class MultiTokenizerWrapper:
+    # FIXME(lsyin): remove this
     worker_id: int
     obj: Optional[Any] = None
 
@@ -1403,12 +1404,12 @@ class BlockReqInput(BaseReq):
 
 
 @dataclass
-class GetLoadReqInput:
+class GetLoadReqInput(BaseReq):
     pass
 
 
 @dataclass
-class GetLoadReqOutput:
+class GetLoadReqOutput(BaseReq):
     dp_rank: int
     num_reqs: int
     num_waiting_reqs: int
@@ -1416,5 +1417,5 @@ class GetLoadReqOutput:
 
 
 @dataclass
-class WatchLoadUpdateReq:
+class WatchLoadUpdateReq(BaseReq):
     loads: List[GetLoadReqOutput]
