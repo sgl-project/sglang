@@ -766,7 +766,7 @@ async fn test_max_tool_calls_limit() {
     mcp.stop().await;
 }
 
- /// Helper function to set up common test infrastructure for streaming MCP tests
+/// Helper function to set up common test infrastructure for streaming MCP tests
 /// Returns (mcp_server, worker, router, temp_dir)
 async fn setup_streaming_mcp_test() -> (
     MockMCPServer,
