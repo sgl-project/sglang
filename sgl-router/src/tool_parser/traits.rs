@@ -27,15 +27,6 @@ pub trait ToolParser: Send + Sync {
     /// Check if text contains tool calls in this parser's format
     fn detect_format(&self, text: &str) -> bool;
 
-    /// Reset parser state (for reuse across requests)
-    ///
-    /// Note: This method is currently never called in the codebase.
-    /// If you need to reset parser state, call helpers::reset_parser_state() directly.
-    /// This default implementation is a no-op to maintain trait compatibility.
-    fn reset(&mut self) {
-        // No-op by default
-    }
-
     /// Optionally expose a token-aware parser implementation.
     /// Default returns `None`, meaning the parser only supports text input.
     fn as_token_parser(&self) -> Option<&dyn TokenToolParser> {
