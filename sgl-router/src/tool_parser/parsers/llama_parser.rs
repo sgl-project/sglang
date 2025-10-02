@@ -2,23 +2,44 @@ use async_trait::async_trait;
 use serde_json::Value;
 use uuid;
 
+use crate::protocols::spec::Tool;
+
 use crate::tool_parser::{
     errors::{ToolParserError, ToolParserResult},
+    parsers::helpers,
     partial_json::PartialJson,
-    state::ParseState,
     traits::ToolParser,
-    types::{FunctionCall, StreamResult, ToolCall},
+    types::{FunctionCall, StreamingParseResult, ToolCall},
 };
 
 /// Llama 3.2 format parser for tool calls
 ///
 /// Handles the Llama 3.2 specific format:
-/// `<|python_tag|>{"name": "func", "arguments": {...}}`
+/// `<|python_tag|>{"name": "func", "parameters": {...}}`
 ///
 /// Also supports plain JSON without the python_tag prefix
 pub struct LlamaParser {
     /// Parser for handling incomplete JSON during streaming
     partial_json: PartialJson,
+
+    /// Buffer for accumulating incomplete patterns across chunks
+    buffer: String,
+
+    /// Stores complete tool call info (name and arguments) for each tool being parsed
+    prev_tool_call_arr: Vec<Value>,
+
+    /// Index of currently streaming tool call (-1 means no active tool)
+    current_tool_id: i32,
+
+    /// Flag for whether current tool's name has been sent to client
+    current_tool_name_sent: bool,
+
+    /// Tracks raw JSON string content streamed to client for each tool's arguments
+    streamed_args_for_tool: Vec<String>,
+
+    /// Token configuration
+    bot_token: &'static str,
+    tool_call_separator: &'static str,
 }
 
 impl LlamaParser {
@@ -26,6 +47,13 @@ impl LlamaParser {
     pub fn new() -> Self {
         Self {
             partial_json: PartialJson::default(),
+            buffer: String::new(),
+            prev_tool_call_arr: Vec::new(),
+            current_tool_id: -1,
+            current_tool_name_sent: false,
+            streamed_args_for_tool: Vec::new(),
+            bot_token: "<|python_tag|>",
+            tool_call_separator: ";",
         }
     }
 
@@ -76,39 +104,6 @@ impl LlamaParser {
         }
     }
 
-    /// Parse JSON value(s) into tool calls
-    fn parse_json_value(&self, value: &Value) -> ToolParserResult<Vec<ToolCall>> {
-        let mut tools = Vec::new();
-
-        match value {
-            Value::Array(arr) => {
-                // Parse each element in the array
-                for item in arr {
-                    if let Some(tool) = self.parse_single_object(item)? {
-                        tools.push(tool);
-                    }
-                }
-            }
-            Value::Object(_) => {
-                // Single tool call
-                if let Some(tool) = self.parse_single_object(value)? {
-                    tools.push(tool);
-                }
-            }
-            _ => {
-                // Not a valid tool call format
-                return Ok(vec![]);
-            }
-        }
-
-        Ok(tools)
-    }
-
-    /// Check if text contains potential tool call markers
-    fn has_python_tag(&self, text: &str) -> bool {
-        text.contains("<|python_tag|>")
-    }
-
     /// Parse semicolon-separated JSON objects
     fn parse_semicolon_separated(&self, content: &str) -> ToolParserResult<Vec<ToolCall>> {
         let mut all_tools = Vec::new();
@@ -135,6 +130,11 @@ impl LlamaParser {
         }
 
         Ok(all_tools)
+    }
+
+    /// Check if text has tool call
+    fn has_tool_call(&self, text: &str) -> bool {
+        text.contains("<|python_tag|>") || text.contains('{')
     }
 }
 
@@ -185,137 +185,57 @@ impl ToolParser for LlamaParser {
     }
 
     async fn parse_incremental(
-        &self,
+        &mut self,
         chunk: &str,
-        state: &mut ParseState,
-    ) -> ToolParserResult<StreamResult> {
-        state.buffer.push_str(chunk);
+        tools: &[Tool],
+    ) -> ToolParserResult<StreamingParseResult> {
+        // Append new text to buffer
+        self.buffer.push_str(chunk);
+        let current_text = &self.buffer.clone();
 
-        // In streaming mode, be more lenient - check for potential JSON start
-        let has_potential_json = state.buffer.contains('{');
-        let has_tag = self.has_python_tag(&state.buffer);
+        // Check if current_text has tool_call
+        let has_tool_start = self.has_tool_call(current_text)
+            || (self.current_tool_id >= 0 && current_text.starts_with(self.tool_call_separator));
 
-        // If we have neither python_tag nor potential JSON structure, return as normal text
-        if !has_tag && !has_potential_json {
-            // No relevant markers detected - return all buffered content as normal text
-            let normal_text = std::mem::take(&mut state.buffer);
-            return Ok(StreamResult::NormalText(normal_text));
-        }
+        if !has_tool_start {
+            // Only clear buffer if we're sure no tool call is starting
+            if helpers::ends_with_partial_token(&self.buffer, self.bot_token).is_none() {
+                let normal_text = self.buffer.clone();
+                self.buffer.clear();
 
-        // If we only have '{' without more content, wait for more data
-        let trimmed = state.buffer.trim();
-        if (trimmed == "{") && !has_tag {
-            return Ok(StreamResult::Incomplete);
-        }
-
-        // Check for text before python_tag and extract it as normal text
-        if let Some(tag_pos) = state.buffer.find("<|python_tag|>") {
-            if tag_pos > 0 {
-                // We have text before the python_tag - extract it as normal text
-                let normal_text: String = state.buffer.drain(..tag_pos).collect();
-                return Ok(StreamResult::NormalText(normal_text));
-            }
-        } else {
-            // For JSON without python_tag, look for the start of JSON structure
-            let brace_pos = state.buffer.find('{');
-            let bracket_pos = state.buffer.find('[');
-            let json_pos = brace_pos.iter().chain(bracket_pos.iter()).min().copied();
-
-            if let Some(pos) = json_pos {
-                if pos > 0 {
-                    // We have text before JSON structure - extract it as normal text
-                    let normal_text: String = state.buffer.drain(..pos).collect();
-                    return Ok(StreamResult::NormalText(normal_text));
-                }
-            }
-        }
-
-        // Extract JSON content based on whether we have python_tag
-        let (json_content, content_start_pos) = if self.has_python_tag(&state.buffer) {
-            // Extract content after python_tag
-            if let Some(tag_pos) = state.buffer.find("<|python_tag|>") {
-                let start = tag_pos + "<|python_tag|>".len();
-                (&state.buffer[start..], start)
+                return Ok(StreamingParseResult {
+                    normal_text,
+                    calls: vec![],
+                });
             } else {
-                (&state.buffer[..], 0)
+                // Might be partial bot_token, keep buffering
+                return Ok(StreamingParseResult::default());
             }
+        }
+
+        // Build tool indices
+        let tool_indices = helpers::get_tool_indices(tools);
+
+        // Determine start index for JSON parsing
+        let start_idx = if let Some(pos) = current_text.find(self.bot_token) {
+            pos + self.bot_token.len()
+        } else if self.current_tool_id >= 0 && current_text.starts_with(self.tool_call_separator) {
+            self.tool_call_separator.len()
         } else {
-            // Find where the actual content starts after trimming
-            let trimmed = state.buffer.trim_start();
-            let trim_offset = state.buffer.len() - trimmed.len();
-            (trimmed.trim_end(), trim_offset)
+            0
         };
 
-        // Check if we have a semicolon separator (multiple tools)
-        if let Some(semicolon_pos) = json_content.find(';') {
-            // We have multiple tools - try to parse the first one
-            let first_json = &json_content[..semicolon_pos];
-
-            if let Ok(value) = serde_json::from_str::<Value>(first_json.trim()) {
-                if let Some(tool) = self.parse_single_object(&value)? {
-                    // Remove the parsed JSON and semicolon from the buffer
-                    let end_pos = content_start_pos + semicolon_pos + 1; // +1 to include the semicolon
-                    state.buffer.drain(content_start_pos..end_pos);
-
-                    return Ok(StreamResult::ToolComplete(tool));
-                }
-            }
-        }
-
-        // Try to parse with partial JSON parser
-        match self.partial_json.parse_value(json_content) {
-            Ok((value, consumed)) => {
-                // Check if we have a complete JSON structure
-                if consumed == json_content.len() {
-                    // Check if this is truly complete
-                    let looks_complete = json_content.ends_with('}') || json_content.ends_with(']');
-
-                    if looks_complete {
-                        // Complete JSON, parse tool calls
-                        let tools = self.parse_json_value(&value)?;
-                        if !tools.is_empty() {
-                            // Clear buffer since we consumed everything
-                            state.buffer.clear();
-
-                            // Return the first tool as complete
-                            if let Some(tool) = tools.into_iter().next() {
-                                return Ok(StreamResult::ToolComplete(tool));
-                            }
-                        }
-                    }
-                } else {
-                    // Partial JSON, try to extract tool name for streaming
-                    if let Some(name) = value.get("name").and_then(|v| v.as_str()) {
-                        // Return tool name once we see it
-                        if !state.in_string {
-                            state.in_string = true; // Use as a flag for "name sent"
-                            return Ok(StreamResult::ToolName {
-                                index: 0,
-                                name: name.to_string(),
-                            });
-                        }
-
-                        // Check for complete arguments
-                        if let Some(args) =
-                            value.get("arguments").or_else(|| value.get("parameters"))
-                        {
-                            if let Ok(args_str) = serde_json::to_string(args) {
-                                return Ok(StreamResult::ToolArguments {
-                                    index: 0,
-                                    arguments: args_str,
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-            Err(_) => {
-                // Failed to parse even as partial JSON
-                // Continue waiting for more data
-            }
-        }
-
-        Ok(StreamResult::Incomplete)
+        helpers::handle_json_tool_streaming(
+            current_text,
+            start_idx,
+            &mut self.partial_json,
+            &tool_indices,
+            &mut self.buffer,
+            &mut self.current_tool_id,
+            &mut self.current_tool_name_sent,
+            &mut self.streamed_args_for_tool,
+            &mut self.prev_tool_call_arr,
+        )
     }
 
     fn detect_format(&self, text: &str) -> bool {
