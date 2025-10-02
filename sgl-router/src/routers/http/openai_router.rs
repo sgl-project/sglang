@@ -1180,7 +1180,9 @@ impl OpenAIRouter {
                                 match action {
                                     StreamAction::Forward => {
                                         // Skip individual function_call_arguments.delta events - we'll send them as one
-                                        if event_name.as_deref() == Some("response.function_call_arguments.delta") {
+                                        if event_name.as_deref()
+                                            == Some("response.function_call_arguments.delta")
+                                        {
                                             continue;
                                         }
 
@@ -1197,21 +1199,39 @@ impl OpenAIRouter {
                                         };
 
                                         // Check if this is function_call_arguments.done - need to send buffered args first
-                                        if event_name.as_deref() == Some("response.function_call_arguments.done") {
+                                        if event_name.as_deref()
+                                            == Some("response.function_call_arguments.done")
+                                        {
                                             // Parse the event data to get output_index and item_id
-                                            if let Ok(event_data) = serde_json::from_str::<Value>(&data) {
+                                            if let Ok(event_data) =
+                                                serde_json::from_str::<Value>(&data)
+                                            {
                                                 // Send the complete arguments as a single delta event
-                                                if let Some(output_index) = event_data.get("output_index").and_then(|v| v.as_u64()).map(|v| v as usize) {
-                                                    if let Some(call) = handler.pending_calls.iter().find(|c| c.output_index == output_index) {
+                                                if let Some(output_index) = event_data
+                                                    .get("output_index")
+                                                    .and_then(|v| v.as_u64())
+                                                    .map(|v| v as usize)
+                                                {
+                                                    if let Some(call) = handler
+                                                        .pending_calls
+                                                        .iter()
+                                                        .find(|c| c.output_index == output_index)
+                                                    {
                                                         if !call.arguments_buffer.is_empty() {
                                                             // Get item_id and transform it
-                                                            let item_id = event_data.get("item_id").and_then(|v| v.as_str()).unwrap_or("");
-                                                            let mcp_item_id = if item_id.starts_with("fc_") {
-                                                                format!("mcp_{}", &item_id[3..])
-                                                            } else {
-                                                                item_id.to_string()
-                                                            };
-                                                            
+                                                            let item_id = event_data
+                                                                .get("item_id")
+                                                                .and_then(|v| v.as_str())
+                                                                .unwrap_or("");
+                                                            let mcp_item_id =
+                                                                if let Some(stripped) =
+                                                                    item_id.strip_prefix("fc_")
+                                                                {
+                                                                    format!("mcp_{}", stripped)
+                                                                } else {
+                                                                    item_id.to_string()
+                                                                };
+
                                                             let delta_event = json!({
                                                                 "type": "response.mcp_call_arguments.delta",
                                                                 "output_index": output_index,
@@ -1219,7 +1239,10 @@ impl OpenAIRouter {
                                                                 "delta": call.arguments_buffer
                                                             });
                                                             let delta_block = format!("event: response.mcp_call_arguments.delta\ndata: {}\n\n", delta_event);
-                                                            if tx.send(Ok(Bytes::from(delta_block))).is_err() {
+                                                            if tx
+                                                                .send(Ok(Bytes::from(delta_block)))
+                                                                .is_err()
+                                                            {
                                                                 return;
                                                             }
                                                         }
@@ -1245,29 +1268,46 @@ impl OpenAIRouter {
                                         }
 
                                         // After sending output_item.added for mcp_call, inject mcp_call.in_progress event
-                                        if event_name.as_deref() == Some("response.output_item.added") {
-                                            if let Ok(event_data) = serde_json::from_str::<Value>(&data) {
+                                        if event_name.as_deref()
+                                            == Some("response.output_item.added")
+                                        {
+                                            if let Ok(event_data) =
+                                                serde_json::from_str::<Value>(&data)
+                                            {
                                                 if let Some(item) = event_data.get("item") {
-                                                    if item.get("type").and_then(|v| v.as_str()) == Some("function_call") 
-                                                        || item.get("type").and_then(|v| v.as_str()) == Some("function_tool_call") {
+                                                    if item.get("type").and_then(|v| v.as_str())
+                                                        == Some("function_call")
+                                                        || item.get("type").and_then(|v| v.as_str())
+                                                            == Some("function_tool_call")
+                                                    {
                                                         // Get item_id and output_index
                                                         if let (Some(item_id), Some(output_index)) = (
                                                             item.get("id").and_then(|v| v.as_str()),
-                                                            event_data.get("output_index").and_then(|v| v.as_u64())
+                                                            event_data
+                                                                .get("output_index")
+                                                                .and_then(|v| v.as_u64()),
                                                         ) {
-                                                            let mcp_item_id = if item_id.starts_with("fc_") {
-                                                                format!("mcp_{}", &item_id[3..])
-                                                            } else {
-                                                                item_id.to_string()
-                                                            };
-                                                            
+                                                            let mcp_item_id =
+                                                                if let Some(stripped) =
+                                                                    item_id.strip_prefix("fc_")
+                                                                {
+                                                                    format!("mcp_{}", stripped)
+                                                                } else {
+                                                                    item_id.to_string()
+                                                                };
+
                                                             let in_progress_event = json!({
                                                                 "type": "response.mcp_call.in_progress",
                                                                 "output_index": output_index,
                                                                 "item_id": mcp_item_id
                                                             });
                                                             let in_progress_block = format!("event: response.mcp_call.in_progress\ndata: {}\n\n", in_progress_event);
-                                                            if tx.send(Ok(Bytes::from(in_progress_block))).is_err() {
+                                                            if tx
+                                                                .send(Ok(Bytes::from(
+                                                                    in_progress_block,
+                                                                )))
+                                                                .is_err()
+                                                            {
                                                                 return;
                                                             }
                                                         }
@@ -1481,15 +1521,15 @@ impl OpenAIRouter {
                         if item_type == "function_call" || item_type == "function_tool_call" {
                             item["type"] = json!("mcp_call");
                             item["server_label"] = json!(server_label);
-                            
+
                             // Transform ID from fc_* to mcp_*
                             if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
-                                if id.starts_with("fc_") {
-                                    let new_id = format!("mcp_{}", &id[3..]);
+                                if let Some(stripped) = id.strip_prefix("fc_") {
+                                    let new_id = format!("mcp_{}", stripped);
                                     item["id"] = json!(new_id);
                                 }
                             }
-                            
+
                             changed = true;
                         }
                     }
@@ -1502,15 +1542,15 @@ impl OpenAIRouter {
                         if item_type == "function_call" || item_type == "function_tool_call" {
                             item["type"] = json!("mcp_call");
                             item["server_label"] = json!(server_label);
-                            
+
                             // Transform ID from fc_* to mcp_*
                             if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
-                                if id.starts_with("fc_") {
-                                    let new_id = format!("mcp_{}", &id[3..]);
+                                if let Some(stripped) = id.strip_prefix("fc_") {
+                                    let new_id = format!("mcp_{}", stripped);
                                     item["id"] = json!(new_id);
                                 }
                             }
-                            
+
                             changed = true;
                         }
                     }
@@ -1519,18 +1559,18 @@ impl OpenAIRouter {
             Some("response.function_call_arguments.done") => {
                 // Change event type to mcp_call_arguments.done
                 parsed["type"] = json!("response.mcp_call_arguments.done");
-                
+
                 // Transform item_id from fc_* to mcp_*
                 if let Some(item_id) = parsed.get("item_id").and_then(|v| v.as_str()) {
-                    if item_id.starts_with("fc_") {
-                        let new_id = format!("mcp_{}", &item_id[3..]);
+                    if let Some(stripped) = item_id.strip_prefix("fc_") {
+                        let new_id = format!("mcp_{}", stripped);
                         parsed["item_id"] = json!(new_id);
                     }
                 }
-                
+
                 // The arguments field should already be in the event from upstream
                 // Just ensure it's present
-                
+
                 changed = true;
             }
             _ => {}
@@ -1612,7 +1652,10 @@ impl OpenAIRouter {
         );
 
         // Get the mcp_call item_id
-        let item_id = mcp_call_item.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        let item_id = mcp_call_item
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
 
         // Event 1: response.mcp_call.completed
         let completed_event = format!(
