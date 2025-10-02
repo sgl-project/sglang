@@ -1,5 +1,4 @@
 #!/bin/bash
-set -e
 
 check_vram_clear() {
     if command -v rocm-smi >/dev/null 2>&1; then
@@ -30,8 +29,8 @@ check_vram_clear() {
     fi
 }
 
-if [ "$1" = "rocm" ]; then
-    check_vram_clear
-else
+# If this script is run directly (not sourced), run the check
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    set -e
     check_vram_clear
 fi
