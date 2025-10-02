@@ -1399,7 +1399,10 @@ class DeepseekV2AttentionMLA(nn.Module):
         """
         return (
             self.current_attention_backend == "trtllm_mla"
-            and forward_batch.forward_mode.is_decode_or_idle()
+            and (
+                forward_batch.forward_mode.is_decode_or_idle()
+                or forward_batch.forward_mode.is_target_verify()
+            )
             and forward_batch.attn_backend.data_type == torch.float8_e4m3fn
         )
 
@@ -1965,6 +1968,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             tmp_lse = torch.empty_like(accum_lse)
             merge_state_v2(output, lse, accum_output, accum_lse, tmp_output, tmp_lse)
             accum_output, accum_lse = tmp_output, tmp_lse
+            del kv, k, v, output, lse, tmp_output, tmp_lse
 
         return accum_output
 
