@@ -577,6 +577,9 @@ class ServerArgs:
         # Handle any other necessary validations.
         self._handle_other_validations()
 
+        # Handle elastic expert parallelism.
+        self._handle_elastic_ep()
+
     def _handle_deprecated_args(self):
         # handle deprecated tool call parsers
         deprecated_tool_call_parsers = {"qwen25": "qwen", "glm45": "glm"}
@@ -1124,6 +1127,15 @@ class ServerArgs:
 
         if self.enable_eplb:
             assert self.ep_size > 1
+
+
+    def _handle_elastic_ep(self):
+        if self.elastic_ep_backend is not None:
+            assert self.enable_eplb, "Elastic EP requires EPLB to be enabled."
+            assert self.ep_dispatch_algorithm == "dynamic", "Elastic EP requires EPLB dynamic dispatch."
+            if self.eplb_algorithm == "auto" :
+                self.eplb_algorithm = "elasticity_aware"
+            assert  self.eplb_algorithm != "elasticity_aware", "Elastic EP requires eplb_algorithm to be set to 'auto' or 'elasticity_aware'."
 
     def _handle_expert_distribution_metrics(self):
         if self.enable_expert_distribution_metrics and (

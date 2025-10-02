@@ -51,7 +51,7 @@ from sglang.srt.distributed import (
     set_symm_mem_all_reduce,
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
-from sglang.srt.elastic_ep.elastic_ep import get_elastic_ep_state
+from sglang.srt.elastic_ep.elastic_ep import get_elastic_ep_state, init_elastic_ep_state
 from sglang.srt.eplb.eplb_manager import EPLBManager
 from sglang.srt.eplb.expert_distribution import (
     ExpertDistributionRecorder,
@@ -384,7 +384,7 @@ class ModelRunner:
             else None
         )
         self.expert_location_updater = ExpertLocationUpdater()
-
+        init_elastic_ep_state(self.server_args)
         # Load the model
         self.sampler = Sampler()
         self.load_model()
