@@ -900,6 +900,17 @@ class ForwardBatch:
         return self.tbo_split_seq_index is not None
 
 
+@dataclass
+class ForwardBatchOutput:
+    # FIXME(lsyin): unify the forward batch output between different spec and parallelism
+    # need to be more organized
+    logits_output: Optional[torch.Tensor] = None
+    next_token_ids: Optional[torch.Tensor] = None
+    num_accepted_tokens: Optional[int] = None
+    pp_proxy_tensors: Optional[PPProxyTensors] = None
+    can_run_cuda_graph: bool = False
+
+
 def enable_num_token_non_padded(server_args):
     return get_moe_expert_parallel_world_size() > 1
 

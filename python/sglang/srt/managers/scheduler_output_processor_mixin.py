@@ -173,8 +173,7 @@ class SchedulerOutputProcessorMixin:
             self.set_next_batch_sampling_info_done(batch)
 
         else:  # embedding or reward model
-            embeddings, bid = result.embeddings, result.bid
-            embeddings = embeddings.tolist()
+            embeddings = result.embeddings.tolist()
 
             # Check finish conditions
             for i, req in enumerate(batch.reqs):
