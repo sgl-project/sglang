@@ -76,7 +76,7 @@ from sglang.srt.managers.io_struct import (
     ClearHiCacheReqOutput,
     CloseSessionReqInput,
     DestroyWeightsUpdateGroupReqInput,
-    ExpertDistributionReq,
+    ExpertDistributionReq_,
     ExpertDistributionReqOutput,
     FlushCacheReqInput,
     FlushCacheReqOutput,
@@ -610,7 +610,7 @@ class Scheduler(
                 (GetInternalStateReq, self.get_internal_state),
                 (SetInternalStateReq, self.set_internal_state),
                 (RpcReqInput, self.handle_rpc_request),
-                (ExpertDistributionReq, self.expert_distribution_handle),
+                (ExpertDistributionReq_, self.expert_distribution_handle),
                 (LoadLoRAAdapterReqInput, self.load_lora_adapter),
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
                 (MultiTokenizerRegisterReq, self.register_multi_tokenizer),
@@ -2675,12 +2675,12 @@ class Scheduler(
         self.forward_sleep_time = t
         return SlowDownReqOutput()
 
-    def expert_distribution_handle(self, recv_req: ExpertDistributionReq):
-        if recv_req == ExpertDistributionReq.START_RECORD:
+    def expert_distribution_handle(self, recv_req: ExpertDistributionReq_):
+        if recv_req == ExpertDistributionReq_.START_RECORD:
             get_global_expert_distribution_recorder().start_record()
-        elif recv_req == ExpertDistributionReq.STOP_RECORD:
+        elif recv_req == ExpertDistributionReq_.STOP_RECORD:
             get_global_expert_distribution_recorder().stop_record()
-        elif recv_req == ExpertDistributionReq.DUMP_RECORD:
+        elif recv_req == ExpertDistributionReq_.DUMP_RECORD:
             get_global_expert_distribution_recorder().dump_record()
         else:
             raise ValueError(f"Unrecognized ExpertDistributionReq value: {recv_req=}")

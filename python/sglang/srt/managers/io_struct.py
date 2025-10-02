@@ -61,7 +61,7 @@ class BaseBatchReq(ABC):
 
 
 @dataclass
-class SessionParams(BaseReq):
+class SessionParams:
     id: Optional[str] = None
     offset: Optional[int] = None
     replace: Optional[bool] = None
@@ -806,7 +806,7 @@ class BatchTokenizedEmbeddingReqInput(BaseBatchReq):
 
 
 @dataclass
-class BatchTokenIDOut(BaseBatchReq):
+class BatchTokenIDOutput(BaseBatchReq):
     # The finish reason
     finished_reasons: List[BaseFinishReason]
     # For incremental decoding
@@ -878,7 +878,7 @@ class BatchMultimodalDecodeReq(BaseBatchReq):
 
 
 @dataclass
-class BatchStrOut(BaseBatchReq):
+class BatchStrOutput(BaseBatchReq):
     # The finish reason
     finished_reasons: List[dict]
     # The output decoded strings
@@ -914,7 +914,7 @@ class BatchStrOut(BaseBatchReq):
 
 
 @dataclass
-class BatchMultimodalOut(BaseBatchReq):
+class BatchMultimodalOutput(BaseBatchReq):
     # The finish reason
     finished_reasons: List[dict]
     decoded_ids: List[List[int]]
@@ -939,7 +939,7 @@ class BatchMultimodalOut(BaseBatchReq):
 
 
 @dataclass
-class BatchEmbeddingOut(BaseBatchReq):
+class BatchEmbeddingOutput(BaseBatchReq):
     # The finish reason
     finished_reasons: List[BaseFinishReason]
     # The output embedding
@@ -1278,7 +1278,8 @@ class HealthCheckOutput(BaseReq):
     pass
 
 
-class ExpertDistributionReq(Enum):
+class ExpertDistributionReq_(Enum):
+    # FIXME: make it align with the convention
     START_RECORD = 1
     STOP_RECORD = 2
     DUMP_RECORD = 3
@@ -1372,13 +1373,13 @@ class UnloadLoRAAdapterReqInput(BaseReq):
 
 
 @dataclass
-class LoRAUpdateResult(BaseReq):
+class LoRAUpdateOutput(BaseReq):
     success: bool
     error_message: Optional[str] = None
     loaded_adapters: Optional[Dict[str, LoRARef]] = None
 
 
-LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = LoRAUpdateResult
+LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = LoRAUpdateOutput
 
 
 @dataclass
@@ -1419,3 +1420,29 @@ class GetLoadReqOutput(BaseReq):
 @dataclass
 class WatchLoadUpdateReq(BaseReq):
     loads: List[GetLoadReqOutput]
+
+
+def _check_all_req_types():
+    """A helper function to check all request types are defined in this file."""
+    import inspect
+    import sys
+
+    all_classes = inspect.getmembers(sys.modules[__name__], inspect.isclass)
+    for class_type in all_classes:
+        # check its name
+        name = class_type[0]
+        is_io_struct = (
+            name.endswith("Req") or name.endswith("Input") or name.endswith("Output")
+        )
+        is_base_req = issubclass(class_type[1], BaseReq) or issubclass(
+            class_type[1], BaseBatchReq
+        )
+        if is_io_struct and not is_base_req:
+            raise ValueError(f"{name} is not a subclass of BaseReq or BaseBatchReq.")
+        if is_base_req and not is_io_struct:
+            raise ValueError(
+                f"{name} is a subclass of BaseReq but not follow the naming convention."
+            )
+
+
+_check_all_req_types()

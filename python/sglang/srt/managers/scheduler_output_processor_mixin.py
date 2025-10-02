@@ -9,7 +9,11 @@ import torch
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.io_struct import AbortReq, BatchEmbeddingOut, BatchTokenIDOut
+from sglang.srt.managers.io_struct import (
+    AbortReq,
+    BatchEmbeddingOutput,
+    BatchTokenIDOutput,
+)
 from sglang.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
 
 if TYPE_CHECKING:
@@ -715,7 +719,7 @@ class SchedulerOutputProcessorMixin:
                 return
 
             self.send_to_detokenizer.send_pyobj(
-                BatchTokenIDOut(
+                BatchTokenIDOutput(
                     finished_reasons,
                     decoded_texts,
                     decode_ids_list,
@@ -762,7 +766,7 @@ class SchedulerOutputProcessorMixin:
                 prompt_tokens.append(len(req.origin_input_ids))
                 cached_tokens.append(req.cached_tokens)
         self.send_to_detokenizer.send_pyobj(
-            BatchEmbeddingOut(
+            BatchEmbeddingOutput(
                 finished_reasons,
                 embeddings,
                 prompt_tokens,

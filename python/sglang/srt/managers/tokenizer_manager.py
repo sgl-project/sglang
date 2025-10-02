@@ -48,15 +48,15 @@ from sglang.srt.hf_transformers_utils import (
     get_tokenizer,
     get_tokenizer_from_processor,
 )
-from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
+from sglang.srt.lora.lora_registry import LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
     AbortReq,
-    BatchEmbeddingOut,
-    BatchMultimodalOut,
-    BatchStrOut,
-    BatchTokenIDOut,
+    BatchEmbeddingOutput,
+    BatchMultimodalOutput,
+    BatchStrOutput,
+    BatchTokenIDOutput,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
     ConfigureLoggingReq,
@@ -339,10 +339,10 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             [
                 (
                     (
-                        BatchStrOut,
-                        BatchEmbeddingOut,
-                        BatchTokenIDOut,
-                        BatchMultimodalOut,
+                        BatchStrOutput,
+                        BatchEmbeddingOutput,
+                        BatchTokenIDOutput,
+                        BatchMultimodalOutput,
                     ),
                     self._handle_batch_output,
                 ),
@@ -1301,7 +1301,10 @@ class TokenizerManager(TokenizerCommunicatorMixin):
     def _handle_batch_output(
         self,
         recv_obj: Union[
-            BatchStrOut, BatchEmbeddingOut, BatchMultimodalOut, BatchTokenIDOut
+            BatchStrOutput,
+            BatchEmbeddingOutput,
+            BatchMultimodalOutput,
+            BatchTokenIDOutput,
         ],
     ):
         for i, rid in enumerate(recv_obj.rids):
@@ -1335,7 +1338,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     i,
                 )
 
-            if not isinstance(recv_obj, BatchEmbeddingOut):
+            if not isinstance(recv_obj, BatchEmbeddingOutput):
                 meta_info.update(
                     {
                         "completion_tokens": recv_obj.completion_tokens[i],
@@ -1346,7 +1349,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             if getattr(recv_obj, "output_hidden_states", None):
                 meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
 
-            if isinstance(recv_obj, BatchStrOut):
+            if isinstance(recv_obj, BatchStrOutput):
                 state.text += recv_obj.output_strs[i]
                 if state.obj.stream:
                     state.output_ids.extend(recv_obj.output_ids[i])
@@ -1361,7 +1364,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     "output_ids": output_token_ids,
                     "meta_info": meta_info,
                 }
-            elif isinstance(recv_obj, BatchTokenIDOut):
+            elif isinstance(recv_obj, BatchTokenIDOutput):
                 if self.server_args.stream_output and state.obj.stream:
                     state.output_ids.extend(recv_obj.output_ids[i])
                     output_token_ids = state.output_ids[state.last_output_offset :]
@@ -1374,10 +1377,10 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     "output_ids": output_token_ids,
                     "meta_info": meta_info,
                 }
-            elif isinstance(recv_obj, BatchMultimodalOut):
+            elif isinstance(recv_obj, BatchMultimodalOutput):
                 raise NotImplementedError("BatchMultimodalOut not implemented")
             else:
-                assert isinstance(recv_obj, BatchEmbeddingOut)
+                assert isinstance(recv_obj, BatchEmbeddingOutput)
                 out_dict = {
                     "embedding": recv_obj.embeddings[i],
                     "meta_info": meta_info,
@@ -1416,7 +1419,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         top_logprobs_num: int,
         token_ids_logprob: List[int],
         return_text_in_logprobs: bool,
-        recv_obj: BatchStrOut,
+        recv_obj: BatchStrOutput,
         recv_obj_index: int,
     ):
         if recv_obj.input_token_logprobs_val is None:
@@ -1534,7 +1537,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 ret.append(None)
         return ret
 
-    def collect_metrics(self, state: ReqState, recv_obj: BatchStrOut, i: int):
+    def collect_metrics(self, state: ReqState, recv_obj: BatchStrOutput, i: int):
         completion_tokens = (
             recv_obj.completion_tokens[i]
             if getattr(recv_obj, "completion_tokens", None)
