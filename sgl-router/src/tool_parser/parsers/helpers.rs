@@ -2,6 +2,9 @@ use crate::protocols::spec::Tool;
 use serde_json::Value;
 use std::collections::HashMap;
 
+use crate::tool_parser::errors::{ToolParserError, ToolParserResult};
+use crate::tool_parser::types::{StreamingParseResult, ToolCallItem};
+
 /// Get a mapping of tool names to their indices
 pub fn get_tool_indices(tools: &[Tool]) -> HashMap<String, usize> {
     tools
@@ -136,10 +139,7 @@ pub fn handle_json_tool_streaming(
     current_tool_name_sent: &mut bool,
     streamed_args_for_tool: &mut Vec<String>,
     prev_tool_call_arr: &mut Vec<Value>,
-) -> crate::tool_parser::errors::ToolParserResult<crate::tool_parser::types::StreamingParseResult> {
-    use crate::tool_parser::errors::ToolParserError;
-    use crate::tool_parser::types::{StreamingParseResult, ToolCallItem};
-
+) -> ToolParserResult<StreamingParseResult> {
     // Check if we have content to parse
     if start_idx >= current_text.len() {
         return Ok(StreamingParseResult::default());
