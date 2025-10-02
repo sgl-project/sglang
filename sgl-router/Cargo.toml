@@ -38,6 +38,7 @@ dashmap = "6.1.0"
 http = "1.1.0"
 tokio = { version = "1.42.0", features = ["full"] }
 async-trait = "0.1"
+async-stream = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "chrono"] }
 tracing-log = "0.2"
