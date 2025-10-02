@@ -766,17 +766,15 @@ async fn test_max_tool_calls_limit() {
     mcp.stop().await;
 }
 
-#[tokio::test]
-async fn test_streaming_with_mcp_tool_calls() {
-    // This test verifies that streaming works with MCP tool calls:
-    // 1. Initial streaming request with MCP tools
-    // 2. Mock worker streams text, then function_call deltas
-    // 3. Router buffers function call, executes MCP tool
-    // 4. Router resumes streaming with tool results
-    // 5. Mock worker streams final answer
-    // 6. Verify SSE events are properly formatted
-
-    let mut mcp = MockMCPServer::start().await.expect("start mcp");
+ /// Helper function to set up common test infrastructure for streaming MCP tests
+/// Returns (mcp_server, worker, router, temp_dir)
+async fn setup_streaming_mcp_test() -> (
+    MockMCPServer,
+    MockWorker,
+    Box<dyn sglang_router_rs::routers::RouterTrait>,
+    tempfile::TempDir,
+) {
+    let mcp = MockMCPServer::start().await.expect("start mcp");
     let mcp_yaml = format!(
         "servers:\n  - name: mock\n    protocol: streamable\n    url: {}\n",
         mcp.url()
@@ -834,6 +832,21 @@ async fn test_streaming_with_mcp_tool_calls() {
     let router = RouterFactory::create_router(&Arc::new(ctx))
         .await
         .expect("router");
+
+    (mcp, worker, router, dir)
+}
+
+#[tokio::test]
+async fn test_streaming_with_mcp_tool_calls() {
+    // This test verifies that streaming works with MCP tool calls:
+    // 1. Initial streaming request with MCP tools
+    // 2. Mock worker streams text, then function_call deltas
+    // 3. Router buffers function call, executes MCP tool
+    // 4. Router resumes streaming with tool results
+    // 5. Mock worker streams final answer
+    // 6. Verify SSE events are properly formatted
+
+    let (mut mcp, mut worker, router, _dir) = setup_streaming_mcp_test().await;
 
     // Build streaming request with MCP tools
     let req = ResponsesRequest {
@@ -946,57 +959,7 @@ async fn test_streaming_with_mcp_tool_calls() {
 #[tokio::test]
 async fn test_streaming_multi_turn_with_mcp() {
     // Test streaming with multiple tool call rounds
-    let mut mcp = MockMCPServer::start().await.expect("start mcp");
-
-    let mut worker = MockWorker::new(MockWorkerConfig {
-        port: 0,
-        worker_type: WorkerType::Regular,
-        health_status: HealthStatus::Healthy,
-        response_delay_ms: 0,
-        fail_rate: 0.0,
-    });
-    let worker_url = worker.start().await.expect("start worker");
-
-    let router_cfg = RouterConfig {
-        mode: RoutingMode::OpenAI {
-            worker_urls: vec![worker_url],
-        },
-        connection_mode: ConnectionMode::Http,
-        policy: PolicyConfig::Random,
-        host: "127.0.0.1".to_string(),
-        port: 0,
-        max_payload_size: 8 * 1024 * 1024,
-        request_timeout_secs: 60,
-        worker_startup_timeout_secs: 5,
-        worker_startup_check_interval_secs: 1,
-        dp_aware: false,
-        api_key: None,
-        discovery: None,
-        metrics: None,
-        log_dir: None,
-        log_level: Some("info".to_string()),
-        request_id_headers: None,
-        max_concurrent_requests: 32,
-        queue_size: 0,
-        queue_timeout_secs: 5,
-        rate_limit_tokens_per_second: None,
-        cors_allowed_origins: vec![],
-        retry: RetryConfig::default(),
-        circuit_breaker: CircuitBreakerConfig::default(),
-        disable_retries: false,
-        disable_circuit_breaker: false,
-        health_check: HealthCheckConfig::default(),
-        enable_igw: false,
-        model_path: None,
-        tokenizer_path: None,
-        history_backend: sglang_router_rs::config::HistoryBackend::Memory,
-        oracle: None,
-    };
-
-    let ctx = AppContext::new(router_cfg, reqwest::Client::new(), 64, None).expect("ctx");
-    let router = RouterFactory::create_router(&Arc::new(ctx))
-        .await
-        .expect("router");
+    let (mut mcp, mut worker, router, _dir) = setup_streaming_mcp_test().await;
 
     let req = ResponsesRequest {
         background: false,
