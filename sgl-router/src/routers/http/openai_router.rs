@@ -1346,6 +1346,7 @@ impl OpenAIRouter {
                     &state.conversation_history,
                     &state.original_input,
                     &tools_json,
+                    true, // is_streaming = true
                 ) {
                     Ok(resume_payload) => {
                         current_payload = resume_payload;
@@ -1932,6 +1933,7 @@ impl OpenAIRouter {
         conversation_history: &[Value],
         original_input: &ResponseInput,
         tools_json: &Value,
+        is_streaming: bool,
     ) -> Result<Value, String> {
         // Clone the base payload which already has cleaned fields
         let mut payload = base_payload.clone();
@@ -1976,8 +1978,8 @@ impl OpenAIRouter {
             }
         }
 
-        // Ensure non-streaming and no store to upstream
-        obj.insert("stream".to_string(), Value::Bool(false));
+        // Set streaming mode based on caller's context
+        obj.insert("stream".to_string(), Value::Bool(is_streaming));
         obj.insert("store".to_string(), Value::Bool(false));
 
         // Note: SGLang-specific fields were already removed from base_payload
@@ -2248,6 +2250,7 @@ impl OpenAIRouter {
                     &state.conversation_history,
                     &state.original_input,
                     &tools_json,
+                    false, // is_streaming = false (non-streaming tool loop)
                 )?;
             } else {
                 // No more tool calls, we're done
