@@ -809,13 +809,13 @@ class TokenizerMetricsCollector:
     def check_time_to_first_token_straggler(self, value: float) -> bool:
         his = self.histogram_time_to_first_token.labels(**self.labels)
         total_observations = sum(bucket._value for bucket in his._buckets)
-        if total_observations < 100:
+        if total_observations < 1000:
             return False
-        p99_threshold = total_observations * 0.99
+        p999_threshold = total_observations * 0.999
         cumulative_count = 0
         for i, bucket in enumerate(his._buckets):
             cumulative_count += bucket._value
-            if cumulative_count > p99_threshold:
+            if cumulative_count > p999_threshold:
                 return value >= his._upper_bounds[i]
         return False
 
