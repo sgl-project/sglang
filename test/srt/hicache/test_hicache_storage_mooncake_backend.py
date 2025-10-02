@@ -191,7 +191,7 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
         """Get additional server arguments specific to configuration - override in subclasses"""
 
         server_args = {
-            "--tp-size": 1,
+            "--tp-size": 2,
             "--hicache-ratio": 2,
             "--hicache-storage-backend": "mooncake",
         }
