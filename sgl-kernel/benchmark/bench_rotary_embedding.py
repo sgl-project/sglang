@@ -11,7 +11,7 @@ from sgl_kernel.testing.rotary_embedding import (
     create_inputs,
 )
 
-from sglang.srt.utils.bench_utils import bench_kineto
+from sglang.srt.bench_utils import bench_kineto
 
 # CI environment detection
 IS_CI = (
