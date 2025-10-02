@@ -22,6 +22,7 @@ from typing import List, Optional, Set, Union
 import torch
 from transformers import PretrainedConfig
 
+from sglang.srt.environ import envs
 from sglang.srt.hf_transformers_utils import (
     get_config,
     get_context_length,
@@ -31,7 +32,7 @@ from sglang.srt.hf_transformers_utils import (
 )
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import get_bool_env_var, is_hip, retry
+from sglang.srt.utils import is_hip, retry
 from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
@@ -237,7 +238,7 @@ class ModelConfig:
                     f"This may lead to incorrect model outputs or CUDA errors. Note that the derived context_length may differ from max_position_embeddings in the model's config."
                 )
                 if (
-                    get_bool_env_var("SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN")
+                    envs.SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN.get()
                     or is_in_ci()  # FIXME: fix this special case
                 ):
                     logger.warning(msg)
