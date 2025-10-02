@@ -23,6 +23,23 @@ use dashmap::DashMap;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
+/// Statistics about a router's workers
+#[derive(Debug, Clone)]
+pub struct RouterStats {
+    /// Average priority of workers (higher is better)
+    pub avg_priority: f32,
+    /// Average cost of workers (lower is better, 1.0 is baseline)
+    pub avg_cost: f32,
+    /// Average load across workers (lower is better)
+    pub avg_load: f32,
+    /// Number of healthy workers
+    pub healthy_workers: usize,
+    /// Total number of workers
+    pub total_workers: usize,
+    /// Whether this is a PD (prefill-decode) router
+    pub is_pd_mode: bool,
+}
+
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct RouterId(String);
 
@@ -217,14 +234,14 @@ impl RouterManager {
             }
         }
 
-        // Multi-router mode logic follows
-        let _priority_threshold = headers.and_then(|h| {
+        // Multi-router mode: Extract request preferences from headers
+        let priority_threshold = headers.and_then(|h| {
             h.get("x-worker-priority")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.parse::<u32>().ok())
         });
 
-        let _max_cost = headers.and_then(|h| {
+        let cost_threshold = headers.and_then(|h| {
             h.get("x-max-cost")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.parse::<f32>().ok())
@@ -238,13 +255,17 @@ impl RouterManager {
             })
             .unwrap_or(false);
 
+        // Get candidate routers - focus on single model if specified
         let candidate_routers = if let Some(model) = model_id {
+            // Single-model routing: only consider routers that have this specific model
             if let Some(router) = self.get_router_for_model(model) {
                 vec![router]
             } else {
+                debug!("No router found for model: {}", model);
                 Vec::new()
             }
         } else {
+            // No model specified: consider all routers
             self.routers
                 .iter()
                 .map(|entry| entry.value().clone())
@@ -255,27 +276,90 @@ impl RouterManager {
             return None;
         }
 
-        let mut best_router = None;
-        let mut best_score = 0.0;
+        let mut best_router: Option<Arc<dyn RouterTrait>> = None;
+        let mut best_priority: f32 = -1.0;
+        let mut best_cost: f32 = f32::MAX;
+        let mut best_load: f32 = f32::MAX;
 
         for router in candidate_routers {
-            let mut score = 1.0;
+            let stats = router.get_router_stats();
 
-            let is_pd = router.is_pd_mode();
-            if prefer_pd && is_pd {
-                score += 2.0;
-            } else if !prefer_pd && !is_pd {
-                score += 1.0;
+            // Skip routers with no healthy workers
+            if stats.healthy_workers == 0 {
+                debug!(
+                    "Skipping router {} with no healthy workers for model {:?}",
+                    router.router_type(),
+                    model_id
+                );
+                continue;
             }
 
-            // TODO: Once routers expose worker stats, we can evaluate:
-            // - Average worker priority vs priority_threshold
-            // - Average worker cost vs max_cost
-            // - Current load and health status
+            // PD preference filter
+            if prefer_pd && !stats.is_pd_mode {
+                continue;
+            }
 
-            if score > best_score {
-                best_score = score;
-                best_router = Some(router);
+            // Priority threshold filter (if specified)
+            if let Some(min_priority) = priority_threshold {
+                if stats.avg_priority < min_priority as f32 {
+                    debug!(
+                        "Skipping router {} with avg_priority {:.1} < threshold {}",
+                        router.router_type(),
+                        stats.avg_priority,
+                        min_priority
+                    );
+                    continue;
+                }
+            }
+
+            // cost threshold filter (if specified)
+            if let Some(max_cost) = cost_threshold {
+                if stats.avg_cost > max_cost as f32 {
+                    debug!(
+                        "Skipping router {} with avg_cost {:.1} > threshold {}",
+                        router.router_type(),
+                        stats.avg_cost,
+                        max_cost
+                    );
+                    continue;
+                }
+            }
+
+            // Selection logic: priority > cost > load
+            let should_select = if stats.avg_priority > best_priority {
+                // Higher priority wins
+                true
+            } else if stats.avg_priority == best_priority {
+                // Same priority, check cost
+                if stats.avg_cost < best_cost {
+                    // Lower cost wins
+                    true
+                } else if stats.avg_cost == best_cost {
+                    // Same cost, check load
+                    stats.avg_load < best_load
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if should_select {
+                best_priority = stats.avg_priority;
+                best_cost = stats.avg_cost;
+                best_load = stats.avg_load;
+                best_router = Some(router.clone());
+
+                debug!(
+                    "Selected router {} for model {:?} (priority={:.1}, cost={:.2}, load={:.1}, healthy={}/{})",
+                    router.router_type(),
+                    model_id,
+                    stats.avg_priority,
+                    stats.avg_cost,
+                    stats.avg_load,
+                    stats.healthy_workers,
+                    stats.total_workers
+                );
             }
         }
 

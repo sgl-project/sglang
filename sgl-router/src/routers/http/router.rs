@@ -123,6 +123,7 @@ impl Router {
         &self,
         model_id: Option<&str>,
         text: Option<&str>,
+        headers: Option<&HeaderMap>,
     ) -> Option<Arc<dyn Worker>> {
         let effective_model_id = if !self.enable_igw { None } else { model_id };
 
@@ -149,7 +150,9 @@ impl Router {
             None => self.policy_registry.get_default_policy(),
         };
 
-        let idx = policy.select_worker(&available, text)?;
+        // Create routing context for header-aware policies
+        let context = crate::policies::RoutingContext::new(headers, text, model_id);
+        let idx = policy.select_worker(&available, &context)?;
         Some(available[idx].clone())
     }
 
@@ -168,7 +171,7 @@ impl Router {
             &self.retry_config,
             // operation per attempt
             |_: u32| async {
-                let worker = match self.select_worker_for_model(model_id, Some(&text)) {
+                let worker = match self.select_worker_for_model(model_id, Some(&text), headers) {
                     Some(w) => w,
                     None => {
                         RouterMetrics::record_request_error(route, "no_available_workers");
@@ -773,6 +776,49 @@ impl RouterTrait for Router {
 
     fn router_type(&self) -> &'static str {
         "regular"
+    }
+
+    fn get_router_stats(&self) -> crate::routers::router_manager::RouterStats {
+        let workers = self.worker_registry.get_all();
+
+        if workers.is_empty() {
+            return crate::routers::router_manager::RouterStats {
+                avg_priority: 0.0,
+                avg_cost: 1.0,
+                avg_load: f32::MAX,
+                healthy_workers: 0,
+                total_workers: 0,
+                is_pd_mode: false,
+            };
+        }
+
+        let healthy_workers: Vec<_> = workers.iter().filter(|w| w.is_healthy()).collect();
+
+        if healthy_workers.is_empty() {
+            return crate::routers::router_manager::RouterStats {
+                avg_priority: 0.0,
+                avg_cost: 1.0,
+                avg_load: f32::MAX,
+                healthy_workers: 0,
+                total_workers: workers.len(),
+                is_pd_mode: false,
+            };
+        }
+
+        let total_priority: u32 = healthy_workers.iter().map(|w| w.priority()).sum();
+        let total_cost: f32 = healthy_workers.iter().map(|w| w.cost()).sum();
+        let total_load: usize = healthy_workers.iter().map(|w| w.load()).sum();
+
+        let count = healthy_workers.len() as f32;
+
+        crate::routers::router_manager::RouterStats {
+            avg_priority: total_priority as f32 / count,
+            avg_cost: total_cost / count,
+            avg_load: total_load as f32 / count,
+            healthy_workers: healthy_workers.len(),
+            total_workers: workers.len(),
+            is_pd_mode: false,
+        }
     }
 
     fn readiness(&self) -> Response {

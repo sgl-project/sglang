@@ -1,6 +1,6 @@
 //! Random load balancing policy
 
-use super::{get_healthy_worker_indices, LoadBalancingPolicy};
+use super::{get_healthy_worker_indices, LoadBalancingPolicy, RoutingContext};
 use crate::core::Worker;
 use crate::metrics::RouterMetrics;
 use rand::Rng;
@@ -22,7 +22,7 @@ impl LoadBalancingPolicy for RandomPolicy {
     fn select_worker(
         &self,
         workers: &[Arc<dyn Worker>],
-        _request_text: Option<&str>,
+        _context: &RoutingContext,
     ) -> Option<usize> {
         let healthy_indices = get_healthy_worker_indices(workers);
 
@@ -76,8 +76,9 @@ mod tests {
         ];
 
         let mut counts = HashMap::new();
+        let context = super::RoutingContext::from_text(None);
         for _ in 0..100 {
-            if let Some(idx) = policy.select_worker(&workers, None) {
+            if let Some(idx) = policy.select_worker(&workers, &context) {
                 *counts.entry(idx).or_insert(0) += 1;
             }
         }
@@ -107,8 +108,9 @@ mod tests {
         workers[0].set_healthy(false);
 
         // Should always select the healthy worker (index 1)
+        let context = super::RoutingContext::from_text(None);
         for _ in 0..10 {
-            assert_eq!(policy.select_worker(&workers, None), Some(1));
+            assert_eq!(policy.select_worker(&workers, &context), Some(1));
         }
     }
 
@@ -122,6 +124,7 @@ mod tests {
         )];
 
         workers[0].set_healthy(false);
-        assert_eq!(policy.select_worker(&workers, None), None);
+        let context = super::RoutingContext::from_text(None);
+        assert_eq!(policy.select_worker(&workers, &context), None);
     }
 }

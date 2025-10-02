@@ -59,7 +59,7 @@
     during the next eviction cycle.
 */
 
-use super::{get_healthy_worker_indices, CacheAwareConfig, LoadBalancingPolicy};
+use super::{get_healthy_worker_indices, CacheAwareConfig, LoadBalancingPolicy, RoutingContext};
 use crate::core::Worker;
 use crate::metrics::RouterMetrics;
 use crate::tree::Tree;
@@ -218,13 +218,16 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
     fn select_worker(
         &self,
         workers: &[Arc<dyn Worker>],
-        request_text: Option<&str>,
+        context: &RoutingContext,
     ) -> Option<usize> {
         let healthy_indices = get_healthy_worker_indices(workers);
 
         if healthy_indices.is_empty() {
             return None;
         }
+
+        // Extract request_text from context
+        let request_text = context.request_text;
 
         // Determine the model for this set of workers (router pre-filters by model)
         // All workers should be from the same model
@@ -376,7 +379,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         &self,
         prefill_workers: &[Arc<dyn Worker>],
         decode_workers: &[Arc<dyn Worker>],
-        request_text: Option<&str>,
+        context: &RoutingContext,
     ) -> Option<(usize, usize)> {
         // DEPRECATED: This method is no longer used when separate policies are configured.
         // The PD router now uses separate policies for prefill and decode selection.
@@ -387,7 +390,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         // - Decode: Use least-load routing for better load distribution
 
         // Select prefill worker using cache-aware logic
-        let prefill_idx = self.select_worker(prefill_workers, request_text)?;
+        let prefill_idx = self.select_worker(prefill_workers, context)?;
 
         // Select decode worker using least-load logic
         let healthy_decode = get_healthy_worker_indices(decode_workers);
@@ -454,14 +457,17 @@ mod tests {
         policy.init_workers(&workers);
 
         // First request should be distributed
-        let idx1 = policy.select_worker(&workers, Some("hello world")).unwrap();
+        let context1 = super::RoutingContext::from_text(Some("hello world"));
+        let idx1 = policy.select_worker(&workers, &context1).unwrap();
 
         // Same request should go to same worker (cache hit)
-        let idx2 = policy.select_worker(&workers, Some("hello world")).unwrap();
+        let context2 = super::RoutingContext::from_text(Some("hello world"));
+        let idx2 = policy.select_worker(&workers, &context2).unwrap();
         assert_eq!(idx1, idx2);
 
         // Similar request should also go to same worker
-        let idx3 = policy.select_worker(&workers, Some("hello")).unwrap();
+        let context3 = super::RoutingContext::from_text(Some("hello"));
+        let idx3 = policy.select_worker(&workers, &context3).unwrap();
         assert_eq!(idx1, idx3);
     }
 
@@ -492,8 +498,9 @@ mod tests {
         policy.init_workers(&workers);
 
         // Should select worker2 (lower load) despite cache affinity
+        let context = super::RoutingContext::from_text(Some("test"));
         for _ in 0..5 {
-            let idx = policy.select_worker(&workers, Some("test")).unwrap();
+            let idx = policy.select_worker(&workers, &context).unwrap();
             assert_eq!(idx, 1); // Should always pick worker2
         }
     }
@@ -521,15 +528,17 @@ mod tests {
         policy.init_workers(&workers);
 
         // Route some requests
-        policy.select_worker(&workers, Some("test1"));
-        policy.select_worker(&workers, Some("test2"));
+        let context1 = super::RoutingContext::from_text(Some("test1"));
+        let context2 = super::RoutingContext::from_text(Some("test2"));
+        policy.select_worker(&workers, &context1);
+        policy.select_worker(&workers, &context2);
 
         // Remove a worker
         policy.remove_worker_by_url("http://w1:8000");
         workers[0].set_healthy(false);
 
         // All requests should now go to worker2
-        let idx = policy.select_worker(&workers, Some("test1")).unwrap();
+        let idx = policy.select_worker(&workers, &context1).unwrap();
         assert_eq!(idx, 1);
     }
 }

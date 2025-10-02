@@ -1,6 +1,6 @@
 //! Power-of-two choices load balancing policy
 
-use super::{get_healthy_worker_indices, LoadBalancingPolicy};
+use super::{get_healthy_worker_indices, LoadBalancingPolicy, RoutingContext};
 use crate::core::Worker;
 use crate::metrics::RouterMetrics;
 use rand::Rng;
@@ -42,7 +42,7 @@ impl LoadBalancingPolicy for PowerOfTwoPolicy {
     fn select_worker(
         &self,
         workers: &[Arc<dyn Worker>],
-        _request_text: Option<&str>,
+        _context: &RoutingContext,
     ) -> Option<usize> {
         let healthy_indices = get_healthy_worker_indices(workers);
 
@@ -148,8 +148,9 @@ mod tests {
 
         // Run multiple selections
         let mut selected_counts = [0; 3];
+        let context = super::RoutingContext::from_text(None);
         for _ in 0..100 {
-            if let Some(idx) = policy.select_worker(&workers, None) {
+            if let Some(idx) = policy.select_worker(&workers, &context) {
                 selected_counts[idx] += 1;
             }
         }
@@ -183,8 +184,9 @@ mod tests {
 
         // Should prefer worker2 with lower cached load
         let mut w2_selected = 0;
+        let context = super::RoutingContext::from_text(None);
         for _ in 0..50 {
-            if let Some(idx) = policy.select_worker(&workers, None) {
+            if let Some(idx) = policy.select_worker(&workers, &context) {
                 if idx == 1 {
                     w2_selected += 1;
                 }
@@ -205,6 +207,7 @@ mod tests {
         )];
 
         // With single worker, should always select it
-        assert_eq!(policy.select_worker(&workers, None), Some(0));
+        let context = super::RoutingContext::from_text(None);
+        assert_eq!(policy.select_worker(&workers, &context), Some(0));
     }
 }

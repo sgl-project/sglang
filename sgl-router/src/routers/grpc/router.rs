@@ -370,8 +370,9 @@ impl GrpcRouter {
             None => self.policy_registry.get_default_policy(),
         };
 
-        // Select worker using the policy
-        let idx = policy.select_worker(&available, text)?;
+        // Create routing context (gRPC doesn't have HTTP headers, so use text-only context)
+        let context = crate::policies::RoutingContext::from_text(text);
+        let idx = policy.select_worker(&available, &context)?;
         Some(available[idx].clone())
     }
 
