@@ -334,17 +334,14 @@ class NativeSparseAttnBackend(AttentionBackend):
                 or forward_batch.forward_mode == ForwardMode.DRAFT_EXTEND
             ):
                 # Hack here, just to test the following path, change it later
+                # extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * batch_size
+
                 print(
-                    f"init_forward_metadata forward_batch.mode: {forward_batch.forward_mode.name}, accept_length_cpu: {forward_batch.spec_info.accept_length_cpu}"
+                    f"init_forward_metadata forward_batch.mode: {forward_batch.forward_mode.name}, seq_lens: {forward_batch.seq_lens}, seq_lens_cpu: {forward_batch.seq_lens_cpu}"
                 )
-                extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * batch_size
-                forward_batch.extend_seq_lens_cpu = extend_seq_lens_cpu
-                max_seqlen_q = max(extend_seq_lens_cpu)
+                max_seqlen_q = max(forward_batch.extend_seq_lens_cpu)
                 cu_seqlens_q = compute_cu_seqlens(
                     forward_batch.extend_seq_lens.to(torch.int32)
-                )
-                print(
-                    f"init_forward_metadata forward_batch.mode: {forward_batch.forward_mode.name}, max_seqlen_q: {max_seqlen_q}, forward_batch.extend_seq_lens_cpu: {forward_batch.extend_seq_lens_cpu}"
                 )
             else:
                 max_seqlen_q = max_seqlen_k
