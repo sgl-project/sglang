@@ -1,7 +1,7 @@
 use super::{CircuitBreaker, WorkerError, WorkerResult};
 use crate::core::CircuitState;
 use crate::core::{BasicWorkerBuilder, DPAwareWorkerBuilder};
-use crate::grpc::SglangSchedulerClient;
+use crate::grpc_client::SglangSchedulerClient;
 use crate::metrics::RouterMetrics;
 use async_trait::async_trait;
 use futures;
@@ -9,7 +9,7 @@ use serde_json;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 static WORKER_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
@@ -220,6 +220,16 @@ pub trait Worker: Send + Sync + fmt::Debug {
             .get("chat_template")
             .map(|s| s.as_str())
     }
+
+    /// Get or create a gRPC client for this worker
+    /// Returns None for HTTP workers, Some(client) for gRPC workers
+    async fn get_grpc_client(&self) -> WorkerResult<Option<Arc<Mutex<SglangSchedulerClient>>>>;
+
+    /// Reset the gRPC client connection (for reconnection scenarios)
+    /// No-op for HTTP workers
+    async fn reset_grpc_client(&self) -> WorkerResult<()> {
+        Ok(())
+    }
 }
 
 /// Connection mode for worker communication
@@ -327,8 +337,8 @@ pub struct BasicWorker {
     pub consecutive_failures: Arc<AtomicUsize>,
     pub consecutive_successes: Arc<AtomicUsize>,
     pub circuit_breaker: CircuitBreaker,
-    /// Optional gRPC client for gRPC workers
-    pub grpc_client: Option<Arc<Mutex<SglangSchedulerClient>>>,
+    /// Lazily initialized gRPC client for gRPC workers
+    pub grpc_client: Arc<RwLock<Option<Arc<Mutex<SglangSchedulerClient>>>>>,
 }
 
 impl fmt::Debug for BasicWorker {
@@ -337,7 +347,7 @@ impl fmt::Debug for BasicWorker {
             .field("metadata", &self.metadata)
             .field("healthy", &self.healthy.load(Ordering::Relaxed))
             .field("circuit_breaker", &self.circuit_breaker)
-            .field("has_grpc_client", &self.grpc_client.is_some())
+            .field("grpc_client", &"<RwLock>")
             .finish()
     }
 }
@@ -411,29 +421,44 @@ impl Worker for BasicWorker {
                 }
             }
             ConnectionMode::Grpc { .. } => {
-                if let Some(grpc_client) = &self.grpc_client {
-                    let mut client = grpc_client.lock().await;
-                    match client.health_check().await {
-                        Ok(response) => {
-                            tracing::debug!(
-                                "gRPC health check succeeded for {}: healthy={}",
-                                self.metadata.url,
+                // Use the new get_grpc_client() method for lazy initialization
+                match self.get_grpc_client().await {
+                    Ok(Some(grpc_client)) => {
+                        let mut client = grpc_client.lock().await;
+                        match client.health_check().await {
+                            Ok(response) => {
+                                tracing::debug!(
+                                    "gRPC health check succeeded for {}: healthy={}",
+                                    self.metadata.url,
+                                    response.healthy
+                                );
                                 response.healthy
-                            );
-                            response.healthy
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "gRPC health check RPC failed for {}: {:?}",
-                                self.metadata.url,
-                                e
-                            );
-                            false
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "gRPC health check RPC failed for {}: {:?}",
+                                    self.metadata.url,
+                                    e
+                                );
+                                false
+                            }
                         }
                     }
-                } else {
-                    tracing::error!("No gRPC client available for worker {}", self.metadata.url);
-                    false
+                    Ok(None) => {
+                        tracing::error!(
+                            "Worker {} is not a gRPC worker but has gRPC connection mode",
+                            self.metadata.url
+                        );
+                        false
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "Failed to get gRPC client for worker {}: {:?}",
+                            self.metadata.url,
+                            e
+                        );
+                        false
+                    }
                 }
             }
         };
@@ -501,6 +526,67 @@ impl Worker for BasicWorker {
 
     fn circuit_breaker(&self) -> &CircuitBreaker {
         &self.circuit_breaker
+    }
+
+    async fn get_grpc_client(&self) -> WorkerResult<Option<Arc<Mutex<SglangSchedulerClient>>>> {
+        match self.metadata.connection_mode {
+            ConnectionMode::Http => Ok(None),
+            ConnectionMode::Grpc { .. } => {
+                {
+                    let client_guard = self.grpc_client.read().await;
+                    if let Some(ref client) = *client_guard {
+                        return Ok(Some(client.clone()));
+                    }
+                }
+
+                let mut client_guard = self.grpc_client.write().await;
+
+                if let Some(ref client) = *client_guard {
+                    return Ok(Some(client.clone()));
+                }
+
+                tracing::info!(
+                    "Lazily initializing gRPC client for worker: {}",
+                    self.metadata.url
+                );
+                match SglangSchedulerClient::connect(&self.metadata.url).await {
+                    Ok(client) => {
+                        let client_arc = Arc::new(Mutex::new(client));
+                        *client_guard = Some(client_arc.clone());
+                        tracing::info!(
+                            "Successfully connected gRPC client for worker: {}",
+                            self.metadata.url
+                        );
+                        Ok(Some(client_arc))
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "Failed to connect gRPC client for worker {}: {}",
+                            self.metadata.url,
+                            e
+                        );
+                        Err(WorkerError::ConnectionFailed {
+                            url: self.metadata.url.clone(),
+                            reason: format!("Failed to connect to gRPC server: {}", e),
+                        })
+                    }
+                }
+            }
+        }
+    }
+
+    async fn reset_grpc_client(&self) -> WorkerResult<()> {
+        match self.metadata.connection_mode {
+            ConnectionMode::Http => Ok(()),
+            ConnectionMode::Grpc { .. } => {
+                let mut client_guard = self.grpc_client.write().await;
+                if client_guard.is_some() {
+                    tracing::info!("Resetting gRPC client for worker: {}", self.metadata.url);
+                    *client_guard = None;
+                }
+                Ok(())
+            }
+        }
     }
 }
 
@@ -629,6 +715,14 @@ impl Worker for DPAwareWorker {
 
     fn endpoint_url(&self, route: &str) -> String {
         format!("{}{}", self.base_url, route)
+    }
+
+    async fn get_grpc_client(&self) -> WorkerResult<Option<Arc<Mutex<SglangSchedulerClient>>>> {
+        self.base_worker.get_grpc_client().await
+    }
+
+    async fn reset_grpc_client(&self) -> WorkerResult<()> {
+        self.base_worker.reset_grpc_client().await
     }
 }
 
@@ -1468,19 +1562,16 @@ mod tests {
             .worker_type(WorkerType::Regular)
             .build();
 
-        // Test health status
         assert!(dp_worker.is_healthy());
         dp_worker.set_healthy(false);
         assert!(!dp_worker.is_healthy());
 
-        // Test load tracking
         assert_eq!(dp_worker.load(), 0);
         dp_worker.increment_load();
         assert_eq!(dp_worker.load(), 1);
         dp_worker.decrement_load();
         assert_eq!(dp_worker.load(), 0);
 
-        // Test processed tracking
         assert_eq!(dp_worker.processed_requests(), 0);
         dp_worker.increment_processed();
         assert_eq!(dp_worker.processed_requests(), 1);

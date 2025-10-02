@@ -178,8 +178,6 @@ where
     }
 }
 
-// ============= Logging Middleware =============
-
 /// Custom span maker that includes request ID
 #[derive(Clone, Debug)]
 pub struct RequestSpan;
@@ -335,8 +333,6 @@ pub fn log_request(entry: RequestLogEntry) {
         );
     }
 }
-
-// ============ Concurrency Limiting with Queue Support ============
 
 /// Request queue entry
 pub struct QueuedRequest {

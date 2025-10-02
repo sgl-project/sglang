@@ -19,6 +19,8 @@ pub enum WorkerError {
     WorkerAtCapacity { url: String },
     /// Invalid URL format
     InvalidUrl { url: String },
+    /// Connection failed
+    ConnectionFailed { url: String, reason: String },
 }
 
 impl fmt::Display for WorkerError {
@@ -41,6 +43,9 @@ impl fmt::Display for WorkerError {
             }
             WorkerError::InvalidUrl { url } => {
                 write!(f, "Invalid URL format: {}", url)
+            }
+            WorkerError::ConnectionFailed { url, reason } => {
+                write!(f, "Connection failed for worker {}: {}", url, reason)
             }
         }
     }
