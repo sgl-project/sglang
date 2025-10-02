@@ -79,14 +79,21 @@ class NgramVerifyInput(SpecInput):
         else:
             # TODO(lsyin): add prefix lens cpu here to support page size > 1
             prefix_lens = batch.seq_lens
+            prefix_lens_cpu = batch.seq_lens_cpu
             end_offset = prefix_lens + self.draft_token_num
+            end_offset_cpu = prefix_lens_cpu + self.draft_token_num
             last_loc = get_last_loc(
                 batch.req_to_token_pool.req_to_token,
                 batch.req_pool_indices,
                 prefix_lens,
             )
             batch.out_cache_loc = batch.alloc_paged_token_slots_extend(
-                prefix_lens, end_offset, last_loc, len(batch.input_ids)
+                prefix_lens,
+                prefix_lens_cpu,
+                end_offset,
+                end_offset_cpu,
+                last_loc,
+                len(batch.input_ids),
             )
             self.last_loc = last_loc
 
