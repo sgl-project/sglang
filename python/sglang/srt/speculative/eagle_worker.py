@@ -543,6 +543,8 @@ class EAGLEWorker(TpModelWorker):
                     batch.seq_lens,
                     self.speculative_num_steps,
                 )
+                prefix_lens_cpu = batch.seq_lens_cpu
+                seq_lens_cpu = batch.seq_lens_cpu + self.speculative_num_steps
                 extend_num_tokens = num_seqs * self.speculative_num_steps
             else:
                 # In this case, the last partial page needs to be duplicated.
@@ -578,14 +580,23 @@ class EAGLEWorker(TpModelWorker):
                     self.topk,
                     self.page_size,
                 )
-
-                # TODO(lmzheng): remove this device sync
-                extend_num_tokens = torch.sum(self.extend_lens).item()
+                prefix_lens_cpu = batch.seq_lens_cpu
+                last_page_lens = prefix_lens_cpu % self.page_size
+                num_new_pages_per_topk = (
+                    last_page_lens + self.speculative_num_steps + self.page_size - 1
+                ) // self.page_size
+                seq_lens_cpu = (
+                    prefix_lens_cpu // self.page_size * self.page_size
+                    + num_new_pages_per_topk * (self.page_size * self.topk)
+                )
+                extend_num_tokens = torch.sum((seq_lens_cpu - prefix_lens_cpu)).item()
 
             out_cache_loc, token_to_kv_pool_state_backup = (
                 batch.alloc_paged_token_slots_extend(
                     prefix_lens,
+                    prefix_lens_cpu,
                     seq_lens,
+                    seq_lens_cpu,
                     last_loc,
                     extend_num_tokens,
                     backup_state=True,
@@ -1003,6 +1014,7 @@ class EAGLEWorker(TpModelWorker):
         assert isinstance(batch.spec_info, EagleDraftInput)
         # Backup fields that will be modified in-place
         seq_lens_backup = batch.seq_lens.clone()
+        seq_lens_cpu_backup = batch.seq_lens_cpu.clone()
         req_pool_indices_backup = batch.req_pool_indices
         accept_length_backup = batch.spec_info.accept_length
         return_logprob_backup = batch.return_logprob
@@ -1081,6 +1093,7 @@ class EAGLEWorker(TpModelWorker):
             ForwardMode.DECODE if not input_is_idle else ForwardMode.IDLE
         )
         batch.seq_lens = seq_lens_backup
+        batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.req_pool_indices = req_pool_indices_backup
         batch.spec_info.accept_length = accept_length_backup
         batch.return_logprob = return_logprob_backup
