@@ -140,6 +140,7 @@ suites = {
         TestFile("test_local_attn.py", 250),
         TestFile("test_pp_single_node.py", 372),
         TestFile("models/test_qwen3_next_models.py", 200),
+        TestFile("models/test_falcon_h1_models.py", 200),
         TestFile("test_multi_instance_release_memory_occupation.py", 64),
     ],
     "per-commit-8-gpu": [
