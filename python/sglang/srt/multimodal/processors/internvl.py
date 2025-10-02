@@ -145,18 +145,19 @@ class InternVLImageProcessor(BaseMultimodalProcessor):
         # Find closest ratio
         best_ratio_diff = float("inf")
         best_ratio = (1, 1)
+        area = H * W
 
         for x, y in target_ratios:
             target_ar = x / y
             diff = abs(aspect_ratio - target_ar)
             blocks = x * y
-            best_blocks = best_ratio[0] * best_ratio[1]
 
             if diff < best_ratio_diff:
                 best_ratio_diff = diff
                 best_ratio = (x, y)
-            elif diff == best_ratio_diff and blocks > best_blocks:
-                best_ratio = (x, y)
+            elif diff == best_ratio_diff:
+                if area > 0.5 * image_size * image_size * x * y:
+                    best_ratio = (x, y)
 
         target_w, target_h = image_size * best_ratio[0], image_size * best_ratio[1]
         blocks = best_ratio[0] * best_ratio[1]
