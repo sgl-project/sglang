@@ -200,10 +200,6 @@ struct OutputIndexMapper {
 }
 
 impl OutputIndexMapper {
-    fn new() -> Self {
-        Self::default()
-    }
-
     fn with_start(next_index: usize) -> Self {
         Self {
             next_index,
@@ -255,15 +251,6 @@ struct StreamingToolHandler {
 }
 
 impl StreamingToolHandler {
-    fn new() -> Self {
-        Self {
-            accumulator: StreamingResponseAccumulator::new(),
-            pending_calls: Vec::new(),
-            in_function_call: false,
-            output_index_mapper: OutputIndexMapper::new(),
-        }
-    }
-
     fn with_starting_index(start: usize) -> Self {
         Self {
             accumulator: StreamingResponseAccumulator::new(),
