@@ -3,7 +3,10 @@
 //! Tests for the Qwen parser which handles <tool_call>...</tool_call> format
 
 use serde_json::json;
-use sglang_router_rs::tool_parser::{ParseState, QwenParser, StreamResult, ToolParser};
+use sglang_router_rs::tool_parser::{QwenParser, ToolParser};
+
+mod common;
+use common::create_test_tools;
 
 #[tokio::test]
 async fn test_qwen_single_tool() {
@@ -189,43 +192,43 @@ These tools will provide the information you need."#;
 
 #[tokio::test]
 async fn test_buffer_drain_optimization() {
-    let parser = QwenParser::new();
-    let mut state = ParseState::new();
+    let mut parser = QwenParser::new();
+
+    let tools = create_test_tools();
 
     // First chunk - incomplete tool call
     let chunk1 = "<tool_call>\n{\"name\": \"test1\", ";
-    let _result = parser.parse_incremental(chunk1, &mut state).await.unwrap();
+    let _result = parser.parse_incremental(chunk1, &tools).await.unwrap();
     // The important thing is buffer accumulation works
-    assert!(!state.buffer.is_empty());
 
     // Complete first tool and start second
     let chunk2 = "\"arguments\": {}}\n</tool_call><tool_call>\n{\"name\": \"test2\", ";
-    let result = parser.parse_incremental(chunk2, &mut state).await.unwrap();
+    let result = parser.parse_incremental(chunk2, &tools).await.unwrap();
 
-    if let StreamResult::ToolComplete(tool) = result {
-        assert_eq!(tool.function.name, "test1");
-        // After consuming the first tool, buffer should contain only the second tool start
-        assert!(state.buffer.starts_with("<tool_call>"));
-        assert!(state.buffer.contains("test2"));
-    } else {
-        // The important thing is the buffer is managed correctly
+    if !result.calls.is_empty() {
+        if let Some(_name) = &result.calls[0].name {
+            assert_eq!(result.calls[0].name.as_ref().unwrap(), "test1");
+            // After consuming the first tool, buffer is managed internally
+        }
     }
 
     // Complete the second tool
     let chunk3 = "\"arguments\": {\"x\": 1}}\n</tool_call>";
-    let result = parser.parse_incremental(chunk3, &mut state).await.unwrap();
+    let result = parser.parse_incremental(chunk3, &tools).await.unwrap();
 
-    if let StreamResult::ToolComplete(tool) = result {
-        assert_eq!(tool.function.name, "test2");
-        // Buffer should be empty after consuming all tools
-        assert!(state.buffer.is_empty() || !state.buffer.contains("</tool_call>"));
+    if !result.calls.is_empty() {
+        if let Some(_name) = &result.calls[0].name {
+            assert_eq!(result.calls[0].name.as_ref().unwrap(), "test2");
+            // Buffer is managed internally
+        }
     }
 }
 
 #[tokio::test]
 async fn test_buffer_efficiency_with_multiple_tools() {
-    let parser = QwenParser::new();
-    let mut state = ParseState::new();
+    let mut parser = QwenParser::new();
+
+    let tools = create_test_tools();
 
     // Send multiple complete tools at once
     let input = r#"<tool_call>
@@ -237,16 +240,13 @@ async fn test_buffer_efficiency_with_multiple_tools() {
 </tool_call>"#;
 
     // This should efficiently process tools using drain() without creating new strings
-    let result = parser.parse_incremental(input, &mut state).await.unwrap();
+    let result = parser.parse_incremental(input, &tools).await.unwrap();
 
     // In Phase 2, this will likely parse only the first tool
     // The important thing is that drain() doesn't cause any issues
-    match result {
-        StreamResult::ToolComplete(tool) => {
-            assert!(["tool1", "tool2", "tool3"].contains(&tool.function.name.as_str()));
-        }
-        _ => {
-            // Simplified streaming might return Incomplete
+    if !result.calls.is_empty() {
+        if let Some(name) = &result.calls[0].name {
+            assert!(["tool1", "tool2", "tool3"].contains(&name.as_str()));
         }
     }
 }

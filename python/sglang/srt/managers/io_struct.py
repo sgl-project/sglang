@@ -610,9 +610,6 @@ class TokenizedGenerateReqInput:
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
 
-    # For dp balance
-    dp_balance_id: int = -1
-
     # Priority for the request
     priority: Optional[int] = None
 
@@ -785,8 +782,6 @@ class TokenizedEmbeddingReqInput:
     sampling_params: SamplingParams
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
-    # For dp balance
-    dp_balance_id: int = -1
     # Priority for the request
     priority: Optional[int] = None
 

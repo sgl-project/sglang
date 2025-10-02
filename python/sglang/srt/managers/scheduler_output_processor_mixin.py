@@ -91,7 +91,7 @@ class SchedulerOutputProcessorMixin:
 
                     if req.finished():
                         self.tree_cache.cache_finished_req(req)
-                        req.time_stats.completion_time = time.time()
+                        req.time_stats.completion_time = time.perf_counter()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         # This updates radix so others can match
                         self.tree_cache.cache_unfinished_req(req)
@@ -173,8 +173,7 @@ class SchedulerOutputProcessorMixin:
             self.set_next_batch_sampling_info_done(batch)
 
         else:  # embedding or reward model
-            embeddings, bid = result.embeddings, result.bid
-            embeddings = embeddings.tolist()
+            embeddings = result.embeddings.tolist()
 
             # Check finish conditions
             for i, req in enumerate(batch.reqs):
@@ -257,7 +256,7 @@ class SchedulerOutputProcessorMixin:
                 else:
                     self.tree_cache.cache_finished_req(req)
 
-                req.time_stats.completion_time = time.time()
+                req.time_stats.completion_time = time.perf_counter()
 
             if req.return_logprob and batch.spec_algorithm.is_none():
                 # speculative worker handles logprob in speculative decoding
@@ -631,22 +630,13 @@ class SchedulerOutputProcessorMixin:
                 completion_tokens.append(len(req.output_ids))
                 cached_tokens.append(req.cached_tokens)
 
-                if req.queue_time_start is not None and req.queue_time_end is not None:
-                    queue_times.append(req.queue_time_end - req.queue_time_start)
-                else:
-                    queue_times.append(None)
+                queue_times.append(req.time_stats.get_queueing_time())
+                inference_start_times.append(req.time_stats.forward_entry_time)
 
-                # Inference starts when we take request off the queue.
-                if req.queue_time_end is not None:
-                    inference_start_times.append(req.queue_time_end)
-                else:
-                    inference_start_times.append(None)
-
-                if (
-                    req.prefill_start_time is not None
-                    and req.queue_time_end is not None
-                ):
-                    prefill_delays.append(req.prefill_start_time - req.queue_time_end)
+                if req.prefill_start_time is not None:
+                    prefill_delays.append(
+                        req.prefill_start_time - req.time_stats.forward_entry_time
+                    )
                 else:
                     prefill_delays.append(None)
 
@@ -804,22 +794,13 @@ class SchedulerOutputProcessorMixin:
                 prompt_tokens.append(len(req.origin_input_ids))
                 cached_tokens.append(req.cached_tokens)
 
-                if req.queue_time_start is not None and req.queue_time_end is not None:
-                    queue_times.append(req.queue_time_end - req.queue_time_start)
-                else:
-                    queue_times.append(None)
+                queue_times.append(req.time_stats.get_queueing_time())
+                inference_start_times.append(req.time_stats.forward_entry_time)
 
-                # Inference starts when we take request off the queue.
-                if req.queue_time_end is not None:
-                    inference_start_times.append(req.queue_time_end)
-                else:
-                    inference_start_times.append(None)
-
-                if (
-                    req.prefill_start_time is not None
-                    and req.queue_time_end is not None
-                ):
-                    prefill_delays.append(req.prefill_start_time - req.queue_time_end)
+                if req.prefill_start_time is not None:
+                    prefill_delays.append(
+                        req.prefill_start_time - req.time_stats.forward_entry_time
+                    )
                 else:
                     prefill_delays.append(None)
 
