@@ -10,7 +10,7 @@
 use criterion::{black_box, criterion_group, BenchmarkId, Criterion, Throughput};
 use serde_json::json;
 use sglang_router_rs::protocols::spec::{Function, Tool};
-use sglang_router_rs::tool_parser::{registry::ParserRegistry, JsonParser, ToolParser};
+use sglang_router_rs::tool_parser::{JsonParser, ToolParser, ToolParserFactory};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -175,7 +175,7 @@ fn bench_registry_creation(c: &mut Criterion) {
         b.iter_custom(|iters| {
             let start = Instant::now();
             for _ in 0..iters {
-                let registry = black_box(ParserRegistry::new());
+                let registry = black_box(ToolParserFactory::new());
                 // Force evaluation to prevent optimization
                 black_box(registry.list_parsers());
             }
@@ -202,7 +202,7 @@ fn bench_registry_creation(c: &mut Criterion) {
 }
 
 fn bench_parser_lookup(c: &mut Criterion) {
-    let registry = Arc::new(ParserRegistry::new());
+    let registry = Arc::new(ToolParserFactory::new());
     let models = vec![
         "gpt-4",
         "mistral-large",
@@ -261,7 +261,7 @@ fn bench_parser_lookup(c: &mut Criterion) {
 
 fn bench_complete_parsing(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
-    let registry = Arc::new(ParserRegistry::new());
+    let registry = Arc::new(ToolParserFactory::new());
 
     let test_cases = vec![
         ("json_simple", "json", JSON_SIMPLE),
@@ -398,7 +398,7 @@ fn bench_streaming_parsing(c: &mut Criterion) {
 
 fn bench_concurrent_parsing(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
-    let registry = Arc::new(ParserRegistry::new());
+    let registry = Arc::new(ToolParserFactory::new());
     let parser = registry.get_parser("json").expect("Parser not found");
 
     let thread_counts = vec![1, 2, 4, 8, 16, 32];
@@ -486,7 +486,7 @@ fn bench_concurrent_parsing(c: &mut Criterion) {
 
 fn bench_large_payloads(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
-    let registry = Arc::new(ParserRegistry::new());
+    let registry = Arc::new(ToolParserFactory::new());
     let parser = registry.get_parser("json").expect("Parser not found");
 
     let sizes = vec![1, 10, 50, 100, 500];
@@ -556,7 +556,7 @@ fn bench_parser_reuse(c: &mut Criterion) {
         b.iter_custom(|iters| {
             let start = Instant::now();
             for _ in 0..iters {
-                let registry = ParserRegistry::new();
+                let registry = ToolParserFactory::new();
                 let parser = registry.get_parser("json").unwrap();
                 let result = rt.block_on(async { parser.parse_complete(JSON_SIMPLE).await });
                 black_box(result.unwrap());
@@ -582,7 +582,7 @@ fn bench_parser_reuse(c: &mut Criterion) {
 
     // Benchmark reusing registry
     let printed_reuse = Arc::new(AtomicBool::new(false));
-    let shared_registry = Arc::new(ParserRegistry::new());
+    let shared_registry = Arc::new(ToolParserFactory::new());
 
     group.bench_function("reuse_registry", |b| {
         let printed_clone = printed_reuse.clone();
@@ -657,7 +657,7 @@ fn bench_parser_reuse(c: &mut Criterion) {
 
 fn bench_latency_distribution(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
-    let registry = Arc::new(ParserRegistry::new());
+    let registry = Arc::new(ToolParserFactory::new());
 
     let test_cases = vec![
         ("json", JSON_SIMPLE),

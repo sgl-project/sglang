@@ -5,28 +5,27 @@ use crate::tool_parser::partial_json::{
 };
 use crate::tool_parser::traits::ToolParser;
 
-#[test]
-fn test_parser_registry() {
-    let registry = ParserRegistry::new();
+#[tokio::test]
+async fn test_tool_parser_factory() {
+    let factory = ToolParserFactory::new();
 
-    assert!(!registry.list_mappings().is_empty());
-
-    let mappings = registry.list_mappings();
-    let has_gpt = mappings.iter().any(|(m, _)| m.starts_with("gpt"));
-    assert!(has_gpt);
+    // Test that we can get a pooled parser
+    let pooled_parser = factory.get_pooled("gpt-4");
+    let parser = pooled_parser.lock().await;
+    assert!(parser.detect_format(r#"{"name": "test", "arguments": {}}"#));
 }
 
-#[test]
-fn test_parser_registry_pattern_matching() {
-    let mut registry = ParserRegistry::new_for_testing();
+#[tokio::test]
+async fn test_tool_parser_factory_model_mapping() {
+    let factory = ToolParserFactory::new();
 
-    registry.map_model("test-model", "json");
+    // Test model mapping
+    factory.registry().map_model("test-model", "json");
 
-    let mappings = registry.list_mappings();
-    let has_test = mappings
-        .iter()
-        .any(|(m, p)| *m == "test-model" && *p == "json");
-    assert!(has_test);
+    // Get parser for the test model
+    let pooled_parser = factory.get_pooled("test-model");
+    let parser = pooled_parser.lock().await;
+    assert!(parser.detect_format(r#"{"name": "test", "arguments": {}}"#));
 }
 
 #[test]
@@ -244,14 +243,12 @@ fn test_json_parser_format_detection() {
 }
 
 #[tokio::test]
-async fn test_registry_with_json_parser() {
-    let registry = ParserRegistry::new();
-
-    // JSON parser should be registered by default
-    assert!(registry.has_parser("json"));
+async fn test_factory_with_json_parser() {
+    let factory = ToolParserFactory::new();
 
     // Should get JSON parser for OpenAI models
-    let parser = registry.get_parser("gpt-4-turbo").unwrap();
+    let pooled_parser = factory.get_pooled("gpt-4-turbo");
+    let parser = pooled_parser.lock().await;
 
     let input = r#"{"name": "test", "arguments": {"x": 1}}"#;
     let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();

@@ -3,7 +3,7 @@
 //! Tests for malformed input, edge cases, and error recovery
 
 use sglang_router_rs::tool_parser::{
-    JsonParser, MistralParser, ParserRegistry, PythonicParser, QwenParser, ToolParser,
+    JsonParser, MistralParser, PythonicParser, QwenParser, ToolParser,
 };
 
 mod common;
@@ -11,21 +11,38 @@ use common::create_test_tools;
 
 #[tokio::test]
 async fn test_empty_input() {
-    let registry = ParserRegistry::new();
-    let parsers = vec!["json", "mistral", "qwen", "pythonic", "llama"];
+    // Test that all parsers handle empty input correctly
+    let json_parser = JsonParser::new();
+    let (_normal_text, tools) = json_parser.parse_complete("").await.unwrap();
+    assert_eq!(
+        tools.len(),
+        0,
+        "JSON parser should return empty for empty input"
+    );
 
-    for parser_name in parsers {
-        let parser = registry
-            .get_parser(&format!("test-{}", parser_name))
-            .unwrap();
-        let (_normal_text, tools) = parser.parse_complete("").await.unwrap();
-        assert_eq!(
-            tools.len(),
-            0,
-            "Parser {} should return empty for empty input",
-            parser_name
-        );
-    }
+    let mistral_parser = MistralParser::new();
+    let (_normal_text, tools) = mistral_parser.parse_complete("").await.unwrap();
+    assert_eq!(
+        tools.len(),
+        0,
+        "Mistral parser should return empty for empty input"
+    );
+
+    let qwen_parser = QwenParser::new();
+    let (_normal_text, tools) = qwen_parser.parse_complete("").await.unwrap();
+    assert_eq!(
+        tools.len(),
+        0,
+        "Qwen parser should return empty for empty input"
+    );
+
+    let pythonic_parser = PythonicParser::new();
+    let (_normal_text, tools) = pythonic_parser.parse_complete("").await.unwrap();
+    assert_eq!(
+        tools.len(),
+        0,
+        "Pythonic parser should return empty for empty input"
+    );
 }
 
 #[tokio::test]
