@@ -6,7 +6,8 @@ use std::fmt::Display;
 
 // Import types from spec module
 use crate::protocols::spec::{
-    ChatCompletionRequest, ChatMessage, ResponseFormat, StringOrArray, UserMessageContent,
+    ChatCompletionRequest, ChatMessage, ResponseFormat, StringOrArray, ToolChoice, ToolChoiceValue,
+    UserMessageContent,
 };
 
 /// Validation constants for OpenAI API parameters
@@ -666,6 +667,65 @@ impl ChatCompletionRequest {
         Ok(())
     }
 
+    /// Validate tool_choice according to OpenAI spec
+    pub fn validate_tool_choice(&self) -> Result<(), ValidationError> {
+        if let Some(tool_choice) = &self.tool_choice {
+            let has_tools = self.tools.as_ref().is_some_and(|tools| !tools.is_empty());
+            match tool_choice {
+                ToolChoice::Value(choice) => {
+                    // If tools are not provided (or empty), only "none" is allowed
+                    if !has_tools && !matches!(choice, ToolChoiceValue::None) {
+                        return Err(ValidationError::InvalidValue {
+                            parameter: "tool_choice".to_string(),
+                            value: serde_json::to_string(choice).unwrap_or_default(),
+                            reason: "tool_choice must be 'none' when no tools are provided"
+                                .to_string(),
+                        });
+                    }
+                }
+                ToolChoice::Function { .. } => {
+                    // Function choice requires tools
+                    if !has_tools {
+                        return Err(ValidationError::InvalidValue {
+                            parameter: "tool_choice".to_string(),
+                            value: "function".to_string(),
+                            reason: "tool_choice 'function' requires tools to be provided"
+                                .to_string(),
+                        });
+                    }
+                }
+                ToolChoice::AllowedTools { tools: allowed, .. } => {
+                    // AllowedTools requires tools
+                    if !has_tools {
+                        return Err(ValidationError::InvalidValue {
+                            parameter: "tool_choice".to_string(),
+                            value: "allowed_tools".to_string(),
+                            reason: "tool_choice 'allowed_tools' requires tools to be provided"
+                                .to_string(),
+                        });
+                    }
+                    // Check that allowed tools exist in tools
+                    if let Some(available_tools) = &self.tools {
+                        let available_names: std::collections::HashSet<&str> = available_tools
+                            .iter()
+                            .map(|t| t.function.name.as_str())
+                            .collect();
+                        for allowed_tool in allowed {
+                            if !available_names.contains(allowed_tool.name.as_str()) {
+                                return Err(ValidationError::InvalidValue {
+                                    parameter: "tool_choice.allowed_tools".to_string(),
+                                    value: allowed_tool.name.clone(),
+                                    reason: "tool not found in provided tools".to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Validate cross-parameter relationships specific to chat completions
     #[allow(deprecated)]
     pub fn validate_chat_cross_parameters(&self) -> Result<(), ValidationError> {
@@ -740,6 +800,7 @@ impl ValidatableRequest for ChatCompletionRequest {
         self.validate_messages()?;
         self.validate_response_format()?;
         self.validate_chat_logprobs()?;
+        self.validate_tool_choice()?;
         self.validate_chat_cross_parameters()?;
 
         Ok(())
@@ -1118,6 +1179,127 @@ mod tests {
             assert!(request.validate().is_err());
             request.n = Some(15);
             assert!(request.validate().is_err());
+        }
+
+        #[test]
+        fn test_tool_choice_validation() {
+            use crate::protocols::spec::{Function, Tool};
+
+            let mut request = create_valid_chat_request();
+
+            // Valid: no tools, tool_choice none
+            request.tool_choice = Some(ToolChoice::Value(ToolChoiceValue::None));
+            request.tools = None;
+            assert!(request.validate().is_ok());
+
+            // Invalid: no tools, tool_choice auto
+            request.tool_choice = Some(ToolChoice::Value(ToolChoiceValue::Auto));
+            assert!(request.validate().is_err());
+
+            // Invalid: empty tools vector is treated as no tools
+            request.tools = Some(vec![]);
+            request.tool_choice = Some(ToolChoice::Value(ToolChoiceValue::Auto));
+            assert!(request.validate().is_err());
+
+            // Valid: with tools, tool_choice auto
+            request.tools = Some(vec![Tool {
+                tool_type: "function".to_string(),
+                function: Function {
+                    name: "test_func".to_string(),
+                    description: None,
+                    parameters: serde_json::json!({}),
+                },
+            }]);
+            request.tool_choice = Some(ToolChoice::Value(ToolChoiceValue::Auto));
+            assert!(request.validate().is_ok());
+
+            // Valid: with tools, tool_choice function
+            request.tool_choice = Some(ToolChoice::Function {
+                tool_type: "function".to_string(),
+                function: crate::protocols::spec::FunctionChoice {
+                    name: "test_func".to_string(),
+                },
+            });
+            assert!(request.validate().is_ok());
+
+            // Invalid: function choice without tools
+            request.tools = None;
+            assert!(request.validate().is_err());
+
+            // Invalid: allowed_tools without tools
+            request.tool_choice = Some(ToolChoice::AllowedTools {
+                tool_type: "allowed_tools".to_string(),
+                mode: "auto".to_string(),
+                tools: vec![crate::protocols::spec::ToolReference {
+                    tool_type: "function".to_string(),
+                    name: "test_func".to_string(),
+                }],
+            });
+            assert!(request.validate().is_err());
+
+            // Valid: allowed_tools with matching tools
+            request.tools = Some(vec![Tool {
+                tool_type: "function".to_string(),
+                function: Function {
+                    name: "test_func".to_string(),
+                    description: None,
+                    parameters: serde_json::json!({}),
+                },
+            }]);
+            assert!(request.validate().is_ok());
+
+            // Invalid: allowed_tools with non-existent tool
+            request.tool_choice = Some(ToolChoice::AllowedTools {
+                tool_type: "allowed_tools".to_string(),
+                mode: "auto".to_string(),
+                tools: vec![crate::protocols::spec::ToolReference {
+                    tool_type: "function".to_string(),
+                    name: "non_existent".to_string(),
+                }],
+            });
+            assert!(request.validate().is_err());
+        }
+
+        #[test]
+        fn test_tool_choice_normalization_defaults() {
+            use crate::protocols::spec::{Function, Tool};
+
+            // Case 1: No tools -> default should be None
+            let mut req = create_valid_chat_request();
+            req.tool_choice = None;
+            req.tools = None;
+            req.normalize_tool_choice();
+            assert!(matches!(
+                req.tool_choice,
+                Some(ToolChoice::Value(ToolChoiceValue::None))
+            ));
+
+            // Case 2: Empty tools vector -> treat as no tools -> default None
+            let mut req = create_valid_chat_request();
+            req.tool_choice = None;
+            req.tools = Some(vec![]);
+            req.normalize_tool_choice();
+            assert!(matches!(
+                req.tool_choice,
+                Some(ToolChoice::Value(ToolChoiceValue::None))
+            ));
+
+            // Case 3: With tools -> default should be Auto
+            let mut req = create_valid_chat_request();
+            req.tool_choice = None;
+            req.tools = Some(vec![Tool {
+                tool_type: "function".to_string(),
+                function: Function {
+                    name: "test_func".to_string(),
+                    description: None,
+                    parameters: serde_json::json!({}),
+                },
+            }]);
+            req.normalize_tool_choice();
+            assert!(matches!(
+                req.tool_choice,
+                Some(ToolChoice::Value(ToolChoiceValue::Auto))
+            ));
         }
 
         #[test]

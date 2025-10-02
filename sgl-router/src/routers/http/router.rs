@@ -8,6 +8,7 @@ use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, GenerationRequest,
     RerankRequest, RerankResponse, RerankResult, ResponsesGetParams, ResponsesRequest,
 };
+use crate::protocols::validation::ValidatableRequest;
 use crate::routers::header_utils;
 use crate::routers::RouterTrait;
 use axum::body::to_bytes;
@@ -679,7 +680,12 @@ impl RouterTrait for Router {
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/chat/completions", model_id)
+        let mut normalized_body = body.clone();
+        normalized_body.normalize_tool_choice();
+        if let Err(e) = normalized_body.validate() {
+            return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+        }
+        self.route_typed_request(headers, &normalized_body, "/v1/chat/completions", model_id)
             .await
     }
 

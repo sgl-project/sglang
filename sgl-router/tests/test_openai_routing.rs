@@ -581,6 +581,8 @@ async fn test_unsupported_endpoints() {
         sampling_params: None,
         stream: false,
         return_logprob: false,
+        logprob_start_len: None,
+        return_text_in_logprobs: false,
         lora_path: None,
         session_params: None,
         return_hidden_states: false,
