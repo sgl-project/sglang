@@ -99,7 +99,7 @@ class MiniLoadBalancer:
             # Wait for both responses to complete. Prefill should end first.
             prefill_response, decode_response = await asyncio.gather(*tasks)
 
-            if "return_logprob" in modified_request:
+            if modified_request.get("return_logprob", False):
 
                 prefill_json = await prefill_response.json()
                 ret_json = await decode_response.json()
@@ -111,6 +111,16 @@ class MiniLoadBalancer:
                             prefill_json["meta_info"]["input_token_logprobs"]
                             + ret_json["meta_info"]["input_token_logprobs"]
                         )
+                    # merge logprob fields if present
+                    for key in ["input_top_logprobs", "input_token_ids_logprobs"]:
+                        if (
+                            key in prefill_json.get("meta_info", {})
+                            and key in ret_json["meta_info"]
+                        ):
+                            ret_json["meta_info"][key] = (
+                                prefill_json["meta_info"][key]
+                                + ret_json["meta_info"][key]
+                            )
             else:
                 ret_json = await decode_response.json()
 
@@ -164,6 +174,18 @@ class MiniLoadBalancer:
                                 ]
                                 + ret_json["meta_info"]["input_token_logprobs"]
                             )
+                            for key in [
+                                "input_top_logprobs",
+                                "input_token_ids_logprobs",
+                            ]:
+                                if (
+                                    key in first_prefill_chunk_json["meta_info"]
+                                    and key in ret_json["meta_info"]
+                                ):
+                                    ret_json["meta_info"][key] = (
+                                        first_prefill_chunk_json["meta_info"][key]
+                                        + ret_json["meta_info"][key]
+                                    )
 
                             yield b"data: " + orjson.dumps(ret_json) + b"\n\n"
                         else:

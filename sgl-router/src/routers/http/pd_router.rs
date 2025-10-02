@@ -479,7 +479,18 @@ impl PDRouter {
                             .as_ref()
                             .and_then(|body| serde_json::from_slice::<Value>(body).ok())
                             .and_then(|json| {
-                                json.pointer("/meta_info/input_token_logprobs").cloned()
+                                let meta = json.get("meta_info")?;
+                                let mut obj = serde_json::Map::new();
+                                if let Some(v) = meta.get("input_token_logprobs") {
+                                    obj.insert("input_token_logprobs".to_string(), v.clone());
+                                }
+                                if let Some(v) = meta.get("input_top_logprobs") {
+                                    obj.insert("input_top_logprobs".to_string(), v.clone());
+                                }
+                                if let Some(v) = meta.get("input_token_ids_logprobs") {
+                                    obj.insert("input_token_ids_logprobs".to_string(), v.clone());
+                                }
+                                Some(Value::Object(obj))
                             })
                     } else {
                         None
@@ -890,6 +901,7 @@ impl PDRouter {
 
     // Helper to merge logprobs from prefill and decode responses
     fn merge_logprobs_in_json(prefill_json: &Value, decode_json: &mut Value) -> bool {
+        let mut merged_any = false;
         if let (Some(prefill_meta), Some(decode_meta)) = (
             prefill_json.get("meta_info"),
             decode_json.get_mut("meta_info"),
@@ -904,11 +916,40 @@ impl PDRouter {
                     let mut merged = prefill_arr.clone();
                     merged.extend(decode_arr.clone());
                     decode_meta["input_token_logprobs"] = Value::Array(merged);
-                    return true;
+                    merged_any = true;
+                }
+            }
+
+            if let (Some(prefill_top), Some(decode_top)) = (
+                prefill_meta.get("input_top_logprobs"),
+                decode_meta.get_mut("input_top_logprobs"),
+            ) {
+                if let (Some(prefill_arr), Some(decode_arr)) =
+                    (prefill_top.as_array(), decode_top.as_array_mut())
+                {
+                    let mut merged = prefill_arr.clone();
+                    merged.extend(decode_arr.clone());
+                    decode_meta["input_top_logprobs"] = Value::Array(merged);
+                    merged_any = true;
+                }
+            }
+
+            // Merge input_token_ids_logprobs
+            if let (Some(prefill_ids), Some(decode_ids)) = (
+                prefill_meta.get("input_token_ids_logprobs"),
+                decode_meta.get_mut("input_token_ids_logprobs"),
+            ) {
+                if let (Some(prefill_arr), Some(decode_arr)) =
+                    (prefill_ids.as_array(), decode_ids.as_array_mut())
+                {
+                    let mut merged = prefill_arr.clone();
+                    merged.extend(decode_arr.clone());
+                    decode_meta["input_token_ids_logprobs"] = Value::Array(merged);
+                    merged_any = true;
                 }
             }
         }
-        false
+        merged_any
     }
 
     // Simple helper to merge logprobs in streaming responses
@@ -936,6 +977,32 @@ impl PDRouter {
                         let mut merged = p_arr.clone();
                         merged.extend(d_arr.clone());
                         *d_logprobs = Value::Array(merged);
+                    }
+                }
+
+                if let Some(d_top) = meta.get_mut("input_top_logprobs") {
+                    if let Some(prefill_top) = p_logprobs
+                        .get("input_top_logprobs")
+                        .and_then(|v| v.as_array())
+                    {
+                        if let Some(d_arr) = d_top.as_array() {
+                            let mut merged = prefill_top.clone();
+                            merged.extend(d_arr.clone());
+                            *d_top = Value::Array(merged);
+                        }
+                    }
+                }
+
+                if let Some(d_ids) = meta.get_mut("input_token_ids_logprobs") {
+                    if let Some(prefill_ids) = p_logprobs
+                        .get("input_token_ids_logprobs")
+                        .and_then(|v| v.as_array())
+                    {
+                        if let Some(d_arr) = d_ids.as_array() {
+                            let mut merged = prefill_ids.clone();
+                            merged.extend(d_arr.clone());
+                            *d_ids = Value::Array(merged);
+                        }
                     }
                 }
             }
