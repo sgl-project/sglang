@@ -762,7 +762,7 @@ class EmbeddingReqInput:
             video_data=self.video_data[i] if self.video_data is not None else None,
             sampling_params=self.sampling_params[i],
             rid=self.rid[i],
-            dimensions=self.dimensions
+            dimensions=self.dimensions,
         )
 
 

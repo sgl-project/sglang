@@ -61,11 +61,17 @@ class Pooler(nn.Module):
             if all_same_dimensions:
                 pooled_data = pooled_data[..., : forward_batch.dimensions[0]]
             else:
-                pooled_data = [tensor[..., : dim] for tensor, dim in zip(pooled_data, forward_batch.dimensions)]
+                pooled_data = [
+                    tensor[..., :dim]
+                    for tensor, dim in zip(pooled_data, forward_batch.dimensions)
+                ]
 
         if self.normalize:
             if isinstance(pooled_data, list):
-                pooled_data = [nn.functional.normalize(tensor, p=2, dim=-1) for tensor in pooled_data]
+                pooled_data = [
+                    nn.functional.normalize(tensor, p=2, dim=-1)
+                    for tensor in pooled_data
+                ]
             else:
                 pooled_data = nn.functional.normalize(pooled_data, p=2, dim=-1)
 

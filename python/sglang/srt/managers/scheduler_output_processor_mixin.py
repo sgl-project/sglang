@@ -4,7 +4,6 @@ import logging
 import threading
 import time
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
-import torch
 
 import torch
 

@@ -677,24 +677,29 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 raise ValueError(error_msg)
 
         # Matryoshka embeddings validations
-        if isinstance(obj, EmbeddingReqInput) and obj.dimensions is not None:            
+        if isinstance(obj, EmbeddingReqInput) and obj.dimensions is not None:
             if not self.model_config.is_matryoshka:
                 raise ValueError(
                     f"Model '{self.model_config.model_path}' does not support matryoshka representation, "
                     f"changing output dimensions will lead to poor results."
                 )
-        
+
             if obj.dimensions < 1:
                 raise ValueError("Requested dimensions must be greater than 0")
-        
-            if self.model_config.matryoshka_dimensions and obj.dimensions not in self.model_config.matryoshka_dimensions:
+
+            if (
+                self.model_config.matryoshka_dimensions
+                and obj.dimensions not in self.model_config.matryoshka_dimensions
+            ):
                 raise ValueError(
                     f"Model '{self.model_config.model_path}' only supports {self.model_config.matryoshka_dimensions} matryoshka dimensions, "
                     f"using other output dimensions will lead to poor results."
                 )
-            
+
             if obj.dimensions > self.model_config.hidden_size:
-                raise ValueError(f"Provided dimensions are greater than max embedding dimension: {self.model_config.hidden_size}")
+                raise ValueError(
+                    f"Provided dimensions are greater than max embedding dimension: {self.model_config.hidden_size}"
+                )
 
         if isinstance(obj, GenerateReqInput):
             if (
