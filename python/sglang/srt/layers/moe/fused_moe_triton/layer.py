@@ -56,7 +56,7 @@ if is_flashinfer_available():
 _is_hip = is_hip()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
-
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 # Try to import FP4 TRTLLM function if flashinfer is available
 trtllm_fp4_block_scale_moe = None
@@ -822,6 +822,14 @@ class FusedMoE(torch.nn.Module):
                 )
             elif TopKOutputChecker.format_is_triton_kernel(topk_output):
                 raise NotImplementedError()
+
+        if _use_aiter:
+            # NOTE: Aiter's fused_moe does not support '-1' value which is broadly used to represent the invalid expert id.
+            # If '-1' is given to gpu kernel, it may cause memory access fault.
+            if TopKOutputChecker.format_is_standard(topk_output):
+                temp_topk_ids = topk_output.topk_ids
+                temp_topk_ids[temp_topk_ids == -1] = self.num_local_experts
+                topk_output = topk_output._replace(topk_ids=temp_topk_ids)
 
         dispatch_output = self.dispatcher.dispatch(
             hidden_states=hidden_states, topk_output=topk_output
