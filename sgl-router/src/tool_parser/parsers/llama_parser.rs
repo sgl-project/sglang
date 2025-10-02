@@ -9,7 +9,7 @@ use crate::tool_parser::{
     parsers::helpers,
     partial_json::PartialJson,
     traits::ToolParser,
-    types::{FunctionCall, StreamingParseResult, ToolCall, ToolCallItem},
+    types::{FunctionCall, StreamingParseResult, ToolCall},
 };
 
 /// Llama 3.2 format parser for tool calls
@@ -260,133 +260,17 @@ impl ToolParser for LlamaParser {
             0
         };
 
-        if start_idx >= current_text.len() {
-            return Ok(StreamingParseResult::default());
-        }
-
-        // Parse partial JSON
-        let json_str = &current_text[start_idx..];
-
-        let (obj, end_idx) = match self.partial_json.parse_value(json_str) {
-            Ok(result) => result,
-            Err(_) => {
-                return Ok(StreamingParseResult::default());
-            }
-        };
-
-        // Check if JSON is complete
-        let is_complete =
-            end_idx == json_str.len() && serde_json::from_str::<Value>(json_str).is_ok();
-
-        // Validate tool name if present
-        if let Some(name) = obj.get("name").and_then(|v| v.as_str()) {
-            if !tool_indices.contains_key(name) {
-                // Invalid tool name - skip this tool, preserve indexing for next tool
-                tracing::warn!("Invalid tool name '{}' - skipping", name);
-                helpers::reset_current_tool_state(
-                    &mut self.buffer,
-                    &mut self.current_tool_name_sent,
-                    &mut self.streamed_args_for_tool,
-                    &self.prev_tool_call_arr,
-                );
-                return Ok(StreamingParseResult::default());
-            }
-        }
-
-        // Handle parameters/arguments aliasing
-        let current_tool_call = helpers::normalize_arguments_field(obj.clone());
-
-        let mut result = StreamingParseResult::default();
-
-        // Case 1: Handle tool name streaming
-        if !self.current_tool_name_sent {
-            if let Some(function_name) = current_tool_call.get("name").and_then(|v| v.as_str()) {
-                if tool_indices.contains_key(function_name) {
-                    // Initialize if first tool
-                    if self.current_tool_id == -1 {
-                        self.current_tool_id = 0;
-                        self.streamed_args_for_tool.push(String::new());
-                    } else if self.current_tool_id as usize >= self.streamed_args_for_tool.len() {
-                        // Ensure capacity for subsequent tools
-                        helpers::ensure_capacity(
-                            self.current_tool_id,
-                            &mut self.prev_tool_call_arr,
-                            &mut self.streamed_args_for_tool,
-                        );
-                    }
-
-                    // Send tool name with empty parameters
-                    self.current_tool_name_sent = true;
-                    result.calls.push(ToolCallItem {
-                        tool_index: self.current_tool_id as usize,
-                        name: Some(function_name.to_string()),
-                        parameters: String::new(),
-                    });
-                }
-            }
-        }
-        // Case 2: Handle streaming arguments
-        else {
-            if let Some(cur_arguments) = current_tool_call.get("arguments") {
-                let tool_id = self.current_tool_id as usize;
-                let sent = self
-                    .streamed_args_for_tool
-                    .get(tool_id)
-                    .map(|s| s.len())
-                    .unwrap_or(0);
-                let cur_args_json = serde_json::to_string(cur_arguments)
-                    .map_err(|e| ToolParserError::ParsingFailed(e.to_string()))?;
-
-                // Compute diff: everything after what we've already sent
-                let diff = cur_args_json[sent..].to_string();
-
-                // Send diff if there's new content
-                if !diff.is_empty() {
-                    // Only accumulate if not complete
-                    if !is_complete && tool_id < self.streamed_args_for_tool.len() {
-                        self.streamed_args_for_tool[tool_id].push_str(&diff);
-                    }
-
-                    result.calls.push(ToolCallItem {
-                        tool_index: tool_id,
-                        name: None,
-                        parameters: diff,
-                    });
-                }
-
-                // If JSON is complete, advance to next tool
-                if is_complete {
-                    // Remove processed portion, keep unprocessed content
-                    self.buffer = current_text[start_idx + end_idx..].to_string();
-
-                    // Clear completed tool data
-                    if tool_id < self.prev_tool_call_arr.len() {
-                        self.prev_tool_call_arr[tool_id] = Value::Null;
-                    }
-                    self.current_tool_name_sent = false;
-                    if tool_id < self.streamed_args_for_tool.len() {
-                        self.streamed_args_for_tool[tool_id].clear();
-                    }
-                    self.current_tool_id += 1;
-                }
-            }
-        }
-
-        // Update prev_tool_call_arr with current state
-        if self.current_tool_id >= 0 {
-            helpers::ensure_capacity(
-                self.current_tool_id,
-                &mut self.prev_tool_call_arr,
-                &mut self.streamed_args_for_tool,
-            );
-            let tool_id = self.current_tool_id as usize;
-
-            if tool_id < self.prev_tool_call_arr.len() {
-                self.prev_tool_call_arr[tool_id] = current_tool_call;
-            }
-        }
-
-        Ok(result)
+        helpers::handle_json_tool_streaming(
+            current_text,
+            start_idx,
+            &mut self.partial_json,
+            &tool_indices,
+            &mut self.buffer,
+            &mut self.current_tool_id,
+            &mut self.current_tool_name_sent,
+            &mut self.streamed_args_for_tool,
+            &mut self.prev_tool_call_arr,
+        )
     }
 
     fn detect_format(&self, text: &str) -> bool {
