@@ -60,6 +60,7 @@ mod event_types {
     pub const ITEM_TYPE_FUNCTION_TOOL_CALL: &str = "function_tool_call";
     pub const ITEM_TYPE_MCP_CALL: &str = "mcp_call";
     pub const ITEM_TYPE_FUNCTION: &str = "function";
+    pub const ITEM_TYPE_MCP_LIST_TOOLS: &str = "mcp_list_tools";
 }
 
 /// Router for OpenAI backend
@@ -253,6 +254,8 @@ struct StreamingToolHandler {
     in_function_call: bool,
     /// Manage output_index remapping so they increment per item
     output_index_mapper: OutputIndexMapper,
+    /// Original response id captured from the first response.created event
+    original_response_id: Option<String>,
 }
 
 impl StreamingToolHandler {
@@ -262,6 +265,7 @@ impl StreamingToolHandler {
             pending_calls: Vec::new(),
             in_function_call: false,
             output_index_mapper: OutputIndexMapper::with_start(start),
+            original_response_id: None,
         }
     }
 
@@ -279,6 +283,16 @@ impl StreamingToolHandler {
 
     fn next_output_index(&self) -> usize {
         self.output_index_mapper.next_index()
+    }
+
+    fn original_response_id(&self) -> Option<&str> {
+        self.original_response_id
+            .as_deref()
+            .or_else(|| self.accumulator.original_response_id())
+    }
+
+    fn snapshot_final_response(&self) -> Option<Value> {
+        self.accumulator.snapshot_final_response()
     }
 
     /// Process an SSE event and determine what action to take
@@ -308,6 +322,17 @@ impl StreamingToolHandler {
             .unwrap_or_default();
 
         match event_type.as_str() {
+            event_types::RESPONSE_CREATED => {
+                if self.original_response_id.is_none() {
+                    if let Some(response_obj) = parsed.get("response").and_then(|v| v.as_object()) {
+                        if let Some(id) = response_obj.get("id").and_then(|v| v.as_str()) {
+                            self.original_response_id = Some(id.to_string());
+                        }
+                    }
+                }
+                StreamAction::Forward
+            }
+            event_types::RESPONSE_COMPLETED => StreamAction::Forward,
             event_types::OUTPUT_ITEM_ADDED => {
                 if let Some(idx) = parsed.get("output_index").and_then(|v| v.as_u64()) {
                     self.ensure_output_index(idx as usize);
@@ -550,6 +575,36 @@ impl StreamingResponseAccumulator {
     fn encountered_error(&self) -> Option<&Value> {
         self.encountered_error.as_ref()
     }
+
+    fn original_response_id(&self) -> Option<&str> {
+        self.initial_response
+            .as_ref()
+            .and_then(|response| response.get("id"))
+            .and_then(|id| id.as_str())
+    }
+
+    fn snapshot_final_response(&self) -> Option<Value> {
+        if let Some(resp) = &self.completed_response {
+            return Some(resp.clone());
+        }
+        self.build_fallback_response_snapshot()
+    }
+
+    fn build_fallback_response_snapshot(&self) -> Option<Value> {
+        let mut response = self.initial_response.clone()?;
+
+        if let Some(obj) = response.as_object_mut() {
+            obj.insert("status".to_string(), Value::String("completed".to_string()));
+
+            let mut output_items = self.output_items.clone();
+            output_items.sort_by_key(|(index, _)| *index);
+            let outputs: Vec<Value> = output_items.into_iter().map(|(_, item)| item).collect();
+            obj.insert("output".to_string(), Value::Array(outputs));
+        }
+
+        Some(response)
+    }
+
     fn process_block(&mut self, block: &str) {
         let trimmed = block.trim();
         if trimmed.is_empty() {
@@ -596,8 +651,10 @@ impl StreamingResponseAccumulator {
 
         match event_type.as_str() {
             event_types::RESPONSE_CREATED => {
-                if let Some(response) = parsed.get("response") {
-                    self.initial_response = Some(response.clone());
+                if self.initial_response.is_none() {
+                    if let Some(response) = parsed.get("response") {
+                        self.initial_response = Some(response.clone());
+                    }
                 }
             }
             event_types::RESPONSE_COMPLETED => {
@@ -1286,7 +1343,7 @@ impl OpenAIRouter {
         raw_block: &str,
         event_name: Option<&str>,
         data: &str,
-        handler: &StreamingToolHandler,
+        handler: &mut StreamingToolHandler,
         tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
         server_label: &str,
         original_request: &ResponsesRequest,
@@ -1307,6 +1364,14 @@ impl OpenAIRouter {
                 return tx.send(Ok(Bytes::from(chunk_to_send))).is_ok();
             }
         };
+
+        let event_type = event_name
+            .or_else(|| parsed_data.get("type").and_then(|v| v.as_str()))
+            .unwrap_or("");
+
+        if event_type == event_types::RESPONSE_COMPLETED {
+            return true;
+        }
 
         // Check if this is function_call_arguments.done - need to send buffered args first
         let mut mapped_output_index: Option<usize> = None;
@@ -1405,6 +1470,15 @@ impl OpenAIRouter {
             original_request,
             previous_response_id,
         );
+
+        if let Some(response_obj) = parsed_data
+            .get_mut("response")
+            .and_then(|v| v.as_object_mut())
+        {
+            if let Some(original_id) = handler.original_response_id() {
+                response_obj.insert("id".to_string(), Value::String(original_id.to_string()));
+            }
+        }
 
         // Update sequence number if present in the event
         if parsed_data.get("sequence_number").is_some() {
@@ -1622,6 +1696,7 @@ impl OpenAIRouter {
             let mut is_first_iteration = true;
             let mut sequence_number: u64 = 0; // Track global sequence number across all iterations
             let mut next_output_index: usize = 0;
+            let mut preserved_response_id: Option<String> = None;
 
             let server_label = original_request
                 .tools
@@ -1661,6 +1736,9 @@ impl OpenAIRouter {
                 // Stream events and check for tool calls
                 let mut upstream_stream = response.bytes_stream();
                 let mut handler = StreamingToolHandler::with_starting_index(next_output_index);
+                if let Some(ref id) = preserved_response_id {
+                    handler.original_response_id = Some(id.clone());
+                }
                 let mut pending = String::new();
                 let mut tool_calls_detected = false;
                 let mut seen_in_progress = false;
@@ -1719,7 +1797,7 @@ impl OpenAIRouter {
                                                 &raw_block,
                                                 event_name,
                                                 data.as_ref(),
-                                                &handler,
+                                                &mut handler,
                                                 &tx,
                                                 server_label,
                                                 &original_request,
@@ -1767,7 +1845,7 @@ impl OpenAIRouter {
                                             &raw_block,
                                             event_name,
                                             data.as_ref(),
-                                            &handler,
+                                            &mut handler,
                                             &tx,
                                             server_label,
                                             &original_request,
@@ -1796,21 +1874,39 @@ impl OpenAIRouter {
                 }
 
                 next_output_index = handler.next_output_index();
+                if let Some(id) = handler.original_response_id().map(|s| s.to_string()) {
+                    preserved_response_id = Some(id);
+                }
 
                 // If no tool calls, we're done - stream is complete
                 if !tool_calls_detected {
+                    if !Self::send_final_response_event(
+                        &handler,
+                        &tx,
+                        &mut sequence_number,
+                        &state,
+                        Some(&active_mcp_clone),
+                        &original_request,
+                        previous_response_id.as_deref(),
+                        server_label,
+                    ) {
+                        return;
+                    }
+
                     // Send final events and done marker
                     if should_store {
                         if let Some(mut response_json) = handler.accumulator.into_final_response() {
-                            // Inject MCP metadata if we executed any tools
-                            if state.total_calls > 0 {
-                                Self::inject_mcp_metadata_streaming(
-                                    &mut response_json,
-                                    &state,
-                                    &active_mcp_clone,
-                                    server_label,
-                                );
+                            if let Some(ref id) = preserved_response_id {
+                                if let Some(obj) = response_json.as_object_mut() {
+                                    obj.insert("id".to_string(), Value::String(id.clone()));
+                                }
                             }
+                            Self::inject_mcp_metadata_streaming(
+                                &mut response_json,
+                                &state,
+                                &active_mcp_clone,
+                                server_label,
+                            );
 
                             // Mask tools back to MCP format
                             Self::mask_tools_as_mcp(&mut response_json, &original_request);
@@ -2088,6 +2184,61 @@ impl OpenAIRouter {
         tx.send(Ok(Bytes::from(done_event))).is_ok()
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn send_final_response_event(
+        handler: &StreamingToolHandler,
+        tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
+        sequence_number: &mut u64,
+        state: &ToolLoopState,
+        active_mcp: Option<&Arc<crate::mcp::McpClientManager>>,
+        original_request: &ResponsesRequest,
+        previous_response_id: Option<&str>,
+        server_label: &str,
+    ) -> bool {
+        let mut final_response = match handler.snapshot_final_response() {
+            Some(resp) => resp,
+            None => {
+                warn!("Final response snapshot unavailable; skipping synthetic completion event");
+                return true;
+            }
+        };
+
+        if let Some(original_id) = handler.original_response_id() {
+            if let Some(obj) = final_response.as_object_mut() {
+                obj.insert("id".to_string(), Value::String(original_id.to_string()));
+            }
+        }
+
+        if let Some(mcp) = active_mcp {
+            Self::inject_mcp_metadata_streaming(&mut final_response, state, mcp, server_label);
+        }
+
+        Self::mask_tools_as_mcp(&mut final_response, original_request);
+        Self::patch_streaming_response_json(
+            &mut final_response,
+            original_request,
+            previous_response_id,
+        );
+
+        if let Some(obj) = final_response.as_object_mut() {
+            obj.insert("status".to_string(), Value::String("completed".to_string()));
+        }
+
+        let completed_payload = json!({
+            "type": event_types::RESPONSE_COMPLETED,
+            "sequence_number": *sequence_number,
+            "response": final_response
+        });
+        *sequence_number += 1;
+
+        let completed_event = format!(
+            "event: {}\ndata: {}\n\n",
+            event_types::RESPONSE_COMPLETED,
+            completed_payload
+        );
+        tx.send(Ok(Bytes::from(completed_event))).is_ok()
+    }
+
     /// Inject MCP metadata into a streaming response
     fn inject_mcp_metadata_streaming(
         response: &mut Value,
@@ -2096,11 +2247,14 @@ impl OpenAIRouter {
         server_label: &str,
     ) {
         if let Some(output_array) = response.get_mut("output").and_then(|v| v.as_array_mut()) {
-            // Add mcp_list_tools at the beginning
+            output_array.retain(|item| {
+                item.get("type").and_then(|t| t.as_str())
+                    != Some(event_types::ITEM_TYPE_MCP_LIST_TOOLS)
+            });
+
             let list_tools_item = Self::build_mcp_list_tools_item(mcp, server_label);
             output_array.insert(0, list_tools_item);
 
-            // Add mcp_call items for executed calls
             let mcp_call_items =
                 Self::build_executed_mcp_call_items(&state.conversation_history, server_label);
             let mut insert_pos = 1;
@@ -2108,6 +2262,14 @@ impl OpenAIRouter {
                 output_array.insert(insert_pos, item);
                 insert_pos += 1;
             }
+        } else if let Some(obj) = response.as_object_mut() {
+            let mut output_items = Vec::new();
+            output_items.push(Self::build_mcp_list_tools_item(mcp, server_label));
+            output_items.extend(Self::build_executed_mcp_call_items(
+                &state.conversation_history,
+                server_label,
+            ));
+            obj.insert("output".to_string(), Value::Array(output_items));
         }
     }
 
@@ -2924,7 +3086,7 @@ impl OpenAIRouter {
 
         json!({
             "id": Self::generate_mcp_id("mcpl"),
-            "type": "mcp_list_tools",
+            "type": event_types::ITEM_TYPE_MCP_LIST_TOOLS,
             "server_label": server_label,
             "tools": tools_json
         })
@@ -2941,7 +3103,7 @@ impl OpenAIRouter {
     ) -> Value {
         json!({
             "id": Self::generate_mcp_id("mcp"),
-            "type": "mcp_call",
+            "type": event_types::ITEM_TYPE_MCP_CALL,
             "status": if success { "completed" } else { "failed" },
             "approval_request_id": Value::Null,
             "arguments": arguments,
