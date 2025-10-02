@@ -771,7 +771,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         """Handle batch tokenization for text inputs only."""
         logger.debug(f"Starting batch tokenization for {batch_size} text requests")
 
-        if self._batch_has_only_input_ids(batch_size, obj):
+        if self._batch_has_only_tokenized_request(batch_size, obj):
             # All requests already have input_ids, no need to tokenize
             return [await self._tokenize_one_request(obj[i]) for i in range(batch_size)]
 
