@@ -71,6 +71,8 @@ rmcp = { version = "0.6.3", features = ["client", "server",
 serde_yaml = "0.9"
 oracle = { version = "0.6.3", features = ["chrono"] }
 subtle = "2.6"
+rustpython-parser = "0.4.0"
+num-traits = "0.2"
 
 # gRPC and Protobuf dependencies
 tonic = { version = "0.12", features = ["tls", "gzip", "transport"] }

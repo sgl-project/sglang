@@ -398,7 +398,6 @@ mod tests {
         // The fix ensures we only output NEW text, not accumulated text
         assert_eq!(outputs.len(), 3);
 
-        // Verify no text is repeated
         for i in 0..outputs.len() {
             for j in i + 1..outputs.len() {
                 // No output should contain another (no accumulation)
