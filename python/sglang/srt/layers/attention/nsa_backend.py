@@ -2,13 +2,12 @@ from __future__ import annotations
 
 import sys
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple, TypeAlias, Union
+from typing import TYPE_CHECKING, Dict, List, Literal, Optional, TypeAlias
 
 import torch
 
 from sglang.srt.configs.model_config import get_nsa_index_topk, is_deepseek_nsa
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.nsa.dequant_k_cache import dequantize_k_cache
 from sglang.srt.layers.attention.nsa.nsa_indexer import BaseIndexerMetadata
 from sglang.srt.layers.attention.nsa.quant_k_cache import quantize_k_cache
 from sglang.srt.layers.attention.nsa.topk import (
@@ -26,24 +25,14 @@ from sglang.srt.layers.attention.nsa.utils import (
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
-from sglang.srt.two_batch_overlap import global_server_args_dict
 from sglang.srt.utils import is_hip
 
 # from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 
-
-if sys.version_info >= (3, 12):
-    from typing import override
-else:
-
-    def override(func):
-        return func
-
-
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.speculative.spec_info import SpecInput
 
 _is_hip = is_hip()
 
@@ -119,19 +108,15 @@ class NSAMetadata:
 class NSAIndexerMetadata(BaseIndexerMetadata):
     attn_metadata: NSAMetadata
 
-    @override
     def get_seqlens_int32(self) -> torch.Tensor:
         return self.attn_metadata.cache_seqlens_int32
 
-    @override
     def get_page_table_64(self) -> torch.Tensor:
         return self.attn_metadata.real_page_table
 
-    @override
     def get_seqlens_expanded(self) -> torch.Tensor:
         return self.attn_metadata.nsa_seqlens_expanded
 
-    @override
     def topk_transform(
         self,
         logits: torch.Tensor,
@@ -359,7 +344,7 @@ class NativeSparseAttnBackend(AttentionBackend):
         seq_lens: torch.Tensor,
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        spec_info: Optional[SpecInput],
     ):
         """Initialize forward metadata for capturing CUDA graph."""
         assert forward_mode.is_decode_or_idle(), "Only support decode for now"
@@ -428,7 +413,7 @@ class NativeSparseAttnBackend(AttentionBackend):
         seq_lens_sum: int,
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
         out_cache_loc: Optional[torch.Tensor] = None,
     ):
