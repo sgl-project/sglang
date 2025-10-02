@@ -3265,9 +3265,10 @@ def get_num_new_pages(
 
     if prefix_lens is None or decode:
         # NOTE: Special case for handling decode, which prefix lens is `seq_lens - 1`.
-        assert decode and prefix_lens.device == cpu_device
+        assert decode
         return (seq_lens % page_size == 1).int().sum().item()
 
+    assert prefix_lens.device == cpu_device
     num_pages_after = (seq_lens + page_size - 1) // page_size
     num_pages_before = (prefix_lens + page_size - 1) // page_size
     num_new_pages = num_pages_after - num_pages_before
