@@ -22,17 +22,8 @@ from sglang.test.test_utils import (
 class TestDisaggregationAccuracy(TestDisaggregationBase):
     @classmethod
     def setUpClass(cls):
+        super.setUpClass()
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
-        parsed_url = urlparse(DEFAULT_URL_FOR_TEST)
-        cls.base_host = parsed_url.hostname
-        base_port = str(parsed_url.port)
-        cls.lb_port = base_port
-        cls.prefill_port = f"{int(base_port) + 100}"
-        cls.decode_port = f"{int(base_port) + 200}"
-        cls.prefill_url = f"http://{cls.base_host}:{cls.prefill_port}"
-        cls.decode_url = f"http://{cls.base_host}:{cls.decode_port}"
-        cls.lb_url = f"http://{cls.base_host}:{cls.lb_port}"
-        print(f"{cls.base_host=} {cls.lb_port=} {cls.prefill_port=} {cls.decode_port=}")
 
         # Non blocking start servers
         cls.start_prefill()
@@ -158,16 +149,6 @@ class TestDisaggregationMooncakeFailure(TestDisaggregationBase):
         os.environ["DISAGGREGATION_TEST_FAILURE_PROB"] = "0.05"
 
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
-        parsed_url = urlparse(DEFAULT_URL_FOR_TEST)
-        cls.base_host = parsed_url.hostname
-        base_port = str(parsed_url.port)
-        cls.lb_port = base_port
-        cls.prefill_port = f"{int(base_port) + 100}"
-        cls.decode_port = f"{int(base_port) + 200}"
-        cls.prefill_url = f"http://{cls.base_host}:{cls.prefill_port}"
-        cls.decode_url = f"http://{cls.base_host}:{cls.decode_port}"
-        cls.lb_url = f"http://{cls.base_host}:{cls.lb_port}"
-        print(f"{cls.base_host=} {cls.lb_port=} {cls.prefill_port=} {cls.decode_port=}")
 
         # Non blocking start servers
         cls.start_prefill()
@@ -254,17 +235,9 @@ class TestDisaggregationMooncakeSpec(TestDisaggregationBase):
 
     @classmethod
     def setUpClass(cls):
+        super.setUpClass()
         cls.model = DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST
         cls.draft_model = DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST
-        parsed_url = urlparse(DEFAULT_URL_FOR_TEST)
-        cls.base_host = parsed_url.hostname
-        base_port = str(parsed_url.port)
-        cls.lb_port = base_port
-        cls.prefill_port = f"{int(base_port) + 100}"
-        cls.decode_port = f"{int(base_port) + 200}"
-        cls.prefill_url = f"http://{cls.base_host}:{cls.prefill_port}"
-        cls.decode_url = f"http://{cls.base_host}:{cls.decode_port}"
-        cls.lb_url = f"http://{cls.base_host}:{cls.lb_port}"
         cls.spec_args = [
             "--speculative-algorithm",
             "EAGLE",
@@ -350,16 +323,6 @@ class TestDisaggregationSimulatedRetract(TestDisaggregationBase):
     def setUpClass(cls):
         os.environ["SGLANG_TEST_RETRACT"] = "true"
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
-        parsed_url = urlparse(DEFAULT_URL_FOR_TEST)
-        cls.base_host = parsed_url.hostname
-        base_port = str(parsed_url.port)
-        cls.lb_port = base_port
-        cls.prefill_port = f"{int(base_port) + 100}"
-        cls.decode_port = f"{int(base_port) + 200}"
-        cls.prefill_url = f"http://{cls.base_host}:{cls.prefill_port}"
-        cls.decode_url = f"http://{cls.base_host}:{cls.decode_port}"
-        cls.lb_url = f"http://{cls.base_host}:{cls.lb_port}"
-        print(f"{cls.base_host=} {cls.lb_port=} {cls.prefill_port=} {cls.decode_port=}")
 
         # Non blocking start servers
         cls.start_prefill()
