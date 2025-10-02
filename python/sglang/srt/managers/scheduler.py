@@ -1459,12 +1459,12 @@ class Scheduler(
                 req.priority = -sys.maxsize - 1
         elif not self.enable_priority_scheduling and req.priority is not None:
             abort_req = AbortReq(
-                req.rid,
                 finished_reason={
                     "type": "abort",
                     "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
                     "message": "Using priority is disabled for this server. Please send a new request without a priority.",
                 },
+                rid=req.rid,
             )
             self.send_to_tokenizer.send_pyobj(abort_req)
 
@@ -1500,12 +1500,12 @@ class Scheduler(
 
         self.send_to_tokenizer.send_pyobj(
             AbortReq(
-                req_to_abort.rid,
                 finished_reason={
                     "type": "abort",
                     "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
                     "message": message,
                 },
+                rid=req_to_abort.rid,
             )
         )
         return req_to_abort.rid == recv_req.rid
@@ -1978,7 +1978,7 @@ class Scheduler(
             self.new_token_ratio = new_token_ratio
             for req in reqs_to_abort:
                 self.send_to_tokenizer.send_pyobj(
-                    AbortReq(req.rid, abort_reason=req.to_abort_message)
+                    AbortReq(abort_reason=req.to_abort_message, rid=req.rid)
                 )
 
             logger.info(
