@@ -2618,14 +2618,6 @@ def read_system_prompt_from_file(model_name: str) -> str:
         return ""
 
 
-def bind_or_assign(target, source):
-    if target is not None:
-        target.copy_(source)
-        return target
-    else:
-        return source
-
-
 def prepack_weight_if_needed(weight):
     if weight.device != torch.device("cpu"):
         return weight
@@ -3251,27 +3243,29 @@ def get_extend_input_len_swa_limit(
 
 
 def get_num_new_pages(
-    prefix_lens: torch.Tensor,
     seq_lens: torch.Tensor,
     page_size: int,
+    prefix_lens: Optional[torch.Tensor] = None,
     decode: bool = False,
 ) -> torch.Tensor:
     """
-    Get the number of new pages for the given prefix and sequence lengths. We use cpu tensors to avoid blocking kernel launch.
+    Get the number of new pages for the given prefix and sequence lengths.
+    We use cpu tensors to avoid blocking kernel launch.
     """
     cpu_device = torch.device("cpu")
-    assert prefix_lens.device == cpu_device
     assert seq_lens.device == cpu_device
+
+    if prefix_lens is None or decode:
+        # NOTE: Special case for handling decode, which prefix lens is `seq_lens - 1`.
+        assert decode
+        return (seq_lens % page_size == 1).int().sum().item()
+
+    assert prefix_lens.device == cpu_device
     num_pages_after = (seq_lens + page_size - 1) // page_size
     num_pages_before = (prefix_lens + page_size - 1) // page_size
     num_new_pages = num_pages_after - num_pages_before
-    extend_lens = seq_lens - prefix_lens
     sum_num_new_pages = torch.sum(num_new_pages).to(torch.int64)
-    if decode:
-        return sum_num_new_pages.item()
-    merged_value = (sum_num_new_pages) << 32 | torch.sum(extend_lens).to(torch.int64)
-
-    return merged_value.item() >> 32
+    return sum_num_new_pages.item()
 
 
 class CachedKernel:
