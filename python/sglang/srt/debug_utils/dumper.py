@@ -26,7 +26,7 @@ class _Dumper:
 
     def __init__(self):
         # Do not import `sglang` to make this file standalone
-        self._enable = bool(int(os.environ.get("SGLANG_DUMPER_ENABLE", "0")))
+        self._enable = bool(int(os.environ.get("SGLANG_DUMPER_ENABLE", "1")))
         self._base_dir = Path(os.environ.get("SGLANG_DUMPER_DIR", "/tmp"))
         self._enable_write_file = bool(
             int(os.environ.get("SGLANG_DUMPER_WRITE_FILE", "1"))
