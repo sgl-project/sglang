@@ -359,7 +359,11 @@ class DataParallelController:
         if self.maybe_external_dp_rank_routing(req):
             return
 
-        raise NotImplementedError()
+        logger.warning(
+            "The 'minimum_tokens' load balancing method is deprecated for now and will introduced later."
+            "Fall back to 'round_robin_scheduler'"
+        )
+        self.round_robin_scheduler(req)
 
     def event_loop(self):
         while True:
