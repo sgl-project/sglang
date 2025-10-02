@@ -1205,20 +1205,6 @@ class Scheduler(
                 self.return_health_check_ct += 1
                 continue
 
-            # If it is a work request, accept or reject the request based on the request queue size.
-            if is_work_request(recv_req):
-                if len(self.waiting_queue) + 1 > self.max_queued_requests:
-                    abort_req = AbortReq(
-                        rid=recv_req.rid,
-                        finished_reason={
-                            "type": "abort",
-                            "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
-                            "message": "The request queue is full.",
-                        },
-                    )
-                    self.send_to_tokenizer.send_pyobj(abort_req)
-                    continue
-
             # If it is a MultiTokenizerWrapper, unwrap it and handle the inner request.
             if isinstance(recv_req, MultiTokenizerWrapper):
                 worker_id = recv_req.worker_id
