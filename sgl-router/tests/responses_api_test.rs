@@ -836,6 +836,41 @@ async fn setup_streaming_mcp_test() -> (
     (mcp, worker, router, dir)
 }
 
+/// Parse SSE (Server-Sent Events) stream into structured events
+fn parse_sse_events(body: &str) -> Vec<(Option<String>, serde_json::Value)> {
+    let mut events = Vec::new();
+    let blocks: Vec<&str> = body
+        .split("\n\n")
+        .filter(|s| !s.trim().is_empty())
+        .collect();
+
+    for block in blocks {
+        let mut event_name: Option<String> = None;
+        let mut data_lines: Vec<String> = Vec::new();
+
+        for line in block.lines() {
+            if let Some(rest) = line.strip_prefix("event:") {
+                event_name = Some(rest.trim().to_string());
+            } else if let Some(rest) = line.strip_prefix("data:") {
+                let data = rest.trim_start();
+                // Skip [DONE] marker
+                if data != "[DONE]" {
+                    data_lines.push(data.to_string());
+                }
+            }
+        }
+
+        if !data_lines.is_empty() {
+            let data = data_lines.join("\n");
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&data) {
+                events.push((event_name, parsed));
+            }
+        }
+    }
+
+    events
+}
+
 #[tokio::test]
 async fn test_streaming_with_mcp_tool_calls() {
     // This test verifies that streaming works with MCP tool calls:
@@ -916,37 +951,139 @@ async fn test_streaming_with_mcp_tool_calls() {
 
     println!("Streaming SSE response:\n{}", body_text);
 
-    // Verify SSE structure
-    assert!(
-        body_text.contains("data:"),
-        "Should contain SSE data events"
-    );
-
-    // Parse SSE events
-    let events: Vec<&str> = body_text
-        .split("\n\n")
-        .filter(|s| !s.trim().is_empty())
-        .collect();
+    // Parse all SSE events into structured format
+    let events = parse_sse_events(&body_text);
 
     assert!(!events.is_empty(), "Should have at least one SSE event");
+    println!("Total parsed SSE events: {}", events.len());
 
     // Check for [DONE] marker
     let has_done_marker = body_text.contains("data: [DONE]");
     assert!(has_done_marker, "Stream should end with [DONE] marker");
 
-    // Try to parse one of the data events
+    // Track which events we've seen
+    let mut found_mcp_list_tools = false;
     let mut found_response_created = false;
-    for event in &events {
-        if event.contains("response.created") || event.contains("\"type\":\"response.created\"") {
-            found_response_created = true;
-            break;
+    let mut found_mcp_call_added = false;
+    let mut found_mcp_call_in_progress = false;
+    let mut found_mcp_call_arguments = false;
+    let mut found_mcp_call_done = false;
+    let mut found_response_completed = false;
+
+    for (event_name, data) in &events {
+        let event_type = data.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+        match event_type {
+            "response.output_item.added" => {
+                // Check if it's an mcp_list_tools item
+                if let Some(item) = data.get("item") {
+                    if item.get("type").and_then(|v| v.as_str()) == Some("mcp_list_tools") {
+                        found_mcp_list_tools = true;
+                        println!("✓ Found mcp_list_tools event");
+
+                        // Verify tools array is present
+                        assert!(
+                            item.get("tools").is_some(),
+                            "mcp_list_tools should have tools array"
+                        );
+                    } else if item.get("type").and_then(|v| v.as_str()) == Some("mcp_call") {
+                        found_mcp_call_added = true;
+                        println!("✓ Found mcp_call added event");
+
+                        // Verify mcp_call has required fields
+                        assert!(item.get("name").is_some(), "mcp_call should have name");
+                        assert_eq!(
+                            item.get("server_label").and_then(|v| v.as_str()),
+                            Some("mock"),
+                            "mcp_call should have server_label"
+                        );
+                    }
+                }
+            }
+            "response.mcp_call.in_progress" => {
+                found_mcp_call_in_progress = true;
+                println!("✓ Found mcp_call.in_progress event");
+
+                // Verify it has output_index and item_id
+                assert!(
+                    data.get("output_index").is_some(),
+                    "mcp_call.in_progress should have output_index"
+                );
+                assert!(
+                    data.get("item_id").is_some(),
+                    "mcp_call.in_progress should have item_id"
+                );
+            }
+            "response.mcp_call_arguments.delta" => {
+                found_mcp_call_arguments = true;
+                println!("✓ Found mcp_call_arguments.delta event");
+            }
+            "response.output_item.done" => {
+                if let Some(item) = data.get("item") {
+                    if item.get("type").and_then(|v| v.as_str()) == Some("mcp_call") {
+                        found_mcp_call_done = true;
+                        println!("✓ Found mcp_call done event");
+
+                        // Verify mcp_call.done has output
+                        assert!(
+                            item.get("output").is_some(),
+                            "mcp_call done should have output"
+                        );
+                    }
+                }
+            }
+            "response.created" => {
+                found_response_created = true;
+                println!("✓ Found response.created event");
+
+                // Verify response has required fields
+                assert!(
+                    data.get("response").is_some(),
+                    "response.created should have response object"
+                );
+            }
+            "response.completed" => {
+                found_response_completed = true;
+                println!("✓ Found response.completed event");
+            }
+            _ => {
+                println!("  Other event: {}", event_type);
+            }
+        }
+
+        if let Some(name) = event_name {
+            println!("  Event name: {}", name);
         }
     }
 
-    // Note: The mock worker may not emit all expected events,
-    // so we just verify basic structure is present
-    println!("Total SSE events received: {}", events.len());
-    println!("Found response.created: {}", found_response_created);
+    // Verify key events were present
+    println!("\n=== Event Summary ===");
+    println!("MCP list_tools: {}", found_mcp_list_tools);
+    println!("Response created: {}", found_response_created);
+    println!("MCP call added: {}", found_mcp_call_added);
+    println!("MCP call in_progress: {}", found_mcp_call_in_progress);
+    println!(
+        "MCP call arguments: {} (optional - router may buffer)",
+        found_mcp_call_arguments
+    );
+    println!("MCP call done: {}", found_mcp_call_done);
+    println!("Response completed: {}", found_response_completed);
+
+    // Assert critical events are present
+    assert!(
+        found_mcp_list_tools,
+        "Should send mcp_list_tools event at the start"
+    );
+    assert!(found_response_created, "Should send response.created event");
+    assert!(found_mcp_call_added, "Should send mcp_call added event");
+    assert!(
+        found_mcp_call_in_progress,
+        "Should send mcp_call.in_progress event"
+    );
+    assert!(found_mcp_call_done, "Should send mcp_call done event");
+
+    // Note: mcp_call_arguments.delta events are optional because the router
+    // may buffer function_call_arguments and send them all at once in the completed event
 
     // Verify no error events
     let has_error = body_text.contains("event: error");

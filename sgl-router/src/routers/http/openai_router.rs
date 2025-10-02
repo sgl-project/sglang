@@ -31,6 +31,32 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{error, info, warn};
 
+// SSE Event Type Constants - single source of truth for event type strings
+mod event_types {
+    // Response lifecycle events
+    pub const RESPONSE_CREATED: &str = "response.created";
+    pub const RESPONSE_IN_PROGRESS: &str = "response.in_progress";
+    pub const RESPONSE_COMPLETED: &str = "response.completed";
+
+    // Output item events
+    pub const OUTPUT_ITEM_ADDED: &str = "response.output_item.added";
+    pub const OUTPUT_ITEM_DONE: &str = "response.output_item.done";
+
+    // Function call events
+    pub const FUNCTION_CALL_ARGUMENTS_DELTA: &str = "response.function_call_arguments.delta";
+    pub const FUNCTION_CALL_ARGUMENTS_DONE: &str = "response.function_call_arguments.done";
+
+    // MCP call events
+    pub const MCP_CALL_ARGUMENTS_DELTA: &str = "response.mcp_call_arguments.delta";
+    pub const MCP_CALL_ARGUMENTS_DONE: &str = "response.mcp_call_arguments.done";
+    pub const MCP_CALL_IN_PROGRESS: &str = "response.mcp_call.in_progress";
+
+    // Item types
+    pub const ITEM_TYPE_FUNCTION_CALL: &str = "function_call";
+    pub const ITEM_TYPE_FUNCTION_TOOL_CALL: &str = "function_tool_call";
+    pub const ITEM_TYPE_MCP_CALL: &str = "mcp_call";
+}
+
 /// Router for OpenAI backend
 pub struct OpenAIRouter {
     /// HTTP client for upstream OpenAI-compatible API
@@ -329,6 +355,9 @@ impl StreamingToolHandler {
         delta: &Value,
     ) -> &mut FunctionCallInProgress {
         // Find existing call for this output index
+        // Note: We use position() + index instead of iter_mut().find() because we need
+        // to potentially mutate pending_calls after the early return, which causes
+        // borrow checker issues with the iter_mut approach
         if let Some(pos) = self
             .pending_calls
             .iter()
@@ -1024,7 +1053,9 @@ impl OpenAIRouter {
 
         let should_patch = matches!(
             event_type.as_str(),
-            "response.created" | "response.in_progress" | "response.completed"
+            event_types::RESPONSE_CREATED
+                | event_types::RESPONSE_IN_PROGRESS
+                | event_types::RESPONSE_COMPLETED
         );
 
         if should_patch {
@@ -1053,7 +1084,7 @@ impl OpenAIRouter {
                     }
                 }
 
-                // Mask tools from function to MCP format
+                // Mask tools from function to MCP format (optimized without cloning)
                 if response_obj.get("tools").is_some() {
                     let requested_mcp = original_request
                         .tools
@@ -1061,10 +1092,11 @@ impl OpenAIRouter {
                         .any(|t| matches!(t.r#type, ResponseToolType::Mcp));
 
                     if requested_mcp {
-                        let mut temp_response = Value::Object(response_obj.clone());
-                        Self::mask_tools_as_mcp(&mut temp_response, original_request);
-                        if let Some(masked_obj) = temp_response.as_object() {
-                            *response_obj = masked_obj.clone();
+                        if let Some(mcp_tools) = Self::build_mcp_tools_value(original_request) {
+                            response_obj.insert("tools".to_string(), mcp_tools);
+                            response_obj
+                                .entry("tool_choice".to_string())
+                                .or_insert(Value::String("auto".to_string()));
                             changed = true;
                         }
                     }
@@ -1074,11 +1106,13 @@ impl OpenAIRouter {
 
         // 2. Apply transform_streaming_event logic (function_call → mcp_call)
         match event_type.as_str() {
-            "response.output_item.added" | "response.output_item.done" => {
+            event_types::OUTPUT_ITEM_ADDED | event_types::OUTPUT_ITEM_DONE => {
                 if let Some(item) = parsed_data.get_mut("item") {
                     if let Some(item_type) = item.get("type").and_then(|v| v.as_str()) {
-                        if item_type == "function_call" || item_type == "function_tool_call" {
-                            item["type"] = json!("mcp_call");
+                        if item_type == event_types::ITEM_TYPE_FUNCTION_CALL
+                            || item_type == event_types::ITEM_TYPE_FUNCTION_TOOL_CALL
+                        {
+                            item["type"] = json!(event_types::ITEM_TYPE_MCP_CALL);
                             item["server_label"] = json!(server_label);
 
                             // Transform ID from fc_* to mcp_*
@@ -1094,8 +1128,8 @@ impl OpenAIRouter {
                     }
                 }
             }
-            "response.function_call_arguments.done" => {
-                parsed_data["type"] = json!("response.mcp_call_arguments.done");
+            event_types::FUNCTION_CALL_ARGUMENTS_DONE => {
+                parsed_data["type"] = json!(event_types::MCP_CALL_ARGUMENTS_DONE);
 
                 // Transform item_id from fc_* to mcp_*
                 if let Some(item_id) = parsed_data.get("item_id").and_then(|v| v.as_str()) {
@@ -1127,7 +1161,7 @@ impl OpenAIRouter {
         previous_response_id: Option<&str>,
     ) -> bool {
         // Skip individual function_call_arguments.delta events - we'll send them as one
-        if event_name == Some("response.function_call_arguments.delta") {
+        if event_name == Some(event_types::FUNCTION_CALL_ARGUMENTS_DELTA) {
             return true;
         }
 
@@ -1142,7 +1176,7 @@ impl OpenAIRouter {
         };
 
         // Check if this is function_call_arguments.done - need to send buffered args first
-        if event_name == Some("response.function_call_arguments.done") {
+        if event_name == Some(event_types::FUNCTION_CALL_ARGUMENTS_DONE) {
             if let Some(output_index) = parsed_data
                 .get("output_index")
                 .and_then(|v| v.as_u64())
@@ -1166,13 +1200,14 @@ impl OpenAIRouter {
                         };
 
                         let delta_event = json!({
-                            "type": "response.mcp_call_arguments.delta",
+                            "type": event_types::MCP_CALL_ARGUMENTS_DELTA,
                             "output_index": output_index,
                             "item_id": mcp_item_id,
                             "delta": call.arguments_buffer
                         });
                         let delta_block = format!(
-                            "event: response.mcp_call_arguments.delta\ndata: {}\n\n",
+                            "event: {}\ndata: {}\n\n",
+                            event_types::MCP_CALL_ARGUMENTS_DELTA,
                             delta_event
                         );
                         if tx.send(Ok(Bytes::from(delta_block))).is_err() {
@@ -1205,10 +1240,16 @@ impl OpenAIRouter {
         let mut final_block = String::new();
         if let Some(evt) = event_name {
             // Update event name for function_call_arguments events
-            if evt == "response.function_call_arguments.delta" {
-                final_block.push_str("event: response.mcp_call_arguments.delta\n");
-            } else if evt == "response.function_call_arguments.done" {
-                final_block.push_str("event: response.mcp_call_arguments.done\n");
+            if evt == event_types::FUNCTION_CALL_ARGUMENTS_DELTA {
+                final_block.push_str(&format!(
+                    "event: {}\n",
+                    event_types::MCP_CALL_ARGUMENTS_DELTA
+                ));
+            } else if evt == event_types::FUNCTION_CALL_ARGUMENTS_DONE {
+                final_block.push_str(&format!(
+                    "event: {}\n",
+                    event_types::MCP_CALL_ARGUMENTS_DONE
+                ));
             } else {
                 final_block.push_str(&format!("event: {}\n", evt));
             }
@@ -1221,21 +1262,24 @@ impl OpenAIRouter {
         }
 
         // After sending output_item.added for mcp_call, inject mcp_call.in_progress event
-        if event_name == Some("response.output_item.added") {
+        if event_name == Some(event_types::OUTPUT_ITEM_ADDED) {
             if let Some(item) = parsed_data.get("item") {
-                if item.get("type").and_then(|v| v.as_str()) == Some("mcp_call") {
+                if item.get("type").and_then(|v| v.as_str())
+                    == Some(event_types::ITEM_TYPE_MCP_CALL)
+                {
                     // Already transformed to mcp_call
                     if let (Some(item_id), Some(output_index)) = (
                         item.get("id").and_then(|v| v.as_str()),
                         parsed_data.get("output_index").and_then(|v| v.as_u64()),
                     ) {
                         let in_progress_event = json!({
-                            "type": "response.mcp_call.in_progress",
+                            "type": event_types::MCP_CALL_IN_PROGRESS,
                             "output_index": output_index,
                             "item_id": item_id
                         });
                         let in_progress_block = format!(
-                            "event: response.mcp_call.in_progress\ndata: {}\n\n",
+                            "event: {}\ndata: {}\n\n",
+                            event_types::MCP_CALL_IN_PROGRESS,
                             in_progress_event
                         );
                         if tx.send(Ok(Bytes::from(in_progress_block))).is_err() {
@@ -2065,6 +2109,40 @@ impl OpenAIRouter {
 
     /// Replace returned tools with the original request's MCP tool block (if present) so
     /// external clients see MCP semantics rather than internal function tools.
+    /// Build MCP tools array value without cloning entire response object
+    fn build_mcp_tools_value(original_body: &ResponsesRequest) -> Option<Value> {
+        let mcp_tool = original_body
+            .tools
+            .iter()
+            .find(|t| matches!(t.r#type, ResponseToolType::Mcp) && t.server_url.is_some())?;
+
+        let mut m = serde_json::Map::new();
+        m.insert("type".to_string(), Value::String("mcp".to_string()));
+        if let Some(label) = &mcp_tool.server_label {
+            m.insert("server_label".to_string(), Value::String(label.clone()));
+        }
+        if let Some(url) = &mcp_tool.server_url {
+            m.insert("server_url".to_string(), Value::String(url.clone()));
+        }
+        if let Some(desc) = &mcp_tool.server_description {
+            m.insert(
+                "server_description".to_string(),
+                Value::String(desc.clone()),
+            );
+        }
+        if let Some(req) = &mcp_tool.require_approval {
+            m.insert("require_approval".to_string(), Value::String(req.clone()));
+        }
+        if let Some(allowed) = &mcp_tool.allowed_tools {
+            m.insert(
+                "allowed_tools".to_string(),
+                Value::Array(allowed.iter().map(|s| Value::String(s.clone())).collect()),
+            );
+        }
+
+        Some(Value::Array(vec![Value::Object(m)]))
+    }
+
     fn mask_tools_as_mcp(resp: &mut Value, original_body: &ResponsesRequest) {
         let mcp_tool = original_body
             .tools
