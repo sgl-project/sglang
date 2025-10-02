@@ -377,6 +377,7 @@ class ServerArgs:
     enable_dp_attention: bool = False
     enable_dp_lm_head: bool = False
     enable_two_batch_overlap: bool = False
+    enable_single_batch_overlap: bool = False
     tbo_token_distribution_threshold: float = 0.48
     enable_torch_compile: bool = False
     torch_compile_max_bs: int = 32
@@ -678,7 +679,7 @@ class ServerArgs:
                 [1, 2, 4, 8, 12]
                 + list(range(16, 257, 8))
                 + list(range(272, 512, 16))
-                + list(range(512, self.cuda_graph_max_bs + 1))
+                + list(range(512, self.cuda_graph_max_bs + 1, 32))
             )
         else:
             # Spec decoding case: list(range(1, 9, 1)) + list(range(10, 33, 2)) + list(range(40, 64, 4)) + list(range(72, 257, 8))
@@ -1087,7 +1088,10 @@ class ServerArgs:
                 and self.attention_backend != "flashinfer"
             ):
                 raise ValueError(
-                    "speculative_eagle_topk > 1 with page_size > 1 is unstable and produces incorrect results for paged attention backends. This combination is only supported for the 'flashinfer' backend."
+                    f"speculative_eagle_topk({self.speculative_eagle_topk}) > 1 "
+                    f"with page_size({self.page_size}) > 1 is unstable "
+                    "and produces incorrect results for paged attention backends. "
+                    "This combination is only supported for the 'flashinfer' backend."
                 )
             if self.enable_dp_attention:
                 # TODO: support dp attention for ngram speculative decoding
@@ -2453,6 +2457,11 @@ class ServerArgs:
             "--enable-two-batch-overlap",
             action="store_true",
             help="Enabling two micro batches to overlap.",
+        )
+        parser.add_argument(
+            "--enable-single-batch-overlap",
+            action="store_true",
+            help="Let computation and communication overlap within one micro batch.",
         )
         parser.add_argument(
             "--tbo-token-distribution-threshold",
