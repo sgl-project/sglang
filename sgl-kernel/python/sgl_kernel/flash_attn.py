@@ -163,7 +163,6 @@ def flash_attn_with_kvcache(
         assert (
             rotary_cos is None
             and rotary_sin is None
-            and rotary_interleaved is None
             and rotary_seqlens is None
         ), "FA4 does not support rotary embedding."
         assert (
