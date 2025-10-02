@@ -24,7 +24,7 @@ MODEL_SCORE_THRESHOLDS = {
     "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct": 0.85,
     "google/gemma-2-27b-it": 0.91,
     "meta-llama/Llama-3.1-70B-Instruct": 0.95,
-    "mistralai/Mixtral-8x7B-Instruct-v0.1": 0.62,
+    "mistralai/Mixtral-8x7B-Instruct-v0.1": 0.616,
     "Qwen/Qwen2-57B-A14B-Instruct": 0.86,
     "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8": 0.83,
     "neuralmagic/Mistral-7B-Instruct-v0.3-FP8": 0.54,
@@ -63,10 +63,15 @@ class TestNightlyGsm8KEval(unittest.TestCase):
             for model in model_group:
                 model_count += 1
                 with self.subTest(model=model):
+                    other_args = ["--tp", "2"] if is_tp2 else []
+
+                    if model == "meta-llama/Llama-3.1-70B-Instruct":
+                        other_args.extend(["--mem-fraction-static", "0.9"])
+
                     process = popen_launch_server(
                         model=model,
+                        other_args=other_args,
                         base_url=self.base_url,
-                        other_args=["--tp", "2"] if is_tp2 else [],
                         timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
                     )
 

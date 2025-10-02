@@ -683,6 +683,33 @@ pub struct CompletionStreamChoice {
 pub struct ResponseTool {
     #[serde(rename = "type")]
     pub r#type: ResponseToolType,
+    // MCP-specific fields (used when type == "mcp")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authorization: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub require_approval: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_tools: Option<Vec<String>>,
+}
+
+impl Default for ResponseTool {
+    fn default() -> Self {
+        Self {
+            r#type: ResponseToolType::WebSearchPreview,
+            server_url: None,
+            authorization: None,
+            server_label: None,
+            server_description: None,
+            require_approval: None,
+            allowed_tools: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -690,12 +717,16 @@ pub struct ResponseTool {
 pub enum ResponseToolType {
     WebSearchPreview,
     CodeInterpreter,
+    Mcp,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ResponseReasoningParam {
     #[serde(default = "default_reasoning_effort")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<ReasoningEffort>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<ReasoningSummary>,
 }
 
 fn default_reasoning_effort() -> Option<ReasoningEffort> {
@@ -708,6 +739,14 @@ pub enum ReasoningEffort {
     Low,
     Medium,
     High,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningSummary {
+    Auto,
+    Concise,
+    Detailed,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -769,6 +808,17 @@ pub enum ResponseReasoningContent {
     ReasoningText { text: String },
 }
 
+/// MCP Tool information for the mcp_list_tools output item
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct McpToolInfo {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub input_schema: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<Value>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
@@ -797,6 +847,25 @@ pub enum ResponseOutputItem {
         #[serde(skip_serializing_if = "Option::is_none")]
         output: Option<String>,
         status: String,
+    },
+    #[serde(rename = "mcp_list_tools")]
+    McpListTools {
+        id: String,
+        server_label: String,
+        tools: Vec<McpToolInfo>,
+    },
+    #[serde(rename = "mcp_call")]
+    McpCall {
+        id: String,
+        status: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        approval_request_id: Option<String>,
+        arguments: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+        name: String,
+        output: String,
+        server_label: String,
     },
 }
 
@@ -1463,6 +1532,7 @@ impl ResponsesResponse {
                 ToolChoice::Value(ToolChoiceValue::Required) => "required".to_string(),
                 ToolChoice::Value(ToolChoiceValue::None) => "none".to_string(),
                 ToolChoice::Function { .. } => "function".to_string(),
+                ToolChoice::AllowedTools { mode, .. } => mode.clone(),
             },
             tools: request.tools.clone(),
             top_p: request.top_p,
@@ -1690,6 +1760,12 @@ pub enum ToolChoice {
         tool_type: String, // "function"
         function: FunctionChoice,
     },
+    AllowedTools {
+        #[serde(rename = "type")]
+        tool_type: String, // "allowed_tools"
+        mode: String, // "auto" | "required" TODO: need validation
+        tools: Vec<ToolReference>,
+    },
 }
 
 impl Default for ToolChoice {
@@ -1701,6 +1777,14 @@ impl Default for ToolChoice {
 /// Function choice specification for ToolChoice::Function
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct FunctionChoice {
+    pub name: String,
+}
+
+/// Tool reference for ToolChoice::AllowedTools
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ToolReference {
+    #[serde(rename = "type")]
+    pub tool_type: String, // "function"
     pub name: String,
 }
 
@@ -1882,6 +1966,8 @@ pub struct SamplingParams {
     pub stop_token_ids: Option<Vec<u32>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub no_stop_trim: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub n: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sampling_seed: Option<u64>,
 }

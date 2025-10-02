@@ -1,6 +1,9 @@
 //! Step3 Parser Integration Tests
 
-use sglang_router_rs::tool_parser::{ParseState, Step3Parser, StreamResult, ToolParser};
+use sglang_router_rs::tool_parser::{Step3Parser, ToolParser};
+
+mod common;
+use common::create_test_tools;
 
 #[tokio::test]
 async fn test_step3_complete_parsing() {
@@ -15,11 +18,12 @@ async fn test_step3_complete_parsing() {
 <｜tool_calls_end｜>
 Here are the results..."#;
 
-    let result = parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 1);
-    assert_eq!(result[0].function.name, "search");
+    let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(normal_text, "Let me help you.\n");
+    assert_eq!(tools[0].function.name, "search");
 
-    let args: serde_json::Value = serde_json::from_str(&result[0].function.arguments).unwrap();
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
     assert_eq!(args["query"], "rust programming");
     assert_eq!(args["limit"], 10);
 }
@@ -38,10 +42,10 @@ async fn test_step3_multiple_tools() {
 </steptml:invoke><｜tool_call_end｜>
 <｜tool_calls_end｜>"#;
 
-    let result = parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 2);
-    assert_eq!(result[0].function.name, "get_weather");
-    assert_eq!(result[1].function.name, "get_news");
+    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 2);
+    assert_eq!(tools[0].function.name, "get_weather");
+    assert_eq!(tools[1].function.name, "get_news");
 }
 
 #[tokio::test]
@@ -58,10 +62,10 @@ async fn test_step3_type_conversion() {
 </steptml:invoke><｜tool_call_end｜>
 <｜tool_calls_end｜>"#;
 
-    let result = parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 1);
+    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
 
-    let args: serde_json::Value = serde_json::from_str(&result[0].function.arguments).unwrap();
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
     assert_eq!(args["count"], 100);
     assert_eq!(args["rate"], 2.5);
     assert_eq!(args["active"], true);
@@ -71,8 +75,9 @@ async fn test_step3_type_conversion() {
 
 #[tokio::test]
 async fn test_step3_streaming() {
-    let parser = Step3Parser::new();
-    let mut state = ParseState::new();
+    let mut parser = Step3Parser::new();
+
+    let tools = create_test_tools();
 
     // Simulate streaming chunks
     let chunks = vec![
@@ -85,26 +90,20 @@ async fn test_step3_streaming() {
         "\n<｜tool_calls_end｜>",
     ];
 
-    let mut found_name = false;
     let mut found_complete = false;
 
     for chunk in chunks {
-        let result = parser.parse_incremental(chunk, &mut state).await.unwrap();
+        let result = parser.parse_incremental(chunk, &tools).await.unwrap();
 
-        match result {
-            StreamResult::ToolName { name, .. } => {
+        if !result.calls.is_empty() {
+            if let Some(name) = &result.calls[0].name {
                 assert_eq!(name, "calc");
-                found_name = true;
-            }
-            StreamResult::ToolComplete(tool) => {
-                assert_eq!(tool.function.name, "calc");
                 found_complete = true;
             }
-            _ => {}
         }
     }
 
-    assert!(found_name || found_complete);
+    assert!(found_complete);
 }
 
 #[test]
@@ -132,11 +131,11 @@ async fn test_step3_nested_steptml() {
 </steptml:invoke><｜tool_call_end｜>
 <｜tool_calls_end｜>"#;
 
-    let result = parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 1);
-    assert_eq!(result[0].function.name, "config");
+    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].function.name, "config");
 
-    let args: serde_json::Value = serde_json::from_str(&result[0].function.arguments).unwrap();
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
     assert!(args["settings"].is_object());
     assert!(args["array"].is_array());
 }
@@ -153,10 +152,10 @@ async fn test_step3_python_literals() {
 </steptml:invoke><｜tool_call_end｜>
 <｜tool_calls_end｜>"#;
 
-    let result = parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 1);
+    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
 
-    let args: serde_json::Value = serde_json::from_str(&result[0].function.arguments).unwrap();
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
     assert_eq!(args["bool_true"], true);
     assert_eq!(args["bool_false"], false);
     assert_eq!(args["none_value"], serde_json::Value::Null);
@@ -174,11 +173,12 @@ async fn test_steptml_format() {
 </steptml:invoke><｜tool_call_end｜>
 <｜tool_calls_end｜>Text after."#;
 
-    let result = parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 1);
-    assert_eq!(result[0].function.name, "search");
+    let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(normal_text, "Text before.\n");
+    assert_eq!(tools[0].function.name, "search");
 
-    let args: serde_json::Value = serde_json::from_str(&result[0].function.arguments).unwrap();
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
     assert_eq!(args["query"], "rust lang");
     assert_eq!(args["limit"], 10);
     // TODO: Verify normal text extraction
@@ -195,10 +195,10 @@ async fn test_json_parameter_values() {
 </steptml:invoke><｜tool_call_end｜>
 <｜tool_calls_end｜>"#;
 
-    let result = parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 1);
+    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
 
-    let args: serde_json::Value = serde_json::from_str(&result[0].function.arguments).unwrap();
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
     assert!(args["settings"].is_object());
     assert!(args["items"].is_array());
 }
@@ -214,11 +214,11 @@ async fn test_step3_parameter_with_angle_brackets() {
 </steptml:invoke><｜tool_call_end｜>
 <｜tool_calls_end｜>"#;
 
-    let result = parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 1);
-    assert_eq!(result[0].function.name, "compare");
+    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].function.name, "compare");
 
-    let args: serde_json::Value = serde_json::from_str(&result[0].function.arguments).unwrap();
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
     assert_eq!(args["expression"], "a < b && b > c");
     assert_eq!(args["context"], "comparison test");
 }
@@ -233,6 +233,6 @@ async fn test_step3_empty_function_name() {
 </steptml:invoke><｜tool_call_end｜>
 <｜tool_calls_end｜>"#;
 
-    let result = parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 0); // Should reject empty function name
+    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 0); // Should reject empty function name
 }
