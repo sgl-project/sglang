@@ -18,7 +18,8 @@ from sglang.srt.layers.moe.utils import (
 
 __all__ = [
     "DeepEPMode",
-    "MoRIEPMode" "MoeA2ABackend",
+    "MoRIEPMode",
+    "MoeA2ABackend",
     "MoeRunner",
     "MoeRunnerConfig",
     "MoeRunnerBackend",

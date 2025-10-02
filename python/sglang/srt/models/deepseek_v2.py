@@ -852,6 +852,7 @@ class DeepseekV2MoE(nn.Module):
                 if not self.experts.should_fuse_routed_scaling_factor_in_topk():
                     final_hidden_states *= self.routed_scaling_factor
         elif is_mori:
+            # mori uses aiter topk, and routed_scaling_factor is fused into topk
             if shared_output is not None:
                 final_hidden_states = shared_output + final_hidden_states
         else:
