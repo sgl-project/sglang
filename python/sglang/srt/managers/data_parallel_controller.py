@@ -312,7 +312,6 @@ class DataParallelController:
                         pp_rank,
                         dp_rank,
                         writer,
-                        self.balance_meta,
                     ),
                 )
                 with memory_saver_adapter.configure_subprocess():
@@ -403,6 +402,3 @@ def run_data_parallel_controller_process(
         traceback = get_exception_traceback()
         logger.error(f"DataParallelController hit an exception: {traceback}")
         parent_process.send_signal(signal.SIGQUIT)
-    finally:
-        # we need to destruct mp.Manager() in balance_meta
-        balance_meta.destructor()
