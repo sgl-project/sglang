@@ -1278,11 +1278,14 @@ class HealthCheckOutput(BaseReq):
     pass
 
 
-class ExpertDistributionReq_(Enum):
-    # FIXME: make it align with the convention
+class ExpertDistributionReqType(Enum):
     START_RECORD = 1
     STOP_RECORD = 2
     DUMP_RECORD = 3
+
+
+class ExpertDistributionReq(BaseReq):
+    action: ExpertDistributionReqType
 
 
 @dataclass
