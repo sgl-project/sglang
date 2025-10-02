@@ -1,7 +1,7 @@
+use crate::protocols::spec::Tool;
 use crate::tool_parser::{
     errors::ToolParserResult,
-    state::ParseState,
-    types::{StreamResult, ToolCall},
+    types::{StreamingParseResult, ToolCall},
 };
 use async_trait::async_trait;
 
@@ -13,14 +13,28 @@ pub trait ToolParser: Send + Sync {
     async fn parse_complete(&self, output: &str) -> ToolParserResult<(String, Vec<ToolCall>)>;
 
     /// Parse tool calls from model output (streaming)
+    /// Parsers now maintain internal state, so self is mutable
+    ///
+    /// # Arguments
+    /// * `chunk` - New text chunk from model output
+    /// * `tools` - List of available tools for validation
     async fn parse_incremental(
-        &self,
+        &mut self,
         chunk: &str,
-        state: &mut ParseState,
-    ) -> ToolParserResult<StreamResult>;
+        tools: &[Tool],
+    ) -> ToolParserResult<StreamingParseResult>;
 
     /// Check if text contains tool calls in this parser's format
     fn detect_format(&self, text: &str) -> bool;
+
+    /// Reset parser state (for reuse across requests)
+    ///
+    /// Note: This method is currently never called in the codebase.
+    /// If you need to reset parser state, call helpers::reset_parser_state() directly.
+    /// This default implementation is a no-op to maintain trait compatibility.
+    fn reset(&mut self) {
+        // No-op by default
+    }
 
     /// Optionally expose a token-aware parser implementation.
     /// Default returns `None`, meaning the parser only supports text input.
@@ -50,9 +64,10 @@ pub trait TokenToolParser: ToolParser {
     ) -> ToolParserResult<(String, Vec<ToolCall>)>;
 
     /// Streaming parser entrypoint for token chunks.
+    /// Parsers maintain internal state, so self is mutable
     async fn parse_incremental_tokens(
-        &self,
+        &mut self,
         tokens: &[u32],
-        state: &mut ParseState,
-    ) -> ToolParserResult<StreamResult>;
+        tools: &[Tool],
+    ) -> ToolParserResult<StreamingParseResult>;
 }
