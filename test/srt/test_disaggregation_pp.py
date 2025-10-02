@@ -45,7 +45,7 @@ class TestDisaggregationPPAccuracy(TestDisaggregationBase):
             "--disaggregation-mode",
             "prefill",
             "--tp-size",
-            "1",
+            "2",
             "--pp-size",
             "2",
             "--disaggregation-ib-device",
@@ -66,11 +66,11 @@ class TestDisaggregationPPAccuracy(TestDisaggregationBase):
             "--disaggregation-mode",
             "decode",
             "--tp",
-            "1",
-            "--base-gpu-id",
             "2",
+            "--base-gpu-id",
+            "4",
             "--disaggregation-ib-device",
-            "mlx5_roce2",
+            "mlx5_roce4,mlx5_roce5",
         ]
         cls.process_decode = popen_launch_pd_server(
             cls.model,
