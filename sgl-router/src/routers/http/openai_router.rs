@@ -133,6 +133,167 @@ struct StreamingResponseAccumulator {
     encountered_error: Option<Value>,
 }
 
+/// Represents a function call being accumulated across delta events
+#[derive(Debug, Clone)]
+struct FunctionCallInProgress {
+    call_id: String,
+    name: String,
+    arguments_buffer: String,
+    output_index: usize,
+}
+
+impl FunctionCallInProgress {
+    fn new(call_id: String, output_index: usize) -> Self {
+        Self {
+            call_id,
+            name: String::new(),
+            arguments_buffer: String::new(),
+            output_index,
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        !self.name.is_empty() && !self.arguments_buffer.is_empty()
+    }
+}
+
+/// Action to take based on streaming event processing
+#[derive(Debug)]
+enum StreamAction {
+    Forward,      // Pass event to client
+    Buffer,       // Accumulate for tool execution
+    ExecuteTools, // Function call complete, execute now
+}
+
+/// Handles streaming responses with MCP tool call interception
+struct StreamingToolHandler {
+    /// Accumulator for response persistence
+    accumulator: StreamingResponseAccumulator,
+    /// Function calls being built from deltas
+    pending_calls: Vec<FunctionCallInProgress>,
+    /// Track if we're currently in a function call
+    in_function_call: bool,
+}
+
+impl StreamingToolHandler {
+    fn new() -> Self {
+        Self {
+            accumulator: StreamingResponseAccumulator::new(),
+            pending_calls: Vec::new(),
+            in_function_call: false,
+        }
+    }
+
+    /// Process an SSE event and determine what action to take
+    fn process_event(&mut self, event_name: Option<&str>, data: &str) -> StreamAction {
+        // Always feed to accumulator for storage
+        self.accumulator.ingest_block(&format!(
+            "{}data: {}",
+            event_name.map(|n| format!("event: {}\n", n)).unwrap_or_default(),
+            data
+        ));
+
+        let parsed: Value = match serde_json::from_str(data) {
+            Ok(v) => v,
+            Err(_) => return StreamAction::Forward,
+        };
+
+        let event_type = event_name
+            .map(|s| s.to_string())
+            .or_else(|| {
+                parsed
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or_default();
+
+        match event_type.as_str() {
+            "response.output_item.delta" => {
+                self.process_output_delta(&parsed)
+            }
+            "response.output_item.done" => {
+                // Check if we have complete function calls ready to execute
+                if self.has_complete_calls() {
+                    StreamAction::ExecuteTools
+                } else {
+                    StreamAction::Forward
+                }
+            }
+            _ => StreamAction::Forward,
+        }
+    }
+
+    /// Process output delta events to detect and accumulate function calls
+    fn process_output_delta(&mut self, event: &Value) -> StreamAction {
+        let output_index = event
+            .get("output_index")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .unwrap_or(0);
+
+        let delta = match event.get("delta") {
+            Some(d) => d,
+            None => return StreamAction::Forward,
+        };
+
+        // Check if this is a function call delta
+        let item_type = delta.get("type").and_then(|v| v.as_str());
+        
+        if item_type == Some("function_tool_call") || item_type == Some("function_call") {
+            self.in_function_call = true;
+
+            // Get or create function call for this output index
+            let call = self.get_or_create_call(output_index, delta);
+
+            // Accumulate call_id if present
+            if let Some(call_id) = delta.get("call_id").and_then(|v| v.as_str()) {
+                call.call_id = call_id.to_string();
+            }
+
+            // Accumulate name if present
+            if let Some(name) = delta.get("name").and_then(|v| v.as_str()) {
+                call.name.push_str(name);
+            }
+
+            // Accumulate arguments if present
+            if let Some(args) = delta.get("arguments").and_then(|v| v.as_str()) {
+                call.arguments_buffer.push_str(args);
+            }
+
+            // Buffer this event, don't forward to client
+            return StreamAction::Buffer;
+        }
+
+        // Forward non-function-call events
+        StreamAction::Forward
+    }
+
+    fn get_or_create_call(&mut self, output_index: usize, delta: &Value) -> &mut FunctionCallInProgress {
+        // Find existing call for this output index
+        if let Some(pos) = self.pending_calls.iter().position(|c| c.output_index == output_index) {
+            return &mut self.pending_calls[pos];
+        }
+
+        // Create new call
+        let call_id = delta
+            .get("call_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        self.pending_calls.push(FunctionCallInProgress::new(call_id, output_index));
+        self.pending_calls.last_mut().unwrap()
+    }
+
+    fn has_complete_calls(&self) -> bool {
+        !self.pending_calls.is_empty() && self.pending_calls.iter().all(|c| c.is_complete())
+    }
+
+    fn take_pending_calls(&mut self) -> Vec<FunctionCallInProgress> {
+        std::mem::take(&mut self.pending_calls)
+    }
+}
+
 impl StreamingResponseAccumulator {
     fn new() -> Self {
         Self {
@@ -589,6 +750,66 @@ impl OpenAIRouter {
         original_body: &ResponsesRequest,
         original_previous_response_id: Option<String>,
     ) -> Response {
+        // Check if MCP is active for this request
+        let req_mcp_manager = Self::mcp_manager_from_request_tools(&original_body.tools).await;
+        let active_mcp = req_mcp_manager.as_ref().or(self.mcp_manager.as_ref());
+
+        // Use unified handler that handles both simple and MCP-aware streaming
+        self.handle_streaming_response_with_mcp(
+            url,
+            headers,
+            payload,
+            original_body,
+            original_previous_response_id,
+            active_mcp,
+        )
+        .await
+    }
+
+    /// Handle streaming response with optional MCP tool call interception
+    /// When active_mcp is None, this acts as a simple pass-through streamer
+    async fn handle_streaming_response_with_mcp(
+        &self,
+        url: String,
+        headers: Option<&HeaderMap>,
+        mut payload: Value,
+        original_body: &ResponsesRequest,
+        original_previous_response_id: Option<String>,
+        active_mcp: Option<&Arc<crate::mcp::McpClientManager>>,
+    ) -> Response {
+        // If no MCP is active, use simple pass-through streaming
+        if active_mcp.is_none() {
+            return self.handle_simple_streaming_passthrough(
+                url,
+                headers,
+                payload,
+                original_body,
+                original_previous_response_id,
+            ).await;
+        }
+
+        let active_mcp = active_mcp.unwrap();
+
+        // MCP is active - transform tools and set up interception
+        self.handle_streaming_with_tool_interception(
+            url,
+            headers,
+            payload,
+            original_body,
+            original_previous_response_id,
+            active_mcp,
+        ).await
+    }
+
+    /// Simple pass-through streaming without MCP interception
+    async fn handle_simple_streaming_passthrough(
+        &self,
+        url: String,
+        headers: Option<&HeaderMap>,
+        payload: Value,
+        original_body: &ResponsesRequest,
+        original_previous_response_id: Option<String>,
+    ) -> Response {
         let mut request_builder = self.client.post(&url).json(&payload);
 
         if let Some(headers) = headers {
@@ -736,6 +957,318 @@ impl OpenAIRouter {
         }
 
         response
+    }
+
+    /// Handle streaming WITH MCP tool call interception and execution
+    async fn handle_streaming_with_tool_interception(
+        &self,
+        url: String,
+        headers: Option<&HeaderMap>,
+        mut payload: Value,
+        original_body: &ResponsesRequest,
+        original_previous_response_id: Option<String>,
+        active_mcp: &Arc<crate::mcp::McpClientManager>,
+    ) -> Response {
+        // Transform MCP tools to function tools in payload (like non-streaming)
+        if let Some(obj) = payload.as_object_mut() {
+            // Remove any non-function tools from outgoing payload
+            if let Some(v) = obj.get_mut("tools") {
+                if let Some(arr) = v.as_array_mut() {
+                    arr.retain(|item| {
+                        item.get("type")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s == "function")
+                            .unwrap_or(false)
+                    });
+                }
+            }
+
+            // Build function tools for all discovered MCP tools
+            let mut tools_json = Vec::new();
+            let tools = active_mcp.list_tools();
+            for t in tools {
+                let parameters = t.parameters.clone().unwrap_or(serde_json::json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }));
+                let tool = serde_json::json!({
+                    "type": "function",
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": parameters
+                });
+                tools_json.push(tool);
+            }
+            if !tools_json.is_empty() {
+                obj.insert("tools".to_string(), Value::Array(tools_json));
+                obj.insert("tool_choice".to_string(), Value::String("auto".to_string()));
+            }
+        }
+
+        let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, io::Error>>();
+        let should_store = original_body.store;
+        let storage = self.response_storage.clone();
+        let original_request = original_body.clone();
+        let previous_response_id = original_previous_response_id.clone();
+
+        let client = self.client.clone();
+        let url_clone = url.clone();
+        let headers_opt = headers.map(|h| h.clone());
+        let payload_clone = payload.clone();
+        let active_mcp_clone = Arc::clone(active_mcp);
+
+        // Spawn the streaming loop task
+        tokio::spawn(async move {
+            let mut state = ToolLoopState::new(original_request.input.clone());
+            let loop_config = McpLoopConfig::default();
+            let max_tool_calls = original_request.max_tool_calls.map(|n| n as usize);
+            let tools_json = payload_clone.get("tools").cloned().unwrap_or(json!([]));
+            let base_payload = payload_clone.clone();
+            let mut current_payload = payload_clone;
+            
+            let server_label = original_request
+                .tools
+                .iter()
+                .find(|t| matches!(t.r#type, ResponseToolType::Mcp))
+                .and_then(|t| t.server_label.as_deref())
+                .unwrap_or("mcp");
+
+            loop {
+                // Make streaming request
+                let mut request_builder = client.post(&url_clone).json(&current_payload);
+                if let Some(ref h) = headers_opt {
+                    request_builder = apply_request_headers(h, request_builder, true);
+                }
+                request_builder = request_builder.header("Accept", "text/event-stream");
+
+                let response = match request_builder.send().await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let error_event = format!("event: error\ndata: {{\"error\": {{\"message\": \"{}\"}}}}\n\n", e);
+                        let _ = tx.send(Ok(Bytes::from(error_event)));
+                        return;
+                    }
+                };
+
+                if !response.status().is_success() {
+                    let status = response.status();
+                    let body = response.text().await.unwrap_or_default();
+                    let error_event = format!("event: error\ndata: {{\"error\": {{\"message\": \"Upstream error {}: {}\"}}}}\n\n", status, body);
+                    let _ = tx.send(Ok(Bytes::from(error_event)));
+                    return;
+                }
+
+                // Stream events and check for tool calls
+                let mut upstream_stream = response.bytes_stream();
+                let mut handler = StreamingToolHandler::new();
+                let mut pending = String::new();
+                let mut tool_calls_detected = false;
+
+                while let Some(chunk_result) = upstream_stream.next().await {
+                    match chunk_result {
+                        Ok(chunk) => {
+                            let chunk_text = match std::str::from_utf8(&chunk) {
+                                Ok(text) => Cow::Borrowed(text),
+                                Err(_) => Cow::Owned(String::from_utf8_lossy(&chunk).to_string()),
+                            };
+
+                            pending.push_str(&chunk_text.replace("\r\n", "\n"));
+
+                            while let Some(pos) = pending.find("\n\n") {
+                                let raw_block = pending[..pos].to_string();
+                                pending.drain(..pos + 2);
+
+                                if raw_block.trim().is_empty() {
+                                    continue;
+                                }
+
+                                // Parse event
+                                let (event_name, data) = Self::parse_sse_block(&raw_block);
+                                
+                                if data.is_empty() {
+                                    continue;
+                                }
+
+                                // Process through handler
+                                let action = handler.process_event(event_name.as_deref(), &data);
+
+                                match action {
+                                    StreamAction::Forward => {
+                                        // Rewrite and forward to client
+                                        let block_to_send = if let Some(modified) = Self::rewrite_streaming_block(
+                                            &raw_block,
+                                            &original_request,
+                                            previous_response_id.as_deref(),
+                                        ) {
+                                            modified
+                                        } else {
+                                            raw_block
+                                        };
+
+                                        let chunk_to_send = format!("{}\n\n", block_to_send);
+                                        if tx.send(Ok(Bytes::from(chunk_to_send))).is_err() {
+                                            return;
+                                        }
+                                    }
+                                    StreamAction::Buffer => {
+                                        // Don't forward, just buffer
+                                    }
+                                    StreamAction::ExecuteTools => {
+                                        tool_calls_detected = true;
+                                        break; // Exit stream processing to execute tools
+                                    }
+                                }
+                            }
+
+                            if tool_calls_detected {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            let error_event = format!("event: error\ndata: {{\"error\": {{\"message\": \"Stream error: {}\"}}}}\n\n", e);
+                            let _ = tx.send(Ok(Bytes::from(error_event)));
+                            return;
+                        }
+                    }
+                }
+
+                // If no tool calls, we're done - stream is complete
+                if !tool_calls_detected {
+                    // Send final events and done marker
+                    if should_store {
+                        if let Some(mut response_json) = handler.accumulator.into_final_response() {
+                            // Inject MCP metadata if we executed any tools
+                            if state.total_calls > 0 {
+                                Self::inject_mcp_metadata_streaming(
+                                    &mut response_json,
+                                    &state,
+                                    &active_mcp_clone,
+                                    server_label,
+                                );
+                            }
+
+                            // Mask tools back to MCP format
+                            Self::mask_tools_as_mcp(&mut response_json, &original_request);
+                            
+                            Self::patch_streaming_response_json(
+                                &mut response_json,
+                                &original_request,
+                                previous_response_id.as_deref(),
+                            );
+
+                            if let Err(err) = Self::store_response_impl(&storage, &response_json, &original_request).await {
+                                warn!("Failed to store streaming response: {}", err);
+                            }
+                        }
+                    }
+                    
+                    let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
+                    return;
+                }
+
+                // Execute tools
+                let pending_calls = handler.take_pending_calls();
+                
+                // Check iteration limit
+                state.iteration += 1;
+                state.total_calls += pending_calls.len();
+
+                let effective_limit = match max_tool_calls {
+                    Some(user_max) => user_max.min(loop_config.max_iterations),
+                    None => loop_config.max_iterations,
+                };
+
+                if state.total_calls > effective_limit {
+                    warn!("Reached tool call limit during streaming: {}", effective_limit);
+                    let error_event = format!("event: error\ndata: {{\"error\": {{\"message\": \"Exceeded max_tool_calls limit\"}}}}\n\n");
+                    let _ = tx.send(Ok(Bytes::from(error_event)));
+                    let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
+                    return;
+                }
+
+                // Execute all pending tool calls (sequential, as PR3 is skipped)
+                for call in pending_calls {
+                    info!("Executing tool call during streaming: {} ({})", call.name, call.call_id);
+
+                    let call_result = Self::execute_mcp_call(&active_mcp_clone, &call.name, &call.arguments_buffer).await;
+                    let output_str = match call_result {
+                        Ok((_, output)) => output,
+                        Err(err) => {
+                            warn!("Tool execution failed during streaming: {}", err);
+                            json!({ "error": err }).to_string()
+                        }
+                    };
+
+                    // Record the call
+                    state.record_call(call.call_id, call.name, call.arguments_buffer, output_str);
+                }
+
+                // Build resume payload
+                match Self::build_resume_payload(
+                    &base_payload,
+                    &state.conversation_history,
+                    &state.original_input,
+                    &tools_json,
+                ) {
+                    Ok(resume_payload) => {
+                        current_payload = resume_payload;
+                        // Continue loop to make next streaming request
+                    }
+                    Err(e) => {
+                        let error_event = format!("event: error\ndata: {{\"error\": {{\"message\": \"Failed to build resume payload: {}\"}}}}\n\n", e);
+                        let _ = tx.send(Ok(Bytes::from(error_event)));
+                        let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
+                        return;
+                    }
+                }
+            }
+        });
+
+        let body_stream = UnboundedReceiverStream::new(rx);
+        let mut response = Response::new(Body::from_stream(body_stream));
+        *response.status_mut() = StatusCode::OK;
+        response.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+        response
+    }
+
+    /// Parse an SSE block into event name and data
+    fn parse_sse_block(block: &str) -> (Option<String>, String) {
+        let mut event_name: Option<String> = None;
+        let mut data_lines: Vec<String> = Vec::new();
+
+        for line in block.lines() {
+            if let Some(rest) = line.strip_prefix("event:") {
+                event_name = Some(rest.trim().to_string());
+            } else if let Some(rest) = line.strip_prefix("data:") {
+                data_lines.push(rest.trim_start().to_string());
+            }
+        }
+
+        let data = data_lines.join("\n");
+        (event_name, data)
+    }
+
+    /// Inject MCP metadata into a streaming response
+    fn inject_mcp_metadata_streaming(
+        response: &mut Value,
+        state: &ToolLoopState,
+        mcp: &Arc<crate::mcp::McpClientManager>,
+        server_label: &str,
+    ) {
+        if let Some(output_array) = response.get_mut("output").and_then(|v| v.as_array_mut()) {
+            // Add mcp_list_tools at the beginning
+            let list_tools_item = Self::build_mcp_list_tools_item(mcp, server_label);
+            output_array.insert(0, list_tools_item);
+
+            // Add mcp_call items for executed calls
+            let mcp_call_items = Self::build_executed_mcp_call_items(&state.conversation_history, server_label);
+            let mut insert_pos = 1;
+            for item in mcp_call_items {
+                output_array.insert(insert_pos, item);
+                insert_pos += 1;
+            }
+        }
     }
 
     async fn store_response_internal(

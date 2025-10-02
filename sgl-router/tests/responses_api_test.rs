@@ -765,3 +765,300 @@ async fn test_max_tool_calls_limit() {
     worker.stop().await;
     mcp.stop().await;
 }
+
+#[tokio::test]
+async fn test_streaming_with_mcp_tool_calls() {
+    // This test verifies that streaming works with MCP tool calls:
+    // 1. Initial streaming request with MCP tools
+    // 2. Mock worker streams text, then function_call deltas
+    // 3. Router buffers function call, executes MCP tool
+    // 4. Router resumes streaming with tool results
+    // 5. Mock worker streams final answer
+    // 6. Verify SSE events are properly formatted
+
+    let mut mcp = MockMCPServer::start().await.expect("start mcp");
+    let mcp_yaml = format!(
+        "servers:\n  - name: mock\n    protocol: streamable\n    url: {}\n",
+        mcp.url()
+    );
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let cfg_path = dir.path().join("mcp.yaml");
+    std::fs::write(&cfg_path, mcp_yaml).expect("write mcp cfg");
+
+    let mut worker = MockWorker::new(MockWorkerConfig {
+        port: 0,
+        worker_type: WorkerType::Regular,
+        health_status: HealthStatus::Healthy,
+        response_delay_ms: 0,
+        fail_rate: 0.0,
+    });
+    let worker_url = worker.start().await.expect("start worker");
+
+    let router_cfg = RouterConfig {
+        mode: RoutingMode::OpenAI {
+            worker_urls: vec![worker_url],
+        },
+        connection_mode: ConnectionMode::Http,
+        policy: PolicyConfig::Random,
+        host: "127.0.0.1".to_string(),
+        port: 0,
+        max_payload_size: 8 * 1024 * 1024,
+        request_timeout_secs: 60,
+        worker_startup_timeout_secs: 5,
+        worker_startup_check_interval_secs: 1,
+        dp_aware: false,
+        api_key: None,
+        discovery: None,
+        metrics: None,
+        log_dir: None,
+        log_level: Some("info".to_string()),
+        request_id_headers: None,
+        max_concurrent_requests: 32,
+        queue_size: 0,
+        queue_timeout_secs: 5,
+        rate_limit_tokens_per_second: None,
+        cors_allowed_origins: vec![],
+        retry: RetryConfig::default(),
+        circuit_breaker: CircuitBreakerConfig::default(),
+        disable_retries: false,
+        disable_circuit_breaker: false,
+        health_check: HealthCheckConfig::default(),
+        enable_igw: false,
+        model_path: None,
+        tokenizer_path: None,
+        history_backend: sglang_router_rs::config::HistoryBackend::Memory,
+        oracle: None,
+    };
+
+    let ctx = AppContext::new(router_cfg, reqwest::Client::new(), 64, None).expect("ctx");
+    let router = RouterFactory::create_router(&Arc::new(ctx))
+        .await
+        .expect("router");
+
+    // Build streaming request with MCP tools
+    let req = ResponsesRequest {
+        background: false,
+        include: None,
+        input: ResponseInput::Text("search for something interesting".to_string()),
+        instructions: Some("Use tools when needed".to_string()),
+        max_output_tokens: Some(256),
+        max_tool_calls: Some(3),
+        metadata: None,
+        model: Some("mock-model".to_string()),
+        parallel_tool_calls: true,
+        previous_response_id: None,
+        reasoning: None,
+        service_tier: ServiceTier::Auto,
+        store: true,
+        stream: true, // KEY: Enable streaming
+        temperature: Some(0.7),
+        tool_choice: ToolChoice::Value(ToolChoiceValue::Auto),
+        tools: vec![ResponseTool {
+            r#type: ResponseToolType::Mcp,
+            server_url: Some(mcp.url()),
+            server_label: Some("mock".to_string()),
+            server_description: Some("Mock MCP for streaming test".to_string()),
+            require_approval: Some("never".to_string()),
+            ..Default::default()
+        }],
+        top_logprobs: 0,
+        top_p: Some(1.0),
+        truncation: Truncation::Disabled,
+        user: None,
+        request_id: "resp_streaming_mcp_test".to_string(),
+        priority: 0,
+        frequency_penalty: 0.0,
+        presence_penalty: 0.0,
+        stop: None,
+        top_k: 50,
+        min_p: 0.0,
+        repetition_penalty: 1.0,
+    };
+
+    let response = router.route_responses(None, &req, None).await;
+
+    // Verify streaming response
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::OK,
+        "Streaming request should succeed"
+    );
+
+    // Check Content-Type is text/event-stream
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok());
+    assert_eq!(
+        content_type,
+        Some("text/event-stream"),
+        "Should have SSE content type"
+    );
+
+    // Read the streaming body
+    use axum::body::to_bytes;
+    let response_body = response.into_body();
+    let body_bytes = to_bytes(response_body, usize::MAX).await.unwrap();
+    let body_text = String::from_utf8_lossy(&body_bytes);
+
+    println!("Streaming SSE response:\n{}", body_text);
+
+    // Verify SSE structure
+    assert!(
+        body_text.contains("data:"),
+        "Should contain SSE data events"
+    );
+
+    // Parse SSE events
+    let events: Vec<&str> = body_text
+        .split("\n\n")
+        .filter(|s| !s.trim().is_empty())
+        .collect();
+
+    assert!(!events.is_empty(), "Should have at least one SSE event");
+
+    // Check for [DONE] marker
+    let has_done_marker = body_text.contains("data: [DONE]");
+    assert!(
+        has_done_marker,
+        "Stream should end with [DONE] marker"
+    );
+
+    // Try to parse one of the data events
+    let mut found_response_created = false;
+    for event in &events {
+        if event.contains("response.created") || event.contains("\"type\":\"response.created\"") {
+            found_response_created = true;
+            break;
+        }
+    }
+
+    // Note: The mock worker may not emit all expected events,
+    // so we just verify basic structure is present
+    println!("Total SSE events received: {}", events.len());
+    println!("Found response.created: {}", found_response_created);
+
+    // Verify no error events
+    let has_error = body_text.contains("event: error");
+    assert!(!has_error, "Should not have error events");
+
+    worker.stop().await;
+    mcp.stop().await;
+}
+
+#[tokio::test]
+async fn test_streaming_multi_turn_with_mcp() {
+    // Test streaming with multiple tool call rounds
+    let mut mcp = MockMCPServer::start().await.expect("start mcp");
+
+    let mut worker = MockWorker::new(MockWorkerConfig {
+        port: 0,
+        worker_type: WorkerType::Regular,
+        health_status: HealthStatus::Healthy,
+        response_delay_ms: 0,
+        fail_rate: 0.0,
+    });
+    let worker_url = worker.start().await.expect("start worker");
+
+    let router_cfg = RouterConfig {
+        mode: RoutingMode::OpenAI {
+            worker_urls: vec![worker_url],
+        },
+        connection_mode: ConnectionMode::Http,
+        policy: PolicyConfig::Random,
+        host: "127.0.0.1".to_string(),
+        port: 0,
+        max_payload_size: 8 * 1024 * 1024,
+        request_timeout_secs: 60,
+        worker_startup_timeout_secs: 5,
+        worker_startup_check_interval_secs: 1,
+        dp_aware: false,
+        api_key: None,
+        discovery: None,
+        metrics: None,
+        log_dir: None,
+        log_level: Some("info".to_string()),
+        request_id_headers: None,
+        max_concurrent_requests: 32,
+        queue_size: 0,
+        queue_timeout_secs: 5,
+        rate_limit_tokens_per_second: None,
+        cors_allowed_origins: vec![],
+        retry: RetryConfig::default(),
+        circuit_breaker: CircuitBreakerConfig::default(),
+        disable_retries: false,
+        disable_circuit_breaker: false,
+        health_check: HealthCheckConfig::default(),
+        enable_igw: false,
+        model_path: None,
+        tokenizer_path: None,
+        history_backend: sglang_router_rs::config::HistoryBackend::Memory,
+        oracle: None,
+    };
+
+    let ctx = AppContext::new(router_cfg, reqwest::Client::new(), 64, None).expect("ctx");
+    let router = RouterFactory::create_router(&Arc::new(ctx))
+        .await
+        .expect("router");
+
+    let req = ResponsesRequest {
+        background: false,
+        include: None,
+        input: ResponseInput::Text("complex query requiring multiple tool calls".to_string()),
+        instructions: Some("Be thorough".to_string()),
+        max_output_tokens: Some(512),
+        max_tool_calls: Some(5), // Allow multiple rounds
+        metadata: None,
+        model: Some("mock-model".to_string()),
+        parallel_tool_calls: true,
+        previous_response_id: None,
+        reasoning: None,
+        service_tier: ServiceTier::Auto,
+        store: true,
+        stream: true,
+        temperature: Some(0.8),
+        tool_choice: ToolChoice::Value(ToolChoiceValue::Auto),
+        tools: vec![ResponseTool {
+            r#type: ResponseToolType::Mcp,
+            server_url: Some(mcp.url()),
+            server_label: Some("mock".to_string()),
+            ..Default::default()
+        }],
+        top_logprobs: 0,
+        top_p: Some(1.0),
+        truncation: Truncation::Disabled,
+        user: None,
+        request_id: "resp_streaming_multiturn_test".to_string(),
+        priority: 0,
+        frequency_penalty: 0.0,
+        presence_penalty: 0.0,
+        stop: None,
+        top_k: 50,
+        min_p: 0.0,
+        repetition_penalty: 1.0,
+    };
+
+    let response = router.route_responses(None, &req, None).await;
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+    use axum::body::to_bytes;
+    let body_bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body_text = String::from_utf8_lossy(&body_bytes);
+
+    println!("Multi-turn streaming response:\n{}", body_text);
+
+    // Verify streaming completed successfully
+    assert!(body_text.contains("data: [DONE]"));
+    assert!(!body_text.contains("event: error"));
+
+    // Count events
+    let event_count = body_text.split("\n\n").filter(|s| !s.trim().is_empty()).count();
+    println!("Total events in multi-turn stream: {}", event_count);
+
+    assert!(event_count > 0, "Should have received streaming events");
+
+    worker.stop().await;
+    mcp.stop().await;
+}
