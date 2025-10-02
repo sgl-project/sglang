@@ -3080,6 +3080,10 @@ class DeepseekV2ForCausalLM(nn.Module):
             num_groups=config.n_group,
         )
 
+    @classmethod
+    def support_elastic_ep(cls) -> bool:
+        return True
+
 
 BackendRegistry.register("ascend", handle_ascend)
 BackendRegistry.register("flashinfer", handle_flashinfer)

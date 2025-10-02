@@ -4,7 +4,9 @@ from dataclasses import dataclass
 from typing import Optional
 
 import torch
+from torch import nn
 
+from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers.schedule_batch import ServerArgs
 from sglang.srt.utils import is_cpu, is_cuda
 
@@ -36,11 +38,23 @@ def get_elastic_ep_state():
     return _elastic_ep_state
 
 
-def init_elastic_ep_state(server_args: ServerArgs):
+def init_elastic_ep_state(server_args: ServerArgs, model_config: ModelConfig):
     global _elastic_ep_state
     assert _elastic_ep_state is None
     if server_args.elastic_ep_backend is not None:
+        assert _model_supports_elastic_ep(
+            model_config
+        ), f"{model_config.hf_config.architectures} does not support elastic ep now."
         return _build_state(ep_size=None, device=None)
+
+
+def _model_supports_elastic_ep(model: nn.Module) -> bool:
+    cls = model.__class__
+    is_support_func = getattr(cls, "support_elastic_ep", None)
+    if callable(is_support_func):
+        return bool(is_support_func())
+    else:
+        return False
 
 
 def _select_device() -> torch.device:

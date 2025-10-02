@@ -330,7 +330,10 @@ class ModelRunner:
             else None
         )
         self.expert_location_updater = ExpertLocationUpdater()
-        init_elastic_ep_state(self.server_args)
+
+        # Elastic EP
+        init_elastic_ep_state(self.server_args, self.model_config)
+
         # Load the model
         self.sampler = Sampler()
         self.load_model()
