@@ -6,42 +6,6 @@ use crate::tool_parser::partial_json::{
 use crate::tool_parser::traits::ToolParser;
 
 #[test]
-fn test_parse_state_new() {
-    let state = ParseState::new();
-    assert_eq!(state.phase, ParsePhase::Searching);
-    assert_eq!(state.buffer, "");
-    assert_eq!(state.consumed, 0);
-    assert_eq!(state.bracket_depth, 0);
-    assert!(!state.in_string);
-    assert!(!state.escape_next);
-}
-
-#[test]
-fn test_parse_state_process_char() {
-    let mut state = ParseState::new();
-
-    state.process_char('{');
-    assert_eq!(state.bracket_depth, 1);
-
-    state.process_char('}');
-    assert_eq!(state.bracket_depth, 0);
-
-    state.process_char('"');
-    assert!(state.in_string);
-
-    state.process_char('"');
-    assert!(!state.in_string);
-
-    state.process_char('"');
-    state.process_char('\\');
-    assert!(state.escape_next);
-
-    state.process_char('"');
-    assert!(!state.escape_next);
-    assert!(state.in_string); // Still in string because quote was escaped
-}
-
-#[test]
 fn test_parser_registry() {
     let registry = ParserRegistry::new();
 
@@ -165,37 +129,7 @@ fn test_compute_diff() {
     assert_eq!(compute_diff("test", "hello"), "hello");
 }
 
-#[test]
-fn test_stream_result_variants() {
-    let result = StreamResult::Incomplete;
-    matches!(result, StreamResult::Incomplete);
-
-    let result = StreamResult::ToolName {
-        index: 0,
-        name: "test".to_string(),
-    };
-    if let StreamResult::ToolName { index, name } = result {
-        assert_eq!(index, 0);
-        assert_eq!(name, "test");
-    } else {
-        panic!("Expected ToolName variant");
-    }
-
-    let tool = ToolCall {
-        id: "123".to_string(),
-        r#type: "function".to_string(),
-        function: FunctionCall {
-            name: "test".to_string(),
-            arguments: "{}".to_string(),
-        },
-    };
-    let result = StreamResult::ToolComplete(tool.clone());
-    if let StreamResult::ToolComplete(t) = result {
-        assert_eq!(t.id, "123");
-    } else {
-        panic!("Expected ToolComplete variant");
-    }
-}
+// NOTE: test_stream_result_variants removed - StreamResult enum replaced by StreamingParseResult
 
 #[test]
 fn test_partial_tool_call() {
@@ -544,62 +478,6 @@ mod edge_cases {
         let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
         assert_eq!(tools.len(), 1);
         assert!(tools[0].function.arguments.contains("null"));
-    }
-
-    #[tokio::test]
-    async fn test_streaming_with_partial_chunks() {
-        let parser = JsonParser::new();
-
-        let mut state1 = ParseState::new();
-        let partial = r#"{"#;
-        let result = parser
-            .parse_incremental(partial, &mut state1)
-            .await
-            .unwrap();
-        assert!(
-            matches!(result, StreamResult::Incomplete),
-            "Should return Incomplete for just opening brace"
-        );
-
-        let mut state2 = ParseState::new();
-        let complete = r#"{"name": "get_weather", "arguments": {"location": "SF"}}"#;
-        let result = parser
-            .parse_incremental(complete, &mut state2)
-            .await
-            .unwrap();
-
-        match result {
-            StreamResult::ToolComplete(tool) => {
-                assert_eq!(tool.function.name, "get_weather");
-                let args: serde_json::Value =
-                    serde_json::from_str(&tool.function.arguments).unwrap();
-                assert_eq!(args["location"], "SF");
-            }
-            _ => panic!("Expected ToolComplete for complete JSON"),
-        }
-
-        // The PartialJson parser can complete partial JSON by filling in missing values
-        let mut state3 = ParseState::new();
-        let partial_with_name = r#"{"name": "test", "argum"#;
-        let result = parser
-            .parse_incremental(partial_with_name, &mut state3)
-            .await
-            .unwrap();
-
-        match result {
-            StreamResult::ToolComplete(tool) => {
-                assert_eq!(tool.function.name, "test");
-                // Arguments will be empty object since "argum" is incomplete
-                assert_eq!(tool.function.arguments, "{}");
-            }
-            StreamResult::ToolName { name, .. } => {
-                assert_eq!(name, "test");
-            }
-            StreamResult::Incomplete => {
-                // Also acceptable if parser decides to wait
-            }
-            _ => panic!("Unexpected result for partial JSON with name"),
-        }
     }
 
     #[tokio::test]

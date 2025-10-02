@@ -246,11 +246,11 @@ impl ToolParser for JsonParser {
         let start_idx = if let Some(bracket_pos) = current_text.find('[') {
             let brace_pos = current_text.find('{');
             match brace_pos {
-                Some(bp) if bp < bracket_pos => bp + 1,
-                _ => bracket_pos + 1,
+                Some(bp) if bp < bracket_pos => bp,
+                _ => bracket_pos,
             }
         } else if let Some(brace_pos) = current_text.find('{') {
-            brace_pos + 1
+            brace_pos
         } else if self.current_tool_id >= 0 && current_text.starts_with(self.tool_call_separator) {
             self.tool_call_separator.len()
         } else {

@@ -4,6 +4,8 @@
 
 use sglang_router_rs::tool_parser::ParserRegistry;
 
+mod common;
+
 #[tokio::test]
 async fn test_registry_has_all_parsers() {
     let registry = ParserRegistry::new();

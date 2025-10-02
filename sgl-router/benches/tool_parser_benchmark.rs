@@ -8,9 +8,9 @@
 //! - Different model formats (JSON, Mistral, Qwen, Pythonic, etc.)
 
 use criterion::{black_box, criterion_group, BenchmarkId, Criterion, Throughput};
-use sglang_router_rs::tool_parser::{
-    registry::ParserRegistry, state::ParseState, types::StreamResult,
-};
+use serde_json::json;
+use sglang_router_rs::protocols::spec::{Function, Tool};
+use sglang_router_rs::tool_parser::{registry::ParserRegistry, JsonParser, ToolParser};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -107,6 +107,40 @@ const STEP3_FORMAT: &str = r#"<step.tML version="0.1">
 </step.tML>"#;
 
 const GPT_OSS_FORMAT: &str = r#"<Channel.vector_search>{"collection": "technical_documentation", "query_embedding": [0.0234, -0.1456, 0.0891, 0.2341, -0.0567, 0.1234, 0.0456, -0.0789, 0.1567, 0.0234, -0.1123, 0.0678, 0.2345, -0.0456, 0.0891, 0.1234, -0.0567, 0.0789, 0.1456, -0.0234, 0.0891, 0.1567, -0.0678, 0.0345, 0.1234, -0.0456, 0.0789, 0.1891, -0.0234, 0.0567, 0.1345, -0.0891], "top_k": 10, "similarity_metric": "cosine", "filters": {"language": "en", "last_updated": {"$gte": "2023-01-01"}, "categories": {"$in": ["api", "sdk", "integration"]}}, "include_metadata": true, "rerank_with_cross_encoder": true}</Channel.vector_search>"#;
+
+// Create test tools for parsers that need them
+fn create_test_tools() -> Vec<Tool> {
+    vec![
+        Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "search".to_string(),
+                description: Some("Search for information".to_string()),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "limit": {"type": "number"}
+                    }
+                }),
+            },
+        },
+        Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "code_interpreter".to_string(),
+                description: Some("Execute code".to_string()),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "language": {"type": "string"},
+                        "code": {"type": "string"}
+                    }
+                }),
+            },
+        },
+    ]
+}
 
 // Large test data for stress testing
 fn generate_large_json(num_tools: usize) -> String {
@@ -295,7 +329,6 @@ fn bench_complete_parsing(c: &mut Criterion) {
 
 fn bench_streaming_parsing(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
-    let registry = Arc::new(ParserRegistry::new());
 
     // Streaming test with chunked input
     let chunks = vec![
@@ -315,24 +348,21 @@ fn bench_streaming_parsing(c: &mut Criterion) {
     let printed = Arc::new(AtomicBool::new(false));
     group.bench_function("json_streaming", |b| {
         let printed_clone = printed.clone();
-        let registry = registry.clone();
         let rt = rt.handle().clone();
 
         b.iter_custom(|iters| {
-            let parser = registry.get_parser("json").expect("Parser not found");
+            let tools = create_test_tools();
 
             let start = Instant::now();
             for _ in 0..iters {
-                let parser = parser.clone();
-                let mut state = ParseState::new();
+                let mut parser = JsonParser::new();
                 let mut complete_tools = Vec::new();
 
                 rt.block_on(async {
                     for chunk in &chunks {
-                        if let StreamResult::ToolComplete(tool) =
-                            parser.parse_incremental(chunk, &mut state).await.unwrap()
-                        {
-                            complete_tools.push(tool);
+                        let result = parser.parse_incremental(chunk, &tools).await.unwrap();
+                        if !result.calls.is_empty() {
+                            complete_tools.extend(result.calls);
                         }
                     }
                 });
