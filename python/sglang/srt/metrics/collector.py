@@ -12,6 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 """Utilities for Prometheus Metrics Collection."""
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
@@ -22,6 +23,20 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var
 
 SGLANG_TEST_REQUEST_TIME_STATS = get_bool_env_var("SGLANG_TEST_REQUEST_TIME_STATS")
+
+
+def get_histogram_conf_from_env(env_var_name: str) -> Optional[List[float]]:
+    """
+    Get the histogram configuration from the environment variable.
+    env value should be like "0.1,0.2,0.5,1,2"
+    """
+    if env_var_name not in os.environ:
+        return None
+    # if the env var is not set or empty, return None
+    env_var_value = os.environ[env_var_name]
+    if not env_var_value:
+        return None
+    return [float(x) for x in env_var_value.split(",")]
 
 
 @dataclass
@@ -147,11 +162,15 @@ class SchedulerStats:
     # Engine startup
     engine_startup_time: float = 0.0
     engine_load_weights_time: float = 0.0
+    new_token_ratio: float = 0.0
 
 
 class SchedulerMetricsCollector:
 
-    def __init__(self, labels: Dict[str, str]) -> None:
+    def __init__(
+        self,
+        labels: Dict[str, str],
+    ) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
         from prometheus_client import Counter, Gauge, Histogram
 
@@ -485,6 +504,13 @@ class SchedulerMetricsCollector:
             labelnames=list(labels.keys()) + ["stage"],
         )
 
+        self.new_token_ratio = Gauge(
+            name="sglang:new_token_ratio",
+            documentation="The new token ratio.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
     def _log_gauge(self, gauge, data: Union[int, float]) -> None:
         # Convenience function for logging to gauge.
         gauge.labels(**self.labels).set(data)
@@ -534,6 +560,7 @@ class SchedulerMetricsCollector:
         self._log_gauge(
             self.num_decode_transfer_queue_reqs, stats.num_decode_transfer_queue_reqs
         )
+        self._log_gauge(self.new_token_ratio, stats.new_token_ratio)
         self._log_gauge(self.kv_transfer_speed_gb_s, stats.kv_transfer_speed_gb_s)
         self._log_gauge(self.kv_transfer_latency_ms, stats.kv_transfer_latency_ms)
 
@@ -555,6 +582,7 @@ class SchedulerMetricsCollector:
             self._log_gauge(
                 self.engine_load_weights_time, stats.engine_load_weights_time
             )
+        self._log_gauge(self.new_token_ratio, stats.new_token_ratio)
 
         self.last_log_time = time.perf_counter()
 
@@ -938,3 +966,100 @@ class StorageMetricsCollector:
             self._log_histogram(self.histogram_prefetch_bandwidth, v)
         for v in storage_metrics.backup_bandwidth:
             self._log_histogram(self.histogram_backup_bandwidth, v)
+
+
+class RadixCacheMetricsCollector:
+    def __init__(
+        self,
+        labels: Dict[str, str],
+    ) -> None:
+        # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
+        from prometheus_client import Counter, Histogram
+
+        self.labels = labels
+
+        bucket_eviction_duration = get_histogram_conf_from_env(
+            "SGLANG_BUCKET_EVICTION_DURATION"
+        )
+        if bucket_eviction_duration is None:
+            bucket_eviction_duration = [
+                0.001,
+                0.002,
+                0.003,
+                0.004,
+                0.005,
+                0.006,
+                0.007,
+                0.008,
+                0.009,
+                0.01,
+                0.02,
+                0.03,
+                0.04,
+                0.05,
+                0.1,
+                0.2,
+                0.5,
+                1.0,
+            ]
+        bucket_load_back_duration = get_histogram_conf_from_env(
+            "SGLANG_BUCKET_LOAD_BACK_DURATION"
+        )
+        if bucket_load_back_duration is None:
+            bucket_load_back_duration = [
+                0.001,
+                0.002,
+                0.003,
+                0.004,
+                0.005,
+                0.006,
+                0.007,
+                0.008,
+                0.009,
+                0.01,
+                0.02,
+                0.03,
+                0.04,
+                0.05,
+                0.1,
+                0.2,
+                0.5,
+                1.0,
+            ]
+        self.eviction_duration_seconds = Histogram(
+            name="sglang:eviction_duration_seconds",
+            documentation="Time taken to evict memory from GPU to CPU in seconds.",
+            labelnames=labels.keys(),
+            buckets=bucket_eviction_duration,
+        )
+
+        self.eviction_num_tokens = Counter(
+            name="sglang:evicted_tokens_total",
+            documentation="The number of tokens evicted from GPU to CPU.",
+            labelnames=labels.keys(),
+        )
+
+        self.load_back_duration_seconds = Histogram(
+            name="sglang:load_back_duration_seconds",
+            documentation="Time taken to load memory from CPU to GPU in seconds.",
+            labelnames=labels.keys(),
+            buckets=bucket_load_back_duration,
+        )
+
+        self.load_back_num_tokens = Counter(
+            name="sglang:load_back_tokens_total",
+            documentation="The number of tokens loaded from CPU to GPU.",
+            labelnames=labels.keys(),
+        )
+
+    def increment_eviction_num_tokens(self, num_tokens: int) -> None:
+        self.eviction_num_tokens.labels(**self.labels).inc(num_tokens)
+
+    def increment_load_back_num_tokens(self, num_tokens: int) -> None:
+        self.load_back_num_tokens.labels(**self.labels).inc(num_tokens)
+
+    def observe_eviction_duration(self, duration_seconds: float) -> None:
+        self.eviction_duration_seconds.labels(**self.labels).observe(duration_seconds)
+
+    def observe_load_back_duration(self, duration_seconds: float) -> None:
+        self.load_back_duration_seconds.labels(**self.labels).observe(duration_seconds)

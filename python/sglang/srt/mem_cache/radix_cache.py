@@ -33,9 +33,14 @@ from sglang.srt.disaggregation.kv_events import (
     BlockStored,
 )
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
+from sglang.srt.mem_cache.base_prefix_cache import (
+    BasePrefixCache,
+    BasePrefixCacheMetricsMixin,
+    MatchResult,
+)
 from sglang.srt.mem_cache.evict_policy import EvictionStrategy, LFUStrategy, LRUStrategy
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -169,7 +174,7 @@ def _convert_to_bigram_key(tokens: List[int]) -> List[Tuple[int, int]]:
     return [(tokens[i], tokens[i + 1]) for i in range(len(tokens) - 1)]
 
 
-class RadixCache(BasePrefixCache):
+class RadixCache(BasePrefixCache, BasePrefixCacheMetricsMixin):
     def __init__(
         self,
         req_to_token_pool: ReqToTokenPool,
@@ -179,6 +184,7 @@ class RadixCache(BasePrefixCache):
         enable_kv_cache_events: bool = False,
         eviction_policy: str = "lru",
         is_eagle: bool = False,
+        server_args: Optional[ServerArgs] = None,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -186,6 +192,7 @@ class RadixCache(BasePrefixCache):
         self.disable = disable
         self.enable_kv_cache_events = enable_kv_cache_events
         self.kv_event_queue = []
+        self.init_metrics(server_args)
         self.is_eagle = is_eagle
 
         if self.token_to_kv_pool_allocator:
@@ -443,6 +450,7 @@ class RadixCache(BasePrefixCache):
         if self.disable:
             return
 
+        start_time = time.perf_counter()
         leaves = self._collect_leaves()
         eviction_heap = [
             (self.eviction_strategy.get_priority(node), node) for node in leaves
@@ -467,6 +475,12 @@ class RadixCache(BasePrefixCache):
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
 
             self._record_remove_event(x)
+
+        if num_evicted > 0 and self.metrics_collector is not None:
+            self.metrics_collector.observe_eviction_duration(
+                time.perf_counter() - start_time
+            )
+            self.metrics_collector.increment_eviction_num_tokens(num_evicted)
 
     def inc_lock_ref(self, node: TreeNode):
         if self.disable:
