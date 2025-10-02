@@ -12,7 +12,7 @@ from sglang.test.test_utils import (
 MODELS = [
     SimpleNamespace(
         model="meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8",
-        tp_size=8,
+        tp_size=4,
     ),
 ]
 
