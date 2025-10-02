@@ -95,23 +95,15 @@ impl ToolParserRegistry {
 
         // Try prefix matching with more specific patterns first
         let model_mapping = self.model_mapping.read().unwrap();
-        let mut matches: Vec<(&String, &String)> = model_mapping
+        let best_match = model_mapping
             .iter()
             .filter(|(pattern, _)| {
-                if pattern.ends_with('*') {
-                    let prefix = &pattern[..pattern.len() - 1];
-                    model.starts_with(prefix)
-                } else {
-                    false
-                }
+                pattern.ends_with('*') && model.starts_with(&pattern[..pattern.len() - 1])
             })
-            .collect();
+            .max_by_key(|(pattern, _)| pattern.len());
 
-        // Sort by pattern length in descending order (longer patterns are more specific)
-        matches.sort_by_key(|(pattern, _)| std::cmp::Reverse(pattern.len()));
-
-        // Return the first matching parser
-        for (_, parser_name) in matches {
+        // Return the best matching parser
+        if let Some((_, parser_name)) = best_match {
             if let Some(parser) = self.get_pooled_parser(parser_name) {
                 return Some(parser);
             }
@@ -270,22 +262,14 @@ impl ToolParserFactory {
                 parser_name.clone()
             } else {
                 // Try prefix matching
-                let mut matches: Vec<(String, String)> = mapping
+                let best_match = mapping
                     .iter()
                     .filter(|(pattern, _)| {
-                        if pattern.ends_with('*') {
-                            let prefix = &pattern[..pattern.len() - 1];
-                            model_id.starts_with(prefix)
-                        } else {
-                            false
-                        }
+                        pattern.ends_with('*') && model_id.starts_with(&pattern[..pattern.len() - 1])
                     })
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect();
+                    .max_by_key(|(pattern, _)| pattern.len());
 
-                matches.sort_by_key(|(pattern, _)| std::cmp::Reverse(pattern.len()));
-
-                if let Some((_, parser_name)) = matches.first() {
+                if let Some((_, parser_name)) = best_match {
                     parser_name.clone()
                 } else {
                     // Fall back to default
