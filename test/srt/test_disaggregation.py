@@ -51,7 +51,7 @@ class TestDisaggregationAccuracy(TestDisaggregationBase):
             "--disaggregation-mode",
             "prefill",
             "--tp",
-            "2",
+            "4",
             "--disaggregation-ib-device",
             "mlx5_roce0,mlx5_roce1",
         ]
@@ -69,11 +69,11 @@ class TestDisaggregationAccuracy(TestDisaggregationBase):
             "--disaggregation-mode",
             "decode",
             "--tp",
-            "2",
+            "4",
             "--base-gpu-id",
-            "2",
+            "4",
             "--disaggregation-ib-device",
-            "mlx5_roce2,mlx5_roce3",
+            "mlx5_roce4,mlx5_roce5",
         ]
         cls.process_decode = popen_launch_pd_server(
             cls.model,
@@ -191,7 +191,7 @@ class TestDisaggregationMooncakeFailure(TestDisaggregationBase):
             "--disaggregation-mode",
             "prefill",
             "--tp",
-            "2",
+            "4",
             "--disaggregation-ib-device",
             "mlx5_roce0,mlx5_roce1",
         ]
@@ -209,11 +209,11 @@ class TestDisaggregationMooncakeFailure(TestDisaggregationBase):
             "--disaggregation-mode",
             "decode",
             "--tp",
-            "2",
+            "4",
             "--base-gpu-id",
-            "2",
+            "4",
             "--disaggregation-ib-device",
-            "mlx5_roce2,mlx5_roce3",
+            "mlx5_roce4,mlx5_roce5",
         ]
         cls.process_decode = popen_launch_pd_server(
             cls.model,
@@ -298,7 +298,7 @@ class TestDisaggregationMooncakeSpec(TestDisaggregationBase):
             "--disaggregation-mode",
             "prefill",
             "--tp",
-            "2",
+            "4",
             "--disaggregation-ib-device",
             "mlx5_roce0,mlx5_roce1",
         ] + cls.spec_args
@@ -316,11 +316,11 @@ class TestDisaggregationMooncakeSpec(TestDisaggregationBase):
             "--disaggregation-mode",
             "decode",
             "--tp",
-            "2",
+            "4",
             "--base-gpu-id",
-            "2",
+            "4",
             "--disaggregation-ib-device",
-            "mlx5_roce2,mlx5_roce3",
+            "mlx5_roce4,mlx5_roce5",
         ] + cls.spec_args
         cls.process_decode = popen_launch_pd_server(
             cls.model,
@@ -383,7 +383,7 @@ class TestDisaggregationSimulatedRetract(TestDisaggregationBase):
             "--disaggregation-mode",
             "prefill",
             "--tp",
-            "2",
+            "4",
             "--disaggregation-ib-device",
             "mlx5_roce0,mlx5_roce1",
         ]
@@ -401,11 +401,11 @@ class TestDisaggregationSimulatedRetract(TestDisaggregationBase):
             "--disaggregation-mode",
             "decode",
             "--tp",
-            "2",
+            "4",
             "--base-gpu-id",
-            "2",
+            "4",
             "--disaggregation-ib-device",
-            "mlx5_roce2,mlx5_roce3",
+            "mlx5_roce4,mlx5_roce5",
         ]
         cls.process_decode = popen_launch_pd_server(
             cls.model,
