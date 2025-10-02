@@ -73,21 +73,12 @@ pub struct PartialToolCall {
 }
 
 /// Result of streaming parse operation (matches Python StreamingParseResult)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct StreamingParseResult {
     /// Normal text that's not part of tool calls
     pub normal_text: String,
     /// Tool call items parsed from the chunk
     pub calls: Vec<ToolCallItem>,
-}
-
-impl Default for StreamingParseResult {
-    fn default() -> Self {
-        Self {
-            normal_text: String::new(),
-            calls: Vec::new(),
-        }
-    }
 }
 
 /// Simple encapsulation of parsed tool call for streaming (matches Python ToolCallItem)

@@ -44,6 +44,12 @@ pub struct PythonicParser {
     buffer: String,
 }
 
+impl Default for PythonicParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PythonicParser {
     /// Create a new Pythonic parser
     pub fn new() -> Self {
@@ -145,7 +151,10 @@ impl ToolParser for PythonicParser {
                             .enumerate()
                             .filter_map(|(idx, tool)| {
                                 if !tool_indices.contains_key(&tool.function.name) {
-                                    tracing::warn!("Invalid tool name '{}' - skipping", tool.function.name);
+                                    tracing::warn!(
+                                        "Invalid tool name '{}' - skipping",
+                                        tool.function.name
+                                    );
                                     return None;
                                 }
 
@@ -210,10 +219,10 @@ fn find_matching_bracket(buffer: &str, start: usize) -> Option<usize> {
     let mut bracket_count = 0;
     let chars: Vec<char> = buffer.chars().collect();
 
-    for i in start..chars.len() {
-        if chars[i] == '[' {
+    for (i, &ch) in chars.iter().enumerate().skip(start) {
+        if ch == '[' {
             bracket_count += 1;
-        } else if chars[i] == ']' {
+        } else if ch == ']' {
             bracket_count -= 1;
             if bracket_count == 0 {
                 return Some(i);

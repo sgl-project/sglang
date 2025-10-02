@@ -41,7 +41,6 @@ pub struct MistralParser {
 
     /// Token configuration
     bot_token: &'static str,
-    eot_token: &'static str,
     tool_call_separator: &'static str,
 }
 
@@ -56,19 +55,8 @@ impl MistralParser {
             current_tool_name_sent: false,
             streamed_args_for_tool: Vec::new(),
             bot_token: "[TOOL_CALLS] [",
-            eot_token: "]",
             tool_call_separator: ", ",
         }
-    }
-
-    /// Extract JSON array using bracket counting
-    ///
-    /// Handles nested brackets in JSON content by tracking:
-    /// - String boundaries (quotes)
-    /// - Escape sequences
-    /// - Bracket depth
-    fn extract_json_array<'a>(&self, text: &'a str) -> Option<&'a str> {
-        self.extract_json_array_with_pos(text).map(|(_, json)| json)
     }
 
     fn extract_json_array_with_pos<'a>(&self, text: &'a str) -> Option<(usize, &'a str)> {
@@ -130,14 +118,14 @@ impl MistralParser {
         let mut tools = Vec::new();
 
         if let Value::Array(arr) = value {
-            for (index, item) in arr.iter().enumerate() {
-                if let Some(tool) = self.parse_single_object(item, index)? {
+            for item in arr.iter() {
+                if let Some(tool) = self.parse_single_object(item)? {
                     tools.push(tool);
                 }
             }
         } else {
             // Single object case (shouldn't happen with Mistral format, but handle it)
-            if let Some(tool) = self.parse_single_object(&value, 0)? {
+            if let Some(tool) = self.parse_single_object(&value)? {
                 tools.push(tool);
             }
         }
@@ -146,7 +134,7 @@ impl MistralParser {
     }
 
     /// Parse a single JSON object into a ToolCall
-    fn parse_single_object(&self, obj: &Value, index: usize) -> ToolParserResult<Option<ToolCall>> {
+    fn parse_single_object(&self, obj: &Value) -> ToolParserResult<Option<ToolCall>> {
         let name = obj.get("name").and_then(|v| v.as_str());
 
         if let Some(name) = name {

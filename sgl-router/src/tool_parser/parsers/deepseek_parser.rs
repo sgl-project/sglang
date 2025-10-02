@@ -264,11 +264,9 @@ impl ToolParser for DeepSeekParser {
                     .map(|s| s.as_str())
                     .unwrap_or("");
 
-                let argument_diff = if func_args_raw.starts_with(last_sent) {
-                    &func_args_raw[last_sent.len()..]
-                } else {
-                    func_args_raw
-                };
+                let argument_diff = func_args_raw
+                    .strip_prefix(last_sent)
+                    .unwrap_or(func_args_raw);
 
                 if !argument_diff.is_empty() {
                     calls.push(ToolCallItem {

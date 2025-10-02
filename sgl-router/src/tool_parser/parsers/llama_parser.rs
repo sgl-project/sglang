@@ -39,7 +39,6 @@ pub struct LlamaParser {
 
     /// Token configuration
     bot_token: &'static str,
-    eot_token: &'static str,
     tool_call_separator: &'static str,
 }
 
@@ -54,7 +53,6 @@ impl LlamaParser {
             current_tool_name_sent: false,
             streamed_args_for_tool: Vec::new(),
             bot_token: "<|python_tag|>",
-            eot_token: "",
             tool_call_separator: ";",
         }
     }
@@ -104,39 +102,6 @@ impl LlamaParser {
         } else {
             Ok(None)
         }
-    }
-
-    /// Parse JSON value(s) into tool calls
-    fn parse_json_value(&self, value: &Value) -> ToolParserResult<Vec<ToolCall>> {
-        let mut tools = Vec::new();
-
-        match value {
-            Value::Array(arr) => {
-                // Parse each element in the array
-                for item in arr {
-                    if let Some(tool) = self.parse_single_object(item)? {
-                        tools.push(tool);
-                    }
-                }
-            }
-            Value::Object(_) => {
-                // Single tool call
-                if let Some(tool) = self.parse_single_object(value)? {
-                    tools.push(tool);
-                }
-            }
-            _ => {
-                // Not a valid tool call format
-                return Ok(vec![]);
-            }
-        }
-
-        Ok(tools)
-    }
-
-    /// Check if text contains potential tool call markers
-    fn has_python_tag(&self, text: &str) -> bool {
-        text.contains("<|python_tag|>")
     }
 
     /// Parse semicolon-separated JSON objects

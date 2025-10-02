@@ -76,7 +76,7 @@ impl QwenParser {
     }
 
     /// Parse a single JSON object into a ToolCall
-    fn parse_single_object(&self, obj: &Value, index: usize) -> ToolParserResult<Option<ToolCall>> {
+    fn parse_single_object(&self, obj: &Value) -> ToolParserResult<Option<ToolCall>> {
         let name = obj.get("name").and_then(|v| v.as_str());
 
         if let Some(name) = name {
@@ -139,17 +139,17 @@ impl ToolParser for QwenParser {
 
         // Extract tool calls
         let mut tools = Vec::new();
-        for (index, captures) in self.extractor.captures_iter(text).enumerate() {
+        for captures in self.extractor.captures_iter(text) {
             if let Some(json_str) = captures.get(1) {
                 let parsed = serde_json::from_str::<Value>(json_str.as_str().trim())
                     .map_err(|e| ToolParserError::ParsingFailed(e.to_string()))
-                    .and_then(|v| self.parse_single_object(&v, index));
+                    .and_then(|v| self.parse_single_object(&v));
 
                 match parsed {
                     Ok(Some(tool)) => tools.push(tool),
                     Ok(None) => continue,
                     Err(e) => {
-                        tracing::warn!("Failed to parse tool call {}: {:?}", index, e);
+                        tracing::warn!("Failed to parse tool call: {:?}", e);
                         continue;
                     }
                 }

@@ -18,12 +18,7 @@ pub fn ends_with_partial_token(buffer: &str, token: &str) -> Option<usize> {
         return None;
     }
 
-    for i in 1..token.len() {
-        if buffer.ends_with(&token[..i]) {
-            return Some(i);
-        }
-    }
-    None
+    (1..token.len()).find(|&i| buffer.ends_with(&token[..i]))
 }
 
 /// Reset state for the current tool being parsed (used when skipping invalid tools).
@@ -92,6 +87,7 @@ pub fn is_complete_json(input: &str) -> bool {
 /// Different LLM formats use different field names:
 /// - Llama and JSON parsers use "parameters" (correct per JSON Schema spec)
 /// - Mistral and Qwen use "arguments"
+///
 /// This function normalizes to "arguments" for consistent downstream processing.
 pub fn normalize_arguments_field(mut obj: Value) -> Value {
     if obj.get("arguments").is_none() {
@@ -129,11 +125,12 @@ pub fn normalize_arguments_field(mut obj: Value) -> Value {
 /// # Returns
 /// - `Ok(StreamingParseResult)` with any tool call items to stream
 /// - `Err(ToolParserError)` if JSON parsing or serialization fails
+#[allow(clippy::too_many_arguments)]
 pub fn handle_json_tool_streaming(
     current_text: &str,
     start_idx: usize,
     partial_json: &mut crate::tool_parser::partial_json::PartialJson,
-    tool_indices: &std::collections::HashMap<String, usize>,
+    tool_indices: &HashMap<String, usize>,
     buffer: &mut String,
     current_tool_id: &mut i32,
     current_tool_name_sent: &mut bool,
@@ -206,48 +203,46 @@ pub fn handle_json_tool_streaming(
         }
     }
     // Case 2: Handle streaming arguments
-    else {
-        if let Some(cur_arguments) = current_tool_call.get("arguments") {
-            let tool_id = *current_tool_id as usize;
-            let sent = streamed_args_for_tool
-                .get(tool_id)
-                .map(|s| s.len())
-                .unwrap_or(0);
-            let cur_args_json = serde_json::to_string(cur_arguments)
-                .map_err(|e| ToolParserError::ParsingFailed(e.to_string()))?;
+    else if let Some(cur_arguments) = current_tool_call.get("arguments") {
+        let tool_id = *current_tool_id as usize;
+        let sent = streamed_args_for_tool
+            .get(tool_id)
+            .map(|s| s.len())
+            .unwrap_or(0);
+        let cur_args_json = serde_json::to_string(cur_arguments)
+            .map_err(|e| ToolParserError::ParsingFailed(e.to_string()))?;
 
-            // Compute diff: everything after what we've already sent
-            let diff = cur_args_json[sent..].to_string();
+        // Compute diff: everything after what we've already sent
+        let diff = cur_args_json[sent..].to_string();
 
-            // Send diff if there's new content
-            if !diff.is_empty() {
-                // Only accumulate if not complete
-                if !is_complete && tool_id < streamed_args_for_tool.len() {
-                    streamed_args_for_tool[tool_id].push_str(&diff);
-                }
-
-                result.calls.push(ToolCallItem {
-                    tool_index: tool_id,
-                    name: None,
-                    parameters: diff,
-                });
+        // Send diff if there's new content
+        if !diff.is_empty() {
+            // Only accumulate if not complete
+            if !is_complete && tool_id < streamed_args_for_tool.len() {
+                streamed_args_for_tool[tool_id].push_str(&diff);
             }
 
-            // If JSON is complete, advance to next tool
-            if is_complete {
-                // Remove processed portion, keep unprocessed content
-                *buffer = current_text[start_idx + end_idx..].to_string();
+            result.calls.push(ToolCallItem {
+                tool_index: tool_id,
+                name: None,
+                parameters: diff,
+            });
+        }
 
-                // Clear completed tool data
-                if tool_id < prev_tool_call_arr.len() {
-                    prev_tool_call_arr[tool_id] = Value::Null;
-                }
-                *current_tool_name_sent = false;
-                if tool_id < streamed_args_for_tool.len() {
-                    streamed_args_for_tool[tool_id].clear();
-                }
-                *current_tool_id += 1;
+        // If JSON is complete, advance to next tool
+        if is_complete {
+            // Remove processed portion, keep unprocessed content
+            *buffer = current_text[start_idx + end_idx..].to_string();
+
+            // Clear completed tool data
+            if tool_id < prev_tool_call_arr.len() {
+                prev_tool_call_arr[tool_id] = Value::Null;
             }
+            *current_tool_name_sent = false;
+            if tool_id < streamed_args_for_tool.len() {
+                streamed_args_for_tool[tool_id].clear();
+            }
+            *current_tool_id += 1;
         }
     }
 

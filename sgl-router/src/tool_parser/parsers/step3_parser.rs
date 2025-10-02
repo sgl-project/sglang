@@ -261,12 +261,10 @@ impl Step3Parser {
                     let new_without_brace = &new_json[..new_json.len() - 1];
 
                     // The new content should extend the old content
-                    if new_without_brace.starts_with(old_without_brace) {
-                        new_without_brace[old_without_brace.len()..].to_string()
-                    } else {
-                        // Parameters changed in unexpected way
-                        String::new()
-                    }
+                    new_without_brace
+                        .strip_prefix(old_without_brace)
+                        .map(|s| s.to_string())
+                        .unwrap_or_default()
                 };
 
                 if !diff.is_empty() {
