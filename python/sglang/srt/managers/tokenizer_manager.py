@@ -773,11 +773,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
         if self._batch_has_only_input_ids(batch_size, obj):
             # All requests already have input_ids, no need to tokenize
-            tokenized_objs = []
-            for i in range(batch_size):
-                tokenized_obj = await self._tokenize_one_request(obj[i])
-                tokenized_objs.append(tokenized_obj)
-            return tokenized_objs
+            return [await self._tokenize_one_request(obj[i]) for i in range(batch_size)]
 
         self._validate_batch_tokenization_constraints(batch_size, obj)
 
@@ -830,16 +826,14 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     "Batch tokenization is not needed for input_embeds. Do not set `enable_tokenizer_batch_encode`."
                 )
 
-    def _batch_has_only_input_ids(
+    def _batch_has_only_tokenized_request(
         self, batch_size: int, obj: Union[GenerateReqInput, EmbeddingReqInput]
     ) -> bool:
         """Check if all requests in the batch provide input_ids only."""
         for i in range(batch_size):
-            if obj[i].input_ids is None:
+            if obj[i].input_ids is None and obj[i].input_embeds is None:
                 return False
             elif obj[i].text:
-                return False
-            elif obj[i].input_embeds is not None:
                 return False
             elif self.is_generation and obj[i].contains_mm_input():
                 return False
@@ -855,7 +849,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         """
         return (
             self.server_args.enable_tokenizer_batch_encode
-            or self._batch_has_only_input_ids(batch_size, requests)
+            or self._batch_has_only_tokenized_request(batch_size, requests)
         )
 
     def _send_one_request(
