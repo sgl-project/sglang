@@ -31,8 +31,6 @@ async fn test_tool_parser_factory_model_mapping() {
 #[test]
 fn test_tool_call_serialization() {
     let tool_call = ToolCall {
-        id: "call-123".to_string(),
-        r#type: "function".to_string(),
         function: FunctionCall {
             name: "search".to_string(),
             arguments: r#"{"query": "rust programming"}"#.to_string(),
@@ -40,13 +38,15 @@ fn test_tool_call_serialization() {
     };
 
     let json = serde_json::to_string(&tool_call).unwrap();
-    assert!(json.contains("call-123"));
     assert!(json.contains("search"));
     assert!(json.contains("rust programming"));
 
     let parsed: ToolCall = serde_json::from_str(&json).unwrap();
-    assert_eq!(parsed.id, "call-123");
     assert_eq!(parsed.function.name, "search");
+    assert_eq!(
+        parsed.function.arguments,
+        r#"{"query": "rust programming"}"#
+    );
 }
 
 #[test]
