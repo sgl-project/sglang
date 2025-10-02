@@ -304,6 +304,31 @@ def find_local_hf_snapshot_dir(
         local_weight_files = []
 
     if len(local_weight_files) > 0:
+        # For safetensors, if index exists, ensure all required files are present
+        if "*.safetensors" in allow_patterns:
+            index_file = "model.safetensors.index.json"
+            index_path = os.path.join(found_local_snapshot_dir, index_file)
+            if os.path.isfile(index_path):
+                try:
+                    with open(index_path) as f:
+                        index_data = json.load(f)
+                    weight_map = index_data.get("weight_map", {})
+                    required_files = set(weight_map.values())
+                    existing_files = set(os.listdir(found_local_snapshot_dir))
+                    if not required_files.issubset(existing_files):
+                        logger.info(
+                            "Local HF snapshot at %s is missing some safetensors files; will attempt download.",
+                            found_local_snapshot_dir,
+                        )
+                        return None
+                except Exception as e:
+                    logger.warning(
+                        "Failed to validate index file %s: %s",
+                        index_path,
+                        e,
+                    )
+                    # If can't validate, assume incomplete
+                    return None
         logger.info(
             "Found local HF snapshot for %s at %s; skipping download.",
             model_name_or_path,
