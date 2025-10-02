@@ -771,6 +771,16 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         """Handle batch tokenization for text inputs only."""
         logger.debug(f"Starting batch tokenization for {batch_size} text requests")
 
+        if self._batch_has_only_input_ids(batch_size, obj):
+            # All requests already have input_ids, no need to tokenize
+            tokenized_objs = []
+            for i in range(batch_size):
+                tokenized_obj = await self._tokenize_one_request(obj[i])
+                tokenized_objs.append(tokenized_obj)
+            return tokenized_objs
+
+        self._validate_batch_tokenization_constraints(batch_size, obj)
+
         # Collect requests and texts
         requests = [obj[i] for i in range(batch_size)]
         texts = [req.text for req in requests]
@@ -835,6 +845,18 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 return False
 
         return True
+
+    def _should_use_batch_tokenization(self, batch_size, requests) -> bool:
+        """Return True if we should run the tokenizer in batch mode.
+
+        Current policy:
+        - Respect explicit server flag `enable_tokenizer_batch_encode`.
+        - Or, if every request only carries `input_ids` (no raw text/embeds), we still batch.
+        """
+        return (
+            self.server_args.enable_tokenizer_batch_encode
+            or self._batch_has_only_input_ids(batch_size, requests)
+        )
 
     def _send_one_request(
         self,
@@ -970,32 +992,8 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         generators = []
         rids = []
         if getattr(obj, "parallel_sample_num", 1) == 1:
-            if self.server_args.enable_tokenizer_batch_encode:
-                # Validate batch tokenization constraints
-                self._validate_batch_tokenization_constraints(batch_size, obj)
-
+            if self._should_use_batch_tokenization(batch_size, obj):
                 tokenized_objs = await self._batch_tokenize_and_process(batch_size, obj)
-
-                # Send as a single batched request
-                self._send_batch_request(obj, tokenized_objs, created_time)
-
-                # Set up generators for each request in the batch
-                for i in range(batch_size):
-                    tmp_obj = obj[i]
-                    generators.append(
-                        self._wait_one_response(
-                            tmp_obj, self.rid_to_state[tmp_obj.rid], request
-                        )
-                    )
-                    rids.append(tmp_obj.rid)
-            elif self._batch_has_only_input_ids(batch_size, obj):
-                tokenized_objs = []
-                for i in range(batch_size):
-                    tmp_obj = obj[i]
-                    tokenized_obj = await self._tokenize_one_request(tmp_obj)
-                    tokenized_objs.append(tokenized_obj)
-
-                # Send as a single batched request
                 self._send_batch_request(obj, tokenized_objs, created_time)
 
                 # Set up generators for each request in the batch
