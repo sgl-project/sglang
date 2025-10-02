@@ -2,11 +2,10 @@ from __future__ import annotations
 
 import logging
 import multiprocessing as mp
-from http import HTTPStatus
 from typing import TYPE_CHECKING, Dict, List, Optional
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 
 if TYPE_CHECKING:
