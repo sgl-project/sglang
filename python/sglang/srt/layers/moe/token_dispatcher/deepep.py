@@ -294,7 +294,8 @@ class _DeepEPDispatcherImplBase:
         # DeepEP internode_ll dispatch uses FINISHED_SUM_TAG=2048
         # and the logic requires num-tokens-sent-from-one-rank-to-another-rank less than it
         # related: https://github.com/deepseek-ai/DeepEP/pull/440
-        assert self.num_max_dispatch_tokens_per_rank <= 2048
+        DEEPEP_FINISHED_SUM_TAG = 2048
+        assert self.num_max_dispatch_tokens_per_rank <= DEEPEP_FINISHED_SUM_TAG
 
         self.handle = None
 
