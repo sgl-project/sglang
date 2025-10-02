@@ -112,7 +112,6 @@ def _launch_scheduler_process_only(
                         pp_rank,
                         None,
                         writer,
-                        None,
                     ),
                 )
 
