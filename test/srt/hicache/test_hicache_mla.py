@@ -13,7 +13,7 @@ from sglang.test.test_utils import (
 
 _is_hip = is_hip()
 if _is_hip:
-    hicache_args = ["--hicache-size", 200]
+    hicache_args = ["--hicache-size", 170]
 else:
     hicache_args = ["--hicache-ratio", 2]
 
