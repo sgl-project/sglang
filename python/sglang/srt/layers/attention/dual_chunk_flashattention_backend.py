@@ -1537,7 +1537,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
                     query_inter,
                     key_cache,
                     value_cache,
-                    block_table[:, : decode_meta.max_seq_len_inter],
+                    block_table,
                     decode_meta.seq_lens_inter,
                     softmax_scale,
                     causal=False,
