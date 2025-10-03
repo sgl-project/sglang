@@ -128,11 +128,11 @@ impl Default for ParserRegistry {
 
 /// Factory for creating reasoning parsers based on model type.
 #[derive(Clone)]
-pub struct ParserFactory {
+pub struct ReasoningParserFactory {
     registry: ParserRegistry,
 }
 
-impl ParserFactory {
+impl ReasoningParserFactory {
     /// Create a new factory with default parsers registered.
     pub fn new() -> Self {
         let registry = ParserRegistry::new();
@@ -237,7 +237,7 @@ impl ParserFactory {
     }
 }
 
-impl Default for ParserFactory {
+impl Default for ReasoningParserFactory {
     fn default() -> Self {
         Self::new()
     }
@@ -249,35 +249,35 @@ mod tests {
 
     #[test]
     fn test_factory_creates_deepseek_r1() {
-        let factory = ParserFactory::new();
+        let factory = ReasoningParserFactory::new();
         let parser = factory.create("deepseek-r1-distill").unwrap();
         assert_eq!(parser.model_type(), "deepseek_r1");
     }
 
     #[test]
     fn test_factory_creates_qwen3() {
-        let factory = ParserFactory::new();
+        let factory = ReasoningParserFactory::new();
         let parser = factory.create("qwen3-7b").unwrap();
         assert_eq!(parser.model_type(), "qwen3");
     }
 
     #[test]
     fn test_factory_creates_kimi() {
-        let factory = ParserFactory::new();
+        let factory = ReasoningParserFactory::new();
         let parser = factory.create("kimi-chat").unwrap();
         assert_eq!(parser.model_type(), "kimi");
     }
 
     #[test]
     fn test_factory_fallback_to_passthrough() {
-        let factory = ParserFactory::new();
+        let factory = ReasoningParserFactory::new();
         let parser = factory.create("unknown-model").unwrap();
         assert_eq!(parser.model_type(), "passthrough");
     }
 
     #[test]
     fn test_case_insensitive_matching() {
-        let factory = ParserFactory::new();
+        let factory = ReasoningParserFactory::new();
         let parser1 = factory.create("DeepSeek-R1").unwrap();
         let parser2 = factory.create("QWEN3").unwrap();
         let parser3 = factory.create("Kimi").unwrap();
@@ -289,21 +289,21 @@ mod tests {
 
     #[test]
     fn test_step3_model() {
-        let factory = ParserFactory::new();
+        let factory = ReasoningParserFactory::new();
         let step3 = factory.create("step3-model").unwrap();
         assert_eq!(step3.model_type(), "step3");
     }
 
     #[test]
     fn test_glm45_model() {
-        let factory = ParserFactory::new();
+        let factory = ReasoningParserFactory::new();
         let glm45 = factory.create("glm45-v2").unwrap();
         assert_eq!(glm45.model_type(), "glm45");
     }
 
     #[test]
     fn test_pooled_parser_reuse() {
-        let factory = ParserFactory::new();
+        let factory = ReasoningParserFactory::new();
 
         // Get the same parser twice - should be the same instance
         let parser1 = factory.get_pooled("deepseek-r1");
@@ -321,7 +321,7 @@ mod tests {
     fn test_pooled_parser_concurrent_access() {
         use std::thread;
 
-        let factory = ParserFactory::new();
+        let factory = ReasoningParserFactory::new();
         let parser = factory.get_pooled("deepseek-r1");
 
         // Spawn multiple threads that use the same parser
@@ -347,7 +347,7 @@ mod tests {
 
     #[test]
     fn test_pool_clearing() {
-        let factory = ParserFactory::new();
+        let factory = ReasoningParserFactory::new();
 
         // Get a pooled parser
         let parser1 = factory.get_pooled("deepseek-r1");
@@ -364,7 +364,7 @@ mod tests {
 
     #[test]
     fn test_passthrough_parser_pooling() {
-        let factory = ParserFactory::new();
+        let factory = ReasoningParserFactory::new();
 
         // Unknown models should get passthrough parser
         let parser1 = factory.get_pooled("unknown-model-1");
@@ -383,7 +383,7 @@ mod tests {
         use std::thread;
         use std::time::Instant;
 
-        let factory = ParserFactory::new();
+        let factory = ReasoningParserFactory::new();
         let num_threads = 100;
         let requests_per_thread = 50;
         let models = vec!["deepseek-r1", "qwen3", "kimi", "qwen3-thinking"];
@@ -527,7 +527,7 @@ mod tests {
     fn test_concurrent_pool_modifications() {
         use std::thread;
 
-        let factory = ParserFactory::new();
+        let factory = ReasoningParserFactory::new();
         let mut handles = vec![];
 
         // Thread 1: Continuously get parsers

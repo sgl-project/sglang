@@ -29,7 +29,7 @@ class BenchArgs:
     port: int = 30000
     batch_size: int = 1
     temperature: float = 0.0
-    sampling_seed: int = None
+    sampling_seed: int = 42
     max_new_tokens: int = 100
     frequency_penalty: float = 0.0
     presence_penalty: float = 0.0

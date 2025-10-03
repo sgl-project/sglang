@@ -36,6 +36,15 @@ class _Dumper:
         self._forward_pass_id = 0
 
     def on_forward_pass_start(self):
+        """This should be called on all ranks."""
+
+        if not self._enable:
+            return
+
+        # Users may want to `dump` only on some ranks, thus determine name here
+        if self._partial_name is None:
+            self._partial_name = _get_partial_name()
+
         self._forward_pass_id += 1
         print(
             f"[Dumper] [{time.time()}] on_forward_pass_start id={self._forward_pass_id}"
@@ -48,10 +57,8 @@ class _Dumper:
         assert (
             self._forward_pass_id >= 1
         ), "Do you forget to call `dumper.on_forward_pass_start()`?"
+        assert self._partial_name is not None
         self._dump_index += 1
-
-        if self._partial_name is None:
-            self._partial_name = _get_partial_name()
 
         rank = _get_rank()
         full_kwargs = dict(
