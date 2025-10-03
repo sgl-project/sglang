@@ -123,6 +123,7 @@ def get_hf_text_config(config: PretrainedConfig):
         return config
 
 
+# Temporary hack for DeepSeek-V3.2 model
 def _load_deepseek_v32_model(
     model_path: str,
     trust_remote_code: bool = False,
