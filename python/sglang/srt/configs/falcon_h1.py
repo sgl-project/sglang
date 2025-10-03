@@ -24,7 +24,11 @@ from transformers.modeling_rope_utils import rope_config_validation
 from transformers.utils import logging
 
 from sglang.srt.distributed.utils import divide
-from sglang.srt.layers.attention.mamba.mamba_utils import MambaStateShapeCalculator
+from sglang.srt.layers.attention.mamba.mamba import (
+    Mamba2CacheParams,
+    Mamba2StateShape,
+    extra_groups_for_head_shards,
+)
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     get_tensor_model_parallel_world_size,
@@ -295,18 +299,6 @@ class FalconH1Config(PretrainedConfig):
         return ["falcon_h1" for i in range(self.num_hidden_layers)]
 
     @property
-    def mamba_cache_per_req(self):
-        conv_state_shape, temporal_state_shape, conv_dtype, ssm_dtype, mamba_layers = (
-            self.hybrid_gdn_params
-        )
-        mamba_layers_len = len(mamba_layers)
-
-        return (
-            int(np.prod(conv_state_shape)) * conv_dtype.itemsize
-            + int(np.prod(temporal_state_shape)) * ssm_dtype.itemsize
-        ) * mamba_layers_len
-
-    @property
     def full_attention_layer_ids(self):
         # For Falcon-H1, we do have attention on all layers
         return range(self.num_hidden_layers)
@@ -317,7 +309,7 @@ class FalconH1Config(PretrainedConfig):
         return range(self.num_hidden_layers)
 
     @property
-    def hybrid_gdn_params(self):
+    def mamba2_cache_params(self):
         world_size = get_tensor_model_parallel_world_size()
 
         n_groups = self.mamba_n_groups
@@ -325,9 +317,7 @@ class FalconH1Config(PretrainedConfig):
             # - for TP we shard conv_dim by sharding on n_groups,
             # - but if n_groups cannot divide tp_size, we need to
             #   extend some extra groups
-            extra_groups = MambaStateShapeCalculator.extra_groups_for_head_shards(
-                self.mamba_n_groups, world_size
-            )
+            extra_groups = extra_groups_for_head_shards(self.mamba_n_groups, world_size)
             n_groups += extra_groups
 
         conv_dim = self.mamba_d_ssm + 2 * n_groups * self.mamba_d_state
@@ -343,18 +333,5 @@ class FalconH1Config(PretrainedConfig):
             self.mamba_d_head,
             divide(self.mamba_n_heads, world_size),
         )
-        conv_dtype = torch.bfloat16
-        dtype_map = {
-            "float32": torch.float32,
-            "bfloat16": torch.bfloat16,
-        }
-        ssm_dtype = dtype_map[os.environ["SGLANG_MAMBA_SSM_DTYPE"]]
-        mamba_layers = self.linear_layer_ids
-
-        return (
-            conv_state_shape,
-            temporal_state_shape,
-            conv_dtype,
-            ssm_dtype,
-            mamba_layers,
-        )
+        shape = Mamba2StateShape(conv=conv_state_shape, temporal=temporal_state_shape)
+        return Mamba2CacheParams(shape=shape, layers=self.linear_layer_ids)

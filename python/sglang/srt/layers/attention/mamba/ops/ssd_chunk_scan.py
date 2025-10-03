@@ -16,66 +16,71 @@ from packaging import version
 TRITON_22 = version.parse(triton.__version__) >= version.parse("2.2.0")
 
 
-# @triton.autotune(
-#     configs=[
-#         triton.Config(
-#             {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 64},
-#             num_stages=3,
-#             num_warps=8,
-#         ),
-#         triton.Config(
-#             {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 32},
-#             num_stages=4,
-#             num_warps=4,
-#         ),
-#         triton.Config(
-#             {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 32},
-#             num_stages=4,
-#             num_warps=4,
-#         ),
-#         triton.Config(
-#             {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 32},
-#             num_stages=4,
-#             num_warps=4,
-#         ),
-#         triton.Config(
-#             {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 32},
-#             num_stages=4,
-#             num_warps=4,
-#         ),
-#         triton.Config(
-#             {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 64},
-#             num_stages=4,
-#             num_warps=4,
-#         ),
-#         triton.Config(
-#             {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 64},
-#             num_stages=4,
-#             num_warps=4,
-#         ),
-#         triton.Config(
-#             {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 32, "BLOCK_SIZE_K": 32},
-#             num_stages=4,
-#             num_warps=4,
-#         ),
-#         triton.Config(
-#             {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 32, "BLOCK_SIZE_K": 32},
-#             num_stages=5,
-#             num_warps=2,
-#         ),
-#         triton.Config(
-#             {"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 32},
-#             num_stages=5,
-#             num_warps=2,
-#         ),
-#         triton.Config(
-#             {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 32},
-#             num_stages=4,
-#             num_warps=2,
-#         ),
-#     ],
-#     key=["chunk_size", "hdim", "dstate", "IS_CAUSAL"],
-# )
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 64},
+            num_stages=3,
+            num_warps=8,
+        ),
+        triton.Config(
+            {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 32},
+            num_stages=4,
+            num_warps=4,
+        ),
+        triton.Config(
+            {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 32},
+            num_stages=4,
+            num_warps=4,
+        ),
+        triton.Config(
+            {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 32},
+            num_stages=4,
+            num_warps=4,
+        ),
+        triton.Config(
+            {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 32},
+            num_stages=4,
+            num_warps=4,
+        ),
+        triton.Config(
+            {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 64},
+            num_stages=4,
+            num_warps=4,
+        ),
+        triton.Config(
+            {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 64},
+            num_stages=4,
+            num_warps=4,
+        ),
+        triton.Config(
+            {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 32, "BLOCK_SIZE_K": 32},
+            num_stages=4,
+            num_warps=4,
+        ),
+        triton.Config(
+            {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 32, "BLOCK_SIZE_K": 32},
+            num_stages=5,
+            num_warps=2,
+        ),
+        triton.Config(
+            {"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 32},
+            num_stages=5,
+            num_warps=2,
+        ),
+        triton.Config(
+            {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 32},
+            num_stages=4,
+            num_warps=2,
+        ),
+        triton.Config(
+            {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 16, "BLOCK_SIZE_K": 16},
+            num_stages=4,
+            num_warps=2,
+        ),
+    ],
+    key=["chunk_size", "hdim", "dstate", "IS_CAUSAL"],
+)
 @triton.jit
 def _chunk_scan_fwd_kernel(
     # Pointers to matrices
@@ -149,12 +154,12 @@ def _chunk_scan_fwd_kernel(
     D_HAS_HDIM: tl.constexpr,
     HAS_Z: tl.constexpr,
     HAS_SEQ_IDX: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_DSTATE: tl.constexpr,
     IS_TRITON_22: tl.constexpr,
     HAS_INITSTATES: tl.constexpr,
-    BLOCK_SIZE_M: tl.constexpr = 16,
-    BLOCK_SIZE_N: tl.constexpr = 16,
-    BLOCK_SIZE_K: tl.constexpr = 16,
 ):
     pid_bc = tl.program_id(axis=1).to(tl.int64)
     pid_c = pid_bc // batch

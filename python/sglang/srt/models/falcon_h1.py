@@ -8,6 +8,10 @@ from torch import nn
 from sglang.srt.configs.falcon_h1 import FalconH1Config
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+    HybridLinearAttnBackend,
+    Mamba2AttnBackend,
+)
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
@@ -198,6 +202,7 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
             chunk_size=config.mamba_chunk_size,
             activation=config.hidden_act,
             use_rms_norm=config.mamba_rms_norm,
+            is_falcon=True,
             prefix=f"{prefix}.mixer",
         )
 
@@ -340,14 +345,18 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
             attention_hidden_states = attention_hidden_states * self.attn_out_multiplier
 
             # Mamba block
-            mamba_hidden_states = torch.empty_like(hidden_states)
-            self.mamba(
-                hidden_states * self.ssm_in_multiplier,
-                mamba_hidden_states,
-                forward_batch=forward_batch,
+            output = torch.empty_like(hidden_states)
+            attn_backend = forward_batch.attn_backend
+            assert isinstance(attn_backend, HybridLinearAttnBackend)
+            assert isinstance(attn_backend.linear_attn_backend, Mamba2AttnBackend)
+            attn_backend.linear_attn_backend.forward(
+                mixer=self.mamba,
+                layer_id=self.layer_id,
+                hidden_states=hidden_states,
+                output=output,
                 mup_vector=self.mup_vector,
             )
-            mamba_hidden_states = mamba_hidden_states * self.ssm_out_multiplier
+            mamba_hidden_states = output * self.ssm_out_multiplier
 
             hidden_states = attention_hidden_states + mamba_hidden_states
 

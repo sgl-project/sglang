@@ -13,17 +13,18 @@ import triton
 import triton.language as tl
 
 
-# @triton.autotune(
-#     configs=[
-#         triton.Config({"BLOCK_SIZE": 64}),
-#         triton.Config({"BLOCK_SIZE": 128}),
-#         triton.Config({"BLOCK_SIZE": 256}),
-#         triton.Config({"BLOCK_SIZE": 512}),
-#         triton.Config({"BLOCK_SIZE": 1024}),
-#         triton.Config({"BLOCK_SIZE": 2048}),
-#     ],
-#     key=["dim"],
-# )
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_SIZE": 16}),
+        triton.Config({"BLOCK_SIZE": 64}),
+        triton.Config({"BLOCK_SIZE": 128}),
+        triton.Config({"BLOCK_SIZE": 256}),
+        triton.Config({"BLOCK_SIZE": 512}),
+        triton.Config({"BLOCK_SIZE": 1024}),
+        triton.Config({"BLOCK_SIZE": 2048}),
+    ],
+    key=["dim"],
+)
 @triton.jit
 def _state_passing_fwd_kernel(
     # Pointers to matrices
@@ -65,7 +66,7 @@ def _state_passing_fwd_kernel(
     HAS_INITSTATES: tl.constexpr,
     HAS_SEQ_IDX: tl.constexpr,
     IS_CONT_BATCHED: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr = 16,
+    BLOCK_SIZE: tl.constexpr,
 ):
     pid_b = tl.program_id(axis=1)
     pid_h = tl.program_id(axis=2)

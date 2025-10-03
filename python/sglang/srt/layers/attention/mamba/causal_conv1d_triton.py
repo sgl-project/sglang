@@ -6,10 +6,10 @@ from typing import List, Optional, Union
 
 import numpy as np
 import torch
-
-PAD_SLOT_ID = -1
 import triton
 import triton.language as tl
+
+PAD_SLOT_ID = -1
 
 
 @triton.jit()
@@ -672,7 +672,9 @@ def _causal_conv1d_update_kernel(
         + (conv_state_batch_coord * stride_conv_state_seq)
         + conv_state_token_offset * stride_conv_state_tok
         + (idx_feats * stride_conv_state_dim)[None, :]
-        + ((idx_tokens + 1) * stride_conv_state_tok)[:, None]
+        + ((idx_tokens + (1 if IS_SPEC_DECODING else seqlen)) * stride_conv_state_tok)[
+            :, None
+        ]
     )  # [BLOCK_M, BLOCK_N]
     mask = (
         (conv_state_batch_coord < num_cache_lines)
@@ -897,7 +899,10 @@ def causal_conv1d_update(
     stride_state_indices = (
         conv_state_indices.stride(0) if conv_state_indices is not None else 0
     )
-    state_len = width - 1 + (seqlen - 1)  # effective state_len needed
+    if num_accepted_tokens is not None:
+        state_len = width - 1 + (seqlen - 1)  # effective state_len needed
+    else:
+        state_len = width - 1
     np2_statelen = triton.next_power_of_2(state_len)
 
     def grid(META):
