@@ -726,6 +726,10 @@ class ForwardBatch:
         self.out_cache_loc = self._pad_tensor_to_size(self.out_cache_loc, num_tokens)
         if self.encoder_lens is not None:
             self.encoder_lens = self._pad_tensor_to_size(self.encoder_lens, bs)
+        if self.out_cache_loc_swa is not None:
+            self.out_cache_loc_swa = self._pad_tensor_to_size(
+                self.out_cache_loc_swa, num_tokens
+            )
         self.positions = self._pad_tensor_to_size(self.positions, num_tokens)
         self.global_num_tokens_cpu = global_num_tokens
         self.global_num_tokens_gpu = self.global_num_tokens_gpu.new_tensor(
