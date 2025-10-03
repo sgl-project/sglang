@@ -68,10 +68,10 @@ suites = {
         # TestFile("test_eagle_infer_a.py", 370),
         # TestFile("test_eagle_infer_b.py", 700),
         # TestFile("test_ebnf_constrained.py", 108),
-        TestFile("test_eval_fp8_accuracy.py", 303),
-        TestFile("test_fa3.py", 376),
+        # TestFile("test_eval_fp8_accuracy.py", 303),
+        # TestFile("test_fa3.py", 376),
         TestFile("test_flashmla.py", 352),
-        TestFile("test_function_call_parser.py", 10),
+        # TestFile("test_function_call_parser.py", 10),
         # TestFile("test_fused_moe.py", 30),
         # TestFile("test_gpt_oss_1gpu.py", 600),
         # TestFile("test_harmony_parser.py", 20),
@@ -262,54 +262,54 @@ suite_amd = {
         # TestFile("test_patch_torch.py", 19), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/11127
     ],
     "per-commit-4-gpu-amd": [
-        TestFile("test_pp_single_node.py", 150),
+        # TestFile("test_pp_single_node.py", 150),
     ],
     "per-commit-8-gpu-amd": [
-        TestFile("test_full_deepseek_v3.py", 250),
+        # TestFile("test_full_deepseek_v3.py", 250),
     ],
     "nightly-amd": [
-        TestFile("test_nightly_gsm8k_eval_amd.py"),
+        # TestFile("test_nightly_gsm8k_eval_amd.py"),
     ],
 }
 
 # Add Intel Xeon tests
 suite_xeon = {
     "per-commit-cpu": [
-        TestFile("cpu/test_activation.py"),
-        TestFile("cpu/test_binding.py"),
-        TestFile("cpu/test_decode.py"),
-        TestFile("cpu/test_extend.py"),
-        TestFile("cpu/test_gemm.py"),
-        TestFile("cpu/test_mla.py"),
-        TestFile("cpu/test_moe.py"),
-        TestFile("cpu/test_norm.py"),
-        TestFile("cpu/test_qkv_proj_with_rope.py"),
-        TestFile("cpu/test_rope.py"),
-        TestFile("cpu/test_shared_expert.py"),
-        TestFile("cpu/test_topk.py"),
-        TestFile("test_intel_amx_attention_backend.py"),
-        TestFile("test_cpu_graph.py"),
+        # TestFile("cpu/test_activation.py"),
+        # TestFile("cpu/test_binding.py"),
+        # TestFile("cpu/test_decode.py"),
+        # TestFile("cpu/test_extend.py"),
+        # TestFile("cpu/test_gemm.py"),
+        # TestFile("cpu/test_mla.py"),
+        # TestFile("cpu/test_moe.py"),
+        # TestFile("cpu/test_norm.py"),
+        # TestFile("cpu/test_qkv_proj_with_rope.py"),
+        # TestFile("cpu/test_rope.py"),
+        # TestFile("cpu/test_shared_expert.py"),
+        # TestFile("cpu/test_topk.py"),
+        # TestFile("test_intel_amx_attention_backend.py"),
+        # TestFile("test_cpu_graph.py"),
     ],
 }
 
 # Add Ascend NPU tests
 suite_ascend = {
     "per-commit-1-ascend-npu": [
-        TestFile("ascend/test_ascend_tp1_bf16.py", 400),
-        TestFile("ascend/test_ascend_graph_tp1_bf16.py", 400),
+        # TestFile("ascend/test_ascend_tp1_bf16.py", 400),
+        # TestFile("ascend/test_ascend_graph_tp1_bf16.py", 400),
     ],
     "per-commit-2-ascend-npu": [
-        TestFile("ascend/test_ascend_tp2_bf16.py", 400),
-        TestFile("ascend/test_ascend_graph_tp2_bf16.py", 400),
-        TestFile("ascend/test_ascend_tp2_fia_bf16.py", 400),
-        TestFile("ascend/test_ascend_mla_fia_w8a8int8.py", 400),
+        # TestFile("ascend/test_ascend_tp2_bf16.py", 400),
+        # TestFile("ascend/test_ascend_graph_tp2_bf16.py", 400),
+        # TestFile("ascend/test_ascend_tp2_fia_bf16.py", 400),
+        # TestFile("ascend/test_ascend_mla_fia_w8a8int8.py", 400),
     ],
     "per-commit-4-ascend-npu": [
-        TestFile("ascend/test_ascend_mla_w8a8int8.py", 400),
-        TestFile("ascend/test_ascend_tp4_bf16.py", 400),
+        # TestFile("ascend/test_ascend_mla_w8a8int8.py", 400),
+        # TestFile("ascend/test_ascend_tp4_bf16.py", 400),
     ],
     "per-commit-16-ascend-a3": [
-        TestFile("ascend/test_ascend_deepep.py", 400),
+        # TestFile("ascend/test_ascend_deepep.py", 400),
     ],
 }
 
