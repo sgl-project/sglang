@@ -661,8 +661,6 @@ class Scheduler(
             ]
         )
 
-        self.max_prefill_bs = server_args.max_prefill_bs
-
     def init_deterministic_inference_config(self):
         """Initialize deterministic inference configuration for different attention backends."""
         if not self.server_args.enable_deterministic_inference:
@@ -1850,7 +1848,6 @@ class Scheduler(
             self.new_token_ratio,
             self.max_prefill_tokens,
             self.chunked_prefill_size,
-            self.max_prefill_bs,
             running_bs if self.is_mixed_chunk else 0,
             self.priority_scheduling_preemption_threshold,
         )

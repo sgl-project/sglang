@@ -418,7 +418,6 @@ class ServerArgs:
     scheduler_recv_interval: int = 1
     numa_node: Optional[List[int]] = None
     enable_deterministic_inference: bool = False
-    max_prefill_bs: Optional[int] = None
 
     # Dynamic batch tokenizer
     enable_dynamic_batch_tokenizer: bool = False
@@ -824,11 +823,6 @@ class ServerArgs:
 
                 self.page_size = 64
                 logger.warning("Setting page size to 64 for DeepSeek NSA.")
-
-                # self.max_prefill_bs = 1
-                logger.warning(
-                    "Setting maximum prefill batch size to 1 for DeepSeek NSA."
-                )
 
                 # For Hopper, we support both bf16 and fp8 kv cache; for Blackwell, we support fp8 only currently
                 import torch
@@ -2649,12 +2643,6 @@ class ServerArgs:
             type=int,
             nargs="+",
             help="Sets the numa node for the subprocesses. i-th element corresponds to i-th subprocess.",
-        )
-        parser.add_argument(
-            "--max-prefill-bs",
-            type=int,
-            default=ServerArgs.max_prefill_bs,
-            help="The maximum batch size for prefill requests.",
         )
 
         # Debug tensor dumps
