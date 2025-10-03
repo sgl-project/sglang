@@ -543,9 +543,7 @@ class ModelRunner:
                 elif _is_hip:
                     head_num = self.model_config.get_num_kv_heads(self.tp_size)
                     # TODO current aiter only support head number 16 or 128 head number
-                    if (
-                        head_num == 128 or head_num == 16
-                    ) and self.spec_algorithm.is_none():
+                    if head_num == 128 or head_num == 16:
                         server_args.attention_backend = "aiter"
                     else:
                         server_args.attention_backend = "triton"
@@ -1644,7 +1642,7 @@ class ModelRunner:
                 )
             elif self.is_hybrid_gdn:
                 self.token_to_kv_pool = HybridLinearKVPool(
-                    page_size=self.page_size if _is_npu else 1,
+                    page_size=self.page_size,
                     size=self.max_total_num_tokens,
                     dtype=self.kv_cache_dtype,
                     head_num=self.model_config.get_num_kv_heads(
