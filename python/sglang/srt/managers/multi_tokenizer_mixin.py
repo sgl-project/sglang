@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""MultiTokenizerMixin is a class that provides nesscary methods for MultiTokenizerManager and DetokenizerManager."""
+"""Mixin class and utils for multi-http-worker mode"""
 import asyncio
 import logging
 import multiprocessing as multiprocessing
@@ -30,10 +30,10 @@ import zmq.asyncio
 from sglang.srt.disaggregation.utils import DisaggregationMode, TransferBackend
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
-    BatchEmbeddingOut,
-    BatchMultimodalOut,
-    BatchStrOut,
-    BatchTokenIDOut,
+    BatchEmbeddingOutput,
+    BatchMultimodalOutput,
+    BatchStrOutput,
+    BatchTokenIDOutput,
     MultiTokenizerRegisterReq,
     MultiTokenizerWrapper,
 )
@@ -83,8 +83,8 @@ class SocketMapping:
 
 def _handle_output_by_index(output, i):
     """NOTE: A maintainable method is better here."""
-    if isinstance(output, BatchTokenIDOut):
-        new_output = BatchTokenIDOut(
+    if isinstance(output, BatchTokenIDOutput):
+        new_output = BatchTokenIDOutput(
             rids=[output.rids[i]],
             finished_reasons=(
                 [output.finished_reasons[i]]
@@ -198,8 +198,8 @@ def _handle_output_by_index(output, i):
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
         )
-    elif isinstance(output, BatchEmbeddingOut):
-        new_output = BatchEmbeddingOut(
+    elif isinstance(output, BatchEmbeddingOutput):
+        new_output = BatchEmbeddingOutput(
             rids=[output.rids[i]],
             finished_reasons=(
                 [output.finished_reasons[i]]
@@ -216,8 +216,8 @@ def _handle_output_by_index(output, i):
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
         )
-    elif isinstance(output, BatchStrOut):
-        new_output = BatchStrOut(
+    elif isinstance(output, BatchStrOutput):
+        new_output = BatchStrOutput(
             rids=[output.rids[i]],
             finished_reasons=(
                 [output.finished_reasons[i]]
@@ -314,8 +314,8 @@ def _handle_output_by_index(output, i):
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
         )
-    elif isinstance(output, BatchMultimodalOut):
-        new_output = BatchMultimodalOut(
+    elif isinstance(output, BatchMultimodalOutput):
+        new_output = BatchMultimodalOutput(
             rids=[output.rids[i]],
             finished_reasons=(
                 [output.finished_reasons[i]]
@@ -343,7 +343,7 @@ def _handle_output_by_index(output, i):
 
 
 class MultiHttpWorkerDetokenizerMixin:
-    """Mixin class for MultiTokenizerManager and DetokenizerManager"""
+    """Mixin class for DetokenizerManager"""
 
     def get_worker_ids_from_req_rids(self, rids):
         if isinstance(rids, list):
@@ -386,7 +386,7 @@ class MultiHttpWorkerDetokenizerMixin:
 
 
 class MultiTokenizerRouter:
-    """A router to receive requests from MultiTokenizerManager"""
+    """A router to receive requests from TokenizerWorker"""
 
     def __init__(
         self,
@@ -454,8 +454,8 @@ class MultiTokenizerRouter:
                 self.socket_mapping.send_output(worker_id, new_recv_obj)
 
 
-class MultiTokenizerManager(TokenizerManager):
-    """Multi Process Tokenizer Manager that tokenizes the text."""
+class TokenizerWorker(TokenizerManager):
+    """Tokenizer Worker in multi-http-worker mode"""
 
     def __init__(
         self,
