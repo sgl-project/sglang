@@ -1272,21 +1272,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.token_to_kv_pool_allocator.page_size == 1:
             out_cache_loc = self.alloc_token_slots(extend_num_tokens)
         else:
-            last_loc = []
-            for prefix in [r.prefix_indices for r in self.reqs]:
-                if len(prefix) > 0:
-                    last_loc.append(prefix[-1:])
-                else:
-                    last_loc.append(
-                        torch.tensor([-1], dtype=torch.int64, device="cuda")
-                    )
-            last_loc = torch.cat(last_loc)
+            last_loc = [
+                (
+                    r.prefix_indices[-1:]
+                    if len(r.prefix_indices) > 0
+                    else torch.tensor([-1], device=self.device)
+                )
+                for r in self.reqs
+            ]
             out_cache_loc = self.alloc_paged_token_slots_extend(
                 prefix_lens_tensor,
                 prefix_lens_cpu_tensor,
                 seq_lens_tensor,
                 seq_lens_cpu,
-                last_loc,
+                torch.cat(last_loc),
                 extend_num_tokens,
             )
 
