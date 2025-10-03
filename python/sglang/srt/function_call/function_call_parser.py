@@ -232,4 +232,6 @@ class FunctionCallParser:
         else:
             filtered_tools = self.tools
 
-        return self.detector.build_ebnf(filtered_tools)
+        # Legacy method kept for backwards compatibility; JSON schema now handles
+        # structured tool constraints, so EBNF grammars are no longer generated.
+        return None
