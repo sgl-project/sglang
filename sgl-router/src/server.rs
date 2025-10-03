@@ -1,7 +1,9 @@
 use crate::{
-    config::{ConnectionMode, HistoryBackend, RouterConfig},
-    core::{WorkerManager, WorkerRegistry, WorkerType},
-    data_connector::{MemoryResponseStorage, NoOpResponseStorage, SharedResponseStorage},
+    config::{ConnectionMode, HistoryBackend, RouterConfig, RoutingMode},
+    core::{LoadMonitor, WorkerManager, WorkerRegistry, WorkerType},
+    data_connector::{
+        MemoryResponseStorage, NoOpResponseStorage, OracleResponseStorage, SharedResponseStorage,
+    },
     logging::{self, LoggingConfig},
     metrics::{self, PrometheusConfig},
     middleware::{self, AuthConfig, QueuedRequest, TokenBucket},
@@ -13,11 +15,11 @@ use crate::{
         },
         worker_spec::{WorkerApiResponse, WorkerConfigRequest, WorkerErrorResponse},
     },
-    reasoning_parser::ParserFactory,
+    reasoning_parser::ReasoningParserFactory,
     routers::{router_manager::RouterManager, RouterTrait},
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
     tokenizer::{factory as tokenizer_factory, traits::Tokenizer},
-    tool_parser::ParserRegistry,
+    tool_parser::ToolParserFactory,
 };
 use axum::{
     extract::{Path, Query, Request, State},
@@ -28,7 +30,7 @@ use axum::{
 };
 use reqwest::Client;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::{
     sync::atomic::{AtomicBool, Ordering},
     sync::Arc,
@@ -43,12 +45,13 @@ pub struct AppContext {
     pub router_config: RouterConfig,
     pub rate_limiter: Arc<TokenBucket>,
     pub tokenizer: Option<Arc<dyn Tokenizer>>,
-    pub reasoning_parser_factory: Option<ParserFactory>,
-    pub tool_parser_registry: Option<&'static ParserRegistry>,
+    pub reasoning_parser_factory: Option<ReasoningParserFactory>,
+    pub tool_parser_factory: Option<ToolParserFactory>,
     pub worker_registry: Arc<WorkerRegistry>,
     pub policy_registry: Arc<PolicyRegistry>,
     pub router_manager: Option<Arc<RouterManager>>,
     pub response_storage: SharedResponseStorage,
+    pub load_monitor: Option<Arc<LoadMonitor>>,
 }
 
 impl AppContext {
@@ -61,7 +64,7 @@ impl AppContext {
         let rate_limit_tokens = rate_limit_tokens_per_second.unwrap_or(max_concurrent_requests);
         let rate_limiter = Arc::new(TokenBucket::new(max_concurrent_requests, rate_limit_tokens));
 
-        let (tokenizer, reasoning_parser_factory, tool_parser_registry) =
+        let (tokenizer, reasoning_parser_factory, tool_parser_factory) =
             if router_config.connection_mode == ConnectionMode::Grpc {
                 let tokenizer_path = router_config
                     .tokenizer_path
@@ -76,10 +79,10 @@ impl AppContext {
                     tokenizer_factory::create_tokenizer(&tokenizer_path)
                         .map_err(|e| format!("Failed to create tokenizer: {e}"))?,
                 );
-                let reasoning_parser_factory = Some(ParserFactory::new());
-                let tool_parser_registry = Some(ParserRegistry::new());
+                let reasoning_parser_factory = Some(ReasoningParserFactory::new());
+                let tool_parser_factory = Some(ToolParserFactory::new());
 
-                (tokenizer, reasoning_parser_factory, tool_parser_registry)
+                (tokenizer, reasoning_parser_factory, tool_parser_factory)
             } else {
                 (None, None, None)
             };
@@ -92,7 +95,25 @@ impl AppContext {
         let response_storage: SharedResponseStorage = match router_config.history_backend {
             HistoryBackend::Memory => Arc::new(MemoryResponseStorage::new()),
             HistoryBackend::None => Arc::new(NoOpResponseStorage::new()),
+            HistoryBackend::Oracle => {
+                let oracle_cfg = router_config.oracle.clone().ok_or_else(|| {
+                    "oracle configuration is required when history_backend=oracle".to_string()
+                })?;
+
+                let storage = OracleResponseStorage::new(oracle_cfg).map_err(|err| {
+                    format!("failed to initialize Oracle response storage: {err}")
+                })?;
+
+                Arc::new(storage)
+            }
         };
+
+        let load_monitor = Some(Arc::new(LoadMonitor::new(
+            worker_registry.clone(),
+            policy_registry.clone(),
+            client.clone(),
+            router_config.worker_startup_check_interval_secs,
+        )));
 
         Ok(Self {
             client,
@@ -100,11 +121,12 @@ impl AppContext {
             rate_limiter,
             tokenizer,
             reasoning_parser_factory,
-            tool_parser_registry,
+            tool_parser_factory,
             worker_registry,
             policy_registry,
             router_manager,
             response_storage,
+            load_monitor,
         })
     }
 }
@@ -121,16 +143,56 @@ async fn sink_handler() -> Response {
     StatusCode::NOT_FOUND.into_response()
 }
 
-async fn liveness(State(state): State<Arc<AppState>>) -> Response {
-    state.router.liveness()
+async fn liveness() -> Response {
+    (StatusCode::OK, "OK").into_response()
 }
 
 async fn readiness(State(state): State<Arc<AppState>>) -> Response {
-    state.router.readiness()
+    let workers = state.context.worker_registry.get_all();
+    let healthy_workers: Vec<_> = workers.iter().filter(|w| w.is_healthy()).collect();
+
+    let is_ready = if state.context.router_config.enable_igw {
+        !healthy_workers.is_empty()
+    } else {
+        match &state.context.router_config.mode {
+            RoutingMode::PrefillDecode { .. } => {
+                let has_prefill = healthy_workers
+                    .iter()
+                    .any(|w| matches!(w.worker_type(), WorkerType::Prefill { .. }));
+                let has_decode = healthy_workers
+                    .iter()
+                    .any(|w| matches!(w.worker_type(), WorkerType::Decode));
+                has_prefill && has_decode
+            }
+            RoutingMode::Regular { .. } => !healthy_workers.is_empty(),
+            RoutingMode::OpenAI { .. } => !healthy_workers.is_empty(),
+        }
+    };
+
+    if is_ready {
+        (
+            StatusCode::OK,
+            Json(json!({
+                "status": "ready",
+                "healthy_workers": healthy_workers.len(),
+                "total_workers": workers.len()
+            })),
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "status": "not ready",
+                "reason": "insufficient healthy workers"
+            })),
+        )
+            .into_response()
+    }
 }
 
-async fn health(State(state): State<Arc<AppState>>, req: Request) -> Response {
-    state.router.health(req).await
+async fn health(_state: State<Arc<AppState>>) -> Response {
+    liveness().await
 }
 
 async fn health_generate(State(state): State<Arc<AppState>>, req: Request) -> Response {
@@ -311,11 +373,77 @@ async fn remove_worker(
 }
 
 async fn flush_cache(State(state): State<Arc<AppState>>, _req: Request) -> Response {
-    state.router.flush_cache().await
+    match WorkerManager::flush_cache_all(&state.context.worker_registry, &state.context.client)
+        .await
+    {
+        Ok(result) => {
+            if result.failed.is_empty() {
+                (
+                    StatusCode::OK,
+                    Json(json!({
+                        "status": "success",
+                        "message": result.message,
+                        "workers_flushed": result.successful.len(),
+                        "total_http_workers": result.http_workers,
+                        "total_workers": result.total_workers
+                    })),
+                )
+                    .into_response()
+            } else {
+                (
+                    StatusCode::PARTIAL_CONTENT,
+                    Json(json!({
+                        "status": "partial_success",
+                        "message": result.message,
+                        "successful": result.successful,
+                        "failed": result.failed.into_iter().map(|(url, err)| json!({
+                            "worker": url,
+                            "error": err
+                        })).collect::<Vec<_>>(),
+                        "total_http_workers": result.http_workers,
+                        "total_workers": result.total_workers
+                    })),
+                )
+                    .into_response()
+            }
+        }
+        Err(e) => {
+            error!("Failed to flush cache: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "status": "error",
+                    "message": format!("Failed to flush cache: {}", e)
+                })),
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn get_loads(State(state): State<Arc<AppState>>, _req: Request) -> Response {
-    state.router.get_worker_loads().await
+    let result =
+        WorkerManager::get_all_worker_loads(&state.context.worker_registry, &state.context.client)
+            .await;
+
+    let loads: Vec<Value> = result
+        .loads
+        .iter()
+        .map(|info| {
+            json!({
+                "worker": &info.worker,
+                "load": info.load
+            })
+        })
+        .collect();
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "workers": loads
+        })),
+    )
+        .into_response()
 }
 
 async fn create_worker(
@@ -607,6 +735,11 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         "Started health checker for workers with {}s interval",
         config.router_config.health_check.check_interval_secs
     );
+
+    if let Some(ref load_monitor) = app_context.load_monitor {
+        load_monitor.start().await;
+        info!("Started LoadMonitor for PowerOfTwo policies");
+    }
 
     let (limiter, processor) = middleware::ConcurrencyLimiter::new(
         app_context.rate_limiter.clone(),

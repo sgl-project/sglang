@@ -14,7 +14,6 @@ from transformers import (
 )
 from transformers.models.auto.modeling_auto import AutoModel
 
-from sglang.srt.hf_transformers_utils import get_processor
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -38,6 +37,7 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models.gemma3n_audio import Gemma3nAudioEncoder
 from sglang.srt.models.gemma3n_causal import Gemma3nRMSNorm, Gemma3nTextModel
 from sglang.srt.utils import add_prefix
+from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
 
