@@ -1108,6 +1108,37 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         else:
             return out_cache_loc
 
+    def write_non_prefix_cache_locs(
+        self,
+        req_pool_indices: List[int],
+        prefix_lens: List[int],
+        seq_lens: List[int],
+        extend_lens: List[int],
+        out_cache_loc: torch.Tensor,
+        req_pool_indices_tensor: torch.Tensor,
+        prefix_lens_tensor: torch.Tensor,
+        seq_lens_tensor: torch.Tensor,
+        extend_lens_tensor: torch.Tensor,
+    ):
+        if support_triton(global_server_args_dict.get("attention_backend")):
+            write_req_to_token_pool_triton[(len(req_pool_indices),)](
+                self.req_to_token_pool.req_to_token,
+                req_pool_indices_tensor,
+                prefix_lens_tensor,
+                seq_lens_tensor,
+                extend_lens_tensor,
+                out_cache_loc,
+                self.req_to_token_pool.req_to_token.shape[1],
+            )
+        else:
+            pt = 0
+            for i in range(len(req_pool_indices)):
+                self.req_to_token_pool.write(
+                    (req_pool_indices[i], slice(prefix_lens[i], seq_lens[i])),
+                    out_cache_loc[pt : pt + extend_lens[i]],
+                )
+                pt += extend_lens[i]
+
     def prepare_encoder_info_extend(self, input_ids: List[int], seq_lens: List[int]):
         self.encoder_lens_cpu = []
         self.encoder_cached = []
@@ -1185,10 +1216,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def prepare_for_extend(self):
         self.forward_mode = ForwardMode.EXTEND
 
-        # Allocate req slots
-        bs = len(self.reqs)
-        req_pool_indices = self.alloc_req_slots(bs, self.reqs)
-
         # Init tensors
         reqs = self.reqs
         input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
@@ -1202,9 +1229,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             r.token_type_ids for r in reqs if r.token_type_ids is not None
         ]
 
-        req_pool_indices_tensor = torch.tensor(req_pool_indices, dtype=torch.int64).to(
-            self.device, non_blocking=True
-        )
         input_ids_tensor = torch.tensor(
             list(chain.from_iterable(input_ids)), dtype=torch.int64
         ).to(self.device, non_blocking=True)
@@ -1228,11 +1252,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         extend_lens_tensor = seq_lens_tensor - prefix_lens_tensor
 
-        # Copy prefix and do some basic check
-        input_embeds = []
-        extend_input_logprob_token_ids = []
-        multimodal_inputs = []
+        # Allocate req slots
+        bs = len(self.reqs)
+        req_pool_indices = self.alloc_req_slots(bs, self.reqs)
+        req_pool_indices_tensor = torch.tensor(req_pool_indices, dtype=torch.int64).to(
+            self.device, non_blocking=True
+        )
 
+        # Write prefix to req_to_token_pool
         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
             req.req_pool_idx = req_pool_indices[i]
             assert seq_len - pre_len == req.extend_input_len
@@ -1246,6 +1273,42 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         req, pre_len, self.model_config.attention_chunk_size
                     )
 
+        # Allocate memory
+        if self.token_to_kv_pool_allocator.page_size == 1:
+            out_cache_loc = self.alloc_token_slots(extend_num_tokens)
+        else:
+            last_loc = get_last_loc(
+                self.req_to_token_pool.req_to_token,
+                req_pool_indices_tensor,
+                prefix_lens_tensor,
+            )
+            out_cache_loc = self.alloc_paged_token_slots_extend(
+                prefix_lens_tensor,
+                prefix_lens_cpu_tensor,
+                seq_lens_tensor,
+                seq_lens_cpu,
+                last_loc,
+                extend_num_tokens,
+            )
+
+        self.write_non_prefix_cache_locs(
+            req_pool_indices,
+            prefix_lens,
+            seq_lens,
+            extend_lens,
+            out_cache_loc,
+            req_pool_indices_tensor,
+            prefix_lens_tensor,
+            seq_lens_tensor,
+            extend_lens_tensor,
+        )
+
+        # Copy prefix and do some basic check
+        input_embeds = []
+        extend_input_logprob_token_ids = []
+        multimodal_inputs = []
+
+        for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
             # If input_embeds are available, store them
             if req.input_embeds is not None:
                 # If req.input_embeds is already a list, append its content directly
@@ -1335,24 +1398,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         else:
             extend_input_logprob_token_ids = None
 
-        # Allocate memory
-        if self.token_to_kv_pool_allocator.page_size == 1:
-            out_cache_loc = self.alloc_token_slots(extend_num_tokens)
-        else:
-            last_loc = get_last_loc(
-                self.req_to_token_pool.req_to_token,
-                req_pool_indices_tensor,
-                prefix_lens_tensor,
-            )
-            out_cache_loc = self.alloc_paged_token_slots_extend(
-                prefix_lens_tensor,
-                prefix_lens_cpu_tensor,
-                seq_lens_tensor,
-                seq_lens_cpu,
-                last_loc,
-                extend_num_tokens,
-            )
-
         # Set fields
         self.input_ids = input_ids_tensor
         self.req_pool_indices = req_pool_indices_tensor
@@ -1385,28 +1430,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.prefix_lens = prefix_lens
         self.extend_lens = extend_lens
         self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
-
-        # Write to req_to_token_pool
-        if support_triton(global_server_args_dict.get("attention_backend")):
-            # TODO: some tensors can be reused for ForwardBatchInfo (e.g., extend_lens, cumsum_start)
-
-            write_req_to_token_pool_triton[(bs,)](
-                self.req_to_token_pool.req_to_token,
-                req_pool_indices_tensor,
-                prefix_lens_tensor,
-                seq_lens_tensor,
-                extend_lens_tensor,
-                out_cache_loc,
-                self.req_to_token_pool.req_to_token.shape[1],
-            )
-        else:
-            pt = 0
-            for i in range(bs):
-                self.req_to_token_pool.write(
-                    (req_pool_indices[i], slice(prefix_lens[i], seq_lens[i])),
-                    out_cache_loc[pt : pt + extend_lens[i]],
-                )
-                pt += extend_lens[i]
 
         if self.model_config.is_encoder_decoder:
             self.prepare_encoder_info_extend(input_ids, seq_lens)
