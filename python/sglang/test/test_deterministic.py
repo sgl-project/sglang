@@ -19,7 +19,7 @@ from sglang.profiler import run_profile
 PROMPT_1 = "Tell me about Richard Feynman: "
 PROMPT_2 = "Generate 1000 random numbers. Go directly into it, don't say Sure and don't say here are numbers. Just start with a number."
 dirpath = os.path.dirname(__file__)
-with open("python/sglang/test/long_prompt.txt", "r") as f:
+with open(os.path.join(dirpath, "long_prompt.txt"), "r") as f:
     LONG_PROMPT = f.read()
 
 
@@ -29,7 +29,7 @@ class BenchArgs:
     port: int = 30000
     batch_size: int = 1
     temperature: float = 0.0
-    sampling_seed: int = None
+    sampling_seed: int = 42
     max_new_tokens: int = 100
     frequency_penalty: float = 0.0
     presence_penalty: float = 0.0
