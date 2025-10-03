@@ -204,7 +204,7 @@ class SchedulerProfilerMixin:
 
             torch.distributed.barrier(self.tp_cpu_group)
             if self.tp_rank == 0:
-                from sglang.srt.rpd_utils import rpd_to_chrome_trace
+                from sglang.srt.utils.rpd_utils import rpd_to_chrome_trace
 
                 rpd_to_chrome_trace("trace.rpd", self.rpd_profile_path)
             self.rpd_profiler = None
