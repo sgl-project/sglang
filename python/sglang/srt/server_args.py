@@ -878,10 +878,9 @@ class ServerArgs:
 
         if self.attention_backend == "dual_chunk_flash_attn":
             logger.warning(
-                "Mixed chunk, radix cache, and cuda graphs are disabled because of using dual chunk flash attention backend"
+                "Mixed chunk and radix cache are disabled when using dual-chunk flash attention backend"
             )
             self.enable_mixed_chunk = False
-            self.disable_cuda_graph = True
             self.disable_radix_cache = True
 
     def _handle_page_size(self):
