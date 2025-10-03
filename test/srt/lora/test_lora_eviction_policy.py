@@ -32,8 +32,6 @@ class TestLoRAEvictionPolicy(unittest.TestCase):
 
     def test_lru_eviction_policy(self):
         """Test LRU eviction policy unit functionality."""
-        print("Testing LRU eviction policy...")
-
         lru = get_eviction_policy("lru")
         adapters = ["adapter_1", "adapter_2", "adapter_3", "adapter_4"]
 
@@ -48,31 +46,22 @@ class TestLoRAEvictionPolicy(unittest.TestCase):
 
         # Test victim selection - should select adapter_1 (least recently used)
         candidates = set(adapters)
-        pinned = set()  # No pinned adapters
-
         victim = lru.select_victim(candidates)
-        print(f"LRU victim: {victim} (expected: adapter_1)")
         self.assertEqual(victim, "adapter_1")
 
         # Test with pinned adapter (simulate pre-filtering in mem_pool)
         pinned = {"adapter_1"}  # Pin the LRU adapter
         filtered_candidates = candidates - pinned  # Pre-filter like mem_pool does
         victim = lru.select_victim(filtered_candidates)
-        print(f"LRU victim with pinning: {victim} (expected: adapter_3)")
         self.assertEqual(victim, "adapter_3")  # Should select next LRU
 
         # Test removal
         lru.remove("adapter_1")
         victim = lru.select_victim(candidates)
-        print(f"LRU victim after removal: {victim} (expected: adapter_3)")
         self.assertEqual(victim, "adapter_3")
-
-        print("LRU eviction policy tests passed")
 
     def test_fifo_eviction_policy(self):
         """Test FIFO eviction policy unit functionality."""
-        print("Testing FIFO eviction policy...")
-
         fifo = get_eviction_policy("fifo")
         adapters = ["adapter_1", "adapter_2", "adapter_3", "adapter_4"]
 
@@ -86,31 +75,22 @@ class TestLoRAEvictionPolicy(unittest.TestCase):
 
         # Test victim selection - should select adapter_1 (first inserted)
         candidates = set(adapters)
-        pinned = set()  # No pinned adapters
-
         victim = fifo.select_victim(candidates)
-        print(f"FIFO victim: {victim} (expected: adapter_1)")
         self.assertEqual(victim, "adapter_1")
 
         # Test with pinned adapter (simulate pre-filtering in mem_pool)
         pinned = {"adapter_1"}  # Pin the first adapter
         filtered_candidates = candidates - pinned  # Pre-filter like mem_pool does
         victim = fifo.select_victim(filtered_candidates)
-        print(f"FIFO victim with pinning: {victim} (expected: adapter_2)")
         self.assertEqual(victim, "adapter_2")  # Should select next FIFO
 
         # Test removal
         fifo.remove("adapter_1")
         victim = fifo.select_victim(candidates)
-        print(f"FIFO victim after removal: {victim} (expected: adapter_2)")
         self.assertEqual(victim, "adapter_2")
-
-        print("FIFO eviction policy tests passed")
 
     def test_eviction_policy_factory(self):
         """Test eviction policy factory function."""
-        print("Testing eviction policy factory...")
-
         # Test valid policies
         lru = get_eviction_policy("lru")
         fifo = get_eviction_policy("fifo")
@@ -122,12 +102,8 @@ class TestLoRAEvictionPolicy(unittest.TestCase):
         with self.assertRaises(ValueError):
             get_eviction_policy("invalid_policy")
 
-        print("Eviction policy factory tests passed")
-
     def test_lru_vs_fifo_behavior(self):
         """Test that LRU and FIFO behave differently."""
-        print("Testing LRU vs FIFO behavioral differences...")
-
         lru = get_eviction_policy("lru")
         fifo = get_eviction_policy("fifo")
 
@@ -144,21 +120,16 @@ class TestLoRAEvictionPolicy(unittest.TestCase):
         fifo.mark_used("adapter_1")
 
         candidates = set(adapters)
-        pinned = set()
 
         # LRU should select adapter_2 (now least recently used)
         lru_victim = lru.select_victim(candidates)
         # FIFO should still select adapter_1 (first inserted)
         fifo_victim = fifo.select_victim(candidates)
 
-        print(f"LRU victim: {lru_victim}, FIFO victim: {fifo_victim}")
-
         # They should select different victims
         self.assertNotEqual(lru_victim, fifo_victim)
         self.assertEqual(lru_victim, "adapter_2")  # LRU behavior
         self.assertEqual(fifo_victim, "adapter_1")  # FIFO behavior
-
-        print("LRU vs FIFO behavioral difference tests passed")
 
 
 class TestLoRAEvictionPolicyIntegration(CustomTestCase):
@@ -166,61 +137,42 @@ class TestLoRAEvictionPolicyIntegration(CustomTestCase):
 
     BASE_MODEL = "/workspace/models/llama3-1-8-b"
     ADAPTER_PATH = "/workspace/adapters/llama_3_1_8B_adapter"
-    ADAPTER_NAMES = ["adapter_1", "adapter_2", "adapter_3"]  # 3 adapters, pool size 2
+    ADAPTER_NAMES = ["adapter_1", "adapter_2", "adapter_3"]
     PROMPT = "What is artificial intelligence?"
+
+    def _get_runner_config(self, eviction_policy: str, max_loras: int = 2):
+        """Get common SRTRunner configuration."""
+        return {
+            "model_path": self.BASE_MODEL,
+            "torch_dtype": torch.float16,
+            "model_type": "generation",
+            "lora_paths": None,
+            "max_loras_per_batch": max_loras,
+            "lora_backend": "triton",
+            "enable_lora": True,
+            "max_lora_rank": 256,
+            "lora_target_modules": ["all"],
+            "lora_eviction_policy": eviction_policy,
+        }
 
     def _run_eviction_test(self, eviction_policy: str, pinned: bool = False):
         """Run eviction test with specified policy and adapters."""
-        print(f"\n{'='*60}")
-        print(f"Testing {eviction_policy.upper()} eviction policy (pinned={pinned})")
-        print(f"{'='*60}")
-
-        with SRTRunner(
-            self.BASE_MODEL,
-            torch_dtype=torch.float16,
-            model_type="generation",
-            lora_paths=None,  # Don't preload, dynamically load adapters
-            max_loras_per_batch=2,  # Pool size 2, will load 3 adapters
-            lora_backend="triton",
-            enable_lora=True,
-            max_lora_rank=256,
-            lora_target_modules=["all"],
-            lora_eviction_policy=eviction_policy,
-        ) as runner:
-            # Load all 3 adapters
-            # For pinned test: adapter_1 is pinned, adapter_2 will be evicted when loading adapter_3
-            # For normal test: eviction based on policy (LRU/FIFO)
+        with SRTRunner(**self._get_runner_config(eviction_policy)) as runner:
+            # Load adapters (pin first one if pinned=True)
             for i, name in enumerate(self.ADAPTER_NAMES):
-                pin_flag = pinned and i == 0
-                print(f"\n  Loading adapter: {name} (pinned={pin_flag})")
                 runner.load_lora_adapter(
-                    lora_name=name, lora_path=self.ADAPTER_PATH, pinned=pin_flag
+                    lora_name=name,
+                    lora_path=self.ADAPTER_PATH,
+                    pinned=(pinned and i == 0),
                 )
-                print(f"    Loaded successfully")
 
-            # Test all adapters to verify they work after eviction
-            print(f"\n--- Testing inference with eviction ---")
+            # Verify all adapters work after eviction
             for adapter_name in self.ADAPTER_NAMES:
-                print(f"\n  Attempting inference with adapter: {adapter_name}")
-
-                try:
-                    output = runner.forward(
-                        [self.PROMPT],
-                        max_new_tokens=32,
-                        lora_paths=[adapter_name],
-                    )
-
-                    # Verify output is generated
-                    self.assertIsNotNone(output.output_strs[0])
-                    self.assertGreater(len(output.output_strs[0]), 0)
-                    print(f"    ✓ Success! Output: {output.output_strs[0][:50]}...")
-                except Exception as e:
-                    print(
-                        f"    ✗ Failed with error: {type(e).__name__}: {str(e)[:200]}"
-                    )
-                    raise
-
-        print(f"\n✓ {eviction_policy.upper()} test passed (pinned={pinned})")
+                output = runner.forward(
+                    [self.PROMPT], max_new_tokens=32, lora_paths=[adapter_name]
+                )
+                self.assertIsNotNone(output.output_strs[0])
+                self.assertGreater(len(output.output_strs[0]), 0)
 
     def test_lru_eviction(self):
         """Test LRU eviction policy with actual inference."""
@@ -237,6 +189,24 @@ class TestLoRAEvictionPolicyIntegration(CustomTestCase):
     def test_fifo_eviction_with_pinning(self):
         """Test FIFO eviction policy with adapter pinning."""
         self._run_eviction_test("fifo", pinned=True)
+
+    def test_base_model_eviction_with_pinned(self):
+        """Test that base model (None) can be evicted when slots are needed."""
+        with SRTRunner(**self._get_runner_config("lru")) as runner:
+            # Load: 1 pinned + 2 unpinned adapters (3 total, pool size 2)
+            adapter_names = ["pinned", "normal", "extra"]
+            for i, name in enumerate(adapter_names):
+                runner.load_lora_adapter(
+                    lora_name=name, lora_path=self.ADAPTER_PATH, pinned=(i == 0)
+                )
+
+            # Verify all adapters work (triggers eviction and reloading)
+            for name in adapter_names:
+                output = runner.forward(
+                    [self.PROMPT], max_new_tokens=32, lora_paths=[name]
+                )
+                self.assertIsNotNone(output.output_strs[0])
+                self.assertGreater(len(output.output_strs[0]), 0)
 
 
 if __name__ == "__main__":

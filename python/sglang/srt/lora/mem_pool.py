@@ -200,24 +200,29 @@ class LoRAMemoryPool:
                     return buffer_id
 
             # 2. Memory pool is full, need to evict using policy
-            # Collect eviction candidates (not in current batch and not pinned)
             candidates = set()
 
             for buffer_id in range(self.max_loras_per_batch):
                 uid = self.buffer_id_to_uid[buffer_id]
-                if uid not in cur_uids and uid is not None:
+
+                # Skip if this adapter is needed by current batch
+                if uid in cur_uids:
+                    continue
+
+                # Skip if this adapter is pinned
+                if uid is not None:
                     lora_ref = lora_refs.get(uid)
-                    # Only add to candidates if not pinned
-                    if lora_ref is None or not lora_ref.pinned:
-                        candidates.add(uid)
+                    if lora_ref and lora_ref.pinned:  # None (base model) can be evicted
+                        continue
+                candidates.add(uid)
 
-            # Use eviction policy to select victim
-            victim_uid = self.eviction_policy.select_victim(candidates)
-
-            if victim_uid is None:
+            if not candidates:
                 raise ValueError(
-                    "No available buffer slots found. Please ensure the number of active loras is less than max_loras_per_batch."
+                    "No available buffer slots found. Please ensure the number of active (pinned) loras is less than max_loras_per_batch."
                 )
+
+            # Select victim using eviction policy
+            victim_uid = self.eviction_policy.select_victim(candidates)
 
             # Evict the selected victim
             victim_buffer_id = self.uid_to_buffer_id[victim_uid]

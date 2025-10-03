@@ -18,6 +18,7 @@ suites = {
         TestFile("hicache/test_hicache_storage.py", 127),
         TestFile("lora/test_lora.py", 200),
         TestFile("lora/test_lora_eviction.py", 200),
+        TestFile("lora/test_lora_eviction_policy.py", 200),
         TestFile("lora/test_lora_backend.py", 99),
         TestFile("lora/test_multi_lora_backend.py", 60),
         TestFile("lora/test_lora_cuda_graph.py", 250),

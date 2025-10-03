@@ -63,12 +63,22 @@ class LRUEvictionPolicy(EvictionPolicy):
 
     def select_victim(self, candidates: Set[Optional[str]]) -> Optional[str]:
         """Select the least recently used adapter from candidates."""
+        # Base model (currently None, will be replaced with special UID in future)
+        # always has lowest priority - evict it first if available
+        BASE_MODEL_UID = None  # TODO: Replace with special UID constant
+        if BASE_MODEL_UID in candidates:
+            logger.debug(f"Selected base model for eviction (LRU)")
+            self.eviction_count += 1
+            return BASE_MODEL_UID
+
         # Iterate through access_order (oldest first) to find LRU victim
         for uid in list(self.access_order.keys()):
             if uid in candidates:
                 logger.debug(f"Selected LoRA {uid} for eviction (LRU)")
                 self.eviction_count += 1
                 return uid
+
+        # Should never reach here if candidates is non-empty
         return None
 
     def remove(self, uid: Optional[str]) -> None:
@@ -91,12 +101,22 @@ class FIFOEvictionPolicy(EvictionPolicy):
 
     def select_victim(self, candidates: Set[Optional[str]]) -> Optional[str]:
         """Select the first inserted adapter from candidates."""
+        # Base model (currently None, will be replaced with special UID in future)
+        # always has lowest priority - evict it first if available
+        BASE_MODEL_UID = None  # TODO: Replace with special UID constant
+        if BASE_MODEL_UID in candidates:
+            logger.debug(f"Selected base model for eviction (FIFO)")
+            self.eviction_count += 1
+            return BASE_MODEL_UID
+
         # Iterate through insertion_order (oldest first) to find FIFO victim
         for uid in list(self.insertion_order.keys()):
             if uid in candidates:
                 logger.debug(f"Selected LoRA {uid} for eviction (FIFO)")
                 self.eviction_count += 1
                 return uid
+
+        # Should never reach here if candidates is non-empty
         return None
 
     def remove(self, uid: Optional[str]) -> None:
