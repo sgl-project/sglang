@@ -694,7 +694,6 @@ class Req:
         if self.return_logprob:
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
         max_prefix_len = max(max_prefix_len, 0)
-        self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
         token_ids = self.fill_ids[:max_prefix_len]
 
         if tree_cache is not None:
@@ -707,6 +706,7 @@ class Req:
                 key=RadixKey(token_ids=token_ids, extra_key=self.extra_key)
             )
             self.last_matched_prefix_len = len(self.prefix_indices)
+        self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
 
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
     def init_incremental_detokenize(self):
