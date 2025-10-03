@@ -1620,7 +1620,7 @@ class ModelRunner:
                 )
             elif self.is_hybrid_gdn:
                 self.token_to_kv_pool = HybridLinearKVPool(
-                    page_size=self.page_size if _is_npu else 1,
+                    page_size=self.page_size,
                     size=self.max_total_num_tokens,
                     dtype=self.kv_cache_dtype,
                     head_num=self.model_config.get_num_kv_heads(
