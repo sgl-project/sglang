@@ -537,7 +537,7 @@ class Req:
 
         # Prefix info
         # The indices to kv cache for the shared prefix.
-        self.prefix_indices: torch.Tensor = []
+        self.prefix_indices: torch.Tensor = torch.empty((0,), dtype=torch.int64)
         # Number of tokens to run prefill.
         self.extend_input_len = 0
         # The relative logprob_start_len in an extend batch
@@ -787,7 +787,7 @@ class Req:
                     return
 
     def reset_for_retract(self):
-        self.prefix_indices = []
+        self.prefix_indices = torch.empty((0,), dtype=torch.int64)
         self.last_node = None
         self.swa_uuid_for_lock = None
         self.extend_input_len = 0
