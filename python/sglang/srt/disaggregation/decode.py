@@ -523,10 +523,18 @@ class DecodePreallocQueue:
                     dtype=torch.int64,
                     device=self.token_to_kv_pool_allocator.device,
                 ),
+                prefix_lens_cpu=torch.tensor(
+                    [0],
+                    dtype=torch.int64,
+                ),
                 seq_lens=torch.tensor(
                     [num_tokens],
                     dtype=torch.int64,
                     device=self.token_to_kv_pool_allocator.device,
+                ),
+                seq_lens_cpu=torch.tensor(
+                    [num_tokens],
+                    dtype=torch.int64,
                 ),
                 last_loc=torch.tensor(
                     [-1],
