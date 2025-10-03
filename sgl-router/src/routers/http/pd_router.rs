@@ -1257,10 +1257,8 @@ impl RouterTrait for PDRouter {
         let prefill_workers = self.worker_registry.get_prefill_workers();
         let decode_workers = self.worker_registry.get_decode_workers();
 
-        let mut all_workers = prefill_workers;
-        all_workers.extend(decode_workers);
-
-        if all_workers.is_empty() {
+        let total_workers = prefill_workers.len() + decode_workers.len();
+        if total_workers == 0 {
             return crate::routers::router_manager::RouterStats {
                 avg_priority: 0.0,
                 avg_cost: 1.0,
@@ -1271,7 +1269,11 @@ impl RouterTrait for PDRouter {
             };
         }
 
-        let healthy_workers: Vec<_> = all_workers.iter().filter(|w| w.is_healthy()).collect();
+        let healthy_workers: Vec<_> = prefill_workers
+            .iter()
+            .chain(decode_workers.iter())
+            .filter(|w| w.is_healthy())
+            .collect();
 
         if healthy_workers.is_empty() {
             return crate::routers::router_manager::RouterStats {
@@ -1279,7 +1281,7 @@ impl RouterTrait for PDRouter {
                 avg_cost: 1.0,
                 avg_load: f32::MAX,
                 healthy_workers: 0,
-                total_workers: all_workers.len(),
+                total_workers,
                 is_pd_mode: true,
             };
         }
@@ -1295,7 +1297,7 @@ impl RouterTrait for PDRouter {
             avg_cost: total_cost / count,
             avg_load: total_load as f32 / count,
             healthy_workers: healthy_workers.len(),
-            total_workers: all_workers.len(),
+            total_workers,
             is_pd_mode: true,
         }
     }

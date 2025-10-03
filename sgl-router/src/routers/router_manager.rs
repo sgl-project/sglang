@@ -314,7 +314,7 @@ impl RouterManager {
 
             // cost threshold filter (if specified)
             if let Some(max_cost) = cost_threshold {
-                if stats.avg_cost > max_cost as f32 {
+                if stats.avg_cost > max_cost {
                     debug!(
                         "Skipping router {} with avg_cost {:.1} > threshold {}",
                         router.router_type(),

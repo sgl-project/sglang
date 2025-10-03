@@ -81,8 +81,7 @@ impl RuleBasedPolicy {
         let priority_threshold = Self::get_priority_threshold(context);
         let max_cost = Self::get_max_cost(context);
 
-        // Apply filters
-        let filtered_indices: Vec<usize> = healthy_indices
+        let best_idx_opt = healthy_indices
             .iter()
             .copied()
             .filter(|&idx| {
@@ -104,33 +103,25 @@ impl RuleBasedPolicy {
 
                 true
             })
-            .collect();
+            .min_by(|&a, &b| Self::compare_workers(&workers[a], &workers[b]));
 
-        if filtered_indices.is_empty() {
+        if let Some(best_idx) = best_idx_opt {
+            debug!(
+                "RuleBasedPolicy selected worker {} (priority={}, load={}, cost={})",
+                workers[best_idx].url(),
+                workers[best_idx].priority(),
+                workers[best_idx].load(),
+                workers[best_idx].cost()
+            );
+            Some(best_idx)
+        } else {
             warn!(
                 "RuleBasedPolicy: All workers filtered out by priority/cost thresholds. \
                  Priority threshold: {:?}, Max cost: {:?}",
                 priority_threshold, max_cost
             );
-            return None;
+            None
         }
-
-        // Select best worker using lexicographic ordering
-        let best_idx = filtered_indices
-            .iter()
-            .copied()
-            .min_by(|&a, &b| Self::compare_workers(&workers[a], &workers[b]))
-            .unwrap();
-
-        debug!(
-            "RuleBasedPolicy selected worker {} (priority={}, load={}, cost={})",
-            workers[best_idx].url(),
-            workers[best_idx].priority(),
-            workers[best_idx].load(),
-            workers[best_idx].cost()
-        );
-
-        Some(best_idx)
     }
 }
 
