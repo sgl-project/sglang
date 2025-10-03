@@ -12,9 +12,6 @@ from sglang.srt.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
 )
-from sglang.srt.layers.attention.mamba.mamba2_mixer_rms_norm_gated import (
-    Mixer2RMSNormGated,
-)
 
 NUM_GPUS = 2
 
@@ -104,13 +101,13 @@ def mixer2_gated_norm_tensor_parallel(
     hidden_states = torch.randn(batch_size, seq_len, hidden_size)
     gate_states = torch.randn(batch_size, seq_len, hidden_size)
 
-    import sglang.srt.layers.attention.mamba.mamba2_mixer_rms_norm_gated as m2
+    import sglang.srt.layers.attention.mamba.mamba as m2
     import sglang.srt.model_loader.weight_utils as wu
 
     # Convenience: Avoid calling initialize_dp_attention
     with patch.object(wu, "get_attention_tp_rank", return_value=local_rank):
         # create gated-norm with TP
-        mixer = Mixer2RMSNormGated(
+        mixer = m2.Mixer2RMSNormGated(
             full_hidden_size=hidden_size,
             full_n_groups=n_groups,
         )
@@ -121,7 +118,7 @@ def mixer2_gated_norm_tensor_parallel(
         patch.object(m2, "get_tensor_model_parallel_rank", return_value=0),
     ):
         # create gated-norm without TP to compute reference
-        mixer_single_gpu = Mixer2RMSNormGated(
+        mixer_single_gpu = m2.Mixer2RMSNormGated(
             full_hidden_size=hidden_size,
             full_n_groups=n_groups,
         )

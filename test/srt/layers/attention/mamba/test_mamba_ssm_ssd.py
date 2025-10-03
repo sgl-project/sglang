@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 
 from sglang.srt.layers.attention.mamba.mamba2_metadata import Mamba2Metadata
-from sglang.srt.layers.attention.mamba.ssd_combined import mamba_chunk_scan_combined
+from sglang.srt.layers.attention.mamba.ops import mamba_chunk_scan_combined
 
 # Added by the IBM Team, 2024
 

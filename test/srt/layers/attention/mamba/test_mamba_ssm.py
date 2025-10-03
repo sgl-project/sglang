@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 
 from sglang.srt.layers.attention.mamba.causal_conv1d_triton import PAD_SLOT_ID
-from sglang.srt.layers.attention.mamba.mamba_ssm import selective_state_update
+from sglang.srt.layers.attention.mamba.ops import selective_state_update
 
 
 def selective_state_update_ref(

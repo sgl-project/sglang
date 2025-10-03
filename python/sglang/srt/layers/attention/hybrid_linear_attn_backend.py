@@ -18,11 +18,11 @@ from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
+from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
 from sglang.srt.layers.attention.mamba.mamba2_metadata import (
     ForwardMetadata,
     Mamba2Metadata,
 )
-from sglang.srt.layers.attention.mamba.mamba2_mixer import Mamba2Mixer
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -497,15 +497,24 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
 
     def forward(
         self,
-        mixer: Mamba2Mixer,
-        layer_id: int,
         *,
+        mixer: MambaMixer2,
+        layer_id: int,
         hidden_states: torch.Tensor,
         output: torch.Tensor,
+        mup_vector: Optional[torch.Tensor] = None,
+        use_triton_causal_conv: bool = False,
     ):
         assert isinstance(self.forward_metadata, Mamba2Metadata)
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
-        return mixer.forward(hidden_states, output, layer_cache, self.forward_metadata)
+        return mixer.forward(
+            hidden_states=hidden_states,
+            output=output,
+            layer_cache=layer_cache,
+            metadata=self.forward_metadata,
+            mup_vector=mup_vector,
+            use_triton_causal_conv=use_triton_causal_conv,
+        )
 
     def forward_decode(self, *args, **kwargs):
         raise NotImplementedError(

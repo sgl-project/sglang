@@ -30,6 +30,7 @@ from urllib.parse import urlparse
 import requests
 import torch
 import torch.distributed as dist
+from transformers import FalconH1Config
 
 from sglang.srt import slow_rank_detector
 from sglang.srt.configs import NemotronHConfig, Qwen3NextConfig
@@ -1298,22 +1299,26 @@ class ModelRunner:
         return self.model_config.hf_config.architectures[0] in [
             "Qwen3NextForCausalLM",
             "Qwen3NextForCausalLMMTP",
-            "FalconH1ForCausalLM",
         ]
 
     @property
-    def is_nemotron_h(self):
-        return isinstance(self.model_config.hf_config, NemotronHConfig)
+    def is_mamba2(self):
+        return self.model_config.hf_config.architectures[0] in [
+            "FalconH1ForCausalLM",
+            "NemotronHForCausalLM",
+        ]
 
     @property
     def is_mambaish(self):
-        return self.is_nemotron_h or self.is_hybrid_gdn
+        return self.is_mamba2 or self.is_hybrid_gdn
 
     @property
     def mambaish_config(self):
         if self.is_mambaish:
             config = self.model_config.hf_config
-            assert isinstance(config, NemotronHConfig | Qwen3NextConfig)
+            assert isinstance(
+                config, NemotronHConfig | Qwen3NextConfig | FalconH1Config
+            )
             return config
         return None
 

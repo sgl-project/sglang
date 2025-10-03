@@ -29,7 +29,7 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
     Mamba2AttnBackend,
 )
-from sglang.srt.layers.attention.mamba.mamba2_mixer import Mamba2Mixer
+from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -146,7 +146,7 @@ class NemotronHMambaDecoderLayer(nn.Module):
         super().__init__()
         self.config = config
         self.layer_id = layer_idx
-        self.mixer = Mamba2Mixer(
+        self.mixer = MambaMixer2(
             hidden_size=config.hidden_size,
             ssm_state_size=config.ssm_state_size,
             conv_kernel_size=config.conv_kernel,
@@ -181,7 +181,11 @@ class NemotronHMambaDecoderLayer(nn.Module):
         assert isinstance(attn_backend, HybridLinearAttnBackend)
         assert isinstance(attn_backend.linear_attn_backend, Mamba2AttnBackend)
         attn_backend.linear_attn_backend.forward(
-            self.mixer, self.layer_id, hidden_states=hidden_states, output=output
+            mixer=self.mixer,
+            layer_id=self.layer_id,
+            hidden_states=hidden_states,
+            output=output,
+            use_triton_causal_conv=True,  # TODO: investigate need of `use_triton_causal_conv`
         )
         return output, residual
 
