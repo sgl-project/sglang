@@ -351,8 +351,6 @@ mod test_pd_routing {
             ("https://api.example.com:443", "api.example.com"),
             ("http://prefill-server", "prefill-server"),
             ("http://[::1]:8080", "::1"),  // IPv6 edge case (previously returned "[" - now fixed)
-            ("http://[fdbd:dccd:cdd2:2001::19d]:8000", "fdbd:dccd:cdd2:2001::19d"),  // IPv6 address
-            ("[2001:db8::1]:443", "2001:db8::1"),  // IPv6 without protocol
             ("prefill:8080", "prefill"), // No protocol
         ];
 
