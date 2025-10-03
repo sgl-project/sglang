@@ -688,8 +688,7 @@ class Req:
     def init_next_round_input(self, tree_cache: Optional[BasePrefixCache] = None):
         self.fill_ids = self.origin_input_ids + self.output_ids
         input_len = len(self.fill_ids)
-        # FIXME: To work around some bugs in logprob computation, we need to ensure each
-        # request has at least one token. Later, we can relax this requirement and use `input_len`.
+        # NOTE: the matched length is at most 1 less than the input length to enable logprob computation
         max_prefix_len = input_len - 1
         if self.return_logprob:
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
@@ -1119,13 +1118,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         prefix_lens_tensor: torch.Tensor,
         seq_lens_tensor: torch.Tensor,
         extend_lens_tensor: torch.Tensor,
-        prefix_tensors: torch.Tensor,
+        prefix_tensors: list[torch.Tensor],
     ):
         if support_triton(global_server_args_dict.get("attention_backend")):
+            prefix_pointers = torch.tensor(
+                [t.data_ptr() for t in prefix_tensors], device=self.device
+            )
+            # TODO: some tensors can be reused for ForwardBatchInfo (e.g., extend_lens, cumsum_start)
             write_req_to_token_pool_triton[(len(req_pool_indices),)](
                 self.req_to_token_pool.req_to_token,
                 req_pool_indices_tensor,
-                prefix_tensors,
+                prefix_pointers,
                 prefix_lens_tensor,
                 seq_lens_tensor,
                 extend_lens_tensor,
@@ -1135,6 +1138,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         else:
             pt = 0
             for i in range(len(req_pool_indices)):
+                self.req_to_token_pool.write(
+                    (req_pool_indices[i], slice(0, prefix_lens[i])),
+                    prefix_tensors[i],
+                )
                 self.req_to_token_pool.write(
                     (req_pool_indices[i], slice(prefix_lens[i], seq_lens[i])),
                     out_cache_loc[pt : pt + extend_lens[i]],
@@ -1284,10 +1291,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
         # Write allocated tokens to req_to_token_pool
-        prefix_tensors = torch.tensor(
-            [r.prefix_indices.data_ptr() for r in reqs], device=self.device
-        )
-
         self.write_cache_indices(
             req_pool_indices,
             prefix_lens,
@@ -1298,7 +1301,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             prefix_lens_tensor,
             seq_lens_tensor,
             extend_lens_tensor,
-            prefix_tensors,
+            [r.prefix_indices for r in reqs],
         )
 
         # Set fields
