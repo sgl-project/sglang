@@ -143,6 +143,7 @@ class TestDisaggregationAccuracy(TestDisaggregationBase):
 class TestDisaggregationMooncakeFailure(TestDisaggregationBase):
     @classmethod
     def setUpClass(cls):
+        super().setUpClass()
         # set DISAGGREGATION_TEST_FAILURE_PROB to simulate failure
         os.environ["DISAGGREGATION_TEST_FAILURE_PROB"] = "0.05"
 
