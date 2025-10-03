@@ -320,6 +320,7 @@ class TestDisaggregationMooncakeSpec(TestDisaggregationBase):
 class TestDisaggregationSimulatedRetract(TestDisaggregationBase):
     @classmethod
     def setUpClass(cls):
+        super().setUpClass()
         os.environ["SGLANG_TEST_RETRACT"] = "true"
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
 
