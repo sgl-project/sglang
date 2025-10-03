@@ -36,13 +36,13 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Ensure VRAM is clear
+        run: bash scripts/ensure_vram_clear.sh rocm
+
       - name: Start CI container
         run: bash scripts/ci/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
-
-      - name: Ensure VRAM is clear
-        run: bash scripts/ensure_vram_clear.sh rocm
 
       - name: Install dependencies
         run: bash scripts/ci/amd_ci_install_dependency.sh
@@ -65,13 +65,13 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Ensure VRAM is clear
+        run: bash scripts/ensure_vram_clear.sh rocm
+
       - name: Start CI container
         run: bash scripts/ci/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
-
-      - name: Ensure VRAM is clear
-        run: bash scripts/ensure_vram_clear.sh rocm
 
       - name: Install dependencies
         run: bash scripts/ci/amd_ci_install_dependency.sh
@@ -92,13 +92,13 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Ensure VRAM is clear
+        run: bash scripts/ensure_vram_clear.sh rocm
+
       - name: Start CI container
         run: bash scripts/ci/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
-
-      - name: Ensure VRAM is clear
-        run: bash scripts/ensure_vram_clear.sh rocm
 
       - name: Install dependencies
         run: bash scripts/ci/amd_ci_install_dependency.sh
@@ -119,13 +119,13 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Ensure VRAM is clear
+        run: bash scripts/ensure_vram_clear.sh rocm
+
       - name: Start CI container
         run: bash scripts/ci/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
-
-      - name: Ensure VRAM is clear
-        run: bash scripts/ensure_vram_clear.sh rocm
 
       - name: Install dependencies
         run: bash scripts/ci/amd_ci_install_dependency.sh
@@ -162,13 +162,13 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Ensure VRAM is clear
+        run: bash scripts/ensure_vram_clear.sh rocm
+
       - name: Start CI container
         run: bash scripts/ci/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
-
-      - name: Ensure VRAM is clear
-        run: bash scripts/ensure_vram_clear.sh rocm
 
       - name: Install dependencies
         run: bash scripts/ci/amd_ci_install_dependency.sh
@@ -199,13 +199,13 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Ensure VRAM is clear
+        run: bash scripts/ensure_vram_clear.sh rocm
+
       - name: Start CI container
         run: bash scripts/ci/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
-
-      - name: Ensure VRAM is clear
-        run: bash scripts/ensure_vram_clear.sh rocm
 
       - name: Install dependencies
         run: bash scripts/ci/amd_ci_install_dependency.sh
@@ -247,13 +247,13 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Ensure VRAM is clear
+        run: bash scripts/ensure_vram_clear.sh rocm
+
       - name: Start CI container
         run: bash scripts/ci/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
-
-      - name: Ensure VRAM is clear
-        run: bash scripts/ensure_vram_clear.sh rocm
 
       - name: Install dependencies
         run: bash scripts/ci/amd_ci_install_dependency.sh
@@ -274,13 +274,13 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Ensure VRAM is clear
+        run: bash scripts/ensure_vram_clear.sh rocm
+
       - name: Start CI container
         run: bash scripts/ci/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
-
-      - name: Ensure VRAM is clear
-        run: bash scripts/ensure_vram_clear.sh rocm
 
       - name: Install dependencies
         run: bash scripts/ci/amd_ci_install_dependency.sh
@@ -301,13 +301,13 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Ensure VRAM is clear
+        run: bash scripts/ensure_vram_clear.sh rocm
+
       - name: Start CI container
         run: bash scripts/ci/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
-
-      - name: Ensure VRAM is clear
-        run: bash scripts/ensure_vram_clear.sh rocm
 
       - name: Install dependencies
         run: bash scripts/ci/amd_ci_install_dependency.sh
@@ -328,13 +328,13 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Ensure VRAM is clear
+        run: bash scripts/ensure_vram_clear.sh rocm
+
       - name: Start CI container
         run: bash scripts/ci/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
-
-      - name: Ensure VRAM is clear
-        run: bash scripts/ensure_vram_clear.sh rocm
 
       - name: Install dependencies
         run: |

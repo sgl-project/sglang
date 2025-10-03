@@ -8,6 +8,11 @@ ensure_vram_clear() {
     local max_retries=3
     local retry_count=0
 
+    # Stop and remove any existing ci_sglang container
+    echo "Stopping any existing ci_sglang container..."
+    docker stop ci_sglang || true
+    docker rm ci_sglang || true
+
     # Log host information for debugging
     echo "=== Host Information ==="
     echo "Hostname: $(hostname)"
@@ -32,10 +37,10 @@ ensure_vram_clear() {
         if [ $retry_count -gt 0 ]; then
             echo "Performing aggressive cleanup..."
             # Kill all processes using KFD
-            lsof /dev/kfd 2>/dev/null | awk 'NR>1 {print $2}' | xargs -r kill -9 2>/dev/null || true
+            rocm-smi --showpids 2>/dev/null | grep 'PID:' | awk '{print $2}' | xargs -r kill -9 2>/dev/null || true
             # Wait a bit for cleanup to take effect
-            echo "Waiting 10 seconds for VRAM to clear..."
-            sleep 10
+            echo "Waiting 30 seconds for VRAM to clear..."
+            sleep 30
         fi
 
         # Check VRAM
@@ -54,13 +59,13 @@ ensure_vram_clear() {
     echo "Final GPU status:"
     timeout 30 rocm-smi --showmemuse || echo "rocm-smi timed out"
     echo "Processes using GPU:"
-    lsof /dev/kfd 2>/dev/null || echo "No processes found using /dev/kfd"
+    rocm-smi --showpids 2>/dev/null | grep -q 'PID:' || echo "No processes found using /dev/kfd"
 
     # Print detailed information about suspicious processes
     echo "=== Detailed Process Information ==="
     if command -v rocm-smi >/dev/null 2>&1; then
-        # For AMD GPUs, get processes from lsof /dev/kfd
-        kfd_pids=$(lsof /dev/kfd 2>/dev/null | awk 'NR>1 {print $2}' | sort -u)
+        # For AMD GPUs, get processes from rocm-smi --showpids
+        kfd_pids=$(rocm-smi --showpids 2>/dev/null | grep 'PID:' | awk '{print $2}' | sort -u)
         if [ -n "$kfd_pids" ]; then
             echo "Processes accessing /dev/kfd (AMD GPU device):"
             for pid in $kfd_pids; do
