@@ -134,15 +134,6 @@ pub trait RouterTrait: Send + Sync + Debug {
         self.router_type() == "pd"
     }
 
-    /// Server liveness check - is the server process running
-    fn liveness(&self) -> Response {
-        // Simple liveness check - if we can respond, we're alive
-        (StatusCode::OK, "OK").into_response()
-    }
-
-    /// Server readiness check - is the server ready to handle requests
-    fn readiness(&self) -> Response;
-
     /// Get router statistics for intelligent routing decisions
     ///
     /// Returns stats about the router's workers including:
