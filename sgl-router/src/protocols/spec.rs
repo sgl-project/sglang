@@ -72,8 +72,6 @@ pub enum ChatMessage {
         name: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         tool_calls: Option<Vec<ToolCall>>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        function_call: Option<FunctionCallResponse>,
         /// Reasoning content for O1-style models (SGLang extension)
         #[serde(skip_serializing_if = "Option::is_none")]
         reasoning_content: Option<String>,
@@ -140,8 +138,6 @@ pub struct ChatMessageDelta {
     pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCallDelta>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub function_call: Option<FunctionCallDelta>,
     /// Reasoning content delta for O1-style models (SGLang extension)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
@@ -473,6 +469,8 @@ pub struct ChatStreamChoice {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logprobs: Option<ChatLogProbs>,
     pub finish_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched_stop: Option<Value>,
 }
 
 // Completions API request types (v1/completions) - DEPRECATED but still supported
@@ -723,7 +721,10 @@ pub enum ResponseToolType {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ResponseReasoningParam {
     #[serde(default = "default_reasoning_effort")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<ReasoningEffort>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<ReasoningSummary>,
 }
 
 fn default_reasoning_effort() -> Option<ReasoningEffort> {
@@ -736,6 +737,14 @@ pub enum ReasoningEffort {
     Low,
     Medium,
     High,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningSummary {
+    Auto,
+    Concise,
+    Detailed,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -797,6 +806,17 @@ pub enum ResponseReasoningContent {
     ReasoningText { text: String },
 }
 
+/// MCP Tool information for the mcp_list_tools output item
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct McpToolInfo {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub input_schema: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<Value>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
@@ -825,6 +845,25 @@ pub enum ResponseOutputItem {
         #[serde(skip_serializing_if = "Option::is_none")]
         output: Option<String>,
         status: String,
+    },
+    #[serde(rename = "mcp_list_tools")]
+    McpListTools {
+        id: String,
+        server_label: String,
+        tools: Vec<McpToolInfo>,
+    },
+    #[serde(rename = "mcp_call")]
+    McpCall {
+        id: String,
+        status: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        approval_request_id: Option<String>,
+        arguments: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+        name: String,
+        output: String,
+        server_label: String,
     },
 }
 
