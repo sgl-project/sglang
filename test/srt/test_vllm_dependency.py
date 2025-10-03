@@ -14,6 +14,7 @@ from sglang.test.test_utils import (
     is_in_ci,
     popen_launch_server,
     write_github_step_summary,
+    write_results_to_json,
 )
 
 MODEL_SCORE_THRESHOLDS = {
@@ -50,31 +51,6 @@ def popen_launch_server_wrapper(base_url, model, is_fp8, is_tp2):
         other_args=other_args,
     )
     return process
-
-
-def write_results_to_json(model, metrics, mode="a"):
-    result = {
-        "timestamp": datetime.now().isoformat(),
-        "model": model,
-        "metrics": metrics,
-        "score": metrics["score"],
-    }
-
-    existing_results = []
-    if mode == "a" and os.path.exists("results.json"):
-        try:
-            with open("results.json", "r") as f:
-                existing_results = json.load(f)
-        except json.JSONDecodeError:
-            existing_results = []
-
-    if isinstance(existing_results, list):
-        existing_results.append(result)
-    else:
-        existing_results = [result]
-
-    with open("results.json", "w") as f:
-        json.dump(existing_results, f, indent=2)
 
 
 def check_model_scores(results):
