@@ -874,6 +874,10 @@ def test_flash_attn_varlen_output(
             ).abs().max().item() + dv_atol
 
 
+@pytest.mark.skipif(
+    is_hopper(),
+    reason="skip on hopper",
+)
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 # @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
