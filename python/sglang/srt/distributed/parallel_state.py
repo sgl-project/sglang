@@ -1085,7 +1085,8 @@ class GroupCoordinator:
 
             comm_group = metadata_group if tensor.is_cpu else group
             work = send_func(tensor, self.ranks[dst], group=comm_group)
-            p2p_works.append(P2PWork(work, tensor))
+            if async_send:
+                p2p_works.append(P2PWork(work, tensor))
         return p2p_works
 
     def recv_tensor_dict(
