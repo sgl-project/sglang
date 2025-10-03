@@ -209,7 +209,7 @@ class EAGLEWorker(TpModelWorker):
         if backend_type not in backend_map:
             raise ValueError(error_template.format(backend_type=backend_type))
 
-        return backend_map[backend_type]() if backend_map[backend_type] else None
+        return backend_map[backend_type]()
 
     def _create_decode_backend(self):
         backend_map = {
@@ -244,7 +244,7 @@ class EAGLEWorker(TpModelWorker):
                 if not is_blackwell()
                 else self._create_triton_prefill_backend
             ),
-            "flashmla": None,
+            "flashmla": self._create_flashmla_prefill_backend,
             "trtllm_mha": self._create_trtllm_mha_prefill_backend,
             "trtllm_mla": self._create_trtllm_mla_prefill_backend,
         }
@@ -383,6 +383,12 @@ class EAGLEWorker(TpModelWorker):
         from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend
 
         return TRTLLMMLABackend(self.draft_model_runner, skip_prefill=False)
+
+    def _create_flashmla_prefill_backend(self):
+        logger.warning(
+            "flashmla prefill backend is not yet supported for draft extend."
+        )
+        return None
 
     def init_cuda_graphs(self):
         """Capture cuda graphs."""
