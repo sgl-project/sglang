@@ -78,6 +78,7 @@ from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
+    ExpertDistributionReqType,
     FlushCacheReqInput,
     FlushCacheReqOutput,
     FreezeGCReq,
@@ -1487,12 +1488,12 @@ class Scheduler(
                 req.priority = -sys.maxsize - 1
         elif not self.enable_priority_scheduling and req.priority is not None:
             abort_req = AbortReq(
-                req.rid,
                 finished_reason={
                     "type": "abort",
                     "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
                     "message": "Using priority is disabled for this server. Please send a new request without a priority.",
                 },
+                rid=req.rid,
             )
             self.send_to_tokenizer.send_pyobj(abort_req)
 
@@ -1528,12 +1529,12 @@ class Scheduler(
 
         self.send_to_tokenizer.send_pyobj(
             AbortReq(
-                req_to_abort.rid,
                 finished_reason={
                     "type": "abort",
                     "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
                     "message": message,
                 },
+                rid=req_to_abort.rid,
             )
         )
         return req_to_abort.rid == recv_req.rid
@@ -2005,7 +2006,7 @@ class Scheduler(
             self.new_token_ratio = new_token_ratio
             for req in reqs_to_abort:
                 self.send_to_tokenizer.send_pyobj(
-                    AbortReq(req.rid, abort_reason=req.to_abort_message)
+                    AbortReq(abort_reason=req.to_abort_message, rid=req.rid)
                 )
 
             logger.info(
@@ -2575,7 +2576,7 @@ class Scheduler(
             if self.enable_hicache_storage:
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)
-            self.send_to_tokenizer.send_pyobj(AbortReq(req.rid))
+            self.send_to_tokenizer.send_pyobj(AbortReq(rid=req.rid))
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 self.tree_cache.cache_finished_req(req)
@@ -2687,11 +2688,12 @@ class Scheduler(
         return SlowDownReqOutput()
 
     def expert_distribution_handle(self, recv_req: ExpertDistributionReq):
-        if recv_req == ExpertDistributionReq.START_RECORD:
+        action = recv_req.action
+        if action == ExpertDistributionReqType.START_RECORD:
             get_global_expert_distribution_recorder().start_record()
-        elif recv_req == ExpertDistributionReq.STOP_RECORD:
+        elif action == ExpertDistributionReqType.STOP_RECORD:
             get_global_expert_distribution_recorder().stop_record()
-        elif recv_req == ExpertDistributionReq.DUMP_RECORD:
+        elif action == ExpertDistributionReqType.DUMP_RECORD:
             get_global_expert_distribution_recorder().dump_record()
         else:
             raise ValueError(f"Unrecognized ExpertDistributionReq value: {recv_req=}")
@@ -2774,7 +2776,8 @@ class IdleSleeper:
 
 
 def is_health_check_generate_req(recv_req):
-    return getattr(recv_req, "rid", "").startswith("HEALTH_CHECK")
+    rid = getattr(recv_req, "rid", None)
+    return rid is not None and rid.startswith("HEALTH_CHECK")
 
 
 def is_work_request(recv_req):
