@@ -584,7 +584,7 @@ class SRTRunner:
             json_model_override_args=(
                 json.dumps(json_model_override_args)
                 if json_model_override_args
-                else None
+                else "{}"
             ),
             **spec_kwargs,
         )
