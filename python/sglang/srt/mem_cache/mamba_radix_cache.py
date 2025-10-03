@@ -385,17 +385,24 @@ class MambaRadixCache(BasePrefixCache):
         # copy mamba state to req local space if cow is true
         if cow_mamba and last_node.mamba_value is not None:
             assert req.req_pool_idx is None  # req_pool_idx is uninitialed
-            dst_index = self.req_to_token_pool.mamba_pool.alloc(1)
-            # try to alloc again, protect last_node from eviction
-            if dst_index is None:
-                self.inc_lock_ref(last_node)
-                self.evict_mamba(1)
+
+            if req.mamba_pool_idx is None:  # for reqs without mamba cache
                 dst_index = self.req_to_token_pool.mamba_pool.alloc(1)
-                self.dec_lock_ref(last_node)
-                assert dst_index is not None, "Can not alloc mamba cache"
-            src_index = last_node.mamba_value
-            self.req_to_token_pool.mamba_pool.copy_from(src_index, dst_index)
-            req.mamba_pool_idx = dst_index[0]
+                # try to alloc again, protect last_node from eviction
+                if dst_index is None:
+                    self.inc_lock_ref(last_node)
+                    self.evict_mamba(1)
+                    dst_index = self.req_to_token_pool.mamba_pool.alloc(1)
+                    self.dec_lock_ref(last_node)
+                    assert dst_index is not None, "Can not alloc mamba cache"
+                src_index = last_node.mamba_value
+                self.req_to_token_pool.mamba_pool.copy_from(src_index, dst_index)
+                req.mamba_pool_idx = dst_index[0]
+            else:
+                src_index = last_node.mamba_value
+                dst_index = req.mamba_pool_idx.unsqueeze(0)
+                self.req_to_token_pool.mamba_pool.copy_from(src_index, dst_index)
+
         if value:
             value = torch.cat(value)
         else:
