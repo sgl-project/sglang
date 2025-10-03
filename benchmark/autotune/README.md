@@ -47,31 +47,6 @@ python -m benchmark.autotune.tune_server_args \
   --max-concurrency-list 1 2 4 8 16
 ```
 
-### Using Configuration File
-
-```bash
-python -m benchmark.autotune.tune_server_args --config config.json
-```
-
-Example `config.json`:
-```json
-{
-  "model_path": "meta-llama/Meta-Llama-3-8B",
-  "static_server_args": {
-    "tp": 2,
-    "port": 30000
-  },
-  "search_server_args": {
-    "attention_backend": ["flashinfer", "triton"],
-    "schedule_policy": ["lpm", "random"]
-  },
-  "request_rates": [1, 4, 8, 16],
-  "num_prompts": 256,
-  "random_input_len": 512,
-  "random_output_len": 256
-}
-```
-
 ## Key Parameters
 
 ### Required Parameters
@@ -99,7 +74,6 @@ Example `config.json`:
 - `--save-server-logs`: Save server stdout/stderr logs
 - `--server-log-dir`: Directory for server logs (default: "server_logs")
 - `--visualize`: Generate grouped bar charts for benchmark metrics
-- `--verbose-benchmark`: Show real-time benchmark output (default: True)
 - `--quiet`: Suppress real-time benchmark output
 
 ### Timeout Configuration
@@ -109,7 +83,6 @@ Example `config.json`:
 ### Advanced Options
 - `--no-restart`: Don't restart server between benchmark runs (default: restart between runs for accurate isolated results)
 - `--warmup-prompts`: Number of warmup prompts before benchmark (default: 10)
-- `--config`: Path to JSON configuration file (overrides other arguments)
 
 ## Output
 
@@ -134,7 +107,6 @@ By default, the server restarts between each benchmark run to ensure isolated, a
 
 ### Server Log Management
 - Use `--save-server-logs` to save all server logs for debugging
-- Use `--verbose-benchmark` (default) to see real-time benchmark output during testing
 - Use `--quiet` to suppress real-time output
 - Logs are organized by configuration and timestamp
 
@@ -176,8 +148,7 @@ python -m benchmark.autotune.tune_server_args \
   --search-server-args '{"attention_backend": ["flashinfer"]}' \
   --request-rates 1 \
   --num-prompts 10 \
-  --save-server-logs \
-  --verbose-benchmark
+  --save-server-logs
 ```
 
 ### Visualize Results

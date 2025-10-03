@@ -100,7 +100,7 @@ class AutoTuner:
         warmup_prompts: int = 10,
         server_timeout: int = 120,
         benchmark_timeout: int = 600,
-        verbose_benchmark: bool = True,
+        quiet: bool = False,
         save_server_logs: bool = False,
         server_log_dir: str = "server_logs",
         visualize: bool = False,
@@ -137,7 +137,7 @@ class AutoTuner:
         self.warmup_prompts = warmup_prompts
         self.server_timeout = server_timeout
         self.benchmark_timeout = benchmark_timeout
-        self.verbose_benchmark = verbose_benchmark
+        self.quiet = quiet
         self.save_server_logs = save_server_logs
         self.server_log_dir = Path(server_log_dir)
         self.visualize = visualize
@@ -505,8 +505,8 @@ class AutoTuner:
                 process.stderr: ([], sys.stderr),
             }
 
-            # Stream output in real-time if verbose
-            if self.verbose_benchmark:
+            # Stream output in real-time if not quiet
+            if not self.quiet:
                 print("\n--- Benchmark Output ---", flush=True)
 
             # Set timeout for benchmark
@@ -546,7 +546,7 @@ class AutoTuner:
                                 data_list, output_stream = streams[stream]
                                 data_list.append(chunk)
                                 data_read = True
-                                if self.verbose_benchmark:
+                                if not self.quiet:
                                     output_stream.write(
                                         chunk.decode("utf-8", errors="replace")
                                     )
@@ -578,12 +578,12 @@ class AutoTuner:
                 "utf-8", errors="replace"
             )
 
-            if self.verbose_benchmark:
+            if not self.quiet:
                 print("\n--- End Benchmark Output ---\n")
 
             if return_code != 0:
                 print(f"Benchmark failed with return code {return_code}")
-                if stderr and not self.verbose_benchmark:
+                if stderr and self.quiet:
                     print(f"STDERR: {stderr[-1000:]}")
                 return None
 
@@ -1272,10 +1272,6 @@ Examples:
            --search-server-args '{"tp": [2, 4], "attention_backend": ["triton", "flashinfer"]}' \\
            --request-rates 4 8 16 32 \\
            --num-prompts 1000
-
-  # Load configurations from file
-  %(prog)s --model-path meta-llama/Meta-Llama-3-8B \\
-           --config config.json
         """,
     )
 
@@ -1407,13 +1403,6 @@ Examples:
     )
 
     parser.add_argument(
-        "--verbose-benchmark",
-        action="store_true",
-        default=True,
-        help="Show real-time benchmark output during execution (default: True)",
-    )
-
-    parser.add_argument(
         "--quiet", action="store_true", help="Suppress real-time benchmark output"
     )
 
@@ -1443,13 +1432,6 @@ Examples:
         "--no-restart",
         action="store_true",
         help="Don't restart server between benchmark runs (default: restart between runs for accurate isolated results)",
-    )
-
-    # Config file option
-    parser.add_argument(
-        "--config",
-        type=str,
-        help="Path to JSON configuration file (overrides other arguments)",
     )
 
     # Parse known args and collect unknown args for server
@@ -1487,66 +1469,24 @@ Examples:
             print(f"Warning: Ignoring unknown argument: {unknown[i]}")
             i += 1
 
-    # Load configuration from file if provided
-    if args.config:
-        with open(args.config, "r") as f:
-            config = json.load(f)
-
-        model_path = config.get("model_path", args.model_path)
-        # Merge static args from config with command line unknown args
-        config_static = config.get("static_server_args", {})
-        config_static.update(static_server_args)
-        static_server_args = config_static
-        search_server_args = config.get(
-            "search_server_args", json.loads(args.search_server_args)
-        )
-        request_rates = config.get("request_rates", args.request_rates)
-        max_concurrency_list = config.get(
-            "max_concurrency_list", args.max_concurrency_list
-        )
-        num_prompts = config.get("num_prompts", args.num_prompts)
-        dataset_name = config.get("dataset_name", args.dataset_name)
-        dataset_path = config.get("dataset_path", args.dataset_path)
-        random_input_len = config.get(
-            "random_input_len", config.get("random_input", args.random_input_len)
-        )  # Support old config files
-        random_output_len = config.get(
-            "random_output_len", config.get("random_output", args.random_output_len)
-        )  # Support old config files
-        random_range_ratio = config.get("random_range_ratio", args.random_range_ratio)
-        sharegpt_output_len = config.get(
-            "sharegpt_output_len", args.sharegpt_output_len
-        )
-        sharegpt_context_len = config.get(
-            "sharegpt_context_len", args.sharegpt_context_len
-        )
-        output_dir = config.get("output_dir", args.output_dir)
-        warmup_prompts = config.get("warmup_prompts", args.warmup_prompts)
-        server_timeout = config.get("server_timeout", args.server_timeout)
-        benchmark_timeout = config.get("benchmark_timeout", args.benchmark_timeout)
-        # Handle quiet flag overriding verbose (quiet takes precedence)
-        verbose_benchmark = (
-            False if args.quiet else config.get("verbose_benchmark", True)
-        )
-    else:
-        model_path = args.model_path
-        search_server_args = json.loads(args.search_server_args)
-        request_rates = args.request_rates
-        max_concurrency_list = args.max_concurrency_list
-        num_prompts = args.num_prompts
-        dataset_name = args.dataset_name
-        dataset_path = args.dataset_path
-        random_input_len = args.random_input_len
-        random_output_len = args.random_output_len
-        random_range_ratio = args.random_range_ratio
-        sharegpt_output_len = args.sharegpt_output_len
-        sharegpt_context_len = args.sharegpt_context_len
-        output_dir = args.output_dir
-        warmup_prompts = args.warmup_prompts
-        server_timeout = args.server_timeout
-        benchmark_timeout = args.benchmark_timeout
-        # Handle quiet flag (quiet takes precedence over default verbose=True)
-        verbose_benchmark = False if args.quiet else True
+    # Process arguments
+    model_path = args.model_path
+    search_server_args = json.loads(args.search_server_args)
+    request_rates = args.request_rates
+    max_concurrency_list = args.max_concurrency_list
+    num_prompts = args.num_prompts
+    dataset_name = args.dataset_name
+    dataset_path = args.dataset_path
+    random_input_len = args.random_input_len
+    random_output_len = args.random_output_len
+    random_range_ratio = args.random_range_ratio
+    sharegpt_output_len = args.sharegpt_output_len
+    sharegpt_context_len = args.sharegpt_context_len
+    output_dir = args.output_dir
+    warmup_prompts = args.warmup_prompts
+    server_timeout = args.server_timeout
+    benchmark_timeout = args.benchmark_timeout
+    quiet = args.quiet
 
     # Create and run auto-tuner
     tuner = AutoTuner(
@@ -1567,7 +1507,7 @@ Examples:
         warmup_prompts=warmup_prompts,
         server_timeout=server_timeout,
         benchmark_timeout=benchmark_timeout,
-        verbose_benchmark=verbose_benchmark,
+        quiet=quiet,
         save_server_logs=args.save_server_logs,
         server_log_dir=args.server_log_dir,
         visualize=args.visualize,
