@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import socket
+import signal
 import threading
 import time
 from collections import defaultdict
@@ -28,6 +29,7 @@ from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
+import psutil
 
 from sglang.srt.configs import FalconH1Config, NemotronHConfig, Qwen3NextConfig
 from sglang.srt.configs.device_config import DeviceConfig
@@ -348,6 +350,8 @@ class ModelRunner:
     def initialize(self, min_per_gpu_memory: float):
         server_args = self.server_args
 
+        
+
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=self.server_args.enable_memory_saver
         )
@@ -382,6 +386,8 @@ class ModelRunner:
         # Load the model
         self.sampler = Sampler()
         self.load_model()
+
+        
 
         # Check if the model is using hybrid SWA
         if (
@@ -804,7 +810,71 @@ class ModelRunner:
         logger.info(
             f"Init torch distributed ends. mem usage={(before_avail_memory - local_gpu_memory):.2f} GB"
         )
+        if self.device == "cuda":
+            self._start_cuda_device_watchdog()
         return min_per_gpu_memory
+
+    def _start_cuda_device_watchdog(self) -> None:
+        """Start a background watchdog that detects CUDA device loss and exits.
+
+        If repeated CUDA errors are observed on this process's assigned GPU,
+        signal SIGQUIT to the parent so the whole server process group is cleaned up.
+        """
+        try:
+            enable = os.environ.get("SGLANG_ENABLE_GPU_WATCHDOG", "1").lower() not in (
+                "0",
+                "false",
+                "no",
+            )
+            if not enable:
+                return
+            interval_s = float(os.environ.get("SGLANG_GPU_WATCHDOG_INTERVAL_SEC", "5"))
+            threshold = int(os.environ.get("SGLANG_GPU_WATCHDOG_FAILURE_THRESHOLD", "3"))
+            if interval_s <= 0 or threshold <= 0:
+                return
+        except Exception:
+            return
+
+        def _watchdog():
+            failures = 0
+            last_signal_time = 0.0
+            while True:
+                try:
+                    time.sleep(interval_s)
+                    # Run a tiny CUDA op on the assigned device to surface device-lost
+                    with torch.cuda.device(self.gpu_id):
+                        x = torch.ones(1, device="cuda")
+                        _ = (x + 1).sum()
+                        torch.cuda.synchronize()
+                    failures = 0
+                except Exception as e:
+                    failures += 1
+                    logger.error(
+                        f"GPU watchdog detected CUDA error on device {self.gpu_id}: {e}"
+                    )
+                    if failures >= threshold:
+                        now = time.time()
+                        if now - last_signal_time > 30.0:
+                            last_signal_time = now
+                            try:
+                                parent = psutil.Process().parent()
+                                if parent is not None:
+                                    parent.send_signal(signal.SIGQUIT)
+                                else:
+                                    os.killpg(os.getpid(), signal.SIGTERM)
+                            except Exception:
+                                try:
+                                    os.killpg(os.getpid(), signal.SIGTERM)
+                                except Exception:
+                                    os._exit(1)
+                            break
+
+        t = threading.Thread(
+            target=_watchdog,
+            name=f"sgl-gpu-watchdog-{self.gpu_id}",
+            daemon=True,
+        )
+        t.start()
 
     def load_model(self):
         before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
@@ -1352,6 +1422,7 @@ class ModelRunner:
             distributed=get_world_group().world_size > 1,
             cpu_group=get_world_group().cpu_group,
         )
+        
         if self.is_draft_worker:
             num_layers = getattr(
                 self.model_config.hf_config,
@@ -1571,6 +1642,7 @@ class ModelRunner:
         max_num_reqs: Optional[int] = None,
         max_total_tokens: Optional[int] = None,
     ):
+        
         # Determine the kv cache dtype
         if self.server_args.kv_cache_dtype == "auto":
             quant_config = getattr(self.model, "quant_config", None)

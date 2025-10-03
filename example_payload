@@ -1,0 +1,43 @@
+{
+  "model": "Qwen/Qwen2.5-7B-Instruct",
+  "messages": [
+    {"role": "user", "content": "write me a pytorch class that uses nn.Module to build an MLP"}
+  ],
+  "max_tokens": 1024,
+  "temperature": 0,
+  "top_p": 1,
+  "stream": false,
+  "top_k": 0,
+  "min_p": 0,
+  "frequency_penalty": 0,
+  "presence_penalty": 0,
+  "repetition_penalty": 1,
+  "stop": "<END>",
+  "stop_token_ids": [
+    0
+  ],
+  "logit_bias": {
+    "additionalProp1": 0,
+    "additionalProp2": 0,
+    "additionalProp3": 0
+  },
+  "response_format": {
+    "additionalProp1": {}
+  },
+  "n": 1,
+  "no_stop_trim": false,
+  "ignore_eos": false,
+  "skip_special_tokens": true,
+  "seed": 0,
+  "top_a": 0,
+  "logprobs": true,
+  "top_logprobs": 0,
+  "tools": [
+    {
+      "additionalProp1": {}
+    }
+  ],
+  "tool_choice": "string",
+  "parallel_tool_calls": true,
+  "verbosity": "string"
+}

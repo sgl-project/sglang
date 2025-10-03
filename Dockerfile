@@ -17,8 +17,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends wget && \
     rm -rf /var/lib/apt/lists/*
 
 ENV CUDA_HOME=/usr/local/cuda
-ENV PATH=${CUDA_HOME}/bin:${PATH}
-ENV LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}
+ENV PATH="${CUDA_HOME}/bin:${PATH}"
 
 # Safe NCCL defaults and async error handling
 ENV TORCH_NCCL_ASYNC_ERROR_HANDLING=1 \
@@ -36,9 +35,10 @@ ENV TORCH_NCCL_ASYNC_ERROR_HANDLING=1 \
 COPY .hathora_build/app/requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install SGLang - adjust this line based on your SGLang installation method
-# For development, you might want to install from source or a specific version
-RUN pip install --no-cache-dir sglang[all]
+# Install SGLang from local source
+COPY python /opt/sglang-src/python
+RUN pip install --no-cache-dir -e /opt/sglang-src/python[all]
+
 
 COPY .hathora_build/app/* .
 RUN chmod +x ./entrypoint.sh

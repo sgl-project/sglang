@@ -56,13 +56,16 @@ def resolve_transformers_arch(model_config: ModelConfig, architectures: list[str
                     "if the model is custom)."
                 )
             model_module = auto_modules["AutoModel"]
+        # Decide whether we want an embedding wrapper or causal wrapper
+        want_embedding = not getattr(model_config, "is_generation", True)
+
         if model_config.model_impl == ModelImpl.TRANSFORMERS:
             if not model_module.is_backend_compatible():
                 raise ValueError(
                     f"The Transformers implementation of {arch} is not "
                     "compatible with SGLang."
                 )
-            architectures[i] = "TransformersForCausalLM"
+            architectures[i] = "TransformersForEmbedding" if want_embedding else "TransformersForCausalLM"
         if model_config.model_impl == ModelImpl.AUTO:
             if not model_module.is_backend_compatible():
                 raise ValueError(
@@ -75,7 +78,7 @@ def resolve_transformers_arch(model_config: ModelConfig, architectures: list[str
                 "performance may not be optimal.",
                 arch,
             )
-            architectures[i] = "TransformersForCausalLM"
+            architectures[i] = "TransformersForEmbedding" if want_embedding else "TransformersForCausalLM"
     return architectures
 
 

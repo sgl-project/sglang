@@ -191,7 +191,6 @@ def get_config(
         config = _load_deepseek_v32_model(
             model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
         )
-
     if (
         config.architectures is not None
         and config.architectures[0] == "Phi4MMForCausalLM"

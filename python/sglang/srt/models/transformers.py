@@ -31,6 +31,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
+from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -257,7 +258,6 @@ class TransformersForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
         get_embedding: bool = False,
     ) -> LogitsProcessorOutput:
-        assert get_embedding is False, "embedding is not supported yet"
         aux_hidden_states = None
         hidden_states = self.model(
             input_ids[None, ...],
@@ -285,4 +285,72 @@ class TransformersForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight)
 
 
-EntryClass = [TransformersForCausalLM]
+class TransformersForEmbedding(nn.Module):
+
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        logger.info("Using Transformers backend for embedding.")
+
+        self.quant_config = quant_config
+        self.config = config
+
+        # model is loaded under set_default_torch_dtype(model_config.dtype)
+        # Use a plain AutoModel to obtain hidden states for pooling
+        self.model: PreTrainedModel = AutoModel.from_config(
+            self.config,
+            torch_dtype=torch.get_default_dtype(),
+            trust_remote_code=True,
+        )
+
+        # Default to MEAN pooling with L2 normalization to match SentenceTransformers
+        self.pooler = Pooler(pooling_type=PoolingType.MEAN, normalize=True)
+
+    @torch.no_grad()
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
+        get_embedding: bool = True,
+    ) -> EmbeddingPoolerOutput:
+        # Flattened sequence as single batch; build optional attention mask if needed
+        attention_mask = None
+        try:
+            # Build a flat attention mask of ones; most encoder-only models ignore position_ids
+            attention_mask = torch.ones_like(input_ids, dtype=torch.long, device=input_ids.device)
+        except Exception:
+            pass
+
+        outputs = self.model(
+            input_ids=input_ids[None, ...],
+            attention_mask=None if attention_mask is None else attention_mask[None, ...],
+            use_cache=False,
+            return_dict=True,
+        )
+
+        # Prefer last_hidden_state; fall back to first tensor in outputs
+        hidden_states = None
+        if hasattr(outputs, "last_hidden_state") and outputs.last_hidden_state is not None:
+            hidden_states = outputs.last_hidden_state[0, ...]
+        else:
+            hidden_states = outputs[0][0, ...]
+
+        return self.pooler(hidden_states, forward_batch)
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        # Mirror TransformersForCausalLM logic to load from disk when provided
+        params_dict = dict(self.named_parameters())
+        for name, loaded_weight in weights:
+            if name in params_dict:
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+
+
+EntryClass = [TransformersForCausalLM, TransformersForEmbedding]

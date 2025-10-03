@@ -16,6 +16,7 @@ from sglang.srt.model_executor.model_runner import ForwardBatch
 class PoolingType(IntEnum):
     LAST = 0
     CLS = 1
+    MEAN = 2
 
 
 @dataclass
@@ -50,6 +51,18 @@ class Pooler(nn.Module):
             first_token_flat_indices = torch.zeros_like(prompt_lens)
             first_token_flat_indices[1:] += torch.cumsum(prompt_lens, dim=0)[:-1]
             pooled_data = hidden_states[first_token_flat_indices]
+        elif self.pooling_type == PoolingType.MEAN:
+            # Mean pool per sequence using extend_seq_lens
+            pooled_list = []
+            offset = 0
+            for length in forward_batch.extend_seq_lens.tolist():
+                seq_hidden = hidden_states[offset : offset + length]
+                offset += length
+                if seq_hidden.numel() == 0:
+                    pooled_list.append(hidden_states.new_zeros(hidden_states.shape[-1]))
+                else:
+                    pooled_list.append(seq_hidden.mean(dim=0))
+            pooled_data = torch.stack(pooled_list, dim=0)
         else:
             raise ValueError(f"Invalid pooling type: {self.pooling_type}")
 

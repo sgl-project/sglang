@@ -168,9 +168,7 @@ class ModelConfig:
         self.is_multimodal = enable_multimodal and is_multimodal_model(
             self.hf_config.architectures
         )
-        self.is_multimodal_gen = enable_multimodal and is_multimodal_gen_model(
-            self.hf_config.architectures
-        )
+        self.is_multimodal_gen = False
         self.is_image_gen = enable_multimodal and is_image_gen_model(
             self.hf_config.architectures
         )
@@ -184,7 +182,7 @@ class ModelConfig:
         self.is_encoder_decoder = is_encoder_decoder_model(self.hf_config.architectures)
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
-        # Derive context length and model shapes
+        # Derive context length and model shapes for token models
         self._derive_context_length(context_length)
         self._derive_model_shapes()
 
@@ -407,6 +405,7 @@ class ModelConfig:
     # adapted from https://github.com/vllm-project/vllm/blob/main/vllm/config.py#L289
     def get_total_num_kv_heads(self) -> int:
         """Returns the total number of KV heads."""
+        
         # For GPTBigCode & Falcon:
         # NOTE: for falcon, when new_decoder_architecture is True, the
         # multi_query flag is ignored and we use n_head_kv for the number of

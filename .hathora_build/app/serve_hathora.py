@@ -1,4 +1,6 @@
 import asyncio
+import uuid
+import torch
 import json
 import logging
 import os
@@ -10,13 +12,15 @@ from contextlib import asynccontextmanager
 from typing import AsyncGenerator, Dict, List, Optional, Union
 
 import sglang as sgl
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Body, Response
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from hathora_config import DeploymentConfig
 from sglang.srt.utils import add_prometheus_middleware, set_prometheus_multiproc_dir
+ 
 
 # Optional HTTP client for enrollment callback
 try:
@@ -171,6 +175,8 @@ logger.info(
 )
 logger.info(f"  namespace: {CONFIG.namespace}, deployment_id: {CONFIG.deployment_id}, customer_id: {CONFIG.customer_id}")
 
+ 
+
 # Global engine instance
 engine = None
 # Enrollment state and chosen runtime params
@@ -246,6 +252,24 @@ async def lifespan(app: FastAPI):
         except Exception:
             pass
 
+        _is_embedding_env = os.environ.get("IS_EMBEDDING", "").lower() in ("1", "true", "yes")
+        _is_embedding_auto = False
+        try:
+            _model_id_lower = (CONFIG.model_id or "").lower()
+            if "embedding" in _model_id_lower:
+                _is_embedding_auto = True
+        except Exception:
+            pass
+
+        # Tune scheduler polling: prefer 0 (busy/fast poll) for low-latency warmup
+        try:
+            _recv_interval = int(os.environ.get("SCHEDULER_RECV_INTERVAL", "0"))
+        except Exception:
+            _recv_interval = 0
+
+        # Decide whether to skip tokenizer/processor initialization.
+        _skip_tokenizer_init = os.environ.get("FORCE_SKIP_TOKENIZER_INIT", "").lower() in ("1", "true", "yes")
+
         engine = sgl.Engine(
             model_path=CONFIG.model_id,
             tokenizer_path=(os.environ.get("TOKENIZER_PATH") or CONFIG.model_id),
@@ -254,6 +278,8 @@ async def lifespan(app: FastAPI):
             quantization=quant,
             kv_cache_dtype=kv_dtype,
             tp_size=CONFIG.tp_size,
+            is_embedding=_is_embedding_env or _is_embedding_auto,
+            disable_radix_cache=(_is_embedding_env or _is_embedding_auto),
             disaggregation_decode_tp=os.environ.get("DISAGGREGATION_DECODE_TP") or os.environ.get("DISAGG_DECODE_TP"),
             disaggregation_prefill_pp=os.environ.get("DISAGGREGATION_PREFILL_PP"),
             max_total_tokens=CONFIG.max_total_tokens,
@@ -266,6 +292,11 @@ async def lifespan(app: FastAPI):
             enable_p2p_check=CONFIG.enable_p2p_check,
             enable_torch_compile=CONFIG.enable_torch_compile,
             trust_remote_code=os.environ.get("TRUST_REMOTE_CODE", "").lower() in ("1", "true", "yes"),
+            skip_tokenizer_init=_skip_tokenizer_init,
+            # Reduce server-side warmup to speed startup
+            skip_server_warmup=True,
+            # Faster scheduler polling for lower latency
+            scheduler_recv_interval=_recv_interval,
             log_level="error",  # Reduce SGLang internal logging
             # Speculative decoding passthrough (possibly adjusted above)
             speculative_algorithm=spec_algo,
@@ -277,6 +308,70 @@ async def lifespan(app: FastAPI):
             speculative_token_map=CONFIG.speculative_token_map,
             speculative_attention_mode=(CONFIG.speculative_attention_mode or "prefill"),
         )
+        # Optional warmup to avoid first-request latency
+        try:
+            warmup_on_start = os.environ.get("WARMUP_ON_START", "1").lower() in ("1", "true", "yes")
+            if warmup_on_start:
+                is_embed_mode = False
+                try:
+                    is_embed_mode = bool(getattr(engine.tokenizer_manager.server_args, "is_embedding", False))
+                except Exception:
+                    pass
+                t0_ns = time.perf_counter_ns()
+                if is_embed_mode:
+                    # Optional: number of warmup samples
+                    try:
+                        _samples = int(os.environ.get("WARMUP_EMBED_SAMPLES", "1"))
+                        _samples = max(1, min(_samples, 8))
+                    except Exception:
+                        _samples = 1
+                    logger.info(f"Warmup: starting embedding warmup ({_samples} sample(s))")
+                    print(f"[Warmup] Embedding warmup start: samples={_samples}")
+                    sys.stdout.flush()
+                    # Pre-warm cuBLAS with a tiny GEMM
+                    try:
+                        import torch
+                        a = torch.ones((16, 16), device="cuda", dtype=torch.float16)
+                        b = torch.ones((16, 16), device="cuda", dtype=torch.float16)
+                        _ = a @ b
+                        torch.cuda.synchronize()
+                        logger.info("Warmup: cuBLAS initialized via tiny GEMM")
+                        print("[Warmup] cuBLAS tiny GEMM done")
+                        sys.stdout.flush()
+                    except Exception as _g:
+                        logger.debug(f"Warmup: GEMM prewarm skipped: {_g}")
+                    w0_ns = time.perf_counter_ns()
+                    fast_only = os.environ.get("WARMUP_FAST", "0").lower() in ("1", "true", "yes")
+                    if not fast_only:
+                        payload = ["warmup"] * _samples
+                        await engine.async_encode(payload)
+                    else:
+                        logger.info("Warmup: FAST mode enabled, skipping encode warmup")
+                        print("[Warmup] FAST mode: skipping encode")
+                        sys.stdout.flush()
+                    w1_ns = time.perf_counter_ns()
+                    logger.info(f"Warmup: embedding encode completed in {(w1_ns - w0_ns)/1e6:.2f} ms")
+                    print(f"[Warmup] Embedding warmup done in {(w1_ns - w0_ns)/1e6:.2f} ms")
+                    sys.stdout.flush()
+                else:
+                    logger.info("Warmup: starting generation warmup (1 token)")
+                    print("[Warmup] Generation warmup start: 1 token")
+                    sys.stdout.flush()
+                    w0_ns = time.perf_counter_ns()
+                    await engine.async_generate(
+                        "warmup",
+                        sampling_params={"max_new_tokens": 1, "temperature": 0.0},
+                    )
+                    w1_ns = time.perf_counter_ns()
+                    logger.info(f"Warmup: generation completed in {(w1_ns - w0_ns)/1e6:.2f} ms")
+                    print(f"[Warmup] Generation warmup done in {(w1_ns - w0_ns)/1e6:.2f} ms")
+                    sys.stdout.flush()
+                t1_ns = time.perf_counter_ns()
+                logger.info(f"Warmup: total warmup time {(t1_ns - t0_ns)/1e6:.2f} ms")
+                print(f"[Warmup] Total warmup time {(t1_ns - t0_ns)/1e6:.2f} ms")
+                sys.stdout.flush()
+        except Exception as _e:
+            logger.warning(f"Warmup skipped due to error: {_e}")
         # Record chosen dtypes; send enrollment if configured
         global _chosen_dtype, _chosen_quant, _chosen_kv_dtype
         _chosen_dtype, _chosen_quant, _chosen_kv_dtype = dtype, quant, kv_dtype
@@ -430,12 +525,12 @@ def generate_request_id() -> str:
 async def generate_response_sglang(
     request: ChatCompletionRequest,
     prompt: str
-) -> tuple[str, float, dict]:
+) -> tuple[str, float, dict, float]:
     """Generate response using SGLang engine."""
     request_id = generate_request_id()
     logger.info(f"[{request_id}] Starting generation for prompt length: {len(prompt)}")
     
-    inference_start_time = time.time()
+    inference_start_ns = time.perf_counter_ns()
     
     try:
         # Allow 'seed' and 'top_a' for compatibility; currently ignored by the backend
@@ -501,13 +596,14 @@ async def generate_response_sglang(
         logger.debug(f"[{request_id}] Sampling params: {sampling_params}")
         
         # Use SGLang async_generate
+        eng_t0_ns = time.perf_counter_ns()
         result = await engine.async_generate(
             prompt,
             sampling_params=sampling_params
         )
+        eng_ms = (time.perf_counter_ns() - eng_t0_ns) / 1e6
         
-        inference_end_time = time.time()
-        total_inference_latency_ms = (inference_end_time - inference_start_time) * 1000
+        total_inference_latency_ms = (time.perf_counter_ns() - inference_start_ns) / 1e6
         
         generated_text = result.get("text", "") if isinstance(result, dict) else str(result)
 
@@ -516,7 +612,7 @@ async def generate_response_sglang(
         else:
             response_text = generated_text[len(prompt):].strip()
         
-        logger.info(f"[{request_id}] Generation completed in {total_inference_latency_ms:.2f}ms")
+        logger.info(f"[{request_id}] Engine generate time: {eng_ms:.2f}ms; request total inference: {total_inference_latency_ms:.2f}ms")
         logger.debug(f"[{request_id}] Response: {response_text[:100]}...")
         
         if isinstance(result, dict) and isinstance(result.get("meta_info"), dict):
@@ -543,7 +639,7 @@ async def generate_response_sglang(
             except Exception as e:
                 raise HTTPException(status_code=500, detail=f"Tokenizer error: {str(e)}")
         
-        return response_text, total_inference_latency_ms, usage_info
+        return response_text, total_inference_latency_ms, usage_info, eng_ms
         
     except Exception as e:
         logger.error(f"[{request_id}] Error during generation: {e}")
@@ -760,6 +856,11 @@ def _count_tokens_from_messages(messages: List[ChatMessage]) -> int:
 class TokenCountResponse(BaseModel):
     prompt_tokens: int
 
+# Simple request schema for /v1/tokens
+class TokenCountSimpleRequest(BaseModel):
+    model: Optional[str] = None
+    input: str
+
 # --- FastAPI App and Endpoints ---
 app = FastAPI(lifespan=lifespan, title="SGLang Hathora Serve", version="1.0.0")
 
@@ -771,6 +872,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+ 
 
 # Attach Prometheus metrics endpoint if enabled
 if CONFIG.enable_metrics:
@@ -840,7 +943,7 @@ async def create_chat_completion(request: ChatCompletionRequest):
             )
         else:
             logger.debug("Processing non-streaming request")
-            response_text, total_inference_latency_ms, usage_info = await generate_response_sglang(
+            response_text, total_inference_latency_ms, usage_info, eng_ms = await generate_response_sglang(
                 request, prompt
             )
             
@@ -849,7 +952,14 @@ async def create_chat_completion(request: ChatCompletionRequest):
             )
             
             logger.info(f"Non-streaming response completed: {len(response_text)} chars generated")
-            return response
+            # Add engine timing to response headers via FastAPI Response in StreamingResponse path.
+            # For non-streaming JSON response, we attach timing as a header in a JSONResponse-like fashion.
+            from fastapi.responses import JSONResponse
+            resp = JSONResponse(content=response.model_dump())
+            resp.headers["X-Engine-Time-MS"] = f"{eng_ms:.2f}"
+            resp.headers["X-Total-Inference-MS"] = f"{total_inference_latency_ms:.2f}"
+            resp.headers["X-Hathora-Region"] = HATHORA_REGION
+            return resp
             
     except HTTPException:
         raise
@@ -858,13 +968,169 @@ async def create_chat_completion(request: ChatCompletionRequest):
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 
+def _count_tokens_from_text(text: str) -> int:
+    tokenizer = getattr(getattr(engine, "tokenizer_manager", None), "tokenizer", None)
+    if tokenizer is None:
+        raise HTTPException(status_code=500, detail="Tokenizer not initialized")
+    try:
+        return len(tokenizer.encode(text))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Tokenizer error: {str(e)}")
+
+
 @app.post("/v1/tokens", response_model=TokenCountResponse)
-async def count_tokens_endpoint(request: ChatCompletionRequest) -> TokenCountResponse:
-    """Return the number of prompt tokens for the given messages using the model tokenizer."""
+async def count_tokens_endpoint(req: TokenCountSimpleRequest) -> TokenCountResponse:
+    """Return the number of tokens for a plain input string."""
     if not engine:
         raise HTTPException(status_code=503, detail="Engine not initialized")
-    tokens = _count_tokens_from_messages(request.messages)
-    return TokenCountResponse(prompt_tokens=tokens)
+    return TokenCountResponse(prompt_tokens=_count_tokens_from_text(req.input))
+
+
+# --- Embedding Endpoints ---
+
+
+class EmbedQueryRequest(BaseModel):
+    input: Union[str, List[str]]
+
+
+class EmbedDocumentsRequest(BaseModel):
+    # New structure: only 'documents' is accepted
+    documents: Union[str, List[str]]
+
+
+class EmbeddingVector(BaseModel):
+    embedding: List[float]
+
+
+class EmbedResponse(BaseModel):
+    data: List[EmbeddingVector]
+    model: str
+
+
+def _ensure_embedding_mode():
+    if not engine:
+        raise HTTPException(status_code=503, detail="Engine not initialized")
+    # Best-effort guard: embedding requires is_embedding at startup
+    if getattr(getattr(engine, "tokenizer_manager", None), "server_args", None):
+        if not engine.tokenizer_manager.server_args.is_embedding:
+            raise HTTPException(status_code=400, detail="Server not started in embedding mode")
+
+
+@app.post("/v1/embedding/query", response_model=EmbedResponse)
+async def embed_query(req: EmbedQueryRequest):
+    _ensure_embedding_mode()
+    texts = req.input if isinstance(req.input, list) else [req.input]
+    eng_t0_ns = time.perf_counter_ns()
+    out = await engine.async_encode(texts)
+    eng_ms = (time.perf_counter_ns() - eng_t0_ns) / 1e6
+    logger.info(f"[embedding.query] Engine encode {len(texts)} item(s) in {eng_ms:.2f}ms")
+    # Expect shape: {"embedding": [...]} or batch style
+    if isinstance(out, dict) and "embedding" in out:
+        vecs = [out["embedding"]]
+    elif isinstance(out, list):
+        vecs = [o.get("embedding", []) for o in out]
+    else:
+        vecs = []
+    # Attach timing header
+    from fastapi.responses import JSONResponse
+    payload = EmbedResponse(data=[EmbeddingVector(embedding=v) for v in vecs], model=CONFIG.model_id or "").model_dump()
+    resp = JSONResponse(content=payload)
+    resp.headers["X-Engine-Time-MS"] = f"{eng_ms:.2f}"
+    resp.headers["X-Hathora-Region"] = HATHORA_REGION
+    return resp
+
+
+@app.post("/v1/embedding/documents", response_model=EmbedResponse)
+async def embed_documents(req: EmbedDocumentsRequest):
+    _ensure_embedding_mode()
+    texts: List[str] = req.documents if isinstance(req.documents, list) else [req.documents]
+    eng_t0_ns = time.perf_counter_ns()
+    out = await engine.async_encode(texts)
+    eng_ms = (time.perf_counter_ns() - eng_t0_ns) / 1e6
+    logger.info(f"[embedding.documents] Engine encode {len(texts)} item(s) in {eng_ms:.2f}ms")
+    if isinstance(out, dict) and "embedding" in out:
+        vecs = [out["embedding"]]
+    elif isinstance(out, list):
+        vecs = [o.get("embedding", []) for o in out]
+    else:
+        vecs = []
+    from fastapi.responses import JSONResponse
+    payload = EmbedResponse(data=[EmbeddingVector(embedding=v) for v in vecs], model=CONFIG.model_id or "").model_dump()
+    resp = JSONResponse(content=payload)
+    resp.headers["X-Engine-Time-MS"] = f"{eng_ms:.2f}"
+    resp.headers["X-Hathora-Region"] = HATHORA_REGION
+    return resp
+
+
+class SimilarityRequest(BaseModel):
+    query: Union[str, List[float]]
+    documents: Union[List[str], List[List[float]]]
+    top_k: Optional[int] = None
+
+
+class SimilarityScore(BaseModel):
+    index: int
+    score: float
+
+
+class SimilarityResponse(BaseModel):
+    scores: List[SimilarityScore]
+
+
+def _to_tensor_1d(x, device: torch.device) -> torch.Tensor:
+    if isinstance(x, torch.Tensor):
+        return x.to(device=device, dtype=torch.float32).view(-1)
+    return torch.tensor(x, dtype=torch.float32, device=device).view(-1)
+
+
+def _normalize_1d(x: torch.Tensor) -> torch.Tensor:
+    norm = torch.linalg.vector_norm(x) + 1e-12
+    return x / norm
+
+
+@app.post("/v1/embedding/similarity", response_model=SimilarityResponse)
+async def embedding_similarity(req: SimilarityRequest):
+    _ensure_embedding_mode()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Prepare query vector
+    if isinstance(req.query, list):
+        q = _to_tensor_1d(req.query, device)
+    else:
+        out = await engine.async_encode(req.query)
+        if isinstance(out, dict) and "embedding" in out:
+            q = _to_tensor_1d(out["embedding"], device)
+        else:
+            q = _to_tensor_1d((out[0] or {}).get("embedding", []), device)
+    q = _normalize_1d(q)
+
+    # Prepare document vectors
+    if len(req.documents) == 0:
+        return SimilarityResponse(scores=[])
+    doc_tensors: List[torch.Tensor] = []
+    if isinstance(req.documents[0], (int, float)):
+        doc_tensors = [_to_tensor_1d(req.documents, device)]
+    elif isinstance(req.documents[0], list) and (
+        len(req.documents[0]) == 0 or isinstance(req.documents[0][0], (int, float))
+    ):
+        doc_tensors = [_to_tensor_1d(v, device) for v in req.documents]  # type: ignore[arg-type]
+    else:
+        out = await engine.async_encode(req.documents)  # type: ignore[arg-type]
+        if isinstance(out, dict) and "embedding" in out:
+            doc_tensors = [_to_tensor_1d(out["embedding"], device)]
+        else:
+            doc_tensors = [_to_tensor_1d(o.get("embedding", []), device) for o in out]
+
+    if not doc_tensors:
+        return SimilarityResponse(scores=[])
+
+    D = torch.stack([_normalize_1d(d) for d in doc_tensors], dim=0)
+    sims = torch.matmul(D, q)  # cosine since normalized
+    sims_list = sims.detach().cpu().tolist()
+
+    scores = [SimilarityScore(index=i, score=float(sims_list[i])) for i in range(len(sims_list))]
+    if req.top_k is not None and req.top_k > 0:
+        scores = sorted(scores, key=lambda x: x.score, reverse=True)[: req.top_k]
+    return SimilarityResponse(scores=scores)
 
 
 @app.get("/health")
@@ -904,6 +1170,10 @@ async def root():
         "customer_id": CONFIG.customer_id,
         "endpoints": [
             "/v1/chat/completions",
+            
+            "/v1/embedding/query",
+            "/v1/embedding/documents",
+            "/v1/embedding/similarity",
             "/health",
             "/docs"
         ]
@@ -928,6 +1198,9 @@ async def stream_logs():
             yield "logs unavailable\n"
 
     return StreamingResponse(log_stream(), media_type="text/plain")
+
+
+ 
 
 
 # --- Signal Handlers for Graceful Shutdown ---
