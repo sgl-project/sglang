@@ -169,11 +169,11 @@ class ModelConfig:
         ) or getattr(self.hf_config, "image_token_index", None)
 
         # matryoshka embeddings
-        self.is_matryoshka = hasattr(
-            self.hf_config, "matryoshka_dimensions"
-        ) or getattr(self.hf_config, "is_matryoshka", False)
         self.matryoshka_dimensions = getattr(
             self.hf_config, "matryoshka_dimensions", None
+        )
+        self.is_matryoshka = self.matryoshka_dimensions or getattr(
+            self.hf_config, "is_matryoshka", False
         )
 
     @staticmethod
