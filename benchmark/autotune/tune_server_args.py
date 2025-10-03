@@ -341,7 +341,7 @@ class AutoTuner:
                                         break
                                 else:
                                     error_msg += f"Last stderr: {stderr_content[-500:]}"
-                        except:
+                        except Exception:
                             pass
                 else:
                     # When not saving logs, we use DEVNULL so no output to read
@@ -925,7 +925,7 @@ class AutoTuner:
     def _generate_visualizations(self, df):
         """Generate grouped bar charts for benchmark metrics."""
 
-        print("Generating visulaizations...")
+        print("Generating visualizations...")
 
         # Filter out failed runs
         df_success = df[df["status"] == "success"].copy()
@@ -1050,7 +1050,7 @@ class AutoTuner:
         # Also show the plot if running interactively
         try:
             plt.show()
-        except:
+        except Exception:
             pass  # Might fail in non-interactive environments
 
     def run(self):
@@ -1283,7 +1283,7 @@ Examples:
     parser.add_argument(
         "--model-path",
         type=str,
-        required=True,
+        required=False,
         help="Path or name of the model to benchmark",
     )
 
