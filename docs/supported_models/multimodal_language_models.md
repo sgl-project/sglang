@@ -25,7 +25,6 @@ repo:sgl-project/sglang path:/^python\/sglang\/srt\/models\// Qwen2_5_VLForCondi
 
 in the GitHub search bar.
 
-
 | Model Family (Variants)    | Example HuggingFace Identifier             | Description                                                                                                                                                                                                     | Notes |
 |----------------------------|--------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-------|
 | **Qwen-VL** | `Qwen/Qwen3-VL-235B-A22B-Instruct`              | Alibaba's vision-language extension of Qwen; for example, Qwen2.5-VL (7B and larger variants) can analyze and converse about image content.                                                                     |  |
@@ -55,3 +54,23 @@ For multimodal models, you can use the `--keep-mm-feature-on-device` flag to opt
 - **With `--keep-mm-feature-on-device`**: Feature tensors remain on GPU, reducing device-to-host copy overhead and improving latency, but consuming more GPU memory
 
 Use this flag when you have sufficient GPU memory and want to minimize latency for multimodal inference.
+
+### Bidirectional Attention in Multimodal Model Serving
+**Note for serving the Gemma-3 multimodal model**:
+
+As mentioned in [Welcome Gemma 3: Google's all new multimodal, multilingual, long context open LLM
+](https://huggingface.co/blog/gemma3#multimodality), Gemma-3 employs bidirectional attention between image tokens during the prefill phase. Currently, SGLang only supports bidirectional attention when using the Triton Attention Backend. Note, however, that SGLang's current bidirectional attention implementation is incompatible with both CUDA Graph and Chunked Prefill.
+
+To enable bidirectional attention, you can use the `TritonAttnBackend` while disabling CUDA Graph and Chunked Prefill. Example launch command:
+```shell
+python -m sglang.launch_server \
+  --model-path google/gemma-3-4b-it \
+  --host 0.0.0.0 --port 30000 \
+  --enable-multimodal \
+  --dtype bfloat16 --triton-attention-reduce-in-fp32 \
+  --attention-backend triton \ # Use Triton attention backend
+  --disable-cuda-graph \ # Disable Cuda Graph
+  --chunked-prefill-size -1 # Disable Chunked Prefill
+```
+
+If higher serving performance is required and a certain degree of accuracy loss is acceptable, you may choose to use other attention backends, and you can also enable features like CUDA Graph and Chunked Prefill for better performance, but note that the model will fall back to using causal attention instead of bidirectional attention.
