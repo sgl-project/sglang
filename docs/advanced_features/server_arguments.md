@@ -305,6 +305,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--num-continuous-decode-steps` | Run multiple continuous decoding steps to reduce scheduling overhead. This can potentially increase throughput but may also increase time-to-first-token latency. The default value is 1, meaning only run one decoding step at a time. | 1 |
 | `--delete-ckpt-after-loading` | Delete the model checkpoint after loading the model. | False |
 | `--enable-memory-saver` | Allow saving memory using release_memory_occupation and resume_memory_occupation. | False |
+| `--enable-weights-cpu-backup` | Save model weights to CPU memory during release_weights_occupation and resume_weights_occupation | False |
 | `--allow-auto-truncate` | Allow automatically truncating requests that exceed the maximum input length instead of returning an error. | False |
 | `--enable-custom-logit-processor` | Enable users to pass custom logit processors to the server (disabled by default for security). | False |
 | `--flashinfer-mla-disable-ragged` | Disable ragged processing in Flashinfer MLA. | False |

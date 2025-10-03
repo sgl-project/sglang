@@ -608,29 +608,353 @@ async fn responses_handler(
     if is_stream {
         let request_id = format!("resp-{}", Uuid::new_v4());
 
-        let stream = stream::once(async move {
-            let chunk = json!({
-                "id": request_id,
-                "object": "response",
-                "created_at": timestamp,
-                "model": "mock-model",
-                "status": "in_progress",
-                "output": [{
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [{
-                        "type": "output_text",
-                        "text": "This is a mock responses streamed output."
-                    }]
-                }]
-            });
-            Ok::<_, Infallible>(Event::default().data(chunk.to_string()))
-        })
-        .chain(stream::once(async { Ok(Event::default().data("[DONE]")) }));
+        // Check if this is an MCP tool call scenario
+        let has_tools = payload
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter().any(|tool| {
+                    tool.get("type")
+                        .and_then(|t| t.as_str())
+                        .map(|t| t == "function")
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+        let has_function_output = payload
+            .get("input")
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items.iter().any(|item| {
+                    item.get("type")
+                        .and_then(|t| t.as_str())
+                        .map(|t| t == "function_call_output")
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
 
-        Sse::new(stream)
-            .keep_alive(KeepAlive::default())
-            .into_response()
+        if has_tools && !has_function_output {
+            // First turn: emit streaming tool call events
+            let call_id = format!(
+                "call_{}",
+                Uuid::new_v4().to_string().split('-').next().unwrap()
+            );
+            let rid = request_id.clone();
+
+            let events = vec![
+                // response.created
+                Ok::<_, Infallible>(
+                    Event::default().event("response.created").data(
+                        json!({
+                            "type": "response.created",
+                            "response": {
+                                "id": rid.clone(),
+                                "object": "response",
+                                "created_at": timestamp,
+                                "model": "mock-model",
+                                "status": "in_progress"
+                            }
+                        })
+                        .to_string(),
+                    ),
+                ),
+                // response.in_progress
+                Ok(Event::default().event("response.in_progress").data(
+                    json!({
+                        "type": "response.in_progress",
+                        "response": {
+                            "id": rid.clone(),
+                            "object": "response",
+                            "created_at": timestamp,
+                            "model": "mock-model",
+                            "status": "in_progress"
+                        }
+                    })
+                    .to_string(),
+                )),
+                // response.output_item.added with function_tool_call
+                Ok(Event::default().event("response.output_item.added").data(
+                    json!({
+                        "type": "response.output_item.added",
+                        "output_index": 0,
+                        "item": {
+                            "id": call_id.clone(),
+                            "type": "function_tool_call",
+                            "name": "brave_web_search",
+                            "arguments": "",
+                            "status": "in_progress"
+                        }
+                    })
+                    .to_string(),
+                )),
+                // response.function_call_arguments.delta events
+                Ok(Event::default()
+                    .event("response.function_call_arguments.delta")
+                    .data(
+                        json!({
+                            "type": "response.function_call_arguments.delta",
+                            "output_index": 0,
+                            "item_id": call_id.clone(),
+                            "delta": "{\"query\""
+                        })
+                        .to_string(),
+                    )),
+                Ok(Event::default()
+                    .event("response.function_call_arguments.delta")
+                    .data(
+                        json!({
+                            "type": "response.function_call_arguments.delta",
+                            "output_index": 0,
+                            "item_id": call_id.clone(),
+                            "delta": ":\"SGLang"
+                        })
+                        .to_string(),
+                    )),
+                Ok(Event::default()
+                    .event("response.function_call_arguments.delta")
+                    .data(
+                        json!({
+                            "type": "response.function_call_arguments.delta",
+                            "output_index": 0,
+                            "item_id": call_id.clone(),
+                            "delta": " router MCP"
+                        })
+                        .to_string(),
+                    )),
+                Ok(Event::default()
+                    .event("response.function_call_arguments.delta")
+                    .data(
+                        json!({
+                            "type": "response.function_call_arguments.delta",
+                            "output_index": 0,
+                            "item_id": call_id.clone(),
+                            "delta": " integration\"}"
+                        })
+                        .to_string(),
+                    )),
+                // response.function_call_arguments.done
+                Ok(Event::default()
+                    .event("response.function_call_arguments.done")
+                    .data(
+                        json!({
+                            "type": "response.function_call_arguments.done",
+                            "output_index": 0,
+                            "item_id": call_id.clone()
+                        })
+                        .to_string(),
+                    )),
+                // response.output_item.done
+                Ok(Event::default().event("response.output_item.done").data(
+                    json!({
+                        "type": "response.output_item.done",
+                        "output_index": 0,
+                        "item": {
+                            "id": call_id.clone(),
+                            "type": "function_tool_call",
+                            "name": "brave_web_search",
+                            "arguments": "{\"query\":\"SGLang router MCP integration\"}",
+                            "status": "completed"
+                        }
+                    })
+                    .to_string(),
+                )),
+                // response.completed
+                Ok(Event::default().event("response.completed").data(
+                    json!({
+                        "type": "response.completed",
+                        "response": {
+                            "id": rid,
+                            "object": "response",
+                            "created_at": timestamp,
+                            "model": "mock-model",
+                            "status": "completed"
+                        }
+                    })
+                    .to_string(),
+                )),
+                // [DONE]
+                Ok(Event::default().data("[DONE]")),
+            ];
+
+            let stream = stream::iter(events);
+            Sse::new(stream)
+                .keep_alive(KeepAlive::default())
+                .into_response()
+        } else if has_tools && has_function_output {
+            // Second turn: emit streaming text response
+            let rid = request_id.clone();
+            let msg_id = format!(
+                "msg_{}",
+                Uuid::new_v4().to_string().split('-').next().unwrap()
+            );
+
+            let events = vec![
+                // response.created
+                Ok::<_, Infallible>(
+                    Event::default().event("response.created").data(
+                        json!({
+                            "type": "response.created",
+                            "response": {
+                                "id": rid.clone(),
+                                "object": "response",
+                                "created_at": timestamp,
+                                "model": "mock-model",
+                                "status": "in_progress"
+                            }
+                        })
+                        .to_string(),
+                    ),
+                ),
+                // response.in_progress
+                Ok(Event::default().event("response.in_progress").data(
+                    json!({
+                        "type": "response.in_progress",
+                        "response": {
+                            "id": rid.clone(),
+                            "object": "response",
+                            "created_at": timestamp,
+                            "model": "mock-model",
+                            "status": "in_progress"
+                        }
+                    })
+                    .to_string(),
+                )),
+                // response.output_item.added with message
+                Ok(Event::default().event("response.output_item.added").data(
+                    json!({
+                        "type": "response.output_item.added",
+                        "output_index": 0,
+                        "item": {
+                            "id": msg_id.clone(),
+                            "type": "message",
+                            "role": "assistant",
+                            "content": []
+                        }
+                    })
+                    .to_string(),
+                )),
+                // response.content_part.added
+                Ok(Event::default().event("response.content_part.added").data(
+                    json!({
+                        "type": "response.content_part.added",
+                        "output_index": 0,
+                        "item_id": msg_id.clone(),
+                        "part": {
+                            "type": "output_text",
+                            "text": ""
+                        }
+                    })
+                    .to_string(),
+                )),
+                // response.output_text.delta events
+                Ok(Event::default().event("response.output_text.delta").data(
+                    json!({
+                        "type": "response.output_text.delta",
+                        "output_index": 0,
+                        "content_index": 0,
+                        "delta": "Tool result"
+                    })
+                    .to_string(),
+                )),
+                Ok(Event::default().event("response.output_text.delta").data(
+                    json!({
+                        "type": "response.output_text.delta",
+                        "output_index": 0,
+                        "content_index": 0,
+                        "delta": " consumed;"
+                    })
+                    .to_string(),
+                )),
+                Ok(Event::default().event("response.output_text.delta").data(
+                    json!({
+                        "type": "response.output_text.delta",
+                        "output_index": 0,
+                        "content_index": 0,
+                        "delta": " here is the final answer."
+                    })
+                    .to_string(),
+                )),
+                // response.output_text.done
+                Ok(Event::default().event("response.output_text.done").data(
+                    json!({
+                        "type": "response.output_text.done",
+                        "output_index": 0,
+                        "content_index": 0,
+                        "text": "Tool result consumed; here is the final answer."
+                    })
+                    .to_string(),
+                )),
+                // response.output_item.done
+                Ok(Event::default().event("response.output_item.done").data(
+                    json!({
+                        "type": "response.output_item.done",
+                        "output_index": 0,
+                        "item": {
+                            "id": msg_id,
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{
+                                "type": "output_text",
+                                "text": "Tool result consumed; here is the final answer."
+                            }]
+                        }
+                    })
+                    .to_string(),
+                )),
+                // response.completed
+                Ok(Event::default().event("response.completed").data(
+                    json!({
+                        "type": "response.completed",
+                        "response": {
+                            "id": rid,
+                            "object": "response",
+                            "created_at": timestamp,
+                            "model": "mock-model",
+                            "status": "completed",
+                            "usage": {
+                                "input_tokens": 12,
+                                "output_tokens": 7,
+                                "total_tokens": 19
+                            }
+                        }
+                    })
+                    .to_string(),
+                )),
+                // [DONE]
+                Ok(Event::default().data("[DONE]")),
+            ];
+
+            let stream = stream::iter(events);
+            Sse::new(stream)
+                .keep_alive(KeepAlive::default())
+                .into_response()
+        } else {
+            // Default streaming response
+            let stream = stream::once(async move {
+                let chunk = json!({
+                    "id": request_id,
+                    "object": "response",
+                    "created_at": timestamp,
+                    "model": "mock-model",
+                    "status": "in_progress",
+                    "output": [{
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{
+                            "type": "output_text",
+                            "text": "This is a mock responses streamed output."
+                        }]
+                    }]
+                });
+                Ok::<_, Infallible>(Event::default().data(chunk.to_string()))
+            })
+            .chain(stream::once(async { Ok(Event::default().data("[DONE]")) }));
+
+            Sse::new(stream)
+                .keep_alive(KeepAlive::default())
+                .into_response()
+        }
     } else if is_background {
         let rid = req_id.unwrap_or_else(|| format!("resp-{}", Uuid::new_v4()));
         Json(json!({

@@ -22,8 +22,8 @@ import zmq.asyncio
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
     AbortReq,
-    BatchEmbeddingOut,
-    BatchTokenIDOut,
+    BatchEmbeddingOutput,
+    BatchTokenIDOutput,
     HealthCheckOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -467,9 +467,9 @@ class GrpcRequestManager:
                         await self.is_pause_cond.wait()
 
                 # Handle different output types
-                if isinstance(recv_obj, BatchTokenIDOut):
+                if isinstance(recv_obj, BatchTokenIDOutput):
                     await self._handle_batch_output(recv_obj)
-                elif isinstance(recv_obj, BatchEmbeddingOut):
+                elif isinstance(recv_obj, BatchEmbeddingOutput):
                     await self._handle_embedding_output(recv_obj)
                 elif isinstance(recv_obj, HealthCheckOutput):
                     await self._handle_health_check_output(recv_obj)
@@ -498,7 +498,7 @@ class GrpcRequestManager:
     def _convert_logprob_style(
         self,
         state: GrpcReqState,
-        batch_out: BatchTokenIDOut,
+        batch_out: BatchTokenIDOutput,
         batch_index: int,
     ):
         """
@@ -545,7 +545,7 @@ class GrpcRequestManager:
                 batch_out.output_top_logprobs_idx[batch_index]
             )
 
-    async def _handle_batch_output(self, batch_out: BatchTokenIDOut):
+    async def _handle_batch_output(self, batch_out: BatchTokenIDOutput):
         """Handle batch generation output from scheduler."""
         # Process each request in the batch
         for i, rid in enumerate(batch_out.rids):
@@ -578,7 +578,7 @@ class GrpcRequestManager:
                         batch_out.cached_tokens[i] if batch_out.cached_tokens else 0
                     ),
                     "finish_reason": (
-                        str(batch_out.finished_reasons[i])
+                        batch_out.finished_reasons[i]
                         if batch_out.finished_reasons[i]
                         else None
                     ),
@@ -666,7 +666,7 @@ class GrpcRequestManager:
 
                 asyncio.create_task(cleanup())
 
-    async def _handle_embedding_output(self, batch_out: BatchEmbeddingOut):
+    async def _handle_embedding_output(self, batch_out: BatchEmbeddingOutput):
         """Handle batch embedding output from scheduler."""
         for i, rid in enumerate(batch_out.rids):
             if rid not in self.rid_to_state:

@@ -112,7 +112,6 @@ def _launch_scheduler_process_only(
                         pp_rank,
                         None,
                         writer,
-                        None,
                     ),
                 )
 
@@ -583,6 +582,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 cached_tokens=meta_info.get("cached_tokens", 0),
                 output_logprobs=output_logprobs_proto,
                 input_logprobs=input_logprobs_proto,
+                index=output.get("index", 0),
             ),
         )
 
@@ -640,6 +640,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 cached_tokens=meta_info.get("cached_tokens", 0),
                 output_logprobs=output_logprobs_proto,
                 input_logprobs=input_logprobs_proto,
+                index=output.get("index", 0),
                 **matched_stop_kwargs,
             ),
         )
