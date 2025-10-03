@@ -309,6 +309,9 @@ from sgl_kernel.speculative import (
     tree_speculative_sampling_target_only,
     verify_tree_greedy,
 )
+from sgl_kernel.allreduce_rmsnorm import (
+    fused_rs_ln_ag_cta
+)
 from sgl_kernel.top_k import fast_topk
 from sgl_kernel.version import __version__
 
