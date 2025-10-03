@@ -409,7 +409,15 @@ def get_available_gpu_memory(
 
         if empty_cache:
             torch.cuda.empty_cache()
-        free_gpu_memory, _ = torch.cuda.mem_get_info(gpu_id)
+        try:
+            prop = torch.cuda.get_device_properties(gpu_id)
+            if prop.is_integrated:
+                free_gpu_memory = psutil.virtual_memory().available
+            else:
+                free_gpu_memory, _ = torch.cuda.mem_get_info(gpu_id)
+        except Exception as e:
+            print(f"Error querying device properties: {e}. Falling back to system memory.")
+            free_gpu_memory = psutil.virtual_memory().available
 
     elif device == "xpu":
         num_gpus = torch.xpu.device_count()
