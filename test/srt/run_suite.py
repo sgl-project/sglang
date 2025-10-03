@@ -134,7 +134,6 @@ suites = {
         TestFile("test_release_memory_occupation.py", 257),
         TestFile("hicache/test_hicache_storage_file_backend.py", 400),
         TestFile("hicache/test_hicache_storage_3fs_backend.py", 400),
-        TestFile("hicache/test_hicache_storage_mooncake_backend.py", 950),
     ],
     "per-commit-4-gpu": [
         TestFile("test_gpt_oss_4gpu.py", 600),
@@ -146,11 +145,14 @@ suites = {
     ],
     "per-commit-8-gpu": [
         TestFile("lora/test_lora_llama4.py", 600),
-        TestFile("test_disaggregation.py", 950),
         TestFile("test_disaggregation_dp_attention.py", 155),
         TestFile("test_disaggregation_different_tp.py", 600),
         TestFile("test_disaggregation_pp.py", 140),
         TestFile("test_full_deepseek_v3.py", 333),
+    ],
+    "per-commit-2-gpu-rdma": [
+        TestFile("test_disaggregation.py", 600),
+        TestFile("hicache/test_hicache_storage_mooncake_backend.py", 950),
     ],
     "per-commit-4-gpu-b200": [
         # TestFile("test_gpt_oss_4gpu.py", 600),
