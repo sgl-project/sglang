@@ -17,13 +17,14 @@ from sglang.test.simple_eval_common import (
 
 
 def get_thinking_kwargs(args):
-    if args.thinking_mode in THINKING_MODE_CHOICES:
-        thinking_param = (
-            "thinking" if args.thinking_mode == "deepseek-v3" else "enable_thinking"
-        )
+    thinking_mode = getattr(args, "thinking_mode", None)
+    if thinking_mode in THINKING_MODE_CHOICES:
+        if thinking_mode == "deepseek-v3":
+            thinking_param = "thinking"
+        else:
+            thinking_param = "enable_thinking"
         return {
             "chat_template_kwargs": {thinking_param: True},
-            "separate_reasoning": True,
         }
     return {}
 
