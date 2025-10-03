@@ -27,8 +27,9 @@ MODELS = [
     SimpleNamespace(model="openbmb/MiniCPM-V-2_6", mmmu_accuracy=0.4),
 ]
 
-#Set default mem_fraction_static to 0.8
+# Set default mem_fraction_static to 0.8
 DEFAULT_MEM_FRACTION_STATIC = 0.8
+
 
 class TestVLMModels(CustomTestCase):
     parsed_args = None  # Class variable to store args
@@ -41,7 +42,9 @@ class TestVLMModels(CustomTestCase):
         cls.time_out = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
 
         if cls.parsed_args is None:
-            cls.parsed_args = SimpleNamespace(mem_fraction_static=DEFAULT_MEM_FRACTION_STATIC)
+            cls.parsed_args = SimpleNamespace(
+                mem_fraction_static=DEFAULT_MEM_FRACTION_STATIC
+            )
 
         # Set OpenAI API key and base URL environment variables. Needed for lmm-evals to work.
         os.environ["OPENAI_API_KEY"] = cls.api_key
