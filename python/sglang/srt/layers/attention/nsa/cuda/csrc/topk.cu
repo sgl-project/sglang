@@ -148,8 +148,9 @@ __device__ void fast_topk_cuda_tl(const float *__restrict__ input,
     __syncthreads();
 
     // clip here to prevent overflow
+    const auto raw_num_input = s_num_input[r_idx];
     const auto num_input =
-        cuda::std::min(s_num_input[r_idx], int(SMEM_INPUT_SIZE));
+        (raw_num_input < SMEM_INPUT_SIZE) ? raw_num_input : SMEM_INPUT_SIZE;
     for (int i = tx; i < num_input; i += BLOCK_SIZE) {
       const auto idx = s_input_idx[r_idx][i];
       const auto bin =
