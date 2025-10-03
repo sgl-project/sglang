@@ -536,9 +536,7 @@ class ModelRunner:
                 elif _is_hip:
                     head_num = self.model_config.get_num_kv_heads(self.tp_size)
                     # TODO current aiter only support head number 16 or 128 head number
-                    if (
-                        head_num == 128 or head_num == 16
-                    ) and self.spec_algorithm.is_none():
+                    if head_num == 128 or head_num == 16:
                         server_args.attention_backend = "aiter"
                     else:
                         server_args.attention_backend = "triton"
