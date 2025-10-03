@@ -43,23 +43,17 @@ from fastapi import BackgroundTasks
 from sglang.srt.aio_rwlock import RWLock
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.hf_transformers_utils import (
-    get_processor,
-    get_tokenizer,
-    get_tokenizer_from_processor,
-)
-from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
+from sglang.srt.lora.lora_registry import LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
     AbortReq,
-    BatchEmbeddingOut,
-    BatchMultimodalOut,
-    BatchStrOut,
-    BatchTokenIDOut,
+    BatchEmbeddingOutput,
+    BatchMultimodalOutput,
+    BatchStrOutput,
+    BatchTokenIDOutput,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
-    CloseSessionReqInput,
     ConfigureLoggingReq,
     EmbeddingReqInput,
     FreezeGCReq,
@@ -67,7 +61,6 @@ from sglang.srt.managers.io_struct import (
     GetLoadReqInput,
     HealthCheckOutput,
     MultiTokenizerWrapper,
-    OpenSessionReqInput,
     OpenSessionReqOutput,
     SessionParams,
     TokenizedEmbeddingReqInput,
@@ -100,6 +93,11 @@ from sglang.srt.utils import (
     get_origin_rid,
     get_zmq_socket,
     kill_process_tree,
+)
+from sglang.srt.utils.hf_transformers_utils import (
+    get_processor,
+    get_tokenizer,
+    get_tokenizer_from_processor,
 )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
@@ -164,6 +162,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             else None
         )
         self.crash_dump_folder = server_args.crash_dump_folder
+        self.enable_trace = server_args.enable_trace
 
         # Read model args
         self.model_path = server_args.model_path
@@ -340,10 +339,10 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             [
                 (
                     (
-                        BatchStrOut,
-                        BatchEmbeddingOut,
-                        BatchTokenIDOut,
-                        BatchMultimodalOut,
+                        BatchStrOutput,
+                        BatchEmbeddingOutput,
+                        BatchTokenIDOutput,
+                        BatchMultimodalOutput,
                     ),
                     self._handle_batch_output,
                 ),
@@ -381,23 +380,8 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 # If it's a single value, add worker_id prefix
                 obj.rid = f"{self.worker_id}_{obj.rid}"
 
-        if obj.is_single:
-            bootstrap_room = (
-                obj.bootstrap_room if hasattr(obj, "bootstrap_room") else None
-            )
-            trace_req_start(obj.rid, bootstrap_room, ts=int(created_time * 1e9))
-            trace_slice_start("", obj.rid, ts=int(created_time * 1e9), anonymous=True)
-        else:
-            for i in range(len(obj.rid)):
-                bootstrap_room = (
-                    obj.bootstrap_room[i]
-                    if hasattr(obj, "bootstrap_room") and obj.bootstrap_room
-                    else None
-                )
-                trace_req_start(obj.rid[i], bootstrap_room, ts=int(created_time * 1e9))
-                trace_slice_start(
-                    "", obj.rid[i], ts=int(created_time * 1e9), anonymous=True
-                )
+        if self.enable_trace:
+            self._trace_request_start(obj, created_time)
 
         if self.log_requests:
             max_length, skip_names, _ = self.log_request_metadata
@@ -730,7 +714,6 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             )
 
             tokenized_obj = TokenizedGenerateReqInput(
-                obj.rid,
                 input_text,
                 input_ids,
                 mm_inputs,
@@ -740,6 +723,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 obj.top_logprobs_num,
                 obj.token_ids_logprob,
                 obj.stream,
+                rid=obj.rid,
                 bootstrap_host=obj.bootstrap_host,
                 bootstrap_port=obj.bootstrap_port,
                 bootstrap_room=obj.bootstrap_room,
@@ -754,12 +738,12 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(
-                obj.rid,
                 input_text,
                 input_ids,
                 mm_inputs,
                 token_type_ids,
                 sampling_params,
+                rid=obj.rid,
                 priority=obj.priority,
             )
 
@@ -1079,10 +1063,13 @@ class TokenizerManager(TokenizerCommunicatorMixin):
     def abort_request(self, rid: str = "", abort_all: bool = False):
         if not abort_all and rid not in self.rid_to_state:
             return
-        req = AbortReq(rid, abort_all)
+        req = AbortReq(rid=rid, abort_all=abort_all)
         self.send_to_scheduler.send_pyobj(req)
         if self.enable_metrics:
-            self.metrics_collector.observe_one_aborted_request()
+            # TODO: also use custom_labels from the request
+            self.metrics_collector.observe_one_aborted_request(
+                self.metrics_collector.labels
+            )
 
     async def pause_generation(self):
         async with self.is_pause_cond:
@@ -1143,84 +1130,6 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             all_message = " | ".join(all_message)
             all_paused_requests = [r.num_paused_requests for r in result]
             return all_success, all_message, all_paused_requests
-
-    async def open_session(
-        self, obj: OpenSessionReqInput, request: Optional[fastapi.Request] = None
-    ):
-        self.auto_create_handle_loop()
-
-        if obj.session_id is None:
-            obj.session_id = uuid.uuid4().hex
-        elif obj.session_id in self.session_futures:
-            return None
-
-        if self.server_args.tokenizer_worker_num > 1:
-            obj = MultiTokenizerWrapper(self.worker_id, obj)
-        self.send_to_scheduler.send_pyobj(obj)
-
-        self.session_futures[obj.session_id] = asyncio.Future()
-        session_id = await self.session_futures[obj.session_id]
-        del self.session_futures[obj.session_id]
-        return session_id
-
-    async def close_session(
-        self, obj: CloseSessionReqInput, request: Optional[fastapi.Request] = None
-    ):
-        await self.send_to_scheduler.send_pyobj(obj)
-
-    def get_log_request_metadata(self):
-        max_length = None
-        skip_names = None
-        out_skip_names = None
-        if self.log_requests:
-            if self.log_requests_level == 0:
-                max_length = 1 << 30
-                skip_names = set(
-                    [
-                        "text",
-                        "input_ids",
-                        "input_embeds",
-                        "image_data",
-                        "audio_data",
-                        "lora_path",
-                        "sampling_params",
-                    ]
-                )
-                out_skip_names = set(
-                    [
-                        "text",
-                        "output_ids",
-                        "embedding",
-                    ]
-                )
-            elif self.log_requests_level == 1:
-                max_length = 1 << 30
-                skip_names = set(
-                    [
-                        "text",
-                        "input_ids",
-                        "input_embeds",
-                        "image_data",
-                        "audio_data",
-                        "lora_path",
-                    ]
-                )
-                out_skip_names = set(
-                    [
-                        "text",
-                        "output_ids",
-                        "embedding",
-                    ]
-                )
-            elif self.log_requests_level == 2:
-                max_length = 2048
-            elif self.log_requests_level == 3:
-                max_length = 1 << 30
-            else:
-                raise ValueError(
-                    f"Invalid --log-requests-level: {self.log_requests_level=}"
-                )
-        return max_length, skip_names, out_skip_names
 
     def configure_logging(self, obj: ConfigureLoggingReq):
         if obj.log_requests is not None:
@@ -1380,12 +1289,12 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         # Drain requests
         while True:
             remain_num_req = len(self.rid_to_state)
+            remaining_rids = list(self.rid_to_state.keys())
 
             if self.server_status == ServerStatus.UnHealthy:
                 # if health check failed, we should exit immediately
                 logger.error(
-                    "Signal SIGTERM received while health check failed. Exiting... remaining number of requests: %d",
-                    remain_num_req,
+                    "Signal SIGTERM received while health check failed. Force exiting."
                 )
                 self.dump_requests_before_crash()
                 break
@@ -1393,13 +1302,12 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             elif get_bool_env_var("SGL_FORCE_SHUTDOWN"):
                 # if force shutdown flag set, exit immediately
                 logger.error(
-                    "Signal SIGTERM received while force shutdown flag set. Force exiting... remaining number of requests: %d",
-                    remain_num_req,
+                    "Signal SIGTERM received while force shutdown flag set. Force exiting."
                 )
                 break
 
             logger.info(
-                f"Gracefully exiting... remaining number of requests {remain_num_req}"
+                f"Gracefully exiting... Remaining number of requests {remain_num_req}. Remaining requests {remaining_rids=}."
             )
             if remain_num_req > 0:
                 await asyncio.sleep(5)
@@ -1420,7 +1328,10 @@ class TokenizerManager(TokenizerCommunicatorMixin):
     def _handle_batch_output(
         self,
         recv_obj: Union[
-            BatchStrOut, BatchEmbeddingOut, BatchMultimodalOut, BatchTokenIDOut
+            BatchStrOutput,
+            BatchEmbeddingOutput,
+            BatchMultimodalOutput,
+            BatchTokenIDOutput,
         ],
     ):
         for i, rid in enumerate(recv_obj.rids):
@@ -1454,7 +1365,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     i,
                 )
 
-            if not isinstance(recv_obj, BatchEmbeddingOut):
+            if not isinstance(recv_obj, BatchEmbeddingOutput):
                 meta_info.update(
                     {
                         "completion_tokens": recv_obj.completion_tokens[i],
@@ -1465,7 +1376,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             if getattr(recv_obj, "output_hidden_states", None):
                 meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
 
-            if isinstance(recv_obj, BatchStrOut):
+            if isinstance(recv_obj, BatchStrOutput):
                 state.text += recv_obj.output_strs[i]
                 if state.obj.stream:
                     state.output_ids.extend(recv_obj.output_ids[i])
@@ -1480,7 +1391,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     "output_ids": output_token_ids,
                     "meta_info": meta_info,
                 }
-            elif isinstance(recv_obj, BatchTokenIDOut):
+            elif isinstance(recv_obj, BatchTokenIDOutput):
                 if self.server_args.stream_output and state.obj.stream:
                     state.output_ids.extend(recv_obj.output_ids[i])
                     output_token_ids = state.output_ids[state.last_output_offset :]
@@ -1493,10 +1404,10 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     "output_ids": output_token_ids,
                     "meta_info": meta_info,
                 }
-            elif isinstance(recv_obj, BatchMultimodalOut):
+            elif isinstance(recv_obj, BatchMultimodalOutput):
                 raise NotImplementedError("BatchMultimodalOut not implemented")
             else:
-                assert isinstance(recv_obj, BatchEmbeddingOut)
+                assert isinstance(recv_obj, BatchEmbeddingOutput)
                 out_dict = {
                     "embedding": recv_obj.embeddings[i],
                     "meta_info": meta_info,
@@ -1535,7 +1446,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         top_logprobs_num: int,
         token_ids_logprob: List[int],
         return_text_in_logprobs: bool,
-        recv_obj: BatchStrOut,
+        recv_obj: BatchStrOutput,
         recv_obj_index: int,
     ):
         if recv_obj.input_token_logprobs_val is None:
@@ -1653,7 +1564,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 ret.append(None)
         return ret
 
-    def collect_metrics(self, state: ReqState, recv_obj: BatchStrOut, i: int):
+    def collect_metrics(self, state: ReqState, recv_obj: BatchStrOutput, i: int):
         completion_tokens = (
             recv_obj.completion_tokens[i]
             if getattr(recv_obj, "completion_tokens", None)
@@ -1749,7 +1660,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
         asyncio.create_task(asyncio.to_thread(background_task))
 
-    def _handle_abort_req(self, recv_obj):
+    def _handle_abort_req(self, recv_obj: AbortReq):
         if is_health_check_generate_req(recv_obj):
             return
         state = self.rid_to_state[recv_obj.rid]
@@ -1915,6 +1826,29 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             load_udpate_req = WatchLoadUpdateReq(loads=loads)
             self.send_to_scheduler.send_pyobj(load_udpate_req)
 
+    def _trace_request_start(
+        self,
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        created_time: Optional[float] = None,
+    ):
+        if obj.is_single:
+            bootstrap_room = (
+                obj.bootstrap_room if hasattr(obj, "bootstrap_room") else None
+            )
+            trace_req_start(obj.rid, bootstrap_room, ts=int(created_time * 1e9))
+            trace_slice_start("", obj.rid, ts=int(created_time * 1e9), anonymous=True)
+        else:
+            for i in range(len(obj.rid)):
+                bootstrap_room = (
+                    obj.bootstrap_room[i]
+                    if hasattr(obj, "bootstrap_room") and obj.bootstrap_room
+                    else None
+                )
+                trace_req_start(obj.rid[i], bootstrap_room, ts=int(created_time * 1e9))
+                trace_slice_start(
+                    "", obj.rid[i], ts=int(created_time * 1e9), anonymous=True
+                )
+
 
 class ServerStatus(Enum):
     Up = "Up"
@@ -1960,7 +1894,7 @@ class SignalHandler:
 
     def running_phase_sigquit_handler(self, signum=None, frame=None):
         logger.error(
-            "Received sigquit from a child process. It usually means the child failed."
+            f"SIGQUIT received. {signum=}, {frame=}. It usually means one child failed."
         )
         self.tokenizer_manager.dump_requests_before_crash()
         kill_process_tree(os.getpid())

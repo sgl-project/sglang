@@ -28,6 +28,7 @@ from torch import nn
 from tqdm import tqdm
 from transformers import PretrainedConfig
 
+from sglang.srt import single_batch_overlap
 from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_pp_group,
@@ -101,6 +102,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.single_batch_overlap import SboFlags
 from sglang.srt.two_batch_overlap import (
     MaybeTboDeepEPDispatcher,
     model_forward_maybe_tbo,
@@ -164,16 +166,15 @@ if _is_cuda:
 elif _is_cpu and _is_cpu_amx_available:
     pass
 elif _is_hip:
+    from sglang.srt.layers.attention.triton_ops.rocm_mla_decode_rope import (
+        decode_attention_fwd_grouped_rope,
+    )
     from sglang.srt.layers.quantization.awq_triton import (
         awq_dequantize_triton as awq_dequantize,
     )
 else:
     pass
 
-if _is_hip:
-    from sglang.srt.layers.attention.triton_ops.rocm_mla_decode_rope import (
-        decode_attention_fwd_grouped_rope,
-    )
 
 _is_flashinfer_available = is_flashinfer_available()
 _is_sm100_supported = is_cuda() and is_sm100_supported()
@@ -227,7 +228,7 @@ def _dispatch_mla_subtype(attn, forward_batch):
             return AttnForwardMethod.MLA
 
 
-class BackendRegistry:
+class AttentionBackendRegistry:
     _handlers = {}
 
     @classmethod
@@ -239,7 +240,7 @@ class BackendRegistry:
         return cls._handlers.get(backend_name, cls._handlers.get("triton"))
 
 
-def handle_ascend(attn, forward_batch):
+def handle_attention_ascend(attn, forward_batch):
     if (
         forward_batch.forward_mode.is_extend()
         and not forward_batch.forward_mode.is_target_verify()
@@ -266,7 +267,7 @@ def _is_extend_without_speculative(forward_batch):
     )
 
 
-def _handle_backend(attn, forward_batch, backend_name):
+def _handle_attention_backend(attn, forward_batch, backend_name):
     sum_extend_prefix_lens = _get_sum_extend_prefix_lens(forward_batch)
     disable_ragged = (
         backend_name in ["flashinfer", "flashmla"]
@@ -288,28 +289,28 @@ def _handle_backend(attn, forward_batch, backend_name):
         return _dispatch_mla_subtype(attn, forward_batch)
 
 
-def handle_flashinfer(attn, forward_batch):
-    return _handle_backend(attn, forward_batch, "flashinfer")
+def handle_attention_flashinfer(attn, forward_batch):
+    return _handle_attention_backend(attn, forward_batch, "flashinfer")
 
 
-def handle_fa3(attn, forward_batch):
-    return _handle_backend(attn, forward_batch, "fa3")
+def handle_attention_fa3(attn, forward_batch):
+    return _handle_attention_backend(attn, forward_batch, "fa3")
 
 
-def handle_flashmla(attn, forward_batch):
-    return _handle_backend(attn, forward_batch, "flashmla")
+def handle_attention_flashmla(attn, forward_batch):
+    return _handle_attention_backend(attn, forward_batch, "flashmla")
 
 
-def handle_cutlass_mla(attn, forward_batch):
-    return _handle_backend(attn, forward_batch, "cutlass_mla")
+def handle_attention_cutlass_mla(attn, forward_batch):
+    return _handle_attention_backend(attn, forward_batch, "cutlass_mla")
 
 
-def handle_fa4(attn, forward_batch):
+def handle_attention_fa4(attn, forward_batch):
     # TODO(cicirori): use FA4 MHA for DeepSeekV3 for now
     return AttnForwardMethod.MHA_CHUNKED_KV
 
 
-def handle_trtllm_mla(attn, forward_batch):
+def handle_attention_trtllm_mla(attn, forward_batch):
     sum_extend_prefix_lens = _get_sum_extend_prefix_lens(forward_batch)
     if _is_extend_without_speculative(forward_batch) and (
         not attn.disable_chunked_prefix_cache or sum_extend_prefix_lens == 0
@@ -319,7 +320,7 @@ def handle_trtllm_mla(attn, forward_batch):
         return _dispatch_mla_subtype(attn, forward_batch)
 
 
-def handle_aiter(attn, forward_batch):
+def handle_attention_aiter(attn, forward_batch):
     if _is_extend_without_speculative(forward_batch):
         if is_dp_attention_enabled():
             if sum(forward_batch.extend_prefix_lens_cpu) == 0:
@@ -332,7 +333,7 @@ def handle_aiter(attn, forward_batch):
         return AttnForwardMethod.MLA
 
 
-def handle_triton(attn, forward_batch):
+def handle_attention_triton(attn, forward_batch):
     if (
         _is_extend_without_speculative(forward_batch)
         and sum(forward_batch.extend_prefix_lens_cpu) == 0
@@ -539,7 +540,7 @@ class DeepseekV2MoE(nn.Module):
             correction_bias=self.gate.e_score_correction_bias,
             quant_config=quant_config,
             routed_scaling_factor=self.routed_scaling_factor,
-            apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk(),
+            apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
             # Some Fp4 MoE backends require the output format to be bypassed but the MTP layers are unquantized
             # and requires the output format to be standard. We use quant_config to determine the output format.
             output_format=TopKOutputFormat.STANDARD if quant_config is None else None,
@@ -806,7 +807,8 @@ class DeepseekV2MoE(nn.Module):
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
-            shared_output = self._forward_shared_experts(hidden_states)
+            if not SboFlags.fuse_shared_experts_inside_sbo():
+                shared_output = self._forward_shared_experts(hidden_states)
             topk_weights, topk_idx, _ = self.topk(
                 hidden_states,
                 router_logits,
@@ -820,22 +822,28 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states.device
             )
 
-        final_hidden_states = self.experts(
+        final_hidden_states, sbo_shared_output = single_batch_overlap.execute_sbo(
             hidden_states=hidden_states,
             topk_idx=topk_idx,
             topk_weights=topk_weights,
             forward_batch=forward_batch,
+            # SBO args
+            forward_shared_experts=lambda: self._forward_shared_experts(hidden_states),
+            experts=self.experts,
+            alt_stream=self.alt_stream,
         )
+        if sbo_shared_output is not None:
+            shared_output = sbo_shared_output
 
         if shared_output is not None:
             x = shared_output
-            if self.experts.should_fuse_routed_scaling_factor_in_topk():
+            if self.experts.should_fuse_routed_scaling_factor_in_topk:
                 x.add_(final_hidden_states)
             else:
                 x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
             final_hidden_states = x
         else:
-            if not self.experts.should_fuse_routed_scaling_factor_in_topk():
+            if not self.experts.should_fuse_routed_scaling_factor_in_topk:
                 final_hidden_states *= self.routed_scaling_factor
 
         return final_hidden_states
@@ -843,7 +851,7 @@ class DeepseekV2MoE(nn.Module):
     def _forward_shared_experts(
         self, hidden_states, gemm_output_zero_allocator: BumpAllocator = None
     ):
-        if self.num_fused_shared_experts == 0:
+        if (hidden_states.shape[0] > 0) and (self.num_fused_shared_experts == 0):
             return self.shared_experts(
                 hidden_states, gemm_output_zero_allocator=gemm_output_zero_allocator
             )
@@ -896,6 +904,7 @@ class DeepseekV2MoE(nn.Module):
         if self.ep_size > 1:
             self.experts.deepep_dispatcher.dispatch_a(
                 hidden_states=state.hidden_states_mlp_input,
+                input_global_scale=None,
                 topk_idx=state.pop("topk_idx_local"),
                 topk_weights=state.pop("topk_weights_local"),
                 forward_batch=state.forward_batch,
@@ -1207,7 +1216,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             attention_backend = global_server_args_dict["prefill_attention_backend"]
         self.current_attention_backend = attention_backend
 
-        handler = BackendRegistry.get_handler(attention_backend)
+        handler = AttentionBackendRegistry.get_handler(attention_backend)
         return handler(self, forward_batch)
 
     def op_prepare(self, state):
@@ -1399,7 +1408,10 @@ class DeepseekV2AttentionMLA(nn.Module):
         """
         return (
             self.current_attention_backend == "trtllm_mla"
-            and forward_batch.forward_mode.is_decode_or_idle()
+            and (
+                forward_batch.forward_mode.is_decode_or_idle()
+                or forward_batch.forward_mode.is_target_verify()
+            )
             and forward_batch.attn_backend.data_type == torch.float8_e4m3fn
         )
 
@@ -1965,6 +1977,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             tmp_lse = torch.empty_like(accum_lse)
             merge_state_v2(output, lse, accum_output, accum_lse, tmp_output, tmp_lse)
             accum_output, accum_lse = tmp_output, tmp_lse
+            del kv, k, v, output, lse, tmp_output, tmp_lse
 
         return accum_output
 
@@ -3078,15 +3091,15 @@ class DeepseekV2ForCausalLM(nn.Module):
         )
 
 
-BackendRegistry.register("ascend", handle_ascend)
-BackendRegistry.register("flashinfer", handle_flashinfer)
-BackendRegistry.register("fa3", handle_fa3)
-BackendRegistry.register("flashmla", handle_flashmla)
-BackendRegistry.register("cutlass_mla", handle_cutlass_mla)
-BackendRegistry.register("fa4", handle_fa4)
-BackendRegistry.register("trtllm_mla", handle_trtllm_mla)
-BackendRegistry.register("aiter", handle_aiter)
-BackendRegistry.register("triton", handle_triton)
+AttentionBackendRegistry.register("ascend", handle_attention_ascend)
+AttentionBackendRegistry.register("flashinfer", handle_attention_flashinfer)
+AttentionBackendRegistry.register("fa3", handle_attention_fa3)
+AttentionBackendRegistry.register("flashmla", handle_attention_flashmla)
+AttentionBackendRegistry.register("cutlass_mla", handle_attention_cutlass_mla)
+AttentionBackendRegistry.register("fa4", handle_attention_fa4)
+AttentionBackendRegistry.register("trtllm_mla", handle_attention_trtllm_mla)
+AttentionBackendRegistry.register("aiter", handle_attention_aiter)
+AttentionBackendRegistry.register("triton", handle_attention_triton)
 
 
 class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):
