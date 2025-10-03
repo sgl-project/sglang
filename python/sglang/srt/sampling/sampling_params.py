@@ -15,6 +15,8 @@
 
 from typing import Any, Dict, List, Optional, Union
 
+from sglang.srt.utils import get_bool_env_var
+
 _SAMPLING_EPS = 1e-6
 TOP_K_ALL = 1 << 30
 
@@ -53,6 +55,7 @@ class SamplingParams:
         custom_params: Optional[Dict[str, Any]] = None,
         stream_interval: Optional[int] = None,
         logit_bias: Optional[Dict[str, float]] = None,
+        sampling_seed: int = 42,
     ) -> None:
         self.max_new_tokens = max_new_tokens
         self.stop_strs = stop
@@ -80,6 +83,7 @@ class SamplingParams:
         self.custom_params = custom_params
         self.stream_interval = stream_interval
         self.logit_bias = logit_bias
+        self.sampling_seed = sampling_seed
 
         # Process some special cases
         if 0 <= self.temperature < _SAMPLING_EPS:

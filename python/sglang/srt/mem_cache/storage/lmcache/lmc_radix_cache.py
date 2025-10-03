@@ -9,7 +9,7 @@ import torch
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import MatchResult
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
+from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 
 try:
     from lmcache.integration.sglang.sglang_adapter import (
@@ -78,6 +78,7 @@ class LMCRadixCache(RadixCache):
         tp_size: int = 1,
         rank: int = 0,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        eviction_policy: str = "lru",
     ):
         super().__init__(
             req_to_token_pool=req_to_token_pool,
@@ -85,6 +86,7 @@ class LMCRadixCache(RadixCache):
             page_size=page_size,
             disable=disable,
             enable_kv_cache_events=enable_kv_cache_events,
+            eviction_policy=eviction_policy,
         )
 
         kvcache = self.token_to_kv_pool_allocator.get_kvcache()
@@ -129,7 +131,7 @@ class LMCRadixCache(RadixCache):
             with self._node_lock:
                 self._in_flight_nodes.clear()
 
-    def match_prefix(self, key: List[int], **kwargs) -> MatchResult:  # type: ignore[override]
+    def match_prefix(self, key: RadixKey, **kwargs) -> MatchResult:  # type: ignore[override]
         """Match cached prefix; if there's a tail miss, prefetch from LMCache.
 
         Reuses the base matching logic to obtain (value, last_node). If there
@@ -176,7 +178,7 @@ class LMCRadixCache(RadixCache):
         with torch.cuda.stream(self.load_stream):
             num_retrieved = self.lmcache_connector.start_load_kv(
                 LoadMetadata(
-                    token_ids=key,  # full page-aligned key
+                    token_ids=key.token_ids,  # full page-aligned key
                     slot_mapping=slot_mapping,
                     offset=value.numel() - prefix_pad,  # LMCache offset convention
                 )
@@ -225,7 +227,7 @@ class LMCRadixCache(RadixCache):
             req.req_pool_idx, : len(token_ids)
         ]
 
-        _, new_last_node, _, _ = self.match_prefix(token_ids)
+        _, new_last_node, _, _ = self.match_prefix(RadixKey(token_ids, req.extra_key))
         assert new_last_node is not None
 
         self.inc_lock_ref(new_last_node)
@@ -275,6 +277,8 @@ if __name__ == "__main__":
         rank=0,
         tp_group=None,
     )
-    cache.insert([1, 2, 3], torch.tensor([10, 11, 12], dtype=torch.int64))
-    cache.insert([1, 2, 3, 4], torch.tensor([10, 11, 12, 13], dtype=torch.int64))
+    cache.insert(RadixKey([1, 2, 3]), torch.tensor([10, 11, 12], dtype=torch.int64))
+    cache.insert(
+        RadixKey([1, 2, 3, 4]), torch.tensor([10, 11, 12, 13], dtype=torch.int64)
+    )
     cache.pretty_print()
