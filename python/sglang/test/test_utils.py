@@ -571,6 +571,7 @@ def popen_launch_server(
             stderr=subprocess.PIPE,
             env=env,
             text=True,
+            bufsize=1,
         )
 
         def _dump(src, sinks):
