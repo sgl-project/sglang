@@ -11,8 +11,6 @@ from torch import nn
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.utils import add_prefix, align, is_cuda, is_hip, is_npu
 
-if not is_npu():
-    from sglang.srt.layers.attention.nsa.tilelang_kernel import act_quant, fp8_index
 if is_cuda():
     import deep_gemm
 
@@ -410,6 +408,9 @@ class Indexer(CustomOp):
         topk: int,
         layer_id: int,
     ) -> Optional[torch.Tensor]:
+        if not is_npu():
+            from sglang.srt.layers.attention.nsa.tilelang_kernel import fp8_index
+
         page_size = forward_batch.token_to_kv_pool.page_size
         assert page_size == 64, "only support page size 64"
 
@@ -501,6 +502,9 @@ class Indexer(CustomOp):
         forward_batch: ForwardBatch,
         layer_id: int,
     ) -> Optional[torch.Tensor]:
+        if not is_npu():
+            from sglang.srt.layers.attention.nsa.tilelang_kernel import act_quant
+
         if TYPE_CHECKING:
             assert isinstance(forward_batch.token_to_kv_pool, NSATokenToKVPool)
 
