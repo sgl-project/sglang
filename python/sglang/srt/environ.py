@@ -111,8 +111,6 @@ class Envs:
     # Model & File Download
     SGLANG_USE_MODELSCOPE = EnvBool(False)
 
-    # MM URLs
-    SGLANG_MM_ALLOW_REDIRECTS = EnvBool(True)
 
     # Test & Debug
     SGLANG_IS_IN_CI = EnvBool(False)
@@ -209,6 +207,11 @@ class Envs:
     SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE = EnvInt(2048)
     SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE = EnvInt(4096)
     SGLANG_TRITON_DECODE_SPLIT_TILE_SIZE = EnvInt(256)
+
+    # Media
+    SGLANG_MEDIA_WHITELISTED_DOMAINS = EnvStr(None)
+    SGLANG_MEDIA_BLACKLISTED_DOMAINS = EnvStr(None)
+    SGLANG_MM_ALLOW_REDIRECTS = EnvBool(True)
 
     # fmt: on
 

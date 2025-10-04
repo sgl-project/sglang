@@ -68,6 +68,7 @@ from typing import (
     TypeVar,
     Union,
 )
+from urllib.parse import urlparse
 
 import numpy as np
 import psutil
@@ -95,6 +96,58 @@ logger = logging.getLogger(__name__)
 
 show_time_cost = False
 time_infos = {}
+
+
+def _parse_media_domains(raw_value: Optional[str]) -> List[str]:
+    if not raw_value:
+        return []
+
+    parsed: List[str] = []
+    try:
+        loaded = json.loads(raw_value)
+        if isinstance(loaded, list):
+            parsed = [item for item in loaded if isinstance(item, str)]
+    except json.JSONDecodeError:
+        parsed = raw_value.split(",")
+
+    if not parsed:
+        return []
+
+    return [item.strip().lower() for item in parsed if item and item.strip()]
+
+
+def _domain_matches_rule(domain: str, rule: str) -> bool:
+    domain = domain.lower().rstrip(".")
+    rule = rule.lower().lstrip("*.").rstrip(".")
+    if not rule:
+        return False
+    return domain == rule or domain.endswith(f".{rule}")
+
+
+def _get_media_domain_rules() -> Tuple[List[str], List[str]]:
+    whitelist = _parse_media_domains(envs.SGLANG_MEDIA_WHITELISTED_DOMAINS.get())
+    blacklist = _parse_media_domains(envs.SGLANG_MEDIA_BLACKLISTED_DOMAINS.get())
+    return whitelist, blacklist
+
+
+def _validate_remote_media_domain(url: str) -> None:
+    parsed = urlparse(url)
+    host = parsed.hostname
+    if not host:
+        return
+
+    whitelist, blacklist = _get_media_domain_rules()
+    host = host.lower()
+
+    if whitelist and not any(_domain_matches_rule(host, rule) for rule in whitelist):
+        raise ValueError(
+            f"Remote media download blocked: '{host}' is not in the whitelist"
+        )
+
+    if blacklist and any(_domain_matches_rule(host, rule) for rule in blacklist):
+        raise ValueError(
+            f"Remote media download blocked: '{host}' is present in the blacklist"
+        )
 
 
 HIP_FP8_E4M3_FNUZ_MAX = 224.0
@@ -738,6 +791,7 @@ def load_audio(
             BytesIO(pybase64.b64decode(audio_file, validate=True))
         )
     elif audio_file.startswith("http://") or audio_file.startswith("https://"):
+        _validate_remote_media_domain(audio_file)
         timeout = int(os.getenv("REQUEST_TIMEOUT", "5"))
         response = requests.get(
             audio_file,
@@ -784,6 +838,7 @@ def load_image(
     elif isinstance(image_file, bytes):
         image = Image.open(BytesIO(image_file))
     elif image_file.startswith("http://") or image_file.startswith("https://"):
+        _validate_remote_media_domain(image_file)
         timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
         response = requests.get(
             image_file,
@@ -814,6 +869,7 @@ def get_image_bytes(image_file: Union[str, bytes]):
     if isinstance(image_file, bytes):
         return image_file
     elif image_file.startswith("http://") or image_file.startswith("https://"):
+        _validate_remote_media_domain(image_file)
         timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
         response = requests.get(
             image_file,
@@ -855,6 +911,7 @@ def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
             vr = VideoReader(tmp_file.name, ctx=ctx)
         elif isinstance(video_file, str):
             if video_file.startswith(("http://", "https://")):
+                _validate_remote_media_domain(video_file)
                 timeout = int(os.getenv("REQUEST_TIMEOUT", "10"))
                 response = requests.get(
                     video_file,

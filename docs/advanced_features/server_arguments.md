@@ -177,6 +177,8 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--chat-template` | The buliltin chat template name or the path of the chat template file. This is only used for OpenAI-compatible API server. | None |
 | `--completion-template` | The buliltin completion template name or the path of the completion template file. This is only used for OpenAI-compatible API server. only for code completion currently. | None |
 | `--file-storage-path` | The path of the file storage in backend. | sglang_storage |
+| `--media-whitelisted-domains` | Restrict remote multimodal downloads to these domains (case-insensitive, subdomains allowed). | None |
+| `--media-blacklisted-domains` | Block remote multimodal downloads that resolve to these domains (case-insensitive, subdomains allowed). | None |
 | `--enable-cache-report` | Return number of cached tokens in usage.prompt_tokens_details for each openai request. | False |
 | `--reasoning-parser` | Specify the parser for reasoning models, supported parsers are: {list(ReasoningParser.DetectorMap.keys())}. | None |
 | `--tool-call-parser` | Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', 'llama3', 'deepseekv3', 'pythonic', 'kimi_k2', 'qwen3_coder', 'glm45', and 'step3'. | None |

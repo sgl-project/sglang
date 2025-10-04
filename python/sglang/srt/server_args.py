@@ -23,6 +23,7 @@ import tempfile
 from typing import List, Literal, Optional, Union
 
 from sglang.srt.connector import ConnectorType
+from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.parser.reasoning_parser import ReasoningParser
@@ -1167,6 +1168,21 @@ class ServerArgs:
                 "Please choose one tokenizer batching approach."
             )
 
+    def _set_media_domain_env_vars(self):
+        if self.media_whitelisted_domains:
+            envs.SGLANG_MEDIA_WHITELISTED_DOMAINS.get() = json.dumps(
+                self.media_whitelisted_domains
+            )
+        else:
+            envs.SGLANG_MEDIA_WHITELISTED_DOMAINS.clear()
+
+        if self.media_blacklisted_domains:
+            envs.SGLANG_MEDIA_BLACKLISTED_DOMAINS.get() = json.dumps(
+                self.media_blacklisted_domains
+            )
+        else:
+            envs.SGLANG_MEDIA_BLACKLISTED_DOMAINS.clear()
+
     def _handle_environment_variables(self):
         os.environ["SGLANG_ENABLE_TORCH_COMPILE"] = (
             "1" if self.enable_torch_compile else "0"
@@ -1258,6 +1274,8 @@ class ServerArgs:
                     "The following domains are present in both --media-whitelisted-domains "
                     f"and --media-blacklisted-domains: {', '.join(sorted(overlap))}"
                 )
+
+        self._set_media_domain_env_vars()
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):

@@ -14,6 +14,8 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_LOGGING_CONFIG_PATH` | Custom logging configuration path | Not set |
 | `SGLANG_DISABLE_REQUEST_LOGGING` | Disable request logging | `false` |
 | `SGLANG_MM_ALLOW_REDIRECTS` | Allow HTTP redirects when downloading multimodal assets | `true` |
+| `SGLANG_MEDIA_WHITELISTED_DOMAINS` | JSON list of domains allowed for remote multimodal downloads; blocks all others | Not set |
+| `SGLANG_MEDIA_BLACKLISTED_DOMAINS` | JSON list of domains blocked for remote multimodal downloads | Not set |
 | `SGLANG_HEALTH_CHECK_TIMEOUT` | Timeout for health check in seconds | `20` |
 
 ## Performance Tuning
