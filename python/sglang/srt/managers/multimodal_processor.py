@@ -6,6 +6,7 @@ import pkgutil
 
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import log_warning_on_rank0
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +20,9 @@ def import_processors(package_name: str):
             try:
                 module = importlib.import_module(name)
             except Exception as e:
-                logger.warning(f"Ignore import error when loading {name}: {e}")
+                log_warning_on_rank0(
+                    logger, f"Ignore import error when loading {name}: {e}"
+                )
                 continue
             all_members = inspect.getmembers(module, inspect.isclass)
             classes = [

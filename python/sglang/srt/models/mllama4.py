@@ -34,7 +34,7 @@ from sglang.srt.managers.schedule_batch import (
     global_server_args_dict,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.utils import is_cpu
+from sglang.srt.utils import is_cpu, log_warning_on_rank0
 
 _is_cpu = is_cpu()
 
@@ -686,8 +686,9 @@ class Llama4ForConditionalGeneration(nn.Module):
             self._handle_default_weight(name, loaded_weight, params_dict)
         unloaded_params = params_dict.keys() - loaded_params
         if unloaded_params:
-            logger.warning(
-                f"Some weights are not initialized from checkpoints {unloaded_params}"
+            log_warning_on_rank0(
+                logger,
+                f"Some weights are not initialized from checkpoints {unloaded_params}",
             )
 
     def _should_skip_weight(self, name: str) -> bool:

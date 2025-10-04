@@ -25,7 +25,7 @@ from transformers import PretrainedConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import is_hip, retry
+from sglang.srt.utils import is_hip, log_info_on_rank0, retry
 from sglang.srt.utils.hf_transformers_utils import (
     get_config,
     get_context_length,
@@ -131,8 +131,9 @@ class ModelConfig:
             ]
             if self.hf_config.architectures[0] in mm_disabled_models:
                 enable_multimodal = False
-                logger.info(
-                    f"Multimodal is disabled for {self.hf_config.model_type}. To enable it, set --enable-multimodal."
+                log_info_on_rank0(
+                    logger,
+                    f"Multimodal is disabled for {self.hf_config.model_type}. To enable it, set --enable-multimodal.",
                 )
             else:
                 enable_multimodal = True

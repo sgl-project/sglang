@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import triton
 
-from sglang.srt.utils import get_device_name, is_hip
+from sglang.srt.utils import get_device_name, is_hip, log_warning_on_rank0
 
 logger = logging.getLogger(__name__)
 _is_hip = is_hip()
@@ -86,7 +86,8 @@ def get_moe_configs(
         )
         if os.path.exists(try_config_file_path):
             with open(try_config_file_path) as f:
-                logger.warning(
+                log_warning_on_rank0(
+                    logger,
                     f"Config file not found at {config_file_path}. Fallback to triton version {try_triton_version} and use MoE kernel config from {try_config_file_path}. Performance might be sub-optimal!",
                 )
                 # If a configuration has been found, return it
@@ -94,12 +95,10 @@ def get_moe_configs(
 
     # If no optimized configuration is available, we will use the default
     # configuration
-    logger.warning(
-        (
-            "Using default MoE kernel config. Performance might be sub-optimal! "
-            "Config file not found at %s, you can create them with https://github.com/sgl-project/sglang/tree/main/benchmark/kernels/fused_moe_triton"
-        ),
-        config_file_path,
+    log_warning_on_rank0(
+        logger,
+        f"Using default MoE kernel config. Performance might be sub-optimal! "
+        f"Config file not found at {config_file_path}, you can create them with https://github.com/sgl-project/sglang/tree/main/benchmark/kernels/fused_moe_triton",
     )
     return None
 

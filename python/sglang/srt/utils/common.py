@@ -2510,6 +2510,13 @@ def log_info_on_rank0(logger, msg):
         logger.info(msg)
 
 
+def log_warning_on_rank0(logger, msg):
+    from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+    if get_tensor_model_parallel_rank() == 0:
+        logger.warning(msg)
+
+
 def load_json_config(data: str):
     try:
         return json.loads(data)
