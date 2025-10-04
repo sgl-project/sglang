@@ -4,7 +4,6 @@ import time
 
 import torch
 
-from sglang import ServerArgs
 from sglang.srt.managers.cache_controller import HiCacheController
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
@@ -17,6 +16,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
     MHATokenToKVPoolHost,
     MLATokenToKVPoolHost,
 )
+from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 
