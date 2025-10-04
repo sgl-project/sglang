@@ -22,6 +22,11 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 from torch.nn.parameter import Parameter
 
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
+)
+from sglang.srt.distributed.parallel_state import get_tp_group
+from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import get_moe_runner_backend
@@ -671,6 +676,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             top_k = topk_output.topk_config.top_k
             router_logits = topk_output.router_logits
 
+            with use_symmetric_memory(
+                get_tp_group(), disabled=not is_allocation_symmetric()
+            ):
+                symm_output = torch.empty_like(x)
             trtllm_gen_output = trtllm_fp4_block_scale_moe(
                 router_logits.to(torch.bfloat16),
                 None,  # routing_bias
@@ -699,6 +708,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 self._get_tile_tokens_dim(x, top_k),
                 1,  # routing_method_type, renormalize
                 True,  # do finalize
+                output=symm_output,
             )[0]
             return StandardCombineInput(hidden_states=trtllm_gen_output)
 
