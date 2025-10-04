@@ -108,7 +108,7 @@ struct CliArgs {
     #[arg(long, num_args = 0..)]
     worker_urls: Vec<String>,
 
-    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two"])]
+    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "load_aware", "rule_based"])]
     policy: String,
 
     #[arg(long, default_value_t = false)]
@@ -117,10 +117,10 @@ struct CliArgs {
     #[arg(long, action = ArgAction::Append)]
     decode: Vec<String>,
 
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two"])]
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "load_aware", "rule_based"])]
     prefill_policy: Option<String>,
 
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two"])]
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "load_aware", "rule_based"])]
     decode_policy: Option<String>,
 
     #[arg(long, default_value_t = 600)]
@@ -314,6 +314,8 @@ impl CliArgs {
         match policy_str {
             "random" => PolicyConfig::Random,
             "round_robin" => PolicyConfig::RoundRobin,
+            "load_aware" => PolicyConfig::LoadAware,
+            "rule_based" => PolicyConfig::RuleBased,
             "cache_aware" => PolicyConfig::CacheAware {
                 cache_threshold: self.cache_threshold,
                 balance_abs_threshold: self.balance_abs_threshold,

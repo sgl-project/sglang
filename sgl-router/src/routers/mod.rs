@@ -133,4 +133,23 @@ pub trait RouterTrait: Send + Sync + Debug {
     fn is_pd_mode(&self) -> bool {
         self.router_type() == "pd"
     }
+
+    /// Get router statistics for intelligent routing decisions
+    ///
+    /// Returns stats about the router's workers including:
+    /// - Average priority, cost, and load
+    /// - Healthy vs total worker counts
+    /// - Whether this is a PD mode router
+    ///
+    /// Default implementation returns stats indicating no workers available.
+    fn get_router_stats(&self) -> router_manager::RouterStats {
+        router_manager::RouterStats {
+            avg_priority: 0.0,
+            avg_cost: 1.0,
+            avg_load: f32::MAX,
+            healthy_workers: 0,
+            total_workers: 0,
+            is_pd_mode: self.is_pd_mode(),
+        }
+    }
 }
