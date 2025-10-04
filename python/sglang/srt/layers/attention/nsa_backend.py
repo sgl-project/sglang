@@ -125,8 +125,8 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
 
         # NOTE(dark): if fused, we return a transformed page table directly
         return fast_topk_transform_fused(
-            input=logits,
-            seq_lens=self.get_seqlens_expanded(),
+            score=logits,
+            lengths=self.get_seqlens_expanded(),
             page_table_size_1=self.attn_metadata.page_table_1,
             cu_seqlens_q=self.attn_metadata.cu_seqlens_q,
             topk=topk,
