@@ -99,53 +99,49 @@ show_time_cost = False
 time_infos = {}
 
 
-def _parse_media_domains(raw_value: Optional[str]) -> List[str]:
-    if not raw_value:
-        return []
-
-    parsed: List[str] = []
-    try:
-        loaded = orjson.loads(raw_value)
-        if isinstance(loaded, list):
-            parsed = [item for item in loaded if isinstance(item, str)]
-    except orjson.JSONDecodeError:
-        parsed = raw_value.split(",")
-
-    if not parsed:
-        return []
-
-    return [item.strip().lower() for item in parsed if item and item.strip()]
-
-
-def _domain_matches_rule(domain: str, rule: str) -> bool:
-    domain = domain.lower().rstrip(".")
-    rule = rule.lower().lstrip("*.").rstrip(".")
-    if not rule:
-        return False
-    return domain == rule or domain.endswith(f".{rule}")
-
-
-def _get_media_domain_rules() -> Tuple[List[str], List[str]]:
-    whitelist = _parse_media_domains(envs.SGLANG_MEDIA_WHITELISTED_DOMAINS.get())
-    blacklist = _parse_media_domains(envs.SGLANG_MEDIA_BLACKLISTED_DOMAINS.get())
-    return whitelist, blacklist
-
-
 def _validate_remote_media_domain(url: str) -> None:
     parsed = urlparse(url)
     host = parsed.hostname
     if not host:
         return
 
-    whitelist, blacklist = _get_media_domain_rules()
-    host = host.lower()
+    host = host.lower().rstrip(".")
 
-    if whitelist and not any(_domain_matches_rule(host, rule) for rule in whitelist):
+    def _load_rules(env_field) -> List[str]:
+        raw_value = env_field.get()
+        if not raw_value:
+            return []
+
+        try:
+            loaded = orjson.loads(raw_value)
+            if isinstance(loaded, list):
+                candidates = loaded
+            else:
+                candidates = []
+        except orjson.JSONDecodeError:
+            candidates = raw_value.split(",")
+
+        rules: List[str] = []
+        for item in candidates:
+            if not isinstance(item, str):
+                continue
+            normalized = item.strip().lower().lstrip("*.").rstrip(".")
+            if normalized:
+                rules.append(normalized)
+        return rules
+
+    def _matches(rules: List[str]) -> bool:
+        return any(host == rule or host.endswith(f".{rule}") for rule in rules)
+
+    whitelist = _load_rules(envs.SGLANG_MEDIA_WHITELISTED_DOMAINS)
+    blacklist = _load_rules(envs.SGLANG_MEDIA_BLACKLISTED_DOMAINS)
+
+    if whitelist and not _matches(whitelist):
         raise ValueError(
             f"Remote media download blocked: '{host}' is not in the whitelist"
         )
 
-    if blacklist and any(_domain_matches_rule(host, rule) for rule in blacklist):
+    if blacklist and _matches(blacklist):
         raise ValueError(
             f"Remote media download blocked: '{host}' is present in the blacklist"
         )
