@@ -31,6 +31,8 @@ import psutil
 import setproctitle
 import torch
 import zmq
+from torch.cuda import Stream as CudaStream
+from torch.cuda import StreamContext as CudaStreamContext
 from torch.distributed import barrier
 
 from sglang.global_config import global_config
@@ -525,9 +527,9 @@ class Scheduler(
         self.kv_transfer_speed_gb_s: float = 0.0
         self.kv_transfer_latency_ms: float = 0.0
         self.sessions: Dict[str, Session] = {}
-        self.current_stream = torch.get_device_module(self.device).current_stream()
+        self.default_stream = torch.cuda.current_stream(self.device)
         if self.device == "cpu":
-            self.current_stream.synchronize = lambda: None  # No-op for CPU
+            self.default_stream.synchronize = lambda: None  # No-op for CPU
         self.forward_sleep_time = None
 
         # Init chunked prefill
@@ -937,14 +939,14 @@ class Scheduler(
         if not self.enable_overlap:
             return
 
-        self.forward_stream = torch.get_device_module(self.device).Stream()
-        self.forward_stream_ctx = torch.get_device_module(self.device).stream(
-            self.forward_stream
-        )
-        self.copy_stream = torch.get_device_module(self.device).Stream()
-        self.copy_stream_ctx = torch.get_device_module(self.device).stream(
-            self.copy_stream
-        )
+        self.forward_stream: CudaStream = torch.get_device_module(self.device).Stream()
+        self.forward_stream_ctx: CudaStreamContext = torch.get_device_module(
+            self.device
+        ).stream(self.forward_stream)
+        self.copy_stream: CudaStream = torch.get_device_module(self.device).Stream()
+        self.copy_stream_ctx: CudaStreamContext = torch.get_device_module(
+            self.device
+        ).stream(self.copy_stream)
 
         self.future_map = FutureMap(self.max_running_requests, self.device)
 
@@ -2086,12 +2088,14 @@ class Scheduler(
                 cur_future_map_ct = self.future_map.update_ct(bs)
 
                 with self.forward_stream_ctx:
+                    self.forward_stream.wait_stream(self.default_stream)
                     self.future_map.resolve_future(model_worker_batch)
                     forward_batch_output = self.model_worker.forward_batch_generation(
                         batch_or_worker_batch
                     )
-                    next_token_ids = forward_batch_output.next_token_ids
-                    self.future_map.store_to_map(cur_future_map_ct, bs, next_token_ids)
+                    self.future_map.store_to_map(
+                        cur_future_map_ct, bs, forward_batch_output.next_token_ids
+                    )
 
                     copy_done = torch.cuda.Event()
                     copy_done.record()
@@ -2100,13 +2104,14 @@ class Scheduler(
                     forward_batch_output.copy_done = copy_done
 
                 # FIXME(lsyin): move this assignment elsewhere
-                forward_batch_output.next_token_ids = (
-                    self.future_map.update_next_future(cur_future_map_ct, bs)
+                maybe_future_next_token_ids = self.future_map.update_next_future(
+                    cur_future_map_ct, bs
                 )
             else:
                 forward_batch_output = self.model_worker.forward_batch_generation(
                     batch_or_worker_batch
                 )
+                maybe_future_next_token_ids = forward_batch_output.next_token_ids
                 copy_done = None
 
             if not self.spec_algorithm.is_none():
@@ -2115,12 +2120,11 @@ class Scheduler(
                     batch.batch_size(), forward_batch_output.num_accepted_tokens
                 )
 
-            # update batch's output ids
-            batch.output_ids = forward_batch_output.next_token_ids
-
-            # print(f"[Run Batch]: {batch.seq_lens_cpu=}")
-            # print(f"[Run Batch]: {batch.input_ids=}")
-            # print(f"[Output Ids]: {batch.output_ids}")
+            # NOTE: maybe_future_next_token_ids is used in ScheduleBatch,
+            #       which can probably be replaced by future_indices later [TODO(lsyin)].
+            #       we shall still keep the original outputs, e.g. next_token_ids
+            #       in the GenerationBatchOutput for processing after copy_done.
+            batch.output_ids = maybe_future_next_token_ids
 
             # These 2 values are needed for processing the output, but the values can be
             # modified by overlap schedule. So we have to copy them here so that
@@ -2445,7 +2449,7 @@ class Scheduler(
         if batch.next_batch_sampling_info:
             if batch.next_batch_sampling_info.grammars is not None:
                 batch.next_batch_sampling_info.update_regex_vocab_mask()
-                self.current_stream.synchronize()
+                self.default_stream.synchronize()
             batch.next_batch_sampling_info.sampling_info_done.set()
 
     def watchdog_thread(self):
