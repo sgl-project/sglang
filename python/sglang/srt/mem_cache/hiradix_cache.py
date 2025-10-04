@@ -44,6 +44,7 @@ class HiRadixCache(RadixCache):
         hicache_storage_prefetch_policy: Optional[str] = "best_effort",
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[str] = None,
+        is_eagle: bool = False,
     ):
 
         if hicache_io_backend == "direct":
@@ -135,6 +136,7 @@ class HiRadixCache(RadixCache):
             page_size,
             disable=False,
             eviction_policy=eviction_policy,
+            is_eagle=is_eagle,
         )
 
     def _parse_storage_backend_extra_config(
@@ -658,6 +660,7 @@ class HiRadixCache(RadixCache):
 
     def match_prefix(self, key: RadixKey, **kwargs):
         empty_value = torch.empty((0,), dtype=torch.int64, device=self.device)
+        key.token_ids = self.key_convert_fn(key.token_ids)
         if self.disable or len(key) == 0:
             return MatchResult(
                 device_indices=empty_value,
@@ -820,8 +823,14 @@ class HiRadixCache(RadixCache):
         return new_node
 
     def insert(self, key: RadixKey, value=None, chunked=False):
+        key.token_ids = self.key_convert_fn(key.token_ids)
+
         if len(key) == 0:
             return 0
+
+        if self.is_eagle and value is not None:
+            # Make sure the value len equal to the EAGLE bigram key len
+            value = value[: len(key)]
 
         node = self.root_node
         child_key = self.get_child_key_fn(key)
