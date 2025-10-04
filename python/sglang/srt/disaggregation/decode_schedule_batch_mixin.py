@@ -76,6 +76,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
             req_pool_indices, dtype=torch.int64, device=self.device
         )
         self.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, device=self.device)
+        self.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
         self.orig_seq_lens = torch.tensor(
             seq_lens, dtype=torch.int32, device=self.device
         )
@@ -157,7 +158,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
             hidden_states = torch.stack(hidden_states_list, dim=0).to(self.device)
 
             # local import to avoid circular import
-            from sglang.srt.speculative.eagle_utils import EagleDraftInput
+            from sglang.srt.speculative.eagle_info import EagleDraftInput
 
             spec_info = EagleDraftInput(
                 topk_p=topk_p,
