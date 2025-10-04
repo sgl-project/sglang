@@ -22,16 +22,14 @@ import torch
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import get_pp_group, get_world_group
-from sglang.srt.hf_transformers_utils import (
-    get_processor,
-    get_tokenizer,
-    get_tokenizer_from_processor,
-)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import (
+    DestroyWeightsUpdateGroupReqInput,
     GetWeightsByNameReqInput,
+    InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterReqInput,
+    SendWeightsToRemoteInstanceReqInput,
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
@@ -40,11 +38,20 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, global_server_args_dict
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    ForwardBatchOutput,
+    PPProxyTensors,
+)
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.patch_torch import monkey_patch_torch_reductions
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
+from sglang.srt.utils.hf_transformers_utils import (
+    get_processor,
+    get_tokenizer,
+    get_tokenizer_from_processor,
+)
+from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
@@ -146,8 +153,8 @@ class TpModelWorker:
         assert self.max_running_requests > 0, "max_running_request is zero"
         self.max_queued_requests = server_args.max_queued_requests
         assert (
-            self.max_queued_requests > 0
-        ), "max_queued_requests is zero. We need to be at least 1 to schedule a request."
+            self.max_queued_requests is None or self.max_queued_requests >= 1
+        ), "If configured, max_queued_requests must be at least 1 for any work to be scheduled."
         self.max_req_len = min(
             self.model_config.context_len - 1,
             self.max_total_num_tokens - 1,
@@ -231,9 +238,7 @@ class TpModelWorker:
         model_worker_batch: ModelWorkerBatch,
         launch_done: Optional[threading.Event] = None,
         skip_sample: bool = False,
-    ) -> Tuple[
-        Union[LogitsProcessorOutput, torch.Tensor], Optional[torch.Tensor], bool
-    ]:
+    ) -> ForwardBatchOutput:
         # update the consumer index of hicache to the running batch
         self.set_hicache_consumer(model_worker_batch.hicache_consumer_index)
 
@@ -256,18 +261,32 @@ class TpModelWorker:
 
             if skip_sample:
                 next_token_ids = None
+                # For prefill-only requests, we still need to compute logprobs even when sampling is skipped
+                if (
+                    model_worker_batch.is_prefill_only
+                    and model_worker_batch.return_logprob
+                ):
+                    # Compute logprobs without full sampling
+                    self.model_runner.compute_logprobs_only(
+                        logits_output, model_worker_batch
+                    )
             else:
-                next_token_ids = self.model_runner.sample(
-                    logits_output, model_worker_batch
-                )
+                next_token_ids = self.model_runner.sample(logits_output, forward_batch)
 
-            return logits_output, next_token_ids, can_run_cuda_graph
+            return ForwardBatchOutput(
+                logits_output=logits_output,
+                next_token_ids=next_token_ids,
+                can_run_cuda_graph=can_run_cuda_graph,
+            )
         else:
             pp_proxy_tensors, can_run_cuda_graph = self.model_runner.forward(
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
-            return pp_proxy_tensors.tensors, None, can_run_cuda_graph
+            return ForwardBatchOutput(
+                pp_proxy_tensors=pp_proxy_tensors,
+                can_run_cuda_graph=can_run_cuda_graph,
+            )
 
     def forward_batch_embedding(self, model_worker_batch: ModelWorkerBatch):
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
@@ -289,6 +308,37 @@ class TpModelWorker:
             recv_req.world_size,
             recv_req.group_name,
             recv_req.backend,
+        )
+        return success, message
+
+    def destroy_weights_update_group(self, recv_req: DestroyWeightsUpdateGroupReqInput):
+        success, message = self.model_runner.destroy_weights_update_group(
+            recv_req.group_name,
+        )
+        return success, message
+
+    def init_weights_send_group_for_remote_instance(
+        self, recv_req: InitWeightsSendGroupForRemoteInstanceReqInput
+    ):
+        success, message = (
+            self.model_runner.init_weights_send_group_for_remote_instance(
+                recv_req.master_address,
+                recv_req.ports,
+                recv_req.group_rank,
+                recv_req.world_size,
+                recv_req.group_name,
+                recv_req.backend,
+            )
+        )
+        return success, message
+
+    def send_weights_to_remote_instance(
+        self, recv_req: SendWeightsToRemoteInstanceReqInput
+    ):
+        success, message = self.model_runner.send_weights_to_remote_instance(
+            recv_req.master_address,
+            recv_req.ports,
+            recv_req.group_name,
         )
         return success, message
 
