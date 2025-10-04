@@ -257,7 +257,19 @@ class MooncakeStore(HiCacheStorage):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
-        key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
+        # Apply extra_backend_tag prefix if available. TODO: move it to backend
+        prefixed_keys = keys
+        if (
+            extra_info
+            and extra_info.extra_info
+            and extra_info.extra_info.get("extra_backend_tag")
+        ):
+            prefix = extra_info.extra_info["extra_backend_tag"]
+            prefixed_keys = [f"{prefix}_{key}" for key in keys]
+
+        key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(
+            prefixed_keys, host_indices
+        )
         get_results = self._get_batch_zero_copy_impl(
             key_strs, buffer_ptrs, buffer_sizes
         )
@@ -269,7 +281,19 @@ class MooncakeStore(HiCacheStorage):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
-        key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
+        # Apply extra_backend_tag prefix if available. TODO: move it to backend
+        prefixed_keys = keys
+        if (
+            extra_info
+            and extra_info.extra_info
+            and extra_info.extra_info.get("extra_backend_tag")
+        ):
+            prefix = extra_info.extra_info["extra_backend_tag"]
+            prefixed_keys = [f"{prefix}_{key}" for key in keys]
+
+        key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(
+            prefixed_keys, host_indices
+        )
         exist_result = self._batch_exist(key_strs)
 
         set_keys = []
