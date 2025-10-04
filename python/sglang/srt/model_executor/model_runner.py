@@ -1421,8 +1421,8 @@ class ModelRunner:
                 4096,
             )
         if self.is_hybrid_gdn:
-            # for mamba cache radix, it need be divided by 4 (magic number now). (yizhang2077)
-            max_num_reqs = min(max_num_reqs, self.server_args.max_mamba_cache_size // 4)
+            # for mamba cache radix, it need be divided by 3 (magic number now). (yizhang2077)
+            max_num_reqs = min(max_num_reqs, self.server_args.max_mamba_cache_size // 3)
 
         if self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone():
             if self.is_draft_worker:

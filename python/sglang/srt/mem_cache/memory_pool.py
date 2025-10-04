@@ -280,7 +280,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             if req.mamba_pool_idx is not None:  # for radix cache
                 mid = req.mamba_pool_idx
             else:
-                mid = self.mamba_pool.alloc(1)
+                mid = self.mamba_pool.alloc(1)[0]
                 req.mamba_pool_idx = mid
             if mid is not None:
                 mamba_index.append(mid)

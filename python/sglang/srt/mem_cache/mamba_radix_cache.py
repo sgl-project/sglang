@@ -386,7 +386,8 @@ class MambaRadixCache(BasePrefixCache):
         if cow_mamba and last_node.mamba_value is not None:
             assert req.req_pool_idx is None  # req_pool_idx is uninitialed
 
-            if req.mamba_pool_idx is None:  # for reqs without mamba cache
+            # for reqs without mamba cache
+            if req.mamba_pool_idx is None:
                 dst_index = self.req_to_token_pool.mamba_pool.alloc(1)
                 # try to alloc again, protect last_node from eviction
                 if dst_index is None:
@@ -444,33 +445,23 @@ class MambaRadixCache(BasePrefixCache):
         # Radix Cache takes one ref in memory pool
         # insert the token_ids and kv_indices into the radix tree
         # Note: the insert function already frees the overlapped kv_indices
-        mamba_value = self.req_to_token_pool.get_mamba_indices(
-            req.req_pool_idx
-        ).unsqueeze(-1)
-        # radix tree mamba value is forked from req space
-        mamba_value_forked = self.req_to_token_pool.mamba_pool.fork_from(mamba_value)
-        # if alloc mamba cache failed, do evict and alloc again
-        if mamba_value_forked is None:
-            self.evict_mamba(1)
-            mamba_value_forked = self.req_to_token_pool.mamba_pool.fork_from(
-                mamba_value
-            )
-            assert mamba_value_forked is not None, "Can not alloc mamba cache"
+        mamba_value = (
+            self.req_to_token_pool.get_mamba_indices(req.req_pool_idx)
+            .unsqueeze(-1)
+            .clone()
+        )
 
         new_prefix_len, mamba_exist = self.insert(
             RadixKey(token_ids[:page_aligned_len], req.extra_key),
             page_aligned_kv_indices,
-            mamba_value_forked,
+            mamba_value,
         )
 
         self.token_to_kv_pool_allocator.free(
             kv_indices[len(req.prefix_indices) : new_prefix_len]
         )
 
-        self.req_to_token_pool.free(req.req_pool_idx)
-        # there is a mamba cache in radix cache, release it
-        if mamba_exist:
-            self.req_to_token_pool.mamba_pool.free(mamba_value_forked)
+        self.req_to_token_pool.free(req.req_pool_idx, free_mamba_cache=mamba_exist)
         self.dec_lock_ref(req.last_node)
 
     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
@@ -787,7 +778,7 @@ class MambaRadixCache(BasePrefixCache):
         new_node = TreeNode()
         new_node.children = {self.get_child_key_fn(key[split_len:]): child}
         new_node.parent = child.parent
-        new_node.mamba_value = None  # mamba cache can not be splitted
+        new_node.mamba_value = None  # mamba cache can not be split
         new_node.full_lock_ref = child.full_lock_ref
         new_node.mamba_lock_ref = 0
         new_node.key = child.key[:split_len]
