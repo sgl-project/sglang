@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import os
 from contextlib import contextmanager
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -9,6 +10,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 import triton
 import triton.language as tl
+from packaging.version import Version
 
 from sglang.srt.distributed import (
     GroupCoordinator,
@@ -17,7 +19,7 @@ from sglang.srt.distributed import (
     get_tp_group,
     tensor_model_parallel_all_reduce,
 )
-from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.utils import get_bool_env_var, get_rocm_version, is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -38,7 +40,11 @@ _LOCAL_ATTN_DP_RANK: Optional[int] = None
 _ENABLE_DP_ATTENTION_FLAG: bool = False
 
 _is_hip = is_hip()
-_USE_ROCM700A_WA = _is_hip and get_bool_env_var("SGLANG_USE_ROCM700A")
+
+if _is_hip:
+    _USE_ROCM7 = get_rocm_version()[0] >= 7
+    if _USE_ROCM7:
+        os.environ["TORCH_NCCL_BLOCKING_WAIT"] = "1"
 
 
 class DpPaddingMode(IntEnum):
@@ -71,12 +77,7 @@ class DpPaddingMode(IntEnum):
 
     @classmethod
     def get_default_mode_in_cuda_graph(cls) -> DpPaddingMode:
-        # TODO(kkhuang-amd): noqa, temporary work-around for rocm 7.0.0 alpha
-        # it can be safely removed later, once RCCL fixed
-        if _USE_ROCM700A_WA:
-            return cls.SUM_LEN
-        else:
-            return cls.MAX_LEN
+        return cls.MAX_LEN
 
 
 class _DpGatheredBufferWrapper:
@@ -446,8 +447,27 @@ def _dp_gather_via_all_gather(
     scattered_local_tokens = local_tokens.tensor_split(get_attention_tp_size())[
         get_attention_tp_rank()
     ]
-    get_attention_tp_group().reduce_scatter_tensor(scattered_local_tokens, local_tokens)
-    get_tp_group().all_gather_into_tensor(global_tokens, scattered_local_tokens)
+    if _USE_ROCM7:
+        rs_work = torch.distributed.reduce_scatter_tensor(
+            scattered_local_tokens,
+            local_tokens,
+            group=get_attention_tp_group().device_group,
+            async_op=True,
+        )
+        # Ensure NCCL comm stream is synced to this stream before touching another PG
+        rs_work.wait()  # with TORCH_NCCL_BLOCKING_WAIT=1
+
+        # AllGather on the (other) TP PG
+        torch.distributed.all_gather_into_tensor(
+            global_tokens,
+            scattered_local_tokens,
+            group=get_tp_group().device_group,
+        )
+    else:
+        get_attention_tp_group().reduce_scatter_tensor(
+            scattered_local_tokens, local_tokens
+        )
+        get_tp_group().all_gather_into_tensor(global_tokens, scattered_local_tokens)
 
 
 def _dp_gather(

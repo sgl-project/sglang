@@ -154,6 +154,18 @@ def get_cuda_version():
     return (0, 0)
 
 
+def get_rocm_version():
+    """Return (major, minor) from torch.version.hip, tolerant of suffixes like '7.0.51831-abc'."""
+    s = getattr(torch.version, "hip", None)  # None on non-ROCm builds
+    if s:
+        nums = re.findall(r"\d+", s)  # e.g. ['7','0','51831']
+        if len(nums) >= 2:
+            return int(nums[0]), int(nums[1])
+        if len(nums) == 1:
+            return int(nums[0]), 0
+    return (0, 0)
+
+
 def _check(cc_major):
     if not is_cuda():
         return False
