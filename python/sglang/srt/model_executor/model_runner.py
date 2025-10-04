@@ -100,10 +100,6 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
     SWAKVPool,
 )
-from sglang.srt.model_executor.compilation.compilation_counter import (
-    compilation_counter,
-)
-from sglang.srt.model_executor.compilation.compile import install_torch_compiled
 from sglang.srt.model_executor.compilation.piecewise_context_manager import (
     set_forward_context,
 )
@@ -287,11 +283,6 @@ class ModelRunner:
         self._weights_send_group = {}
 
         if self.server_args.enable_piecewise_cuda_graph:
-            install_torch_compiled(
-                self.model.model,
-                fullgraph=True,
-                dynamic_arg_dims=None,
-            )
             self.piecewise_cuda_graph_runner = PiecewiseCudaGraphRunner(self)
 
     def initialize(self, min_per_gpu_memory: float):

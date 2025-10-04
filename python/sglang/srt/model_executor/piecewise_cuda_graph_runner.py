@@ -31,7 +31,7 @@ from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
-from sglang.srt.distributed.parallel_state import GroupCoordinator, graph_capture
+from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     get_attention_tp_rank,
@@ -40,7 +40,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.torchao_utils import save_gemlite_cache
-from sglang.srt.model_executor.compilation.backend import SGLangBackend
+from sglang.srt.model_executor.compilation.compilation_config import CompilationConfig
 from sglang.srt.model_executor.compilation.compile import (
     install_torch_compiled,
     set_compiled,
@@ -53,20 +53,10 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
     PPProxyTensors,
-    enable_num_token_non_padded,
 )
 from sglang.srt.patch_torch import monkey_patch_torch_compile
 from sglang.srt.two_batch_overlap import TboCudaGraphRunnerPlugin
-from sglang.srt.utils import (
-    empty_context,
-    get_available_gpu_memory,
-    get_device_memory_capacity,
-    log_info_on_rank0,
-    require_attn_tp_gather,
-    require_gathered_buffer,
-    require_mlp_sync,
-    require_mlp_tp_gather,
-)
+from sglang.srt.utils import get_available_gpu_memory, log_info_on_rank0
 
 logger = logging.getLogger(__name__)
 
@@ -169,12 +159,6 @@ def set_torch_compile_config():
     monkey_patch_torch_compile()
 
 
-def get_batch_sizes_to_capture(model_runner: ModelRunner):
-    capture_bs = [1, 2, 4, 8, 16, 32, 36, 64, 128, 256, 512]
-    compile_bs = [1, 2, 4, 8, 16, 32, 36, 64, 128, 256, 512]
-    return capture_bs, compile_bs
-
-
 # Reuse this memory pool across all cuda graph runners.
 global_graph_memory_pool = None
 
@@ -205,47 +189,38 @@ class PiecewiseCudaGraphRunner:
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
 
+        self.compile_config = CompilationConfig()
+
+        install_torch_compiled(
+            self.model_runner.model.model,
+            fullgraph=True,
+            dynamic_arg_dims=None,
+            compile_config=self.compile_config,
+        )
+
         # Batch sizes to capture
-        self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
-        log_info_on_rank0(logger, f"Capture cuda graph bs {self.capture_bs}")
+        self.capture_num_tokens = self.compile_config.get_capture_sizes()
+        log_info_on_rank0(logger, f"Capture cuda graph bs {self.capture_num_tokens}")
         self.capture_forward_mode = ForwardMode.EXTEND
         self.capture_hidden_mode = CaptureHiddenMode.NULL
-        self.num_tokens_per_bs = 1
 
         # If returning hidden states is enabled, set initial capture hidden mode to full to avoid double-capture on startup
         if model_runner.server_args.enable_return_hidden_states:
             self.capture_hidden_mode = CaptureHiddenMode.FULL
 
         # Attention backend
-        self.max_bs = max(self.capture_bs)
-        self.max_num_token = self.max_bs * self.num_tokens_per_bs
-        self.seq_len_fill_value = (
-            self.model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
-        )
-        self.seq_lens_cpu = torch.full(
-            (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
-        )
-        self.extend_prefix_lens_cpu = torch.full(
-            (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
-        )
-        self.extend_seq_lens_cpu = torch.full(
-            (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
-        )
-        self.extend_logprob_start_lens_cpu = torch.full(
-            (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
-        )
+        self.max_num_tokens = max(self.capture_num_tokens)
 
         # Graph inputs
         with torch.device(self.device):
-            self.input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
+            self.input_ids = torch.zeros((self.max_num_tokens,), dtype=torch.int64)
             self.out_cache_loc = torch.zeros(
-                (self.max_num_token,), dtype=self._cache_loc_dtype()
+                (self.max_num_tokens,), dtype=self._cache_loc_dtype()
             )
-            self.positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
+            self.positions = torch.zeros((self.max_num_tokens,), dtype=torch.int64)
             self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
         self.attention_layers = self.model_runner.attention_layers
-        self.bsz_to_forward_batch = {}
         with set_compiled(True):
             self.warmup_and_capture()
 
@@ -311,7 +286,7 @@ class PiecewiseCudaGraphRunner:
 
     def can_run(self, forward_batch: ForwardBatch):
         num_tokens = len(forward_batch.input_ids)
-        if num_tokens < self.max_num_token:
+        if num_tokens <= self.max_num_tokens:
             return True
         return False
 
@@ -330,11 +305,11 @@ class PiecewiseCudaGraphRunner:
         )
         # Reverse the order to enable better memory sharing across cuda graphs.
         capture_range = (
-            tqdm.tqdm(list((self.capture_bs)))
+            tqdm.tqdm(list((self.capture_num_tokens)))
             if get_tensor_model_parallel_rank() == 0
-            else (self.capture_bs)
+            else (self.capture_num_tokens)
         )
-        for i, bs in enumerate(capture_range):
+        for i, num_tokens in enumerate(capture_range):
             if get_tensor_model_parallel_rank() == 0:
                 avail_mem = get_available_gpu_memory(
                     self.model_runner.device,
@@ -342,11 +317,11 @@ class PiecewiseCudaGraphRunner:
                     empty_cache=False,
                 )
                 capture_range.set_description(
-                    f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
+                    f"Capturing num tokens ({num_tokens=} {avail_mem=:.2f} GB)"
                 )
 
             with set_compiled(True):
-                self.bsz_to_forward_batch[bs] = self.capture_one_batch_size(bs)
+                self.capture_one_batch_size(num_tokens)
 
             # Save gemlite cache after each capture
             save_gemlite_cache()
@@ -451,7 +426,7 @@ class PiecewiseCudaGraphRunner:
         # Set graph pool id globally to be able to use symmetric memory
         set_graph_pool_id(get_global_graph_memory_pool())
 
-        return forward_batch
+        return
 
     def replay_prepare(
         self,
@@ -459,8 +434,8 @@ class PiecewiseCudaGraphRunner:
         **kwargs,
     ):
         num_tokens = len(forward_batch.input_ids)
-        index = bisect.bisect_left(self.capture_bs, num_tokens)
-        static_num_tokens = self.capture_bs[index]
+        index = bisect.bisect_left(self.capture_num_tokens, num_tokens)
+        static_num_tokens = self.capture_num_tokens[index]
         self.raw_num_tokens = num_tokens
         if static_num_tokens != num_tokens:
             self.out_cache_loc.zero_()

@@ -12,6 +12,7 @@ import torch
 import torch.fx as fx
 from torch._dispatch.python import enable_python_dispatcher
 
+from sglang.srt.model_executor.compilation.compilation_config import CompilationConfig
 from sglang.srt.model_executor.compilation.compilation_counter import (
     compilation_counter,
 )
@@ -235,6 +236,7 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
         compile_submod_names: list[str],
         inductor_config: dict[str, Any],
         graph_pool,
+        compile_config: CompilationConfig,
         sglang_backend: "SGLangBackend",
     ):
         super().__init__(module)
@@ -247,6 +249,7 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
         # When True, it annoyingly dumps the torch.fx.Graph on errors.
         self.extra_traceback = False
         self.inductor_config = inductor_config
+        self.compile_config = compile_config
 
     def run(self, *args):
         fake_args = [
@@ -285,6 +288,7 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
 
             self.module.__dict__[target] = CUDAPiecewiseBackend(
                 submod,
+                self.compile_config,
                 self.inductor_config,
                 self.graph_pool,
                 index,
@@ -335,6 +339,7 @@ class SGLangBackend:
 
     def __init__(
         self,
+        config: CompilationConfig,
     ):
         global global_graph_pool
         if global_graph_pool is None:
@@ -349,6 +354,7 @@ class SGLangBackend:
         self.inductor_config = {
             "enable_auto_functionalized_v2": False,
         }
+        self.compile_config = config
 
     def configure_post_pass(self):
         self.post_grad_pass_manager.configure()
@@ -400,6 +406,7 @@ class SGLangBackend:
             submod_names_to_compile,
             self.inductor_config,
             self.graph_pool,
+            self.compile_config,
             self,
         ).run(*example_inputs)
 

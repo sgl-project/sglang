@@ -13,6 +13,8 @@ from typing import Callable, Optional, Union
 
 import torch
 
+from sglang.srt.model_executor.compilation.compilation_config import CompilationConfig
+
 logger = logging.getLogger(__name__)
 
 _COMPILE_ENABLED = contextvars.ContextVar("_COMPILE_ENABLED", default=False)
@@ -123,6 +125,7 @@ def install_torch_compiled(
     *,
     dynamic_arg_dims: dict[str, Union[int, list[int]]] | None = None,
     backend_factory: Optional[Callable[[torch.fx.GraphModule, list], Callable]] = None,
+    compile_config: CompilationConfig = None,
     fullgraph: bool = True,
     use_custom_dispatcher: bool = True,
 ):
@@ -136,7 +139,7 @@ def install_torch_compiled(
     if backend_factory is None:
         from sglang.srt.model_executor.compilation.backend import SGLangBackend
 
-        backend_factory = lambda gm, ex: SGLangBackend()(gm, ex)
+        backend_factory = lambda gm, ex: SGLangBackend(compile_config)(gm, ex)
 
     compiled_codes: list[type(original_code)] = []
     state = {"compiled": False, "compiled_callable": None}

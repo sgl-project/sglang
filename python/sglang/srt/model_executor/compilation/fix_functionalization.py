@@ -37,7 +37,7 @@ class FixFunctionalizationPass(SGLangInductorPass):
             kwargs = node.kwargs
             at_target = node.args[0]
 
-            print("at_target: ", at_target)
+            # print("at_target: ", at_target)
 
             # if at_target == torch.ops.sgl_kernel.apply_rope_pos_ids_cos_sin_cache.default:
             #     print("rotary_embedding")

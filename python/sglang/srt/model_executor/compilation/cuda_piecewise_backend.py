@@ -102,77 +102,7 @@ class CUDAPiecewiseBackend:
 
         self.compile_sizes: set[int] = set([])
         self.compile_config = compile_config
-        self.cudagraph_capture_sizes: set[int] = set(
-            [
-                512,
-                504,
-                496,
-                488,
-                480,
-                472,
-                464,
-                456,
-                448,
-                440,
-                432,
-                424,
-                416,
-                408,
-                400,
-                392,
-                384,
-                376,
-                368,
-                360,
-                352,
-                344,
-                336,
-                328,
-                320,
-                312,
-                304,
-                296,
-                288,
-                280,
-                272,
-                264,
-                256,
-                248,
-                240,
-                232,
-                224,
-                216,
-                208,
-                200,
-                192,
-                184,
-                176,
-                168,
-                160,
-                152,
-                144,
-                136,
-                128,
-                120,
-                112,
-                104,
-                96,
-                88,
-                80,
-                72,
-                64,
-                56,
-                48,
-                40,
-                32,
-                24,
-                16,
-                8,
-                4,
-                2,
-                1,
-            ]
-        )
+        self.cudagraph_capture_sizes: set[int] = set(compile_config.get_capture_sizes())
 
         self.first_run_finished = False
 
@@ -243,13 +173,6 @@ class CUDAPiecewiseBackend:
         if entry.cudagraph is None:
             if entry.num_finished_warmup < 1:  # noqa
                 entry.num_finished_warmup += 1
-                if self.is_first_graph:
-                    logger.info(
-                        "Warming up %s/%s for shape %s",
-                        entry.num_finished_warmup,
-                        1,
-                        runtime_shape,
-                    )
                 return entry.runnable(*args)
 
             input_addresses = [
