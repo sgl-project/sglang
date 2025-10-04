@@ -44,13 +44,17 @@ def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
     global _DO_COMPILE_ALL
     global _IS_FIRST_RANK_ON_NODE
 
-    # Generate m_max
-    m_max = 1024 * 16
-    if server_args.chunked_prefill_size < 1:
-        m_max = 1024 * 64
-    elif server_args.chunked_prefill_size > 8192:
-        m_max = server_args.chunked_prefill_size * 2
-    m_max = min(1024 * 128, m_max)
+    # Generate world_size aware m_max
+    world_size = (
+        torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+    )
+    est_tokens = (
+        server_args.chunked_prefill_size
+        if server_args.chunked_prefill_size > 0
+        else 1024
+    )
+    m_max = min(1024 * 128, world_size * est_tokens * 2)
+
     _BUILTIN_M_LIST = list(range(1, m_max + 1))
 
     _IS_FIRST_RANK_ON_NODE = ServerArgs.base_gpu_id == gpu_id
@@ -125,8 +129,13 @@ def _compile_deep_gemm_one_type_all(
     m_list: List[int],
 ) -> None:
     if kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG:
-        m_alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
-        m_list = sorted(list(set(m for m in m_list if m % m_alignment == 0)))
+        alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
+    else:
+        alignment = 128
+    m_list = sorted({m for m in m_list if m % alignment == 0})
+
+    if not m_list:
+        m_list = [alignment]
 
     executor = _BaseWarmupExecutor.create(
         kernel_type, max_m=max(m_list), n=n, k=k, num_groups=num_groups
@@ -134,6 +143,7 @@ def _compile_deep_gemm_one_type_all(
 
     old_compile_mode = deep_gemm.get_compile_mode()
     deep_gemm.set_compile_mode(1)
+
     # TODO can use multi thread
     for m in tqdm(m_list, desc=f"DeepGEMM warmup"):
         executor.execute(m=m)
