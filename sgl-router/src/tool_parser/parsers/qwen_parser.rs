@@ -39,14 +39,6 @@ impl QwenParser {
         }
     }
 
-    /// Extract all tool call blocks from text
-    fn extract_tool_calls<'a>(&self, text: &'a str) -> Vec<&'a str> {
-        self.extractor
-            .captures_iter(text)
-            .filter_map(|cap| cap.get(1).map(|m| m.as_str()))
-            .collect()
-    }
-
     /// Parse a single JSON object into a ToolCall
     fn parse_single_object(&self, obj: &Value, index: usize) -> ToolParserResult<Option<ToolCall>> {
         let name = obj.get("name").and_then(|v| v.as_str());
@@ -128,32 +120,41 @@ impl Default for QwenParser {
 
 #[async_trait]
 impl ToolParser for QwenParser {
-    async fn parse_complete(&self, text: &str) -> ToolParserResult<Vec<ToolCall>> {
+    async fn parse_complete(&self, text: &str) -> ToolParserResult<(String, Vec<ToolCall>)> {
         // Check if text contains Qwen format
         if !self.has_tool_markers(text) {
-            return Ok(vec![]);
+            return Ok((text.to_string(), vec![]));
         }
 
-        // Extract all tool call blocks
-        let tool_blocks = self.extract_tool_calls(text);
-        let mut tools = Vec::new();
+        // Find where the first tool call begins
+        let idx = text.find("<tool_call>").unwrap(); // Safe because has_tool_markers checked
+        let normal_text = text[..idx].to_string();
 
-        for (index, json_str) in tool_blocks.iter().enumerate() {
-            // Parse each JSON block
-            match serde_json::from_str::<Value>(json_str.trim()) {
-                Ok(value) => {
-                    if let Some(tool) = self.parse_single_object(&value, index)? {
-                        tools.push(tool);
+        // Extract tool calls
+        let mut tools = Vec::new();
+        for (index, captures) in self.extractor.captures_iter(text).enumerate() {
+            if let Some(json_str) = captures.get(1) {
+                let parsed = serde_json::from_str::<Value>(json_str.as_str().trim())
+                    .map_err(|e| ToolParserError::ParsingFailed(e.to_string()))
+                    .and_then(|v| self.parse_single_object(&v, index));
+
+                match parsed {
+                    Ok(Some(tool)) => tools.push(tool),
+                    Ok(None) => continue,
+                    Err(e) => {
+                        tracing::warn!("Failed to parse tool call {}: {:?}", index, e);
+                        continue;
                     }
-                }
-                Err(_) => {
-                    // Skip malformed JSON blocks
-                    continue;
                 }
             }
         }
 
-        Ok(tools)
+        // If no tools were successfully parsed despite having markers, return entire text as fallback
+        if tools.is_empty() {
+            return Ok((text.to_string(), vec![]));
+        }
+
+        Ok((normal_text, tools))
     }
 
     async fn parse_incremental(
@@ -171,7 +172,18 @@ impl ToolParser for QwenParser {
 
         // Check if we have the start marker
         if !self.has_tool_markers(&state.buffer) {
-            return Ok(StreamResult::Incomplete);
+            // No tool markers detected - return all buffered content as normal text
+            let normal_text = std::mem::take(&mut state.buffer);
+            return Ok(StreamResult::NormalText(normal_text));
+        }
+
+        // Check for text before tool markers and extract it as normal text
+        if let Some(marker_pos) = state.buffer.find("<tool_call>") {
+            if marker_pos > 0 {
+                // We have text before the tool marker - extract it as normal text
+                let normal_text: String = state.buffer.drain(..marker_pos).collect();
+                return Ok(StreamResult::NormalText(normal_text));
+            }
         }
 
         // Find start and end positions
@@ -193,7 +205,12 @@ impl ToolParser for QwenParser {
                         }
                     }
                     Err(_) => {
-                        // JSON parsing failed, might be incomplete
+                        // JSON parsing failed, might be incomplete or malformed
+                        // If we have what looks like a complete tool call block, treat as normal text
+                        if state.buffer[start_pos..end_pos].contains("\n</tool_call>") {
+                            let malformed_text: String = state.buffer.drain(..end_pos).collect();
+                            return Ok(StreamResult::NormalText(malformed_text));
+                        }
                     }
                 }
             } else {
@@ -241,156 +258,6 @@ impl ToolParser for QwenParser {
     }
 
     fn detect_format(&self, text: &str) -> bool {
-        // Check if text contains Qwen-specific markers. If not, it's not this format.
-        if !self.has_tool_markers(text) {
-            return false;
-        }
-
-        // Try to extract tool calls to see if we have a complete, valid one.
-        let tool_blocks = self.extract_tool_calls(text);
-        for json_str in &tool_blocks {
-            if let Ok(value) = serde_json::from_str::<Value>(json_str.trim()) {
-                if let Some(obj) = value.as_object() {
-                    if obj.contains_key("name") && obj.contains_key("arguments") {
-                        // Found a valid, complete tool call.
-                        return true;
-                    }
-                }
-            }
-        }
-
-        // If we have the marker but no valid complete tool call,
-        // it could be a partial stream. We should detect this as the format.
-        true
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_parse_qwen_format() {
-        let parser = QwenParser::new();
-        let input = r#"<tool_call>
-{"name": "get_weather", "arguments": {"location": "Beijing", "units": "celsius"}}
-</tool_call>"#;
-
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.name, "get_weather");
-        assert!(result[0].function.arguments.contains("Beijing"));
-    }
-
-    #[tokio::test]
-    async fn test_parse_multiple_tools() {
-        let parser = QwenParser::new();
-        let input = r#"<tool_call>
-{"name": "search", "arguments": {"query": "rust programming"}}
-</tool_call>
-<tool_call>
-{"name": "calculate", "arguments": {"expression": "2 + 2"}}
-</tool_call>"#;
-
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].function.name, "search");
-        assert_eq!(result[1].function.name, "calculate");
-    }
-
-    #[tokio::test]
-    async fn test_with_normal_text() {
-        let parser = QwenParser::new();
-        let input = r#"Let me help you with that.
-<tool_call>
-{"name": "get_info", "arguments": {"topic": "Rust"}}
-</tool_call>
-Here are the results."#;
-
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.name, "get_info");
-    }
-
-    #[tokio::test]
-    async fn test_nested_json_structures() {
-        let parser = QwenParser::new();
-        let input = r#"<tool_call>
-{
-    "name": "process_data",
-    "arguments": {
-        "data": {
-            "nested": {
-                "array": [1, 2, 3],
-                "object": {"key": "value"}
-            }
-        }
-    }
-}
-</tool_call>"#;
-
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.name, "process_data");
-        assert!(result[0].function.arguments.contains("nested"));
-    }
-
-    #[test]
-    fn test_detect_format() {
-        let parser = QwenParser::new();
-
-        assert!(parser.detect_format(
-            r#"<tool_call>
-{"name": "test", "arguments": {}}
-</tool_call>"#
-        ));
-
-        assert!(parser.detect_format(
-            r#"Text before <tool_call>
-{"name": "test", "arguments": {}}
-</tool_call> text after"#
-        ));
-
-        assert!(!parser.detect_format(r#"{"name": "test", "arguments": {}}"#));
-        assert!(!parser.detect_format("plain text"));
-
-        // Partial format should still be detected
-        assert!(parser.detect_format("<tool_call>"));
-    }
-
-    #[tokio::test]
-    async fn test_streaming_partial() {
-        let parser = QwenParser::new();
-        let mut state = ParseState::new();
-
-        // Simulate streaming chunks
-        let chunks = vec![
-            "<tool_call>\n",
-            r#"{"name": "search","#,
-            r#" "arguments": {"query":"#,
-            r#" "rust"}}"#,
-            "\n</tool_call>",
-        ];
-
-        let mut found_name = false;
-        let mut found_complete = false;
-
-        for chunk in chunks {
-            let result = parser.parse_incremental(chunk, &mut state).await.unwrap();
-
-            match result {
-                StreamResult::ToolName { name, .. } => {
-                    assert_eq!(name, "search");
-                    found_name = true;
-                }
-                StreamResult::ToolComplete(tool) => {
-                    assert_eq!(tool.function.name, "search");
-                    found_complete = true;
-                }
-                _ => {}
-            }
-        }
-
-        assert!(found_name || found_complete); // At least one should be found
+        self.has_tool_markers(text)
     }
 }

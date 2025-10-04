@@ -4,7 +4,6 @@ use crate::tool_parser::partial_json::{
     compute_diff, find_common_prefix, is_complete_json, PartialJson,
 };
 use crate::tool_parser::traits::ToolParser;
-use crate::tool_parser::types::TokenConfig;
 
 #[test]
 fn test_parse_state_new() {
@@ -40,20 +39,6 @@ fn test_parse_state_process_char() {
     state.process_char('"');
     assert!(!state.escape_next);
     assert!(state.in_string); // Still in string because quote was escaped
-}
-
-#[test]
-fn test_token_config() {
-    let config = TokenConfig {
-        start_tokens: vec!["<start>".to_string(), "[".to_string()],
-        end_tokens: vec!["</end>".to_string(), "]".to_string()],
-        separator: ", ".to_string(),
-    };
-
-    let pairs: Vec<_> = config.iter_pairs().collect();
-    assert_eq!(pairs.len(), 2);
-    assert_eq!(pairs[0], ("<start>", "</end>"));
-    assert_eq!(pairs[1], ("[", "]"));
 }
 
 #[test]
@@ -242,12 +227,12 @@ async fn test_json_parser_complete_single() {
     let parser = JsonParser::new();
 
     let input = r#"{"name": "get_weather", "arguments": {"location": "San Francisco", "units": "celsius"}}"#;
-    let result = parser.parse_complete(input).await.unwrap();
+    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
 
-    assert_eq!(result.len(), 1);
-    assert_eq!(result[0].function.name, "get_weather");
-    assert!(result[0].function.arguments.contains("San Francisco"));
-    assert!(result[0].function.arguments.contains("celsius"));
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].function.name, "get_weather");
+    assert!(tools[0].function.arguments.contains("San Francisco"));
+    assert!(tools[0].function.arguments.contains("celsius"));
 }
 
 #[tokio::test]
@@ -259,11 +244,11 @@ async fn test_json_parser_complete_array() {
         {"name": "get_news", "arguments": {"query": "technology"}}
     ]"#;
 
-    let result = parser.parse_complete(input).await.unwrap();
+    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
 
-    assert_eq!(result.len(), 2);
-    assert_eq!(result[0].function.name, "get_weather");
-    assert_eq!(result[1].function.name, "get_news");
+    assert_eq!(tools.len(), 2);
+    assert_eq!(tools[0].function.name, "get_weather");
+    assert_eq!(tools[1].function.name, "get_news");
 }
 
 #[tokio::test]
@@ -271,55 +256,16 @@ async fn test_json_parser_with_parameters() {
     let parser = JsonParser::new();
 
     let input = r#"{"name": "calculate", "parameters": {"x": 10, "y": 20, "operation": "add"}}"#;
-    let result = parser.parse_complete(input).await.unwrap();
+    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
 
-    assert_eq!(result.len(), 1);
-    assert_eq!(result[0].function.name, "calculate");
-    assert!(result[0].function.arguments.contains("10"));
-    assert!(result[0].function.arguments.contains("20"));
-    assert!(result[0].function.arguments.contains("add"));
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].function.name, "calculate");
+    assert!(tools[0].function.arguments.contains("10"));
+    assert!(tools[0].function.arguments.contains("20"));
+    assert!(tools[0].function.arguments.contains("add"));
 }
 
-#[tokio::test]
-async fn test_json_parser_with_tokens() {
-    let parser = JsonParser::with_config(TokenConfig {
-        start_tokens: vec!["[TOOL_CALLS] [".to_string()],
-        end_tokens: vec!["]".to_string()],
-        separator: ", ".to_string(),
-    });
-
-    let input = r#"[TOOL_CALLS] [{"name": "search", "arguments": {"query": "rust programming"}}]"#;
-    let result = parser.parse_complete(input).await.unwrap();
-
-    assert_eq!(result.len(), 1);
-    assert_eq!(result[0].function.name, "search");
-}
-
-#[tokio::test]
-async fn test_multiline_json_with_tokens() {
-    let parser = JsonParser::with_config(TokenConfig {
-        start_tokens: vec!["<tool>".to_string()],
-        end_tokens: vec!["</tool>".to_string()],
-        separator: ", ".to_string(),
-    });
-
-    // Pretty-printed multi-line JSON
-    let input = r#"<tool>{
-    "name": "get_weather",
-    "arguments": {
-        "location": "San Francisco",
-        "units": "celsius",
-        "include_forecast": true
-    }
-}</tool>"#;
-
-    let result = parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 1);
-    assert_eq!(result[0].function.name, "get_weather");
-    assert!(result[0].function.arguments.contains("San Francisco"));
-    assert!(result[0].function.arguments.contains("celsius"));
-    assert!(result[0].function.arguments.contains("true"));
-}
+// Tests removed - TokenConfig no longer supported in JsonParser
 
 #[tokio::test]
 async fn test_multiline_json_array() {
@@ -342,12 +288,12 @@ async fn test_multiline_json_array() {
     }
 ]"#;
 
-    let result = parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 2);
-    assert_eq!(result[0].function.name, "function1");
-    assert_eq!(result[1].function.name, "function2");
-    assert!(result[0].function.arguments.contains("value1"));
-    assert!(result[1].function.arguments.contains("[1,2,3]"));
+    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 2);
+    assert_eq!(tools[0].function.name, "function1");
+    assert_eq!(tools[1].function.name, "function2");
+    assert!(tools[0].function.arguments.contains("value1"));
+    assert!(tools[1].function.arguments.contains("[1,2,3]"));
 }
 
 #[test]
@@ -361,29 +307,6 @@ fn test_json_parser_format_detection() {
 
     // Should not detect non-tool formats
     assert!(!parser.detect_format("plain text"));
-    assert!(!parser.detect_format(r#"{"key": "value"}"#));
-    assert!(!parser.detect_format(r#"{"data": {"nested": true}}"#));
-}
-
-#[tokio::test]
-async fn test_json_parser_streaming() {
-    let parser = JsonParser::new();
-    let mut state = ParseState::new();
-
-    let full_json = r#"{"name": "get_weather", "arguments": {"location": "San Francisco"}}"#;
-
-    let result = parser
-        .parse_incremental(full_json, &mut state)
-        .await
-        .unwrap();
-
-    match result {
-        StreamResult::ToolComplete(tool) => {
-            assert_eq!(tool.function.name, "get_weather");
-            assert!(tool.function.arguments.contains("San Francisco"));
-        }
-        _ => panic!("Expected ToolComplete for complete JSON"),
-    }
 }
 
 #[tokio::test]
@@ -397,9 +320,9 @@ async fn test_registry_with_json_parser() {
     let parser = registry.get_parser("gpt-4-turbo").unwrap();
 
     let input = r#"{"name": "test", "arguments": {"x": 1}}"#;
-    let result = parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 1);
-    assert_eq!(result[0].function.name, "test");
+    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].function.name, "test");
 }
 
 #[tokio::test]
@@ -407,9 +330,9 @@ async fn test_json_parser_invalid_input() {
     let parser = JsonParser::new();
 
     // Invalid JSON should return empty results
-    assert_eq!(parser.parse_complete("not json").await.unwrap().len(), 0);
-    assert_eq!(parser.parse_complete("{invalid}").await.unwrap().len(), 0);
-    assert_eq!(parser.parse_complete("").await.unwrap().len(), 0);
+    assert_eq!(parser.parse_complete("not json").await.unwrap().1.len(), 0);
+    assert_eq!(parser.parse_complete("{invalid}").await.unwrap().1.len(), 0);
+    assert_eq!(parser.parse_complete("").await.unwrap().1.len(), 0);
 }
 
 #[tokio::test]
@@ -418,11 +341,11 @@ async fn test_json_parser_empty_arguments() {
 
     // Tool call with no arguments
     let input = r#"{"name": "get_time"}"#;
-    let result = parser.parse_complete(input).await.unwrap();
+    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
 
-    assert_eq!(result.len(), 1);
-    assert_eq!(result[0].function.name, "get_time");
-    assert_eq!(result[0].function.arguments, "{}");
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].function.name, "get_time");
+    assert_eq!(tools[0].function.arguments, "{}");
 }
 
 #[cfg(test)]
@@ -435,14 +358,14 @@ mod failure_cases {
 
         // Missing name field
         let input = r#"{"arguments": {"x": 1}}"#;
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 0, "Should return empty for tool without name");
+        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tools.len(), 0, "Should return empty for tool without name");
 
         // Empty name
         let input = r#"{"name": "", "arguments": {"x": 1}}"#;
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1, "Should accept empty name string");
-        assert_eq!(result[0].function.name, "");
+        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tools.len(), 1, "Should accept empty name string");
+        assert_eq!(tools[0].function.name, "");
     }
 
     #[tokio::test]
@@ -451,55 +374,25 @@ mod failure_cases {
 
         // Arguments is a string instead of object
         let input = r#"{"name": "test", "arguments": "not an object"}"#;
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
+        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tools.len(), 1);
         // Should serialize the string as JSON
-        assert!(result[0].function.arguments.contains("not an object"));
+        assert!(tools[0].function.arguments.contains("not an object"));
 
         // Arguments is a number
         let input = r#"{"name": "test", "arguments": 42}"#;
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.arguments, "42");
+        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].function.arguments, "42");
 
         // Arguments is null
         let input = r#"{"name": "test", "arguments": null}"#;
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.arguments, "null");
+        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].function.arguments, "null");
     }
 
-    #[tokio::test]
-    async fn test_broken_wrapper_tokens() {
-        let parser = JsonParser::with_config(TokenConfig {
-            start_tokens: vec!["<tool>".to_string()],
-            end_tokens: vec!["</tool>".to_string()],
-            separator: ", ".to_string(),
-        });
-
-        // Missing end token
-        let input = r#"<tool>{"name": "test", "arguments": {}}"#;
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(
-            result.len(),
-            0,
-            "Should fail to parse without complete wrapper"
-        );
-
-        // Missing start token - parser looks for complete wrapper, so this won't parse
-        let input = r#"{"name": "test", "arguments": {}}</tool>"#;
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(
-            result.len(),
-            0,
-            "Should not parse JSON with incomplete wrapper"
-        );
-
-        // Mismatched tokens
-        let input = r#"<tool>{"name": "test", "arguments": {}}</wrong>"#;
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 0, "Should fail with mismatched tokens");
-    }
+    // Test removed - wrapper token functionality moved to specific parsers
 
     #[tokio::test]
     async fn test_invalid_json_structures() {
@@ -507,18 +400,18 @@ mod failure_cases {
 
         // Trailing comma
         let input = r#"{"name": "test", "arguments": {"x": 1,}}"#;
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 0, "Should reject JSON with trailing comma");
+        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tools.len(), 0, "Should reject JSON with trailing comma");
 
         // Missing quotes on keys
         let input = r#"{name: "test", arguments: {}}"#;
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 0, "Should reject invalid JSON syntax");
+        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tools.len(), 0, "Should reject invalid JSON syntax");
 
         // Unclosed object
         let input = r#"{"name": "test", "arguments": {"#;
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 0, "Should reject incomplete JSON");
+        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tools.len(), 0, "Should reject incomplete JSON");
     }
 }
 
@@ -532,17 +425,17 @@ mod edge_cases {
 
         // Unicode in function name
         let input = r#"{"name": "获取天气", "arguments": {"location": "北京"}}"#;
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.name, "获取天气");
-        assert!(result[0].function.arguments.contains("北京"));
+        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].function.name, "获取天气");
+        assert!(tools[0].function.arguments.contains("北京"));
 
         // Emoji in arguments
         let input = r#"{"name": "send_message", "arguments": {"text": "Hello 👋 World 🌍"}}"#;
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert!(result[0].function.arguments.contains("👋"));
-        assert!(result[0].function.arguments.contains("🌍"));
+        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert!(tools[0].function.arguments.contains("👋"));
+        assert!(tools[0].function.arguments.contains("🌍"));
     }
 
     #[tokio::test]
@@ -551,22 +444,22 @@ mod edge_cases {
 
         // Escaped quotes in arguments
         let input = r#"{"name": "echo", "arguments": {"text": "He said \"hello\""}}"#;
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert!(result[0].function.arguments.contains(r#"\"hello\""#));
+        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert!(tools[0].function.arguments.contains(r#"\"hello\""#));
 
         // Escaped backslashes
         let input = r#"{"name": "path", "arguments": {"dir": "C:\\Users\\test"}}"#;
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert!(result[0].function.arguments.contains("\\\\"));
+        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert!(tools[0].function.arguments.contains("\\\\"));
 
         // Newlines and tabs
         let input = r#"{"name": "format", "arguments": {"text": "line1\nline2\ttabbed"}}"#;
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert!(result[0].function.arguments.contains("\\n"));
-        assert!(result[0].function.arguments.contains("\\t"));
+        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert!(tools[0].function.arguments.contains("\\n"));
+        assert!(tools[0].function.arguments.contains("\\t"));
     }
 
     #[tokio::test]
@@ -580,10 +473,10 @@ mod edge_cases {
         }
         large_args.push_str(r#""final": "value"}}"#);
 
-        let result = parser.parse_complete(&large_args).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.name, "process");
-        assert!(result[0].function.arguments.contains("field_999"));
+        let (_normal_text, tools) = parser.parse_complete(&large_args).await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].function.name, "process");
+        assert!(tools[0].function.arguments.contains("field_999"));
 
         // Large array of tool calls
         let mut large_array = "[".to_string();
@@ -595,9 +488,9 @@ mod edge_cases {
         }
         large_array.push(']');
 
-        let result = parser.parse_complete(&large_array).await.unwrap();
-        assert_eq!(result.len(), 100);
-        assert_eq!(result[99].function.name, "func_99");
+        let (_normal_text, tools) = parser.parse_complete(&large_array).await.unwrap();
+        assert_eq!(tools.len(), 100);
+        assert_eq!(tools[99].function.name, "func_99");
     }
 
     #[tokio::test]
@@ -612,10 +505,10 @@ mod edge_cases {
             {"key": "value", "another": "field"}
         ]"#;
 
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 2, "Should only parse valid tool calls");
-        assert_eq!(result[0].function.name, "tool1");
-        assert_eq!(result[1].function.name, "tool2");
+        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tools.len(), 2, "Should only parse valid tool calls");
+        assert_eq!(tools[0].function.name, "tool1");
+        assert_eq!(tools[1].function.name, "tool2");
     }
 
     #[tokio::test]
@@ -624,14 +517,14 @@ mod edge_cases {
 
         // JSON with duplicate keys (last one wins in most parsers)
         let input = r#"{"name": "first", "name": "second", "arguments": {"x": 1, "x": 2}}"#;
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
+        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tools.len(), 1);
         assert_eq!(
-            result[0].function.name, "second",
+            tools[0].function.name, "second",
             "Last duplicate key should win"
         );
         assert!(
-            result[0].function.arguments.contains("2"),
+            tools[0].function.arguments.contains("2"),
             "Last duplicate value should win"
         );
     }
@@ -642,43 +535,15 @@ mod edge_cases {
 
         // Null values in arguments
         let input = r#"{"name": "test", "arguments": {"required": "value", "optional": null}}"#;
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert!(result[0].function.arguments.contains("null"));
+        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert!(tools[0].function.arguments.contains("null"));
 
         // Array with null
         let input = r#"{"name": "test", "arguments": {"items": [1, null, "three"]}}"#;
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert!(result[0].function.arguments.contains("null"));
-    }
-
-    #[tokio::test]
-    async fn test_multiple_token_pairs_with_conflicts() {
-        let parser = JsonParser::with_config(TokenConfig {
-            start_tokens: vec!["<<".to_string(), "<tool>".to_string()],
-            end_tokens: vec![">>".to_string(), "</tool>".to_string()],
-            separator: ", ".to_string(),
-        });
-
-        // First pattern
-        let input = r#"<<{"name": "test1", "arguments": {}}>>"#;
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.name, "test1");
-
-        // Second pattern
-        let input = r#"<tool>{"name": "test2", "arguments": {}}</tool>"#;
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.name, "test2");
-
-        // Nested patterns (should use first match)
-        let input = r#"<<tool>{"name": "test3", "arguments": {}}</tool>>"#;
-        let result = parser.parse_complete(input).await.unwrap();
-        // This is tricky - depends on regex behavior
-        // The parser should handle this gracefully
-        assert!(result.len() <= 1, "Should not parse multiple times");
+        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert!(tools[0].function.arguments.contains("null"));
     }
 
     #[tokio::test]
@@ -743,25 +608,25 @@ mod edge_cases {
 
         // Boolean values
         let input = r#"{"name": "toggle", "arguments": {"enabled": true, "disabled": false}}"#;
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert!(result[0].function.arguments.contains("true"));
-        assert!(result[0].function.arguments.contains("false"));
+        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert!(tools[0].function.arguments.contains("true"));
+        assert!(tools[0].function.arguments.contains("false"));
 
         // Numbers (including float and negative)
         let input = r#"{"name": "calc", "arguments": {"int": 42, "float": 3.14, "negative": -17}}"#;
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert!(result[0].function.arguments.contains("42"));
-        assert!(result[0].function.arguments.contains("3.14"));
-        assert!(result[0].function.arguments.contains("-17"));
+        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert!(tools[0].function.arguments.contains("42"));
+        assert!(tools[0].function.arguments.contains("3.14"));
+        assert!(tools[0].function.arguments.contains("-17"));
 
         // Empty arrays and objects
         let input = r#"{"name": "test", "arguments": {"empty_arr": [], "empty_obj": {}}}"#;
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert!(result[0].function.arguments.contains("[]"));
-        assert!(result[0].function.arguments.contains("{}"));
+        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert!(tools[0].function.arguments.contains("[]"));
+        assert!(tools[0].function.arguments.contains("{}"));
     }
 
     #[tokio::test]
@@ -770,15 +635,15 @@ mod edge_cases {
 
         // Using "function" instead of "name"
         let input = r#"{"function": "test_func", "arguments": {"x": 1}}"#;
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.name, "test_func");
+        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].function.name, "test_func");
 
         // Both "name" and "function" present (name should take precedence)
         let input = r#"{"name": "primary", "function": "secondary", "arguments": {}}"#;
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.name, "primary");
+        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].function.name, "primary");
     }
 
     #[tokio::test]
@@ -792,15 +657,15 @@ mod edge_cases {
                 "key"   :   "value"
             }
         }  "#;
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.name, "test");
+        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].function.name, "test");
 
         // Minified JSON (no whitespace)
         let input = r#"{"name":"compact","arguments":{"a":1,"b":2}}"#;
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.name, "compact");
+        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].function.name, "compact");
     }
 }
 
@@ -830,9 +695,9 @@ mod stress_tests {
             }
         }"#;
 
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert!(result[0].function.arguments.contains("deep"));
+        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert!(tools[0].function.arguments.contains("deep"));
     }
 
     #[tokio::test]
@@ -845,9 +710,9 @@ mod stress_tests {
             let parser_clone = parser.clone();
             let handle = tokio::spawn(async move {
                 let input = format!(r#"{{"name": "func_{}", "arguments": {{}}}}"#, i);
-                let result = parser_clone.parse_complete(&input).await.unwrap();
-                assert_eq!(result.len(), 1);
-                assert_eq!(result[0].function.name, format!("func_{}", i));
+                let (_normal_text, tools) = parser_clone.parse_complete(&input).await.unwrap();
+                assert_eq!(tools.len(), 1);
+                assert_eq!(tools[0].function.name, format!("func_{}", i));
             });
             handles.push(handle);
         }

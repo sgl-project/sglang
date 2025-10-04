@@ -12,11 +12,11 @@ async fn test_qwen_single_tool() {
 {"name": "get_weather", "arguments": {"city": "Beijing", "units": "celsius"}}
 </tool_call>"#;
 
-    let result = parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 1);
-    assert_eq!(result[0].function.name, "get_weather");
+    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].function.name, "get_weather");
 
-    let args: serde_json::Value = serde_json::from_str(&result[0].function.arguments).unwrap();
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
     assert_eq!(args["city"], "Beijing");
     assert_eq!(args["units"], "celsius");
 }
@@ -32,10 +32,11 @@ async fn test_qwen_multiple_sequential_tools() {
 {"name": "translate", "arguments": {"text": "Hello", "to": "zh"}}
 </tool_call>"#;
 
-    let result = parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 2);
-    assert_eq!(result[0].function.name, "search");
-    assert_eq!(result[1].function.name, "translate");
+    let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 2);
+    assert_eq!(normal_text, "Let me help you with that.\n");
+    assert_eq!(tools[0].function.name, "search");
+    assert_eq!(tools[1].function.name, "translate");
 }
 
 #[tokio::test]
@@ -55,11 +56,11 @@ async fn test_qwen_pretty_printed_json() {
 }
 </tool_call>"#;
 
-    let result = parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 1);
-    assert_eq!(result[0].function.name, "create_document");
+    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].function.name, "create_document");
 
-    let args: serde_json::Value = serde_json::from_str(&result[0].function.arguments).unwrap();
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
     assert_eq!(args["metadata"]["author"], "Qwen");
     assert_eq!(args["metadata"]["tags"], json!(["test", "example"]));
 }
@@ -79,10 +80,11 @@ Now I'll translate something.
 </tool_call>
 Done!"#;
 
-    let result = parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 2);
-    assert_eq!(result[0].function.name, "search");
-    assert_eq!(result[1].function.name, "translate");
+    let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 2);
+    assert_eq!(normal_text, "First, let me search for information.\n");
+    assert_eq!(tools[0].function.name, "search");
+    assert_eq!(tools[1].function.name, "translate");
 }
 
 #[tokio::test]
@@ -92,9 +94,9 @@ async fn test_qwen_empty_arguments() {
 {"name": "get_time", "arguments": {}}
 </tool_call>"#;
 
-    let result = parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 1);
-    assert_eq!(result[0].function.name, "get_time");
+    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].function.name, "get_time");
 }
 
 #[tokio::test]
@@ -104,10 +106,10 @@ async fn test_qwen_with_newlines_in_strings() {
 {"name": "write_file", "arguments": {"content": "Line 1\nLine 2\nLine 3", "path": "/tmp/test.txt"}}
 </tool_call>"#;
 
-    let result = parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 1);
+    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
 
-    let args: serde_json::Value = serde_json::from_str(&result[0].function.arguments).unwrap();
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
     assert_eq!(args["content"], "Line 1\nLine 2\nLine 3");
 }
 
@@ -128,14 +130,14 @@ async fn test_qwen_incomplete_tags() {
     // Missing closing tag
     let input = r#"<tool_call>
 {"name": "test", "arguments": {}}"#;
-    let result = parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 0);
+    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 0);
 
     // Missing opening tag
     let input = r#"{"name": "test", "arguments": {}}
 </tool_call>"#;
-    let result = parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 0);
+    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 0);
 }
 
 #[tokio::test]
@@ -171,12 +173,16 @@ Let me also calculate something for you:
 
 These tools will provide the information you need."#;
 
-    let result = parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 2);
-    assert_eq!(result[0].function.name, "web_search");
-    assert_eq!(result[1].function.name, "calculator");
+    let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 2);
+    assert_eq!(
+        normal_text,
+        "I'll help you search for information and perform calculations.\n\n"
+    );
+    assert_eq!(tools[0].function.name, "web_search");
+    assert_eq!(tools[1].function.name, "calculator");
 
-    let args0: serde_json::Value = serde_json::from_str(&result[0].function.arguments).unwrap();
+    let args0: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
     assert_eq!(args0["query"], "quantum computing breakthroughs 2024");
     assert_eq!(args0["safe_search"], true);
 }
