@@ -112,7 +112,6 @@ def _launch_scheduler_process_only(
                         pp_rank,
                         None,
                         writer,
-                        None,
                     ),
                 )
 
@@ -583,6 +582,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 cached_tokens=meta_info.get("cached_tokens", 0),
                 output_logprobs=output_logprobs_proto,
                 input_logprobs=input_logprobs_proto,
+                index=output.get("index", 0),
             ),
         )
 
@@ -640,6 +640,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 cached_tokens=meta_info.get("cached_tokens", 0),
                 output_logprobs=output_logprobs_proto,
                 input_logprobs=input_logprobs_proto,
+                index=output.get("index", 0),
                 **matched_stop_kwargs,
             ),
         )
@@ -793,6 +794,28 @@ def main():
     # Logging
     parser.add_argument("--log-level", type=str, default="INFO", help="Logging level")
 
+    # Disaggregation mode arguments
+    parser.add_argument(
+        "--disaggregation-mode",
+        type=str,
+        default="null",
+        choices=["null", "prefill", "decode"],
+        help='Only used for PD disaggregation. "prefill" for prefill-only server, and "decode" for decode-only server. If not specified, it is not PD disaggregated',
+    )
+    parser.add_argument(
+        "--disaggregation-transfer-backend",
+        type=str,
+        default="mooncake",
+        choices=["mooncake", "nixl", "ascend", "fake"],
+        help="The backend for disaggregation transfer. Default is mooncake.",
+    )
+    parser.add_argument(
+        "--disaggregation-bootstrap-port",
+        type=int,
+        default=8998,
+        help="Bootstrap server port on the prefill server. Default is 8998.",
+    )
+
     args = parser.parse_args()
 
     # Convert to ServerArgs with gRPC host and port
@@ -808,7 +831,9 @@ def main():
         attention_backend=args.attention_backend,
         lora_paths=args.lora_paths.split(",") if args.lora_paths else None,
         log_level=args.log_level,
-        # Override with gRPC server host and port
+        disaggregation_mode=args.disaggregation_mode,
+        disaggregation_transfer_backend=args.disaggregation_transfer_backend,
+        disaggregation_bootstrap_port=args.disaggregation_bootstrap_port,
         host=args.host,
         port=args.port,
     )
