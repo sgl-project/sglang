@@ -1252,11 +1252,22 @@ impl WorkerManager {
             Ok(response) if response.status().is_success() => {
                 match response.json::<Value>().await {
                     Ok(json) => {
-                        if let Some(load) = json.get("load").and_then(|v| v.as_i64()) {
-                            debug!("Worker {} load: {}", url, load);
-                            Some(load as isize)
+                        // The /get_load endpoint returns an array of load info objects (one per DP rank)
+                        // Each object has: {dp_rank, num_reqs, num_waiting_reqs, num_tokens}
+                        if let Some(array) = json.as_array() {
+                            let total_tokens: i64 = array
+                                .iter()
+                                .filter_map(|entry| {
+                                    entry.get("num_tokens").and_then(|v| v.as_i64())
+                                })
+                                .sum();
+                            debug!("Worker {} load (total tokens): {}", url, total_tokens);
+                            Some(total_tokens as isize)
                         } else {
-                            warn!("Invalid load response from {}: {:?}", url, json);
+                            warn!(
+                                "Invalid load response from {}: expected array, got {:?}",
+                                url, json
+                            );
                             None
                         }
                     }
