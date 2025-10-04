@@ -350,7 +350,7 @@ mod test_pd_routing {
             ("http://10.0.0.1:8080", "10.0.0.1"),
             ("https://api.example.com:443", "api.example.com"),
             ("http://prefill-server", "prefill-server"),
-            ("http://[::1]:8080", "["),  // IPv6 edge case
+            ("http://[::1]:8080", "::1"),  // IPv6 edge case (previously returned "[" - now fixed)
             ("prefill:8080", "prefill"), // No protocol
         ];
 
