@@ -1,9 +1,9 @@
-import base64
 import io
 import os
 
 import numpy as np
 import openai
+import pybase64
 import requests
 from PIL import Image
 
@@ -378,7 +378,7 @@ class ImageOpenAITestMixin(TestOpenAIOmniServerBase):
             pil_img = Image.fromarray(frame)
             buff = io.BytesIO()
             pil_img.save(buff, format="JPEG")
-            base64_str = base64.b64encode(buff.getvalue()).decode("utf-8")
+            base64_str = pybase64.b64encode(buff.getvalue()).decode("utf-8")
             base64_frames.append(base64_str)
 
         messages = [{"role": "user", "content": []}]
