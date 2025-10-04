@@ -145,7 +145,7 @@ suites = {
         TestFile("lora/test_lora_llama4.py", 600),
     ],
     "per-commit-8-gpu": [
-        TestFile("hicache/test_hicache_storage_mooncake_backend.py", 800),
+        TestFile("hicache/test_hicache_storage_mooncake_backend.py", 400),
         TestFile("lora/test_lora_llama4.py", 600),
         TestFile("test_disaggregation.py", 499),
         TestFile("test_disaggregation_dp_attention.py", 155),
