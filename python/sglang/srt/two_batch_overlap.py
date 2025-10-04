@@ -30,7 +30,8 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.operations import execute_operations, execute_overlapped_operations
 from sglang.srt.operations_strategy import OperationsStrategy
-from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
+from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
+from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import BumpAllocator, empty_context, get_bool_env_var, is_hip
 
 if TYPE_CHECKING:
@@ -48,7 +49,7 @@ logger = logging.getLogger(__name__)
 
 def get_token_num_per_seq(
     forward_mode: ForwardMode,
-    spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]] = None,
+    spec_info: Optional[SpecInput] = None,
 ):
     if forward_mode.is_target_verify():
         return spec_info.draft_token_num
@@ -273,7 +274,7 @@ def compute_split_token_index(
 def compute_split_indices_for_cuda_graph_replay(
     forward_mode: ForwardMode,
     cuda_graph_num_tokens: int,
-    spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+    spec_info: Optional[SpecInput],
 ):
     forward_mode_for_tbo_split = (
         forward_mode if forward_mode != ForwardMode.IDLE else ForwardMode.DECODE
@@ -333,7 +334,7 @@ class TboCudaGraphRunnerPlugin:
         forward_mode: ForwardMode,
         bs: int,
         num_token_non_padded: int,
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        spec_info: Optional[SpecInput],
     ):
         token_num_per_seq = get_token_num_per_seq(
             forward_mode=forward_mode, spec_info=spec_info

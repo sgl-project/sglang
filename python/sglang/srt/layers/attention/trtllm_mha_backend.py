@@ -20,12 +20,10 @@ from sglang.srt.utils import is_flashinfer_available
 if is_flashinfer_available():
     import flashinfer
 
-from sglang.srt.speculative.eagle_utils import EagleDraftInput
-
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
-    from sglang.srt.speculative.spec_info import SpecInfo
+    from sglang.srt.speculative.spec_info import SpecInput
 
 # Constants
 DEFAULT_WORKSPACE_SIZE_MB = (
@@ -201,7 +199,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         seq_lens: torch.Tensor,
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
-        spec_info: Optional[SpecInfo],
+        spec_info: Optional[SpecInput],
     ):
         """Initialize metadata for CUDA graph capture."""
         metadata = TRTLLMMHAMetadata()
@@ -314,7 +312,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         seq_lens_sum: int,
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
-        spec_info: Optional[SpecInfo],
+        spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
         """Replay CUDA graph with new inputs."""
@@ -661,7 +659,7 @@ class TRTLLMHAAttnMultiStepDraftBackend(FlashInferMultiStepDraftBackend):
         forward_batch: ForwardBatch,
     ):
         assert forward_batch.spec_info is not None
-        assert isinstance(forward_batch.spec_info, EagleDraftInput)
+        assert forward_batch.spec_info.is_draft_input()
 
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_forward_metadata_capture_cuda_graph(
@@ -678,7 +676,7 @@ class TRTLLMHAAttnMultiStepDraftBackend(FlashInferMultiStepDraftBackend):
         self, forward_batch: ForwardBatch, bs: int
     ):
         assert forward_batch.spec_info is not None
-        assert isinstance(forward_batch.spec_info, EagleDraftInput)
+        assert forward_batch.spec_info.is_draft_input()
 
         for i in range(self.speculative_num_steps - 1):
 

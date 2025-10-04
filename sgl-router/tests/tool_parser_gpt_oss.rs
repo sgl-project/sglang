@@ -1,6 +1,9 @@
 //! GPT-OSS Parser Integration Tests
 
-use sglang_router_rs::tool_parser::{GptOssParser, ParseState, StreamResult, ToolParser};
+use sglang_router_rs::tool_parser::{GptOssParser, ToolParser};
+
+mod common;
+use common::create_test_tools;
 
 #[tokio::test]
 async fn test_gpt_oss_complete_parsing() {
@@ -71,8 +74,9 @@ async fn test_gpt_oss_empty_args() {
 
 #[tokio::test]
 async fn test_gpt_oss_streaming() {
-    let parser = GptOssParser::new();
-    let mut state = ParseState::new();
+    let tools = create_test_tools();
+
+    let mut parser = GptOssParser::new();
 
     // Simulate streaming chunks
     let chunks = vec![
@@ -84,26 +88,20 @@ async fn test_gpt_oss_streaming() {
         "<|call|>",
     ];
 
-    let mut found_name = false;
     let mut found_complete = false;
 
     for chunk in chunks {
-        let result = parser.parse_incremental(chunk, &mut state).await.unwrap();
+        let result = parser.parse_incremental(chunk, &tools).await.unwrap();
 
-        match result {
-            StreamResult::ToolName { name, .. } => {
+        if !result.calls.is_empty() {
+            if let Some(name) = &result.calls[0].name {
                 assert_eq!(name, "calculate");
-                found_name = true;
-            }
-            StreamResult::ToolComplete(tool) => {
-                assert_eq!(tool.function.name, "calculate");
                 found_complete = true;
             }
-            _ => {}
         }
     }
 
-    assert!(found_name || found_complete);
+    assert!(found_complete);
 }
 
 #[test]

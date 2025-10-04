@@ -68,7 +68,6 @@ mod tests {
                 content: Some("Hi there".to_string()),
                 name: None,
                 tool_calls: None,
-                function_call: None,
                 reasoning_content: None,
             },
         ];
@@ -213,7 +212,6 @@ mod tests {
                 content: Some("World".to_string()),
                 name: None,
                 tool_calls: None,
-                function_call: None,
                 reasoning_content: None,
             },
         ];
