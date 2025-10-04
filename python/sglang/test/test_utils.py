@@ -921,7 +921,7 @@ def run_score_benchmark(
     async def _run_benchmark():
 
         # Load tokenizer for generating test data
-        from sglang.srt.hf_transformers_utils import get_tokenizer
+        from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
         tokenizer = get_tokenizer(model)
 
