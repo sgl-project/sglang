@@ -22,6 +22,8 @@ import random
 import tempfile
 from typing import List, Literal, Optional, Union
 
+import orjson
+
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -51,6 +53,9 @@ from sglang.srt.utils.hf_transformers_utils import check_gguf_file, get_config
 from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
+
+
+CLI_UNSET = object()
 
 # Define constants
 LOAD_FORMAT_CHOICES = [
@@ -247,6 +252,8 @@ class ServerArgs:
     file_storage_path: str = "sglang_storage"
     media_whitelisted_domains: Optional[List[str]] = None
     media_blacklisted_domains: Optional[List[str]] = None
+    _media_whitelist_cli_provided: bool = dataclasses.field(default=False, repr=False)
+    _media_blacklist_cli_provided: bool = dataclasses.field(default=False, repr=False)
     enable_cache_report: bool = False
     reasoning_parser: Optional[str] = None
     tool_call_parser: Optional[str] = None
@@ -1168,20 +1175,25 @@ class ServerArgs:
                 "Please choose one tokenizer batching approach."
             )
 
-    def _set_media_domain_env_vars(self):
-        if self.media_whitelisted_domains:
-            envs.SGLANG_MEDIA_WHITELISTED_DOMAINS.set(
-                json.dumps(self.media_whitelisted_domains)
-            )
-        else:
-            envs.SGLANG_MEDIA_WHITELISTED_DOMAINS.clear()
+    def _serialize_domains(self, domains: List[str]) -> str:
+        return orjson.dumps(domains).decode("utf-8")
 
-        if self.media_blacklisted_domains:
-            envs.SGLANG_MEDIA_BLACKLISTED_DOMAINS.set(
-                json.dumps(self.media_blacklisted_domains)
-            )
-        else:
-            envs.SGLANG_MEDIA_BLACKLISTED_DOMAINS.clear()
+    def _set_media_domain_env_vars(self):
+        if self._media_whitelist_cli_provided:
+            if self.media_whitelisted_domains:
+                envs.SGLANG_MEDIA_WHITELISTED_DOMAINS.set(
+                    self._serialize_domains(self.media_whitelisted_domains)
+                )
+            else:
+                envs.SGLANG_MEDIA_WHITELISTED_DOMAINS.clear()
+
+        if self._media_blacklist_cli_provided:
+            if self.media_blacklisted_domains:
+                envs.SGLANG_MEDIA_BLACKLISTED_DOMAINS.set(
+                    self._serialize_domains(self.media_blacklisted_domains)
+                )
+            else:
+                envs.SGLANG_MEDIA_BLACKLISTED_DOMAINS.clear()
 
     def _handle_environment_variables(self):
         os.environ["SGLANG_ENABLE_TORCH_COMPILE"] = (
@@ -1249,6 +1261,12 @@ class ServerArgs:
                 )
 
     def _handle_other_validations(self):
+        if (
+            not self._media_whitelist_cli_provided
+            and self.media_whitelisted_domains is not None
+        ):
+            self._media_whitelist_cli_provided = True
+
         if self.media_whitelisted_domains:
             cleaned_whitelist = [
                 domain.strip().lower()
@@ -1256,6 +1274,12 @@ class ServerArgs:
                 if domain and domain.strip()
             ]
             self.media_whitelisted_domains = cleaned_whitelist or None
+
+        if (
+            not self._media_blacklist_cli_provided
+            and self.media_blacklisted_domains is not None
+        ):
+            self._media_blacklist_cli_provided = True
 
         if self.media_blacklisted_domains:
             cleaned_blacklist = [
@@ -1834,14 +1858,14 @@ class ServerArgs:
             "--media-whitelisted-domains",
             type=str,
             nargs="+",
-            default=ServerArgs.media_whitelisted_domains,
+            default=CLI_UNSET,
             help="Restrict remote multimodal downloads to the provided domains. Domains are compared case-insensitively.",
         )
         parser.add_argument(
             "--media-blacklisted-domains",
             type=str,
             nargs="+",
-            default=ServerArgs.media_blacklisted_domains,
+            default=CLI_UNSET,
             help="Block remote multimodal downloads that match any of the provided domains. Domains are compared case-insensitively.",
         )
         parser.add_argument(
@@ -2869,8 +2893,48 @@ class ServerArgs:
         args.dp_size = args.data_parallel_size
         args.ep_size = args.expert_parallel_size
 
-        attrs = [attr.name for attr in dataclasses.fields(cls)]
-        return cls(**{attr: getattr(args, attr) for attr in attrs})
+        field_values = {}
+        whitelist_cli_provided = (
+            hasattr(args, "media_whitelisted_domains")
+            and getattr(args, "media_whitelisted_domains") is not CLI_UNSET
+        )
+        blacklist_cli_provided = (
+            hasattr(args, "media_blacklisted_domains")
+            and getattr(args, "media_blacklisted_domains") is not CLI_UNSET
+        )
+
+        for field in dataclasses.fields(cls):
+            if not field.init:
+                continue
+
+            name = field.name
+            if name == "_media_whitelist_cli_provided":
+                field_values[name] = whitelist_cli_provided
+                continue
+            if name == "_media_blacklist_cli_provided":
+                field_values[name] = blacklist_cli_provided
+                continue
+
+            if hasattr(args, name):
+                value = getattr(args, name)
+            elif field.default is not dataclasses.MISSING:
+                value = field.default
+            elif field.default_factory is not dataclasses.MISSING:  # type: ignore[attr-defined]
+                value = field.default_factory()  # type: ignore[misc]
+            else:
+                raise AttributeError(f"Missing required argument: {name}")
+
+            if value is CLI_UNSET:
+                if field.default is not dataclasses.MISSING:
+                    value = field.default
+                elif field.default_factory is not dataclasses.MISSING:  # type: ignore[attr-defined]
+                    value = field.default_factory()  # type: ignore[misc]
+                else:
+                    value = None
+
+            field_values[name] = value
+
+        return cls(**field_values)
 
     def url(self):
         if is_valid_ipv6_address(self.host):

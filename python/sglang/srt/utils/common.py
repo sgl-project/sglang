@@ -71,6 +71,7 @@ from typing import (
 from urllib.parse import urlparse
 
 import numpy as np
+import orjson
 import psutil
 import pybase64
 import requests
@@ -104,10 +105,10 @@ def _parse_media_domains(raw_value: Optional[str]) -> List[str]:
 
     parsed: List[str] = []
     try:
-        loaded = json.loads(raw_value)
+        loaded = orjson.loads(raw_value)
         if isinstance(loaded, list):
             parsed = [item for item in loaded if isinstance(item, str)]
-    except json.JSONDecodeError:
+    except orjson.JSONDecodeError:
         parsed = raw_value.split(",")
 
     if not parsed:
