@@ -810,6 +810,7 @@ def get_benchmark_args(
         prompt_suffix="",
         device=device,
         pd_separated=pd_separated,
+        priorities=None,
     )
 
 
