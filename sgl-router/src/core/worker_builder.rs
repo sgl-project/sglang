@@ -111,7 +111,7 @@ impl BasicWorkerBuilder {
 
         let bootstrap_host = match url::Url::parse(&url_to_parse) {
             Ok(parsed) => parsed.host_str().unwrap_or("localhost").to_string(),
-            Err(_) => "localhost".to_string(), // Fallback for truly unparseable URLs
+            Err(_) => "localhost".to_string(),
         };
 
         let bootstrap_port = match self.worker_type {
