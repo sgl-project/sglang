@@ -88,6 +88,7 @@ from torch.profiler import ProfilerActivity, profile, record_function
 from torch.utils._contextlib import _DecoratorContextManager
 from typing_extensions import Literal
 
+from sglang.srt.environ import envs
 from sglang.srt.metrics.func_timer import enable_func_timer
 
 logger = logging.getLogger(__name__)
@@ -738,7 +739,12 @@ def load_audio(
         )
     elif audio_file.startswith("http://") or audio_file.startswith("https://"):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "5"))
-        response = requests.get(audio_file, stream=True, timeout=timeout)
+        response = requests.get(
+            audio_file,
+            stream=True,
+            timeout=timeout,
+            allow_redirects=envs.SGLANG_MM_ALLOW_REDIRECTS.get(),
+        )
         audio_file = BytesIO(response.content)
         response.close()
         audio, original_sr = sf.read(audio_file)
@@ -779,7 +785,12 @@ def load_image(
         image = Image.open(BytesIO(image_file))
     elif image_file.startswith("http://") or image_file.startswith("https://"):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
-        response = requests.get(image_file, stream=True, timeout=timeout)
+        response = requests.get(
+            image_file,
+            stream=True,
+            timeout=timeout,
+            allow_redirects=envs.SGLANG_MM_ALLOW_REDIRECTS.get(),
+        )
         try:
             response.raise_for_status()
             image = Image.open(response.raw)
@@ -804,7 +815,11 @@ def get_image_bytes(image_file: Union[str, bytes]):
         return image_file
     elif image_file.startswith("http://") or image_file.startswith("https://"):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
-        response = requests.get(image_file, timeout=timeout)
+        response = requests.get(
+            image_file,
+            timeout=timeout,
+            allow_redirects=envs.SGLANG_MM_ALLOW_REDIRECTS.get(),
+        )
         return response.content
     elif image_file.lower().endswith(("png", "jpg", "jpeg", "webp", "gif")):
         with open(image_file, "rb") as f:
@@ -841,7 +856,12 @@ def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
         elif isinstance(video_file, str):
             if video_file.startswith(("http://", "https://")):
                 timeout = int(os.getenv("REQUEST_TIMEOUT", "10"))
-                response = requests.get(video_file, stream=True, timeout=timeout)
+                response = requests.get(
+                    video_file,
+                    stream=True,
+                    timeout=timeout,
+                    allow_redirects=envs.SGLANG_MM_ALLOW_REDIRECTS.get(),
+                )
                 response.raise_for_status()
                 tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
                 for chunk in response.iter_content(chunk_size=8192):

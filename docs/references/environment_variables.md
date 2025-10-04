@@ -13,6 +13,7 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_PORT` | Port for the server | auto-detected |
 | `SGLANG_LOGGING_CONFIG_PATH` | Custom logging configuration path | Not set |
 | `SGLANG_DISABLE_REQUEST_LOGGING` | Disable request logging | `false` |
+| `SGLANG_MM_ALLOW_REDIRECTS` | Allow HTTP redirects when downloading multimodal assets | `true` |
 | `SGLANG_HEALTH_CHECK_TIMEOUT` | Timeout for health check in seconds | `20` |
 
 ## Performance Tuning

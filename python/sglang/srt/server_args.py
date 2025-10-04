@@ -244,6 +244,8 @@ class ServerArgs:
     chat_template: Optional[str] = None
     completion_template: Optional[str] = None
     file_storage_path: str = "sglang_storage"
+    media_whitelisted_domains: Optional[List[str]] = None
+    media_blacklisted_domains: Optional[List[str]] = None
     enable_cache_report: bool = False
     reasoning_parser: Optional[str] = None
     tool_call_parser: Optional[str] = None
@@ -1231,7 +1233,31 @@ class ServerArgs:
                 )
 
     def _handle_other_validations(self):
-        pass
+        if self.media_whitelisted_domains:
+            cleaned_whitelist = [
+                domain.strip().lower()
+                for domain in self.media_whitelisted_domains
+                if domain and domain.strip()
+            ]
+            self.media_whitelisted_domains = cleaned_whitelist or None
+
+        if self.media_blacklisted_domains:
+            cleaned_blacklist = [
+                domain.strip().lower()
+                for domain in self.media_blacklisted_domains
+                if domain and domain.strip()
+            ]
+            self.media_blacklisted_domains = cleaned_blacklist or None
+
+        if self.media_whitelisted_domains and self.media_blacklisted_domains:
+            overlap = set(self.media_whitelisted_domains).intersection(
+                self.media_blacklisted_domains
+            )
+            if overlap:
+                raise ValueError(
+                    "The following domains are present in both --media-whitelisted-domains "
+                    f"and --media-blacklisted-domains: {', '.join(sorted(overlap))}"
+                )
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -1785,6 +1811,20 @@ class ServerArgs:
             type=str,
             default=ServerArgs.file_storage_path,
             help="The path of the file storage in backend.",
+        )
+        parser.add_argument(
+            "--media-whitelisted-domains",
+            type=str,
+            nargs="+",
+            default=ServerArgs.media_whitelisted_domains,
+            help="Restrict remote multimodal downloads to the provided domains. Domains are compared case-insensitively.",
+        )
+        parser.add_argument(
+            "--media-blacklisted-domains",
+            type=str,
+            nargs="+",
+            default=ServerArgs.media_blacklisted_domains,
+            help="Block remote multimodal downloads that match any of the provided domains. Domains are compared case-insensitively.",
         )
         parser.add_argument(
             "--enable-cache-report",
