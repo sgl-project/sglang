@@ -16,7 +16,6 @@ from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.quark.quark_moe import QuarkMoEMethod
 from sglang.srt.layers.quantization.quark.schemes import QuarkScheme, QuarkW4A4MXFP4
 from sglang.srt.layers.quantization.quark.utils import deep_compare, should_ignore_layer
-from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.utils import get_device_capability
 
