@@ -31,6 +31,8 @@ import psutil
 import setproctitle
 import torch
 import zmq
+from torch.cuda import Stream as CudaStream
+from torch.cuda import StreamContext as CudaStreamContext
 from torch.distributed import barrier
 
 from sglang.global_config import global_config
@@ -112,8 +114,10 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.mm_utils import init_embedding_cache
+from sglang.srt.managers.overlap_utils import FutureMap
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
+    ModelWorkerBatch,
     MultimodalInputs,
     Req,
     RequestStage,
@@ -210,6 +214,9 @@ class GenerationBatchResult:
     extend_input_len_per_req: List[int]
     extend_logprob_start_len_per_req: List[int]
 
+    # For overlap scheduling
+    copy_done: Optional[torch.cuda.Event] = None
+
     @classmethod
     def from_forward_batch_output(
         cls,
@@ -226,6 +233,7 @@ class GenerationBatchResult:
             extend_input_len_per_req=extend_input_len_per_req,
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             can_run_cuda_graph=forward_batch_output.can_run_cuda_graph,
+            copy_done=forward_batch_output.copy_done,
         )
 
     @classmethod
@@ -388,12 +396,8 @@ class Scheduler(
             logger.info("Overlap scheduler is disabled for embedding models.")
 
         # Launch a tensor parallel worker
-        if self.enable_overlap:
-            TpWorkerClass = TpModelWorkerClient
-        else:
-            TpWorkerClass = TpModelWorker
 
-        self.tp_worker = TpWorkerClass(
+        self.tp_worker = TpModelWorker(
             server_args=server_args,
             gpu_id=gpu_id,
             tp_rank=tp_rank,
@@ -525,9 +529,9 @@ class Scheduler(
         self.kv_transfer_speed_gb_s: float = 0.0
         self.kv_transfer_latency_ms: float = 0.0
         self.sessions: Dict[str, Session] = {}
-        self.current_stream = torch.get_device_module(self.device).current_stream()
+        self.default_stream = torch.cuda.current_stream(self.device)
         if self.device == "cpu":
-            self.current_stream.synchronize = lambda: None  # No-op for CPU
+            self.default_stream.synchronize = lambda: None  # No-op for CPU
         self.forward_sleep_time = None
 
         # Init chunked prefill
@@ -617,6 +621,9 @@ class Scheduler(
 
         # Init prefill kv split size when deterministic inference is enabled with various attention backends
         self.init_deterministic_inference_config()
+
+        # Init overlap
+        self.init_overlap()
 
         # Init request dispatcher
         self._request_dispatcher = TypeBasedDispatcher(
@@ -930,6 +937,21 @@ class Scheduler(
             # The prefill requests that are in the middle of kv sending
             self.disagg_prefill_inflight_queue: List[Req] = []
 
+    def init_overlap(self):
+        if not self.enable_overlap:
+            return
+
+        self.forward_stream: CudaStream = torch.get_device_module(self.device).Stream()
+        self.forward_stream_ctx: CudaStreamContext = torch.get_device_module(
+            self.device
+        ).stream(self.forward_stream)
+        self.copy_stream: CudaStream = torch.get_device_module(self.device).Stream()
+        self.copy_stream_ctx: CudaStreamContext = torch.get_device_module(
+            self.device
+        ).stream(self.copy_stream)
+
+        self.future_map = FutureMap(self.max_running_requests, self.device)
+
     def init_moe_config(self):
         if hasattr(self.model_config.hf_config, "num_experts_per_tok"):
             initialize_moe_config(self.server_args)
@@ -959,6 +981,9 @@ class Scheduler(
         self.result_queue = deque()
 
         while True:
+            # TODO(!!!): handle the last batch sample here, for overlap scheduling + xgrammar
+            self.run_last_batch_sample_if_needed()
+
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
 
@@ -2033,10 +2058,120 @@ class Scheduler(
         batch.prepare_for_decode()
         return batch
 
+    def run_batch_exp(
+        self, batch: ScheduleBatch
+    ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
+        """Run a batch."""
+        self.forward_ct += 1
+
+        # Whether to run the profiler
+        self._profile_batch_predicate(batch)
+        if self.forward_sleep_time is not None:
+            logger.info(f"Scheduler.run_batch sleep {self.forward_sleep_time}s")
+            time.sleep(self.forward_sleep_time)
+
+        # Run forward
+        if self.is_generation:
+
+            batch_or_worker_batch = batch
+
+            if self.spec_algorithm.is_none():
+                # FIXME(lsyin): remove this if and finally unify the abstraction
+                batch_or_worker_batch = batch.get_model_worker_batch()
+
+            if self.enable_overlap:
+                # FIXME: remove this assert
+                assert isinstance(batch_or_worker_batch, ModelWorkerBatch)
+                model_worker_batch = batch_or_worker_batch
+
+                # Sampling info will be modified during forward
+                model_worker_batch.sampling_info = self.tp_worker.cur_sampling_info = (
+                    model_worker_batch.sampling_info.copy_for_forward()
+                )
+
+                bs = len(model_worker_batch.seq_lens)
+                cur_future_map_ct = self.future_map.update_ct(bs)
+
+                with self.forward_stream_ctx:
+                    self.forward_stream.wait_stream(self.default_stream)
+                    self.future_map.resolve_future(model_worker_batch)
+                    forward_batch_output = self.model_worker.forward_batch_generation(
+                        batch_or_worker_batch
+                    )
+                    self.future_map.store_to_map(
+                        cur_future_map_ct, bs, forward_batch_output.next_token_ids
+                    )
+
+                    copy_done = torch.cuda.Event()
+                    copy_done.record()
+
+                    # FIXME(lsyin): move copy_done elsewhere
+                    forward_batch_output.copy_done = copy_done
+
+                # FIXME(lsyin): move this assignment elsewhere
+                maybe_future_next_token_ids = self.future_map.update_next_future(
+                    cur_future_map_ct, bs
+                )
+            else:
+                forward_batch_output = self.model_worker.forward_batch_generation(
+                    batch_or_worker_batch
+                )
+                maybe_future_next_token_ids = forward_batch_output.next_token_ids
+                copy_done = None
+
+            if not self.spec_algorithm.is_none():
+                # TODO(lsyin): unify this metric-updating logic with non-spec, and move it to decode processing
+                self.update_spec_metrics(
+                    batch.batch_size(), forward_batch_output.num_accepted_tokens
+                )
+
+            # NOTE: maybe_future_next_token_ids is used in ScheduleBatch,
+            #       which can probably be replaced by future_indices later [TODO(lsyin)].
+            #       we shall still keep the original outputs, e.g. next_token_ids
+            #       in the GenerationBatchOutput for processing after copy_done.
+            batch.output_ids = maybe_future_next_token_ids
+
+            # These 2 values are needed for processing the output, but the values can be
+            # modified by overlap schedule. So we have to copy them here so that
+            # we can use the correct values in output processing.
+            if batch.return_logprob or self.spec_algorithm.is_eagle():
+                extend_input_len_per_req = [req.extend_input_len for req in batch.reqs]
+            else:
+                extend_input_len_per_req = None
+
+            if batch.return_logprob:
+                extend_logprob_start_len_per_req = [
+                    req.extend_logprob_start_len for req in batch.reqs
+                ]
+            else:
+                extend_logprob_start_len_per_req = None
+
+            return GenerationBatchResult.from_forward_batch_output(
+                forward_batch_output=forward_batch_output,
+                extend_input_len_per_req=extend_input_len_per_req,
+                extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
+            )
+        else:  # embedding or reward model
+            model_worker_batch = batch.get_model_worker_batch()
+            embeddings = self.tp_worker.forward_batch_embedding(model_worker_batch)
+            ret = EmbeddingBatchResult(embeddings=embeddings)
+        return ret
+
+    def run_last_batch_sample_if_needed(
+        self,
+    ) -> Union[GenerationBatchResult, EmbeddingBatchResult, None]:
+        # 1. pop left from the result queue
+        # 2. get the future tensor (logits)
+        # 3. sample the next token
+        # 4. update the future map
+        pass
+
     def run_batch(
         self, batch: ScheduleBatch
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
+        return self.run_batch_exp(batch)
+
         self.forward_ct += 1
 
         # Whether to run the profiler
@@ -2060,7 +2195,7 @@ class Scheduler(
 
             if not self.spec_algorithm.is_none():
                 # TODO(lsyin): unify this metric-updating logic with non-spec, and move it to decode processing
-                self.udpate_spec_metrics(
+                self.update_spec_metrics(
                     batch.batch_size(), forward_batch_output.num_accepted_tokens
                 )
 
@@ -2111,7 +2246,8 @@ class Scheduler(
 
         elif batch.forward_mode.is_idle():
             if self.enable_overlap:
-                self.tp_worker.resolve_last_batch_result(launch_done)
+                if result.copy_done is not None:
+                    result.copy_done.synchronize()
                 self.set_next_batch_sampling_info_done(batch)
         elif batch.forward_mode.is_dummy_first():
             self.set_next_batch_sampling_info_done(batch)
@@ -2328,7 +2464,7 @@ class Scheduler(
         if batch.next_batch_sampling_info:
             if batch.next_batch_sampling_info.grammars is not None:
                 batch.next_batch_sampling_info.update_regex_vocab_mask()
-                self.current_stream.synchronize()
+                self.default_stream.synchronize()
             batch.next_batch_sampling_info.sampling_info_done.set()
 
     def watchdog_thread(self):
