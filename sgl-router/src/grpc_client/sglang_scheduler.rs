@@ -1,7 +1,7 @@
 use std::convert::TryFrom;
 use std::time::Duration;
 use tonic::{transport::Channel, Request};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::protocols::spec::{
     ChatCompletionRequest, GenerateRequest, ResponseFormat,
@@ -27,9 +27,22 @@ impl SglangSchedulerClient {
     pub async fn connect(endpoint: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         debug!("Connecting to SGLang scheduler at {}", endpoint);
 
-        // Convert grpc:// to http:// for tonic
+        // Convert grpc:// to http:// for tonic, preserving IPv6 bracket notation
         let http_endpoint = if endpoint.starts_with("grpc://") {
-            endpoint.replace("grpc://", "http://")
+            // Use proper URL parsing to preserve IPv6 brackets
+            match url::Url::parse(endpoint) {
+                Ok(mut parsed) => {
+                    let _ = parsed.set_scheme("http");
+                    parsed.to_string()
+                }
+                Err(_) => {
+                    warn!(
+                        "Failed to parse gRPC endpoint '{}', using simple string replacement",
+                        endpoint
+                    );
+                    endpoint.replace("grpc://", "http://")
+                }
+            }
         } else {
             endpoint.to_string()
         };
