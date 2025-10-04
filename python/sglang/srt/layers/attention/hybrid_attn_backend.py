@@ -3,6 +3,7 @@ from typing import Optional, Union
 import torch
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.nsa.nsa_indexer import BaseIndexerMetadata
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -138,3 +139,9 @@ class HybridAttnBackend(AttentionBackend):
         return backend.forward_extend(
             q, k, v, layer, forward_batch, save_kv_cache, **kwargs
         )
+
+    def get_indexer_metadata(
+        self, layer_id: int, forward_batch: ForwardBatch
+    ) -> Optional[BaseIndexerMetadata]:
+        backend = self._select_backend(forward_batch.forward_mode)
+        return backend.get_indexer_metadata(layer_id, forward_batch)
