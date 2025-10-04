@@ -1,5 +1,7 @@
 import logging
 
+import torch
+
 from sglang.srt.utils import get_bool_env_var, get_device_sm, is_blackwell
 
 logger = logging.getLogger(__name__)
@@ -9,7 +11,9 @@ def _compute_enable_deep_gemm():
     sm_version = get_device_sm()
     if sm_version < 90:
         return False
-
+    if sm_version == 90 and torch.version.cuda is not None:
+        if torch.version.cuda != "12.8" and torch.version.cuda != "12.9":
+            return False
     try:
         import deep_gemm
     except ImportError:
