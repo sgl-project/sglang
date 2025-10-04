@@ -65,7 +65,7 @@ suites = {
         TestFile("test_abort.py", 51),
         TestFile("test_create_kvindices.py", 2),
         TestFile("test_chunked_prefill.py", 313),
-        TestFile("test_deterministic.py", 60),
+        TestFile("test_deterministic.py", 180),
         TestFile("test_eagle_infer_a.py", 370),
         TestFile("test_eagle_infer_b.py", 700),
         TestFile("test_ebnf_constrained.py", 108),
