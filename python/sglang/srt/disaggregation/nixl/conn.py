@@ -496,30 +496,36 @@ class NixlKVManager(CommonKVManager):
         dst_aux_index: int,
         notif: str,
     ):
-        # Make descs
-        aux_item_len = self.kv_args.aux_item_lens[0]
-        prefill_aux_addr = (
-            self.kv_args.aux_data_ptrs[0] + prefill_aux_index * aux_item_len
-        )
-        decode_aux_addr = dst_aux_ptrs[0] + dst_aux_index * aux_item_len
-        src_addrs = [(prefill_aux_addr, aux_item_len, 0)]
-        dst_addrs = [(decode_aux_addr, aux_item_len, 0)]
-        src_descs = self.agent.get_xfer_descs(src_addrs, "DRAM")
-        dst_descs = self.agent.get_xfer_descs(dst_addrs, "DRAM")
-        # Transfer data
-        xfer_handle = self.agent.initialize_xfer(
-            "WRITE",
-            src_descs,
-            dst_descs,
-            peer_name,
-            notif.encode("ascii"),  # type: ignore
-        )
-        if not xfer_handle:
-            raise Exception("KVSender failed to create transfer")
-        state = self.agent.transfer(xfer_handle)
-        if state == "ERR":
-            raise Exception("KVSender failed to post transfer")
-        return xfer_handle
+        handles = []
+
+        for prefill_aux_ptr, dst_aux_ptr, aux_item_len in zip(
+            self.kv_args.aux_data_ptrs,
+            dst_aux_ptrs,
+            self.kv_args.aux_item_lens,
+        ):
+            prefill_aux_addr = prefill_aux_ptr + prefill_aux_index * aux_item_len
+            decode_aux_addr = dst_aux_ptr + dst_aux_index * aux_item_len
+            src_addrs = [(prefill_aux_addr, aux_item_len, 0)]
+            dst_addrs = [(decode_aux_addr, aux_item_len, 0)]
+            src_descs = self.agent.get_xfer_descs(src_addrs, "DRAM")
+            dst_descs = self.agent.get_xfer_descs(dst_addrs, "DRAM")
+            # Transfer data
+            xfer_handle = self.agent.initialize_xfer(
+                "WRITE",
+                src_descs,
+                dst_descs,
+                peer_name,
+                notif.encode("ascii"),  # type: ignore
+            )
+            if not xfer_handle:
+                raise Exception("KVSender failed to create transfer")
+            state = self.agent.transfer(xfer_handle)
+            if state == "ERR":
+                raise Exception("KVSender failed to post transfer")
+
+            handles.append(xfer_handle)
+
+        return handles
 
     def add_transfer_request(
         self,
@@ -578,14 +584,14 @@ class NixlKVManager(CommonKVManager):
             # Only the last chunk we need to send the aux data.
             if is_last:
                 assert aux_index is not None
-                aux_xfer_handle = self.send_aux(
+                aux_xfer_handles = self.send_aux(
                     req.agent_name,
                     aux_index,
                     self.decode_kv_args_table[req.agent_name].dst_aux_ptrs,
                     req.dst_aux_index,
                     str(req.room) + "_aux",
                 )
-                handles.append(aux_xfer_handle)
+                handles.extend(aux_xfer_handles)
         if is_last:
             del self.transfer_infos[bootstrap_room]
         return handles
