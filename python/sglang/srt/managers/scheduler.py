@@ -2111,7 +2111,7 @@ class Scheduler(
 
             if not self.spec_algorithm.is_none():
                 # TODO(lsyin): unify this metric-updating logic with non-spec, and move it to decode processing
-                self.udpate_spec_metrics(
+                self.update_spec_metrics(
                     batch.batch_size(), forward_batch_output.num_accepted_tokens
                 )
 
@@ -2177,7 +2177,7 @@ class Scheduler(
 
             if not self.spec_algorithm.is_none():
                 # TODO(lsyin): unify this metric-updating logic with non-spec, and move it to decode processing
-                self.udpate_spec_metrics(
+                self.update_spec_metrics(
                     batch.batch_size(), forward_batch_output.num_accepted_tokens
                 )
 
