@@ -221,6 +221,7 @@ class FusedMoE(torch.nn.Module):
             gemm1_clamp_limit=gemm1_clamp_limit,
         )
 
+        self.quant_method = None
         if quant_config is not None:
             self.quant_method: FusedMoEMethodBase = quant_config.get_quant_method(
                 self, prefix
