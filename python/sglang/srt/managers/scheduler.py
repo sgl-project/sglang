@@ -177,6 +177,7 @@ from sglang.srt.utils import (
     get_zmq_socket,
     kill_itself_when_parent_died,
     numa_bind_to_node,
+    patch_torch,
     point_to_point_pyobj,
     pyspy_dump_schedulers,
     require_mlp_sync,
@@ -366,6 +367,9 @@ class Scheduler(
             self.send_metrics_from_scheduler = get_zmq_socket(
                 context, zmq.PUSH, port_args.metrics_ipc_name, False
             )
+
+        if get_bool_env_var("SGLANG_SANITY_CHECK_TORCH_EMPTY"):
+            patch_torch.monkey_patch_torch_empty_to_explicit()
 
         # Init tokenizer
         self.init_tokenizer()

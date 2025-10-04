@@ -88,3 +88,36 @@ def monkey_patch_torch_compile():
 
         af.auto_functionalized_v2._cacheable = True
         af.auto_functionalized._cacheable = True
+
+
+def monkey_patch_torch_empty_to_explicit():
+    print("monkey_patch_torch_empty_to_explicit")
+
+    def sanity_fill_tensor(t):
+        if torch.is_floating_point(t):
+            # may use random for float8_e4m3fn
+            t.fill_(float("nan"))
+        elif torch.is_integral(t):
+            info = torch.iinfo(t.dtype)
+            torch.randint(
+                low=info.min,
+                high=info.max,
+                size=t.shape,
+                dtype=t.dtype,
+                device=t.device,
+                out=t,
+            )
+        else:
+            pass
+
+    def add_postprocessor(original_fn):
+        def fn(*args, **kwargs):
+            tensor = original_fn(*args, **kwargs)
+            sanity_fill_tensor(tensor)
+            return tensor
+
+        return fn
+
+    torch.empty = add_postprocessor(torch.empty)
+    torch.empty_like = add_postprocessor(torch.empty_like)
+    torch.empty_strided = add_postprocessor(torch.empty_strided)
