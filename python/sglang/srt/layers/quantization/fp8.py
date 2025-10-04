@@ -551,6 +551,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 self.quant_config.weight_block_size[0],
                 self.quant_config.weight_block_size[1],
             )
+            return StandardCombineInput(hidden_states=output)
             # NOTE(HandH1998): To ensure proper alignment of the block-wise quantization scales, the output_size of the weights for both the gate and up layers must be divisible by block_n.
             # Required by column parallel or enabling merged weights
             if intermediate_size_per_partition % block_n != 0:
@@ -1084,62 +1085,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 self.problem_sizes1,
                 self.problem_sizes2,
                 use_fp8_blockscale=True,
+                activation=self.moe_runner_config.activation,
+                gemm1_alpha=self.moe_runner_config.gemm1_alpha,
+                gemm1_limit=self.moe_runner_config.gemm1_clamp_limit,
             )
             return StandardCombineInput(hidden_states=output)
-
-        quant_info = TritonMoeQuantInfo(
-            w13_weight=layer.w13_weight,
-            w2_weight=layer.w2_weight,
-            use_fp8_w8a8=True,
-            w13_scale=(
-                layer.w13_weight_scale_inv
-                if self.block_quant
-                else layer.w13_weight_scale
-            ),
-            w2_scale=(
-                layer.w2_weight_scale_inv if self.block_quant else layer.w2_weight_scale
-            ),
-            a13_scale=layer.w13_input_scale,
-            a2_scale=layer.w2_input_scale,
-            block_shape=self.quant_config.weight_block_size,
-        )
-        return self.runner.run(dispatch_output, quant_info)
-
-    def apply_with_router_logits(
-        self,
-        layer: torch.nn.Module,
-        dispatch_output: StandardDispatchOutput,
-    ) -> torch.Tensor:
-        x = dispatch_output.hidden_states
-        topk_output = dispatch_output.topk_output
-
-        activation = self.moe_runner_config.activation
-        routed_scaling_factor = self.moe_runner_config.routed_scaling_factor
-
-        from flashinfer.fused_moe import trtllm_fp8_block_scale_moe
-
-        from sglang.srt.layers.moe.topk import TopKOutputChecker
-
-        assert TopKOutputChecker.format_is_bypassed(topk_output)
-        router_logits = topk_output.router_logits
-        topk_config = topk_output.topk_config
-        assert (
-            activation == "silu"
-        ), "Only silu is supported for flashinfer blockscale fp8 moe"
-        a_q, a_sf = per_token_group_quant_fp8(x, self.quant_config.weight_block_size[1])
-        # NOTE: scales of hidden states have to be transposed!
-        a_sf_t = a_sf.t().contiguous()
-
-        assert (
-            topk_config.num_expert_group is not None
-            and topk_config.topk_group is not None
-        ), "Current trtllm_fp8_block_scale_moe kernel does not support these two arguments as None"
-
-        correction_bias = (
-            None
-            if topk_config.correction_bias is None
-            else topk_config.correction_bias.to(x.dtype)
-        )
 
         return trtllm_fp8_block_scale_moe(
             routing_logits=router_logits.to(torch.float32),
