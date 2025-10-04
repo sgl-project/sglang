@@ -844,6 +844,9 @@ class BatchTokenIDOutput(BaseBatchReq):
     placeholder_tokens_idx: List[Optional[List[int]]]
     placeholder_tokens_val: List[Optional[List[int]]]
 
+    # Number of times each request was retracted.
+    retraction_counts: List[int]
+
 
 @dataclass
 class BatchMultimodalDecodeReq(BaseBatchReq):
@@ -907,6 +910,9 @@ class BatchStrOutput(BaseBatchReq):
     placeholder_tokens_idx: List[Optional[List[int]]]
     placeholder_tokens_val: List[Optional[List[int]]]
 
+    # Number of times each request was retracted.
+    retraction_counts: List[int]
+
 
 @dataclass
 class BatchMultimodalOutput(BaseBatchReq):
@@ -945,6 +951,9 @@ class BatchEmbeddingOutput(BaseBatchReq):
     # Placeholder token info
     placeholder_tokens_idx: List[Optional[List[int]]]
     placeholder_tokens_val: List[Optional[List[int]]]
+
+    # Number of times each request was retracted.
+    retraction_counts: List[int]
 
 
 @dataclass
