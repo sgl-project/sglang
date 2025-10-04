@@ -64,12 +64,14 @@ class TritonAttnBackend(AttentionBackend):
         )
         from sglang.srt.layers.attention.triton_ops.extend_attention import (
             extend_attention_fwd,
+            extend_attention_fwd_unified,
         )
 
         super().__init__()
 
         self.decode_attention_fwd = torch.compiler.disable(decode_attention_fwd)
         self.extend_attention_fwd = torch.compiler.disable(extend_attention_fwd)
+        self.extend_attention_fwd_unified = torch.compiler.disable(extend_attention_fwd_unified)
 
         # Parse args
         self.skip_prefill = skip_prefill
@@ -771,6 +773,7 @@ class TritonAttnBackend(AttentionBackend):
         else:
             o = torch.empty_like(q)
 
+        # Save KV cache first (must do this before unified kernel)
         if save_kv_cache:
             forward_batch.token_to_kv_pool.set_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, v
@@ -782,6 +785,13 @@ class TritonAttnBackend(AttentionBackend):
         if layer.attn_type == AttentionType.ENCODER_ONLY:
             causal = False
 
+        # Deterministic mode: use unified 1-stage kernel
+        if self.enable_deterministic:
+            return self._forward_extend_unified(
+                q, o, layer, forward_batch, causal, logits_soft_cap, sinks
+            )
+
+        # Normal mode: use original 2-stage kernel
         if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
             sliding_window_size = (
                 layer.sliding_window_size
@@ -816,6 +826,88 @@ class TritonAttnBackend(AttentionBackend):
             window_kv_offsets=window_kv_offsets,
             xai_temperature_len=layer.xai_temperature_len,
         )
+        return o
+
+    def _forward_extend_unified(
+        self,
+        q: torch.Tensor,
+        o: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        causal: bool,
+        logits_soft_cap: float,
+        sinks: Optional[torch.Tensor],
+    ):
+        """
+        Unified 1-stage extend attention for deterministic inference.
+        Both prefix and extend KV are accessed through unified kv_indices.
+        """
+        bs = forward_batch.batch_size
+        
+        # Determine sliding window settings
+        if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
+            sliding_window_size = layer.sliding_window_size
+            # Note: for unified kernel, we use full kv_indptr (not window)
+            prefix_kv_indptr = self.forward_metadata.window_kv_indptr
+            prefix_kv_indices = self.forward_metadata.window_kv_indices
+        else:
+            sliding_window_size = -1
+            prefix_kv_indptr = self.forward_metadata.kv_indptr
+            prefix_kv_indices = self.forward_metadata.kv_indices
+
+        # Build unified kv_indices (prefix + extend)
+        # Extend tokens are already in cache (written above)
+        extend_kv_indices = forward_batch.out_cache_loc
+        
+        # Concatenate prefix and extend indices
+        unified_kv_indices_list = []
+        unified_kv_indptr = torch.zeros(bs + 1, dtype=torch.int32, device=self.device)
+        prefix_lens_list = []
+        
+        for i in range(bs):
+            # Get prefix indices for this sequence
+            prefix_start = prefix_kv_indptr[i].item()
+            prefix_end = prefix_kv_indptr[i + 1].item()
+            prefix_len = prefix_end - prefix_start
+            prefix_lens_list.append(prefix_len)
+            
+            if prefix_len > 0:
+                seq_prefix_indices = prefix_kv_indices[prefix_start:prefix_end]
+            else:
+                seq_prefix_indices = torch.tensor([], dtype=torch.int64, device=self.device)
+            
+            # Get extend indices for this sequence
+            extend_start = forward_batch.extend_start_loc[i].item() if hasattr(forward_batch, 'extend_start_loc') else sum(forward_batch.extend_seq_lens_cpu[:i])
+            extend_len = forward_batch.extend_seq_lens[i].item()
+            seq_extend_indices = extend_kv_indices[extend_start:extend_start + extend_len]
+            
+            # Concatenate
+            seq_unified_indices = torch.cat([seq_prefix_indices, seq_extend_indices])
+            unified_kv_indices_list.append(seq_unified_indices)
+            unified_kv_indptr[i + 1] = unified_kv_indptr[i] + len(seq_unified_indices)
+        
+        unified_kv_indices = torch.cat(unified_kv_indices_list)
+        prefix_lens = torch.tensor(prefix_lens_list, dtype=torch.int32, device=self.device)
+        
+        # Call unified kernel
+        self.extend_attention_fwd_unified(
+            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
+            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            self.forward_metadata.qo_indptr,
+            unified_kv_indptr,
+            unified_kv_indices,
+            prefix_lens,
+            self.forward_metadata.max_extend_len,
+            sm_scale=layer.scaling,
+            logit_cap=logits_soft_cap,
+            is_causal=causal,
+            sliding_window_size=sliding_window_size,
+            sinks=sinks,
+            xai_temperature_len=layer.xai_temperature_len,
+        )
+        
         return o
 
     def forward_decode(
