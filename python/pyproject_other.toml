@@ -70,7 +70,7 @@ srt = [
     "torchaudio==2.8.0",
     "torchvision",
     "cuda-python",
-    "flashinfer_python==0.4.0rc1",
+    "flashinfer_python==0.4.0rc3",
 ]
 
 blackwell = [
@@ -80,8 +80,8 @@ blackwell = [
     "torchaudio==2.8.0",
     "torchvision",
     "cuda-python",
-    "flashinfer_python==0.4.0rc1",
-    "nvidia-cutlass-dsl==4.2.1",
+    "flashinfer_python==0.4.0rc3",
+    "nvidia-cutlass-dsl==4.2.0",
 ]
 
 # HIP (Heterogeneous-computing Interface for Portability) for AMD
@@ -110,7 +110,7 @@ srt_hpu = ["sglang[runtime_common]"]
 openai = ["openai==1.99.1", "tiktoken"]
 anthropic = ["anthropic>=0.20.0"]
 litellm = ["litellm>=1.0.0"]
-torch_memory_saver = ["torch_memory_saver==0.0.8"]
+torch_memory_saver = ["torch_memory_saver==0.0.9rc1"]
 decord = ["decord"]
 test = [
     "accelerate",

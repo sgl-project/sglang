@@ -1,6 +1,9 @@
 #include "ngram.h"
 
+#include <algorithm>
+#include <cstring>
 #include <limits>
+#include <queue>
 #include <vector>
 
 namespace ngram {
