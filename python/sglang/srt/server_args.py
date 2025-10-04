@@ -770,7 +770,7 @@ class ServerArgs:
                     logger.warning(
                         "Detected GPT-OSS model, enabling triton_kernels MOE kernel."
                     )
-            self.disable_hybrid_swa_memory = True
+            # self.disable_hybrid_swa_memory = True
             if is_mxfp4_quant_format:
                 # use bf16 for mxfp4 triton kernels
                 self.dtype = "bfloat16"
