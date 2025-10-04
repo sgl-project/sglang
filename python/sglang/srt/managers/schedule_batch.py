@@ -112,6 +112,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "enable_custom_logit_processor",
     "disaggregation_mode",
     "enable_deterministic_inference",
+    "kv_cache_dtype",
 ]
 
 # Put some global args for easy access
