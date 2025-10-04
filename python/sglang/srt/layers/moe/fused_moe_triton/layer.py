@@ -221,15 +221,14 @@ class FusedMoE(torch.nn.Module):
             gemm1_clamp_limit=gemm1_clamp_limit,
         )
 
-        if quant_config is None:
-            self.quant_method: FusedMoEMethodBase = UnquantizedFusedMoEMethod(
-                self.use_triton_kernels
-            )
-        else:
+        if quant_config is not None:
             self.quant_method: FusedMoEMethodBase = quant_config.get_quant_method(
                 self, prefix
             )
-        assert self.quant_method is not None
+        if self.quant_method is None:
+            self.quant_method: FusedMoEMethodBase = UnquantizedFusedMoEMethod(
+                self.use_triton_kernels
+            )
 
         self.quant_method.create_weights(
             layer=self,
