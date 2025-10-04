@@ -20,7 +20,9 @@ class PoolingType(IntEnum):
 
 @dataclass
 class EmbeddingPoolerOutput:
-    embeddings: torch.Tensor
+    # Pooler can return list[tensor] instead of tensor if the dimension of each tensor in the batch is different
+    # due to different per-request matryoshka dim truncation
+    embeddings: torch.Tensor | list[torch.Tensor]
 
 
 class Pooler(nn.Module):
@@ -42,6 +44,7 @@ class Pooler(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> EmbeddingPoolerOutput:
+
         if self.pooling_type == PoolingType.LAST:
             last_token_indices = torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
             pooled_data = hidden_states[last_token_indices]
@@ -53,8 +56,24 @@ class Pooler(nn.Module):
         else:
             raise ValueError(f"Invalid pooling type: {self.pooling_type}")
 
+        if forward_batch.dimensions is not None:
+            all_same_dimensions = len(set(forward_batch.dimensions)) == 1
+            if all_same_dimensions:
+                pooled_data = pooled_data[..., : forward_batch.dimensions[0]]
+            else:
+                pooled_data = [
+                    tensor[..., :dim]
+                    for tensor, dim in zip(pooled_data, forward_batch.dimensions)
+                ]
+
         if self.normalize:
-            pooled_data = nn.functional.normalize(pooled_data, p=2, dim=1)
+            if isinstance(pooled_data, list):
+                pooled_data = [
+                    nn.functional.normalize(tensor, p=2, dim=-1)
+                    for tensor in pooled_data
+                ]
+            else:
+                pooled_data = nn.functional.normalize(pooled_data, p=2, dim=-1)
 
         return EmbeddingPoolerOutput(embeddings=pooled_data)
 
