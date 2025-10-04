@@ -37,8 +37,12 @@ class FixFunctionalizationPass(SGLangInductorPass):
             kwargs = node.kwargs
             at_target = node.args[0]
 
-            # if at_target == torch.ops._C.rotary_embedding.default:
-            #     query = kwargs["query"]
+            print("at_target: ", at_target)
+
+            # if at_target == torch.ops.sgl_kernel.apply_rope_pos_ids_cos_sin_cache.default:
+            #     print("rotary_embedding")
+            #     print("kwargs: ", kwargs)
+            #     query = kwargs["q"]
             #     mm_node = query.args[0].args[0]
 
             #     # rotary_embedding is a special case: the two mutating inputs
@@ -57,42 +61,6 @@ class FixFunctionalizationPass(SGLangInductorPass):
 
             #     self.insert_defunctionalized(graph, node)
             #     self._remove(node)
-
-            # rms_norm replacements avoid the most copies for LLaMa.
-            # if at_target == torch.ops._C.fused_add_rms_norm.default:
-            #     mutated_args = {1: "input", 2: "residual"}
-            #     self.defunctionalize(graph, node, mutated_args)
-            # elif (
-            #     at_target == torch.ops._C.fused_add_rms_norm_static_fp8_quant.default
-            # ):  # noqa: E501
-            #     mutated_args = {1: "result", 2: "residual"}
-            #     self.defunctionalize(graph, node, mutated_args)
-            # elif (
-            #     at_target == torch.ops._C.rms_norm_dynamic_per_token_quant.default
-            # ):  # noqa: E501
-            #     mutated_args = {1: "result", 2: "scale", 3: "residual"}
-            #     self.defunctionalize(graph, node, mutated_args)
-            # elif at_target in [
-            #     torch.ops._C.rms_norm.default,
-            #     torch.ops._C.rms_norm_static_fp8_quant.default,
-            # ]:
-            #     mutated_args = {1: "result"}
-            #     self.defunctionalize(graph, node, mutated_args)
-            # # For some reason we need to specify the args for both
-            # # silu_and_mul and silu_and_mul_quant. The kwargs
-            # # pathway gets the wrong answer.
-            # elif at_target == torch.ops._C.silu_and_mul.default:
-            #     mutated_args = {1: "result"}
-            #     self.defunctionalize(
-            #         graph, node, mutated_args, args=("result", "input")
-            #     )
-            # elif at_target == torch.ops._C.silu_and_mul_quant.default:
-            #     mutated_args = {1: "result"}
-            #     self.defunctionalize(
-            #         graph, node, mutated_args, args=("result", "input", "scale")
-            #     )
-            # else:
-            continue  # skip the count
 
             count += 1
 

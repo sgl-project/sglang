@@ -41,7 +41,6 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.torchao_utils import save_gemlite_cache
-from sglang.srt.model_executor.compilation.decorators import set_compiled
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -492,13 +491,12 @@ class CudaGraphRunner:
                         num_tokens=bs * self.num_tokens_per_bs,
                         tp_group=self.model_runner.tp_group,
                     ) as forward:
-                        with set_compiled(True):
-                            (
-                                graph,
-                                output_buffers,
-                            ) = self.capture_one_batch_size(bs, forward)
-                            self.graphs[bs] = graph
-                            self.output_buffers[bs] = output_buffers
+                        (
+                            graph,
+                            output_buffers,
+                        ) = self.capture_one_batch_size(bs, forward)
+                        self.graphs[bs] = graph
+                        self.output_buffers[bs] = output_buffers
 
                     # Save gemlite cache after each capture
                     save_gemlite_cache()

@@ -40,7 +40,6 @@ from sglang.srt.configs.model_config import AttentionArch, ModelConfig
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
 from sglang.srt.connector import ConnectorType
 from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
-from sglang.srt.context_manager import set_forward_context
 from sglang.srt.distributed import (
     get_pp_group,
     get_tp_group,
@@ -101,14 +100,12 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
     SWAKVPool,
 )
-from sglang.srt.model_executor.compilation.backend import SGLangBackend
-from sglang.srt.model_executor.compilation.compilation_config import CompilationConfig
 from sglang.srt.model_executor.compilation.compilation_counter import (
     compilation_counter,
 )
-from sglang.srt.model_executor.compilation.decorators import (
-    install_torch_compiled,
-    set_compiled,
+from sglang.srt.model_executor.compilation.compile import install_torch_compiled
+from sglang.srt.model_executor.compilation.piecewise_context_manager import (
+    set_forward_context,
 )
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
@@ -295,174 +292,7 @@ class ModelRunner:
                 fullgraph=True,
                 dynamic_arg_dims=None,
             )
-            with set_compiled(True):
-                self.capture_model()
             self.piecewise_cuda_graph_runner = PiecewiseCudaGraphRunner(self)
-
-    def capture_model(self) -> None:
-        """Warm up (largest→smallest) using the same packing/forward path as the benchmark.
-        No manual attention pre-init here; let ModelRunner.forward wire everything correctly.
-        """
-        import gc
-        import time
-        from contextlib import contextmanager
-
-        compilation_counter.num_gpu_runner_capture_triggers += 1
-
-        start_time = time.perf_counter()
-        start_free_gpu_memory = torch.cuda.mem_get_info()[0]
-
-        # Ensure a sane upper bound for constructing dummy reqs
-        self.max_num_tokens = max(getattr(self, "max_num_tokens", 0), 1024)
-
-        @contextmanager
-        def freeze_gc():
-            gc.collect()
-            should_freeze = True
-            if should_freeze:
-                gc.freeze()
-            try:
-                yield
-            finally:
-                if should_freeze:
-                    gc.unfreeze()
-
-        # Warm up largest → smallest so smaller buckets can reuse pools/allocations
-        with freeze_gc():
-            self.cudagraph_batch_sizes = [256, 128, 64, 32, 16, 8, 4, 2, 1]
-            compilation_cases = self.cudagraph_batch_sizes
-
-            try:
-                from tqdm import tqdm
-
-                iterator = (
-                    tqdm(compilation_cases)
-                    if getattr(self, "tp_rank", 0) == 0
-                    else compilation_cases
-                )
-            except Exception:
-                iterator = compilation_cases
-
-            for num_tokens in iterator:
-                # a couple of dry runs to steady allocator/pools
-                for _ in range(2):
-                    self._dummy_run(
-                        num_tokens=num_tokens,
-                        capture_attn_cudagraph=False,
-                        skip_eplb=True,
-                    )
-                    return
-                # one more for good measure
-                self._dummy_run(
-                    num_tokens=num_tokens,
-                    capture_attn_cudagraph=False,
-                    skip_eplb=True,
-                )
-
-        elapsed = time.perf_counter() - start_time
-        cuda_graph_size = start_free_gpu_memory - torch.cuda.mem_get_info()[0]
-        logger.info(
-            "Graph capturing finished in %.0f secs, took %.2f GiB",
-            elapsed,
-            cuda_graph_size / (1 << 30),
-        )
-
-    @torch.inference_mode()
-    def _dummy_run(
-        self,
-        num_tokens: int,
-        capture_attn_cudagraph: bool = False,
-        skip_eplb: bool = False,
-        is_profile: bool = False,
-    ) -> tuple[torch.Tensor] | tuple[torch.Tensor, torch.Tensor]:
-        """Build ScheduleBatch → ForwardBatch exactly like the benchmark and call self.forward()."""
-
-        # ---------- 0) Reset pools/backends to avoid stale KV mappings ----------
-        if hasattr(self, "req_to_token_pool"):
-            self.req_to_token_pool.clear()
-        if hasattr(self, "token_to_kv_pool_allocator"):
-            self.token_to_kv_pool_allocator.clear()
-        if hasattr(self, "token_to_kv_pool") and hasattr(
-            self.token_to_kv_pool, "clear"
-        ):
-            self.token_to_kv_pool.clear()
-        if hasattr(self, "attn_backend") and hasattr(self.attn_backend, "reset"):
-            self.attn_backend.reset()
-
-        # ---------- 1) Split num_tokens into synthetic prefill reqs ----------
-        per_req = [num_tokens]
-
-        from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
-        from sglang.srt.managers.scheduler import Scheduler
-        from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-        from sglang.srt.sampling.sampling_params import SamplingParams
-        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-        from sglang.srt.utils import require_mlp_sync, require_mlp_tp_gather
-
-        reqs: list[Req] = []
-        for rid, t in enumerate(per_req):
-            r = Req(
-                rid=rid,
-                origin_input_text="",
-                origin_input_ids=[1] * t,  # dummy valid token ids
-                sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
-            )
-            r.prefix_indices = []  # pure prefill
-            r.fill_ids = r.origin_input_ids
-            r.extend_input_len = len(r.fill_ids)
-            r.logprob_start_len = 0
-            reqs.append(r)
-
-        # ---------- 2) Build ScheduleBatch → ForwardBatch (same as bench_one_batch) ----------
-        batch = ScheduleBatch.init_new(
-            reqs=reqs,
-            req_to_token_pool=self.req_to_token_pool,
-            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-            tree_cache=None,
-            model_config=self.model_config,
-            enable_overlap=False,
-            spec_algorithm=SpeculativeAlgorithm.NONE,
-        )
-        batch.prepare_for_extend()
-
-        if require_mlp_sync(self.server_args):
-            Scheduler.prepare_mlp_sync_batch_raw(
-                batch,
-                dp_size=self.server_args.dp_size,
-                attn_tp_size=1,
-                tp_group=self.tp_group,
-                get_idle_batch=None,
-                disable_cuda_graph=self.server_args.disable_cuda_graph,
-                spec_algorithm=SpeculativeAlgorithm.NONE,
-                speculative_num_draft_tokens=None,
-                require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),
-                disable_overlap_schedule=self.server_args.disable_overlap_schedule,
-            )
-
-        model_worker_batch = batch.get_model_worker_batch()
-        forward_batch = ForwardBatch.init_new(model_worker_batch, self)
-
-        # ---------- 3) Warmup call via ModelRunner.forward (matches benchmark) ----------
-        # Do NOT pre-init attention metadata here; let forward() wire Q/KV batch consistently.
-        with set_forward_context(forward_batch, self.attention_layers):
-            _ = self.model.forward(
-                forward_batch.input_ids,
-                forward_batch.positions,
-                forward_batch,
-            )
-
-        # If you truly need to pre-init for a later CG capture, derive from forward_batch:
-        # B = int(forward_batch.seq_lens.shape[0])
-        # total_tokens = int(forward_batch.seq_lens.sum().item())
-        # self.attn_backend.init_forward_metadata_capture_cuda_graph(
-        #     B,
-        #     total_tokens,
-        #     forward_batch.req_pool_indices,
-        #     forward_batch.seq_lens,
-        #     None,
-        #     forward_batch.forward_mode,
-        #     None,
-        # )
 
     def initialize(self, min_per_gpu_memory: float):
         server_args = self.server_args
@@ -2197,14 +2027,15 @@ class ModelRunner:
             kwargs["get_embedding"] = True
 
         if self.server_args.enable_piecewise_cuda_graph:
-            return self.piecewise_cuda_graph_runner.replay(forward_batch, **kwargs)
-        else:
-            return self.model.forward(
-                forward_batch.input_ids,
-                forward_batch.positions,
-                forward_batch,
-                **kwargs,
-            )
+            if self.piecewise_cuda_graph_runner.can_run(forward_batch):
+                return self.piecewise_cuda_graph_runner.replay(forward_batch, **kwargs)
+
+        return self.model.forward(
+            forward_batch.input_ids,
+            forward_batch.positions,
+            forward_batch,
+            **kwargs,
+        )
 
     def forward_idle(
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None

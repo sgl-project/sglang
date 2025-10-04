@@ -109,30 +109,11 @@ class CompilerManager:
 
         compiled_graph = None
 
-        # try to load from the cache
-        # compiled_graph = self.load(graph, example_inputs, graph_index,
-        #                            runtime_shape)
-        # if compiled_graph is not None:
-        #     if graph_index == num_graphs - 1:
-        #         # after loading the last graph for this shape, record the time.
-        #         # there can be multiple graphs due to piecewise compilation.
-        #         now = time.time()
-        #         elapsed = now - compilation_start_time
-        #         if runtime_shape is None:
-        #             logger.info(
-        #                 "Directly load the compiled graph(s) for dynamic shape "
-        #                 "from the cache, took %.3f s", elapsed)
-        #         else:
-        #             logger.info(
-        #                 "Directly load the compiled graph(s) for shape %s "
-        #                 "from the cache, took %.3f s", str(runtime_shape),
-        #                 elapsed)
-        #     return compiled_graph
+        # TODO(Yuwei): support cache loading
 
         # no compiler cached the graph, or the cache is disabled,
         # we need to compile it
         if isinstance(self.compiler, InductorAdaptor):
-            # Let compile_fx generate a key for us
             maybe_key = None
         else:
             maybe_key = f"artifact_shape_{runtime_shape}_subgraph_{graph_index}"
@@ -287,7 +268,6 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
         if target in self.compile_submod_names:
             index = self.compile_submod_names.index(target)
             submod = self.fetch_attr(target)
-            print(f"args length: {len(args)}")
             sym_shape_indices = [
                 i for i, x in enumerate(args) if isinstance(x, torch.SymInt)
             ]
@@ -381,8 +361,6 @@ class SGLangBackend:
             "08329392",
         )
 
-        print(f"example_inputs[0]: {example_inputs[0]}")
-        print(f"len(example_inputs): {len(example_inputs)}")
         os.makedirs(cache_dir, exist_ok=True)
         rank = 0
         dp_rank = 0
@@ -441,40 +419,3 @@ class SGLangBackend:
 
         self._called = True
         return self.split_gm
-
-        from torch._guards import detect_fake_mode
-
-        fake_mode = detect_fake_mode()
-        fake_args = [
-            fake_mode.from_tensor(t) if isinstance(t, torch.Tensor) else t
-            for t in example_inputs
-        ]
-
-        from torch.fx.experimental.symbolic_shapes import is_symbolic
-
-        self.sym_tensor_indices = [
-            i
-            for i, x in enumerate(fake_args)
-            if isinstance(x, torch._subclasses.fake_tensor.FakeTensor)
-            and any(is_symbolic(d) for d in x.size())
-        ]
-
-        self.input_buffers = [
-            example_inputs[x].clone() for x in self.sym_tensor_indices
-        ]
-
-        def copy_and_call(*args):
-            list_args = list(args)
-            for i, index in enumerate(self.sym_tensor_indices):
-                runtime_tensor = list_args[index]
-                runtime_shape = runtime_tensor.shape[0]
-                static_tensor = self.input_buffers[i][:runtime_shape]
-
-                # copy the tensor to the static buffer
-                static_tensor.copy_(runtime_tensor)
-
-                # replace the tensor in the list_args to the static buffer
-                list_args[index] = static_tensor
-            return self.split_gm(*list_args)
-
-        return copy_and_call

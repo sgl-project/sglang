@@ -10,6 +10,7 @@ from unittest.mock import patch
 import torch
 import torch.fx as fx
 
+from sglang.srt.model_executor.compilation.compilation_config import CompilationConfig
 from sglang.srt.model_executor.compilation.compilation_counter import (
     compilation_counter,
 )
@@ -67,6 +68,7 @@ class CUDAPiecewiseBackend:
     def __init__(
         self,
         graph: fx.GraphModule,
+        compile_config: CompilationConfig,
         inductor_config: dict[str, Any],
         graph_pool: Any,
         piecewise_compile_index: int,
@@ -99,6 +101,7 @@ class CUDAPiecewiseBackend:
         self.is_last_graph = piecewise_compile_index == total_piecewise_compiles - 1
 
         self.compile_sizes: set[int] = set([])
+        self.compile_config = compile_config
         self.cudagraph_capture_sizes: set[int] = set(
             [
                 512,
@@ -238,7 +241,6 @@ class CUDAPiecewiseBackend:
         #     return entry.runnable(*args)
 
         if entry.cudagraph is None:
-            print(f"Capturing a cudagraph for shape {runtime_shape}!")
             if entry.num_finished_warmup < 1:  # noqa
                 entry.num_finished_warmup += 1
                 if self.is_first_graph:
@@ -249,12 +251,6 @@ class CUDAPiecewiseBackend:
                         runtime_shape,
                     )
                 return entry.runnable(*args)
-
-            if self.is_first_graph:
-                # Since we capture cudagraph for many different shapes and
-                # capturing is fast, we don't need to log it for every shape.
-                # We only log it in the debug mode.
-                logger.info("Capturing a cudagraph for shape %s", runtime_shape)
 
             input_addresses = [
                 x.data_ptr() for x in args if isinstance(x, torch.Tensor)
@@ -296,22 +292,6 @@ class CUDAPiecewiseBackend:
             # the weak ref of the output, so that pytorch can correctly
             # manage the memory during cuda graph capture
             return output
-
-        print(f"Replaying a cudagraph for shape {runtime_shape}")
-
-        print("--- Replay-time Argument Inspection ---")
-        current_tensor_idx = 0
-        for i, arg in enumerate(args):
-            if isinstance(arg, torch.Tensor):
-                print(
-                    f"args[{i}] (Tensor #{current_tensor_idx}): "
-                    f"shape={arg.shape}, dtype={arg.dtype}, device={arg.device}, "
-                    f"address={arg.data_ptr()}"
-                )
-                current_tensor_idx += 1
-            else:
-                print(f"args[{i}]: type={type(arg)}, value={arg}")
-        print("--- End Inspection ---")
 
         if self.is_debugging_mode:
             # check if the input addresses are the same
