@@ -208,6 +208,10 @@ async def async_request_openai_completions(
             "ignore_eos": not args.disable_ignore_eos,
             **request_func_input.extra_request_body,
         }
+
+        if request_func_input.image_data:
+            payload.update({"image_data": request_func_input.image_data})
+
         headers = get_auth_headers()
 
         output = RequestFuncOutput.init_new(request_func_input)
@@ -631,7 +635,7 @@ def get_tokenizer(
     if pretrained_model_name_or_path.endswith(
         ".json"
     ) or pretrained_model_name_or_path.endswith(".model"):
-        from sglang.srt.hf_transformers_utils import get_tokenizer
+        from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
         return get_tokenizer(pretrained_model_name_or_path)
 
@@ -1759,7 +1763,9 @@ async def benchmark(
         pbar.close()
 
     if "sglang" in backend:
-        server_info = requests.get(base_url + "/get_server_info")
+        server_info = requests.get(
+            base_url + "/get_server_info", headers=get_auth_headers()
+        )
         if server_info.status_code == 200:
             server_info_json = server_info.json()
             if "decode" in server_info_json:

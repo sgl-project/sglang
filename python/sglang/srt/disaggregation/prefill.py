@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from collections import deque
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional, Type
@@ -263,9 +264,10 @@ class PrefillBootstrapQueue:
             num_pages = kv_to_page_num(num_kv_indices, self.token_to_kv_pool.page_size)
             req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
 
-            req.add_latency(RequestStage.PREFILL_BOOTSTRAP)
             bootstrapped_reqs.append(req)
             indices_to_remove.add(i)
+            req.time_stats.wait_queue_entry_time = time.perf_counter()
+            req.add_latency(RequestStage.PREFILL_BOOTSTRAP)
 
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
@@ -407,7 +409,6 @@ class SchedulerDisaggregationPrefillMixin:
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
-            req: Req
             if req.is_chunked <= 0:
                 # There is no output_ids for prefill
                 req.output_ids.append(next_token_id)
@@ -421,6 +422,8 @@ class SchedulerDisaggregationPrefillMixin:
                     last_hidden_index = (
                         hidden_state_offset + extend_input_len_per_req[i] - 1
                     )
+                    req.output_topk_p = batch.spec_info.topk_p[i]
+                    req.output_topk_index = batch.spec_info.topk_index[i]
                     if self.spec_algorithm.is_eagle3():
                         req.hidden_states_tensor = (
                             batch.spec_info.hidden_states[i].cpu().clone()
@@ -448,6 +451,7 @@ class SchedulerDisaggregationPrefillMixin:
                     )
                     logprob_pt += num_input_logprobs
                 self.send_kv_chunk(req, last_chunk=True)
+                req.time_stats.prefill_transfer_queue_entry_time = time.perf_counter()
 
                 if req.grammar is not None:
                     # FIXME: this try-except block is for handling unexpected xgrammar issue.
@@ -544,6 +548,9 @@ class SchedulerDisaggregationPrefillMixin:
                     self.metrics_collector.increment_transfer_failed_reqs()
             else:
                 assert False, f"Unexpected polling state {poll=}"
+
+        for req in done_reqs:
+            req.time_stats.completion_time = time.perf_counter()
 
         # Stream requests which have finished transfer
         self.stream_output(
@@ -682,7 +689,6 @@ class SchedulerDisaggregationPrefillMixin:
         self.running_mbs = [
             ScheduleBatch(reqs=[], batch_is_full=False) for _ in range(self.pp_size)
         ]
-        bids = [None] * self.pp_size
         pp_outputs: Optional[PPProxyTensors] = None
 
         # Either success or failed
@@ -754,10 +760,7 @@ class SchedulerDisaggregationPrefillMixin:
                 # send the outputs to the next step
                 if self.pp_group.is_last_rank:
                     if self.cur_batch:
-                        next_token_ids, bids[mb_id] = (
-                            result.next_token_ids,
-                            result.bid,
-                        )
+                        next_token_ids = result.next_token_ids
                         pp_outputs = PPProxyTensors(
                             {
                                 "next_token_ids": next_token_ids,
@@ -794,7 +797,6 @@ class SchedulerDisaggregationPrefillMixin:
                         next_token_ids=next_pp_outputs["next_token_ids"],
                         extend_input_len_per_req=None,
                         extend_logprob_start_len_per_req=None,
-                        bid=bids[next_mb_id],
                         can_run_cuda_graph=result.can_run_cuda_graph,
                     )
                     self.process_batch_result_disagg_prefill(
@@ -811,8 +813,6 @@ class SchedulerDisaggregationPrefillMixin:
 
                 # carry the outputs to the next stage
                 if not self.pp_group.is_last_rank:
-                    if self.cur_batch:
-                        bids[mb_id] = result.bid
                     if pp_outputs:
                         # send the outputs from the last round to let the next stage worker run post processing
                         self.pp_group.send_tensor_dict(
@@ -831,8 +831,10 @@ class SchedulerDisaggregationPrefillMixin:
 
                     # send out proxy tensors to the next stage
                     if self.cur_batch:
+                        # FIXME(lsyin): remove this assert
+                        assert result.pp_hidden_states_proxy_tensors.tensors is not None
                         self.pp_group.send_tensor_dict(
-                            result.pp_hidden_states_proxy_tensors,
+                            result.pp_hidden_states_proxy_tensors.tensors,
                             all_gather_group=self.attn_tp_group,
                         )
 
