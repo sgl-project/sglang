@@ -15,7 +15,7 @@ from sglang.srt.function_call.mistral_detector import MistralDetector
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 from sglang.srt.function_call.qwen25_detector import Qwen25Detector
-from sglang.srt.hf_transformers_utils import get_tokenizer
+from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
 

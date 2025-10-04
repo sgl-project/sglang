@@ -3,7 +3,7 @@ This example demonstrates how to provide tokenized ids to LLM as input instead o
 """
 
 import sglang as sgl
-from sglang.srt.hf_transformers_utils import get_tokenizer
+from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
 MODEL_PATH = "meta-llama/Llama-3.1-8B-Instruct"
 
