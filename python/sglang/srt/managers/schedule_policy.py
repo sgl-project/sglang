@@ -174,7 +174,7 @@ class SchedulePolicy:
         self.waiting_queue_radix_tree.reset()
 
         for r in waiting_queue:
-            prefix_ids = r.adjust_max_prefix_ids()
+            prefix_ids = r.origin_input_ids + r.output_ids
             extra_key = r.extra_key
 
             # NOTE: the prefix_indices must always be aligned with last_node
