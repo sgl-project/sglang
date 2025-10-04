@@ -173,6 +173,8 @@ class OpenAIServingChat(OpenAIServingBase):
             bootstrap_room=request.bootstrap_room,
             return_hidden_states=request.return_hidden_states,
             rid=request.rid,
+            user_id=request.user_id,
+            external_request_id=request.external_request_id,
             extra_key=self._compute_extra_key(request),
             priority=request.priority,
             custom_labels=custom_labels,

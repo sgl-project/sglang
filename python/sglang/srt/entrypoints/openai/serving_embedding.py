@@ -125,6 +125,8 @@ class OpenAIServingEmbedding(OpenAIServingBase):
         adapted_request = EmbeddingReqInput(
             **prompt_kwargs,
             rid=request.rid,
+            user_id=request.user_id,
+            external_request_id=request.external_request_id,
             priority=request.priority,
         )
 
