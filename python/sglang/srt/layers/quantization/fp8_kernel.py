@@ -26,6 +26,7 @@ import triton.language as tl
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.utils import (
     align,
+    cached_triton_kernel,
     direct_register_custom_op,
     get_bool_env_var,
     get_device_core_count,
@@ -562,6 +563,7 @@ def sglang_per_token_quant_fp8(
     return x_q, x_s
 
 
+@cached_triton_kernel(lambda _, kwargs: (kwargs["BLOCK"], kwargs["REPEAT_SCALE"]))
 @triton.jit
 def _static_quant_fp8(
     # Pointers to inputs and output

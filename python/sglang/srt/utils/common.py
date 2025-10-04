@@ -3323,6 +3323,7 @@ class CachedKernel:
             else:
                 # Use cached kernel
                 all_args = self._build_args(args, kwargs)
+                # Do not forward non-parameter kwargs (e.g., num_warps/num_stages) to compiled kernels
                 cached_kernel[grid](*all_args)
                 return cached_kernel
 
