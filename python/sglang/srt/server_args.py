@@ -1170,15 +1170,15 @@ class ServerArgs:
 
     def _set_media_domain_env_vars(self):
         if self.media_whitelisted_domains:
-            envs.SGLANG_MEDIA_WHITELISTED_DOMAINS.get() = json.dumps(
-                self.media_whitelisted_domains
+            envs.SGLANG_MEDIA_WHITELISTED_DOMAINS.set(
+                json.dumps(self.media_whitelisted_domains)
             )
         else:
             envs.SGLANG_MEDIA_WHITELISTED_DOMAINS.clear()
 
         if self.media_blacklisted_domains:
-            envs.SGLANG_MEDIA_BLACKLISTED_DOMAINS.get() = json.dumps(
-                self.media_blacklisted_domains
+            envs.SGLANG_MEDIA_BLACKLISTED_DOMAINS.set(
+                json.dumps(self.media_blacklisted_domains)
             )
         else:
             envs.SGLANG_MEDIA_BLACKLISTED_DOMAINS.clear()
