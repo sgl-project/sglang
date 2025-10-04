@@ -111,7 +111,6 @@ class Envs:
     # Model & File Download
     SGLANG_USE_MODELSCOPE = EnvBool(False)
 
-
     # Test & Debug
     SGLANG_IS_IN_CI = EnvBool(False)
     SGLANG_AMD_CI = EnvBool(False)
