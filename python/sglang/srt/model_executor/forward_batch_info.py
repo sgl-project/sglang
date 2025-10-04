@@ -910,6 +910,9 @@ class ForwardBatchOutput:
     pp_proxy_tensors: Optional[PPProxyTensors] = None
     can_run_cuda_graph: bool = False
 
+    # For overlap scheduling
+    copy_done: Optional[torch.cuda.Event] = None
+
 
 def enable_num_token_non_padded(server_args):
     return get_moe_expert_parallel_world_size() > 1
