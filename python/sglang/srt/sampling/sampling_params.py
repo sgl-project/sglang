@@ -170,3 +170,20 @@ class SamplingParams:
                 else:
                     stop_str_max_len = max(stop_str_max_len, len(stop_str))
             self.stop_str_max_len = stop_str_max_len
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return getattr(self, key, default)
+
+    def to_input_dict(self) -> Dict[str, Any]:
+        """
+        Convert the sampling parameters to a dictionary format.
+        Should only be used for downstream to construct a new SamplingParams object.
+        Note greedy sampling(temperature=0) will be passed as temperature=1.0, top_k=1,
+        which is equivalent to greedy sampling.
+        """
+        input_dict = self.__dict__.copy()
+        if "stop_strs" in input_dict:
+            input_dict["stop"] = input_dict.pop("stop_strs")
+        if "stop_str_max_len" in input_dict:
+            input_dict.pop("stop_str_max_len")
+        return input_dict
