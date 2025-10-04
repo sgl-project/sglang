@@ -407,7 +407,7 @@ impl Default for MetricsConfig {
     fn default() -> Self {
         Self {
             port: 29000,
-            host: "127.0.0.1".to_string(),
+            host: "0.0.0.0".to_string(),
         }
     }
 }
@@ -419,7 +419,7 @@ impl Default for RouterConfig {
                 worker_urls: vec![],
             },
             policy: PolicyConfig::Random,
-            host: "127.0.0.1".to_string(),
+            host: "0.0.0.0".to_string(),
             port: 3001,
             max_payload_size: 536_870_912, // 512MB
             request_timeout_secs: 1800,    // 30 minutes
