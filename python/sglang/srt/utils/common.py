@@ -1507,6 +1507,32 @@ def get_npu_memory_capacity():
         raise ImportError("torch_npu is required when run on npu device.")
 
 
+def get_cpu_memory_capacity():
+    # Per-rank memory capacity cannot be determined for customized core settings
+    if os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", ""):
+        return None
+    n_numa_node: int = len(get_cpu_ids_by_node())
+    if n_numa_node == 0:
+        # Cannot determine NUMA config, fallback to total memory and avoid ZeroDivisionError.
+        return float(psutil.virtual_memory().total // (1 << 20))
+    try:
+        numa_mem_list = list()
+        file_prefix = "/sys/devices/system/node/"
+        for numa_id in range(n_numa_node):
+            file_meminfo = f"node{numa_id}/meminfo"
+            with open(os.path.join(file_prefix, file_meminfo), "r") as f:
+                # 1st line contains 'MemTotal'
+                line = f.read().split("\n")[0]
+                numa_mem_list.append(int(line.split()[3]))
+        # Retrieved value in KB, need MB
+        numa_mem = float(min(numa_mem_list) // 1024)
+        return numa_mem
+    except FileNotFoundError:
+        numa_mem = psutil.virtual_memory().total / n_numa_node
+        # Retrieved value in Byte, need MB
+        return float(numa_mem // (1 << 20))
+
+
 def get_device_memory_capacity(device: str = None):
     if is_cuda():
         gpu_mem = get_nvgpu_memory_capacity()
@@ -1516,6 +1542,8 @@ def get_device_memory_capacity(device: str = None):
         gpu_mem = get_hpu_memory_capacity()
     elif device == "npu":
         gpu_mem = get_npu_memory_capacity()
+    elif device == "cpu":
+        gpu_mem = get_cpu_memory_capacity()
     else:
         # GPU memory is not known yet or no GPU is available.
         gpu_mem = None
@@ -2460,7 +2488,7 @@ class BumpAllocator:
 def log_info_on_rank0(logger, msg):
     from sglang.srt.distributed import get_tensor_model_parallel_rank
 
-    if get_tensor_model_parallel_rank() == 0:
+    if torch.distributed.is_initialized() and get_tensor_model_parallel_rank() == 0:
         logger.info(msg)
 
 
@@ -2588,14 +2616,6 @@ def read_system_prompt_from_file(model_name: str) -> str:
     except Exception:
         # If anything fails, return empty string
         return ""
-
-
-def bind_or_assign(target, source):
-    if target is not None:
-        target.copy_(source)
-        return target
-    else:
-        return source
 
 
 def prepack_weight_if_needed(weight):
@@ -3220,6 +3240,32 @@ def get_extend_input_len_swa_limit(
     #    and we can only free out-of-sliding-window kv indices after each prefill.
     # 3. page_size is because we want to have 1 token extra for generated tokens.
     return page_size + 2 * max(sliding_window_size, chunked_prefill_size)
+
+
+def get_num_new_pages(
+    seq_lens: torch.Tensor,
+    page_size: int,
+    prefix_lens: Optional[torch.Tensor] = None,
+    decode: bool = False,
+) -> torch.Tensor:
+    """
+    Get the number of new pages for the given prefix and sequence lengths.
+    We use cpu tensors to avoid blocking kernel launch.
+    """
+    cpu_device = torch.device("cpu")
+    assert seq_lens.device == cpu_device
+
+    if prefix_lens is None or decode:
+        # NOTE: Special case for handling decode, which prefix lens is `seq_lens - 1`.
+        assert decode
+        return (seq_lens % page_size == 1).int().sum().item()
+
+    assert prefix_lens.device == cpu_device
+    num_pages_after = (seq_lens + page_size - 1) // page_size
+    num_pages_before = (prefix_lens + page_size - 1) // page_size
+    num_new_pages = num_pages_after - num_pages_before
+    sum_num_new_pages = torch.sum(num_new_pages).to(torch.int64)
+    return sum_num_new_pages.item()
 
 
 class CachedKernel:

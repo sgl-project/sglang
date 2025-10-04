@@ -3,7 +3,7 @@ use std::fmt;
 /// Result of parsing text for reasoning content.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ParserResult {
-    /// The normal text outside of reasoning blocks.
+    /// The normal text outside reasoning blocks.
     pub normal_text: String,
 
     /// The extracted reasoning text from within reasoning blocks.
