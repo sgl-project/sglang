@@ -41,6 +41,7 @@ from sglang.srt.configs import (
     DotsOCRConfig,
     DotsVLMConfig,
     ExaoneConfig,
+    FalconH1Config,
     KimiVLConfig,
     LongcatFlashConfig,
     MultiModalityConfig,
@@ -62,6 +63,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     Step3VLConfig.model_type: Step3VLConfig,
     LongcatFlashConfig.model_type: LongcatFlashConfig,
     Qwen3NextConfig.model_type: Qwen3NextConfig,
+    FalconH1Config.model_type: FalconH1Config,
     DotsVLMConfig.model_type: DotsVLMConfig,
     DotsOCRConfig.model_type: DotsOCRConfig,
 }

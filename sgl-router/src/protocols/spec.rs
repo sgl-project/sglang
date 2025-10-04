@@ -2,6 +2,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{to_value, Map, Number, Value};
 use std::collections::HashMap;
 
+// Default model value when not specified
+fn default_model() -> String {
+    "unknown".to_string()
+}
+
 // # Protocol Specifications
 //
 // This module contains all protocol definitions for OpenAI and SGLang APIs.
@@ -72,8 +77,6 @@ pub enum ChatMessage {
         name: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         tool_calls: Option<Vec<ToolCall>>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        function_call: Option<FunctionCallResponse>,
         /// Reasoning content for O1-style models (SGLang extension)
         #[serde(skip_serializing_if = "Option::is_none")]
         reasoning_content: Option<String>,
@@ -140,8 +143,6 @@ pub struct ChatMessageDelta {
     pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCallDelta>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub function_call: Option<FunctionCallDelta>,
     /// Reasoning content delta for O1-style models (SGLang extension)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
@@ -173,6 +174,7 @@ pub struct ChatCompletionRequest {
     pub messages: Vec<ChatMessage>,
 
     /// ID of the model to use
+    #[serde(default = "default_model")]
     pub model: String,
 
     /// Number between -2.0 and 2.0. Positive values penalize new tokens based on their existing frequency in the text so far
@@ -473,6 +475,8 @@ pub struct ChatStreamChoice {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logprobs: Option<ChatLogProbs>,
     pub finish_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched_stop: Option<Value>,
 }
 
 // Completions API request types (v1/completions) - DEPRECATED but still supported

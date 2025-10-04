@@ -82,7 +82,7 @@ class DisaggregatedParams(_message.Message):
     def __init__(self, bootstrap_host: _Optional[str] = ..., bootstrap_port: _Optional[int] = ..., bootstrap_room: _Optional[int] = ...) -> None: ...
 
 class GenerateRequest(_message.Message):
-    __slots__ = ("request_id", "tokenized", "mm_inputs", "sampling_params", "return_logprob", "logprob_start_len", "top_logprobs_num", "token_ids_logprob", "return_hidden_states", "disaggregated_params", "custom_logit_processor", "timestamp", "log_metrics", "input_embeds", "lora_id", "data_parallel_rank", "dp_balance_id", "stream")
+    __slots__ = ("request_id", "tokenized", "mm_inputs", "sampling_params", "return_logprob", "logprob_start_len", "top_logprobs_num", "token_ids_logprob", "return_hidden_states", "disaggregated_params", "custom_logit_processor", "timestamp", "log_metrics", "input_embeds", "lora_id", "data_parallel_rank", "stream")
     REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
     TOKENIZED_FIELD_NUMBER: _ClassVar[int]
     MM_INPUTS_FIELD_NUMBER: _ClassVar[int]
@@ -99,7 +99,6 @@ class GenerateRequest(_message.Message):
     INPUT_EMBEDS_FIELD_NUMBER: _ClassVar[int]
     LORA_ID_FIELD_NUMBER: _ClassVar[int]
     DATA_PARALLEL_RANK_FIELD_NUMBER: _ClassVar[int]
-    DP_BALANCE_ID_FIELD_NUMBER: _ClassVar[int]
     STREAM_FIELD_NUMBER: _ClassVar[int]
     request_id: str
     tokenized: TokenizedInput
@@ -117,9 +116,8 @@ class GenerateRequest(_message.Message):
     input_embeds: _containers.RepeatedScalarFieldContainer[float]
     lora_id: str
     data_parallel_rank: int
-    dp_balance_id: int
     stream: bool
-    def __init__(self, request_id: _Optional[str] = ..., tokenized: _Optional[_Union[TokenizedInput, _Mapping]] = ..., mm_inputs: _Optional[_Union[MultimodalInputs, _Mapping]] = ..., sampling_params: _Optional[_Union[SamplingParams, _Mapping]] = ..., return_logprob: bool = ..., logprob_start_len: _Optional[int] = ..., top_logprobs_num: _Optional[int] = ..., token_ids_logprob: _Optional[_Iterable[int]] = ..., return_hidden_states: bool = ..., disaggregated_params: _Optional[_Union[DisaggregatedParams, _Mapping]] = ..., custom_logit_processor: _Optional[str] = ..., timestamp: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., log_metrics: bool = ..., input_embeds: _Optional[_Iterable[float]] = ..., lora_id: _Optional[str] = ..., data_parallel_rank: _Optional[int] = ..., dp_balance_id: _Optional[int] = ..., stream: bool = ...) -> None: ...
+    def __init__(self, request_id: _Optional[str] = ..., tokenized: _Optional[_Union[TokenizedInput, _Mapping]] = ..., mm_inputs: _Optional[_Union[MultimodalInputs, _Mapping]] = ..., sampling_params: _Optional[_Union[SamplingParams, _Mapping]] = ..., return_logprob: bool = ..., logprob_start_len: _Optional[int] = ..., top_logprobs_num: _Optional[int] = ..., token_ids_logprob: _Optional[_Iterable[int]] = ..., return_hidden_states: bool = ..., disaggregated_params: _Optional[_Union[DisaggregatedParams, _Mapping]] = ..., custom_logit_processor: _Optional[str] = ..., timestamp: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., log_metrics: bool = ..., input_embeds: _Optional[_Iterable[float]] = ..., lora_id: _Optional[str] = ..., data_parallel_rank: _Optional[int] = ..., stream: bool = ...) -> None: ...
 
 class TokenizedInput(_message.Message):
     __slots__ = ("original_text", "input_ids")
@@ -162,7 +160,7 @@ class GenerateResponse(_message.Message):
     def __init__(self, request_id: _Optional[str] = ..., chunk: _Optional[_Union[GenerateStreamChunk, _Mapping]] = ..., complete: _Optional[_Union[GenerateComplete, _Mapping]] = ..., error: _Optional[_Union[GenerateError, _Mapping]] = ...) -> None: ...
 
 class GenerateStreamChunk(_message.Message):
-    __slots__ = ("token_ids", "prompt_tokens", "completion_tokens", "cached_tokens", "output_logprobs", "hidden_states", "input_logprobs")
+    __slots__ = ("token_ids", "prompt_tokens", "completion_tokens", "cached_tokens", "output_logprobs", "hidden_states", "input_logprobs", "index")
     TOKEN_IDS_FIELD_NUMBER: _ClassVar[int]
     PROMPT_TOKENS_FIELD_NUMBER: _ClassVar[int]
     COMPLETION_TOKENS_FIELD_NUMBER: _ClassVar[int]
@@ -170,6 +168,7 @@ class GenerateStreamChunk(_message.Message):
     OUTPUT_LOGPROBS_FIELD_NUMBER: _ClassVar[int]
     HIDDEN_STATES_FIELD_NUMBER: _ClassVar[int]
     INPUT_LOGPROBS_FIELD_NUMBER: _ClassVar[int]
+    INDEX_FIELD_NUMBER: _ClassVar[int]
     token_ids: _containers.RepeatedScalarFieldContainer[int]
     prompt_tokens: int
     completion_tokens: int
@@ -177,10 +176,11 @@ class GenerateStreamChunk(_message.Message):
     output_logprobs: OutputLogProbs
     hidden_states: _containers.RepeatedScalarFieldContainer[float]
     input_logprobs: InputLogProbs
-    def __init__(self, token_ids: _Optional[_Iterable[int]] = ..., prompt_tokens: _Optional[int] = ..., completion_tokens: _Optional[int] = ..., cached_tokens: _Optional[int] = ..., output_logprobs: _Optional[_Union[OutputLogProbs, _Mapping]] = ..., hidden_states: _Optional[_Iterable[float]] = ..., input_logprobs: _Optional[_Union[InputLogProbs, _Mapping]] = ...) -> None: ...
+    index: int
+    def __init__(self, token_ids: _Optional[_Iterable[int]] = ..., prompt_tokens: _Optional[int] = ..., completion_tokens: _Optional[int] = ..., cached_tokens: _Optional[int] = ..., output_logprobs: _Optional[_Union[OutputLogProbs, _Mapping]] = ..., hidden_states: _Optional[_Iterable[float]] = ..., input_logprobs: _Optional[_Union[InputLogProbs, _Mapping]] = ..., index: _Optional[int] = ...) -> None: ...
 
 class GenerateComplete(_message.Message):
-    __slots__ = ("output_ids", "finish_reason", "prompt_tokens", "completion_tokens", "cached_tokens", "output_logprobs", "all_hidden_states", "matched_token_id", "matched_stop_str", "input_logprobs")
+    __slots__ = ("output_ids", "finish_reason", "prompt_tokens", "completion_tokens", "cached_tokens", "output_logprobs", "all_hidden_states", "matched_token_id", "matched_stop_str", "input_logprobs", "index")
     OUTPUT_IDS_FIELD_NUMBER: _ClassVar[int]
     FINISH_REASON_FIELD_NUMBER: _ClassVar[int]
     PROMPT_TOKENS_FIELD_NUMBER: _ClassVar[int]
@@ -191,6 +191,7 @@ class GenerateComplete(_message.Message):
     MATCHED_TOKEN_ID_FIELD_NUMBER: _ClassVar[int]
     MATCHED_STOP_STR_FIELD_NUMBER: _ClassVar[int]
     INPUT_LOGPROBS_FIELD_NUMBER: _ClassVar[int]
+    INDEX_FIELD_NUMBER: _ClassVar[int]
     output_ids: _containers.RepeatedScalarFieldContainer[int]
     finish_reason: str
     prompt_tokens: int
@@ -201,7 +202,8 @@ class GenerateComplete(_message.Message):
     matched_token_id: int
     matched_stop_str: str
     input_logprobs: InputLogProbs
-    def __init__(self, output_ids: _Optional[_Iterable[int]] = ..., finish_reason: _Optional[str] = ..., prompt_tokens: _Optional[int] = ..., completion_tokens: _Optional[int] = ..., cached_tokens: _Optional[int] = ..., output_logprobs: _Optional[_Union[OutputLogProbs, _Mapping]] = ..., all_hidden_states: _Optional[_Iterable[_Union[HiddenStates, _Mapping]]] = ..., matched_token_id: _Optional[int] = ..., matched_stop_str: _Optional[str] = ..., input_logprobs: _Optional[_Union[InputLogProbs, _Mapping]] = ...) -> None: ...
+    index: int
+    def __init__(self, output_ids: _Optional[_Iterable[int]] = ..., finish_reason: _Optional[str] = ..., prompt_tokens: _Optional[int] = ..., completion_tokens: _Optional[int] = ..., cached_tokens: _Optional[int] = ..., output_logprobs: _Optional[_Union[OutputLogProbs, _Mapping]] = ..., all_hidden_states: _Optional[_Iterable[_Union[HiddenStates, _Mapping]]] = ..., matched_token_id: _Optional[int] = ..., matched_stop_str: _Optional[str] = ..., input_logprobs: _Optional[_Union[InputLogProbs, _Mapping]] = ..., index: _Optional[int] = ...) -> None: ...
 
 class GenerateError(_message.Message):
     __slots__ = ("message", "http_status_code", "details")

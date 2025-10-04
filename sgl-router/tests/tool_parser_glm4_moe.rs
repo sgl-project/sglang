@@ -1,6 +1,9 @@
 //! GLM-4 MoE Parser Integration Tests
 
-use sglang_router_rs::tool_parser::{Glm4MoeParser, ParseState, StreamResult, ToolParser};
+use sglang_router_rs::tool_parser::{Glm4MoeParser, ToolParser};
+
+mod common;
+use common::create_test_tools;
 
 #[tokio::test]
 async fn test_glm4_complete_parsing() {
@@ -78,8 +81,9 @@ async fn test_glm4_type_conversion() {
 
 #[tokio::test]
 async fn test_glm4_streaming() {
-    let parser = Glm4MoeParser::new();
-    let mut state = ParseState::new();
+    let mut parser = Glm4MoeParser::new();
+
+    let tools = create_test_tools();
 
     // Simulate streaming chunks
     let chunks = vec![
@@ -93,25 +97,19 @@ async fn test_glm4_streaming() {
     ];
 
     let mut found_name = false;
-    let mut found_complete = false;
 
     for chunk in chunks {
-        let result = parser.parse_incremental(chunk, &mut state).await.unwrap();
+        let result = parser.parse_incremental(chunk, &tools).await.unwrap();
 
-        match result {
-            StreamResult::ToolName { name, .. } => {
+        for call in result.calls {
+            if let Some(name) = call.name {
                 assert_eq!(name, "get_weather");
                 found_name = true;
             }
-            StreamResult::ToolComplete(tool) => {
-                assert_eq!(tool.function.name, "get_weather");
-                found_complete = true;
-            }
-            _ => {}
         }
     }
 
-    assert!(found_name || found_complete);
+    assert!(found_name, "Should have found tool name during streaming");
 }
 
 #[test]

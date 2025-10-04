@@ -1,5 +1,4 @@
 default_stages: [pre-commit, pre-push, manual]
-exclude: ^python/sglang/srt/grpc/
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks

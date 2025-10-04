@@ -142,6 +142,9 @@ class SamplingParams:
                         f"logit_bias must has keys in [0, {vocab_size - 1}], got "
                         f"{token_id}."
                     )
+        if self.sampling_seed is None:
+            raise ValueError("sampling_seed should not be None")
+
         grammars = [
             self.json_schema,
             self.regex,

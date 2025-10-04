@@ -31,6 +31,18 @@ pub trait Worker: Send + Sync + fmt::Debug {
     /// Get the worker's connection mode (HTTP or gRPC)
     fn connection_mode(&self) -> ConnectionMode;
 
+    /// Get the bootstrap hostname for PD mode
+    /// Returns cached hostname parsed from URL at construction time
+    fn bootstrap_host(&self) -> &str {
+        &self.metadata().bootstrap_host
+    }
+
+    /// Get the bootstrap port for PD mode
+    /// Returns cached port from WorkerType::Prefill
+    fn bootstrap_port(&self) -> Option<u16> {
+        self.metadata().bootstrap_port
+    }
+
     /// Check if the worker is currently healthy
     fn is_healthy(&self) -> bool;
 
@@ -146,21 +158,6 @@ pub trait Worker: Send + Sync + fmt::Debug {
     fn can_handle(&self, _req: &serde_json::Value) -> bool {
         true
     }
-
-    // TODO: - Enhanced Worker Discovery
-    // The Worker trait should handle async discovery of metadata from the worker itself
-    // rather than having service discovery or other components query /get_server_info.
-    // This keeps service discovery decoupled from worker-specific APIs.
-    //
-    // Proposed additions:
-    // - async fn discover_metadata(&mut self) -> Result<(), Error>
-    //   Query /get_server_info and populate metadata labels with model_id, priority, cost, etc.
-    // - async fn validate_configuration(&self) -> Result<(), Error>
-    //   Ensure worker has required configuration for its mode (e.g., tokenizer for gRPC)
-    // - Make worker creation async to allow metadata discovery during initialization
-    //
-    // This way service discovery just calls router.add_worker() and the worker
-    // handles its own metadata discovery internally.
 
     /// Get the model ID this worker serves
     fn model_id(&self) -> &str {
@@ -325,6 +322,10 @@ pub struct WorkerMetadata {
     pub health_config: HealthConfig,
     /// API key
     pub api_key: Option<String>,
+    /// Cached bootstrap hostname (parsed from URL at construction time)
+    pub bootstrap_host: String,
+    /// Cached bootstrap port (from WorkerType::Prefill)
+    pub bootstrap_port: Option<u16>,
 }
 
 /// Basic worker implementation
