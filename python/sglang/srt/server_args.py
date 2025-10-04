@@ -24,7 +24,6 @@ from typing import List, Literal, Optional, Union
 
 from sglang.srt.connector import ConnectorType
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
-from sglang.srt.hf_transformers_utils import check_gguf_file, get_config
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils import (
@@ -47,6 +46,7 @@ from sglang.srt.utils import (
     nullable_str,
     parse_connector_type,
 )
+from sglang.srt.utils.hf_transformers_utils import check_gguf_file, get_config
 from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
@@ -116,6 +116,8 @@ GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 
 DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton"]
 
+RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu"]
+
 
 # Allow external code to add more choices
 def add_load_format_choices(choices):
@@ -136,6 +138,14 @@ def add_disagg_transfer_backend_choices(choices):
 
 def add_grammar_backend_choices(choices):
     GRAMMAR_BACKEND_CHOICES.extend(choices)
+
+
+def add_deterministic_attention_backend_choices(choices):
+    DETERMINISTIC_ATTENTION_BACKEND_CHOICES.extend(choices)
+
+
+def add_radix_eviction_policy_choices(choices):
+    RADIX_EVICTION_POLICY_CHOICES.extend(choices)
 
 
 @dataclasses.dataclass
@@ -390,6 +400,7 @@ class ServerArgs:
     num_continuous_decode_steps: int = 1
     delete_ckpt_after_loading: bool = False
     enable_memory_saver: bool = False
+    enable_weights_cpu_backup: bool = False
     allow_auto_truncate: bool = False
     enable_custom_logit_processor: bool = False
     flashinfer_mla_disable_ragged: bool = False
@@ -868,10 +879,9 @@ class ServerArgs:
 
         if self.attention_backend == "dual_chunk_flash_attn":
             logger.warning(
-                "Mixed chunk, radix cache, and cuda graphs are disabled because of using dual chunk flash attention backend"
+                "Mixed chunk and radix cache are disabled when using dual-chunk flash attention backend"
             )
             self.enable_mixed_chunk = False
-            self.disable_cuda_graph = True
             self.disable_radix_cache = True
 
     def _handle_page_size(self):
@@ -2243,7 +2253,7 @@ class ServerArgs:
         parser.add_argument(
             "--radix-eviction-policy",
             type=str,
-            choices=["lru", "lfu"],
+            choices=RADIX_EVICTION_POLICY_CHOICES,
             default=ServerArgs.radix_eviction_policy,
             help="The eviction policy of radix trees. 'lru' stands for Least Recently Used, 'lfu' stands for Least Frequently Used.",
         )
@@ -2531,6 +2541,11 @@ class ServerArgs:
             "--enable-memory-saver",
             action="store_true",
             help="Allow saving memory using release_memory_occupation and resume_memory_occupation",
+        )
+        parser.add_argument(
+            "--enable-weights-cpu-backup",
+            action="store_true",
+            help="Save model weights to CPU memory during release_weights_occupation and resume_weights_occupation",
         )
         parser.add_argument(
             "--allow-auto-truncate",

@@ -60,11 +60,6 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.hf_transformers_utils import (
-    get_processor,
-    get_tokenizer,
-    get_tokenizer_from_processor,
-)
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe import initialize_moe_config
@@ -78,6 +73,7 @@ from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
+    ExpertDistributionReqType,
     FlushCacheReqInput,
     FlushCacheReqOutput,
     FreezeGCReq,
@@ -145,12 +141,16 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
 from sglang.srt.managers.session_controller import Session
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient
-from sglang.srt.managers.utils import DPBalanceMeta, validate_input_length
+from sglang.srt.managers.utils import validate_input_length
 from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
-from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatchOutput,
+    ForwardMode,
+    PPProxyTensors,
+)
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -175,7 +175,6 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_int_env_var,
     get_zmq_socket,
-    is_cpu,
     kill_itself_when_parent_died,
     numa_bind_to_node,
     point_to_point_pyobj,
@@ -186,6 +185,11 @@ from sglang.srt.utils import (
     set_random_seed,
     suppress_other_loggers,
 )
+from sglang.srt.utils.hf_transformers_utils import (
+    get_processor,
+    get_tokenizer,
+    get_tokenizer_from_processor,
+)
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -194,24 +198,59 @@ logger = logging.getLogger(__name__)
 TEST_RETRACT = get_bool_env_var("SGLANG_TEST_RETRACT")
 GRAMMAR_TIMEOUT = float(os.environ.get("SGLANG_GRAMMAR_TIMEOUT", 300))
 
-_is_cpu = is_cpu()
-
 
 @dataclass
 class GenerationBatchResult:
     logits_output: Optional[LogitsProcessorOutput]
-    pp_hidden_states_proxy_tensors: Optional[torch.Tensor]
+    pp_hidden_states_proxy_tensors: Optional[PPProxyTensors]
     next_token_ids: Optional[List[int]]
+    can_run_cuda_graph: bool
+
+    # For output processing
     extend_input_len_per_req: List[int]
     extend_logprob_start_len_per_req: List[int]
-    bid: int
-    can_run_cuda_graph: bool
+
+    @classmethod
+    def from_forward_batch_output(
+        cls,
+        forward_batch_output: ForwardBatchOutput,
+        extend_input_len_per_req: List[int],
+        extend_logprob_start_len_per_req: List[int],
+    ):
+        # TODO(lsyin): remove this workaround logic and try to unify output classes
+
+        return cls(
+            logits_output=forward_batch_output.logits_output,
+            pp_hidden_states_proxy_tensors=forward_batch_output.pp_proxy_tensors,
+            next_token_ids=forward_batch_output.next_token_ids,
+            extend_input_len_per_req=extend_input_len_per_req,
+            extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
+            can_run_cuda_graph=forward_batch_output.can_run_cuda_graph,
+        )
+
+    @classmethod
+    def from_pp_proxy(
+        cls, logits_output, next_pp_outputs: PPProxyTensors, can_run_cuda_graph
+    ):
+        # TODO(lsyin): also simplify this logic
+        # Current PP implementation in scheduler is not compatible with ForwardBatchOutput
+        # Maybe introduce a ProxyBatchOutput for PP and the original ForwardBatchOutput for TP
+        proxy_dict = next_pp_outputs.tensors
+        return cls(
+            logits_output=logits_output,
+            pp_hidden_states_proxy_tensors=None,
+            next_token_ids=next_pp_outputs["next_token_ids"],
+            extend_input_len_per_req=proxy_dict.get("extend_input_len_per_req", None),
+            extend_logprob_start_len_per_req=proxy_dict.get(
+                "extend_logprob_start_len_per_req", None
+            ),
+            can_run_cuda_graph=can_run_cuda_graph,
+        )
 
 
 @dataclass
 class EmbeddingBatchResult:
     embeddings: torch.Tensor
-    bid: int
 
 
 class Scheduler(
@@ -233,7 +272,6 @@ class Scheduler(
         moe_ep_rank: int,
         pp_rank: int,
         dp_rank: Optional[int],
-        dp_balance_meta: Optional[DPBalanceMeta] = None,
     ):
         # Parse args
         self.server_args = server_args
@@ -261,7 +299,9 @@ class Scheduler(
         self.enable_metrics_for_all_schedulers = (
             server_args.enable_metrics_for_all_schedulers
         )
-        self.enable_kv_cache_events = server_args.kv_events_config and tp_rank == 0
+        self.enable_kv_cache_events = bool(
+            server_args.kv_events_config and tp_rank == 0
+        )
         self.enable_trace = server_args.enable_trace
         self.stream_interval = server_args.stream_interval
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
@@ -402,6 +442,12 @@ class Scheduler(
             )
         else:
             self.draft_worker = None
+
+        # Dispatch the model worker
+        if self.spec_algorithm.is_none():
+            self.model_worker = self.tp_worker
+        else:
+            self.model_worker = self.draft_worker
 
         # Get token and memory info from the model worker
         (
@@ -556,7 +602,6 @@ class Scheduler(
 
         # Init metrics stats
         self.init_metrics(tp_rank, pp_rank, dp_rank)
-        self.init_dp_balance(dp_balance_meta)
 
         if self.enable_kv_cache_events:
             self.init_kv_events(server_args.kv_events_config)
@@ -959,7 +1004,6 @@ class Scheduler(
         self.running_mbs = [
             ScheduleBatch(reqs=[], batch_is_full=False) for _ in range(self.pp_size)
         ]
-        bids = [None] * self.pp_size
         pp_outputs: Optional[PPProxyTensors] = None
         while True:
             server_is_idle = True
@@ -980,10 +1024,7 @@ class Scheduler(
                 # (last rank) send the outputs to the next step
                 if self.pp_group.is_last_rank:
                     if self.cur_batch:
-                        next_token_ids, bids[mb_id] = (
-                            result.next_token_ids,
-                            result.bid,
-                        )
+                        next_token_ids = result.next_token_ids
                         if self.cur_batch.return_logprob:
                             pp_outputs = PPProxyTensors(
                                 {
@@ -1031,17 +1072,10 @@ class Scheduler(
                         logits_output = LogitsProcessorOutput(**logits_output_args)
                     else:
                         logits_output = None
-                    output_result = GenerationBatchResult(
+
+                    output_result = GenerationBatchResult.from_pp_proxy(
                         logits_output=logits_output,
-                        pp_hidden_states_proxy_tensors=None,
-                        next_token_ids=next_pp_outputs["next_token_ids"],
-                        extend_input_len_per_req=next_pp_outputs.tensors.get(
-                            "extend_input_len_per_req", None
-                        ),
-                        extend_logprob_start_len_per_req=next_pp_outputs.tensors.get(
-                            "extend_logprob_start_len_per_req", None
-                        ),
-                        bid=bids[next_mb_id],
+                        next_pp_outputs=next_pp_outputs,
                         can_run_cuda_graph=result.can_run_cuda_graph,
                     )
                     self.process_batch_result(mbs[next_mb_id], output_result)
@@ -1049,8 +1083,6 @@ class Scheduler(
 
                 # (not last rank)
                 if not self.pp_group.is_last_rank:
-                    if self.cur_batch:
-                        bids[mb_id] = result.bid
                     # carry the outputs to the next stage
                     # send the outputs from the last round to let the next stage worker run post processing
                     if pp_outputs:
@@ -1072,8 +1104,10 @@ class Scheduler(
 
                     # send out proxy tensors to the next stage
                     if self.cur_batch:
+                        # FIXME(lsyin): remove this assert
+                        assert result.pp_hidden_states_proxy_tensors.tensors is not None
                         self.pp_group.send_tensor_dict(
-                            result.pp_hidden_states_proxy_tensors,
+                            result.pp_hidden_states_proxy_tensors.tensors,
                             all_gather_group=self.attn_tp_group,
                         )
 
@@ -1237,8 +1271,6 @@ class Scheduler(
         self,
         recv_req: TokenizedGenerateReqInput,
     ):
-        self.maybe_update_dp_balance_data(recv_req)
-
         # Create a new request
         if (
             recv_req.session_params is None
@@ -1458,12 +1490,12 @@ class Scheduler(
                 req.priority = -sys.maxsize - 1
         elif not self.enable_priority_scheduling and req.priority is not None:
             abort_req = AbortReq(
-                req.rid,
                 finished_reason={
                     "type": "abort",
                     "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
                     "message": "Using priority is disabled for this server. Please send a new request without a priority.",
                 },
+                rid=req.rid,
             )
             self.send_to_tokenizer.send_pyobj(abort_req)
 
@@ -1499,12 +1531,12 @@ class Scheduler(
 
         self.send_to_tokenizer.send_pyobj(
             AbortReq(
-                req_to_abort.rid,
                 finished_reason={
                     "type": "abort",
                     "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
                     "message": message,
                 },
+                rid=req_to_abort.rid,
             )
         )
         return req_to_abort.rid == recv_req.rid
@@ -1764,7 +1796,6 @@ class Scheduler(
 
         # Handle DP attention
         if need_dp_attn_preparation:
-            self.maybe_handle_dp_balance_data()
             ret = self.prepare_mlp_sync_batch(ret)
 
         return ret
@@ -1977,7 +2008,7 @@ class Scheduler(
             self.new_token_ratio = new_token_ratio
             for req in reqs_to_abort:
                 self.send_to_tokenizer.send_pyobj(
-                    AbortReq(req.rid, abort_reason=req.to_abort_message)
+                    AbortReq(abort_reason=req.to_abort_message, rid=req.rid)
                 )
 
             logger.info(
@@ -2016,33 +2047,25 @@ class Scheduler(
 
         # Run forward
         if self.is_generation:
+
+            batch_or_worker_batch = batch
+
             if self.spec_algorithm.is_none():
-                model_worker_batch = batch.get_model_worker_batch()
+                # FIXME(lsyin): remove this if and finally unify the abstraction
+                batch_or_worker_batch = batch.get_model_worker_batch()
 
-                if self.pp_group.is_last_rank:
-                    logits_output, next_token_ids, can_run_cuda_graph = (
-                        self.tp_worker.forward_batch_generation(model_worker_batch)
-                    )
-                else:
-                    pp_hidden_states_proxy_tensors, _, can_run_cuda_graph = (
-                        self.tp_worker.forward_batch_generation(model_worker_batch)
-                    )
-                bid = model_worker_batch.bid
-            else:
-                (
-                    logits_output,
-                    next_token_ids,
-                    bid,
-                    num_accepted_tokens,
-                    can_run_cuda_graph,
-                ) = self.draft_worker.forward_batch_speculative_generation(batch)
-                bs = batch.batch_size()
-                self.spec_num_total_accepted_tokens += num_accepted_tokens + bs
-                self.spec_num_total_forward_ct += bs
-                self.num_generated_tokens += num_accepted_tokens
+            forward_batch_output = self.model_worker.forward_batch_generation(
+                batch_or_worker_batch
+            )
 
-            if self.pp_group.is_last_rank:
-                batch.output_ids = next_token_ids
+            if not self.spec_algorithm.is_none():
+                # TODO(lsyin): unify this metric-updating logic with non-spec, and move it to decode processing
+                self.udpate_spec_metrics(
+                    batch.batch_size(), forward_batch_output.num_accepted_tokens
+                )
+
+            # update batch's output ids
+            batch.output_ids = forward_batch_output.next_token_ids
 
             # These 2 values are needed for processing the output, but the values can be
             # modified by overlap schedule. So we have to copy them here so that
@@ -2051,6 +2074,7 @@ class Scheduler(
                 extend_input_len_per_req = [req.extend_input_len for req in batch.reqs]
             else:
                 extend_input_len_per_req = None
+
             if batch.return_logprob:
                 extend_logprob_start_len_per_req = [
                     req.extend_logprob_start_len for req in batch.reqs
@@ -2058,25 +2082,15 @@ class Scheduler(
             else:
                 extend_logprob_start_len_per_req = None
 
-            ret = GenerationBatchResult(
-                logits_output=logits_output if self.pp_group.is_last_rank else None,
-                pp_hidden_states_proxy_tensors=(
-                    pp_hidden_states_proxy_tensors
-                    if not self.pp_group.is_last_rank
-                    else None
-                ),
-                next_token_ids=next_token_ids if self.pp_group.is_last_rank else None,
+            return GenerationBatchResult.from_forward_batch_output(
+                forward_batch_output=forward_batch_output,
                 extend_input_len_per_req=extend_input_len_per_req,
                 extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
-                bid=bid,
-                can_run_cuda_graph=can_run_cuda_graph,
             )
         else:  # embedding or reward model
             model_worker_batch = batch.get_model_worker_batch()
             embeddings = self.tp_worker.forward_batch_embedding(model_worker_batch)
-            ret = EmbeddingBatchResult(
-                embeddings=embeddings, bid=model_worker_batch.bid
-            )
+            ret = EmbeddingBatchResult(embeddings=embeddings)
         return ret
 
     def process_batch_result(
@@ -2564,7 +2578,7 @@ class Scheduler(
             if self.enable_hicache_storage:
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)
-            self.send_to_tokenizer.send_pyobj(AbortReq(req.rid))
+            self.send_to_tokenizer.send_pyobj(AbortReq(rid=req.rid))
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 self.tree_cache.cache_finished_req(req)
@@ -2585,31 +2599,31 @@ class Scheduler(
         # Delete requests not in the waiting queue when PD disaggregation is enabled
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             # Abort requests that have not yet been bootstrapped
-            for i, req in enumerate(self.disagg_prefill_bootstrap_queue.queue):
-                logger.debug(f"Abort bootstrap queue request. {req.rid=}")
+            for req in self.disagg_prefill_bootstrap_queue.queue:
                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+                    logger.debug(f"Abort bootstrap queue request. {req.rid=}")
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
 
             # Abort in-flight requests
-            for i, req in enumerate(self.disagg_prefill_inflight_queue):
-                logger.debug(f"Abort inflight queue request. {req.rid=}")
+            for req in self.disagg_prefill_inflight_queue:
                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+                    logger.debug(f"Abort inflight queue request. {req.rid=}")
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
 
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             # Abort requests that have not yet finished preallocation
-            for i, decode_req in enumerate(self.disagg_decode_prealloc_queue.queue):
-                logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
+            for decode_req in self.disagg_decode_prealloc_queue.queue:
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
+                    logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
                     if hasattr(decode_req.kv_receiver, "abort"):
                         decode_req.kv_receiver.abort()
 
             # Abort requests waiting for kvcache to release tree cache
-            for i, decode_req in enumerate(self.disagg_decode_transfer_queue.queue):
-                logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
+            for decode_req in self.disagg_decode_transfer_queue.queue:
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
+                    logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
                     if hasattr(decode_req.kv_receiver, "abort"):
                         decode_req.kv_receiver.abort()
 
@@ -2676,11 +2690,12 @@ class Scheduler(
         return SlowDownReqOutput()
 
     def expert_distribution_handle(self, recv_req: ExpertDistributionReq):
-        if recv_req == ExpertDistributionReq.START_RECORD:
+        action = recv_req.action
+        if action == ExpertDistributionReqType.START_RECORD:
             get_global_expert_distribution_recorder().start_record()
-        elif recv_req == ExpertDistributionReq.STOP_RECORD:
+        elif action == ExpertDistributionReqType.STOP_RECORD:
             get_global_expert_distribution_recorder().stop_record()
-        elif recv_req == ExpertDistributionReq.DUMP_RECORD:
+        elif action == ExpertDistributionReqType.DUMP_RECORD:
             get_global_expert_distribution_recorder().dump_record()
         else:
             raise ValueError(f"Unrecognized ExpertDistributionReq value: {recv_req=}")
@@ -2763,7 +2778,8 @@ class IdleSleeper:
 
 
 def is_health_check_generate_req(recv_req):
-    return getattr(recv_req, "rid", "").startswith("HEALTH_CHECK")
+    rid = getattr(recv_req, "rid", None)
+    return rid is not None and rid.startswith("HEALTH_CHECK")
 
 
 def is_work_request(recv_req):
@@ -2787,7 +2803,6 @@ def run_scheduler_process(
     pp_rank: int,
     dp_rank: Optional[int],
     pipe_writer,
-    balance_meta: Optional[DPBalanceMeta] = None,
 ):
     # Generate the logger prefix
     prefix = ""
@@ -2836,7 +2851,6 @@ def run_scheduler_process(
             moe_ep_rank,
             pp_rank,
             dp_rank,
-            dp_balance_meta=balance_meta,
         )
         pipe_writer.send(
             {
