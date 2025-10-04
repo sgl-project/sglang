@@ -20,7 +20,7 @@ import logging
 import os
 import random
 import tempfile
-from typing import List, Literal, Optional, Union
+from typing import Dict, List, Literal, Optional, Union
 
 from sglang.srt.connector import ConnectorType
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -159,6 +159,7 @@ class ServerArgs:
     load_format: str = "auto"
     model_loader_extra_config: str = "{}"
     trust_remote_code: bool = False
+    modelopt_quant: Optional[Union[str, Dict]] = None
     context_length: Optional[int] = None
     is_embedding: bool = False
     enable_multimodal: Optional[bool] = None
@@ -1403,6 +1404,29 @@ class ServerArgs:
             "scaling factors. This should generally be supplied, when "
             "KV cache dtype is FP8. Otherwise, KV cache scaling factors "
             "default to 1.0, which may cause accuracy issues. ",
+        )
+        parser.add_argument(
+            "--modelopt-quant",
+            type=str,
+            default=ServerArgs.modelopt_quant,
+            help="The ModelOpt quantization configuration. "
+            "Supported values: 'fp8', 'int4_awq', 'w4a8_awq', 'nvfp4', 'nvfp4_awq'. "
+            "This requires the NVIDIA Model Optimizer library to be installed: pip install nvidia-modelopt",
+        )
+        parser.add_argument(
+            "--modelopt-checkpoint-restore-path",
+            type=str,
+            default=ServerArgs.modelopt_checkpoint_restore_path,
+            help="Path to restore a previously saved ModelOpt quantized checkpoint. "
+            "If provided, the quantization process will be skipped and the model "
+            "will be loaded from this checkpoint.",
+        )
+        parser.add_argument(
+            "--modelopt-checkpoint-save-path",
+            type=str,
+            default=ServerArgs.modelopt_checkpoint_save_path,
+            help="Path to save the ModelOpt quantized checkpoint after quantization. "
+            "This allows reusing the quantized model in future runs.",
         )
         parser.add_argument(
             "--kv-cache-dtype",
