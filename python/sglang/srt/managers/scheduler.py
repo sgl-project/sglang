@@ -2045,6 +2045,12 @@ class Scheduler(
             logger.info(f"Scheduler.run_batch sleep {self.forward_sleep_time}s")
             time.sleep(self.forward_sleep_time)
 
+        # Capture prefill start time for EXTEND mode
+        if batch.forward_mode == ForwardMode.EXTEND:
+            current_time = time.perf_counter()
+            for req in batch.reqs:
+                req.time_stats.prefill_start_time = current_time
+
         # Run forward
         if self.is_generation:
 
@@ -2082,7 +2088,7 @@ class Scheduler(
             else:
                 extend_logprob_start_len_per_req = None
 
-            return GenerationBatchResult.from_forward_batch_output(
+            ret = GenerationBatchResult.from_forward_batch_output(
                 forward_batch_output=forward_batch_output,
                 extend_input_len_per_req=extend_input_len_per_req,
                 extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
@@ -2091,6 +2097,13 @@ class Scheduler(
             model_worker_batch = batch.get_model_worker_batch()
             embeddings = self.tp_worker.forward_batch_embedding(model_worker_batch)
             ret = EmbeddingBatchResult(embeddings=embeddings)
+
+        # Capture prefill end time for EXTEND mode
+        if batch.forward_mode == ForwardMode.EXTEND:
+            current_time = time.perf_counter()
+            for req in batch.reqs:
+                req.time_stats.prefill_end_time = current_time
+
         return ret
 
     def process_batch_result(

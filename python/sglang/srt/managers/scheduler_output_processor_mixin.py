@@ -542,6 +542,11 @@ class SchedulerOutputProcessorMixin:
         spec_verify_ct = []
         output_hidden_states = None
 
+        queue_times = []
+        inference_start_times = []
+        prefill_delays = []
+        prefill_latencies = []
+
         if return_logprob:
             input_token_logprobs_val = []
             input_token_logprobs_idx = []
@@ -628,6 +633,28 @@ class SchedulerOutputProcessorMixin:
                 prompt_tokens.append(len(req.origin_input_ids))
                 completion_tokens.append(len(req.output_ids))
                 cached_tokens.append(req.cached_tokens)
+
+                queue_times.append(req.time_stats.get_queueing_time())
+                inference_start_times.append(req.time_stats.forward_entry_time)
+
+                if req.time_stats.prefill_start_time > 0.0:
+                    prefill_delays.append(
+                        req.time_stats.prefill_start_time
+                        - req.time_stats.forward_entry_time
+                    )
+                else:
+                    prefill_delays.append(None)
+
+                if (
+                    req.time_stats.prefill_start_time > 0.0
+                    and req.time_stats.prefill_end_time > 0.0
+                ):
+                    prefill_latencies.append(
+                        req.time_stats.prefill_end_time
+                        - req.time_stats.prefill_start_time
+                    )
+                else:
+                    prefill_latencies.append(None)
 
                 if not self.spec_algorithm.is_none():
                     spec_verify_ct.append(req.spec_verify_ct)
@@ -747,6 +774,10 @@ class SchedulerOutputProcessorMixin:
                     rids=rids,
                     placeholder_tokens_idx=None,
                     placeholder_tokens_val=None,
+                    queue_time=queue_times,
+                    inference_start_time=inference_start_times,
+                    prefill_delay=prefill_delays,
+                    prefill_latency=prefill_latencies,
                 )
             )
 
@@ -757,6 +788,10 @@ class SchedulerOutputProcessorMixin:
         embeddings = []
         prompt_tokens = []
         cached_tokens = []
+        queue_times = []
+        inference_start_times = []
+        prefill_delays = []
+        prefill_latencies = []
         for req in reqs:
             if req.finished():
                 rids.append(req.rid)
@@ -764,6 +799,28 @@ class SchedulerOutputProcessorMixin:
                 embeddings.append(req.embedding)
                 prompt_tokens.append(len(req.origin_input_ids))
                 cached_tokens.append(req.cached_tokens)
+
+                queue_times.append(req.time_stats.get_queueing_time())
+                inference_start_times.append(req.time_stats.forward_entry_time)
+
+                if req.time_stats.prefill_start_time > 0.0:
+                    prefill_delays.append(
+                        req.time_stats.prefill_start_time
+                        - req.time_stats.forward_entry_time
+                    )
+                else:
+                    prefill_delays.append(None)
+
+                if (
+                    req.time_stats.prefill_start_time > 0.0
+                    and req.time_stats.prefill_end_time > 0.0
+                ):
+                    prefill_latencies.append(
+                        req.time_stats.prefill_end_time
+                        - req.time_stats.prefill_start_time
+                    )
+                else:
+                    prefill_latencies.append(None)
         self.send_to_detokenizer.send_pyobj(
             BatchEmbeddingOutput(
                 finished_reasons,
@@ -773,5 +830,9 @@ class SchedulerOutputProcessorMixin:
                 rids=rids,
                 placeholder_tokens_idx=None,
                 placeholder_tokens_val=None,
+                queue_time=queue_times,
+                inference_start_time=inference_start_times,
+                prefill_delay=prefill_delays,
+                prefill_latency=prefill_latencies,
             )
         )
