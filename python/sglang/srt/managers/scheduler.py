@@ -369,7 +369,7 @@ class Scheduler(
             )
 
         if get_bool_env_var("SGLANG_SANITY_CHECK_TORCH_EMPTY"):
-            patch_torch.monkey_patch_torch_empty_to_explicit()
+            patch_torch.handle_sanity_check_torch_empty()
 
         # Init tokenizer
         self.init_tokenizer()
