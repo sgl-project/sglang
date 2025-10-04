@@ -979,6 +979,9 @@ class Scheduler(
         self.result_queue = deque()
 
         while True:
+            # TODO(!!!): handle the last batch sample here, for overlap scheduling + xgrammar
+            self.run_last_batch_sample_if_needed()
+
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
 
@@ -2151,6 +2154,15 @@ class Scheduler(
             embeddings = self.tp_worker.forward_batch_embedding(model_worker_batch)
             ret = EmbeddingBatchResult(embeddings=embeddings)
         return ret
+
+    def run_last_batch_sample_if_needed(
+        self,
+    ) -> Union[GenerationBatchResult, EmbeddingBatchResult, None]:
+        # 1. pop left from the result queue
+        # 2. get the future tensor (logits)
+        # 3. sample the next token
+        # 4. update the future map
+        pass
 
     def run_batch(
         self, batch: ScheduleBatch
