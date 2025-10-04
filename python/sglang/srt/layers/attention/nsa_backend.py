@@ -10,10 +10,6 @@ from sglang.srt.configs.model_config import get_nsa_index_topk, is_deepseek_nsa
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.nsa.nsa_indexer import BaseIndexerMetadata
 from sglang.srt.layers.attention.nsa.quant_k_cache import quantize_k_cache
-from sglang.srt.layers.attention.nsa.topk import (
-    fast_topk_impl,
-    fast_topk_transform_fused_cuda,
-)
 from sglang.srt.layers.attention.nsa.transform_index import (
     transform_index_page_table_decode,
     transform_index_page_table_prefill,
@@ -122,16 +118,18 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
         logits: torch.Tensor,
         topk: int,
     ) -> torch.Tensor:
+        from sgl_kernel import fast_topk_transform_fused, fast_topk_v2
+
         if not NSA_FUSE_TOPK:
-            return fast_topk_impl(logits, self.get_seqlens_expanded(), topk)
+            return fast_topk_v2(logits, self.get_seqlens_expanded(), topk)
 
         # NOTE(dark): if fused, we return a transformed page table directly
-        return fast_topk_transform_fused_cuda(
+        return fast_topk_transform_fused(
             input=logits,
             seq_lens=self.get_seqlens_expanded(),
-            topk=topk,
-            src_page_table=self.attn_metadata.page_table_1,
+            page_table_size_1=self.attn_metadata.page_table_1,
             cu_seqlens_q=self.attn_metadata.cu_seqlens_q,
+            topk=topk,
         )
 
 
