@@ -54,7 +54,6 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     PPProxyTensors,
 )
-from sglang.srt.patch_torch import monkey_patch_torch_compile
 from sglang.srt.two_batch_overlap import TboCudaGraphRunnerPlugin
 from sglang.srt.utils import get_available_gpu_memory, log_info_on_rank0
 
@@ -141,22 +140,6 @@ def patch_model(
         if enable_compile:
             _to_torch(model, reverse=True, num_tokens=num_tokens)
             tp_group.ca_comm = backup_ca_comm
-
-
-def set_torch_compile_config():
-    import torch._dynamo.config
-    import torch._inductor.config
-
-    torch._inductor.config.coordinate_descent_tuning = True
-    torch._inductor.config.triton.unique_kernel_names = True
-    torch._inductor.config.fx_graph_cache = True  # Experimental feature to reduce compilation times, will be on by default in future
-
-    # FIXME: tmp workaround
-    torch._dynamo.config.accumulated_cache_size_limit = 1024
-    if hasattr(torch._dynamo.config, "cache_size_limit"):
-        torch._dynamo.config.cache_size_limit = 1024
-
-    monkey_patch_torch_compile()
 
 
 # Reuse this memory pool across all cuda graph runners.

@@ -98,9 +98,6 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
     SWAKVPool,
 )
-from sglang.srt.model_executor.compilation.piecewise_context_manager import (
-    set_forward_context,
-)
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import (
@@ -2021,19 +2018,17 @@ class ModelRunner:
             forward_batch.prepare_mlp_sync_batch(self)
 
         if forward_batch.forward_mode.is_decode():
-            with set_forward_context(forward_batch, self.attention_layers):
-                ret = self.forward_decode(
-                    forward_batch,
-                    skip_attn_backend_init=skip_attn_backend_init,
-                    pp_proxy_tensors=pp_proxy_tensors,
-                )
+            ret = self.forward_decode(
+                forward_batch,
+                skip_attn_backend_init=skip_attn_backend_init,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
         elif forward_batch.forward_mode.is_extend():
-            with set_forward_context(forward_batch, self.attention_layers):
-                ret = self.forward_extend(
-                    forward_batch,
-                    skip_attn_backend_init=skip_attn_backend_init,
-                    pp_proxy_tensors=pp_proxy_tensors,
-                )
+            ret = self.forward_extend(
+                forward_batch,
+                skip_attn_backend_init=skip_attn_backend_init,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
         elif forward_batch.forward_mode.is_split_prefill():
             ret = self.forward_split_prefill(
                 forward_batch,
@@ -2041,10 +2036,7 @@ class ModelRunner:
                 forward_count=split_forward_count,
             )
         elif forward_batch.forward_mode.is_idle():
-            with set_forward_context(forward_batch, self.attention_layers):
-                ret = self.forward_idle(
-                    forward_batch, pp_proxy_tensors=pp_proxy_tensors
-                )
+            ret = self.forward_idle(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
         else:
             raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
 
