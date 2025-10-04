@@ -8,10 +8,14 @@ test into unit tests so that's easily reproducible in CI.
 """
 
 import unittest
-from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_deterministic import BenchArgs, test_deterministic
+from sglang.test.test_deterministic_utils import (
+    COMMON_SERVER_ARGS,
+    DEFAULT_MODEL,
+    TestDeterministicBase,
+)
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -20,60 +24,46 @@ from sglang.test.test_utils import (
 )
 
 
-class TestDeterministicFlashinfer(CustomTestCase):
+class TestFlashinferDeterministic(TestDeterministicBase):
+    # Test with flashinfer attention backend
     @classmethod
-    def setUpClass(cls):
-        cls.model = "Qwen/Qwen3-8B"
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            device="auto",
-            other_args=[
-                "--enable-deterministic",
-                "--disable-radix-cache",  # this should be by default now but still set it for safety
+    def get_server_args(cls):
+        args = COMMON_SERVER_ARGS
+        args.extend(
+            [
                 "--attention-backend",
                 "flashinfer",
-            ],
+            ]
         )
+        return args
 
+
+class TestFa3Deterministic(TestDeterministicBase):
+    # Test with fa3 attention backend
     @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+    def get_server_args(cls):
+        args = COMMON_SERVER_ARGS
+        args.extend(
+            [
+                "--attention-backend",
+                "fa3",
+            ]
+        )
+        return args
 
-    def _extract_host_and_port(self, url):
-        return url.split("://")[-1].split(":")[0], int(url.split(":")[-1])
 
-    def test_single(self):
-        args = BenchArgs()
-        url = DEFAULT_URL_FOR_TEST
-        args.host, args.port = self._extract_host_and_port(url)
-        args.test_mode = "single"
-        args.n_start = 10
-        args.n_trials = 10
-        results = test_deterministic(args)
-        assert all(lambda x: x == 1, results)
-
-    def test_mixed(self):
-        args = BenchArgs()
-        url = DEFAULT_URL_FOR_TEST
-        args.host, args.port = self._extract_host_and_port(url)
-        args.test_mode = "mixed"
-        args.n_start = 10
-        args.n_trials = 10
-        results = test_deterministic(args)
-        assert all(lambda x: x == 1, results)
-
-    def test_prefix(self):
-        args = BenchArgs()
-        url = DEFAULT_URL_FOR_TEST
-        args.host, args.port = self._extract_host_and_port(url)
-        args.test_mode = "prefix"
-        args.n_start = 10
-        args.n_trials = 10
-        results = test_deterministic(args)
-        assert all(lambda x: x == 1, results)
+class TestTritonDeterministic(TestDeterministicBase):
+    # Test with triton attention backend
+    @classmethod
+    def get_server_args(cls):
+        args = COMMON_SERVER_ARGS
+        args.extend(
+            [
+                "--attention-backend",
+                "triton",
+            ]
+        )
+        return args
 
 
 if __name__ == "__main__":
