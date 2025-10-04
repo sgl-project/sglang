@@ -326,11 +326,21 @@ inline bool getEnvEnablePDL() {
 #define DISPATCH_INTEGRAL_TYPES(TYPE, NAME, ...) \
   AT_DISPATCH_SWITCH(TYPE, NAME, DISPATCH_CASE_INTEGRAL_TYPES(__VA_ARGS__))
 
+#define SGLANG_DISPATCH_CASE_FLOATING_TYPES(...)       \
+  AT_DISPATCH_CASE(at::ScalarType::Float, __VA_ARGS__) \
+  AT_DISPATCH_CASE(at::ScalarType::Half, __VA_ARGS__)  \
+  AT_DISPATCH_CASE(at::ScalarType::BFloat16, __VA_ARGS__)
+
+#define SGLANG_DISPATCH_FLOATING_TYPES(TYPE, NAME, ...) \
+  AT_DISPATCH_SWITCH(TYPE, NAME, SGLANG_DISPATCH_CASE_FLOATING_TYPES(__VA_ARGS__))
+
 #define CEILDIV(x, y) (((x) + (y) - 1) / (y))
 
 #ifndef USE_ROCM
+#define SGLANG_LDG(arg) __ldg(arg)
 #define WARP_SIZE 32
 #else
+#define SGLANG_LDG(arg) *(arg)
 #if defined(__GFX9__) || !defined(__HIP_DEVICE_COMPILE__)
 #define WARP_SIZE 64
 #else
