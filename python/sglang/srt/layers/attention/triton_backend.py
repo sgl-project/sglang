@@ -24,6 +24,28 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInput
 
+try:
+    from sglang.global_config import INFLLM2_SWITCH
+    from sglang.srt.layers.attention.infllmv2_backend import InfLLM2Runner, InfLLM2Config
+    from sglang.srt.mem_cache.infllmv2_memory import ContextMemoryManager as _InfMem
+    _INF_RUNNER = None
+    _INF_MEM = _InfMem()
+    def _get_inf_runner():
+        global _INF_RUNNER
+        if _INF_RUNNER is None:
+            _INF_RUNNER = InfLLM2Runner(cfg=InfLLM2Config(
+                enable=INFLLM2_SWITCH.enable,
+                topk=INFLLM2_SWITCH.topk,
+                block_size=INFLLM2_SWITCH.block_size,
+                incremental=INFLLM2_SWITCH.incremental,
+                sw_span=INFLLM2_SWITCH.sw_span,
+                sink_len=INFLLM2_SWITCH.sink_len,
+            ), mem_mgr=_INF_MEM)
+        return _INF_RUNNER
+except Exception:
+    INFLLM2_SWITCH = None
+    def _get_inf_runner():
+        return None
 
 def logit_capping_mod(logit_capping_method, logit_cap):
     # positive logit_cap -> tanh cap
@@ -161,6 +183,30 @@ class TritonAttnBackend(AttentionBackend):
 
         # Initialize forward metadata
         self.forward_metadata: ForwardMetadata = None
+
+        # ---- InfLLM-v2 runner (lazy, Triton-first) ----
+        self._inf_runner = None
+        if _inf_enabled() and InfLLM2Runner is not None:
+            # 将 SGLang 的 sliding_window_size 直接喂给 InfLLM 做 SW，并由其与 TopK/Sink 取并集
+            _cfg = InfLLM2Config(
+                enable=True,
+                topk=getattr(INFLLM2_SWITCH, "topk", 8),
+                block_size=getattr(INFLLM2_SWITCH, "block_size", 64),
+                incremental=True,                         # 由 Runner 的 ContextMemoryManager 管
+                sw_span=self.sliding_window_size or None, # 传递 SGLang 的 SW
+                sink_len=getattr(INFLLM2_SWITCH, "sink_len", None),
+            )
+            self._inf_runner = InfLLM2Runner(cfg=_cfg, mem_mgr=_InfMem())
+
+    # -- helper: gather per-seq K/V (dense view) from pooled buffers using kv_indptr/kv_indices
+    @staticmethod
+    def _gather_seq_kv_from_pool(K_pool: torch.Tensor, V_pool: torch.Tensor,
+                                 kv_indices: torch.Tensor, s: int, e: int) -> tuple[torch.Tensor, torch.Tensor]:
+        # K_pool/V_pool shape: [Pool, Hk, D]
+        idx = kv_indices[s:e]                     # [Sk]
+        K = K_pool.index_select(0, idx)           # [Sk, Hk, D]
+        V = V_pool.index_select(0, idx)           # [Sk, Hk, D]  (assumed D_v == D_k; if not, sparse path will be disabled)
+        return K, V
 
     def get_num_kv_splits(
         self,
@@ -769,7 +815,7 @@ class TritonAttnBackend(AttentionBackend):
         if layer.qk_head_dim != layer.v_head_dim:
             o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
         else:
-            o = torch.empty_like(q)
+            o = torch.empty_like(q)       
 
         if save_kv_cache:
             forward_batch.token_to_kv_pool.set_kv_buffer(
@@ -795,6 +841,39 @@ class TritonAttnBackend(AttentionBackend):
             kv_indices = self.forward_metadata.kv_indices
             window_kv_offsets = None
 
+        # ---- InfLLM-v2 sparse attention early return (EXTEND / prefill) ----
+        if self._inf_runner is not None and layer.qk_head_dim == layer.v_head_dim:
+            # 构造每条序列自己的 (Sq, Sk, H, D) 并调用 Runner；保留原有存 KV 行为
+            if save_kv_cache:
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    layer, forward_batch.out_cache_loc, k, v
+                )
+            # 视图准备
+            Q_bhd = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)          # [ΣSq, Hq, D]
+            K_pool = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)   # [Pool, Hk, D]
+            V_pool = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id) # [Pool, Hk, D]
+            kv_indptr = kv_indptr.contiguous(); kv_indices = kv_indices.contiguous()
+            qo_indptr = self.forward_metadata.qo_indptr.contiguous()            # [B+1]
+            B = qo_indptr.numel() - 1
+            out_view = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+            # 逐序列调用（正确性优先；后续可批处理 + page-attn）
+            for b in range(B):
+                q_start = int(qo_indptr[b].item()); q_end = int(qo_indptr[b+1].item())
+                k_start = int(kv_indptr[b].item());  k_end = int(kv_indptr[b+1].item())
+                if q_end == q_start:
+                    continue
+                Q_bshd = Q_bhd[q_start:q_end].unsqueeze(0)                      # [1,Sq,Hq,D]
+                K_seq, V_seq = self._gather_seq_kv_from_pool(K_pool, V_pool, kv_indices, k_start, k_end)
+                K_bshd = K_seq.unsqueeze(0)                                     # [1,Sk,Hk,D]
+                V_bshd = V_seq.unsqueeze(0)
+                # 以 req_pool_index 作为 request_id（同一条请求生命周期内稳定）
+                req_id = f"req{int(forward_batch.req_pool_indices[b].item())}"
+                O = self._inf_runner.forward(Q_bshd, K_bshd, V_bshd, state=None,
+                                             layer_id=layer.layer_id, request_id=req_id)
+                out_view[q_start:q_end].copy_(O[0])                             # [Sq,Hq,D]
+            return o
+
+        # ---- 回落到原 dense extend ----
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             k.contiguous(),
@@ -816,7 +895,8 @@ class TritonAttnBackend(AttentionBackend):
             window_kv_offsets=window_kv_offsets,
             xai_temperature_len=layer.xai_temperature_len,
         )
-        return o
+        return o       
+
 
     def forward_decode(
         self,
@@ -852,6 +932,32 @@ class TritonAttnBackend(AttentionBackend):
             kv_indptr = self.forward_metadata.kv_indptr
             kv_indices = self.forward_metadata.kv_indices
 
+        # ---- InfLLM-v2 sparse attention early return (DECODE) ----
+        if self._inf_runner is not None and layer.qk_head_dim == layer.v_head_dim:
+            if save_kv_cache:
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    layer, forward_batch.out_cache_loc, k, v
+                )
+            Q_bhd  = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)               # [B,Hq,D]
+            K_pool = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)    # [Pool,Hk,D]
+            V_pool = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)  # [Pool,Hk,D]
+            kv_indptr = self.forward_metadata.kv_indptr.contiguous()                  # [B+1]
+            kv_indices = self.forward_metadata.kv_indices.contiguous()                # [sum Sk]
+            B = kv_indptr.numel() - 1
+            out_view = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+            for b in range(B):
+                s = int(kv_indptr[b].item()); e = int(kv_indptr[b+1].item())
+                Q_bshd = Q_bhd[b:b+1].unsqueeze(1)                                    # [1,1,Hq,D]
+                K_seq, V_seq = self._gather_seq_kv_from_pool(K_pool, V_pool, kv_indices, s, e)
+                K_bshd = K_seq.unsqueeze(0)                                           # [1,Sk,Hk,D]
+                V_bshd = V_seq.unsqueeze(0)
+                req_id = f"req{int(forward_batch.req_pool_indices[b].item())}"
+                O = self._inf_runner.forward(Q_bshd, K_bshd, V_bshd, state=None,
+                                             layer_id=layer.layer_id, request_id=req_id)
+                out_view[b].copy_(O[0,0])                                             # [Hq,D]
+            return o
+
+        # ---- 回落到原 dense decode ----
         self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
