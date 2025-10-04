@@ -49,7 +49,12 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, RequestStage, ScheduleBatch
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import (
+    HybridReqToTokenPool,
+    KVCache,
+    MambaPool,
+    ReqToTokenPool,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import get_int_env_var, require_mlp_sync
@@ -122,6 +127,55 @@ class DecodeReqToTokenPool:
 
     def clear(self):
         self.free_slots = list(range(self.size + self.pre_alloc_size))
+
+
+class HybridDecodeReqToTokenPool(HybridReqToTokenPool):
+
+    def __init__(
+        self,
+        size: int,
+        max_context_len: int,
+        device: str,
+        enable_memory_saver: bool,
+        conv_dtype: torch.dtype,
+        ssm_dtype: torch.dtype,
+        mamba_layers: List[int],
+        conv_state_shape: Tuple[int, int],
+        temporal_state_shape: Tuple[int, int],
+        speculative_num_draft_tokens: int,
+        pre_alloc_size: int,
+    ):
+        DecodeReqToTokenPool.__init__(
+            self,
+            size=size,
+            max_context_len=max_context_len,
+            device=device,
+            enable_memory_saver=enable_memory_saver,
+            pre_alloc_size=pre_alloc_size,
+        )
+        self.mamba_pool = MambaPool(
+            size + pre_alloc_size,
+            conv_dtype,
+            ssm_dtype,
+            len(mamba_layers),
+            conv_state_shape,
+            temporal_state_shape,
+            device,
+            speculative_num_draft_tokens,
+        )
+        self.mamba_map = {layer_id: i for i, layer_id in enumerate(mamba_layers)}
+
+        self.device = device
+        self.req_index_to_mamba_index_mapping: torch.Tensor = torch.zeros(
+            size, dtype=torch.int32, device=self.device
+        )
+
+        self.rid_to_mamba_index_mapping: Dict[str, int] = {}
+        self.mamba_index_to_rid_mapping: Dict[int, str] = {}
+
+    def clear(self):
+        self.free_slots = list(range(self.size + self.pre_alloc_size))
+        self.mamba_pool.clear()
 
 
 @dataclass
@@ -216,6 +270,18 @@ class DecodePreallocQueue:
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
             self.metadata_buffers.get_buf_infos()
         )
+
+        if hasattr(self.token_to_kv_pool, "get_extra_pool_buf_infos"):
+            extra_pool_data_ptrs, extra_pool_data_lens, extra_pool_item_lens = (
+                self.token_to_kv_pool.get_extra_pool_buf_infos()
+            )
+            kv_args.extra_pool_data_ptrs = extra_pool_data_ptrs
+            kv_args.extra_pool_data_lens = extra_pool_data_lens
+            kv_args.extra_pool_item_lens = extra_pool_item_lens
+        else:
+            kv_args.extra_pool_data_ptrs = []
+            kv_args.extra_pool_data_lens = []
+            kv_args.extra_pool_item_lens = []
 
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.gpu_id
@@ -414,6 +480,14 @@ class DecodePreallocQueue:
                 .cpu()
                 .numpy()
             )
+            if hasattr(self.req_to_token_pool, "rid_to_mamba_index_mapping"):
+                extra_pool_indices = [
+                    self.req_to_token_pool.rid_to_mamba_index_mapping[
+                        decode_req.req.rid
+                    ]
+                ]
+            else:
+                extra_pool_indices = None
 
             decode_req.metadata_buffer_index = (
                 self.req_to_metadata_buffer_idx_allocator.alloc()
@@ -422,8 +496,10 @@ class DecodePreallocQueue:
             page_indices = kv_to_page_indices(
                 kv_indices, self.token_to_kv_pool_allocator.page_size
             )
-            decode_req.kv_receiver.init(page_indices, decode_req.metadata_buffer_index)
-
+            decode_req.kv_receiver.init(
+                page_indices, decode_req.metadata_buffer_index, extra_pool_indices
+            )
+            decode_req.req.add_latency(RequestStage.DECODE_BOOTSTRAP)
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
             decode_req.req.time_stats.decode_transfer_queue_entry_time = (
@@ -503,7 +579,10 @@ class DecodePreallocQueue:
 
     def _pre_alloc(self, req: Req) -> torch.Tensor:
         """Pre-allocate the memory for req_to_token and token_kv_pool"""
-        req_pool_indices = self.req_to_token_pool.alloc(1)
+        if hasattr(self.req_to_token_pool, "rid_to_mamba_index_mapping"):
+            req_pool_indices = self.req_to_token_pool.alloc(1, [req])
+        else:
+            req_pool_indices = self.req_to_token_pool.alloc(1)
 
         assert (
             req_pool_indices is not None
