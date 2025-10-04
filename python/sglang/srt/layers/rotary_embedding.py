@@ -152,9 +152,10 @@ class RotaryEmbedding(CustomOp):
         fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """A PyTorch-native implementation of forward()."""
-        assert (
-            fused_set_kv_buffer_arg is None
-        ), "fused_set_kv_buffer_arg is not supported for native implementation"
+
+        # fused_set_kv_buffer_arg is not used in the PyTorch-native forward,
+        # however, it is required to match the signature of the forward method
+        # to avoid errors in the fallback of torch.compile.
 
         if offsets is not None:
             positions = positions + offsets
