@@ -755,6 +755,12 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         """Handle batch tokenization for text inputs only."""
         logger.debug(f"Starting batch tokenization for {batch_size} text requests")
 
+        if self._batch_has_only_tokenized_request(batch_size, obj):
+            # All requests already have input_ids, no need to tokenize
+            return [await self._tokenize_one_request(obj[i]) for i in range(batch_size)]
+
+        self._validate_batch_tokenization_constraints(batch_size, obj)
+
         # Collect requests and texts
         requests = [obj[i] for i in range(batch_size)]
         texts = [req.text for req in requests]
@@ -803,6 +809,32 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 raise ValueError(
                     "Batch tokenization is not needed for input_embeds. Do not set `enable_tokenizer_batch_encode`."
                 )
+
+    def _batch_has_only_tokenized_request(
+        self, batch_size: int, obj: Union[GenerateReqInput, EmbeddingReqInput]
+    ) -> bool:
+        """Check if all requests in the batch provide input_ids only."""
+        for i in range(batch_size):
+            if obj[i].input_ids is None and obj[i].input_embeds is None:
+                return False
+            elif obj[i].text:
+                return False
+            elif self.is_generation and obj[i].contains_mm_input():
+                return False
+
+        return True
+
+    def _should_use_batch_tokenization(self, batch_size, requests) -> bool:
+        """Return True if we should run the tokenizer in batch mode.
+
+        Current policy:
+        - Respect explicit server flag `enable_tokenizer_batch_encode`.
+        - Or, if every request only carries `input_ids` (no raw text/embeds), we still batch.
+        """
+        return (
+            self.server_args.enable_tokenizer_batch_encode
+            or self._batch_has_only_tokenized_request(batch_size, requests)
+        )
 
     def _send_one_request(
         self,
@@ -938,13 +970,8 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         generators = []
         rids = []
         if getattr(obj, "parallel_sample_num", 1) == 1:
-            if self.server_args.enable_tokenizer_batch_encode:
-                # Validate batch tokenization constraints
-                self._validate_batch_tokenization_constraints(batch_size, obj)
-
+            if self._should_use_batch_tokenization(batch_size, obj):
                 tokenized_objs = await self._batch_tokenize_and_process(batch_size, obj)
-
-                # Send as a single batched request
                 self._send_batch_request(obj, tokenized_objs, created_time)
 
                 # Set up generators for each request in the batch
