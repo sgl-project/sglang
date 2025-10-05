@@ -91,9 +91,14 @@ tracing = [
     "opentelemetry-sdk",
 ]
 all = ["sglang[test]", "sglang[decord]"]
+all_aarch64 = ["sglang[test]"]
+dev = ["sglang[test]", "sglang[decord]"]
+
+
+# The following will be deprecated in 2 weeks
 blackwell = ["sglang[test]", "sglang[decord]"]
 blackwell_aarch64 = ["sglang[test]"]
-dev = ["sglang[test]", "sglang[decord]"]
+
 
 [project.urls]
 "Homepage" = "https://github.com/sgl-project/sglang"

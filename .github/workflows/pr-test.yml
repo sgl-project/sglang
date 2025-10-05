@@ -62,7 +62,7 @@ jobs:
   sgl-kernel-build-wheels:
     needs: [check-changes]
     if: needs.check-changes.outputs.sgl_kernel == 'true'
-    runs-on: sgl-kernel-build-node
+    runs-on: x64-kernel-build-node
     strategy:
       matrix:
         include:
@@ -668,7 +668,7 @@ jobs:
     needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
     if: always() && !failure() && !cancelled() &&
         ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-    runs-on: 4-b200-runner
+    runs-on: 4-gpu-b200
     strategy:
       fail-fast: false
     steps:
