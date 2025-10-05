@@ -164,8 +164,6 @@ class TpModelWorkerClient:
             forward_batch_output = self.worker.forward_batch_generation(
                 model_worker_batch,
                 model_worker_batch.launch_done,
-                #  Skip sampling for prefill-only requests
-                skip_sample=model_worker_batch.is_prefill_only,
             )
 
             logits_output, next_token_ids, can_run_cuda_graph = (
