@@ -4,6 +4,8 @@ FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04 AS base
 ARG BUILD_TYPE=all
 ARG BRANCH_TYPE=remote
 ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
+ARG FLASHMLA_COMMIT=1408756a88e52a25196b759eaf8db89d2b51b5a1
+ARG FAST_HADAMARD_TRANSFORM_COMMIT=f3cdeed95b0f3284b5df3da9b3311d3d0600ce2b
 ARG CMAKE_BUILD_PARALLEL_LEVEL=2
 ARG SGL_KERNEL_VERSION=0.3.12
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -136,6 +138,18 @@ RUN cd /sgl-workspace/DeepEP && \
     esac && \
     NVSHMEM_DIR=${NVSHMEM_DIR} TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" pip install .
 
+# Install flashmla
+RUN git clone https://github.com/deepseek-ai/FlashMLA.git flash-mla && \
+    cd flash-mla && \
+    git checkout ${FLASHMLA_COMMIT} && \
+    git submodule update --init --recursive && \
+    pip install -v .
+
+# Install fast-hadamard-transform
+RUN git clone https://github.com/Dao-AILab/fast-hadamard-transform && \
+    cd fast-hadamard-transform && \
+    git checkout ${FAST_HADAMARD_TRANSFORM_COMMIT} && \
+    pip install .
 
 # Python tools
 RUN python3 -m pip install --no-cache-dir \
