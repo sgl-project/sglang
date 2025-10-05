@@ -72,7 +72,8 @@ class FlakyJobAnalyzer:
             response = self.session.get(url)
             response.raise_for_status()
             return response.json().get("jobs", [])
-        except:
+        except requests.exceptions.RequestException as e:
+            print(f"Warning: Could not fetch job details for run {run_id}: {e}")
             return []
 
     def analyze_flaky_jobs(self, runs: List[Dict]) -> Dict:

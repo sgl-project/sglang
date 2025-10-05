@@ -288,16 +288,15 @@ class SGLangCIAnalyzer:
         if stats["job_failures"]:
             print(f"\nMost Frequently Failed Jobs (Top 50):")
             # Sort by failure rate instead of count
-            jobs_with_rate = [
-                (job, count, (count / stats["job_total_runs"].get(job, 1) * 100))
-                for job, count in stats["job_failures"].items()
-            ]
-            for i, (job, count, _) in enumerate(
+            jobs_with_rate = []
+            for job, count in stats["job_failures"].items():
+                total_runs = stats["job_total_runs"].get(job, 0)
+                failure_rate = (count / total_runs * 100) if total_runs > 0 else 0.0
+                jobs_with_rate.append((job, count, failure_rate))
+
+            for i, (job, count, failure_rate) in enumerate(
                 sorted(jobs_with_rate, key=lambda x: x[2], reverse=True)[:50], 1
             ):
-                # Calculate failure rate for this job
-                total_runs = stats["job_total_runs"].get(job, 0)
-                failure_rate = (count / total_runs * 100) if total_runs > 0 else 0
                 print(f"  {i:2d}. {job}: {count} times ({failure_rate:.1f}% fail rate)")
 
                 # Show last successful run
