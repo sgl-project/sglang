@@ -8,7 +8,6 @@ from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1,
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2,
-    DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1,
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -16,7 +15,7 @@ from sglang.test.test_utils import (
     check_evaluation_test_results,
     parse_models,
     popen_launch_server,
-    write_results_to_json,
+    write_results_to_json, DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1,
 )
 
 MODEL_SCORE_THRESHOLDS = {
