@@ -139,7 +139,6 @@ class MambaPool:
         conv_dtype = cache_params.dtype.conv
         ssm_dtype = cache_params.dtype.temporal
         num_mamba_layers = len(cache_params.layers)
-        # TODO: why +1?
 
         # assume conv_state = (dim, state_len)
         assert conv_state_shape[0] > conv_state_shape[1]
