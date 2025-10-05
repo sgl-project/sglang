@@ -91,12 +91,12 @@ class TestNightlyGsm8KEval(unittest.TestCase):
 
         def create_model_setup(model_path, tp_size):
             env = {
-                "SGLANG_MOE_PADDING": "0"
-                if model_path in NO_MOE_PADDING_MODELS
-                else "1",
-                "HF_HUB_DISABLE_XET": "1"
-                if model_path in DISABLE_HF_XET_MODELS
-                else "0",
+                "SGLANG_MOE_PADDING": (
+                    "0" if model_path in NO_MOE_PADDING_MODELS else "1"
+                ),
+                "HF_HUB_DISABLE_XET": (
+                    "1" if model_path in DISABLE_HF_XET_MODELS else "0"
+                ),
                 "SGLANG_USE_AITER": "0" if model_path in TRITON_MOE_MODELS else "1",
             }
             cls.models.append(

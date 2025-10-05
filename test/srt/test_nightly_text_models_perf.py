@@ -56,12 +56,8 @@ class TestNightlyTextModelsPerformance(unittest.TestCase):
                     profile_filename = (
                         f"{model_setup.model_path.replace('/', '_')}_{int(time.time())}"
                     )
-                    profile_path_prefix = os.path.join(
-                        PROFILE_DIR, profile_filename
-                    )
-                    json_output_file = (
-                        f"results_{model_setup.model_path.replace('/', '_')}_{int(time.time())}.json"
-                    )
+                    profile_path_prefix = os.path.join(PROFILE_DIR, profile_filename)
+                    json_output_file = f"results_{model_setup.model_path.replace('/', '_')}_{int(time.time())}.json"
 
                     command = [
                         "python3",
@@ -117,9 +113,7 @@ class TestNightlyTextModelsPerformance(unittest.TestCase):
                         # Clean up JSON file
                         os.remove(json_output_file)
                     else:
-                        print(
-                            f"Warning: JSON output file {json_output_file} not found"
-                        )
+                        print(f"Warning: JSON output file {json_output_file} not found")
 
                 finally:
                     kill_process_tree(process.pid)

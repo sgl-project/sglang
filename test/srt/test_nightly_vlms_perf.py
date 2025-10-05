@@ -18,10 +18,22 @@ from sglang.test.test_utils import (
 
 PROFILE_DIR = "performance_profiles_vlms"
 
+VLM_EXTRA_ARGS = [
+    "--enable-multimodal",
+    "--trust-remote-code",
+    "--mem-fraction-static=0.7",
+]
+
 MODEL_DEFAULTS = [
     # Keep conservative defaults. Can be overridden by env NIGHTLY_VLM_MODELS
-    "Qwen/Qwen2.5-VL-7B-Instruct",
-    "google/gemma-3-27b-it",
+    ModelDeploySetup(
+        "Qwen/Qwen2.5-VL-7B-Instruct",
+        extra_args=VLM_EXTRA_ARGS,
+    ),
+    ModelDeploySetup(
+        "google/gemma-3-27b-it",
+        extra_args=VLM_EXTRA_ARGS,
+    ),
     # "OpenGVLab/InternVL2_5-2B",
     # buggy in official transformers impl
     # "openbmb/MiniCPM-V-2_6",
@@ -34,17 +46,18 @@ class TestNightlyVLMModelsPerformance(unittest.TestCase):
         warnings.filterwarnings(
             "ignore", category=ResourceWarning, message="unclosed.*socket"
         )
-        vlm_extra_args = [
-            "--enable-multimodal",
-            "--trust-remote-code",
-            "--mem-fraction-static=0.7",
-        ]
-        cls.models = []
-        model_paths = parse_models(
-            os.environ.get("NIGHTLY_VLM_MODELS", ",".join(MODEL_DEFAULTS))
-        )
-        for model_path in model_paths:
-            cls.models.append(ModelDeploySetup(model_path, extra_args=vlm_extra_args))
+
+        nightly_vlm_models_str = os.environ.get("NIGHTLY_VLM_MODELS")
+        if nightly_vlm_models_str:
+            cls.models = []
+            model_paths = parse_models(nightly_vlm_models_str)
+            for model_path in model_paths:
+                cls.models.append(
+                    ModelDeploySetup(model_path, extra_args=VLM_EXTRA_ARGS)
+                )
+        else:
+            cls.models = MODEL_DEFAULTS
+
         cls.base_url = DEFAULT_URL_FOR_TEST
 
         cls.batch_sizes = _parse_int_list_env("NIGHTLY_VLM_BATCH_SIZES", "1,1,2,8,16")
