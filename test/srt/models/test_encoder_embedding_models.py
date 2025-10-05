@@ -25,7 +25,7 @@ from transformers import AutoConfig, AutoTokenizer
 from sglang.test.runners import DEFAULT_PROMPTS, HFRunner, SRTRunner
 from sglang.test.test_utils import CustomTestCase, get_similarities, is_in_ci
 
-MODELS = [("BAAI/bge-small-en", 1, 1e-5), ("BAAI/bge-m3", 1, 1e-5)]
+MODELS = [("BAAI/bge-small-en", 1, 1e-5), ("BAAI/bge-m3", 1, 1e-5), ("answerdotai/ModernBERT-base", 1, 1e-5)]
 
 ATTENTION_BACKEND = ["torch_native", "triton", "flashinfer"]
 BATCH_SIZE = [1, 2]
@@ -123,9 +123,15 @@ class TestEncoderEmbeddingModels(CustomTestCase):
             models_to_test = [random.choice(MODELS)]
 
         for model, tp_size, prefill_tolerance in models_to_test:
-            for attention_backend in ATTENTION_BACKEND:
+            attn_backends = ATTENTION_BACKEND
+            dtypes = TORCH_DTYPES
+            if model == "answerdotai/ModernBERT-base":
+                attn_backends = ["torch_native"]
+                dtypes = [torch.float16]
+
+            for attention_backend in attn_backends:
                 for batch_size in BATCH_SIZE:
-                    for torch_dtype in TORCH_DTYPES:
+                    for torch_dtype in dtypes:
                         # NOTE: FlashInfer currently has limitations with head_dim = 32 or
                         # other dimensions.
                         # The FlashInfer head_dim limitation itself is tracked here:

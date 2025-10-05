@@ -20,7 +20,6 @@ from typing import Iterable, Optional, Tuple
 
 import torch
 from torch import nn
-import torch.nn.functional as F
 from transformers import ModernBertConfig
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
@@ -40,7 +39,6 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix
 
 
-# checked
 class ModernBertEmbeddings(nn.Module):
     """Token embedding + layer norm + dropout."""
 
@@ -88,7 +86,10 @@ class ModernBertSelfAttention(nn.Module):
             )
 
         self.layer_id = layer_id
-        self.global_attn_interval = max(getattr(config, "global_attn_every_n_layers", 0), 1)
+        self.global_attn_interval = max(
+            getattr(config, "global_attn_every_n_layers", 0),
+            1,
+        )
         self.local_attention = getattr(config, "local_attention", -1)
         self.is_global_layer = (
             getattr(config, "global_attn_every_n_layers", 0) <= 0
@@ -123,7 +124,6 @@ class ModernBertSelfAttention(nn.Module):
             prefix=add_prefix("out_proj", prefix),
         )
 
-        # Rotary uses global rope theta for global layers, local otherwise.
         if self.is_global_layer:
             rope_theta = config.global_rope_theta
         else:
@@ -132,11 +132,11 @@ class ModernBertSelfAttention(nn.Module):
                 if config.local_rope_theta is not None
                 else config.global_rope_theta
             )
-        # 关键修复：局部注意力层使用local_attention作为max_position_embeddings
         if self.is_global_layer:
             max_position_embeddings = config.max_position_embeddings
         else:
-            max_position_embeddings = config.max_position_embeddings 
+            # use max_position_embeddings can be better than local_attention
+            max_position_embeddings = config.local_attention
 
         self.rotary_emb = get_rope(
             head_size=self.head_dim,
@@ -189,7 +189,7 @@ class ModernBertSelfAttention(nn.Module):
         attn_output, _ = self.out_proj(attn_output)
         return attn_output
 
-# checked
+
 class ModernBertMLP(nn.Module):
     """ModernBERT MLP uses gated activation."""
 
@@ -228,7 +228,7 @@ class ModernBertMLP(nn.Module):
         hidden_states, _ = self.Wo(hidden_states)
         return hidden_states
 
-# checked
+
 class ModernBertEncoderLayer(nn.Module):
     def __init__(
         self,
@@ -337,8 +337,8 @@ class ModernBertModel(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("encoder", prefix),
         )
-        self.pooler = Pooler(pooling_type=PoolingType.MEAN, normalize=True)
-    
+        self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
+
     @torch.no_grad()
     def forward(
         self,
@@ -349,16 +349,16 @@ class ModernBertModel(nn.Module):
         get_embedding: bool = True,
     ) -> EmbeddingPoolerOutput:
         assert get_embedding, "ModernBertModel is only used for embedding"
-        
+
         # 1. Embeddings
         if input_embeds is None:
             hidden_states = self.embeddings(input_ids=input_ids)
         else:
             hidden_states = self.embeddings(inputs_embeds=input_embeds)
-        
+
         # 2. Encoder (22 layers)
         hidden_states = self.encoder(hidden_states, positions, forward_batch)
-        
+
         # 3. Pooling
         return self.pooler(hidden_states, forward_batch)
 
@@ -377,27 +377,21 @@ class ModernBertModel(nn.Module):
             (".mlp_norm", ".mlp_norm"),
         )
 
-        unmatched = []
         for name, loaded_weight in weights:
-            original_name = name
             for src, dst in replace_rules:
                 if src in name:
                     name = name.replace(src, dst)
 
             if name not in params_dict:
-                unmatched.append(original_name)
                 continue
 
             param = params_dict[name]
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, loaded_weight)
-
-        if unmatched:
-            print(
-                "[ModernBertModel] Unmatched weights:",
-                ", ".join(unmatched[:10])
-                + (" ..." if len(unmatched) > 10 else ""),
+            weight_loader = getattr(
+                param,
+                "weight_loader",
+                default_weight_loader,
             )
+            weight_loader(param, loaded_weight)
 
 
 class ModernBertForMaskedLM(ModernBertModel):

@@ -16,7 +16,6 @@ from sglang.srt.model_executor.model_runner import ForwardBatch
 class PoolingType(IntEnum):
     LAST = 0
     CLS = 1
-    MEAN = 2
 
 
 @dataclass
@@ -31,7 +30,7 @@ class Pooler(nn.Module):
     2. Normalizes output if specified.
     3. Returns structured results as `PoolerOutput`.
     Attributes:
-        pooling_type: The type of pooling to use (LAST, CLS, MEAN).
+        pooling_type: The type of pooling to use (LAST, AVERAGE, MAX).
         normalize: Whether to normalize the pooled data.
     """
 
@@ -51,29 +50,6 @@ class Pooler(nn.Module):
             first_token_flat_indices = torch.zeros_like(prompt_lens)
             first_token_flat_indices[1:] += torch.cumsum(prompt_lens, dim=0)[:-1]
             pooled_data = hidden_states[first_token_flat_indices]
-        elif self.pooling_type == PoolingType.MEAN:
-            seq_lens = forward_batch.extend_seq_lens
-            num_sequences = seq_lens.shape[0]
-            hidden_size = hidden_states.size(-1)
-
-            device = hidden_states.device
-            dtype = hidden_states.dtype
-
-            # Build segment ids for each token in the flattened hidden_states
-            segment_ids = torch.arange(num_sequences, device=device).repeat_interleave(
-                seq_lens
-            )
-
-            # Sum hidden states per segment
-            sums = torch.zeros((num_sequences, hidden_size), device=device, dtype=dtype)
-            sums.scatter_add_(
-                0,
-                segment_ids.unsqueeze(1).expand(-1, hidden_size),
-                hidden_states,
-            )
-
-            # Divide by sequence lengths to get means
-            pooled_data = sums / seq_lens.to(dtype=dtype).unsqueeze(1)
         else:
             raise ValueError(f"Invalid pooling type: {self.pooling_type}")
 
