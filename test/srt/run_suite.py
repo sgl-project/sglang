@@ -2,6 +2,7 @@ import argparse
 import glob
 from dataclasses import dataclass
 
+from sglang.srt.utils import is_hip
 from sglang.test.test_utils import run_unittest_files
 
 
@@ -17,6 +18,7 @@ suites = {
         TestFile("hicache/test_hicache.py", 116),
         TestFile("hicache/test_hicache_mla.py", 127),
         TestFile("hicache/test_hicache_storage.py", 127),
+        TestFile("hicache/test_hicache_eagle.py", 150),
         TestFile("lora/test_lora.py", 200),
         TestFile("lora/test_lora_eviction.py", 200),
         TestFile("lora/test_lora_backend.py", 99),
@@ -132,8 +134,8 @@ suites = {
         TestFile("test_load_weights_from_remote_instance.py", 72),
         TestFile("test_patch_torch.py", 19),
         TestFile("test_release_memory_occupation.py", 257),
-        TestFile("hicache/test_hicache_storage_file_backend.py", 400),
-        TestFile("hicache/test_hicache_storage_3fs_backend.py", 400),
+        TestFile("hicache/test_hicache_storage_file_backend.py", 200),
+        TestFile("hicache/test_hicache_storage_3fs_backend.py", 200),
     ],
     "per-commit-4-gpu": [
         TestFile("test_gpt_oss_4gpu.py", 600),
@@ -144,13 +146,13 @@ suites = {
         TestFile("test_multi_instance_release_memory_occupation.py", 64),
     ],
     "per-commit-8-gpu": [
-        TestFile("hicache/test_hicache_storage_mooncake_backend.py", 800),
-        TestFile("lora/test_lora_llama4.py", 600),
-        TestFile("test_disaggregation.py", 499),
+        TestFile("hicache/test_hicache_storage_mooncake_backend.py", 400),
+        TestFile("lora/test_lora_llama4.py", 400),
+        TestFile("test_disaggregation.py", 600),
         TestFile("test_disaggregation_dp_attention.py", 155),
-        TestFile("test_disaggregation_different_tp.py", 155),
-        TestFile("test_disaggregation_pp.py", 60),
-        TestFile("test_full_deepseek_v3.py", 333),
+        TestFile("test_disaggregation_different_tp.py", 600),
+        TestFile("test_disaggregation_pp.py", 140),
+        TestFile("test_full_deepseek_v3.py", 550),
     ],
     "per-commit-4-gpu-b200": [
         # TestFile("test_gpt_oss_4gpu.py", 600),
@@ -367,7 +369,7 @@ if __name__ == "__main__":
     arg_parser.add_argument(
         "--timeout-per-file",
         type=int,
-        default=1200,
+        default=1500 if is_hip() else 1200,
         help="The time limit for running one file in seconds.",
     )
     arg_parser.add_argument(
