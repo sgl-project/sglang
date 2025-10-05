@@ -1641,7 +1641,7 @@ def _ensure_remove_suffix(text: str, suffix: str):
     return text.removesuffix(suffix)
 
 
-class ModelDeploySetup:
+class ModelLaunchSettings:
     def __init__(
         self,
         model_path: str,

@@ -8,7 +8,7 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
-    ModelDeploySetup,
+    ModelLaunchSettings,
     _parse_int_list_env,
     is_in_ci,
     parse_models,
@@ -26,11 +26,11 @@ VLM_EXTRA_ARGS = [
 
 MODEL_DEFAULTS = [
     # Keep conservative defaults. Can be overridden by env NIGHTLY_VLM_MODELS
-    ModelDeploySetup(
+    ModelLaunchSettings(
         "Qwen/Qwen2.5-VL-7B-Instruct",
         extra_args=VLM_EXTRA_ARGS,
     ),
-    ModelDeploySetup(
+    ModelLaunchSettings(
         "google/gemma-3-27b-it",
         extra_args=VLM_EXTRA_ARGS,
     ),
@@ -53,7 +53,7 @@ class TestNightlyVLMModelsPerformance(unittest.TestCase):
             model_paths = parse_models(nightly_vlm_models_str)
             for model_path in model_paths:
                 cls.models.append(
-                    ModelDeploySetup(model_path, extra_args=VLM_EXTRA_ARGS)
+                    ModelLaunchSettings(model_path, extra_args=VLM_EXTRA_ARGS)
                 )
         else:
             cls.models = MODEL_DEFAULTS

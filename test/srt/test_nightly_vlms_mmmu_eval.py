@@ -8,8 +8,8 @@ from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
-    ModelDeploySetup,
     ModelEvalMetrics,
+    ModelLaunchSettings,
     check_evaluation_test_results,
     popen_launch_server,
     write_results_to_json,
@@ -19,49 +19,49 @@ VLM_EXTRA_ARGS = ["--enable-multimodal", "--trust-remote-code"]
 
 MODEL_THRESHOLDS = {
     # Conservative thresholds on 100 MMMU samples, especially for latency thresholds
-    ModelDeploySetup(
+    ModelLaunchSettings(
         "deepseek-ai/deepseek-vl2-small", extra_args=VLM_EXTRA_ARGS
     ): ModelEvalMetrics(0.330, 56.1),
-    ModelDeploySetup(
+    ModelLaunchSettings(
         "deepseek-ai/Janus-Pro-7B", extra_args=VLM_EXTRA_ARGS
     ): ModelEvalMetrics(0.285, 39.9),
-    ModelDeploySetup(
+    ModelLaunchSettings(
         "Efficient-Large-Model/NVILA-Lite-2B-hf-0626", extra_args=VLM_EXTRA_ARGS
     ): ModelEvalMetrics(0.305, 23.8),
-    ModelDeploySetup(
+    ModelLaunchSettings(
         "google/gemma-3-4b-it", extra_args=VLM_EXTRA_ARGS
     ): ModelEvalMetrics(0.360, 10.9),
-    ModelDeploySetup(
+    ModelLaunchSettings(
         "google/gemma-3n-E4B-it", extra_args=VLM_EXTRA_ARGS
     ): ModelEvalMetrics(0.360, 15.3),
-    ModelDeploySetup(
+    ModelLaunchSettings(
         "mistral-community/pixtral-12b", extra_args=VLM_EXTRA_ARGS
     ): ModelEvalMetrics(0.360, 16.6),
-    ModelDeploySetup(
+    ModelLaunchSettings(
         "moonshotai/Kimi-VL-A3B-Instruct", extra_args=VLM_EXTRA_ARGS
     ): ModelEvalMetrics(0.330, 22.3),
-    ModelDeploySetup(
+    ModelLaunchSettings(
         "openbmb/MiniCPM-o-2_6", extra_args=VLM_EXTRA_ARGS
     ): ModelEvalMetrics(0.330, 29.3),
-    ModelDeploySetup(
+    ModelLaunchSettings(
         "openbmb/MiniCPM-v-2_6", extra_args=VLM_EXTRA_ARGS
     ): ModelEvalMetrics(0.270, 24.5),
-    ModelDeploySetup(
+    ModelLaunchSettings(
         "OpenGVLab/InternVL2_5-2B", extra_args=VLM_EXTRA_ARGS
     ): ModelEvalMetrics(0.300, 14.0),
-    ModelDeploySetup(
+    ModelLaunchSettings(
         "Qwen/Qwen2-VL-7B-Instruct", extra_args=VLM_EXTRA_ARGS
     ): ModelEvalMetrics(0.310, 83.3),
-    ModelDeploySetup(
+    ModelLaunchSettings(
         "Qwen/Qwen2.5-VL-7B-Instruct", extra_args=VLM_EXTRA_ARGS
     ): ModelEvalMetrics(0.340, 31.9),
-    ModelDeploySetup(
+    ModelLaunchSettings(
         "unsloth/Mistral-Small-3.1-24B-Instruct-2503", extra_args=VLM_EXTRA_ARGS
     ): ModelEvalMetrics(0.310, 16.7),
-    ModelDeploySetup(
+    ModelLaunchSettings(
         "XiaomiMiMo/MiMo-VL-7B-RL", extra_args=VLM_EXTRA_ARGS
     ): ModelEvalMetrics(0.28, 32.0),
-    ModelDeploySetup(
+    ModelLaunchSettings(
         "zai-org/GLM-4.1V-9B-Thinking", extra_args=VLM_EXTRA_ARGS
     ): ModelEvalMetrics(0.280, 30.4),
 }

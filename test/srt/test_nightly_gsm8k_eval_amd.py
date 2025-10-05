@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
-    ModelDeploySetup,
+    ModelLaunchSettings,
     is_in_ci,
     parse_models,
     popen_launch_server,
@@ -100,7 +100,7 @@ class TestNightlyGsm8KEval(unittest.TestCase):
                 "SGLANG_USE_AITER": "0" if model_path in TRITON_MOE_MODELS else "1",
             }
             cls.models.append(
-                ModelDeploySetup(
+                ModelLaunchSettings(
                     model_path, tp_size=tp_size, extra_args=extra_args, env=env
                 )
             )

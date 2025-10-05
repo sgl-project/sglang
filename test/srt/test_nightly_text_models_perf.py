@@ -8,7 +8,7 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
-    ModelDeploySetup,
+    ModelLaunchSettings,
     _parse_int_list_env,
     is_in_ci,
     parse_models,
@@ -25,9 +25,9 @@ class TestNightlyTextModelsPerformance(unittest.TestCase):
         cls.models = []
         # TODO: replace with DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1 or other model lists
         for model_path in parse_models("meta-llama/Llama-3.1-8B-Instruct"):
-            cls.models.append(ModelDeploySetup(model_path, tp_size=1))
+            cls.models.append(ModelLaunchSettings(model_path, tp_size=1))
         for model_path in parse_models("Qwen/Qwen2-57B-A14B-Instruct"):
-            cls.models.append(ModelDeploySetup(model_path, tp_size=2))
+            cls.models.append(ModelLaunchSettings(model_path, tp_size=2))
         # (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1), False, False),
         # (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2), False, True),
         # (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1), True, False),
