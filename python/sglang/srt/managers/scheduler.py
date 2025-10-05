@@ -217,7 +217,7 @@ class GenerationBatchResult:
 
     # For overlap scheduling
     copy_done: Optional[torch.cuda.Event] = None
-    sample_launch_delayed: bool = False
+    delay_sample_launch: bool = False
     forward_batch: Optional[ForwardBatch] = None
     future_map_ct: Optional[int] = None
 
@@ -238,7 +238,7 @@ class GenerationBatchResult:
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             can_run_cuda_graph=forward_batch_output.can_run_cuda_graph,
             copy_done=forward_batch_output.copy_done,
-            sample_launch_delayed=forward_batch_output.delay_sample_launch,
+            delay_sample_launch=forward_batch_output.delay_sample_launch,
             forward_batch=forward_batch_output.forward_batch,
             future_map_ct=forward_batch_output.future_map_ct,
         )
@@ -989,7 +989,6 @@ class Scheduler(
         self.result_queue: Deque[Tuple[ScheduleBatch, GenerationBatchResult]] = deque()
 
         while True:
-            # When sample_launch_delayed
             self.launch_last_batch_sample_if_needed()
 
             recv_reqs = self.recv_requests()
@@ -2103,11 +2102,13 @@ class Scheduler(
                 with self.forward_stream_ctx:
                     self.forward_stream.wait_stream(self.default_stream)
                     self.future_map.resolve_future(model_worker_batch)
+                    if batch.sampling_info.grammars is not None:
+                        model_worker_batch.delay_sample_launch = True
                     forward_batch_output = self.model_worker.forward_batch_generation(
                         batch_or_worker_batch
                     )
                     copy_done = torch.cuda.Event()
-                    if not forward_batch_output.delay_sample_launch:
+                    if not model_worker_batch.delay_sample_launch:
                         self.future_map.store_to_map(
                             cur_future_map_ct, bs, forward_batch_output.next_token_ids
                         )
@@ -2126,13 +2127,6 @@ class Scheduler(
                 forward_batch_output = self.model_worker.forward_batch_generation(
                     batch_or_worker_batch
                 )
-                if forward_batch_output.delay_sample_launch:
-                    forward_batch_output.next_token_ids = (
-                        self.model_worker.model_runner.sample(
-                            forward_batch_output.logits_output,
-                            forward_batch_output.forward_batch,
-                        )
-                    )
                 maybe_future_next_token_ids = forward_batch_output.next_token_ids
                 copy_done = None
 
@@ -2183,7 +2177,7 @@ class Scheduler(
         tmp_batch, tmp_result = self.result_queue.popleft()
 
         tmp_result: GenerationBatchResult
-        if not tmp_result.sample_launch_delayed:
+        if not tmp_result.delay_sample_launch:
             self.result_queue.appendleft((tmp_batch, tmp_result))
             return
 

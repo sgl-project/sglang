@@ -268,16 +268,21 @@ class TpModelWorker:
                 # Skip sampling and return logits for target forward
                 return forward_batch_output
 
+            if model_worker_batch.delay_sample_launch:
+                forward_batch_output.delay_sample_launch = True
+                forward_batch_output.forward_batch = forward_batch
+                return forward_batch_output
+
             if model_worker_batch.is_prefill_only:
+                # For prefill-only requests, create dummy token IDs on CPU
+                forward_batch_output.next_token_ids = torch.zeros_like(
+                    model_worker_batch.input_ids, dtype=torch.long
+                )
                 if model_worker_batch.return_logprob:
                     # NOTE: Compute logprobs without full sampling
                     self.model_runner.compute_logprobs_only(
                         logits_output, model_worker_batch
                     )
-            elif model_worker_batch.sampling_info.grammars is not None:
-                # The launch of sampling is delayed for overlap scheduling
-                forward_batch_output.delay_sample_launch = True
-                forward_batch_output.forward_batch = forward_batch
             else:
                 forward_batch_output.next_token_ids = self.model_runner.sample(
                     logits_output, forward_batch
