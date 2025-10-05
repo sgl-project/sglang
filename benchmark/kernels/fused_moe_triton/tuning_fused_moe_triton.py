@@ -414,10 +414,21 @@ def main(args: argparse.Namespace):
     print(args)
 
     config = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
+
+    # Determine block shape for quantization
+    block_shape = None
+    if (
+        hasattr(config, "quantization_config")
+        and "weight_block_size" in config.quantization_config
+    ):
+        block_shape = config.quantization_config["weight_block_size"]
+        assert len(block_shape) == 2
+
     architecture = config.architectures[0]
-    # replace config with text_config for encoder-decoder models
+    # replace config with text_config for encoder-decoder models after getting block_shape and architecture
     if hasattr(config, "text_config"):
         config = config.get_text_config()
+
     if architecture == "DbrxForCausalLM":
         E = config.ffn_config.moe_num_experts
         topk = config.ffn_config.moe_top_k
@@ -488,13 +499,6 @@ def main(args: argparse.Namespace):
     use_int8_w8a8 = args.dtype == "int8_w8a8"
     use_int8_w8a16 = args.dtype == "int8_w8a16"
     per_channel_quant = args.per_channel_quant
-    block_shape = None
-    if (
-        hasattr(config, "quantization_config")
-        and "weight_block_size" in config.quantization_config
-    ):
-        block_shape = config.quantization_config["weight_block_size"]
-        assert len(block_shape) == 2
 
     if args.batch_size is None:
         batch_sizes = [
