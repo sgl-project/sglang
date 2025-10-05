@@ -8,6 +8,7 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    ModelDeploySetup,
     _parse_int_list_env,
     is_in_ci,
     parse_models,
@@ -33,9 +34,17 @@ class TestNightlyVLMModelsPerformance(unittest.TestCase):
         warnings.filterwarnings(
             "ignore", category=ResourceWarning, message="unclosed.*socket"
         )
-        cls.models = parse_models(
+        vlm_extra_args = [
+            "--enable-multimodal",
+            "--trust-remote-code",
+            "--mem-fraction-static=0.7",
+        ]
+        cls.models = []
+        model_paths = parse_models(
             os.environ.get("NIGHTLY_VLM_MODELS", ",".join(MODEL_DEFAULTS))
         )
+        for model_path in model_paths:
+            cls.models.append(ModelDeploySetup(model_path, extra_args=vlm_extra_args))
         cls.base_url = DEFAULT_URL_FOR_TEST
 
         cls.batch_sizes = _parse_int_list_env("NIGHTLY_VLM_BATCH_SIZES", "1,1,2,8,16")
@@ -46,29 +55,31 @@ class TestNightlyVLMModelsPerformance(unittest.TestCase):
     def test_bench_one_batch(self):
         all_benchmark_results = []
 
-        for model in self.models:
+        for model_setup in self.models:
             benchmark_results = []
-            with self.subTest(model=model):
+            with self.subTest(model=model_setup.model_path):
                 process = popen_launch_server(
-                    model=model,
+                    model=model_setup.model_path,
                     base_url=self.base_url,
-                    other_args=["--mem-fraction-static=0.7"],
+                    other_args=model_setup.extra_args,
                     timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
                 )
                 try:
                     # Run bench_one_batch_server against the launched server
-                    profile_filename = f"{model.replace('/', '_')}"
+                    profile_filename = f"{model_setup.model_path.replace('/', '_')}"
                     # path for this run
                     profile_path_prefix = os.path.join(PROFILE_DIR, profile_filename)
 
                     # JSON output file for this model
-                    json_output_file = f"results_{model.replace('/', '_')}.json"
+                    json_output_file = (
+                        f"results_{model_setup.model_path.replace('/', '_')}.json"
+                    )
 
                     command = [
                         "python3",
                         "-m",
                         "sglang.bench_one_batch_server",
-                        f"--model={model}",
+                        f"--model={model_setup.model_path}",
                         "--base-url",
                         self.base_url,
                         "--batch-size",
@@ -91,12 +102,14 @@ class TestNightlyVLMModelsPerformance(unittest.TestCase):
                     result = subprocess.run(command, capture_output=True, text=True)
 
                     if result.returncode != 0:
-                        print(f"Error running benchmark for {model} with batch size:")
+                        print(
+                            f"Error running benchmark for {model_setup.model_path} with batch size:"
+                        )
                         print(result.stderr)
                         # Continue to next batch size even if one fails
                         continue
 
-                    print(f"Output for {model} with batch size:")
+                    print(f"Output for {model_setup.model_path} with batch size:")
                     print(result.stdout)
 
                     # Load and deserialize JSON results
