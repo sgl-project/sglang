@@ -260,7 +260,6 @@ class TpModelWorker:
                 launch_done.set()
 
             skip_sample = is_verify or model_worker_batch.is_prefill_only
-            model_worker_batch.return_logprob
             next_token_ids = None
 
             if not skip_sample:
