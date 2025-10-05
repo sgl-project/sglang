@@ -541,7 +541,9 @@ class MambaRadixCache(BasePrefixCache):
     def total_size(self) -> Tuple[int, int]:
         return self._total_size_helper()
 
-    def _evict_leaf_node(self, x: TreeNode) -> Tuple[int, int, TreeNode, TreeNode]:
+    def _evict_leaf_node(
+        self, x: TreeNode, is_evict_mamba: bool
+    ) -> Tuple[int, int, TreeNode, TreeNode]:
         assert (
             x.full_lock_ref == 0
         ), f"leaf node with full lock must also have mamba lock, {x.id=} {x.full_lock_ref=}"
@@ -552,7 +554,10 @@ class MambaRadixCache(BasePrefixCache):
         mamba_num_evicted = len(x.mamba_value)
 
         # 2. get the next node, update the lru lists
-        x_next = self.mamba_lru_list.get_prev_no_lock(x)
+        if is_evict_mamba:
+            x_next = self.mamba_lru_list.get_prev_no_lock(x)
+        else:
+            x_next = self.full_lru_list.get_prev_leaf_no_lock(x)
         self.full_lru_list.remove_node(x)
         self.mamba_lru_list.remove_node(x)
 
@@ -588,7 +593,7 @@ class MambaRadixCache(BasePrefixCache):
                 # 3. tombstone the node
                 self._tombstone_internal_node(x)
             else:
-                _, mamba_evicted_delta, _, x_next = self._evict_leaf_node(x)
+                _, mamba_evicted_delta, _, x_next = self._evict_leaf_node(x, True)
                 mamba_num_evicted += mamba_evicted_delta
 
             x = x_next
@@ -605,7 +610,7 @@ class MambaRadixCache(BasePrefixCache):
             assert (
                 x != self.root_node
             ), f"root node should not exist in full lru list, {x.id=}"
-            full_num_evicted_delta, _, x, x_next = self._evict_leaf_node(x)
+            full_num_evicted_delta, _, x, x_next = self._evict_leaf_node(x, False)
             full_num_evicted += full_num_evicted_delta
 
             # if parent has no more children, it is a leaf. It is possible that this node is lru, so
