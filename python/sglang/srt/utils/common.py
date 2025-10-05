@@ -1,4 +1,6 @@
 # Copyright 2023-2024 SGLang Team
+import orjson
+
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -1083,7 +1085,7 @@ def configure_logger(server_args, prefix: str = ""):
                 f"{SGLANG_LOGGING_CONFIG_PATH} but it does not exist!"
             )
         with open(SGLANG_LOGGING_CONFIG_PATH, encoding="utf-8") as file:
-            custom_config = json.loads(file.read())
+            custom_config = orjson.loads(file.read())
         logging.config.dictConfig(custom_config)
         return
     format = f"[%(asctime)s{prefix}] %(message)s"
@@ -2494,9 +2496,9 @@ def log_info_on_rank0(logger, msg):
 
 def load_json_config(data: str):
     try:
-        return json.loads(data)
+        return orjson.loads(data)
     except JSONDecodeError:
-        return json.loads(Path(data).read_text())
+        return orjson.loads(Path(data).read_text())
 
 
 def dispose_tensor(x: torch.Tensor):
@@ -3205,7 +3207,7 @@ def numa_bind_to_node(node: int):
 
 def json_list_type(value):
     try:
-        return json.loads(value)
+        return orjson.loads(value)
     except json.JSONDecodeError:
         raise argparse.ArgumentTypeError(
             f"Invalid JSON list: {value}. Please provide a valid JSON list."

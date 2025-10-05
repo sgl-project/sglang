@@ -1,4 +1,6 @@
 # Copyright 2023-2024 SGLang Team
+import orjson
+
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -157,7 +159,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         self.log_requests = server_args.log_requests
         self.log_requests_level = server_args.log_requests_level
         self.preferred_sampling_params = (
-            json.loads(server_args.preferred_sampling_params)
+            orjson.loads(server_args.preferred_sampling_params)
             if server_args.preferred_sampling_params
             else None
         )
