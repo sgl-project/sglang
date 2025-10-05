@@ -448,11 +448,9 @@ def main(args: argparse.Namespace):
         intermediate_size = config.moe_intermediate_size
         shard_intermediate_size = 2 * intermediate_size // args.tp_size
     elif architecture == "Llama4ForConditionalGeneration":
-        E = config.text_config.num_local_experts + (
-            0 if args.disable_shared_experts_fusion else 1
-        )
-        topk = config.text_config.num_experts_per_tok
-        intermediate_size = config.text_config.intermediate_size
+        E = config.num_local_experts + (0 if args.disable_shared_experts_fusion else 1)
+        topk = config.num_experts_per_tok
+        intermediate_size = config.intermediate_size
         shard_intermediate_size = 2 * intermediate_size // args.tp_size
     elif architecture in [
         "Grok1ForCausalLM",
@@ -484,7 +482,7 @@ def main(args: argparse.Namespace):
         intermediate_size = config.intermediate_size
         shard_intermediate_size = 2 * intermediate_size // args.tp_size
 
-    hidden_size = getattr(config, "hidden_size", None) or config.text_config.hidden_size
+    hidden_size = config.hidden_size
     dtype = config.torch_dtype
     use_fp8_w8a8 = args.dtype == "fp8_w8a8"
     use_int8_w8a8 = args.dtype == "int8_w8a8"
