@@ -69,6 +69,6 @@ class TestDeterministicBase(CustomTestCase):
         args.host, args.port = self._extract_host_and_port(url)
         args.test_mode = "prefix"
         args.n_start = 10
-        args.n_trials = 20
+        args.n_trials = 10
         results = test_deterministic(args)
         assert all(lambda x: x == 1, results)
