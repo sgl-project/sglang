@@ -12,7 +12,7 @@ from aiter.utility.fp4_utils import e8m0_shuffle
 
 from sglang.srt.layers.moe import MoeRunnerConfig
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
-from sglang.srt.utils import get_bool_env_var, mxfp_supported, set_weight_attrs, is_hip
+from sglang.srt.utils import get_bool_env_var, is_hip, mxfp_supported, set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
