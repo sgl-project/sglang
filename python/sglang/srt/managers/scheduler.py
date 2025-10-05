@@ -762,6 +762,7 @@ class Scheduler(
                     hicache_storage_prefetch_policy=server_args.hicache_storage_prefetch_policy,
                     model_name=server_args.served_model_name,
                     storage_backend_extra_config=server_args.hicache_storage_backend_extra_config,
+                    is_eagle=self.spec_algorithm.is_eagle(),
                 )
                 self.tp_worker.register_hicache_layer_transfer_counter(
                     self.tree_cache.cache_controller.layer_done_counter

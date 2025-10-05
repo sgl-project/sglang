@@ -96,11 +96,28 @@ impl BasicWorkerBuilder {
 
     /// Build the BasicWorker instance
     pub fn build(self) -> BasicWorker {
+        use std::borrow::Cow;
         use std::sync::{
             atomic::{AtomicBool, AtomicUsize},
             Arc,
         };
         use tokio::sync::{Mutex, RwLock};
+
+        let url_to_parse = if self.url.contains("://") {
+            Cow::from(&self.url)
+        } else {
+            Cow::from(format!("http://{}", self.url))
+        };
+
+        let bootstrap_host = match url::Url::parse(&url_to_parse) {
+            Ok(parsed) => parsed.host_str().unwrap_or("localhost").to_string(),
+            Err(_) => "localhost".to_string(),
+        };
+
+        let bootstrap_port = match self.worker_type {
+            WorkerType::Prefill { bootstrap_port } => bootstrap_port,
+            _ => None,
+        };
 
         let metadata = WorkerMetadata {
             url: self.url.clone(),
@@ -109,6 +126,8 @@ impl BasicWorkerBuilder {
             connection_mode: self.connection_mode,
             labels: self.labels,
             health_config: self.health_config,
+            bootstrap_host,
+            bootstrap_port,
         };
 
         let grpc_client = Arc::new(RwLock::new(
