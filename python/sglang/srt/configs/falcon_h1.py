@@ -326,9 +326,9 @@ class FalconH1Config(PretrainedConfig):
 
         # we TP-ize on the heads dimension
         temporal_state_shape = (
-            self.mamba_d_state,
-            self.mamba_d_head,
             divide(self.mamba_n_heads, world_size),
+            self.mamba_d_head,
+            self.mamba_d_state,
         )
         shape = Mamba2StateShape(conv=conv_state_shape, temporal=temporal_state_shape)
         return Mamba2CacheParams(shape=shape, layers=self.linear_layer_ids)

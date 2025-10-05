@@ -469,10 +469,6 @@ class MambaMixer2(torch.nn.Module):
         conv_state = layer_cache.conv
         ssm_state = layer_cache.temporal
 
-        assert (
-            ssm_state.size(1) == self.ssm_state_size
-        ), f"dstate must be {self.ssm_state_size}, got {ssm_state.size(1)}"
-
         query_start_loc = metadata.query_start_loc
 
         # 1. Gated MLP's linear projection
@@ -558,7 +554,7 @@ class MambaMixer2(torch.nn.Module):
             # 2. Convolution sequence transformation
             # - "cache_indices" updates the conv_state cache in positions
             #   pointed to by "state_indices_tensor"
-            has_initial_states = mixed_metadata.has_initial_states
+            has_initial_states_p = mixed_metadata.has_initial_states
             prep_initial_states = mixed_metadata.prep_initial_states
             cache_indices = state_indices_tensor_p
             x = hidden_states_B_C_p.transpose(
@@ -575,7 +571,7 @@ class MambaMixer2(torch.nn.Module):
                 self.conv1d.bias,
                 activation=self.activation,
                 conv_states=conv_state,
-                has_initial_state=has_initial_states,
+                has_initial_state=has_initial_states_p,
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc_p,
                 seq_lens_cpu=mixed_metadata.extend_seq_lens_cpu,
@@ -585,9 +581,9 @@ class MambaMixer2(torch.nn.Module):
 
             # 3. State Space Model sequence transformation
             initial_states = None
-            if has_initial_states is not None and prep_initial_states:
+            if has_initial_states_p is not None and prep_initial_states:
                 initial_states = torch.where(
-                    has_initial_states[:, None, None, None],
+                    has_initial_states_p[:, None, None, None],
                     ssm_state[state_indices_tensor_p],
                     0,
                 )

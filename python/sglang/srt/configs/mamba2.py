@@ -76,7 +76,9 @@ class Mamba2CacheParams:
     ) -> Mamba2StateShape:
         # if n_groups is not divisible by world_size, need to extend the shards
         # to ensure all groups needed by a head is sharded along with it
-        n_groups = n_groups + extra_groups_for_head_shards(n_groups, tp_world_size)
+        if n_groups % tp_world_size != 0:
+            extra_groups = extra_groups_for_head_shards(n_groups, tp_world_size)
+            n_groups += extra_groups
         # heads and n_groups are TP-ed
         conv_dim = intermediate_size + 2 * n_groups * state_size
 
