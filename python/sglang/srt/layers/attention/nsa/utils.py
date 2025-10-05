@@ -12,15 +12,12 @@ NSA_QUANT_K_CACHE_FAST = get_bool_env_var("SGLANG_NSA_QUANT_K_CACHE_FAST", "true
 NSA_DEQUANT_K_CACHE_FAST = get_bool_env_var("SGLANG_NSA_DEQUANT_K_CACHE_FAST", "true")
 
 
-def _print_bool_env_vars():
+def print_nsa_bool_env_vars():
     msg = ""
     for k, v in globals().items():
         if k.startswith("NSA_") and isinstance(v, bool):
             msg += f"{k}={v} "
     print(msg, flush=True)
-
-
-_print_bool_env_vars()
 
 
 def compute_nsa_seqlens(original_seq_lens, nsa_index_topk: int):

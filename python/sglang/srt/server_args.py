@@ -843,6 +843,13 @@ class ServerArgs:
                         "Setting NSA backend to flashmla_decode for FP8 KV Cache."
                     )
 
+                # Logging env vars for NSA
+                from sglang.srt.layers.attention.nsa.utils import (
+                    print_nsa_bool_env_vars,
+                )
+
+                print_nsa_bool_env_vars()
+
     def _handle_sampling_backend(self):
         if self.sampling_backend is None:
             self.sampling_backend = (
