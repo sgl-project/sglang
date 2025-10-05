@@ -102,6 +102,9 @@ class SGLangCIAnalyzer:
             "skipped_runs": 0,
             "category_failures": defaultdict(int),
             "job_failures": defaultdict(int),
+            "job_total_runs": defaultdict(
+                int
+            ),  # Track total runs per job (excluding cancelled/skipped)
             "failure_patterns": defaultdict(int),
             "job_failure_links": defaultdict(
                 list
@@ -137,6 +140,9 @@ class SGLangCIAnalyzer:
             run_url = f"https://github.com/{self.repo}/actions/runs/{run_id}"
             pr_info = self._get_pr_info(run)
 
+            # Only count jobs for runs that are not cancelled or skipped
+            count_job_runs = run_status not in ["cancelled", "skipped"]
+
             for job in jobs:
                 job_name = job.get("name", "Unknown")
                 job_conclusion = job.get("conclusion", "unknown")
@@ -148,6 +154,10 @@ class SGLangCIAnalyzer:
                     "pr-test-h20-finish",
                     "lint",
                 ]:
+                    # Count this job run if the workflow run is not cancelled or skipped
+                    if count_job_runs:
+                        stats["job_total_runs"][job_name] += 1
+
                     # Record successful jobs (update last success)
                     if job_conclusion == "success":
                         stats["job_last_success"][job_name] = {
@@ -254,7 +264,9 @@ class SGLangCIAnalyzer:
         success = stats["successful_runs"]
         cancelled = stats["cancelled_runs"]
         skipped = stats["skipped_runs"]
-        success_rate = (success / total * 100) if total > 0 else 0
+        # Calculate success rate excluding cancelled and skipped runs
+        completed_runs = success + failed
+        success_rate = (success / completed_runs * 100) if completed_runs > 0 else 0
 
         print(f"\nOverall Statistics:")
         print(f"  Total runs: {total}")
@@ -275,13 +287,18 @@ class SGLangCIAnalyzer:
         # Most frequently failed jobs with links
         if stats["job_failures"]:
             print(f"\nMost Frequently Failed Jobs (Top 50):")
-            for i, (job, count) in enumerate(
-                sorted(stats["job_failures"].items(), key=lambda x: x[1], reverse=True)[
-                    :50
-                ],
-                1,
+            # Sort by failure rate instead of count
+            jobs_with_rate = [
+                (job, count, (count / stats["job_total_runs"].get(job, 1) * 100))
+                for job, count in stats["job_failures"].items()
+            ]
+            for i, (job, count, _) in enumerate(
+                sorted(jobs_with_rate, key=lambda x: x[2], reverse=True)[:50], 1
             ):
-                print(f"  {i:2d}. {job}: {count} times")
+                # Calculate failure rate for this job
+                total_runs = stats["job_total_runs"].get(job, 0)
+                failure_rate = (count / total_runs * 100) if total_runs > 0 else 0
+                print(f"  {i:2d}. {job}: {count} times ({failure_rate:.1f}% fail rate)")
 
                 # Show last successful run
                 if job in stats["job_last_success"]:
