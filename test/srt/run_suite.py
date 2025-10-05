@@ -19,6 +19,7 @@ suites = {
         TestFile("hicache/test_hicache.py", 116),
         TestFile("hicache/test_hicache_mla.py", 127),
         TestFile("hicache/test_hicache_storage.py", 127),
+        TestFile("hicache/test_hicache_eagle.py", 150),
         TestFile("lora/test_lora.py", 200),
         TestFile("lora/test_lora_eviction.py", 200),
         TestFile("lora/test_lora_backend.py", 99),
@@ -139,6 +140,8 @@ suites = {
         TestFile("test_release_memory_occupation.py", 257),
         TestFile("hicache/test_hicache_storage_file_backend.py", 400),
         TestFile("hicache/test_hicache_storage_3fs_backend.py", 400),
+        TestFile("hicache/test_hicache_storage_file_backend.py", 200),
+        TestFile("hicache/test_hicache_storage_3fs_backend.py", 200),
         TestFile("layers/attention/mamba/test_mamba2_mixer.py", TODO),  # TODO: Measure
     ],
     "per-commit-4-gpu": [
@@ -150,7 +153,7 @@ suites = {
         TestFile("test_multi_instance_release_memory_occupation.py", 64),
     ],
     "per-commit-8-gpu": [
-        TestFile("hicache/test_hicache_storage_mooncake_backend.py", 800),
+        TestFile("hicache/test_hicache_storage_mooncake_backend.py", 400),
         TestFile("lora/test_lora_llama4.py", 600),
         TestFile("test_disaggregation.py", 499),
         TestFile("test_disaggregation_dp_attention.py", 155),
