@@ -54,7 +54,7 @@ def _state_passing_fwd_kernel(
     HAS_INITSTATES: tl.constexpr,
     HAS_SEQ_IDX: tl.constexpr,
     IS_CONT_BATCHED: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr = 16,
 ):
     pid_b = tl.program_id(axis=1)
     pid_h = tl.program_id(axis=2)
