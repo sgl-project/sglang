@@ -904,7 +904,7 @@ class ForwardBatch:
 class ForwardBatchOutput:
     # FIXME(lsyin): unify the forward batch output between different spec and parallelism
     # need to be more organized
-    logits_output: Optional[torch.Tensor] = None
+    logits_output: Optional[LogitsProcessorOutput] = None
     next_token_ids: Optional[torch.Tensor] = None
     num_accepted_tokens: Optional[int] = None
     pp_proxy_tensors: Optional[PPProxyTensors] = None
