@@ -49,8 +49,8 @@ def _chunk_cumsum_fwd_kernel(
     # Meta-parameters
     DT_SOFTPLUS: tl.constexpr,
     HAS_DT_BIAS: tl.constexpr,
-    BLOCK_SIZE_H: tl.constexpr,
     BLOCK_SIZE_CHUNK: tl.constexpr,
+    BLOCK_SIZE_H: tl.constexpr = 16,
 ):
     pid_b = tl.program_id(axis=0)
 
