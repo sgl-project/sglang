@@ -1,6 +1,9 @@
 //! Step3 Parser Integration Tests
 
-use sglang_router_rs::tool_parser::{ParseState, Step3Parser, StreamResult, ToolParser};
+use sglang_router_rs::tool_parser::{Step3Parser, ToolParser};
+
+mod common;
+use common::create_test_tools;
 
 #[tokio::test]
 async fn test_step3_complete_parsing() {
@@ -15,8 +18,9 @@ async fn test_step3_complete_parsing() {
 <｜tool_calls_end｜>
 Here are the results..."#;
 
-    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
     assert_eq!(tools.len(), 1);
+    assert_eq!(normal_text, "Let me help you.\n");
     assert_eq!(tools[0].function.name, "search");
 
     let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
@@ -71,8 +75,9 @@ async fn test_step3_type_conversion() {
 
 #[tokio::test]
 async fn test_step3_streaming() {
-    let parser = Step3Parser::new();
-    let mut state = ParseState::new();
+    let mut parser = Step3Parser::new();
+
+    let tools = create_test_tools();
 
     // Simulate streaming chunks
     let chunks = vec![
@@ -85,26 +90,20 @@ async fn test_step3_streaming() {
         "\n<｜tool_calls_end｜>",
     ];
 
-    let mut found_name = false;
     let mut found_complete = false;
 
     for chunk in chunks {
-        let result = parser.parse_incremental(chunk, &mut state).await.unwrap();
+        let result = parser.parse_incremental(chunk, &tools).await.unwrap();
 
-        match result {
-            StreamResult::ToolName { name, .. } => {
+        if !result.calls.is_empty() {
+            if let Some(name) = &result.calls[0].name {
                 assert_eq!(name, "calc");
-                found_name = true;
-            }
-            StreamResult::ToolComplete(tool) => {
-                assert_eq!(tool.function.name, "calc");
                 found_complete = true;
             }
-            _ => {}
         }
     }
 
-    assert!(found_name || found_complete);
+    assert!(found_complete);
 }
 
 #[test]
@@ -174,8 +173,9 @@ async fn test_steptml_format() {
 </steptml:invoke><｜tool_call_end｜>
 <｜tool_calls_end｜>Text after."#;
 
-    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
     assert_eq!(tools.len(), 1);
+    assert_eq!(normal_text, "Text before.\n");
     assert_eq!(tools[0].function.name, "search");
 
     let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
