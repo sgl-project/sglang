@@ -1,6 +1,4 @@
 # Copyright 2023-2024 SGLang Team
-import orjson
-
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -36,6 +34,7 @@ from http import HTTPStatus
 from typing import Any, Awaitable, Dict, List, Optional, Tuple, Union
 
 import fastapi
+import orjson
 import torch
 import uvloop
 import zmq

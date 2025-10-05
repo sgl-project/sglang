@@ -1,6 +1,4 @@
 # Copyright 2023-2024 SGLang Team
-import orjson
-
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -14,7 +12,6 @@ import orjson
 # limitations under the License.
 # ==============================================================================
 """Common utilities."""
-
 from __future__ import annotations
 
 import argparse
@@ -72,6 +69,7 @@ from typing import (
 )
 
 import numpy as np
+import orjson
 import psutil
 import pybase64
 import requests

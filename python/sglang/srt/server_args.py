@@ -22,6 +22,8 @@ import random
 import tempfile
 from typing import List, Literal, Optional, Union
 
+import orjson
+
 from sglang.srt.connector import ConnectorType
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.lora.lora_registry import LoRARef
