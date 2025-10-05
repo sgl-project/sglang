@@ -299,7 +299,23 @@ app.add_middleware(
 
 @app.exception_handler(HTTPException)
 async def validation_exception_handler(request: Request, exc: HTTPException):
-    """Enrich HTTP exception with status code and other details"""
+    """Enrich HTTP exception with status code and other details.
+
+    For /v1/responses, emit OpenAI-style nested error envelope:
+    {"error": {"message": "...", "type": "...", "param": null, "code": <status>}}
+    """
+    # adjust fmt for responses api
+    if request.url.path.startswith("/v1/responses"):
+        nested_error = {
+            "message": exc.detail,
+            "type": HTTPStatus(exc.status_code).phrase,
+            "param": None,
+            "code": exc.status_code,
+        }
+        return ORJSONResponse(
+            content={"error": nested_error}, status_code=exc.status_code
+        )
+
     error = ErrorResponse(
         object="error",
         message=exc.detail,
@@ -312,7 +328,10 @@ async def validation_exception_handler(request: Request, exc: HTTPException):
 # Custom exception handlers to change validation error status codes
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    """Override FastAPI's default 422 validation error with 400"""
+    """Override FastAPI's default 422 validation error with 400.
+
+    For /v1/responses, emit OpenAI-style nested error envelope; for other endpoints keep legacy format.
+    """
     exc_str = str(exc)
     errors_str = str(exc.errors())
 
@@ -320,6 +339,16 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         message = f"{exc_str} {errors_str}"
     else:
         message = exc_str
+
+    if request.url.path.startswith("/v1/responses"):
+        # adapt specially, for v1/responses API only (notice the error key is different)
+        nested_error = {
+            "message": message,
+            "type": HTTPStatus.BAD_REQUEST.phrase,
+            "param": None,
+            "code": HTTPStatus.BAD_REQUEST.value,
+        }
+        return ORJSONResponse(status_code=400, content={"error": nested_error})
 
     err = ErrorResponse(
         message=message,
