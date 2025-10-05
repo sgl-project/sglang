@@ -70,6 +70,7 @@ from sglang.srt.managers.io_struct import (
     AbortReq,
     CloseSessionReqInput,
     ConfigureLoggingReq,
+    DestroyWeightsUpdateGroupReqInput,
     EmbeddingReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
@@ -93,8 +94,8 @@ from sglang.srt.managers.io_struct import (
     VertexGenerateReqInput,
 )
 from sglang.srt.managers.multi_tokenizer_mixin import (
-    MultiTokenizerManager,
     MultiTokenizerRouter,
+    TokenizerWorker,
     get_main_process_id,
     monkey_patch_uvicorn_multiprocessing,
     read_from_shared_memory,
@@ -126,9 +127,7 @@ HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
 # Store global states
 @dataclasses.dataclass
 class _GlobalState:
-    tokenizer_manager: Union[
-        TokenizerManager, MultiTokenizerRouter, MultiTokenizerManager
-    ]
+    tokenizer_manager: Union[TokenizerManager, MultiTokenizerRouter, TokenizerWorker]
     template_manager: TemplateManager
     scheduler_info: Dict
 
@@ -163,7 +162,7 @@ async def init_multi_tokenizer() -> ServerArgs:
     )
 
     # Launch multi-tokenizer manager process
-    tokenizer_manager = MultiTokenizerManager(server_args, port_args)
+    tokenizer_manager = TokenizerWorker(server_args, port_args)
     template_manager = TemplateManager()
     template_manager.initialize_templates(
         tokenizer_manager=tokenizer_manager,
@@ -727,6 +726,20 @@ async def init_weights_update_group(
         return ORJSONResponse(content, status_code=200)
     else:
         return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
+@app.post("/destroy_weights_update_group")
+async def destroy_weights_update_group(
+    obj: DestroyWeightsUpdateGroupReqInput, request: Request
+):
+    """Destroy the parameter update group."""
+    success, message = (
+        await _global_state.tokenizer_manager.destroy_weights_update_group(obj, request)
+    )
+    content = {"success": success, "message": message}
+    return ORJSONResponse(
+        content, status_code=200 if success else HTTPStatus.BAD_REQUEST
+    )
 
 
 @app.post("/update_weights_from_tensor")
