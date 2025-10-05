@@ -401,7 +401,7 @@ def save_configs(
         shard_intermediate_size // 2,
         dtype_str,
         block_shape,
-        per_channel_quant,
+        # per_channel_quant,
     )
 
     print(f"Writing best config to {filename}...")
@@ -414,42 +414,47 @@ def main(args: argparse.Namespace):
     print(args)
 
     config = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
-    if config.architectures[0] == "DbrxForCausalLM":
+    architecture = config.architectures[0]
+    # replace config with text_config for encoder-decoder models
+    if hasattr(config, "text_config"):
+        config = config.get_text_config()
+    if architecture == "DbrxForCausalLM":
         E = config.ffn_config.moe_num_experts
         topk = config.ffn_config.moe_top_k
         intermediate_size = config.ffn_config.ffn_hidden_size
         shard_intermediate_size = 2 * intermediate_size // args.tp_size
-    elif config.architectures[0] == "JambaForCausalLM":
+    elif architecture == "JambaForCausalLM":
         E = config.num_experts
         topk = config.num_experts_per_tok
         intermediate_size = config.intermediate_size
         shard_intermediate_size = 2 * intermediate_size // args.tp_size
-    elif config.architectures[0] in [
+    elif architecture in [
         "Qwen2MoeForCausalLM",
         "Qwen3MoeForCausalLM",
         "Qwen3NextForCausalLM",
+        "Qwen3VLMoeForConditionalGeneration",
     ]:
         E = config.num_experts
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
         shard_intermediate_size = 2 * intermediate_size // args.tp_size
-    elif config.architectures[0] in ["DeepseekV2ForCausalLM", "DeepseekV3ForCausalLM"]:
+    elif architecture in ["DeepseekV2ForCausalLM", "DeepseekV3ForCausalLM"]:
         E = (
             config.n_routed_experts + (0 if args.disable_shared_experts_fusion else 1)
-            if config.architectures[0] in ["DeepseekV3ForCausalLM"]
+            if architecture == "DeepseekV3ForCausalLM"
             else config.n_routed_experts
         )
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
         shard_intermediate_size = 2 * intermediate_size // args.tp_size
-    elif config.architectures[0] == "Llama4ForConditionalGeneration":
+    elif architecture == "Llama4ForConditionalGeneration":
         E = config.text_config.num_local_experts + (
             0 if args.disable_shared_experts_fusion else 1
         )
         topk = config.text_config.num_experts_per_tok
         intermediate_size = config.text_config.intermediate_size
         shard_intermediate_size = 2 * intermediate_size // args.tp_size
-    elif config.architectures[0] in [
+    elif architecture in [
         "Grok1ForCausalLM",
         "Grok1ImgGen",
         "Grok1AForCausalLM",
@@ -458,7 +463,7 @@ def main(args: argparse.Namespace):
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
         shard_intermediate_size = 2 * intermediate_size // args.tp_size
-    elif config.architectures[0] in [
+    elif architecture in [
         "BailingMoEForCausalLM",
         "BailingMoeForCausalLM",
         "BailingMoeV2ForCausalLM",
@@ -467,7 +472,7 @@ def main(args: argparse.Namespace):
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
         shard_intermediate_size = 2 * intermediate_size // args.tp_size
-    elif config.architectures[0] in ["Glm4MoeForCausalLM"]:
+    elif architecture in ["Glm4MoeForCausalLM"]:
         E = config.n_routed_experts
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
