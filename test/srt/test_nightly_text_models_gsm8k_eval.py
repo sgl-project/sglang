@@ -52,7 +52,6 @@ class TestNightlyGsm8KEval(unittest.TestCase):
         for model_path in models_tp1:
             cls.models.append(ModelLaunchSettings(model_path, tp_size=1))
 
-
         models_tp2 = parse_models(
             DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2
         ) + parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2)
