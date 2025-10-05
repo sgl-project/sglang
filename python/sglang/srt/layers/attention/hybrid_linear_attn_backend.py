@@ -681,7 +681,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         )
 
         mamba_caches = (
-            self.linear_attn_backend.req_to_token_pool.get_speculative_mamba_params_all_layers()
+            self.linear_attn_backend.req_to_token_pool.get_speculative_mamba2_params_all_layers()
         )
 
         conv_states = mamba_caches.conv

@@ -20,12 +20,7 @@ from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_rope_utils import rope_config_validation
 from transformers.utils import logging
 
-from sglang.srt.configs.mamba2 import (
-    Mamba2CacheParams,
-    Mamba2StateShape,
-    extra_groups_for_head_shards,
-)
-from sglang.srt.distributed.utils import divide
+from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     get_tensor_model_parallel_world_size,

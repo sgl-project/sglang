@@ -182,6 +182,7 @@ def _layer_norm_fwd(
 
 
 def rms_norm_gated(
+    *,
     x,
     weight,
     bias,
@@ -234,15 +235,30 @@ class LayerNormFn(torch.autograd.Function):
         is_rms_norm=False,
     ):
         return rms_norm_gated(
-            x,
-            weight,
-            bias,
-            eps,
+            x=x,
+            weight=weight,
+            bias=bias,
+            eps=eps,
             z=z,
             group_size=group_size,
             norm_before_gate=norm_before_gate,
             is_rms_norm=is_rms_norm,
         )
+
+
+def layernorm_fn(
+    x,
+    weight,
+    bias,
+    z=None,
+    eps=1e-6,
+    group_size=None,
+    norm_before_gate=True,
+    is_rms_norm=False,
+):
+    return LayerNormFn.apply(
+        x, weight, bias, z, eps, group_size, norm_before_gate, is_rms_norm
+    )
 
 
 class LayerNorm(torch.nn.Module):
@@ -274,7 +290,8 @@ class LayerNorm(torch.nn.Module):
         torch.nn.init.zeros_(self.bias)
 
     def forward(self, x, z=None):
-        return LayerNormFn.apply(
+        """If z is not None, we do norm(x) * silu(z) if norm_before_gate, else norm(x * silu(z))"""
+        return layernorm_fn(
             x,
             self.weight,
             self.bias,
@@ -313,7 +330,8 @@ class RMSNorm(torch.nn.Module):
         torch.nn.init.ones_(self.weight)
 
     def forward(self, x, z=None):
-        return LayerNormFn.apply(
+        """If z is not None, we do norm(x) * silu(z) if norm_before_gate, else norm(x * silu(z))"""
+        return layernorm_fn(
             x,
             self.weight,
             self.bias,

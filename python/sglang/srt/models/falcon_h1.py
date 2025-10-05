@@ -192,6 +192,7 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
             hidden_size=config.hidden_size,
             use_conv_bias=config.mamba_conv_bias,
             use_bias=config.mamba_proj_bias,
+            n_groups=config.mamba_n_groups,
             rms_norm_eps=config.rms_norm_eps,
             activation=config.hidden_act,
             use_rms_norm=config.mamba_rms_norm,

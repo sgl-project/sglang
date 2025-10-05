@@ -41,8 +41,6 @@ class Mamba2StateShape:
     intermediate_size: int
     conv_dim: int
     ssm_state_size: int
-    groups_ssm_state_size: int
-    n_groups: int
     num_heads: int
     head_dim: int
     state_size: int
@@ -65,7 +63,6 @@ class Mamba2StateShape:
             extra_groups = extra_groups_for_head_shards(n_groups, tp_world_size)
             n_groups += extra_groups
         # heads and n_groups are TP-ed
-        groups_ssm_state_size = n_groups * state_size
         conv_dim = intermediate_size + 2 * n_groups * state_size
 
         # contiguous along 'dim' axis
@@ -81,8 +78,6 @@ class Mamba2StateShape:
             intermediate_size=intermediate_size,
             conv_dim=conv_dim,
             ssm_state_size=state_size,
-            groups_ssm_state_size=groups_ssm_state_size,
-            n_groups=n_groups,
             num_heads=num_heads,
             head_dim=head_dim,
             state_size=state_size,

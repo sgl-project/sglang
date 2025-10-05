@@ -5,7 +5,10 @@ import torch.nn as nn
 
 from python.sglang.srt.layers.attention.mamba.mamba2_metadata import Mamba2Metadata
 from python.sglang.srt.mem_cache.memory_pool import MambaPool
-from sglang.srt.configs.mamba2 import Mamba2CacheParams
+from sglang.srt.configs.mamba_utils import (
+    Mamba2CacheParams,
+    extra_groups_for_head_shards,
+)
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import (
     divide,
@@ -226,6 +229,7 @@ class MambaMixer2(torch.nn.Module):
         hidden_size: int,
         use_conv_bias: bool,
         use_bias: bool,
+        n_groups: int = 1,
         rms_norm_eps: float = 1e-5,
         activation: str = "silu",
         use_rms_norm: bool = True,
@@ -251,7 +255,6 @@ class MambaMixer2(torch.nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
 
-        self.n_groups = n_groups = cache_params.shape.n_groups
         self.num_heads = num_heads = cache_params.shape.num_heads
         self.head_dim = cache_params.shape.head_dim
 
@@ -278,7 +281,14 @@ class MambaMixer2(torch.nn.Module):
         self.intermediate_size = intermediate_size = (
             cache_params.shape.intermediate_size
         )
-        self.groups_ssm_state_size = cache_params.shape.groups_ssm_state_size
+        self.n_groups = n_groups
+        if n_groups % self.tp_size != 0:
+            # - for TP we shard conv_dim by sharding on n_groups,
+            # - but if n_groups cannot divide tp_size, we need to
+            #   extend some extra groups
+            groups = extra_groups_for_head_shards(n_groups, self.tp_size)
+            self.n_groups = n_groups + groups
+        self.groups_ssm_state_size = self.n_groups * self.ssm_state_size
         self.conv_dim = cache_params.shape.conv_dim
 
         if n_groups % self.tp_size == 0:

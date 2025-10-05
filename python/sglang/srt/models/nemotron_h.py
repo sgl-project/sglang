@@ -151,6 +151,7 @@ class NemotronHMambaDecoderLayer(nn.Module):
             hidden_size=config.hidden_size,
             use_conv_bias=config.use_conv_bias,
             use_bias=config.use_bias,
+            n_groups=config.mamba_n_groups,
             rms_norm_eps=config.rms_norm_eps,
             activation=config.mamba_hidden_act,
             quant_config=quant_config,

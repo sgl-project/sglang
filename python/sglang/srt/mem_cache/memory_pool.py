@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from sglang.srt.configs.mamba2 import Mamba2CacheParams
+from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 """
