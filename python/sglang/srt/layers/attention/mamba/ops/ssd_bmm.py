@@ -46,9 +46,9 @@ def _bmm_chunk_fwd_kernel(
     IS_CAUSAL: tl.constexpr,
     dot_dtype: tl.constexpr,
     HAS_SEQ_IDX: tl.constexpr,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr = 16,
+    BLOCK_SIZE_N: tl.constexpr = 16,
+    BLOCK_SIZE_K: tl.constexpr = 16,
 ):
     pid_b = tl.program_id(axis=1)
     pid_ch = tl.program_id(axis=2).to(tl.int64)

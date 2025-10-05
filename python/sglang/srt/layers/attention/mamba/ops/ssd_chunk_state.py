@@ -151,9 +151,9 @@ def _chunk_state_fwd_kernel(
     stride_seq_idx_seqlen,
     # Meta-parameters
     HAS_SEQ_IDX: tl.constexpr,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr = 16,
+    BLOCK_SIZE_N: tl.constexpr = 16,
+    BLOCK_SIZE_K: tl.constexpr = 16,
 ):
     pid_bc = tl.program_id(axis=1).to(tl.int64)
     pid_c = pid_bc // batch
@@ -357,10 +357,10 @@ def _chunk_state_varlen_kernel(
     stride_init_states_hdim,
     stride_init_states_dstate,
     # Meta-parameters
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
     HAS_INITSTATES: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr = 16,
+    BLOCK_SIZE_N: tl.constexpr = 16,
+    BLOCK_SIZE_K: tl.constexpr = 16,
 ):
     pid_b = tl.program_id(axis=1)
     pid_h = tl.program_id(axis=2)

@@ -89,12 +89,12 @@ def _chunk_scan_fwd_kernel(
     D_HAS_HDIM: tl.constexpr,
     HAS_Z: tl.constexpr,
     HAS_SEQ_IDX: tl.constexpr,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_DSTATE: tl.constexpr,
     IS_TRITON_22: tl.constexpr,
     HAS_INITSTATES: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr = 16,
+    BLOCK_SIZE_N: tl.constexpr = 16,
+    BLOCK_SIZE_K: tl.constexpr = 16,
 ):
     pid_bc = tl.program_id(axis=1).to(tl.int64)
     pid_c = pid_bc // batch
