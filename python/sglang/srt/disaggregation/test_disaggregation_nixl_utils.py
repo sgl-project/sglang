@@ -14,10 +14,7 @@ class TestDisaggregationNixl(TestDisaggregationBase):
 
     @classmethod
     def setUpClass(cls):
-        cls.model = (
-            "/lustre/fsw/portfolios/coreai/users/smor/models/Llama-3.1-8B-Instruct"
-        )
-        # cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         parsed_url = urlparse(DEFAULT_URL_FOR_TEST)
         cls.base_host = parsed_url.hostname
         base_port = str(parsed_url.port)
