@@ -263,13 +263,13 @@ class TpModelWorker:
             compute_logprobs = model_worker_batch.return_logprob
             next_token_ids = None
 
-            if skip_sample and compute_logprobs:
+            if not skip_sample:
+                next_token_ids = self.model_runner.sample(logits_output, forward_batch)
+            elif compute_logprobs:
                 # Compute logprobs without full sampling
                 self.model_runner.compute_logprobs_only(
                     logits_output, model_worker_batch
                 )
-            elif not skip_sample:
-                next_token_ids = self.model_runner.sample(logits_output, forward_batch)
 
             return ForwardBatchOutput(
                 logits_output=logits_output,
