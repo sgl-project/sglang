@@ -21,8 +21,8 @@ from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_rope_utils import rope_config_validation
 from transformers.utils import logging
 
+from sglang.srt.configs.mamba2 import Mamba2CacheParams, Mamba2StateShape
 from sglang.srt.distributed.utils import divide
-from sglang.srt.layers.attention.mamba.mamba import Mamba2CacheParams, Mamba2StateShape
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 
 logger = logging.get_logger(__name__)

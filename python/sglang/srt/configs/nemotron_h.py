@@ -19,7 +19,7 @@ import regex as re
 from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
 
-from sglang.srt.layers.attention.mamba.mamba import Mamba2CacheParams
+from sglang.srt.configs.mamba2 import Mamba2CacheParams
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 
 logger = logging.get_logger(__name__)

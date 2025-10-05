@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from sglang.srt.layers.attention.mamba.mamba import Mamba2CacheParams
+from sglang.srt.configs.mamba2 import Mamba2CacheParams
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 """
@@ -130,7 +130,7 @@ class MambaPool:
         self,
         *,
         size: int,
-        cache_params: Mamba2CacheParams,
+        cache_params: "Mamba2CacheParams",
         device: str,
         speculative_num_draft_tokens: Optional[int] = None,
     ):
@@ -247,7 +247,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         max_context_len: int,
         device: str,
         enable_memory_saver: bool,
-        cache_params: Mamba2CacheParams,
+        cache_params: "Mamba2CacheParams",
         speculative_num_draft_tokens: int = None,
     ):
         super().__init__(
