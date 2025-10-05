@@ -4,11 +4,7 @@ set -euxo pipefail
 
 IS_BLACKWELL=${IS_BLACKWELL:-0}
 
-if [ "$IS_BLACKWELL" = "1" ]; then
-    CU_VERSION="cu129"
-else
-    CU_VERSION="cu126"
-fi
+CU_VERSION="cu128"
 
 # Clear torch compilation cache
 python3 -c 'import os, shutil, tempfile, getpass; cache_dir = os.environ.get("TORCHINDUCTOR_CACHE_DIR") or os.path.join(tempfile.gettempdir(), "torchinductor_" + getpass.getuser()); shutil.rmtree(cache_dir, ignore_errors=True)'
@@ -53,22 +49,12 @@ SGL_KERNEL_VERSION_FROM_KERNEL=$(grep -Po '(?<=^version = ")[^"]*' sgl-kernel/py
 SGL_KERNEL_VERSION_FROM_SRT=$(grep -Po -m1 '(?<=sgl-kernel==)[0-9A-Za-z\.\-]+' python/pyproject.toml)
 echo "SGL_KERNEL_VERSION_FROM_KERNEL=${SGL_KERNEL_VERSION_FROM_KERNEL} SGL_KERNEL_VERSION_FROM_SRT=${SGL_KERNEL_VERSION_FROM_SRT}"
 
-if [ "$IS_BLACKWELL" = "1" ]; then
-    SGL_KERNEL_CUDA_VERSION=cu128
-else
-    SGL_KERNEL_CUDA_VERSION=cu124
-fi
-
+# Install sgl-kernel
 if [ "${CUSTOM_BUILD_SGL_KERNEL:-}" = "true" ]; then
     ls -alh sgl-kernel/dist
-    WHEEL_FILE=$(ls sgl-kernel/dist/sgl_kernel-${SGL_KERNEL_VERSION_FROM_KERNEL}+${SGL_KERNEL_CUDA_VERSION}-cp310-abi3-manylinux2014_x86_64.whl 2>/dev/null || true)
-    if [ -f "$WHEEL_FILE" ]; then
-      $PIP_CMD install sgl-kernel/dist/sgl_kernel-${SGL_KERNEL_VERSION_FROM_KERNEL}+${SGL_KERNEL_CUDA_VERSION}-cp310-abi3-manylinux2014_x86_64.whl --force-reinstall $PIP_INSTALL_SUFFIX
-    else
-      $PIP_CMD install sgl-kernel/dist/sgl_kernel-${SGL_KERNEL_VERSION_FROM_KERNEL}-cp310-abi3-manylinux2014_x86_64.whl --force-reinstall $PIP_INSTALL_SUFFIX
-    fi
+    $PIP_CMD install sgl-kernel/dist/sgl_kernel-${SGL_KERNEL_VERSION_FROM_KERNEL}-cp310-abi3-manylinux2014_x86_64.whl --force-reinstall $PIP_INSTALL_SUFFIX
 else
-    $PIP_CMD install https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION_FROM_SRT}/sgl_kernel-${SGL_KERNEL_VERSION_FROM_SRT}+${SGL_KERNEL_CUDA_VERSION}-cp310-abi3-manylinux2014_x86_64.whl --force-reinstall $PIP_INSTALL_SUFFIX
+    $PIP_CMD install sgl-kernel==${SGL_KERNEL_VERSION_FROM_SRT} --force-reinstall $PIP_INSTALL_SUFFIX
 fi
 
 # Show current packages
