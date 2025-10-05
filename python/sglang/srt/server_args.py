@@ -775,6 +775,30 @@ class ServerArgs:
                 # use bf16 for mxfp4 triton kernels
                 self.dtype = "bfloat16"
 
+        elif model_arch == "DeepseekV3ForCausalLM":
+            # Enable optimizations for DeepSeek V3 on Blackwell
+            if is_sm100_supported():
+                # Set attention backend to trtllm_mla if not already set
+                if self.attention_backend is None:
+                    self.attention_backend = "trtllm_mla"
+                    logger.info(
+                        f"Set attention backend to trtllm_mla on sm100 for {model_arch}"
+                    )
+                
+                # Enable FlashInfer TRTLLM MoE
+                if not self.enable_flashinfer_trtllm_moe:
+                    self.enable_flashinfer_trtllm_moe = True
+                    logger.info(
+                        f"Enable FlashInfer TRTLLM MoE on sm100 for {model_arch}"
+                    )
+                
+                # Enable FlashInfer AllReduce Fusion
+                if not self.enable_dp_attention:
+                    self.enable_flashinfer_allreduce_fusion = True
+                    logger.info(
+                        f"Enable FlashInfer AllReduce Fusion on sm100 for {model_arch}"
+                    )
+
         elif "Llama4" in model_arch and self.device != "cpu":
             assert self.attention_backend in {
                 "fa3",
