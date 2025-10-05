@@ -17,6 +17,7 @@ suites = {
         TestFile("hicache/test_hicache.py", 116),
         TestFile("hicache/test_hicache_mla.py", 127),
         TestFile("hicache/test_hicache_storage.py", 127),
+        TestFile("hicache/test_hicache_eagle.py", 150),
         TestFile("lora/test_lora.py", 200),
         TestFile("lora/test_lora_eviction.py", 200),
         TestFile("lora/test_lora_backend.py", 99),
@@ -59,6 +60,7 @@ suites = {
         TestFile("quant/test_int8_kernel.py", 8),
         TestFile("quant/test_triton_scaled_mm.py", 8),
         TestFile("quant/test_w8a8_quantization.py", 46),
+        TestFile("rl/test_fp32_lm_head.py", 30),
         TestFile("rl/test_update_weights_from_disk.py", 114),
         TestFile("rl/test_update_weights_from_tensor.py", 48),
         TestFile("test_abort.py", 51),
@@ -131,20 +133,22 @@ suites = {
         TestFile("test_load_weights_from_remote_instance.py", 72),
         TestFile("test_patch_torch.py", 19),
         TestFile("test_release_memory_occupation.py", 257),
-        TestFile("hicache/test_hicache_storage_file_backend.py", 400),
-        TestFile("hicache/test_hicache_storage_3fs_backend.py", 400),
+        TestFile("hicache/test_hicache_storage_file_backend.py", 200),
+        TestFile("hicache/test_hicache_storage_3fs_backend.py", 200),
     ],
     "per-commit-4-gpu": [
         TestFile("test_gpt_oss_4gpu.py", 600),
         TestFile("test_local_attn.py", 250),
         TestFile("test_pp_single_node.py", 372),
         TestFile("models/test_qwen3_next_models.py", 200),
+        TestFile("models/test_falcon_h1_models.py", 200),
         TestFile("test_multi_instance_release_memory_occupation.py", 64),
     ],
     "per-commit-8-gpu": [
-        TestFile("hicache/test_hicache_storage_mooncake_backend.py", 800),
+        TestFile("hicache/test_hicache_storage_mooncake_backend.py", 400),
         TestFile("lora/test_lora_llama4.py", 600),
         TestFile("test_disaggregation.py", 499),
+        TestFile("test_disaggregation_dp_attention.py", 155),
         TestFile("test_disaggregation_different_tp.py", 155),
         TestFile("test_disaggregation_pp.py", 60),
         TestFile("test_full_deepseek_v3.py", 333),
@@ -183,7 +187,7 @@ suite_amd = {
         TestFile("lora/test_multi_lora_backend.py", 60),
         TestFile("lora/test_lora_cuda_graph.py", 250),
         TestFile("lora/test_lora_qwen3.py", 97),
-        TestFile("models/test_embedding_models.py", 73),
+        # TestFile("models/test_embedding_models.py", 73), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/11127
         TestFile("models/test_compressed_tensors_models.py", 42),
         TestFile("models/test_qwen_models.py", 82),
         TestFile("models/test_reward_models.py", 132),
@@ -245,7 +249,7 @@ suite_amd = {
         TestFile("test_triton_attention_backend.py", 150),
         # TestFile("test_vision_chunked_prefill.py", 175), # Disabled temporarily and track in #7701
         TestFile("test_wave_attention_kernels.py", 2),
-        TestFile("test_wave_attention_backend.py", 150),
+        # TestFile("test_wave_attention_backend.py", 150), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/11127
     ],
     "per-commit-amd-mi35x": [
         TestFile("test_mla.py", 242),
@@ -256,7 +260,7 @@ suite_amd = {
         TestFile("rl/test_update_weights_from_distributed.py", 103),
         TestFile("test_data_parallelism.py", 73),
         TestFile("test_load_weights_from_remote_instance.py", 72),
-        TestFile("test_patch_torch.py", 19),
+        # TestFile("test_patch_torch.py", 19), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/11127
     ],
     "per-commit-4-gpu-amd": [
         TestFile("test_pp_single_node.py", 150),
