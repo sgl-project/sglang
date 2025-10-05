@@ -30,10 +30,9 @@ from urllib.parse import urlparse
 import requests
 import torch
 import torch.distributed as dist
-from transformers import FalconH1Config
 
 from sglang.srt import slow_rank_detector
-from sglang.srt.configs import NemotronHConfig, Qwen3NextConfig
+from sglang.srt.configs import FalconH1Config, NemotronHConfig, Qwen3NextConfig
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
