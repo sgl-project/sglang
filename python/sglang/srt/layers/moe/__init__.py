@@ -1,4 +1,4 @@
-from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner import MoeRunner, MoeRunnerConfig
 from sglang.srt.layers.moe.utils import (
     DeepEPMode,
     MoeA2ABackend,
@@ -17,6 +17,7 @@ from sglang.srt.layers.moe.utils import (
 __all__ = [
     "DeepEPMode",
     "MoeA2ABackend",
+    "MoeRunner",
     "MoeRunnerConfig",
     "MoeRunnerBackend",
     "initialize_moe_config",

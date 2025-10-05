@@ -14,7 +14,6 @@ from transformers import (
 )
 from transformers.models.auto.modeling_auto import AutoModel
 
-from sglang.srt.hf_transformers_utils import get_processor
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -38,6 +37,7 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models.gemma3n_audio import Gemma3nAudioEncoder
 from sglang.srt.models.gemma3n_causal import Gemma3nRMSNorm, Gemma3nTextModel
 from sglang.srt.utils import add_prefix
+from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
 
@@ -499,7 +499,7 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
     def should_apply_lora(self, module_name: str) -> bool:
         return bool(self.lora_pattern.match(module_name))
 
-    def get_hidden_dim(self, module_name):
+    def get_hidden_dim(self, module_name, layer_idx):
         # return input_dim, output_dim
         if module_name == "qkv_proj":
             return (
