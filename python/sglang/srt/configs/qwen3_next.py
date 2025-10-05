@@ -281,19 +281,14 @@ class Qwen3NextConfig(PretrainedConfig):
 
     @property
     def mamba2_cache_params(self) -> Mamba2CacheParams:
-        world_size = get_attention_tp_size()
-        conv_dim = (
-            self.linear_key_head_dim * self.linear_num_key_heads * 2
-            + self.linear_value_head_dim * self.linear_num_value_heads
+        shape = Mamba2CacheParams.shape(
+            tp_world_size=get_attention_tp_size(),
+            intermediate_size=self.linear_value_head_dim * self.linear_num_value_heads,
+            n_groups=self.linear_num_key_heads,
+            num_heads=self.linear_num_value_heads,
+            head_dim=self.linear_value_head_dim,
+            state_size=self.linear_key_head_dim,
+            conv_kernel=self.linear_conv_kernel_dim,
         )
-        conv_state_shape = (
-            divide(conv_dim, world_size),
-            self.linear_conv_kernel_dim - 1,
-        )
-        temporal_state_shape = (
-            divide(self.linear_num_value_heads, world_size),
-            self.linear_key_head_dim,
-            self.linear_value_head_dim,
-        )
-        shape = Mamba2StateShape(conv=conv_state_shape, temporal=temporal_state_shape)
+
         return Mamba2CacheParams(shape=shape, layers=self.linear_layer_ids)

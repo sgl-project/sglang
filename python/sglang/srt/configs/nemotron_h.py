@@ -275,8 +275,8 @@ class NemotronHConfig(PretrainedConfig):
     def mamba2_cache_params(self) -> Mamba2CacheParams:
         intermediate_size = self.mamba_num_heads * self.mamba_head_dim
         shape = Mamba2CacheParams.shape(
-            intermediate_size=intermediate_size,
             tp_world_size=get_attention_tp_size(),
+            intermediate_size=intermediate_size,
             n_groups=self.n_groups,
             num_heads=self.mamba_num_heads,
             head_dim=self.mamba_head_dim,

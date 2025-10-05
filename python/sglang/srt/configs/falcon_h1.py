@@ -309,11 +309,11 @@ class FalconH1Config(PretrainedConfig):
     def mamba2_cache_params(self):
         shape = Mamba2CacheParams.shape(
             tp_world_size=get_tensor_model_parallel_world_size(),
-            n_groups=self.mamba_n_groups,
             intermediate_size=self.mamba_d_ssm,
+            n_groups=self.mamba_n_groups,
+            num_heads=self.mamba_n_heads,
+            head_dim=self.mamba_d_head,
             state_size=self.mamba_d_state,
             conv_kernel=self.mamba_d_conv,
-            head_dim=self.mamba_d_head,
-            num_heads=self.mamba_n_heads,
         )
         return Mamba2CacheParams(shape=shape, layers=self.linear_layer_ids)
