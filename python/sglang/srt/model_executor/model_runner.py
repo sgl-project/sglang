@@ -100,8 +100,15 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    ForwardMode,
+    PPProxyTensors,
+)
 from sglang.srt.model_executor.npu_graph_runner import NPUGraphRunner
+from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
+    PiecewiseCudaGraphRunner,
+)
 from sglang.srt.model_loader import get_model
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
@@ -297,6 +304,9 @@ class ModelRunner:
         # For weight updates
         self._model_update_group = {}
         self._weights_send_group = {}
+
+        if self.server_args.enable_piecewise_cuda_graph:
+            self.piecewise_cuda_graph_runner = PiecewiseCudaGraphRunner(self)
 
     def initialize(self, min_per_gpu_memory: float):
         server_args = self.server_args
@@ -843,6 +853,11 @@ class ModelRunner:
             raise ValueError(
                 f"TP rank {self.tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
             ) from None
+
+        self.attention_layers = []
+        for layer in self.model.model.layers:
+            if hasattr(layer, "self_attn"):
+                self.attention_layers.append(layer.self_attn.attn)
 
     def update_expert_location(
         self,
@@ -1898,6 +1913,11 @@ class ModelRunner:
             kwargs["input_embeds"] = forward_batch.input_embeds.bfloat16()
         if not self.is_generation:
             kwargs["get_embedding"] = True
+
+        if self.server_args.enable_piecewise_cuda_graph:
+            if self.piecewise_cuda_graph_runner.can_run(forward_batch):
+                return self.piecewise_cuda_graph_runner.replay(forward_batch, **kwargs)
+
         return self.model.forward(
             forward_batch.input_ids,
             forward_batch.positions,
