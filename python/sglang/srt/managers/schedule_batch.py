@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import enum
+
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -35,6 +37,7 @@ import copy
 import dataclasses
 import logging
 import threading
+import time
 from enum import Enum, auto
 from http import HTTPStatus
 from itertools import chain
@@ -51,6 +54,7 @@ from sglang.srt.disaggregation.base import BaseKVSender
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
@@ -58,10 +62,10 @@ from sglang.srt.mem_cache.allocator import (
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
-from sglang.srt.mem_cache.lora_radix_cache import LoRAKey, LoRARadixCache
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
-from sglang.srt.metrics.collector import TimeStats
+from sglang.srt.metrics.collector import SchedulerMetricsCollector, TimeStats
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -70,8 +74,7 @@ from sglang.srt.utils import flatten_nested_list, support_triton
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
-    from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
-    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+    from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
@@ -86,6 +89,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "disable_flashinfer_cutlass_moe_fp4_allgather",
     "disable_radix_cache",
     "enable_dp_lm_head",
+    "enable_fp32_lm_head",
     "flashinfer_mxfp4_moe_precision",
     "enable_flashinfer_allreduce_fusion",
     "moe_dense_tp_size",
@@ -98,16 +102,16 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "sampling_backend",
     "speculative_accept_threshold_single",
     "speculative_accept_threshold_acc",
-    "speculative_attention_backend",
+    "speculative_attention_mode",
     "torchao_config",
     "triton_attention_reduce_in_fp32",
     "num_reserved_decode_tokens",
     "weight_loader_disable_mmap",
     "enable_multimodal",
     "enable_symm_mem",
-    "quantization",
     "enable_custom_logit_processor",
     "disaggregation_mode",
+    "enable_deterministic_inference",
 ]
 
 # Put some global args for easy access
@@ -408,6 +412,23 @@ class MultimodalInputs:
         # other args would be kept intact
 
 
+class RequestStage(str, enum.Enum):
+    # prefill
+    PREFILL_WAITING = "prefill_waiting"
+
+    # disaggregation prefill
+    PREFILL_PREPARE = "prefill_prepare"
+    PREFILL_BOOTSTRAP = "prefill_bootstrap"
+    PREFILL_FORWARD = "prefill_forward"
+    PREFILL_TRANSFER_KV_CACHE = "prefill_transfer_kv_cache"
+
+    # disaggregation decode
+    DECODE_PREPARE = "decode_prepare"
+    DECODE_BOOTSTRAP = "decode_bootstrap"
+    DECODE_WAITING = "decode_waiting"
+    DECODE_TRANSFERRED = "decode_transferred"
+
+
 class Req:
     """The input and output status of a request."""
 
@@ -432,8 +453,12 @@ class Req:
         bootstrap_host: Optional[str] = None,
         bootstrap_port: Optional[int] = None,
         bootstrap_room: Optional[int] = None,
+        disagg_mode: Optional[DisaggregationMode] = None,
         data_parallel_rank: Optional[int] = None,
         vocab_size: Optional[int] = None,
+        priority: Optional[int] = None,
+        metrics_collector: Optional[SchedulerMetricsCollector] = None,
+        extra_key: Optional[str] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -466,6 +491,14 @@ class Req:
         self.sampling_params = sampling_params
         self.custom_logit_processor = custom_logit_processor
         self.return_hidden_states = return_hidden_states
+
+        # extra key for classifying the request (e.g. cache_salt)
+        if lora_id is not None:
+            extra_key = (
+                extra_key or ""
+            ) + lora_id  # lora_id is concatenated to the extra key
+
+        self.extra_key = extra_key
         self.lora_id = lora_id
 
         # Memory pool info
@@ -484,6 +517,7 @@ class Req:
         self.stream = stream
         self.eos_token_ids = eos_token_ids
         self.vocab_size = vocab_size
+        self.priority = priority
 
         # For incremental decoding
         # ----- | --------- read_ids -------|
@@ -513,6 +547,8 @@ class Req:
         self.host_hit_length = 0
         # The node to lock until for swa radix tree lock ref
         self.swa_uuid_for_lock: Optional[int] = None
+        # The prefix length of the last prefix matching
+        self.last_matched_prefix_len: int = 0
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
@@ -561,7 +597,10 @@ class Req:
             # shape: (bs, k)
             self.output_top_logprobs_val = []
             self.output_top_logprobs_idx = []
-            self.output_token_ids_logprobs_val = []
+            # Can contain either lists or GPU tensors (delayed copy optimization for prefill-only scoring)
+            self.output_token_ids_logprobs_val: List[
+                Union[List[float], torch.Tensor]
+            ] = []
             self.output_token_ids_logprobs_idx = []
         else:
             self.output_token_logprobs_val = self.output_token_logprobs_idx = (
@@ -571,6 +610,8 @@ class Req:
             ) = None
         self.hidden_states: List[List[float]] = []
         self.hidden_states_tensor = None  # Note: use tensor instead of list to transfer hidden_states when PD + MTP
+        self.output_topk_p = None
+        self.output_topk_index = None
 
         # Embedding (return values)
         self.embedding = None
@@ -588,10 +629,10 @@ class Req:
         self.spec_verify_ct = 0
 
         # For metrics
-        self.time_stats: TimeStats = TimeStats()
+        self.metrics_collector = metrics_collector
+        self.time_stats: TimeStats = TimeStats(disagg_mode=disagg_mode)
         self.has_log_time_stats: bool = False
-        self.queue_time_start = None
-        self.queue_time_end = None
+        self.last_tic = time.monotonic()
 
         # For disaggregation
         self.bootstrap_host: str = bootstrap_host
@@ -619,6 +660,25 @@ class Req:
     def seqlen(self):
         return len(self.origin_input_ids) + len(self.output_ids)
 
+    @property
+    def is_prefill_only(self) -> bool:
+        """Check if this request is prefill-only (no token generation needed)."""
+        # NOTE: when spec is enabled, prefill_only optimizations are disabled
+        return (
+            self.sampling_params.max_new_tokens == 0
+            and global_server_args_dict["speculative_algorithm"] is None
+        )
+
+    def add_latency(self, stage: RequestStage):
+        if self.metrics_collector is None:
+            return
+
+        now = time.monotonic()
+        self.metrics_collector.observe_per_stage_req_latency(
+            stage.value, now - self.last_tic
+        )
+        self.last_tic = now
+
     def extend_image_inputs(self, image_inputs):
         if self.multimodal_inputs is None:
             self.multimodal_inputs = image_inputs
@@ -635,26 +695,17 @@ class Req:
     ):
         self.fill_ids = self.origin_input_ids + self.output_ids
         if tree_cache is not None:
-            if isinstance(tree_cache, LoRARadixCache):
-                (
-                    self.prefix_indices,
-                    self.last_node,
-                    self.last_host_node,
-                    self.host_hit_length,
-                ) = tree_cache.match_prefix_with_lora_id(
-                    key=LoRAKey(
-                        lora_id=self.lora_id, token_ids=self.adjust_max_prefix_ids()
-                    ),
-                )
-            else:
-                (
-                    self.prefix_indices,
-                    self.last_node,
-                    self.last_host_node,
-                    self.host_hit_length,
-                ) = tree_cache.match_prefix(
-                    key=self.adjust_max_prefix_ids(),
-                )
+            (
+                self.prefix_indices,
+                self.last_node,
+                self.last_host_node,
+                self.host_hit_length,
+            ) = tree_cache.match_prefix(
+                key=RadixKey(
+                    token_ids=self.adjust_max_prefix_ids(), extra_key=self.extra_key
+                ),
+            )
+            self.last_matched_prefix_len = len(self.prefix_indices)
         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
 
     def adjust_max_prefix_ids(self):
@@ -684,9 +735,15 @@ class Req:
             self.surr_offset = max(
                 self.read_offset - INIT_INCREMENTAL_DETOKENIZATION_OFFSET, 0
             )
+            self.surr_and_decode_ids = (
+                self.origin_input_ids_unpadded[self.surr_offset :] + self.output_ids
+            )
+            self.cur_decode_ids_len = len(self.output_ids)
+        else:
+            self.surr_and_decode_ids.extend(self.output_ids[self.cur_decode_ids_len :])
+            self.cur_decode_ids_len = len(self.output_ids)
 
-        all_ids = self.origin_input_ids_unpadded + self.output_ids
-        return all_ids[self.surr_offset :], self.read_offset - self.surr_offset
+        return self.surr_and_decode_ids, self.read_offset - self.surr_offset
 
     def check_finished(self):
         if self.finished():
@@ -781,10 +838,10 @@ class Req:
             return
 
         if self.bootstrap_room is not None:
-            prefix = f"Req Time Stats(rid={self.rid}, bootstrap_room={self.bootstrap_room}, input len={len(self.origin_input_ids)}, output len={len(self.output_ids)}, type={self.time_stats.get_type().value})"
+            prefix = f"Req Time Stats(rid={self.rid}, bootstrap_room={self.bootstrap_room}, input len={len(self.origin_input_ids)}, output len={len(self.output_ids)}, type={self.time_stats.disagg_mode_str()})"
         else:
-            prefix = f"Req Time Stats(rid={self.rid}, input len={len(self.origin_input_ids)}, output len={len(self.output_ids)}, type={self.time_stats.get_type().value})"
-        logger.info(f"{prefix}: {self.time_stats}")
+            prefix = f"Req Time Stats(rid={self.rid}, input len={len(self.origin_input_ids)}, output len={len(self.output_ids)}, type={self.time_stats.disagg_mode_str()})"
+        logger.info(f"{prefix}: {self.time_stats.convert_to_duration()}")
         self.has_log_time_stats = True
 
     def set_finish_with_abort(self, error_msg: str):
@@ -805,10 +862,6 @@ class Req:
             f"{self.grammar=}, "
             f"{self.sampling_params=})"
         )
-
-
-# Batch id
-bid = 0
 
 
 @dataclasses.dataclass
@@ -847,6 +900,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     token_type_ids: torch.Tensor = None  # shape: [b], int64
     req_pool_indices: torch.Tensor = None  # shape: [b], int64
     seq_lens: torch.Tensor = None  # shape: [b], int64
+    seq_lens_cpu: torch.Tensor = None  # shape: [b], int64
     # The output locations of the KV cache
     out_cache_loc: torch.Tensor = None  # shape: [b], int64
     output_ids: torch.Tensor = None  # shape: [b], int64
@@ -902,7 +956,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Speculative decoding
     spec_algorithm: SpeculativeAlgorithm = None
-    spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]] = None
+    # spec_info: Optional[SpecInput] = None
+    spec_info: Optional[SpecInput] = None
 
     # Whether to return hidden states
     return_hidden_states: bool = False
@@ -911,7 +966,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     is_prefill_only: bool = False
 
     # hicache pointer for synchronizing data loading from CPU to GPU
-    hicache_consumer_index: int = 0
+    hicache_consumer_index: int = -1
 
     @classmethod
     def init_new(
@@ -950,9 +1005,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             device=req_to_token_pool.device,
             spec_algorithm=spec_algorithm,
             return_hidden_states=any(req.return_hidden_states for req in reqs),
-            is_prefill_only=all(
-                req.sampling_params.max_new_tokens == 0 for req in reqs
-            ),
+            is_prefill_only=all(req.is_prefill_only for req in reqs),
             chunked_req=chunked_req,
         )
 
@@ -962,8 +1015,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def is_empty(self):
         return len(self.reqs) == 0
 
-    def alloc_req_slots(self, num_reqs: int):
-        req_pool_indices = self.req_to_token_pool.alloc(num_reqs)
+    def alloc_req_slots(self, num_reqs: int, reqs: Optional[List[Req]] = None):
+        if isinstance(self.req_to_token_pool, HybridReqToTokenPool):
+            req_pool_indices = self.req_to_token_pool.alloc(num_reqs, reqs)
+        else:
+            req_pool_indices = self.req_to_token_pool.alloc(num_reqs)
         if req_pool_indices is None:
             raise RuntimeError(
                 "alloc_req_slots runs out of memory. "
@@ -1000,7 +1056,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def alloc_paged_token_slots_extend(
         self,
         prefix_lens: torch.Tensor,
+        prefix_lens_cpu: torch.Tensor,
         seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,
         extend_num_tokens: int,
         backup_state: bool = False,
@@ -1008,7 +1066,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Over estimate the number of tokens: assume each request needs a new page.
         num_tokens = (
             extend_num_tokens
-            + len(seq_lens) * self.token_to_kv_pool_allocator.page_size
+            + len(seq_lens_cpu) * self.token_to_kv_pool_allocator.page_size
         )
         self._evict_tree_cache_if_needed(num_tokens)
 
@@ -1016,7 +1074,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             state = self.token_to_kv_pool_allocator.backup_state()
 
         out_cache_loc = self.token_to_kv_pool_allocator.alloc_extend(
-            prefix_lens, seq_lens, last_loc, extend_num_tokens
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc,
+            extend_num_tokens,
         )
         if out_cache_loc is None:
             error_msg = (
@@ -1035,6 +1098,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def alloc_paged_token_slots_decode(
         self,
         seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,
         backup_state: bool = False,
     ):
@@ -1045,7 +1109,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if backup_state:
             state = self.token_to_kv_pool_allocator.backup_state()
 
-        out_cache_loc = self.token_to_kv_pool_allocator.alloc_decode(seq_lens, last_loc)
+        out_cache_loc = self.token_to_kv_pool_allocator.alloc_decode(
+            seq_lens, seq_lens_cpu, last_loc
+        )
         if out_cache_loc is None:
             error_msg = (
                 f"Decode out of memory. Try to lower your batch size.\n"
@@ -1114,6 +1180,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens = torch.tensor(seq_lens, dtype=torch.int64).to(
             self.device, non_blocking=True
         )
+        self.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
 
         if not decoder_out_cache_loc:
             self.out_cache_loc = torch.zeros(0, dtype=torch.int64).to(
@@ -1138,7 +1205,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Allocate req slots
         bs = len(self.reqs)
-        req_pool_indices = self.alloc_req_slots(bs)
+        req_pool_indices = self.alloc_req_slots(bs, self.reqs)
 
         # Init tensors
         reqs = self.reqs
@@ -1162,12 +1229,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int64).to(
             self.device, non_blocking=True
         )
+        seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
         orig_seq_lens_tensor = torch.tensor(orig_seq_lens, dtype=torch.int32).to(
             self.device, non_blocking=True
         )
         prefix_lens_tensor = torch.tensor(
             prefix_lens, dtype=torch.int64, device=self.device
         )
+        prefix_lens_cpu_tensor = torch.tensor(prefix_lens, dtype=torch.int64)
 
         token_type_ids_tensor = None
         if len(token_type_ids) > 0:
@@ -1207,13 +1276,36 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.is_retracted = False
 
             # Compute the relative logprob_start_len in an extend batch
+            #
+            # Key variables:
+            # - logprob_start_len: Absolute position in full sequence where logprob computation begins
+            # - extend_logprob_start_len: Relative position within current extend batch where logprob computation begins
+            # - extend_input_len: Number of tokens that need to be processed in this extend batch
+            #   (= len(fill_ids) - len(prefix_indices), where fill_ids = origin_input_ids + output_ids
+            #    and prefix_indices are the cached/shared prefix tokens)
+            #
             if req.logprob_start_len >= pre_len:
-                req.extend_logprob_start_len = min(
-                    req.logprob_start_len - pre_len,
-                    req.extend_input_len,
-                    req.seqlen - 1,
-                )
+                # Optimization for prefill-only requests: When we only need logprobs at
+                # positions beyond the input sequence (to score next-token likelihood), skip all
+                # input logprob computation during prefill since no generation will occur.
+                if self.is_prefill_only and req.logprob_start_len == len(
+                    req.origin_input_ids
+                ):
+                    # Skip ALL input logprobs: set extend_logprob_start_len = extend_input_len
+                    req.extend_logprob_start_len = req.extend_input_len
+                else:
+                    # Convert absolute logprob_start_len to relative extend_logprob_start_len
+                    #
+                    # Example: origin_input_ids=[1,2,3,4,5] (5 tokens, positions 0-4), logprob_start_len=3
+                    # Regular logic: min(3-0, 5, 5-1) = min(3,5,4) = 3
+                    # This means: "compute logprobs from position 3 onwards in extend batch"
+                    req.extend_logprob_start_len = min(
+                        req.logprob_start_len - pre_len,
+                        req.extend_input_len,
+                        req.seqlen - 1,
+                    )
             else:
+                # logprob_start_len is before the current extend batch, so start from beginning
                 req.extend_logprob_start_len = 0
 
             if self.return_logprob:
@@ -1271,13 +1363,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 prefix_lens_tensor,
             )
             out_cache_loc = self.alloc_paged_token_slots_extend(
-                prefix_lens_tensor, seq_lens_tensor, last_loc, extend_num_tokens
+                prefix_lens_tensor,
+                prefix_lens_cpu_tensor,
+                seq_lens_tensor,
+                seq_lens_cpu,
+                last_loc,
+                extend_num_tokens,
             )
 
         # Set fields
         self.input_ids = input_ids_tensor
         self.req_pool_indices = req_pool_indices_tensor
         self.seq_lens = seq_lens_tensor
+        self.seq_lens_cpu = seq_lens_cpu
         self.orig_seq_lens = orig_seq_lens_tensor
         self.out_cache_loc = out_cache_loc
         self.input_embeds = (
@@ -1420,7 +1518,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
         retracted_reqs = []
-        seq_lens_cpu = self.seq_lens.cpu().numpy()
         first_iter = True
         while first_iter or (
             not self.check_decode_mem(selected_indices=sorted_indices)
@@ -1447,37 +1544,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             idx = sorted_indices.pop()
             req = self.reqs[idx]
             retracted_reqs.append(req)
-
-            if server_args.disaggregation_mode == "decode":
-                req.offload_kv_cache(
-                    self.req_to_token_pool, self.token_to_kv_pool_allocator
-                )
-
-            if isinstance(self.tree_cache, ChunkCache):
-                # ChunkCache does not have eviction
-                token_indices = self.req_to_token_pool.req_to_token[
-                    req.req_pool_idx, : seq_lens_cpu[idx]
-                ]
-                self.token_to_kv_pool_allocator.free(token_indices)
-                self.req_to_token_pool.free(req.req_pool_idx)
-            else:
-                # TODO: apply more fine-grained retraction
-                last_uncached_pos = (
-                    len(req.prefix_indices) // server_args.page_size
-                ) * server_args.page_size
-                token_indices = self.req_to_token_pool.req_to_token[
-                    req.req_pool_idx, last_uncached_pos : seq_lens_cpu[idx]
-                ]
-                self.token_to_kv_pool_allocator.free(token_indices)
-                self.req_to_token_pool.free(req.req_pool_idx)
-
-                # release the last node
-                if self.is_hybrid:
-                    self.tree_cache.dec_lock_ref(req.last_node, req.swa_uuid_for_lock)
-                else:
-                    self.tree_cache.dec_lock_ref(req.last_node)
-
-            req.reset_for_retract()
+            self.release_req(idx, len(sorted_indices), server_args)
 
             if len(retracted_reqs) == 0:
                 # Corner case: only one request left
@@ -1496,7 +1563,45 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         ) / total_max_new_tokens
         new_estimate_ratio = min(1.0, new_estimate_ratio)
 
-        return retracted_reqs, new_estimate_ratio
+        return retracted_reqs, new_estimate_ratio, []
+
+    def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
+        req = self.reqs[idx]
+        seq_lens_cpu = self.seq_lens_cpu.numpy()
+
+        if server_args.disaggregation_mode == "decode":
+            req.offload_kv_cache(
+                self.req_to_token_pool, self.token_to_kv_pool_allocator
+            )
+        if isinstance(self.tree_cache, ChunkCache):
+            # ChunkCache does not have eviction
+            token_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, : seq_lens_cpu[idx]
+            ]
+            self.token_to_kv_pool_allocator.free(token_indices)
+            self.req_to_token_pool.free(req.req_pool_idx)
+        else:
+            # TODO: apply more fine-grained retraction
+            last_uncached_pos = (
+                len(req.prefix_indices) // server_args.page_size
+            ) * server_args.page_size
+            token_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, last_uncached_pos : seq_lens_cpu[idx]
+            ]
+            self.token_to_kv_pool_allocator.free(token_indices)
+            self.req_to_token_pool.free(req.req_pool_idx)
+
+            # release the last node
+            if self.is_hybrid:
+                self.tree_cache.dec_lock_ref(req.last_node, req.swa_uuid_for_lock)
+            else:
+                self.tree_cache.dec_lock_ref(req.last_node)
+
+            # NOTE(lsyin): we should use the newly evictable memory instantly.
+            num_tokens = remaing_req_count * global_config.retract_decode_steps
+            self._evict_tree_cache_if_needed(num_tokens)
+
+        req.reset_for_retract()
 
     def prepare_encoder_info_decode(self):
         # Reset the encoder cached status
@@ -1506,6 +1611,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.forward_mode = ForwardMode.IDLE
         self.input_ids = torch.empty(0, dtype=torch.int64, device=self.device)
         self.seq_lens = torch.empty(0, dtype=torch.int64, device=self.device)
+        self.seq_lens_cpu = torch.empty(0, dtype=torch.int64)
         self.orig_seq_lens = torch.empty(0, dtype=torch.int32, device=self.device)
         self.out_cache_loc = torch.empty(0, dtype=torch.int64, device=self.device)
         self.req_pool_indices = torch.empty(0, dtype=torch.int32, device=self.device)
@@ -1520,7 +1626,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
 
-        if self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone():
+        if (
+            self.spec_algorithm.is_eagle()
+            or self.spec_algorithm.is_standalone()
+            or self.spec_algorithm.is_ngram()
+        ):
             # if spec decoding is used, the decode batch is prepared inside
             # `forward_batch_speculative_generation` after running draft models.
             return
@@ -1561,10 +1671,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.enable_overlap:
             # Do not use in-place operations in the overlap mode
             self.seq_lens = self.seq_lens + 1
+            self.seq_lens_cpu = self.seq_lens_cpu + 1
             self.orig_seq_lens = self.orig_seq_lens + 1
         else:
             # A faster in-place version
             self.seq_lens.add_(1)
+            self.seq_lens_cpu.add_(1)
             self.orig_seq_lens.add_(1)
         self.seq_lens_sum += bs
 
@@ -1583,7 +1695,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.req_pool_indices, self.seq_lens - 2
             ]
             self.out_cache_loc = self.alloc_paged_token_slots_decode(
-                self.seq_lens, last_loc
+                self.seq_lens, self.seq_lens_cpu, last_loc
             )
 
         self.req_to_token_pool.write(
@@ -1629,6 +1741,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.multimodal_inputs = [self.multimodal_inputs[i] for i in keep_indices]
         self.req_pool_indices = self.req_pool_indices[keep_indices_device]
         self.seq_lens = self.seq_lens[keep_indices_device]
+        self.seq_lens_cpu = self.seq_lens_cpu[keep_indices]
         self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
         self.out_cache_loc = None
         self.seq_lens_sum = self.seq_lens.sum().item()
@@ -1646,7 +1759,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         self.sampling_info.filter_batch(keep_indices, keep_indices_device)
         if self.spec_info:
-            self.spec_info.filter_batch(keep_indices_device)
+            if chunked_req_to_exclude is not None and len(chunked_req_to_exclude) > 0:
+                has_been_filtered = False
+            else:
+                has_been_filtered = True
+            self.spec_info.filter_batch(
+                new_indices=keep_indices_device,
+                has_been_filtered=has_been_filtered,
+            )
 
     def merge_batch(self, other: "ScheduleBatch"):
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
@@ -1662,6 +1782,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             [self.req_pool_indices, other.req_pool_indices]
         )
         self.seq_lens = torch.cat([self.seq_lens, other.seq_lens])
+        self.seq_lens_cpu = torch.cat([self.seq_lens_cpu, other.seq_lens_cpu])
         self.orig_seq_lens = torch.cat([self.orig_seq_lens, other.orig_seq_lens])
         self.out_cache_loc = None
         self.seq_lens_sum += other.seq_lens_sum
@@ -1705,15 +1826,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.sampling_info.grammars = None
 
         seq_lens_cpu = (
-            seq_lens_cpu_cache
-            if seq_lens_cpu_cache is not None
-            else self.seq_lens.cpu()
+            seq_lens_cpu_cache if seq_lens_cpu_cache is not None else self.seq_lens_cpu
         )
 
-        global bid
-        bid += 1
         return ModelWorkerBatch(
-            bid=bid,
             forward_mode=self.forward_mode,
             input_ids=self.input_ids,
             req_pool_indices=self.req_pool_indices,
@@ -1760,6 +1876,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             ),
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
             launch_done=self.launch_done,
+            is_prefill_only=self.is_prefill_only,
         )
 
     def copy(self):
@@ -1832,8 +1949,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
 @dataclasses.dataclass
 class ModelWorkerBatch:
-    # The batch id
-    bid: int
     # The forward mode
     forward_mode: ForwardMode
     # The input ids
@@ -1894,13 +2009,18 @@ class ModelWorkerBatch:
 
     # Speculative decoding
     spec_algorithm: SpeculativeAlgorithm = None
-    spec_info: Optional[Union[EagleVerifyInput, EagleDraftInput]] = None
+
+    spec_info: Optional[SpecInput] = None
+
     # If set, the output of the batch contains the hidden states of the run.
     capture_hidden_mode: CaptureHiddenMode = None
-    hicache_consumer_index: int = 0
+    hicache_consumer_index: int = -1
 
     # Overlap event
     launch_done: Optional[threading.Event] = None
+
+    # Whether this batch is prefill-only (no token generation needed)
+    is_prefill_only: bool = False
 
 
 @triton.jit

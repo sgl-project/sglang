@@ -16,6 +16,7 @@ python3 -c 'import os, shutil, tempfile, getpass; cache_dir = os.environ.get("TO
 # Kill existing processes
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 bash "${SCRIPT_DIR}/../killall_sglang.sh"
+echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}"
 
 # Install apt packages
 apt install -y git libnuma-dev
@@ -48,18 +49,33 @@ $PIP_CMD install -e "python[dev]" --extra-index-url https://download.pytorch.org
 # Install router for pd-disagg test
 SGLANG_ROUTER_BUILD_NO_RUST=1 $PIP_CMD install -e "sgl-router" $PIP_INSTALL_SUFFIX
 
+SGL_KERNEL_VERSION_FROM_KERNEL=$(grep -Po '(?<=^version = ")[^"]*' sgl-kernel/pyproject.toml)
+SGL_KERNEL_VERSION_FROM_SRT=$(grep -Po -m1 '(?<=sgl-kernel==)[0-9A-Za-z\.\-]+' python/pyproject.toml)
+echo "SGL_KERNEL_VERSION_FROM_KERNEL=${SGL_KERNEL_VERSION_FROM_KERNEL} SGL_KERNEL_VERSION_FROM_SRT=${SGL_KERNEL_VERSION_FROM_SRT}"
 
 if [ "$IS_BLACKWELL" = "1" ]; then
-    # TODO auto determine sgl-kernel version
-    SGL_KERNEL_VERSION=0.3.8
-    $PIP_CMD install https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}+cu128-cp310-abi3-manylinux2014_x86_64.whl --force-reinstall $PIP_INSTALL_SUFFIX
+    SGL_KERNEL_CUDA_VERSION=cu128
+else
+    SGL_KERNEL_CUDA_VERSION=cu124
+fi
+
+if [ "${CUSTOM_BUILD_SGL_KERNEL:-}" = "true" ]; then
+    ls -alh sgl-kernel/dist
+    WHEEL_FILE=$(ls sgl-kernel/dist/sgl_kernel-${SGL_KERNEL_VERSION_FROM_KERNEL}+${SGL_KERNEL_CUDA_VERSION}-cp310-abi3-manylinux2014_x86_64.whl 2>/dev/null || true)
+    if [ -f "$WHEEL_FILE" ]; then
+      $PIP_CMD install sgl-kernel/dist/sgl_kernel-${SGL_KERNEL_VERSION_FROM_KERNEL}+${SGL_KERNEL_CUDA_VERSION}-cp310-abi3-manylinux2014_x86_64.whl --force-reinstall $PIP_INSTALL_SUFFIX
+    else
+      $PIP_CMD install sgl-kernel/dist/sgl_kernel-${SGL_KERNEL_VERSION_FROM_KERNEL}-cp310-abi3-manylinux2014_x86_64.whl --force-reinstall $PIP_INSTALL_SUFFIX
+    fi
+else
+    $PIP_CMD install https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION_FROM_SRT}/sgl_kernel-${SGL_KERNEL_VERSION_FROM_SRT}+${SGL_KERNEL_CUDA_VERSION}-cp310-abi3-manylinux2014_x86_64.whl --force-reinstall $PIP_INSTALL_SUFFIX
 fi
 
 # Show current packages
 $PIP_CMD list
 
 # Install additional dependencies
-$PIP_CMD install mooncake-transfer-engine==0.3.5 nvidia-cuda-nvrtc-cu12 py-spy huggingface_hub[hf_xet] $PIP_INSTALL_SUFFIX
+$PIP_CMD install mooncake-transfer-engine==0.3.6.post1 nvidia-cuda-nvrtc-cu12 py-spy huggingface_hub[hf_xet] $PIP_INSTALL_SUFFIX
 
 if [ "$IS_BLACKWELL" != "1" ]; then
     # For lmms_evals evaluating MMMU
@@ -76,4 +92,8 @@ fi
 # Show current packages
 $PIP_CMD list
 
-echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}"
+
+if [ -n "${HF_TOKEN:-}" ]; then
+    $PIP_CMD install -U "huggingface_hub[cli]" $PIP_INSTALL_SUFFIX
+    hf auth login --token $HF_TOKEN
+fi
