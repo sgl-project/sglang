@@ -364,7 +364,7 @@ class ModelRunner:
                     )
                 else:
                     self.server_args.max_mamba_cache_size = 512
-        if self.is_hybrid_gdn:
+        if self.hybrid_gdn_config is not None:
             self.server_args.max_mamba_cache_size = (
                 self.server_args.max_mamba_cache_size
                 // (
@@ -1312,14 +1312,6 @@ class ModelRunner:
     def mambaish_config(self):
         return self.mamba2_config or self.hybrid_gdn_config
 
-    @property
-    def is_mambaish(self):
-        return self.mambaish_config is not None
-
-    @property
-    def is_hybrid_gdn(self):
-        return self.hybrid_gdn_config is not None
-
     def set_num_token_hybrid(self):
         if (
             "Llama4ForConditionalGeneration"
@@ -1453,7 +1445,7 @@ class ModelRunner:
                 ),
                 4096,
             )
-        if self.is_mambaish:
+        if self.mambaish_config is not None:
             max_num_reqs = min(max_num_reqs, self.server_args.max_mamba_cache_size)
 
         if self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone():
@@ -1662,7 +1654,8 @@ class ModelRunner:
         need_sort = self.server_args.disaggregation_mode in ("decode", "prefill")
         if self.token_to_kv_pool_allocator is None:
             if _is_npu and (
-                self.server_args.attention_backend == "ascend" or self.is_hybrid_gdn
+                self.server_args.attention_backend == "ascend"
+                or self.hybrid_gdn_config is not None
             ):
                 self.token_to_kv_pool_allocator = AscendPagedTokenToKVPoolAllocator(
                     self.max_total_num_tokens,

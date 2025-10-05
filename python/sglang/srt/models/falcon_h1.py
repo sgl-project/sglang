@@ -344,7 +344,9 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
             # Mamba block
             output = torch.empty_like(hidden_states)
             attn_backend = forward_batch.attn_backend
-            assert isinstance(attn_backend, HybridLinearAttnBackend)
+            assert isinstance(
+                attn_backend, HybridLinearAttnBackend
+            ), f"{attn_backend} is not a HybridLinearAttnBackend"
             assert isinstance(attn_backend.linear_attn_backend, Mamba2AttnBackend)
             attn_backend.linear_attn_backend.forward(
                 mixer=self.mamba,

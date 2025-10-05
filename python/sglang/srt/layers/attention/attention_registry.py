@@ -175,7 +175,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
     need to change the code of the original attention backend.
     """
     assert not (
-        runner.is_hybrid_gdn and runner.use_mla_backend
+        runner.hybrid_gdn_config is not None and runner.use_mla_backend
     ), "hybrid_gdn can only be used with non-MLA models."
 
     if cfg := runner.mambaish_config:
@@ -186,7 +186,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         )
         from sglang.srt.utils import is_blackwell, is_npu
 
-        if runner.is_hybrid_gdn:
+        if runner.hybrid_gdn_config is not None:
             if is_blackwell():
                 assert (
                     runner.server_args.attention_backend == "triton"
@@ -197,7 +197,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                 ), "ascend backend is the only supported backend on NPU for hybrid GDN models, use --attention-backend ascend to specify the backend."
             logger.info(f"Using hybrid linear attention backend for hybrid GDN models.")
             linear_attn_backend = GDNAttnBackend(runner)
-        elif runner.is_mamba2:
+        elif runner:
             linear_attn_backend = Mamba2AttnBackend(runner)
         else:
             raise ValueError(
