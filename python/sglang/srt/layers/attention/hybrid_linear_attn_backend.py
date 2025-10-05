@@ -499,11 +499,10 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
 
     def forward(
         self,
-        *,
         mixer: MambaMixer2,
-        layer_id: int,
         hidden_states: torch.Tensor,
         output: torch.Tensor,
+        layer_id: int,
         mup_vector: Optional[torch.Tensor] = None,
         use_triton_causal_conv: bool = False,
     ):
