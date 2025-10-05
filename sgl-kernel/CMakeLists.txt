@@ -268,6 +268,7 @@ set(SOURCES
     "csrc/elementwise/concat_mla.cu"
     "csrc/elementwise/fused_add_rms_norm_kernel.cu"
     "csrc/elementwise/rope.cu"
+    "csrc/elementwise/topk.cu"
     "csrc/common_extension.cc"
 
     "csrc/gemm/awq_kernel.cu"
