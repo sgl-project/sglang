@@ -3,16 +3,15 @@
 set -euxo pipefail
 
 IS_BLACKWELL=${IS_BLACKWELL:-0}
-
 CU_VERSION="cu128"
-
-# Clear torch compilation cache
-python3 -c 'import os, shutil, tempfile, getpass; cache_dir = os.environ.get("TORCHINDUCTOR_CACHE_DIR") or os.path.join(tempfile.gettempdir(), "torchinductor_" + getpass.getuser()); shutil.rmtree(cache_dir, ignore_errors=True)'
 
 # Kill existing processes
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 bash "${SCRIPT_DIR}/../killall_sglang.sh"
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}"
+
+# Clear torch compilation cache
+python3 -c 'import os, shutil, tempfile, getpass; cache_dir = os.environ.get("TORCHINDUCTOR_CACHE_DIR") or os.path.join(tempfile.gettempdir(), "torchinductor_" + getpass.getuser()); shutil.rmtree(cache_dir, ignore_errors=True)'
 
 # Install apt packages
 apt install -y git libnuma-dev
@@ -25,7 +24,7 @@ if [ "$IS_BLACKWELL" = "1" ]; then
     PIP_INSTALL_SUFFIX="--break-system-packages"
 
     # Clean up existing installations
-    $PIP_CMD uninstall -y flashinfer_python sgl-kernel sglang vllm $PIP_INSTALL_SUFFIX || true
+    $PIP_CMD uninstall -y flashinfer_python sgl-kernel sglang vllm torch $PIP_INSTALL_SUFFIX || true
 else
     # In normal cases, we use uv, which is much faster than pip.
     pip install --upgrade pip
@@ -36,7 +35,7 @@ else
     PIP_INSTALL_SUFFIX="--index-strategy unsafe-best-match"
 
     # Clean up existing installations
-    $PIP_CMD uninstall flashinfer_python sgl-kernel sglang vllm || true
+    $PIP_CMD uninstall flashinfer_python sgl-kernel sglang vllm torch || true
 fi
 
 # Install the main package
@@ -45,11 +44,11 @@ $PIP_CMD install -e "python[dev]" --extra-index-url https://download.pytorch.org
 # Install router for pd-disagg test
 SGLANG_ROUTER_BUILD_NO_RUST=1 $PIP_CMD install -e "sgl-router" $PIP_INSTALL_SUFFIX
 
+# Install sgl-kernel
 SGL_KERNEL_VERSION_FROM_KERNEL=$(grep -Po '(?<=^version = ")[^"]*' sgl-kernel/pyproject.toml)
 SGL_KERNEL_VERSION_FROM_SRT=$(grep -Po -m1 '(?<=sgl-kernel==)[0-9A-Za-z\.\-]+' python/pyproject.toml)
 echo "SGL_KERNEL_VERSION_FROM_KERNEL=${SGL_KERNEL_VERSION_FROM_KERNEL} SGL_KERNEL_VERSION_FROM_SRT=${SGL_KERNEL_VERSION_FROM_SRT}"
 
-# Install sgl-kernel
 if [ "${CUSTOM_BUILD_SGL_KERNEL:-}" = "true" ]; then
     ls -alh sgl-kernel/dist
     $PIP_CMD install sgl-kernel/dist/sgl_kernel-${SGL_KERNEL_VERSION_FROM_KERNEL}-cp310-abi3-manylinux2014_x86_64.whl --force-reinstall $PIP_INSTALL_SUFFIX
@@ -71,9 +70,6 @@ if [ "$IS_BLACKWELL" != "1" ]; then
     # Install xformers
     $PIP_CMD install xformers --index-url https://download.pytorch.org/whl/${CU_VERSION} --no-deps $PIP_INSTALL_SUFFIX
 fi
-
-# Install FlashMLA for attention backend tests
-# $PIP_CMD install git+https://github.com/deepseek-ai/FlashMLA.git $PIP_INSTALL_SUFFIX
 
 # Show current packages
 $PIP_CMD list
