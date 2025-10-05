@@ -1295,32 +1295,30 @@ class ModelRunner:
         return max_num_token
 
     @property
-    def is_hybrid_gdn(self):
-        return self.model_config.hf_config.architectures[0] in [
-            "Qwen3NextForCausalLM",
-            "Qwen3NextForCausalLMMTP",
-        ]
+    def hybrid_gdn_config(self):
+        config = self.model_config.hf_config
+        if isinstance(config, Qwen3NextConfig):
+            return config
+        return None
 
     @property
-    def is_mamba2(self):
-        return self.model_config.hf_config.architectures[0] in [
-            "FalconH1ForCausalLM",
-            "NemotronHForCausalLM",
-        ]
-
-    @property
-    def is_mambaish(self):
-        return self.is_mamba2 or self.is_hybrid_gdn
+    def mamba2_config(self):
+        config = self.model_config.hf_config
+        if isinstance(config, FalconH1Config | NemotronHConfig):
+            return config
+        return None
 
     @property
     def mambaish_config(self):
-        if self.is_mambaish:
-            config = self.model_config.hf_config
-            assert isinstance(
-                config, NemotronHConfig | Qwen3NextConfig | FalconH1Config
-            )
-            return config
-        return None
+        return self.mamba2_config or self.hybrid_gdn_config
+
+    @property
+    def is_mambaish(self):
+        return self.mambaish_config is not None
+
+    @property
+    def is_hybrid_gdn(self):
+        return self.hybrid_gdn_config is not None
 
     def set_num_token_hybrid(self):
         if (

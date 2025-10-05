@@ -244,7 +244,7 @@ class NemotronHConfig(PretrainedConfig):
         self.time_step_floor = mamba_dt_init_floor
         self.use_conv_bias = mamba_conv_bias
         self.mamba_proj_bias = mamba_proj_bias
-        self.chunk_size = mamba_chunk_size
+        self.mamba_chunk_size = mamba_chunk_size
         self.rescale_prenorm_residual = rescale_prenorm_residual
 
         super().__init__(

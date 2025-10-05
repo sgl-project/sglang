@@ -451,14 +451,16 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
-        self.chunk_size = int(getattr(model_runner.server_args, "chunk_size", 256))
+        config = model_runner.mamba2_config
+        assert config is not None
+        self.mamba_chunk_size = config.mamba_chunk_size
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         metadata = self._forward_metadata(forward_batch)
         self.forward_metadata = Mamba2Metadata.prepare_mixed(
             metadata.query_start_loc,
             metadata.mamba_cache_indices,
-            self.chunk_size,
+            self.mamba_chunk_size,
             forward_batch,
         )
 

@@ -196,13 +196,10 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
             use_bias=config.mamba_proj_bias,
             n_groups=config.mamba_n_groups,
             num_heads=config.mamba_n_heads,
-            layer_id=layer_id,
             head_dim=config.mamba_d_head,
             rms_norm_eps=config.rms_norm_eps,
-            chunk_size=config.mamba_chunk_size,
             activation=config.hidden_act,
             use_rms_norm=config.mamba_rms_norm,
-            is_falcon=True,
             prefix=f"{prefix}.mixer",
         )
 

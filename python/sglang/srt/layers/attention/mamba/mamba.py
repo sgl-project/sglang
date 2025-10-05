@@ -8,6 +8,7 @@ import torch.nn as nn
 
 from python.sglang.srt.layers.attention.mamba.mamba2_metadata import Mamba2Metadata
 from python.sglang.srt.mem_cache.memory_pool import MambaPool
+from sglang.srt.configs.mamba2 import extra_groups_for_head_shards
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import (
     divide,
