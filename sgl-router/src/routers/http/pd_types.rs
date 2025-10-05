@@ -37,6 +37,16 @@ pub fn get_hostname(url: &str) -> String {
     let url = url
         .trim_start_matches("http://")
         .trim_start_matches("https://");
+
+    // Handle IPv6 addresses (e.g., [::1]:8000 or [fdbd:dccd:cdd2:2001::19d]:8000)
+    if let Some(start) = url.find('[') {
+        if let Some(end) = url.find(']') {
+            // Extract hostname between brackets
+            return url[start + 1..end].to_string();
+        }
+    }
+
+    // Handle IPv4 or hostname (e.g., localhost:8000 or 192.168.1.1:8000)
     url.split(':').next().unwrap_or("localhost").to_string()
 }
 
