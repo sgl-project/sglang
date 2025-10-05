@@ -156,14 +156,15 @@ class OpenAIServingEmbedding(OpenAIServingBase):
         prompt_tokens = 0
 
         for idx, ret_item in enumerate(ret):
+            # Handle missing prompt_tokens gracefully
+            meta_info = ret_item.get("meta_info", {})
             embedding_objects.append(
                 EmbeddingObject(
                     embedding=ret_item["embedding"],
                     index=idx,
+                    cache_hit_rate=meta_info.get("cache_hit_rate", None),
                 )
             )
-            # Handle missing prompt_tokens gracefully
-            meta_info = ret_item.get("meta_info", {})
             prompt_tokens += meta_info.get("prompt_tokens", 0)
 
         return EmbeddingResponse(
