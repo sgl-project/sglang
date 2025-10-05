@@ -533,10 +533,6 @@ class NativeSparseAttnBackend(AttentionBackend):
                 page_size=1,
             )
         if NSA_PREFILL_IMPL == "tilelang":
-            from sglang.srt.layers.attention.nsa.tilelang_kernel import (
-                tilelang_sparse_fwd,
-            )
-
             if q_rope is not None:
                 q_all = torch.cat([q_nope, q_rope], dim=-1)
             return self._forward_tilelang(
