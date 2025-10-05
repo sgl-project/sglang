@@ -146,12 +146,12 @@ suites = {
     ],
     "per-commit-8-gpu": [
         TestFile("hicache/test_hicache_storage_mooncake_backend.py", 400),
-        TestFile("lora/test_lora_llama4.py", 600),
-        TestFile("test_disaggregation.py", 499),
+        TestFile("lora/test_lora_llama4.py", 400),
+        TestFile("test_disaggregation.py", 600),
         TestFile("test_disaggregation_dp_attention.py", 155),
-        TestFile("test_disaggregation_different_tp.py", 155),
-        TestFile("test_disaggregation_pp.py", 60),
-        TestFile("test_full_deepseek_v3.py", 333),
+        TestFile("test_disaggregation_different_tp.py", 600),
+        TestFile("test_disaggregation_pp.py", 140),
+        TestFile("test_full_deepseek_v3.py", 550),
     ],
     "per-commit-4-gpu-b200": [
         # TestFile("test_gpt_oss_4gpu.py", 600),
