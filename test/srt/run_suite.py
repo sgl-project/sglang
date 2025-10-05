@@ -13,6 +13,7 @@ class TestFile:
 
 suites = {
     "per-commit": [
+        TestFile("ep/test_moe_ep.py", 30),
         TestFile("function_call/test_json_schema_constraint.py", 30),
         TestFile("hicache/test_hicache.py", 116),
         TestFile("hicache/test_hicache_mla.py", 127),

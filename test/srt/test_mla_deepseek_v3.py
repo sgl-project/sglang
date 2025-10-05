@@ -99,6 +99,8 @@ class TestMLADeepseekV3Fa3Fp8Kvcache(CustomTestCase):
             "256",
             "--kv-cache-dtype",
             "fp8_e4m3",
+            "--mem-fraction-static",
+            "0.8",
         ]
         if is_cuda():
             other_args.extend(["--attention-backend", "fa3"])

@@ -118,6 +118,17 @@ DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton"]
 
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu"]
 
+MOE_RUNNER_BACKEND_CHOICES = [
+    "auto",
+    "deep_gemm",
+    "triton",
+    "triton_kernel",
+    "flashinfer_trtllm",
+    "flashinfer_cutlass",
+    "flashinfer_mxfp4",
+    "flashinfer_cutedsl",
+]
+
 
 # Allow external code to add more choices
 def add_load_format_choices(choices):
@@ -310,11 +321,13 @@ class ServerArgs:
     moe_a2a_backend: Literal["none", "deepep"] = "none"
     moe_runner_backend: Literal[
         "auto",
+        "deep_gemm",
         "triton",
         "triton_kernel",
         "flashinfer_trtllm",
         "flashinfer_cutlass",
         "flashinfer_mxfp4",
+        "flashinfer_cutedsl",
     ] = "auto"
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
     enable_flashinfer_allreduce_fusion: bool = False
@@ -2102,15 +2115,7 @@ class ServerArgs:
         parser.add_argument(
             "--moe-runner-backend",
             type=str,
-            choices=[
-                "auto",
-                "triton",
-                "triton_kernel",
-                "flashinfer_trtllm",
-                "flashinfer_cutlass",
-                "flashinfer_mxfp4",
-                "flashinfer_cutedsl",
-            ],
+            choices=MOE_RUNNER_BACKEND_CHOICES,
             default=ServerArgs.moe_runner_backend,
             help="Choose the runner backend for MoE.",
         )
