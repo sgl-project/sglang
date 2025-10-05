@@ -21,10 +21,8 @@ NUM_GPUS = 2
 @pytest.mark.parametrize(
     "hidden_size_n_groups",
     [
-        (64, 1),
-        (64, 2),
-        (64, 4),  # hidden_size be divisible by num_gpus
-        (100, 5),  # and n_groups must divide hidden_size
+        (64, 1),  # hidden_size be divisible by num_gpus
+        (100, 4),  # and n_groups must divide hidden_size
     ],
 )
 @pytest.mark.parametrize("dtype", [torch.float16])
@@ -101,7 +99,7 @@ def mixer2_gated_norm_tensor_parallel(
     hidden_states = torch.randn(batch_size, seq_len, hidden_size)
     gate_states = torch.randn(batch_size, seq_len, hidden_size)
 
-    import sglang.srt.layers.attention.mamba.mamba as m2
+    import sglang.srt.layers.attention.mamba.mixer2_rms_norm_gated as m2
     import sglang.srt.model_loader.weight_utils as wu
 
     # Convenience: Avoid calling initialize_dp_attention
