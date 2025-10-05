@@ -820,6 +820,7 @@ class Req:
         self.extend_logprob_start_len = 0
         self.is_chunked = 0
         self.req_pool_idx = None
+        self.mamba_pool_idx = None
         self.already_computed = 0
 
     def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):

@@ -216,7 +216,7 @@ class MambaPool:
         self.mamba_cache[1][:, dst_index] = self.mamba_cache[1][:, src_index]
         return
 
-    def fork_from(self, src_index: torch.Tensor) -> Optional[int]:
+    def fork_from(self, src_index: torch.Tensor) -> Optional[torch.Tensor]:
         dst_index = self.alloc(1)
         if dst_index == None:
             return None
