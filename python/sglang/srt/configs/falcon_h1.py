@@ -307,28 +307,13 @@ class FalconH1Config(PretrainedConfig):
 
     @property
     def mamba2_cache_params(self):
-        world_size = get_tensor_model_parallel_world_size()
-
-        n_groups = self.mamba_n_groups
-        if self.mamba_n_groups % world_size != 0:
-            # - for TP we shard conv_dim by sharding on n_groups,
-            # - but if n_groups cannot divide tp_size, we need to
-            #   extend some extra groups
-            extra_groups = extra_groups_for_head_shards(self.mamba_n_groups, world_size)
-            n_groups += extra_groups
-
-        conv_dim = self.mamba_d_ssm + 2 * n_groups * self.mamba_d_state
-
-        conv_state_shape = (
-            divide(conv_dim, world_size),
-            self.mamba_d_conv - 1,
+        shape = Mamba2CacheParams.shape(
+            tp_world_size=get_tensor_model_parallel_world_size(),
+            n_groups=self.mamba_n_groups,
+            intermediate_size=self.mamba_d_ssm,
+            state_size=self.mamba_d_state,
+            conv_kernel=self.mamba_d_conv,
+            head_dim=self.mamba_d_head,
+            num_heads=self.mamba_n_heads,
         )
-
-        # we TP-ize on the heads dimension
-        temporal_state_shape = (
-            divide(self.mamba_n_heads, world_size),
-            self.mamba_d_head,
-            self.mamba_d_state,
-        )
-        shape = Mamba2StateShape(conv=conv_state_shape, temporal=temporal_state_shape)
         return Mamba2CacheParams(shape=shape, layers=self.linear_layer_ids)
