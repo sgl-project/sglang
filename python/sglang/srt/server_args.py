@@ -382,6 +382,7 @@ class ServerArgs:
     disable_outlines_disk_cache: bool = False
     disable_custom_all_reduce: bool = False
     enable_mscclpp: bool = False
+    enable_torch_symm_mem: bool = False
     disable_overlap_schedule: bool = False
     enable_mixed_chunk: bool = False
     enable_dp_attention: bool = False
@@ -2442,6 +2443,11 @@ class ServerArgs:
             "--enable-mscclpp",
             action="store_true",
             help="Enable using mscclpp for small messages for all-reduce kernel and fall back to NCCL.",
+        )
+        parser.add_argument(
+            "--enable-torch-symm-mem",
+            action="store_true",
+            help="Enable using torch symm mem for all-reduce kernel and fall back to NCCL. Only supports CUDA device SM90 and above. SM90 supports world size 4, 6, 8. SM10 supports world size 6, 8.",
         )
         parser.add_argument(
             "--disable-overlap-schedule",
