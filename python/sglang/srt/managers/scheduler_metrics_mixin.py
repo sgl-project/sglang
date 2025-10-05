@@ -117,7 +117,7 @@ class SchedulerMetricsMixin:
             ) = self._get_mamba_token_info()
             num_used = full_num_used
             token_usage = full_token_usage
-            token_msg = (
+            token_usage_msg = (
                 f"full token usage: {full_token_usage:.2f}, "
                 f"mamba usage: {mamba_usage:.2f}, "
             )
@@ -233,7 +233,7 @@ class SchedulerMetricsMixin:
             ) = self._get_mamba_token_info()
             num_used = full_num_used
             token_usage = full_token_usage
-            token_msg = (
+            token_usage_msg = (
                 f"#full token: {full_num_used}, "
                 f"full token usage: {full_token_usage:.2f}, "
                 f"mamba num: {mamba_used}, "
