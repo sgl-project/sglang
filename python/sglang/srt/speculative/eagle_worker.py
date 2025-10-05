@@ -823,7 +823,7 @@ class EAGLEWorker(TpModelWorker):
 
         # Forward
         forward_batch_output = self.target_worker.forward_batch_generation(
-            model_worker_batch, skip_sample=True
+            model_worker_batch, is_verify=True
         )
         logits_output, can_run_cuda_graph = (
             forward_batch_output.logits_output,

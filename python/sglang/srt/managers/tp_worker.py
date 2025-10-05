@@ -237,7 +237,7 @@ class TpModelWorker:
         self,
         model_worker_batch: ModelWorkerBatch,
         launch_done: Optional[threading.Event] = None,
-        skip_sample: bool = False,
+        is_verify: bool = False,
     ) -> ForwardBatchOutput:
         # update the consumer index of hicache to the running batch
         self.set_hicache_consumer(model_worker_batch.hicache_consumer_index)
@@ -259,19 +259,16 @@ class TpModelWorker:
             if launch_done is not None:
                 launch_done.set()
 
-            if skip_sample:
-                next_token_ids = None
-                # For prefill-only requests, we still need to compute logprobs even when sampling is skipped
-                if (
-                    model_worker_batch.is_prefill_only
-                    and model_worker_batch.return_logprob
-                ):
-                    # Compute logprobs without full sampling
-                    self.model_runner.compute_logprobs_only(
-                        logits_output, model_worker_batch
-                    )
-            else:
+            skip_sample = is_verify or model_worker_batch.is_prefill_only
+            next_token_ids = None
+
+            if not skip_sample:
                 next_token_ids = self.model_runner.sample(logits_output, forward_batch)
+            elif model_worker_batch.return_logprob and not is_verify:
+                # NOTE: Compute logprobs without full sampling
+                self.model_runner.compute_logprobs_only(
+                    logits_output, model_worker_batch
+                )
 
             return ForwardBatchOutput(
                 logits_output=logits_output,
