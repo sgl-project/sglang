@@ -85,6 +85,7 @@ class _StageExecutor:
         self._global_dp_buffer_len = forward_batch.global_dp_buffer_len
         self._local_dp_buffer_len = forward_batch.input_ids.shape[0]
         self._global_num_tokens = forward_batch.global_num_tokens_cpu
+        self._is_dp_max_padding = forward_batch.dp_padding_mode.is_max_len()
 
     def next(self):
         assert not self.done
@@ -95,6 +96,7 @@ class _StageExecutor:
             set_dp_buffer_len(
                 self._global_dp_buffer_len,
                 self._local_dp_buffer_len,
+                self._is_dp_max_padding,
                 self._global_num_tokens,
             )
 
