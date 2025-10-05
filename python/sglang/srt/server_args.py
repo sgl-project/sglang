@@ -2826,7 +2826,7 @@ class ServerArgs:
             self.model_path,
             trust_remote_code=self.trust_remote_code,
             revision=self.revision,
-            model_override_args=json.loads(self.json_model_override_args),
+            model_override_args=orjson.loads(self.json_model_override_args),
             **kwargs,
         )
         return hf_config
