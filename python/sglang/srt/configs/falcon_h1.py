@@ -215,7 +215,7 @@ class FalconH1Config(PretrainedConfig):
         self.rope_scaling = None
         self.rope_scaling = rope_scaling
         self.projectors_bias = projectors_bias
-        mamba_intermediate = (
+        self.mamba_intermediate = mamba_intermediate = (
             mamba_expand * hidden_size if mamba_d_ssm is None else mamba_d_ssm
         )
 
@@ -307,9 +307,9 @@ class FalconH1Config(PretrainedConfig):
 
     @property
     def mamba2_cache_params(self):
-        shape = Mamba2CacheParams.shape(
+        shape = Mamba2StateShape.create(
             tp_world_size=get_tensor_model_parallel_world_size(),
-            intermediate_size=self.mamba_d_ssm,
+            intermediate_size=self.mamba_intermediate,
             n_groups=self.mamba_n_groups,
             num_heads=self.mamba_n_heads,
             head_dim=self.mamba_d_head,

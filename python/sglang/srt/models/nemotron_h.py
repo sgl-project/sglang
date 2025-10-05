@@ -147,15 +147,10 @@ class NemotronHMambaDecoderLayer(nn.Module):
         self.config = config
         self.layer_id = layer_idx
         self.mixer = MambaMixer2(
+            cache_params=config.mamba2_cache_params,
             hidden_size=config.hidden_size,
-            ssm_state_size=config.ssm_state_size,
-            conv_kernel_size=config.conv_kernel,
-            intermediate_size=config.mamba_num_heads * config.mamba_head_dim,
             use_conv_bias=config.use_conv_bias,
             use_bias=config.use_bias,
-            n_groups=config.n_groups,
-            num_heads=config.mamba_num_heads,
-            head_dim=config.mamba_head_dim,
             rms_norm_eps=config.rms_norm_eps,
             activation=config.mamba_hidden_act,
             quant_config=quant_config,

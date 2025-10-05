@@ -19,7 +19,7 @@ import regex as re
 from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
 
-from sglang.srt.configs.mamba2 import Mamba2CacheParams
+from sglang.srt.configs.mamba2 import Mamba2CacheParams, Mamba2StateShape
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 
 logger = logging.get_logger(__name__)
@@ -273,10 +273,9 @@ class NemotronHConfig(PretrainedConfig):
 
     @property
     def mamba2_cache_params(self) -> Mamba2CacheParams:
-        intermediate_size = self.mamba_num_heads * self.mamba_head_dim
-        shape = Mamba2CacheParams.shape(
+        shape = Mamba2StateShape.create(
             tp_world_size=get_attention_tp_size(),
-            intermediate_size=intermediate_size,
+            intermediate_size=self.mamba_num_heads * self.mamba_head_dim,
             n_groups=self.n_groups,
             num_heads=self.mamba_num_heads,
             head_dim=self.mamba_head_dim,

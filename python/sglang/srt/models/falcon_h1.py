@@ -188,15 +188,10 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
         )
 
         self.mamba = MambaMixer2(
+            cache_params=config.mamba2_cache_params,
             hidden_size=config.hidden_size,
-            ssm_state_size=config.mamba_d_state,
-            conv_kernel_size=config.mamba_d_conv,
-            intermediate_size=self.d_ssm,
             use_conv_bias=config.mamba_conv_bias,
             use_bias=config.mamba_proj_bias,
-            n_groups=config.mamba_n_groups,
-            num_heads=config.mamba_n_heads,
-            head_dim=config.mamba_d_head,
             rms_norm_eps=config.rms_norm_eps,
             activation=config.hidden_act,
             use_rms_norm=config.mamba_rms_norm,

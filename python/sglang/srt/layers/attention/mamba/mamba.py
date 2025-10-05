@@ -1,14 +1,11 @@
-import os
-from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Tuple, Union
 
-import numpy as np
 import torch
 import torch.nn as nn
 
 from python.sglang.srt.layers.attention.mamba.mamba2_metadata import Mamba2Metadata
 from python.sglang.srt.mem_cache.memory_pool import MambaPool
-from sglang.srt.configs.mamba2 import extra_groups_for_head_shards
+from sglang.srt.configs.mamba2 import Mamba2CacheParams
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import (
     divide,
@@ -225,15 +222,10 @@ class MambaMixer2(torch.nn.Module):
 
     def __init__(
         self,
+        cache_params: Mamba2CacheParams,
         hidden_size: int,
-        ssm_state_size: int,
-        conv_kernel_size: int,
-        intermediate_size: int,
         use_conv_bias: bool,
         use_bias: bool,
-        n_groups: int = 1,
-        num_heads: int = 128,
-        head_dim: int = 64,
         rms_norm_eps: float = 1e-5,
         activation: str = "silu",
         use_rms_norm: bool = True,
@@ -259,6 +251,10 @@ class MambaMixer2(torch.nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
 
+        self.n_groups = n_groups = cache_params.shape.n_groups
+        self.num_heads = num_heads = cache_params.shape.num_heads
+        self.head_dim = cache_params.shape.head_dim
+
         assert (
             num_heads % self.tp_size == 0
         ), "Tensor parallel world size must divide num heads."
@@ -275,24 +271,15 @@ class MambaMixer2(torch.nn.Module):
             "if tensor parallel world size divides num groups."
         )
 
-        self.ssm_state_size = ssm_state_size
-        self.conv_kernel_size = conv_kernel_size
+        self.ssm_state_size = cache_params.shape.ssm_state_size
         self.activation = activation
 
-        self.intermediate_size = intermediate_size
-        self.head_dim = head_dim
-        self.num_heads = num_heads
-
-        self.n_groups = n_groups
-        if n_groups % self.tp_size != 0:
-            # - for TP we shard conv_dim by sharding on n_groups,
-            # - but if n_groups cannot divide tp_size, we need to
-            #   extend some extra groups
-            groups = extra_groups_for_head_shards(n_groups, self.tp_size)
-            self.n_groups = n_groups + groups
-
-        self.groups_ssm_state_size = self.n_groups * self.ssm_state_size
-        self.conv_dim = intermediate_size + 2 * self.groups_ssm_state_size
+        conv_kernel_size = cache_params.shape.conv_kernel
+        self.intermediate_size = intermediate_size = (
+            cache_params.shape.intermediate_size
+        )
+        self.groups_ssm_state_size = cache_params.shape.groups_ssm_state_size
+        self.conv_dim = cache_params.shape.conv_dim
 
         if n_groups % self.tp_size == 0:
             self.conv1d = MergedColumnParallelLinear(

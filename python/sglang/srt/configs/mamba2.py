@@ -38,6 +38,57 @@ class Mamba2StateShape:
     conv: tuple[int, int]
     temporal: tuple[int, int, int]
 
+    intermediate_size: int
+    conv_dim: int
+    ssm_state_size: int
+    groups_ssm_state_size: int
+    n_groups: int
+    num_heads: int
+    head_dim: int
+    state_size: int
+    conv_kernel: int
+
+    @staticmethod
+    def create(
+        *,
+        tp_world_size: int,
+        intermediate_size: int,
+        n_groups: int,
+        num_heads: int,
+        head_dim: int,
+        state_size: int,
+        conv_kernel: int,
+    ) -> "Mamba2StateShape":
+        # if n_groups is not divisible by world_size, need to extend the shards
+        # to ensure all groups needed by a head is sharded along with it
+        if n_groups % tp_world_size != 0:
+            extra_groups = extra_groups_for_head_shards(n_groups, tp_world_size)
+            n_groups += extra_groups
+        # heads and n_groups are TP-ed
+        groups_ssm_state_size = n_groups * state_size
+        conv_dim = intermediate_size + 2 * n_groups * state_size
+
+        # contiguous along 'dim' axis
+        conv_state_shape = divide(conv_dim, tp_world_size), conv_kernel - 1
+
+        # These are not TP-ed as they depend on A, dt_bias, D
+        # - they are typically small
+        #   e.g., (h_heads, head_dim, state_size) = (128, 64, 128)
+        temporal_state_shape = (divide(num_heads, tp_world_size), head_dim, state_size)
+        return Mamba2StateShape(
+            conv=conv_state_shape,
+            temporal=temporal_state_shape,
+            intermediate_size=intermediate_size,
+            conv_dim=conv_dim,
+            ssm_state_size=state_size,
+            groups_ssm_state_size=groups_ssm_state_size,
+            n_groups=n_groups,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            state_size=state_size,
+            conv_kernel=conv_kernel,
+        )
+
 
 @dataclass(kw_only=True, frozen=True)
 class Mamba2StateDType:
@@ -62,34 +113,6 @@ class Mamba2CacheParams:
     shape: Mamba2StateShape
     dtype: Mamba2StateDType = field(default_factory=mamba2_state_dtype)
     layers: list[int]
-
-    @staticmethod
-    def shape(
-        *,
-        tp_world_size: int,
-        intermediate_size: int,
-        n_groups: int,
-        num_heads: int,
-        head_dim: int,
-        state_size: int,
-        conv_kernel: int,
-    ) -> Mamba2StateShape:
-        # if n_groups is not divisible by world_size, need to extend the shards
-        # to ensure all groups needed by a head is sharded along with it
-        if n_groups % tp_world_size != 0:
-            extra_groups = extra_groups_for_head_shards(n_groups, tp_world_size)
-            n_groups += extra_groups
-        # heads and n_groups are TP-ed
-        conv_dim = intermediate_size + 2 * n_groups * state_size
-
-        # contiguous along 'dim' axis
-        conv_state_shape = divide(conv_dim, tp_world_size), conv_kernel - 1
-
-        # These are not TP-ed as they depend on A, dt_bias, D
-        # - they are typically small
-        #   e.g., (h_heads, head_dim, state_size) = (128, 64, 128)
-        temporal_state_shape = (divide(num_heads, tp_world_size), head_dim, state_size)
-        return Mamba2StateShape(conv=conv_state_shape, temporal=temporal_state_shape)
 
     @property
     def mamba_cache_per_req(self) -> int:
