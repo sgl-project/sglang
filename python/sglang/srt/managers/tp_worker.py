@@ -259,22 +259,31 @@ class TpModelWorker:
             if launch_done is not None:
                 launch_done.set()
 
-            skip_sample = is_verify or model_worker_batch.is_prefill_only
-            next_token_ids = None
-
-            if not skip_sample:
-                next_token_ids = self.model_runner.sample(logits_output, forward_batch)
-            elif model_worker_batch.return_logprob and not is_verify:
-                # NOTE: Compute logprobs without full sampling
-                self.model_runner.compute_logprobs_only(
-                    logits_output, model_worker_batch
-                )
-
-            return ForwardBatchOutput(
+            forward_batch_output = ForwardBatchOutput(
                 logits_output=logits_output,
-                next_token_ids=next_token_ids,
                 can_run_cuda_graph=can_run_cuda_graph,
             )
+
+            if is_verify:
+                # Skip sampling and return logits for target forward
+                return forward_batch_output
+
+            if model_worker_batch.is_prefill_only:
+                if model_worker_batch.return_logprob:
+                    # NOTE: Compute logprobs without full sampling
+                    self.model_runner.compute_logprobs_only(
+                        logits_output, model_worker_batch
+                    )
+            elif model_worker_batch.sampling_info.grammars is not None:
+                # The launch of sampling is delayed for overlap scheduling
+                forward_batch_output.delay_sample_launch = True
+                forward_batch_output.forward_batch = forward_batch
+            else:
+                forward_batch_output.next_token_ids = self.model_runner.sample(
+                    logits_output, forward_batch
+                )
+
+            return forward_batch_output
         else:
             pp_proxy_tensors, can_run_cuda_graph = self.model_runner.forward(
                 forward_batch,

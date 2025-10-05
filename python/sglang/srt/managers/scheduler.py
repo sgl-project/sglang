@@ -25,7 +25,7 @@ from concurrent import futures
 from dataclasses import dataclass
 from http import HTTPStatus
 from types import SimpleNamespace
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Deque, Dict, List, Optional, Tuple, Union
 
 import psutil
 import setproctitle
@@ -151,6 +151,7 @@ from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
     ForwardBatchOutput,
     ForwardMode,
     PPProxyTensors,
@@ -216,6 +217,9 @@ class GenerationBatchResult:
 
     # For overlap scheduling
     copy_done: Optional[torch.cuda.Event] = None
+    sample_launch_delayed: bool = False
+    forward_batch: Optional[ForwardBatch] = None
+    future_map_ct: Optional[int] = None
 
     @classmethod
     def from_forward_batch_output(
@@ -234,6 +238,9 @@ class GenerationBatchResult:
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             can_run_cuda_graph=forward_batch_output.can_run_cuda_graph,
             copy_done=forward_batch_output.copy_done,
+            sample_launch_delayed=forward_batch_output.delay_sample_launch,
+            forward_batch=forward_batch_output.forward_batch,
+            future_map_ct=forward_batch_output.future_map_ct,
         )
 
     @classmethod
@@ -979,11 +986,11 @@ class Scheduler(
     @DynamicGradMode()
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
-        self.result_queue = deque()
+        self.result_queue: Deque[Tuple[ScheduleBatch, GenerationBatchResult]] = deque()
 
         while True:
-            # TODO(!!!): handle the last batch sample here, for overlap scheduling + xgrammar
-            self.run_last_batch_sample_if_needed()
+            # When sample_launch_delayed
+            self.launch_last_batch_sample_if_needed()
 
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
@@ -2099,12 +2106,14 @@ class Scheduler(
                     forward_batch_output = self.model_worker.forward_batch_generation(
                         batch_or_worker_batch
                     )
-                    self.future_map.store_to_map(
-                        cur_future_map_ct, bs, forward_batch_output.next_token_ids
-                    )
-
                     copy_done = torch.cuda.Event()
-                    copy_done.record()
+                    if not forward_batch_output.delay_sample_launch:
+                        self.future_map.store_to_map(
+                            cur_future_map_ct, bs, forward_batch_output.next_token_ids
+                        )
+                        copy_done.record()
+                    else:
+                        forward_batch_output.future_map_ct = cur_future_map_ct
 
                     # FIXME(lsyin): move copy_done elsewhere
                     forward_batch_output.copy_done = copy_done
@@ -2117,6 +2126,13 @@ class Scheduler(
                 forward_batch_output = self.model_worker.forward_batch_generation(
                     batch_or_worker_batch
                 )
+                if forward_batch_output.delay_sample_launch:
+                    forward_batch_output.next_token_ids = (
+                        self.model_worker.model_runner.sample(
+                            forward_batch_output.logits_output,
+                            forward_batch_output.forward_batch,
+                        )
+                    )
                 maybe_future_next_token_ids = forward_batch_output.next_token_ids
                 copy_done = None
 
@@ -2158,14 +2174,30 @@ class Scheduler(
             ret = EmbeddingBatchResult(embeddings=embeddings)
         return ret
 
-    def run_last_batch_sample_if_needed(
+    def launch_last_batch_sample_if_needed(
         self,
-    ) -> Union[GenerationBatchResult, EmbeddingBatchResult, None]:
-        # 1. pop left from the result queue
-        # 2. get the future tensor (logits)
-        # 3. sample the next token
-        # 4. update the future map
-        pass
+    ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
+        if len(self.result_queue) == 0:
+            return
+
+        tmp_batch, tmp_result = self.result_queue.popleft()
+
+        tmp_result: GenerationBatchResult
+        if not tmp_result.sample_launch_delayed:
+            self.result_queue.appendleft((tmp_batch, tmp_result))
+            return
+
+        with self.forward_stream_ctx:
+            self.forward_stream.wait_stream(self.default_stream)
+            tmp_result.next_token_ids = self.model_worker.model_runner.sample(
+                tmp_result.logits_output,
+                tmp_result.forward_batch,
+            )
+            tmp_result.copy_done.record()
+            ct = tmp_result.future_map_ct
+            bs = len(tmp_batch.reqs)
+            self.future_map.store_to_map(ct, bs, tmp_result.next_token_ids)
+            self.result_queue.appendleft((tmp_batch, tmp_result))
 
     def run_batch(
         self, batch: ScheduleBatch

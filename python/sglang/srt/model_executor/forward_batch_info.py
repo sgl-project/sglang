@@ -912,6 +912,9 @@ class ForwardBatchOutput:
 
     # For overlap scheduling
     copy_done: Optional[torch.cuda.Event] = None
+    delay_sample_launch: bool = False
+    forward_batch: Optional[ForwardBatch] = None
+    future_map_ct: Optional[int] = None
 
 
 def enable_num_token_non_padded(server_args):
