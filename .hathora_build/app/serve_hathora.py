@@ -118,6 +118,9 @@ def _load_deployment_config() -> DeploymentConfig:
         # Allow L4 in prod by default; can still force H100 via env
         h100_only=os.environ.get("H100_ONLY", "false").lower() in ("1", "true", "yes"),
         auto_use_fp8_on_h100=os.environ.get("AUTO_USE_FP8_ON_H100", "true").lower() in ("1", "true", "yes"),
+        # Memory saver and allocator behavior
+        enable_memory_saver=os.environ.get("ENABLE_MEMORY_SAVER", "true").lower() in ("1", "true", "yes"),
+        enable_expandable_segments=os.environ.get("ENABLE_EXPANDABLE_SEGMENTS", "true").lower() in ("1", "true", "yes"),
         autoscale_target_tokens_per_s=(
             float(os.environ["AUTOSCALE_TARGET_TOKENS_PER_S"]) if os.environ.get("AUTOSCALE_TARGET_TOKENS_PER_S") else None
         ),
@@ -161,6 +164,19 @@ logger.info(f"  model_id: {CONFIG.model_id}")
 logger.info(f"  tp_size: {CONFIG.tp_size}")
 logger.info(f"  dtype: {CONFIG.dtype}, quant: {CONFIG.quantization}, kv: {CONFIG.kv_cache_dtype}")
 logger.info(f"  max_total_tokens: {CONFIG.max_total_tokens}")
+try:
+    # Optional: log concurrency/batch envs if set
+    _mr = os.environ.get("MAX_RUNNING_REQUESTS")
+    _cgb = os.environ.get("CUDA_GRAPH_MAX_BS")
+    _ccy = os.environ.get("CONCURRENCY") or os.environ.get("MAX_CONCURRENCY")
+    if _mr:
+        logger.info(f"  MAX_RUNNING_REQUESTS (env): {_mr}")
+    if _cgb:
+        logger.info(f"  CUDA_GRAPH_MAX_BS (env): {_cgb}")
+    if _ccy:
+        logger.info(f"  CONCURRENCY (env): {_ccy}")
+except Exception:
+    pass
 logger.info(f"  enable_metrics: {CONFIG.enable_metrics}")
 logger.info(f"  h100_only: {CONFIG.h100_only}")
 logger.info(
@@ -270,6 +286,27 @@ async def lifespan(app: FastAPI):
         # Decide whether to skip tokenizer/processor initialization.
         _skip_tokenizer_init = os.environ.get("FORCE_SKIP_TOKENIZER_INIT", "").lower() in ("1", "true", "yes")
 
+        # Read optional overrides from env for concurrency/batch sizing
+        try:
+            _max_running_reqs = int(os.environ.get("MAX_RUNNING_REQUESTS")) if os.environ.get("MAX_RUNNING_REQUESTS") else None
+        except Exception:
+            _max_running_reqs = None
+        try:
+            _cuda_graph_max_bs = int(os.environ.get("CUDA_GRAPH_MAX_BS")) if os.environ.get("CUDA_GRAPH_MAX_BS") else None
+        except Exception:
+            _cuda_graph_max_bs = None
+        # If a generic CONCURRENCY/MAX_CONCURRENCY is provided and explicit knobs are not set, use it for both
+        try:
+            _concurrency_env = os.environ.get("CONCURRENCY") or os.environ.get("MAX_CONCURRENCY")
+            if _concurrency_env is not None:
+                _concurrency_val = int(_concurrency_env)
+                if _max_running_reqs is None:
+                    _max_running_reqs = _concurrency_val
+                if _cuda_graph_max_bs is None:
+                    _cuda_graph_max_bs = _concurrency_val
+        except Exception:
+            pass
+
         engine = sgl.Engine(
             model_path=CONFIG.model_id,
             tokenizer_path=(os.environ.get("TOKENIZER_PATH") or CONFIG.model_id),
@@ -283,6 +320,8 @@ async def lifespan(app: FastAPI):
             disaggregation_decode_tp=os.environ.get("DISAGGREGATION_DECODE_TP") or os.environ.get("DISAGG_DECODE_TP"),
             disaggregation_prefill_pp=os.environ.get("DISAGGREGATION_PREFILL_PP"),
             max_total_tokens=CONFIG.max_total_tokens,
+            # If set, cap concurrent running requests (scheduler will align micro-batches accordingly)
+            max_running_requests=_max_running_reqs,
             enable_memory_saver=getattr(CONFIG, "enable_memory_saver", True),
             disable_custom_all_reduce=True,
             mem_fraction_static=CONFIG.mem_fraction_static,
@@ -307,6 +346,8 @@ async def lifespan(app: FastAPI):
             speculative_num_draft_tokens=CONFIG.speculative_num_draft_tokens,
             speculative_token_map=CONFIG.speculative_token_map,
             speculative_attention_mode=(CONFIG.speculative_attention_mode or "prefill"),
+            # Optional CUDA graph max batch size for capture expansion
+            cuda_graph_max_bs=_cuda_graph_max_bs,
         )
         # Optional warmup to avoid first-request latency
         try:
