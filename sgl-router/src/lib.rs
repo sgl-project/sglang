@@ -226,7 +226,7 @@ impl Router {
     #[pyo3(signature = (
         worker_urls,
         policy = PolicyType::RoundRobin,
-        host = String::from("127.0.0.1"),
+        host = String::from("0.0.0.0"),
         port = 3001,
         worker_startup_timeout_secs = 600,
         worker_startup_check_interval = 30,
