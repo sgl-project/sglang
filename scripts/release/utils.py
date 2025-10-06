@@ -20,13 +20,18 @@ def parse_version(version: str) -> Tuple[int, int, int, int, int]:
     Parse version string into comparable components.
 
     Returns: (major, minor, patch, pre_release, post_release)
-    - pre_release: -1 for rcN (where N is the rc number), 0 for stable
+    - pre_release: -1000 + rc_number for rcN, 0 for stable (rc0 < rc1 < stable)
     - post_release: N for .postN, 0 otherwise
 
+    The pre_release field uses negative numbers to ensure RC versions come before
+    stable versions when tuples are compared. Python compares tuples element by
+    element, so (0, 5, 3, -1000, 0) < (0, 5, 3, 0, 0) ensures rc0 < stable.
+
     Examples:
-    - "0.5.3rc0" → (0, 5, 3, -1, 0)  # rc comes before stable
-    - "0.5.3"    → (0, 5, 3, 0, 0)   # stable version
-    - "0.5.3.post1" → (0, 5, 3, 0, 1)  # post comes after stable
+    - "0.5.3rc0" → (0, 5, 3, -1000, 0)  # rc0 comes before stable
+    - "0.5.3rc1" → (0, 5, 3, -999, 0)   # rc1 comes after rc0
+    - "0.5.3"    → (0, 5, 3, 0, 0)      # stable version
+    - "0.5.3.post1" → (0, 5, 3, 0, 1)   # post comes after stable
     """
     # Match version components
     match = re.match(r"^(\d+)\.(\d+)\.(\d+)(?:rc(\d+)|\.post(\d+))?$", version)
@@ -37,8 +42,8 @@ def parse_version(version: str) -> Tuple[int, int, int, int, int]:
     major, minor, patch = int(major), int(minor), int(patch)
 
     if rc is not None:
-        # RC version: pre_release = -1 (comes before stable)
-        return (major, minor, patch, -1, 0)
+        # RC version: pre_release = -1000 + rc_number (ensures rc0 < rc1 < ... < stable)
+        return (major, minor, patch, -1000 + int(rc), 0)
     elif post is not None:
         # Post version: post_release = N
         return (major, minor, patch, 0, int(post))
