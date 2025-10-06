@@ -62,7 +62,7 @@ def _run_profile(
         "activities": activities,
         "profile_by_stage": profile_by_stage,
     }
-    
+
     # Add profile_stage (always included, defaults to "all")
     json_data["profile_stage"] = profile_stage
 
@@ -84,7 +84,13 @@ def run_profile(
 ):
     # step based profile will self terminate on num_steps constraints
     link = _run_profile(
-        url, num_steps, activities, output_dir, profile_name, profile_by_stage, profile_stage
+        url,
+        num_steps,
+        activities,
+        output_dir,
+        profile_name,
+        profile_by_stage,
+        profile_stage,
     )
     return link
 

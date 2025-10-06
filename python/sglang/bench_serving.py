@@ -593,8 +593,7 @@ async def async_request_gserver(
 
 
 async def async_request_profile(
-    api_url: str, 
-    profile_params: Optional[Dict[str, Any]] = None
+    api_url: str, profile_params: Optional[Dict[str, Any]] = None
 ) -> RequestFuncOutput:
     async with _create_bench_client_session() as session:
         output = RequestFuncOutput()
@@ -1712,13 +1711,17 @@ async def benchmark(
             profile_params["profile_by_stage"] = True
             # Pass stage directly (None means profile all stages)
             profile_params["profile_stage"] = profile_stage
-                
+
         profile_output = await async_request_profile(
             api_url=base_url + "/start_profile",
-            profile_params=profile_params if profile_params else None
+            profile_params=profile_params if profile_params else None,
         )
         if profile_output.success:
-            stage_info = f" ({profile_stage or 'all'} stage{'s' if not profile_stage else ''})" if profile_by_stage else ""
+            stage_info = (
+                f" ({profile_stage or 'all'} stage{'s' if not profile_stage else ''})"
+                if profile_by_stage
+                else ""
+            )
             print(f"Profiler started{stage_info}")
 
     # Run all requests
@@ -1997,10 +2000,10 @@ def run_benchmark(args_: argparse.Namespace):
 
     if not hasattr(args, "mooncake_num_rounds"):
         args.mooncake_num_rounds = 1
-        
+
     if not hasattr(args, "profile_by_stage"):
         args.profile_by_stage = False
-        
+
     if not hasattr(args, "profile_stage"):
         args.profile_stage = "all"
 

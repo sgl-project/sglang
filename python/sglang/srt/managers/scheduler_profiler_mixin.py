@@ -43,7 +43,9 @@ class SchedulerProfilerMixin:
         self.rpd_profiler = None
         # New flags for separate stage profiling
         self.profile_stage: str = "all"  # "prefill", "decode", or "all" (default)
-        self.current_profiling_stage: Optional[str] = None  # Track which stage is being profiled
+        self.current_profiling_stage: Optional[str] = (
+            None  # Track which stage is being profiled
+        )
 
     def init_profile(
         self,
@@ -83,24 +85,30 @@ class SchedulerProfilerMixin:
         # Set default num_steps if None is passed
         if num_steps is None:
             num_steps = 10
-            
+
         self.profile_steps = num_steps
-        
+
         if self.profile_by_stage:
             # Set target counts based on which stage we want to profile
             if self.profile_stage == "prefill":
                 self.profiler_target_prefill_ct = num_steps
                 self.profiler_target_decode_ct = None  # Don't profile decode
-                logger.info(f"PROFILE CONFIG: Stage-based profiling initialized for PREFILL ONLY - target: {num_steps} prefill batches")
+                logger.info(
+                    f"PROFILE CONFIG: Stage-based profiling initialized for PREFILL ONLY - target: {num_steps} prefill batches"
+                )
             elif self.profile_stage == "decode":
                 self.profiler_target_prefill_ct = None  # Don't profile prefill
                 self.profiler_target_decode_ct = num_steps
-                logger.info(f"PROFILE CONFIG: Stage-based profiling initialized for DECODE ONLY - target: {num_steps} decode batches")
+                logger.info(
+                    f"PROFILE CONFIG: Stage-based profiling initialized for DECODE ONLY - target: {num_steps} decode batches"
+                )
             else:  # profile both stages
                 self.profiler_target_prefill_ct = num_steps
                 self.profiler_target_decode_ct = num_steps
-                logger.info(f"PROFILE CONFIG: Stage-based profiling initialized for BOTH STAGES - target: {num_steps} prefill + {num_steps} decode batches")
-            
+                logger.info(
+                    f"PROFILE CONFIG: Stage-based profiling initialized for BOTH STAGES - target: {num_steps} prefill + {num_steps} decode batches"
+                )
+
             # Reset counters
             self.profiler_prefill_ct = 0
             self.profiler_decode_ct = 0
@@ -215,11 +223,11 @@ class SchedulerProfilerMixin:
         if not self.profile_in_progress:
             # Check if there's any configuration to clear
             profiling_configured = (
-                self.profiler_target_prefill_ct is not None or 
-                self.profiler_target_decode_ct is not None or
-                self.profiler_target_forward_ct is not None
+                self.profiler_target_prefill_ct is not None
+                or self.profiler_target_decode_ct is not None
+                or self.profiler_target_forward_ct is not None
             )
-            
+
             if profiling_configured:
                 return ProfileReqOutput(
                     success=True,
@@ -295,8 +303,10 @@ class SchedulerProfilerMixin:
 
     def _profile_batch_predicate(self, batch):
         if self.profile_by_stage:
-            current_batch_stage = "prefill" if batch.forward_mode.is_prefill() else "decode"
-            
+            current_batch_stage = (
+                "prefill" if batch.forward_mode.is_prefill() else "decode"
+            )
+
             # Check for stage transition - stop profiling if stage changes
             if self.profile_in_progress and self.current_profiling_stage:
                 if current_batch_stage != self.current_profiling_stage:
@@ -314,26 +324,34 @@ class SchedulerProfilerMixin:
                         self.profiler_target_decode_ct = None
                         self.profiler_decode_ct = 0
                     self.current_profiling_stage = None
-                
+
             if batch.forward_mode.is_prefill():
                 # Only profile prefill if we want to profile prefill and haven't reached target
                 should_profile_prefill = (
-                    self.profile_by_stage and
-                    (self.profile_stage == "prefill" or self.profile_stage == "all") and 
-                    self.profiler_target_prefill_ct is not None and 
-                    self.profiler_target_prefill_ct > 0
+                    self.profile_by_stage
+                    and (self.profile_stage == "prefill" or self.profile_stage == "all")
+                    and self.profiler_target_prefill_ct is not None
+                    and self.profiler_target_prefill_ct > 0
                 )
-                
+
                 if should_profile_prefill:
                     # Start profiling if this is the first prefill batch and no profiling is active
                     if self.profiler_prefill_ct == 0 and not self.profile_in_progress:
-                        logger.info(f"PROFILE START: Beginning prefill profiling (target: {self.profiler_target_prefill_ct} steps)")
+                        logger.info(
+                            f"PROFILE START: Beginning prefill profiling (target: {self.profiler_target_prefill_ct} steps)"
+                        )
                         self.start_profile(batch.forward_mode)
-                    
-                    if self.profile_in_progress and self.current_profiling_stage and self.current_profiling_stage == "prefill":
+
+                    if (
+                        self.profile_in_progress
+                        and self.current_profiling_stage
+                        and self.current_profiling_stage == "prefill"
+                    ):
                         # Check if we have profiled enough steps before processing the current one
                         if self.profiler_prefill_ct >= self.profiler_target_prefill_ct:
-                            logger.info(f"PROFILE STOP: Prefill profiling complete after {self.profiler_target_prefill_ct} steps")
+                            logger.info(
+                                f"PROFILE STOP: Prefill profiling complete after {self.profiler_target_prefill_ct} steps"
+                            )
                             self.stop_profile(stage=ForwardMode.EXTEND)
                             self.profiler_target_prefill_ct = None
                             self.profiler_prefill_ct = 0
@@ -341,45 +359,63 @@ class SchedulerProfilerMixin:
                             return
 
                         self.profiler_prefill_ct += 1
-                        logger.info(f"PROFILE: Prefill batch {self.profiler_prefill_ct}/{self.profiler_target_prefill_ct} processed")
-   
+                        logger.info(
+                            f"PROFILE: Prefill batch {self.profiler_prefill_ct}/{self.profiler_target_prefill_ct} processed"
+                        )
+
                 else:
-                    logger.debug(f"PREFILL: Not profiling this stage (filter='{self.profile_stage}')")
-                                
+                    logger.debug(
+                        f"PREFILL: Not profiling this stage (filter='{self.profile_stage}')"
+                    )
+
             elif batch.forward_mode.is_decode():
                 # Only profile decode if we want to profile decode and haven't reached target
                 should_profile_decode = (
-                    self.profile_by_stage and
-                    (self.profile_stage == "decode" or self.profile_stage == "all") and 
-                    self.profiler_target_decode_ct is not None and 
-                    self.profiler_target_decode_ct > 0
+                    self.profile_by_stage
+                    and (self.profile_stage == "decode" or self.profile_stage == "all")
+                    and self.profiler_target_decode_ct is not None
+                    and self.profiler_target_decode_ct > 0
                 )
 
                 if should_profile_decode:
                     # Start profiling if this is the first decode batch and no profiling is active
                     if self.profiler_decode_ct == 0 and not self.profile_in_progress:
-                        logger.info(f"PROFILE START: Beginning decode profiling (target: {self.profiler_target_decode_ct} steps)")
+                        logger.info(
+                            f"PROFILE START: Beginning decode profiling (target: {self.profiler_target_decode_ct} steps)"
+                        )
                         self.start_profile(batch.forward_mode)
 
-                    if self.profile_in_progress and self.current_profiling_stage and self.current_profiling_stage == "decode":
+                    if (
+                        self.profile_in_progress
+                        and self.current_profiling_stage
+                        and self.current_profiling_stage == "decode"
+                    ):
                         # Check if we have profiled enough steps before processing the current one
                         if self.profiler_decode_ct >= self.profiler_target_decode_ct:
-                            logger.info(f"PROFILE STOP: Decode profiling complete after {self.profiler_target_decode_ct} steps")
+                            logger.info(
+                                f"PROFILE STOP: Decode profiling complete after {self.profiler_target_decode_ct} steps"
+                            )
                             self.stop_profile(stage=ForwardMode.DECODE)
                             self.profiler_target_decode_ct = None
                             self.profiler_decode_ct = 0
                             self.current_profiling_stage = None
                             return
-                        
+
                         self.profiler_decode_ct += 1
-                        logger.info(f"PROFILE: Decode batch {self.profiler_decode_ct}/{self.profiler_target_decode_ct} processed")
+                        logger.info(
+                            f"PROFILE: Decode batch {self.profiler_decode_ct}/{self.profiler_target_decode_ct} processed"
+                        )
                 else:
-                    logger.debug(f"DECODE: Not profiling this stage (filter='{self.profile_stage}')")
-                                
+                    logger.debug(
+                        f"DECODE: Not profiling this stage (filter='{self.profile_stage}')"
+                    )
+
             elif batch.forward_mode.is_idle():
                 logger.debug("IDLE: Skipping idle batch")
             else:
-                logger.error(f"PROFILE ERROR: Unsupported batch stage: {batch.forward_mode}")
+                logger.error(
+                    f"PROFILE ERROR: Unsupported batch stage: {batch.forward_mode}"
+                )
                 raise RuntimeError(f"unsupported profile stage: {batch.forward_mode}")
         else:
             # Check profiler
@@ -397,8 +433,8 @@ class SchedulerProfilerMixin:
     def profile(self, recv_req: ProfileReq):
         if recv_req.type == ProfileReqType.START_PROFILE:
             # Extract profile_stage from request if available, default to "decode"
-            profile_stage = getattr(recv_req, 'profile_stage', "all")
-            
+            profile_stage = getattr(recv_req, "profile_stage", "all")
+
             if recv_req.profile_by_stage or recv_req.start_step:
                 return self.init_profile(
                     recv_req.output_dir,
