@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
-import custom_ops
 import torch
 import torch_npu
 
