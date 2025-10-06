@@ -151,6 +151,9 @@ RUN git clone https://github.com/Dao-AILab/fast-hadamard-transform && \
     git checkout ${FAST_HADAMARD_TRANSFORM_COMMIT} && \
     pip install .
 
+# Install tilelang
+RUN pip install tilelang==0.1.6.post1
+
 # Python tools
 RUN python3 -m pip install --no-cache-dir \
     datamodel_code_generator \
