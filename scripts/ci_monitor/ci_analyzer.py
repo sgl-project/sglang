@@ -41,7 +41,11 @@ class SGLangCIAnalyzer:
 
         while len(all_runs) < limit:
             url = f"{self.base_url}/repos/{self.repo}/actions/runs"
-            params = {"per_page": min(per_page, limit - len(all_runs)), "page": page}
+            params = {
+                "per_page": min(per_page, limit - len(all_runs)),
+                "page": page,
+                "branch": "main",
+            }
 
             try:
                 response = self.session.get(url, params=params)
