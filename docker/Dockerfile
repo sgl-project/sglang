@@ -140,7 +140,7 @@ RUN cd /sgl-workspace/DeepEP && \
     NVSHMEM_DIR=${NVSHMEM_DIR} TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" pip install .
 
 # Install flashmla
-RUN if [ "$TARGETARCH" = "linux/amd64" ]; then \
+RUN if [ "$TARGETARCH" = "amd64" ]; then \
       git clone https://github.com/deepseek-ai/FlashMLA.git flash-mla && \
       cd flash-mla && \
       git checkout ${FLASHMLA_COMMIT} && \
@@ -149,7 +149,7 @@ RUN if [ "$TARGETARCH" = "linux/amd64" ]; then \
     fi
 
 # Install fast-hadamard-transform
-RUN if [ "$TARGETARCH" = "linux/amd64" ]; then \
+RUN if [ "$TARGETARCH" = "amd64" ]; then \
       git clone https://github.com/Dao-AILab/fast-hadamard-transform && \
       cd fast-hadamard-transform && \
       git checkout ${FAST_HADAMARD_TRANSFORM_COMMIT} && \
@@ -157,7 +157,7 @@ RUN if [ "$TARGETARCH" = "linux/amd64" ]; then \
     fi
 
 # Install tilelang
-RUN if [ "$TARGETARCH" = "linux/amd64" ]; then \
+RUN if [ "$TARGETARCH" = "amd64" ]; then \
       pip install tilelang==0.1.6.post1 ; \
     fi
 
