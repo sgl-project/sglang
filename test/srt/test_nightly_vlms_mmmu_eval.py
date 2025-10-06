@@ -24,7 +24,7 @@ MODEL_THRESHOLDS = {
     ): ModelEvalMetrics(0.330, 56.1),
     ModelLaunchSettings(
         "deepseek-ai/Janus-Pro-7B", extra_args=VLM_EXTRA_ARGS
-    ): ModelEvalMetrics(0.285, 39.9),
+    ): ModelEvalMetrics(0.285, 40.3),
     ModelLaunchSettings(
         "Efficient-Large-Model/NVILA-Lite-2B-hf-0626", extra_args=VLM_EXTRA_ARGS
     ): ModelEvalMetrics(0.305, 23.8),
