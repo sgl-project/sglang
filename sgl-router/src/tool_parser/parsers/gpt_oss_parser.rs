@@ -238,6 +238,6 @@ impl ToolParser for GptOssParser {
     }
 
     fn has_tool_markers(&self, text: &str) -> bool {
-        text.contains("<|channel|>commentary to=")
+        text.contains("<|channel|>commentary")
     }
 }
