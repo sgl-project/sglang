@@ -135,7 +135,6 @@ class ModernBertSelfAttention(nn.Module):
         if self.is_global_layer:
             max_position_embeddings = config.max_position_embeddings
         else:
-            # use max_position_embeddings can be better than local_attention
             max_position_embeddings = config.local_attention
 
         self.rotary_emb = get_rope(
@@ -182,17 +181,13 @@ class ModernBertSelfAttention(nn.Module):
         k = k.contiguous()
         v = v.contiguous()
 
-        # Apply rotary embeddings with dtype conversion for CUDA kernel compatibility
+        # Apply rotary embeddings
         if q.dtype == torch.float32:
-            # Convert to float16 for CUDA kernel, then convert back
-            orig_dtype = q.dtype
-            q_half = q.to(torch.float16)
-            k_half = k.to(torch.float16)
-            q_half, k_half = self.rotary_emb.forward(
-                forward_batch.positions, q_half, k_half
-            )
-            q = q_half.to(orig_dtype)
-            k = k_half.to(orig_dtype)
+            # For float32, use forward_native to avoid precision loss
+            positions = forward_batch.positions
+            max_pos = self.rotary_emb.max_position_embeddings - 1
+            positions = torch.clamp(positions, 0, max_pos)
+            q, k = self.rotary_emb.forward_native(positions, q, k)
         else:
             q, k = self.rotary_emb.forward(forward_batch.positions, q, k)
 
@@ -380,10 +375,6 @@ class ModernBertModel(nn.Module):
             ("model.final_norm", "encoder.final_norm"),
             (".attn.Wqkv", ".attention.qkv_proj"),
             (".attn.Wo", ".attention.out_proj"),
-            (".mlp.Wi", ".mlp.Wi"),
-            (".mlp.Wo", ".mlp.Wo"),
-            (".attn_norm", ".attn_norm"),
-            (".mlp_norm", ".mlp_norm"),
         )
 
         for name, loaded_weight in weights:
