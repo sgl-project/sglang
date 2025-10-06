@@ -447,6 +447,7 @@ def latency_test_run_once(
     profile_record_shapes,
     profile_filename_prefix,
     cuda_profiler,
+    cuda_profiler_stage,
     tp_rank,
 ):
     max_batch_size = model_runner.max_total_num_tokens // (input_len + output_len)
@@ -484,7 +485,7 @@ def latency_test_run_once(
         profiler.start()
 
     # Prefill
-    if cuda_profiler:
+    if cuda_profiler and cuda_profiler_stage in ["all", "prefill"]:
         start_cuda_profiler(rank_print)
 
     synchronize(device)
@@ -493,7 +494,7 @@ def latency_test_run_once(
     synchronize(device)
     prefill_latency = time.perf_counter() - tic
 
-    if cuda_profiler:
+    if cuda_profiler and cuda_profiler_stage in ["all", "prefill"]:
         stop_cuda_profiler(rank_print)
         rank_print(
             f"CUDA profiler trace for prefill completed (batch={batch_size}, input={input_len}, output={output_len})"
@@ -530,7 +531,11 @@ def latency_test_run_once(
             )
             profiler.start()
 
-        if cuda_profiler and i == output_len // 2:
+        if (
+            cuda_profiler
+            and cuda_profiler_stage in ["all", "decode"]
+            and i == output_len // 2
+        ):
             start_cuda_profiler(rank_print)
 
         tic = time.perf_counter()
@@ -538,7 +543,11 @@ def latency_test_run_once(
         synchronize(device)
         latency = time.perf_counter() - tic
 
-        if cuda_profiler and i == output_len // 2:
+        if (
+            cuda_profiler
+            and cuda_profiler_stage in ["all", "decode"]
+            and i == output_len // 2
+        ):
             stop_cuda_profiler(rank_print)
             rank_print(
                 f"CUDA profiler trace for decode completed (batch={batch_size}, input={input_len}, output={output_len})"
@@ -621,6 +630,7 @@ def latency_test(
         profile_record_shapes=False,
         profile_filename_prefix="",  # not used
         cuda_profiler=False,  # no profiling during warmup
+        cuda_profiler_stage="all",  # not used during warmup
         tp_rank=tp_rank,
     )
 
@@ -670,6 +680,7 @@ def latency_test(
             bench_args.profile_record_shapes if tp_rank == 0 else None,
             bench_args.profile_filename_prefix,
             bench_args.cuda_profiler if tp_rank == 0 else False,
+            bench_args.cuda_profiler_stage,
             tp_rank,
         )
         if ret is not None:
