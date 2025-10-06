@@ -1,0 +1,94 @@
+name: Bot Bump SGLang Version
+
+on:
+  workflow_dispatch:
+    inputs:
+      new_version:
+        description: 'New SGLang version (e.g., 0.5.3 or 0.5.3rc0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump-sglang-version:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Configure Git
+        run: |
+          git config user.name "sglang-bot"
+          git config user.email "sglang-bot@users.noreply.github.com"
+
+      - name: Create new branch
+        run: |
+          BRANCH_NAME="bot/bump-sglang-version-${{ github.event.inputs.new_version }}"
+          git checkout -b "$BRANCH_NAME"
+          echo "BRANCH_NAME=$BRANCH_NAME" >> $GITHUB_ENV
+
+      - name: Run SGLang version bump script
+        run: |
+          python scripts/release/bump_sglang_version.py "${{ github.event.inputs.new_version }}"
+
+      - name: Commit changes
+        run: |
+          git add -A
+          git commit -m "chore: bump SGLang version to ${{ github.event.inputs.new_version }}
+
+          This commit updates the SGLang version across all relevant files:
+          - Makefile
+          - benchmark/deepseek_v3/README.md
+          - docker/Dockerfile.rocm
+          - docs/get_started/install.md
+          - docs/platforms/amd_gpu.md
+          - docs/platforms/ascend_npu.md
+          - python/pyproject.toml
+          - python/pyproject_other.toml
+          - python/sglang/version.py
+
+          🤖 Generated with GitHub Actions"
+
+      - name: Push changes
+        run: |
+          git push origin "$BRANCH_NAME"
+
+      - name: Create Pull Request
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr create \
+            --title "chore: bump SGLang version to ${{ github.event.inputs.new_version }}" \
+            --body "## Summary
+
+          This PR bumps the SGLang version to \`${{ github.event.inputs.new_version }}\` across all relevant files.
+
+          ## Files Updated
+          - Makefile
+          - benchmark/deepseek_v3/README.md
+          - docker/Dockerfile.rocm
+          - docs/get_started/install.md
+          - docs/platforms/amd_gpu.md
+          - docs/platforms/ascend_npu.md
+          - python/pyproject.toml
+          - python/pyproject_other.toml
+          - python/sglang/version.py
+
+          ## Testing
+          - [ ] Verify all version strings are updated correctly
+          - [ ] Test installation with new version
+          - [ ] Run CI tests
+
+          🤖 Generated with GitHub Actions" \
+            --base main \
+            --head "$BRANCH_NAME"
