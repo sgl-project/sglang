@@ -166,8 +166,6 @@ class GenerateReqInput(BaseReq):
     # For custom metric labels
     custom_labels: Optional[Dict[str, str]] = None
 
-    # (Deprecated, please use custom_labels) Label for the request
-    label: Optional[str] = None
     # (Internal) Whether to return bytes for image generation
     return_bytes: bool = False
 
@@ -568,7 +566,6 @@ class GenerateReqInput(BaseReq):
             extra_key=self.extra_key,
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
-            label=self.label,
             return_bytes=self.return_bytes,
         )
 
@@ -632,8 +629,6 @@ class TokenizedGenerateReqInput(BaseReq):
     # tracing context
     trace_context: Optional[Dict] = None
 
-    # (Deprecated, please use custom_labels) Label for the request
-    label: Optional[str] = None
     # (Internal) Whether to return bytes for image generation
     return_bytes: bool = False
 
