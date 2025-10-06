@@ -62,7 +62,7 @@ jobs:
   sgl-kernel-build-wheels:
     needs: [check-changes]
     if: needs.check-changes.outputs.sgl_kernel == 'true'
-    runs-on: sgl-kernel-build-node
+    runs-on: x64-kernel-build-node
     strategy:
       matrix:
         include:
@@ -155,7 +155,7 @@ jobs:
 
   sgl-kernel-benchmark-test:
     needs: [check-changes, sgl-kernel-build-wheels]
-    if: always() && !failure() && !cancelled()
+    if: needs.check-changes.outputs.sgl_kernel == 'true'
     runs-on: 1-gpu-runner
     env:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
@@ -323,7 +323,7 @@ jobs:
     needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
     if: always() && !failure() && !cancelled() &&
         ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-    runs-on: 8-gpu-runner
+    runs-on: 8-gpu-h200
     strategy:
       fail-fast: false
       matrix:
@@ -459,6 +459,39 @@ jobs:
         run: |
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_vlm_online_latency
+
+  performance-test-1-gpu-part-3:
+    needs: [check-changes, sgl-kernel-build-wheels]
+    if: always() && !failure() && !cancelled() &&
+        ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    runs-on: 1-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download artifacts
+        if: needs.check-changes.outputs.sgl_kernel == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda12.9
+
+      - name: Install dependencies
+        run: |
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
+
+      - name: Benchmark Scores online latency and throughput
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_score_api_latency_throughput
+
+      - name: Benchmark Scores online latency and throughput (batch size scaling)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_score_api_batch_scaling
 
   performance-test-2-gpu:
     needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
@@ -608,7 +641,7 @@ jobs:
     needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
     if: always() && !failure() && !cancelled() &&
         ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-    runs-on: 8-gpu-runner
+    runs-on: 8-gpu-h200
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -635,7 +668,7 @@ jobs:
     needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
     if: always() && !failure() && !cancelled() &&
         ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-    runs-on: 4-b200-runner
+    runs-on: 4-gpu-b200
     strategy:
       fail-fast: false
     steps:
@@ -669,7 +702,8 @@ jobs:
 
       unit-test-frontend, unit-test-backend-1-gpu,
       unit-test-backend-2-gpu, unit-test-backend-4-gpu, unit-test-backend-8-gpu,
-      performance-test-1-gpu-part-1, performance-test-1-gpu-part-2, performance-test-2-gpu,
+      performance-test-1-gpu-part-1, performance-test-1-gpu-part-2, performance-test-1-gpu-part-3,
+      performance-test-2-gpu,
       accuracy-test-1-gpu, accuracy-test-2-gpu,
       unit-test-deepep-4-gpu, unit-test-deepep-8-gpu,
       unit-test-backend-4-gpu-b200,
