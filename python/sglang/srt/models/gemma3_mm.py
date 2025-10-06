@@ -165,6 +165,13 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         self.config = config
         self.quant_config = quant_config
 
+        # For LoRA compatibility: expose text_config attributes at top level
+        # This allows LoRA code to work without special multimodal handling
+        if not hasattr(config, "num_hidden_layers"):
+            config.num_hidden_layers = config.text_config.num_hidden_layers
+        if not hasattr(config, "hidden_size"):
+            config.hidden_size = config.text_config.hidden_size
+
         self.vision_tower = SiglipVisionModel(
             config=config.vision_config,
             quant_config=quant_config,
