@@ -1,40 +1,27 @@
 import json
 import os
-import subprocess
 import time
 import unittest
 from types import SimpleNamespace
-from urllib.parse import urlparse
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from sglang.test.test_disaggregation_utils import TestDisaggregationBase
 from sglang.test.test_utils import (
     DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
     DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    DEFAULT_URL_FOR_TEST,
-    CustomTestCase,
     popen_launch_pd_server,
 )
 
 
-class TestDisaggregationAccuracy(CustomTestCase):
+class TestDisaggregationAccuracy(TestDisaggregationBase):
     @classmethod
     def setUpClass(cls):
+        super().setUpClass()
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
-        parsed_url = urlparse(DEFAULT_URL_FOR_TEST)
-        cls.base_host = parsed_url.hostname
-        base_port = str(parsed_url.port)
-        cls.lb_port = base_port
-        cls.prefill_port = f"{int(base_port) + 100}"
-        cls.decode_port = f"{int(base_port) + 200}"
-        cls.prefill_url = f"http://{cls.base_host}:{cls.prefill_port}"
-        cls.decode_url = f"http://{cls.base_host}:{cls.decode_port}"
-        cls.lb_url = f"http://{cls.base_host}:{cls.lb_port}"
-        print(f"{cls.base_host=} {cls.lb_port=} {cls.prefill_port=} {cls.decode_port=}")
 
         # Non blocking start servers
         cls.start_prefill()
@@ -44,25 +31,7 @@ class TestDisaggregationAccuracy(CustomTestCase):
         cls.wait_server_ready(cls.prefill_url + "/health")
         cls.wait_server_ready(cls.decode_url + "/health")
 
-        lb_command = [
-            "python3",
-            "-m",
-            "sglang.srt.disaggregation.mini_lb",
-            "--prefill",
-            cls.prefill_url,
-            "--decode",
-            cls.decode_url,
-            "--host",
-            cls.base_host,
-            "--port",
-            cls.lb_port,
-        ]
-
-        print("Starting load balancer:", " ".join(lb_command))
-        cls.process_lb = subprocess.Popen(
-            lb_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-        )
-        cls.wait_server_ready(cls.lb_url + "/health")
+        cls.launch_lb()
 
     @classmethod
     def start_prefill(cls):
@@ -71,9 +40,9 @@ class TestDisaggregationAccuracy(CustomTestCase):
             "--disaggregation-mode",
             "prefill",
             "--tp",
-            "1",
+            "2",
             "--disaggregation-ib-device",
-            "mlx5_roce0",
+            "mlx5_roce0,mlx5_roce1",
         ]
         cls.process_prefill = popen_launch_pd_server(
             cls.model,
@@ -89,11 +58,11 @@ class TestDisaggregationAccuracy(CustomTestCase):
             "--disaggregation-mode",
             "decode",
             "--tp",
-            "1",
+            "2",
             "--base-gpu-id",
-            "1",
+            "2",
             "--disaggregation-ib-device",
-            "mlx5_roce1",
+            "mlx5_roce2,mlx5_roce3",
         ]
         cls.process_decode = popen_launch_pd_server(
             cls.model,
@@ -101,34 +70,6 @@ class TestDisaggregationAccuracy(CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=decode_args,
         )
-
-    @classmethod
-    def wait_server_ready(cls, url, timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH):
-        start_time = time.perf_counter()
-        while True:
-            try:
-                response = requests.get(url)
-                if response.status_code == 200:
-                    print(f"Server {url} is ready")
-                    return
-            except Exception:
-                pass
-
-            if time.perf_counter() - start_time > timeout:
-                raise RuntimeError(f"Server {url} failed to start in {timeout}s")
-            time.sleep(1)
-
-    @classmethod
-    def tearDownClass(cls):
-        for process in [cls.process_lb, cls.process_decode, cls.process_prefill]:
-            if process:
-                try:
-                    kill_process_tree(process.pid)
-                except Exception as e:
-                    print(f"Error killing process {process.pid}: {e}")
-
-        # wait for 5 seconds
-        time.sleep(5)
 
     def test_gsm8k(self):
         args = SimpleNamespace(
@@ -199,23 +140,14 @@ class TestDisaggregationAccuracy(CustomTestCase):
         json.loads(output)
 
 
-class TestDisaggregationMooncakeFailure(CustomTestCase):
+class TestDisaggregationMooncakeFailure(TestDisaggregationBase):
     @classmethod
     def setUpClass(cls):
+        super().setUpClass()
         # set DISAGGREGATION_TEST_FAILURE_PROB to simulate failure
         os.environ["DISAGGREGATION_TEST_FAILURE_PROB"] = "0.05"
 
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
-        parsed_url = urlparse(DEFAULT_URL_FOR_TEST)
-        cls.base_host = parsed_url.hostname
-        base_port = str(parsed_url.port)
-        cls.lb_port = base_port
-        cls.prefill_port = f"{int(base_port) + 100}"
-        cls.decode_port = f"{int(base_port) + 200}"
-        cls.prefill_url = f"http://{cls.base_host}:{cls.prefill_port}"
-        cls.decode_url = f"http://{cls.base_host}:{cls.decode_port}"
-        cls.lb_url = f"http://{cls.base_host}:{cls.lb_port}"
-        print(f"{cls.base_host=} {cls.lb_port=} {cls.prefill_port=} {cls.decode_port=}")
 
         # Non blocking start servers
         cls.start_prefill()
@@ -225,25 +157,12 @@ class TestDisaggregationMooncakeFailure(CustomTestCase):
         cls.wait_server_ready(cls.prefill_url + "/health")
         cls.wait_server_ready(cls.decode_url + "/health")
 
-        lb_command = [
-            "python3",
-            "-m",
-            "sglang.srt.disaggregation.mini_lb",
-            "--prefill",
-            cls.prefill_url,
-            "--decode",
-            cls.decode_url,
-            "--host",
-            cls.base_host,
-            "--port",
-            cls.lb_port,
-        ]
+        cls.launch_lb()
 
-        print("Starting load balancer:", " ".join(lb_command))
-        cls.process_lb = subprocess.Popen(
-            lb_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-        )
-        cls.wait_server_ready(cls.lb_url + "/health")
+    @classmethod
+    def tearDownClass(cls):
+        os.environ.pop("DISAGGREGATION_TEST_FAILURE_PROB")
+        super().tearDownClass()
 
     @classmethod
     def start_prefill(cls):
@@ -252,9 +171,9 @@ class TestDisaggregationMooncakeFailure(CustomTestCase):
             "--disaggregation-mode",
             "prefill",
             "--tp",
-            "1",
+            "2",
             "--disaggregation-ib-device",
-            "mlx5_roce0",
+            "mlx5_roce0,mlx5_roce1",
         ]
         cls.process_prefill = popen_launch_pd_server(
             cls.model,
@@ -270,11 +189,11 @@ class TestDisaggregationMooncakeFailure(CustomTestCase):
             "--disaggregation-mode",
             "decode",
             "--tp",
-            "1",
+            "2",
             "--base-gpu-id",
-            "1",
+            "2",
             "--disaggregation-ib-device",
-            "mlx5_roce1",
+            "mlx5_roce2,mlx5_roce3",
         ]
         cls.process_decode = popen_launch_pd_server(
             cls.model,
@@ -282,36 +201,6 @@ class TestDisaggregationMooncakeFailure(CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=decode_args,
         )
-
-    @classmethod
-    def wait_server_ready(cls, url, timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH):
-        start_time = time.perf_counter()
-        while True:
-            try:
-                response = requests.get(url)
-                if response.status_code == 200:
-                    print(f"Server {url} is ready")
-                    return
-            except Exception:
-                pass
-
-            if time.perf_counter() - start_time > timeout:
-                raise RuntimeError(f"Server {url} failed to start in {timeout}s")
-            time.sleep(1)
-
-    @classmethod
-    def tearDownClass(cls):
-        # unset DISAGGREGATION_TEST_FAILURE_PROB
-        os.environ.pop("DISAGGREGATION_TEST_FAILURE_PROB")
-        for process in [cls.process_lb, cls.process_decode, cls.process_prefill]:
-            if process:
-                try:
-                    kill_process_tree(process.pid)
-                except Exception as e:
-                    print(f"Error killing process {process.pid}: {e}")
-
-        # wait for 5 seconds
-        time.sleep(5)
 
     def test_gsm8k(self):
         args = SimpleNamespace(
@@ -341,21 +230,13 @@ class TestDisaggregationMooncakeFailure(CustomTestCase):
                 raise e from health_check_error
 
 
-class TestDisaggregationMooncakeSpec(CustomTestCase):
+class TestDisaggregationMooncakeSpec(TestDisaggregationBase):
 
     @classmethod
     def setUpClass(cls):
+        super().setUpClass()
         cls.model = DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST
         cls.draft_model = DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST
-        parsed_url = urlparse(DEFAULT_URL_FOR_TEST)
-        cls.base_host = parsed_url.hostname
-        base_port = str(parsed_url.port)
-        cls.lb_port = base_port
-        cls.prefill_port = f"{int(base_port) + 100}"
-        cls.decode_port = f"{int(base_port) + 200}"
-        cls.prefill_url = f"http://{cls.base_host}:{cls.prefill_port}"
-        cls.decode_url = f"http://{cls.base_host}:{cls.decode_port}"
-        cls.lb_url = f"http://{cls.base_host}:{cls.lb_port}"
         cls.spec_args = [
             "--speculative-algorithm",
             "EAGLE",
@@ -380,41 +261,7 @@ class TestDisaggregationMooncakeSpec(CustomTestCase):
         cls.wait_server_ready(cls.prefill_url + "/health")
         cls.wait_server_ready(cls.decode_url + "/health")
 
-        lb_command = [
-            "python3",
-            "-m",
-            "sglang.srt.disaggregation.mini_lb",
-            "--prefill",
-            cls.prefill_url,
-            "--decode",
-            cls.decode_url,
-            "--host",
-            cls.base_host,
-            "--port",
-            cls.lb_port,
-        ]
-
-        print("Starting load balancer:", " ".join(lb_command))
-        cls.process_lb = subprocess.Popen(
-            lb_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-        )
-        cls.wait_server_ready(cls.lb_url + "/health")
-
-    @classmethod
-    def wait_server_ready(cls, url, timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH):
-        start_time = time.perf_counter()
-        while True:
-            try:
-                response = requests.get(url)
-                if response.status_code == 200:
-                    print(f"Server {url} is ready")
-                    return
-            except Exception:
-                pass
-
-            if time.perf_counter() - start_time > timeout:
-                raise RuntimeError(f"Server {url} failed to start in {timeout}s")
-            time.sleep(1)
+        cls.launch_lb()
 
     @classmethod
     def start_prefill(cls):
@@ -454,18 +301,6 @@ class TestDisaggregationMooncakeSpec(CustomTestCase):
             other_args=decode_args,
         )
 
-    @classmethod
-    def tearDownClass(cls):
-        for process in [cls.process_lb, cls.process_decode, cls.process_prefill]:
-            if process:
-                try:
-                    kill_process_tree(process.pid)
-                except Exception as e:
-                    print(f"Error killing process {process.pid}: {e}")
-
-        # wait for 5 seconds
-        time.sleep(5)
-
     def test_gsm8k(self):
         args = SimpleNamespace(
             num_shots=5,
@@ -482,21 +317,12 @@ class TestDisaggregationMooncakeSpec(CustomTestCase):
         self.assertGreater(metrics["accuracy"], 0.20)
 
 
-class TestDisaggregationSimulatedRetract(CustomTestCase):
+class TestDisaggregationSimulatedRetract(TestDisaggregationBase):
     @classmethod
     def setUpClass(cls):
+        super().setUpClass()
         os.environ["SGLANG_TEST_RETRACT"] = "true"
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
-        parsed_url = urlparse(DEFAULT_URL_FOR_TEST)
-        cls.base_host = parsed_url.hostname
-        base_port = str(parsed_url.port)
-        cls.lb_port = base_port
-        cls.prefill_port = f"{int(base_port) + 100}"
-        cls.decode_port = f"{int(base_port) + 200}"
-        cls.prefill_url = f"http://{cls.base_host}:{cls.prefill_port}"
-        cls.decode_url = f"http://{cls.base_host}:{cls.decode_port}"
-        cls.lb_url = f"http://{cls.base_host}:{cls.lb_port}"
-        print(f"{cls.base_host=} {cls.lb_port=} {cls.prefill_port=} {cls.decode_port=}")
 
         # Non blocking start servers
         cls.start_prefill()
@@ -506,25 +332,12 @@ class TestDisaggregationSimulatedRetract(CustomTestCase):
         cls.wait_server_ready(cls.prefill_url + "/health")
         cls.wait_server_ready(cls.decode_url + "/health")
 
-        lb_command = [
-            "python3",
-            "-m",
-            "sglang.srt.disaggregation.mini_lb",
-            "--prefill",
-            cls.prefill_url,
-            "--decode",
-            cls.decode_url,
-            "--host",
-            cls.base_host,
-            "--port",
-            cls.lb_port,
-        ]
+        cls.launch_lb()
 
-        print("Starting load balancer:", " ".join(lb_command))
-        cls.process_lb = subprocess.Popen(
-            lb_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-        )
-        cls.wait_server_ready(cls.lb_url + "/health")
+    @classmethod
+    def tearDownClass(cls):
+        os.environ.pop("SGLANG_TEST_RETRACT")
+        super().tearDownClass()
 
     @classmethod
     def start_prefill(cls):
@@ -533,9 +346,9 @@ class TestDisaggregationSimulatedRetract(CustomTestCase):
             "--disaggregation-mode",
             "prefill",
             "--tp",
-            "1",
+            "2",
             "--disaggregation-ib-device",
-            "mlx5_roce0",
+            "mlx5_roce0,mlx5_roce1",
         ]
         cls.process_prefill = popen_launch_pd_server(
             cls.model,
@@ -551,11 +364,11 @@ class TestDisaggregationSimulatedRetract(CustomTestCase):
             "--disaggregation-mode",
             "decode",
             "--tp",
-            "1",
+            "2",
             "--base-gpu-id",
-            "1",
+            "2",
             "--disaggregation-ib-device",
-            "mlx5_roce1",
+            "mlx5_roce2,mlx5_roce3",
         ]
         cls.process_decode = popen_launch_pd_server(
             cls.model,
@@ -563,35 +376,6 @@ class TestDisaggregationSimulatedRetract(CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=decode_args,
         )
-
-    @classmethod
-    def wait_server_ready(cls, url, timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH):
-        start_time = time.perf_counter()
-        while True:
-            try:
-                response = requests.get(url)
-                if response.status_code == 200:
-                    print(f"Server {url} is ready")
-                    return
-            except Exception:
-                pass
-
-            if time.perf_counter() - start_time > timeout:
-                raise RuntimeError(f"Server {url} failed to start in {timeout}s")
-            time.sleep(1)
-
-    @classmethod
-    def tearDownClass(cls):
-        os.environ.pop("SGLANG_TEST_RETRACT")
-        for process in [cls.process_lb, cls.process_decode, cls.process_prefill]:
-            if process:
-                try:
-                    kill_process_tree(process.pid)
-                except Exception as e:
-                    print(f"Error killing process {process.pid}: {e}")
-
-        # wait for 5 seconds
-        time.sleep(5)
 
     def test_gsm8k(self):
         args = SimpleNamespace(

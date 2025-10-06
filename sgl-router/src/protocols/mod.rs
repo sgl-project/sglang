@@ -3,3 +3,4 @@
 
 pub mod spec;
 pub mod validation;
+pub mod worker_spec;

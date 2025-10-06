@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import logging
 from enum import Enum
 from functools import lru_cache
 from typing import TYPE_CHECKING, Optional
@@ -12,10 +13,11 @@ from sglang.srt.layers.dp_attention import (
     get_attention_dp_size,
     is_dp_attention_enabled,
 )
-from sglang.srt.utils import logger
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
+
+logger = logging.getLogger(__name__)
 
 
 class MoeA2ABackend(Enum):
@@ -44,9 +46,10 @@ class MoeRunnerBackend(Enum):
     AUTO = "auto"
     TRITON = "triton"
     TRITON_KERNEL = "triton_kernel"
-    FLASHINFER = "flashinfer_trtllm"
+    FLASHINFER_TRTLLM = "flashinfer_trtllm"
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
     FLASHINFER_MXFP4 = "flashinfer_mxfp4"
+    FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
 
     def is_auto(self):
         return self == MoeRunnerBackend.AUTO
@@ -58,10 +61,13 @@ class MoeRunnerBackend(Enum):
         return self == MoeRunnerBackend.TRITON_KERNEL
 
     def is_flashinfer_trtllm(self):
-        return self == MoeRunnerBackend.FLASHINFER
+        return self == MoeRunnerBackend.FLASHINFER_TRTLLM
 
     def is_flashinfer_cutlass(self):
         return self == MoeRunnerBackend.FLASHINFER_CUTLASS
+
+    def is_flashinfer_cutedsl(self):
+        return self == MoeRunnerBackend.FLASHINFER_CUTEDSL
 
     def is_flashinfer_mxfp4(self):
         return self == MoeRunnerBackend.FLASHINFER_MXFP4
@@ -102,6 +108,7 @@ MOE_A2A_BACKEND: Optional[MoeA2ABackend] = None
 MOE_RUNNER_BACKEND: Optional[MoeRunnerBackend] = None
 DEEPEP_MODE: Optional[DeepEPMode] = None
 IS_TBO_ENABLED: Optional[bool] = None
+IS_SBO_ENABLED: Optional[bool] = None
 TBO_TOKEN_DISTRIBUTION_THRESHOLD: Optional[float] = None
 DEEPEP_CONFIG: Optional[str] = None
 DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER: Optional[bool] = None
@@ -113,6 +120,7 @@ def initialize_moe_config(server_args: ServerArgs):
     global DEEPEP_MODE
     global DEEPEP_CONFIG
     global IS_TBO_ENABLED
+    global IS_SBO_ENABLED
     global TBO_TOKEN_DISTRIBUTION_THRESHOLD
     global DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER
 
@@ -121,6 +129,7 @@ def initialize_moe_config(server_args: ServerArgs):
     DEEPEP_MODE = DeepEPMode(server_args.deepep_mode)
     DEEPEP_CONFIG = server_args.deepep_config or ""
     IS_TBO_ENABLED = server_args.enable_two_batch_overlap
+    IS_SBO_ENABLED = server_args.enable_single_batch_overlap
     TBO_TOKEN_DISTRIBUTION_THRESHOLD = server_args.tbo_token_distribution_threshold
     DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER = (
         server_args.disable_flashinfer_cutlass_moe_fp4_allgather
@@ -131,7 +140,7 @@ def get_moe_a2a_backend() -> MoeA2ABackend:
     global MOE_A2A_BACKEND
     if MOE_A2A_BACKEND is None:
         logger.warning("MOE_A2A_BACKEND is not initialized, using default backend")
-        MOE_A2A_BACKEND = MoeA2ABackend(None)
+        MOE_A2A_BACKEND = MoeA2ABackend.NONE
     return MOE_A2A_BACKEND
 
 
@@ -139,7 +148,7 @@ def get_moe_runner_backend() -> MoeRunnerBackend:
     global MOE_RUNNER_BACKEND
     if MOE_RUNNER_BACKEND is None:
         logger.warning("MOE_RUNNER_BACKEND is not initialized, using triton backend")
-        MOE_RUNNER_BACKEND = MoeRunnerBackend("triton")
+        MOE_RUNNER_BACKEND = MoeRunnerBackend.AUTO
     return MOE_RUNNER_BACKEND
 
 
@@ -147,7 +156,7 @@ def get_deepep_mode() -> DeepEPMode:
     global DEEPEP_MODE
     if DEEPEP_MODE is None:
         logger.warning("DEEPEP_MODE is not initialized, using auto mode")
-        DEEPEP_MODE = DeepEPMode("auto")
+        DEEPEP_MODE = DeepEPMode.AUTO
     return DEEPEP_MODE
 
 
@@ -164,6 +173,13 @@ def is_tbo_enabled() -> bool:
     if IS_TBO_ENABLED is None:
         IS_TBO_ENABLED = False
     return IS_TBO_ENABLED
+
+
+def is_sbo_enabled() -> bool:
+    global IS_SBO_ENABLED
+    if IS_SBO_ENABLED is None:
+        IS_SBO_ENABLED = False
+    return IS_SBO_ENABLED
 
 
 def get_tbo_token_distribution_threshold() -> float:

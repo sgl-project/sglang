@@ -22,27 +22,33 @@ repos:
     rev: 5.13.2
     hooks:
       - id: isort
+        exclude: '^python/sglang/srt/grpc/.*_pb2\.py$|^python/sglang/srt/grpc/.*_pb2_grpc\.py$|^python/sglang/srt/grpc/.*_pb2\.pyi$|^python/sglang/srt/grpc/.*_pb2_grpc\.pyi$'
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.11.7
     hooks:
       - id: ruff
         args: [--select=F401, --fixable=F401]
         files: ^(benchmark/|docs/|examples/)
-        exclude: \.ipynb$
+        exclude: \.ipynb$|^python/sglang/srt/grpc/.*_pb2\.py$|^python/sglang/srt/grpc/.*_pb2_grpc\.py$|^python/sglang/srt/grpc/.*_pb2\.pyi$|^python/sglang/srt/grpc/.*_pb2_grpc\.pyi$
   - repo: https://github.com/psf/black
     rev: 24.10.0
     hooks:
       - id: black-jupyter
+        exclude: '^python/sglang/srt/grpc/.*_pb2\.py$|^python/sglang/srt/grpc/.*_pb2_grpc\.py$|^python/sglang/srt/grpc/.*_pb2\.pyi$|^python/sglang/srt/grpc/.*_pb2_grpc\.pyi$'
   - repo: https://github.com/codespell-project/codespell
     rev: v2.4.1
     hooks:
       - id: codespell
         additional_dependencies: ['tomli']
-        args: ['--toml', 'python/pyproject.toml', '-L', 'cann,thi,makro,wil,rouge']
+        args: ['--toml', 'python/pyproject.toml', '-L', 'cann,thi,makro,wil,rouge,PRIS']
         exclude: |
           (?x)^(
             test/srt/test_reasoning_parser\.py|
-            docs/advanced_features/vlm_query\.ipynb
+            docs/advanced_features/vlm_query\.ipynb|
+            python/sglang/srt/grpc/.*_pb2\.py|
+            python/sglang/srt/grpc/.*_pb2_grpc\.py|
+            python/sglang/srt/grpc/.*_pb2\.pyi|
+            python/sglang/srt/grpc/.*_pb2_grpc\.pyi
           )$
   - repo: https://github.com/pre-commit/mirrors-clang-format
     rev: v18.1.8
