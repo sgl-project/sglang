@@ -321,6 +321,8 @@ class SchedulerDisaggregationPrefillMixin:
         self.result_queue = deque()
 
         while True:
+            self.launch_last_batch_sample_if_needed()
+
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             self.waiting_queue.extend(
