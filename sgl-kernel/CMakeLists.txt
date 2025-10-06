@@ -55,7 +55,7 @@ FetchContent_Populate(repo-cutlass)
 FetchContent_Declare(
     repo-deepgemm
     GIT_REPOSITORY https://github.com/sgl-project/DeepGEMM
-    GIT_TAG        sgl
+    GIT_TAG        4d23df0a07b057fbb4a44ff8666e528a600feb5e
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-deepgemm)
@@ -268,6 +268,7 @@ set(SOURCES
     "csrc/elementwise/concat_mla.cu"
     "csrc/elementwise/fused_add_rms_norm_kernel.cu"
     "csrc/elementwise/rope.cu"
+    "csrc/elementwise/topk.cu"
     "csrc/common_extension.cc"
 
     "csrc/gemm/awq_kernel.cu"

@@ -11,9 +11,8 @@ import triton.language as tl
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.mem_cache.memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
+from sglang.srt.speculative.spec_info import SpecInput
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -1487,7 +1486,7 @@ class FlashAttentionBackend(AttentionBackend):
         seq_lens: torch.Tensor,
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        spec_info: Optional[SpecInput],
     ):
         """Initialize forward metadata for capturing CUDA graph."""
         metadata = FlashAttentionMetadata()
@@ -1722,7 +1721,7 @@ class FlashAttentionBackend(AttentionBackend):
         seq_lens_sum: int,
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
         out_cache_loc: Optional[torch.Tensor] = None,
     ):
@@ -2340,7 +2339,7 @@ class FlashAttentionMultiStepBackend:
         forward_batch: ForwardBatch,
     ):
         assert forward_batch.spec_info is not None
-        assert isinstance(forward_batch.spec_info, EagleDraftInput)
+        assert forward_batch.spec_info.is_draft_input()
 
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_forward_metadata_capture_cuda_graph(
@@ -2357,7 +2356,7 @@ class FlashAttentionMultiStepBackend:
         self, forward_batch: ForwardBatch, bs: int
     ):
         assert forward_batch.spec_info is not None
-        assert isinstance(forward_batch.spec_info, EagleDraftInput)
+        assert forward_batch.spec_info.is_draft_input()
 
         for i in range(self.speculative_num_steps - 1):
             # TODO: incrementally update the metadata for the later steps,

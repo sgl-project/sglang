@@ -15,6 +15,9 @@ pub mod pythonic_parser;
 pub mod qwen_parser;
 pub mod step3_parser;
 
+// Shared helpers and utilities
+pub mod helpers;
+
 // Re-export parser types for convenience
 pub use deepseek_parser::DeepSeekParser;
 pub use glm4_moe_parser::Glm4MoeParser;
