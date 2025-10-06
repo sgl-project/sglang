@@ -1,13 +1,8 @@
 use serde::{Deserialize, Serialize};
 
-/// Parsed tool call from model output (OpenAI format)
+/// Parsed tool call from model output
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToolCall {
-    /// Unique identifier for the tool call
-    pub id: String,
-    /// Type of tool call (currently always "function")
-    #[serde(rename = "type")]
-    pub r#type: String,
     /// Function call details
     pub function: FunctionCall,
 }
