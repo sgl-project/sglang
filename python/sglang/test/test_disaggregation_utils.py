@@ -1,13 +1,16 @@
 import time
+import warnings
 from urllib.parse import urlparse
 
 import requests
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_in_ci,
     popen_with_error_check,
 )
 
@@ -26,6 +29,24 @@ class TestDisaggregationBase(CustomTestCase):
         cls.lb_url = f"http://{cls.base_host}:{cls.lb_port}"
         print(f"{cls.base_host=} {cls.lb_port=} {cls.prefill_port=} {cls.decode_port=}")
         cls.process_lb, cls.process_decode, cls.process_prefill = None, None, None
+
+        # config transfer backend and rdma devices
+        if is_in_ci():
+            cls.transfer_backend = ["--disaggregation-transfer-backend", "mooncake"]
+            cls.rdma_devices = ["--disaggregation-ib-device", "mlx5_roce0,mlx5_roce1"]
+        else:
+            cls.transfer_backend = [
+                "--disaggregation-transfer-backend",
+                envs.SGLANG_TEST_PD_DISAGG_BACKEND.get(),
+            ]
+            cls.rdma_devices = [
+                "--disaggregation-ib-device",
+                envs.SGLANG_TEST_PD_DISAGG_DEVICES.get(),
+            ]
+            if cls.rdma_devices[1] is None:
+                cls.rdma_devices = []
+                msg = "No RDMA devices specified for disaggregation test, using default settings."
+                warnings.warn(msg)
 
     @classmethod
     def launch_lb(cls):

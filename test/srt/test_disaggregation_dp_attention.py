@@ -45,9 +45,8 @@ class TestDisaggregationDPAttention(TestDisaggregationBase):
             "--dp",
             "2",
             "--enable-dp-attention",
-            "--disaggregation-ib-device",
-            "mlx5_roce0,mlx5_roce1",
         ]
+        prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
             cls.model,
             cls.prefill_url,
