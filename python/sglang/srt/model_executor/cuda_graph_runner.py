@@ -808,12 +808,9 @@ class CudaGraphRunner:
         output = self.output_buffers[self.bs]
         if isinstance(output, LogitsProcessorOutput):
             return LogitsProcessorOutput(
-                # FIXME(lsyin): remove this clone(), only for testing
-                next_token_logits=output.next_token_logits[
-                    : self.raw_num_token
-                ].clone(),
+                next_token_logits=output.next_token_logits[: self.raw_num_token],
                 hidden_states=(
-                    output.hidden_states[: self.raw_num_token].clone()
+                    output.hidden_states[: self.raw_num_token]
                     if output.hidden_states is not None
                     else None
                 ),

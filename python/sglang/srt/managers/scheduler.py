@@ -208,7 +208,7 @@ GRAMMAR_TIMEOUT = float(os.environ.get("SGLANG_GRAMMAR_TIMEOUT", 300))
 class GenerationBatchResult:
     logits_output: Optional[LogitsProcessorOutput]
     pp_hidden_states_proxy_tensors: Optional[PPProxyTensors]
-    next_token_ids: Optional[List[int]]
+    next_token_ids: Optional[torch.Tensor]
     can_run_cuda_graph: bool
 
     # For output processing
@@ -220,6 +220,28 @@ class GenerationBatchResult:
     delay_sample_launch: bool = False
     forward_batch: Optional[ForwardBatch] = None
     future_map_ct: Optional[int] = None
+
+    def copy_to_cpu(self, return_logprob: bool = False):
+        """Copy tensors to CPU in overlap scheduling.
+        Only the tensors which are needed for processing results are copied,
+        e.g., next_token_ids, logits outputs
+        """
+        # FIXME(lsyin): merge this dataclass with ForwardBatchOutput
+        if return_logprob:
+            if self.logits_output.next_token_logits is not None:
+                self.logits_output.next_token_logits = (
+                    self.logits_output.next_token_logits.to("cpu", non_blocking=True)
+                )
+            if self.logits_output.input_token_logprobs is not None:
+                self.logits_output.input_token_logprobs = (
+                    self.logits_output.input_token_logprobs.to("cpu", non_blocking=True)
+                )
+        if self.logits_output.hidden_states is not None:
+            self.logits_output.hidden_states = self.logits_output.hidden_states.to(
+                "cpu", non_blocking=True
+            )
+        self.next_token_ids = self.next_token_ids.to("cpu", non_blocking=True)
+        self.copy_done.record()
 
     @classmethod
     def from_forward_batch_output(
@@ -2107,17 +2129,15 @@ class Scheduler(
                     forward_batch_output = self.model_worker.forward_batch_generation(
                         batch_or_worker_batch
                     )
-                    copy_done = torch.cuda.Event()
+                    # FIXME(lsyin): maybe move this to forward_batch_generation
+                    forward_batch_output.copy_done = torch.cuda.Event()
                     if not model_worker_batch.delay_sample_launch:
                         self.future_map.store_to_map(
                             cur_future_map_ct, bs, forward_batch_output.next_token_ids
                         )
-                        copy_done.record()
+                        forward_batch_output.copy_to_cpu()
                     else:
                         forward_batch_output.future_map_ct = cur_future_map_ct
-
-                    # FIXME(lsyin): move copy_done elsewhere
-                    forward_batch_output.copy_done = copy_done
 
                 # FIXME(lsyin): move this assignment elsewhere
                 maybe_future_next_token_ids = self.future_map.update_next_future(
@@ -2187,10 +2207,9 @@ class Scheduler(
                 tmp_result.logits_output,
                 tmp_result.forward_batch,
             )
-            tmp_result.copy_done.record()
-            ct = tmp_result.future_map_ct
-            bs = len(tmp_batch.reqs)
+            ct, bs = tmp_result.future_map_ct, len(tmp_batch.reqs)
             self.future_map.store_to_map(ct, bs, tmp_result.next_token_ids)
+            tmp_result.copy_to_cpu()
             self.result_queue.appendleft((tmp_batch, tmp_result))
 
     def run_batch(
