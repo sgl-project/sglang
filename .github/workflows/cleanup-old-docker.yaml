@@ -1,0 +1,54 @@
+name: Cleanup Old Development Docker Images
+
+on:
+    workflow_dispatch:
+    schedule:
+        - cron: "0 2 * * *" # Run daily at 2 AM
+
+jobs:
+    cleanup:
+        if: ${{ github.repository == 'sgl-project/sglang' }}
+        runs-on: ubuntu-22.04
+        steps:
+            - name: Cleanup old dev images
+              env:
+                  DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+                  DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+              run: |
+                  # Get auth token
+                  TOKEN=$(curl -s -H "Content-Type: application/json" -X POST \
+                    -d '{"username": "'${DOCKERHUB_USERNAME}'", "password": "'${DOCKERHUB_TOKEN}'"}' \
+                    https://hub.docker.com/v2/users/login/ | jq -r .token)
+
+                  # Calculate cutoff date (2 weeks ago)
+                  CUTOFF_DATE=$(date -u -d '14 days ago' +%s)
+
+                  # Tags to clean up
+                  for TAG_PREFIX in "dev-x86" "dev-arm64" "dev"; do
+                    echo "Checking ${TAG_PREFIX}-* tags..."
+                    
+                    # Get all tags
+                    TAGS=$(curl -s -H "Authorization: JWT ${TOKEN}" \
+                      "https://hub.docker.com/v2/repositories/lmsysorg/sglang/tags/?page_size=100" \
+                      | jq -r '.results[] | select(.name | startswith("'${TAG_PREFIX}'-")) | select(.name != "'${TAG_PREFIX}'") | "\(.name)|\(.last_updated)"')
+                    
+                    # Process each tag
+                    echo "$TAGS" | while IFS='|' read -r TAG_NAME LAST_UPDATED; do
+                      if [ -z "$TAG_NAME" ]; then
+                        continue
+                      fi
+                      
+                      # Convert last_updated to epoch
+                      TAG_DATE=$(date -u -d "$LAST_UPDATED" +%s)
+                      
+                      # Check if older than 2 weeks
+                      if [ "$TAG_DATE" -lt "$CUTOFF_DATE" ]; then
+                        echo "Deleting old tag: $TAG_NAME (last updated: $LAST_UPDATED)"
+                        curl -X DELETE \
+                          -H "Authorization: JWT ${TOKEN}" \
+                          "https://hub.docker.com/v2/repositories/lmsysorg/sglang/tags/${TAG_NAME}/"
+                      else
+                        echo "Keeping tag: $TAG_NAME (last updated: $LAST_UPDATED)"
+                      fi
+                    done
+                  done
