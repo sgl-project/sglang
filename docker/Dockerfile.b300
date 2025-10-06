@@ -35,6 +35,7 @@ RUN if [ "$BRANCH_TYPE" = "local" ]; then \
 # Remove after the next torch release
 RUN sed -i "/torch/d" sglang/sgl-kernel/pyproject.toml && \
     sed -i -e "/torchaudio/d" \
+        -e "s/sgl-kernel==0.3.10/sgl-kernel==0.3.14/" \
         -e "s/torch==2.8.0/torch==2.8.0a0+34c6371d24.nv25.8/" \
         -e "s/torchao==0.9.0/torchao==0.12.0+git/" \
         sglang/python/pyproject.toml
