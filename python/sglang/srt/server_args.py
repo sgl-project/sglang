@@ -119,9 +119,6 @@ DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton"]
 
 NSA_CHOICES = ["flashmla_prefill", "flashmla_decode", "fa3", "tilelang", "aiter"]
 
-NSA_DEFAULT_PREFILL = "flashmla_prefill"
-NSA_DEFAULT_DECODE = "fa3"
-
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu"]
 
 
@@ -290,6 +287,8 @@ class ServerArgs:
     sampling_backend: Optional[str] = None
     grammar_backend: Optional[str] = None
     mm_attention_backend: Optional[str] = None
+    nsa_prefill: str = "flashmla_prefill"
+    nsa_decode: str = "fa3"
 
     # Speculative decoding
     speculative_algorithm: Optional[str] = None
@@ -454,10 +453,6 @@ class ServerArgs:
     # For PD-Multiplexing
     enable_pdmux: bool = False
     sm_group_num: int = 3
-
-    # NSA attention backend
-    nsa_prefill: str = NSA_DEFAULT_PREFILL
-    nsa_decode: str = NSA_DEFAULT_DECODE
 
     def __post_init__(self):
         """
@@ -2029,6 +2024,18 @@ class ServerArgs:
             default=ServerArgs.mm_attention_backend,
             help="Set multimodal attention backend.",
         )
+        parser.add_argument(
+            "--nsa-prefill",
+            default=ServerArgs.nsa_prefill,
+            type=str,
+            choices=NSA_CHOICES,
+        )
+        parser.add_argument(
+            "--nsa-decode",
+            default=ServerArgs.nsa_decode,
+            type=str,
+            choices=NSA_CHOICES,
+        )
 
         # Speculative decoding
         parser.add_argument(
@@ -2819,21 +2826,6 @@ class ServerArgs:
             "--enable-deterministic-inference",
             action="store_true",
             help="Enable deterministic inference mode with batch invariant ops.",
-        )
-
-        # For NSA models
-        parser.add_argument(
-            "--nsa-prefill",
-            default=NSA_DEFAULT_PREFILL,
-            type=str,
-            choices=NSA_CHOICES,
-        )
-
-        parser.add_argument(
-            "--nsa-decode",
-            default=NSA_DEFAULT_DECODE,
-            type=str,
-            choices=NSA_CHOICES,
         )
 
         # Deprecated arguments
