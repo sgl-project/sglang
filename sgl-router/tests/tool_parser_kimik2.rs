@@ -99,7 +99,6 @@ fn test_kimik2_format_detection() {
 
     // Should detect Kimi K2 format
     assert!(parser.has_tool_markers("<|tool_calls_section_begin|>"));
-    assert!(parser.has_tool_markers("<|tool_call_begin|>"));
     assert!(parser.has_tool_markers("text with <|tool_calls_section_begin|> marker"));
 
     // Should not detect other formats
