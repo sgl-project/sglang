@@ -33,7 +33,8 @@ jobs:
 
       - name: Create new branch
         run: |
-          BRANCH_NAME="bot/bump-kernel-version-${{ github.event.inputs.new_version }}"
+          RANDOM_SUFFIX=$(echo $RANDOM | md5sum | head -c 4)
+          BRANCH_NAME="bot/bump-kernel-version-${{ github.event.inputs.new_version }}-${RANDOM_SUFFIX}"
           git checkout -b "$BRANCH_NAME"
           echo "BRANCH_NAME=$BRANCH_NAME" >> $GITHUB_ENV
 
@@ -60,7 +61,7 @@ jobs:
 
       - name: Create Pull Request
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_TAGGING }}
         run: |
           gh pr create \
             --title "chore: bump sgl-kernel version to ${{ github.event.inputs.new_version }}" \
