@@ -116,6 +116,8 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "nnodes",
     "node_rank",
     "fake_node",
+    "nsa_prefill",
+    "nsa_decode",
 ]
 
 # Put some global args for easy access
