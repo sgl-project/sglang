@@ -16,6 +16,7 @@
 # https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/gemma3_mm.py
 
 import logging
+import re
 from functools import lru_cache
 from typing import Dict, Iterable, List, Optional, Set, Tuple, TypedDict
 
@@ -154,6 +155,10 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
     embedding_modules = {}
     embedding_padding_modules = []
     supports_lora = True
+    # Pattern to match language model layers only (skip vision_tower and multi_modal_projector)
+    lora_pattern = re.compile(
+        r"^language_model\.model\.layers\.(\d+)\.(?:self_attn|mlp)\.(?:qkv_proj|o_proj|down_proj|gate_up_proj)"
+    )
 
     def __init__(
         self,
@@ -386,6 +391,10 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         )
 
         return hs
+
+    def should_apply_lora(self, module_name: str) -> bool:
+        """Skip vision tower and multi_modal_projector for LoRA."""
+        return bool(self.lora_pattern.match(module_name))
 
     def tie_weights(self):
         return self.language_model.tie_weights()

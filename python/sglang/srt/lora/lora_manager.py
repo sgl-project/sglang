@@ -418,12 +418,6 @@ class LoRAManager:
         replace_submodule(self.base_model, module_name, lora_module)
         return lora_module
 
-    def should_skip_lora_for_vision_model(self, module_name):
-        # Skip vision/audio components for all multimodal models TODO: maybe need to support other multimodal models
-        vision_prefixes = {"vision_model", "vision_tower", "multi_modal_projector"}
-        module_parts = module_name.split(".")
-        return any(part in vision_prefixes for part in module_parts)
-
     def init_lora_modules(self):
         # Look-up table that essentially maps (layer_index, module_name) to the corresponding LoRA module.
         self.lora_modules: List[Dict[str, BaseLayerWithLoRA]] = [
@@ -439,10 +433,6 @@ class LoRAManager:
             if getattr(
                 self.base_model, "should_apply_lora", None
             ) and not self.base_model.should_apply_lora(module_name):
-                continue
-
-            # Skip vision model
-            if self.should_skip_lora_for_vision_model(module_name):
                 continue
 
             # The module should be converted if it is included in target_names
