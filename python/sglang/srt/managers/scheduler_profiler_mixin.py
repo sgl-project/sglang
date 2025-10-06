@@ -93,21 +93,12 @@ class SchedulerProfilerMixin:
             if self.profile_stage == "prefill":
                 self.profiler_target_prefill_ct = num_steps
                 self.profiler_target_decode_ct = None  # Don't profile decode
-                logger.info(
-                    f"PROFILE CONFIG: Stage-based profiling initialized for PREFILL ONLY - target: {num_steps} prefill batches"
-                )
             elif self.profile_stage == "decode":
                 self.profiler_target_prefill_ct = None  # Don't profile prefill
                 self.profiler_target_decode_ct = num_steps
-                logger.info(
-                    f"PROFILE CONFIG: Stage-based profiling initialized for DECODE ONLY - target: {num_steps} decode batches"
-                )
             else:  # profile both stages
                 self.profiler_target_prefill_ct = num_steps
                 self.profiler_target_decode_ct = num_steps
-                logger.info(
-                    f"PROFILE CONFIG: Stage-based profiling initialized for BOTH STAGES - target: {num_steps} prefill + {num_steps} decode batches"
-                )
 
             # Reset counters
             self.profiler_prefill_ct = 0
@@ -363,11 +354,6 @@ class SchedulerProfilerMixin:
                             f"PROFILE: Prefill batch {self.profiler_prefill_ct}/{self.profiler_target_prefill_ct} processed"
                         )
 
-                else:
-                    logger.debug(
-                        f"PREFILL: Not profiling this stage (filter='{self.profile_stage}')"
-                    )
-
             elif batch.forward_mode.is_decode():
                 # Only profile decode if we want to profile decode and haven't reached target
                 should_profile_decode = (
@@ -405,17 +391,10 @@ class SchedulerProfilerMixin:
                         logger.info(
                             f"PROFILE: Decode batch {self.profiler_decode_ct}/{self.profiler_target_decode_ct} processed"
                         )
-                else:
-                    logger.debug(
-                        f"DECODE: Not profiling this stage (filter='{self.profile_stage}')"
-                    )
 
             elif batch.forward_mode.is_idle():
-                logger.debug("IDLE: Skipping idle batch")
+                pass
             else:
-                logger.error(
-                    f"PROFILE ERROR: Unsupported batch stage: {batch.forward_mode}"
-                )
                 raise RuntimeError(f"unsupported profile stage: {batch.forward_mode}")
         else:
             # Check profiler
