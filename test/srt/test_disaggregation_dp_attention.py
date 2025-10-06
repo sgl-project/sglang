@@ -17,21 +17,12 @@ from sglang.test.test_utils import (
 class TestDisaggregationDPAttention(TestDisaggregationBase):
     @classmethod
     def setUpClass(cls):
+        super().setUpClass()
         # Temporarily disable JIT DeepGEMM
         cls.original_jit_deepgemm = os.environ.get("SGL_ENABLE_JIT_DEEPGEMM")
         os.environ["SGL_ENABLE_JIT_DEEPGEMM"] = "false"
 
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
-        parsed_url = urlparse(DEFAULT_URL_FOR_TEST)
-        cls.base_host = parsed_url.hostname
-        base_port = str(parsed_url.port)
-        cls.lb_port = base_port
-        cls.prefill_port = f"{int(base_port) + 100}"
-        cls.decode_port = f"{int(base_port) + 200}"
-        cls.prefill_url = f"http://{cls.base_host}:{cls.prefill_port}"
-        cls.decode_url = f"http://{cls.base_host}:{cls.decode_port}"
-        cls.lb_url = f"http://{cls.base_host}:{cls.lb_port}"
-        print(f"{cls.base_host=} {cls.lb_port=} {cls.prefill_port=} {cls.decode_port=}")
 
         # Non blocking start servers
         cls.start_prefill()
