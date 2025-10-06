@@ -13,6 +13,7 @@
 # ==============================================================================
 
 import dataclasses
+import random
 from typing import List
 
 import torch
@@ -386,3 +387,11 @@ def run_lora_test_by_batch(
             srt_no_lora_outputs.output_strs[i].strip(" "),
             hf_no_lora_outputs.output_strs[i].strip(" "),
         )
+
+
+def ensure_reproducibility():
+    seed = 42
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.use_deterministic_algorithms(True)
