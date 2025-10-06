@@ -3,6 +3,10 @@
 SGLang supports a large variety of attention backends. Each of them has different pros and cons.
 You can test them according to your needs.
 
+```{important}
+Selecting an optimal attention backend is crucial for maximizing your performance. Different backends excel in various scenarios, so choose based on your model, hardware, and use case.
+```
+
 ## Supporting Matrix
 
 | **Backend**               | **Page Size > 1** | **Spec Decoding** | **MLA** | **Sliding Window** | **MultiModal** |
@@ -11,22 +15,26 @@ You can test them according to your needs.
 | **FA3**                   | ✅                | ✅                 | ✅      | ✅                 | ✅              |
 | **FA4**                   | ❌                | ❌                 | ✅      | ❌                 | ❌              |
 | **Triton**                | ❌                | ✅                 | ✅      | ✅                 | ❌              |
-| **Torch Native**          | ❌                | ❌                 | ✅      | ❌                 | ❌              |
-| **FlexAttention**         | ❌                | ❌                 | ✅      | ❌                 | ❌              |
+| **NSA**                   | ✅                | ❌                 | ✅      | ❌                 | ❌              |
 | **FlashMLA**              | ✅                | ✅                 | ✅      | ❌                 | ❌              |
 | **Cutlass MLA**           | ✅                | ✅                 | ✅      | ❌                 | ❌              |
 | **TRTLLM MLA**            | ✅                | ❌                 | ✅      | ✅                 | ❌              |
 | **TRTLLM MHA**            | ✅                | ✅                 | ❌      | ✅                 | ❌              |
-| **Ascend**                | ✅                | ❌                 | ✅      | ❌                 | ❌              |
+| **Torch Native**          | ❌                | ❌                 | ✅      | ❌                 | ❌              |
+| **FlexAttention**         | ❌                | ❌                 | ✅      | ❌                 | ❌              |
+| **Dual Chunk FlashAttention** | ✅                | ✅                 | ✅      | ❌                 | ✅              |
 | **AITER**                 | ✅                | ✅                 | ✅      | ❌                 | ❌              |
 | **Wave**                  | ✅                | ❌                 | ❌      | ❌                 | ❌              |
+| **Ascend**                | ✅                | ❌                 | ✅      | ❌                 | ❌              |
 
-```{important}
+```{note}
 FlashAttention v4 (fa4) is prefill-only for now.
 
 TRTLLM MLA only implements decode operations. For prefill operations, it falls back to FlashInfer MLA backend.
 
 TRTLLM MHA supports speculative decoding with topk ≤ 1 only.
+
+NSA is designed for DeepSeek NSA models and enables sparse attention via indexing.
 ```
 
 Note: Every kernel backend is compatible with a page size > 1 by specifying an argument such as `--page-size 16`.
@@ -45,7 +53,7 @@ You can mix-and-match attention backends for prefill and decode. This is useful 
 # Example: Prefill with FA4, Decode with TRTLLM MLA (Blackwell)
 python3 -m sglang.launch_server \
   --model-path nvidia/DeepSeek-R1-FP4 \
-  --tp 4 \
+  --tp 8 \
   --attention-backend trtllm_mla \
   --moe-runner-backend flashinfer_trtllm \
   --quantization modelopt_fp4 \
