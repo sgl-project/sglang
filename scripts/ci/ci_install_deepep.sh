@@ -62,7 +62,5 @@ rm -rf /root/.cache/deepep && git clone https://github.com/deepseek-ai/DeepEP.gi
 cd /root/.cache/deepep && python3 setup.py install
 
 # Verify configuration
-echo "=== Verify GDRCOPY ==="
-gdrcopy_copybw
 echo "=== Verify NVSHMEM ==="
 nvshmem-info -a
