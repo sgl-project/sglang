@@ -228,7 +228,7 @@ impl ToolParser for LlamaParser {
         )
     }
 
-    fn detect_format(&self, text: &str) -> bool {
+    fn has_tool_markers(&self, text: &str) -> bool {
         // Llama format if contains python_tag or starts with JSON object
         text.contains("<|python_tag|>")
             || (text.trim_start().starts_with('{') && text.contains(r#""name""#))

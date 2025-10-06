@@ -156,11 +156,6 @@ impl MistralParser {
             Ok(None)
         }
     }
-
-    /// Check if text contains Mistral tool markers
-    fn has_tool_markers(&self, text: &str) -> bool {
-        text.contains("[TOOL_CALLS]")
-    }
 }
 
 impl Default for MistralParser {
@@ -254,8 +249,8 @@ impl ToolParser for MistralParser {
         )
     }
 
-    fn detect_format(&self, text: &str) -> bool {
-        self.has_tool_markers(text)
+    fn has_tool_markers(&self, text: &str) -> bool {
+        text.contains("[TOOL_CALLS]")
     }
 
     fn get_unstreamed_tool_args(&self) -> Option<Vec<crate::tool_parser::types::ToolCallItem>> {
