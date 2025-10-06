@@ -14,6 +14,7 @@ from concurrent import futures
 from typing import AsyncIterator, Dict, Optional, Tuple
 
 import grpc
+from google.protobuf.json_format import MessageToDict
 from grpc_reflection.v1alpha import reflection
 
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
@@ -483,28 +484,40 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         elif grpc_params.HasField("structural_tag"):
             structural_tag = grpc_params.structural_tag
 
+        # Convert logit_bias from proto map to dict
+        logit_bias = dict(grpc_params.logit_bias) if grpc_params.logit_bias else None
+
+        # Convert custom_params from proto Struct to dict
+        custom_params = None
+        if grpc_params.HasField("custom_params"):
+            custom_params = MessageToDict(grpc_params.custom_params)
+
         return SGLSamplingParams(
-            temperature=grpc_params.temperature or 1.0,
-            top_p=grpc_params.top_p or 1.0,
-            top_k=grpc_params.top_k or -1,
-            min_p=grpc_params.min_p or 0.0,
-            frequency_penalty=grpc_params.frequency_penalty or 0.0,
-            presence_penalty=grpc_params.presence_penalty or 0.0,
-            repetition_penalty=grpc_params.repetition_penalty or 1.0,
-            max_new_tokens=grpc_params.max_new_tokens or 128,
-            min_new_tokens=grpc_params.min_new_tokens or 0,
-            stop=list(grpc_params.stop) if grpc_params.stop else [],
+            temperature=grpc_params.temperature,
+            top_p=grpc_params.top_p,
+            top_k=grpc_params.top_k,
+            min_p=grpc_params.min_p,
+            frequency_penalty=grpc_params.frequency_penalty,
+            presence_penalty=grpc_params.presence_penalty,
+            repetition_penalty=grpc_params.repetition_penalty,
+            max_new_tokens=grpc_params.max_new_tokens,
+            min_new_tokens=grpc_params.min_new_tokens,
+            stop=list(grpc_params.stop) if grpc_params.stop else None,
             stop_token_ids=(
-                list(grpc_params.stop_token_ids) if grpc_params.stop_token_ids else []
+                list(grpc_params.stop_token_ids) if grpc_params.stop_token_ids else None
             ),
             skip_special_tokens=grpc_params.skip_special_tokens,
             spaces_between_special_tokens=grpc_params.spaces_between_special_tokens,
+            no_stop_trim=grpc_params.no_stop_trim,
             regex=regex,
             json_schema=json_schema,
             ebnf=ebnf_grammar,
             structural_tag=structural_tag,
-            n=grpc_params.n or 1,
+            n=grpc_params.n,
             ignore_eos=grpc_params.ignore_eos,
+            stream_interval=grpc_params.stream_interval,
+            logit_bias=logit_bias,
+            custom_params=custom_params,
         )
 
     def _convert_output_logprobs_to_proto(
