@@ -290,15 +290,16 @@ def find_local_hf_snapshot_dir(
             os.path.join(found_local_snapshot_dir, "..", "..")
         )
         blobs_dir = os.path.join(repo_folder, "blobs")
-        if os.path.isdir(blobs_dir):
-            if glob.glob(os.path.join(blobs_dir, "*.incomplete")):
-                logger.info(
-                    "Found .incomplete files in %s for %s. "
-                    "Considering local snapshot incomplete.",
-                    blobs_dir,
-                    model_name_or_path,
-                )
-                return None
+        if os.path.isdir(blobs_dir) and glob.glob(
+            os.path.join(blobs_dir, "*.incomplete")
+        ):
+            logger.info(
+                "Found .incomplete files in %s for %s. "
+                "Considering local snapshot incomplete.",
+                blobs_dir,
+                model_name_or_path,
+            )
+            return None
 
     # if local snapshot exists, validate it contains at least one weight file
     # matching allow_patterns before skipping download.
@@ -331,7 +332,7 @@ def find_local_hf_snapshot_dir(
             break
         base_name = os.path.basename(f)
         # Regex for files like model-00001-of-00009.safetensors
-        match = re.match(r"(.*?)-([0-9]+)-of-([0-9]+)\\.(.*)", base_name)
+        match = re.match(r"(.*?)-([0-9]+)-of-([0-9]+)\.(.*)", base_name)
         if match:
             prefix = match.group(1)
             shard_id_str = match.group(2)
