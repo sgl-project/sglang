@@ -1020,7 +1020,6 @@ class Scheduler(
             self.cur_batch = batch
 
             if batch:
-                batch.launch_done = threading.Event()
                 result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), result))
 
@@ -1032,7 +1031,7 @@ class Scheduler(
                         forward_mode=ForwardMode.DUMMY_FIRST,
                         next_batch_sampling_info=self.tp_worker.cur_sampling_info,
                     )
-                    self.process_batch_result(tmp_batch, None, batch.launch_done)
+                    self.process_batch_result(tmp_batch, None)
 
             if self.last_batch:
                 # Process the results of the last batch
@@ -1040,10 +1039,7 @@ class Scheduler(
                 tmp_batch.next_batch_sampling_info = (
                     self.tp_worker.cur_sampling_info if batch else None
                 )
-                # NOTE: we should use current launched batch's launch_done event Instead of the last batch's
-                self.process_batch_result(
-                    tmp_batch, tmp_result, batch.launch_done if batch else None
-                )
+                self.process_batch_result(tmp_batch, tmp_result)
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
@@ -2087,7 +2083,7 @@ class Scheduler(
         batch.prepare_for_decode()
         return batch
 
-    def run_batch_exp(
+    def run_batch(
         self, batch: ScheduleBatch
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
@@ -2212,81 +2208,18 @@ class Scheduler(
             tmp_result.copy_to_cpu()
             self.result_queue.appendleft((tmp_batch, tmp_result))
 
-    def run_batch(
-        self, batch: ScheduleBatch
-    ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
-        """Run a batch."""
-        return self.run_batch_exp(batch)
-
-        self.forward_ct += 1
-
-        # Whether to run the profiler
-        self._profile_batch_predicate(batch)
-        if self.forward_sleep_time is not None:
-            logger.info(f"Scheduler.run_batch sleep {self.forward_sleep_time}s")
-            time.sleep(self.forward_sleep_time)
-
-        # Run forward
-        if self.is_generation:
-
-            batch_or_worker_batch = batch
-
-            if self.spec_algorithm.is_none():
-                # FIXME(lsyin): remove this if and finally unify the abstraction
-                batch_or_worker_batch = batch.get_model_worker_batch()
-
-            forward_batch_output = self.model_worker.forward_batch_generation(
-                batch_or_worker_batch
-            )
-
-            if not self.spec_algorithm.is_none():
-                # TODO(lsyin): unify this metric-updating logic with non-spec, and move it to decode processing
-                self.update_spec_metrics(
-                    batch.batch_size(), forward_batch_output.num_accepted_tokens
-                )
-
-            # update batch's output ids
-            batch.output_ids = forward_batch_output.next_token_ids
-
-            # These 2 values are needed for processing the output, but the values can be
-            # modified by overlap schedule. So we have to copy them here so that
-            # we can use the correct values in output processing.
-            if batch.return_logprob or self.spec_algorithm.is_eagle():
-                extend_input_len_per_req = [req.extend_input_len for req in batch.reqs]
-            else:
-                extend_input_len_per_req = None
-
-            if batch.return_logprob:
-                extend_logprob_start_len_per_req = [
-                    req.extend_logprob_start_len for req in batch.reqs
-                ]
-            else:
-                extend_logprob_start_len_per_req = None
-
-            return GenerationBatchResult.from_forward_batch_output(
-                forward_batch_output=forward_batch_output,
-                extend_input_len_per_req=extend_input_len_per_req,
-                extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
-            )
-        else:  # embedding or reward model
-            model_worker_batch = batch.get_model_worker_batch()
-            embeddings = self.tp_worker.forward_batch_embedding(model_worker_batch)
-            ret = EmbeddingBatchResult(embeddings=embeddings)
-        return ret
-
     def process_batch_result(
         self,
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
-        launch_done: Optional[threading.Event] = None,
     ):
         if batch.forward_mode.is_decode():
-            self.process_batch_result_decode(batch, result, launch_done)
+            self.process_batch_result_decode(batch, result)
             if self.enable_trace:
                 trace_slice_batch("decode loop", batch.reqs)
 
         elif batch.forward_mode.is_extend():
-            self.process_batch_result_prefill(batch, result, launch_done)
+            self.process_batch_result_prefill(batch, result)
             if self.enable_trace:
                 trace_slice_batch("prefill", batch.reqs)
 

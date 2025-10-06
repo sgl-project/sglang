@@ -15,14 +15,12 @@
 from __future__ import annotations
 
 import logging
-import threading
-from typing import TYPE_CHECKING, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import get_pp_group, get_world_group
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     GetWeightsByNameReqInput,
@@ -236,7 +234,6 @@ class TpModelWorker:
     def forward_batch_generation(
         self,
         model_worker_batch: ModelWorkerBatch,
-        launch_done: Optional[threading.Event] = None,
         is_verify: bool = False,
     ) -> ForwardBatchOutput:
         # update the consumer index of hicache to the running batch
@@ -256,9 +253,6 @@ class TpModelWorker:
             logits_output, can_run_cuda_graph = self.model_runner.forward(
                 forward_batch, pp_proxy_tensors=pp_proxy_tensors
             )
-            if launch_done is not None:
-                launch_done.set()
-
             forward_batch_output = ForwardBatchOutput(
                 logits_output=logits_output,
                 can_run_cuda_graph=can_run_cuda_graph,

@@ -368,7 +368,6 @@ class SchedulerDisaggregationPrefillMixin:
         self: Scheduler,
         batch: ScheduleBatch,
         result: GenerationBatchResult,
-        launch_done: Optional[threading.Event] = None,
     ) -> None:
         """
         Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
