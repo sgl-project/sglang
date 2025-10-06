@@ -60,9 +60,8 @@ class TestDisaggregationMooncakePrefillLargerTP(TestDisaggregationBase):
             "2",
             "--base-gpu-id",
             "4",
-            "--disaggregation-ib-device",
-            "mlx5_roce4,mlx5_roce5",
         ]
+        decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
             cls.model,
             cls.decode_url,
@@ -133,9 +132,8 @@ class TestDisaggregationMooncakeDecodeLargerTP(TestDisaggregationBase):
             "4",
             "--base-gpu-id",
             "4",
-            "--disaggregation-ib-device",
-            "mlx5_roce4,mlx5_roce5",
         ]
+        decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
             cls.model,
             cls.decode_url,
@@ -206,9 +204,8 @@ class TestDisaggregationMooncakeMHAPrefillLargerTP(TestDisaggregationBase):
             "2",
             "--base-gpu-id",
             "4",
-            "--disaggregation-ib-device",
-            "mlx5_roce4,mlx5_roce5",
         ]
+        decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
             cls.model,
             cls.decode_url,
@@ -279,9 +276,8 @@ class TestDisaggregationMooncakeMHADecodeLargerTP(TestDisaggregationBase):
             "4",
             "--base-gpu-id",
             "4",
-            "--disaggregation-ib-device",
-            "mlx5_roce4,mlx5_roce5",
         ]
+        decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
             cls.model,
             cls.decode_url,

@@ -60,9 +60,8 @@ class TestDisaggregationAccuracy(TestDisaggregationBase):
             "2",
             "--base-gpu-id",
             "2",
-            "--disaggregation-ib-device",
-            "mlx5_roce2,mlx5_roce3",
         ]
+        decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
             cls.model,
             cls.decode_url,
@@ -190,9 +189,8 @@ class TestDisaggregationMooncakeFailure(TestDisaggregationBase):
             "2",
             "--base-gpu-id",
             "2",
-            "--disaggregation-ib-device",
-            "mlx5_roce2,mlx5_roce3",
         ]
+        decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
             cls.model,
             cls.decode_url,
@@ -288,9 +286,8 @@ class TestDisaggregationMooncakeSpec(TestDisaggregationBase):
             "2",
             "--base-gpu-id",
             "2",
-            "--disaggregation-ib-device",
-            "mlx5_roce2,mlx5_roce3",
         ] + cls.spec_args
+        decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
             cls.model,
             cls.decode_url,
@@ -363,9 +360,8 @@ class TestDisaggregationSimulatedRetract(TestDisaggregationBase):
             "2",
             "--base-gpu-id",
             "2",
-            "--disaggregation-ib-device",
-            "mlx5_roce2,mlx5_roce3",
         ]
+        decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
             cls.model,
             cls.decode_url,
