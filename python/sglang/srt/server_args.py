@@ -205,7 +205,7 @@ class ServerArgs:
     device: Optional[str] = None
     tp_size: int = 1
     pp_size: int = 1
-    max_micro_batch_size: Optional[int] = None
+    pp_max_micro_batch_size: Optional[int] = None
     stream_interval: int = 1
     stream_output: bool = False
     random_seed: Optional[int] = None
@@ -1599,9 +1599,9 @@ class ServerArgs:
             help="The pipeline parallelism size.",
         )
         parser.add_argument(
-            "--max-micro-batch-size",
+            "--pp-max-micro-batch-size",
             type=int,
-            default=ServerArgs.max_micro_batch_size,
+            default=ServerArgs.pp_max_micro_batch_size,
             help="The maximum micro batch size in pipeline parallelism.",
         )
         parser.add_argument(
