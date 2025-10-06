@@ -182,14 +182,14 @@ class ModernBertSelfAttention(nn.Module):
         v = v.contiguous()
 
         # Apply rotary embeddings
+        positions = forward_batch.positions
+        max_pos = self.rotary_emb.max_position_embeddings - 1
+        positions = torch.clamp(positions, 0, max_pos)
         if q.dtype == torch.float32:
             # For float32, use forward_native to avoid precision loss
-            positions = forward_batch.positions
-            max_pos = self.rotary_emb.max_position_embeddings - 1
-            positions = torch.clamp(positions, 0, max_pos)
             q, k = self.rotary_emb.forward_native(positions, q, k)
         else:
-            q, k = self.rotary_emb.forward(forward_batch.positions, q, k)
+            q, k = self.rotary_emb.forward(positions, q, k)
 
         attn_output = self.attn(q, k, v, forward_batch)
         attn_output, _ = self.out_proj(attn_output)
@@ -208,7 +208,7 @@ class ModernBertMLP(nn.Module):
         super().__init__()
         self.intermediate_size = config.intermediate_size
         self.hidden_size = config.hidden_size
-        self.Wi = ColumnParallelLinear(
+        self.gate_up_proj = ColumnParallelLinear(
             input_size=config.hidden_size,
             output_size=config.intermediate_size * 2,
             bias=config.mlp_bias,
@@ -218,7 +218,7 @@ class ModernBertMLP(nn.Module):
         hidden_act = getattr(config, "hidden_activation", "gelu")
         self.activation = get_act_fn(hidden_act)
         self.dropout = nn.Dropout(config.mlp_dropout)
-        self.Wo = RowParallelLinear(
+        self.down_proj = RowParallelLinear(
             input_size=config.intermediate_size,
             output_size=config.hidden_size,
             bias=config.mlp_bias,
@@ -227,11 +227,11 @@ class ModernBertMLP(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        gate_up, _ = self.Wi(hidden_states)
+        gate_up, _ = self.gate_up_proj(hidden_states)
         input, gate = gate_up.chunk(2, dim=-1)
         hidden_states = self.activation(input) * gate
         hidden_states = self.dropout(hidden_states)
-        hidden_states, _ = self.Wo(hidden_states)
+        hidden_states, _ = self.down_proj(hidden_states)
         return hidden_states
 
 
@@ -375,6 +375,8 @@ class ModernBertModel(nn.Module):
             ("model.final_norm", "encoder.final_norm"),
             (".attn.Wqkv", ".attention.qkv_proj"),
             (".attn.Wo", ".attention.out_proj"),
+            (".mlp.Wi", ".mlp.gate_up_proj"),
+            (".mlp.Wo", ".mlp.down_proj"),
         )
 
         for name, loaded_weight in weights:
