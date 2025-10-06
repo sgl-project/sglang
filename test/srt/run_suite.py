@@ -87,7 +87,7 @@ suites = {
         TestFile("test_metrics.py", 32),
         TestFile("test_metrics_utils.py", 1),
         TestFile("test_mla.py", 167),
-        TestFile("test_mla_deepseek_v3.py", 1420),
+        TestFile("test_mla_deepseek_v3.py", 500),
         TestFile("test_mla_int8_deepseek_v3.py", 429),
         TestFile("test_mla_flashinfer.py", 302),
         TestFile("test_mla_fp8.py", 93),
