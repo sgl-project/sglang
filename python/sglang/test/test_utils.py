@@ -20,7 +20,6 @@ from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, List, Optional, Tuple
-from urllib.parse import quote
 
 import aiohttp
 import numpy as np
@@ -1656,6 +1655,11 @@ class ModelLaunchSettings:
 
         if self.tp_size > 1 and "--tp" not in self.extra_args:
             self.extra_args.extend(["--tp", str(self.tp_size)])
+
+        fixed_args = ["--enable-multimodal", "--trust-remote-code"]
+        for fixed_arg in fixed_args:
+            if fixed_arg not in self.extra_args:
+                self.extra_args.append(fixed_arg)
 
 
 class ModelEvalMetrics:

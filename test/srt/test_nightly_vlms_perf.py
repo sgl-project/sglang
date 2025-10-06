@@ -18,21 +18,14 @@ from sglang.test.test_utils import (
 
 PROFILE_DIR = "performance_profiles_vlms"
 
-VLM_EXTRA_ARGS = [
-    "--enable-multimodal",
-    "--trust-remote-code",
-    "--mem-fraction-static=0.7",
-]
-
 MODEL_DEFAULTS = [
     # Keep conservative defaults. Can be overridden by env NIGHTLY_VLM_MODELS
     ModelLaunchSettings(
         "Qwen/Qwen2.5-VL-7B-Instruct",
-        extra_args=VLM_EXTRA_ARGS,
+        extra_args=["--mem-fraction-static=0.7"],
     ),
     ModelLaunchSettings(
         "google/gemma-3-27b-it",
-        extra_args=VLM_EXTRA_ARGS,
     ),
     # "OpenGVLab/InternVL2_5-2B",
     # buggy in official transformers impl
