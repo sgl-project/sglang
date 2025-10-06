@@ -97,7 +97,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "ep_num_redundant_experts",
     "enable_nan_detection",
     "flashinfer_mla_disable_ragged",
-    "max_micro_batch_size",
+    "pp_max_micro_batch_size",
     "disable_shared_experts_fusion",
     "sampling_backend",
     "speculative_accept_threshold_single",
