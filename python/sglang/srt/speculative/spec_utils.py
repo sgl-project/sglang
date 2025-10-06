@@ -15,7 +15,7 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.utils import is_cuda, is_hip
 
 if is_cuda():
-    from sgl_kernel import fast_topk
+    from sgl_kernel import fast_topk, tree_speculative_sampling_target_only
 elif is_hip():
     from sgl_kernel import fast_topk
 
