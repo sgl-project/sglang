@@ -407,7 +407,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             ret, n_choices=request.n, enable_cache_report=cache_report
         )
 
-        response = CompletionResponse(
+        chunk = CompletionResponse(
             id=ret[0]["meta_info"]["id"],
             model=request.model,
             created=created,
@@ -415,8 +415,8 @@ class OpenAIServingCompletion(OpenAIServingBase):
             usage=usage,
             metadata={"weight_version": ret[0]["meta_info"]["weight_version"]},
         )
-        response.chutes_verification = get_chutes_verification_value(chunk.id, chunk.created, choices[0].text)
-        return response
+        chunk.chutes_verification = get_chutes_verification_value(chunk.id, chunk.created, choices[0].text)
+        return chunk
 
 
     def _get_echo_text(self, request: CompletionRequest, index: int) -> str:

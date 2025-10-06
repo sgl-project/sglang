@@ -825,7 +825,7 @@ class OpenAIServingChat(OpenAIServingBase):
             enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
         )
 
-        return ChatCompletionResponse(
+        chunk = ChatCompletionResponse(
             id=ret[0]["meta_info"]["id"],
             created=created,
             model=request.model,
@@ -833,6 +833,9 @@ class OpenAIServingChat(OpenAIServingBase):
             usage=usage,
             metadata={"weight_version": ret[0]["meta_info"]["weight_version"]},
         )
+        if choices:
+            chunk.chutes_verification = get_chutes_verification_value(chunk.id, chunk.created, choices[0].message.content)
+        return chunk
 
     def _process_logprobs_tokens(
         self, logprobs: LogProbs, use_token_index: bool = False
