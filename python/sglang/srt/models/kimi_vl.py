@@ -79,6 +79,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
 from sglang.srt.models.kimi_vl_moonvit import MoonVitPretrainedModel
+from sglang.srt.models.utils import TowerAwareMixin
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
@@ -118,7 +119,9 @@ class KimiVLMultiModalProjector(nn.Module):
         return hidden_states
 
 
-class KimiVLForConditionalGeneration(nn.Module):
+class KimiVLForConditionalGeneration(TowerAwareMixin, nn.Module):
+    tower_names = ("vision_tower",)
+
     def __init__(
         self,
         config: KimiVLConfig,

@@ -26,10 +26,13 @@ from sglang.srt.managers.schedule_batch import MultimodalInputs, flatten_nested_
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaForCausalLM
+from sglang.srt.models.utils import TowerAwareMixin
 from sglang.srt.utils import add_prefix
 
 
-class LlavaVidForCausalLM(nn.Module):
+class LlavaVidForCausalLM(TowerAwareMixin, nn.Module):
+    tower_names = ("vision_tower",)
+
     def __init__(
         self,
         config: LlavaConfig,

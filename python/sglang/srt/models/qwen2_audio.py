@@ -59,13 +59,14 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
+from sglang.srt.models.utils import TowerAwareMixin
 from sglang.srt.utils import add_prefix
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
 
 
-class Qwen2AudioForConditionalGeneration(nn.Module):
+class Qwen2AudioForConditionalGeneration(TowerAwareMixin, nn.Module):
     # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [
         ".gate_proj.",
@@ -84,6 +85,8 @@ class Qwen2AudioForConditionalGeneration(nn.Module):
         "gate_proj": ("gate_up_proj", 0),
         "up_proj": ("gate_up_proj", 1),
     }
+
+    tower_names = ("audio_tower",)
 
     def __init__(
         self,
@@ -151,6 +154,7 @@ class Qwen2AudioForConditionalGeneration(nn.Module):
         return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        audio_tower_name = self.get_tower_name()
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -173,7 +177,7 @@ class Qwen2AudioForConditionalGeneration(nn.Module):
                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name or "audio_tower" in name:
+                if weight_name not in name or audio_tower_name in name:
                     continue
                 name_tmp = name.replace(weight_name, param_name)
 

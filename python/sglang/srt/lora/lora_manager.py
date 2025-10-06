@@ -68,6 +68,20 @@ class LoRAManager:
         self.tp_size: int = tp_size
         self.tp_rank: int = tp_rank
 
+        tower_names_fn = getattr(self.base_model, "get_mm_tower_names", None)
+        self.tower_module_prefixes: Set[str] = set()
+        if callable(tower_names_fn):
+            raw_prefixes = tower_names_fn()
+            if not isinstance(raw_prefixes, (list, tuple, set)):
+                raise TypeError(
+                    "get_mm_tower_names() must return an iterable of strings."
+                )
+            self.tower_module_prefixes = {
+                str(prefix).strip()
+                for prefix in raw_prefixes
+                if isinstance(prefix, str) and prefix.strip()
+            }
+
         # LoRA backend for running sgemm kernels
         logger.info(f"Using {lora_backend} as backend of LoRA kernels.")
         backend_type = get_backend_from_name(lora_backend)
@@ -418,9 +432,14 @@ class LoRAManager:
         replace_submodule(self.base_model, module_name, lora_module)
         return lora_module
 
-    def should_skip_lora_for_vision_model(self, module_name):
-        # TODO: support different vision models
-        return module_name.find("vision_model.model") != -1
+    def should_skip_lora_for_tower(self, module_name: str) -> bool:
+        if any(
+            module_name == prefix or module_name.startswith(prefix + ".")
+            for prefix in self.tower_module_prefixes
+        ):
+            return True
+        # Maintain backward compatibility for historical vision model naming.
+        return "vision_model.model" in module_name
 
     def init_lora_modules(self):
         # Look-up table that essentially maps (layer_index, module_name) to the corresponding LoRA module.
@@ -440,7 +459,7 @@ class LoRAManager:
                 continue
 
             # Skip vision model
-            if self.should_skip_lora_for_vision_model(module_name):
+            if self.should_skip_lora_for_tower(module_name):
                 continue
 
             # The module should be converted if it is included in target_names

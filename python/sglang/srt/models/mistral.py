@@ -89,5 +89,11 @@ class Mistral3ForConditionalGeneration:
     def __call__(self, *args, **kwargs):
         return self.inner(*args, **kwargs)
 
+    def get_mm_tower_names(self):
+        get_names = getattr(self.inner, "get_mm_tower_names", None)
+        if callable(get_names):
+            return get_names()
+        return []
+
 
 EntryClass = [MistralForCausalLM, Mistral3ForConditionalGeneration]

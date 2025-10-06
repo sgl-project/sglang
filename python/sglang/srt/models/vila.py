@@ -24,6 +24,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
+from sglang.srt.models.utils import TowerAwareMixin
 
 logger = logging.getLogger(__name__)
 
@@ -179,7 +180,7 @@ class MultimodalProjector(nn.Module):
 ##### END COPY modeling_vila.py #####
 
 
-class VILAForConditionalGeneration(nn.Module):
+class VILAForConditionalGeneration(TowerAwareMixin, nn.Module):
     config: VILAConfig
     quant_config: Optional[QuantizationConfig]
 
@@ -189,6 +190,8 @@ class VILAForConditionalGeneration(nn.Module):
     llm: Qwen2ForCausalLM
     mm_projector: MultimodalProjector
     vision_tower: SiglipVisionModel
+
+    tower_names = ("vision_tower",)
 
     def __init__(
         self,

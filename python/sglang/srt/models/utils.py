@@ -12,6 +12,8 @@
 # limitations under the License.
 # ==============================================================================
 
+from typing import List, Sequence
+
 import torch
 
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -49,3 +51,20 @@ def create_fused_set_kv_buffer_arg(
         v_scale=layer.v_scale,
         cache_loc=forward_batch.out_cache_loc,
     )
+
+
+class TowerAwareMixin:
+    """Mixin for multimodal models to declare tower module prefixes."""
+
+    tower_names: Sequence[str] = ()
+
+    def get_mm_tower_names(self) -> List[str]:
+        return [name for name in self.tower_names if isinstance(name, str) and name]
+
+    def get_tower_name(self, index: int = 0) -> str:
+        names = self.get_mm_tower_names()
+        if not names:
+            raise ValueError("No tower names defined for this model.")
+        if not (0 <= index < len(names)):
+            raise IndexError(f"Tower index {index} out of range for towers {names}.")
+        return names[index]

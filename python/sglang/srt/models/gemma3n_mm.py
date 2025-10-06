@@ -36,6 +36,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.gemma3n_audio import Gemma3nAudioEncoder
 from sglang.srt.models.gemma3n_causal import Gemma3nRMSNorm, Gemma3nTextModel
+from sglang.srt.models.utils import TowerAwareMixin
 from sglang.srt.utils import add_prefix
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
@@ -142,7 +143,7 @@ class Gemma3nMultimodalEmbedder(nn.Module):
         return self.embedding_post_projection_norm(emb_norm_proj)
 
 
-class Gemma3nForConditionalGeneration(PreTrainedModel):
+class Gemma3nForConditionalGeneration(TowerAwareMixin, PreTrainedModel):
     config_class = Gemma3nConfig
     """Gemma3n multimodal model for conditional generation."""
 
@@ -189,6 +190,7 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
     embedding_modules = {}
     embedding_padding_modules = []
     supports_lora = True
+    tower_names = ("vision_tower", "audio_tower")
 
     def __init__(
         self,
@@ -221,10 +223,11 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
             prefix=add_prefix("embed_audio", prefix),
         )
 
+        audio_tower_name = self.get_tower_name(1)
         self.audio_tower = Gemma3nAudioEncoder(
             config.audio_config,
             quant_config=quant_config,
-            prefix=add_prefix("audio_tower", prefix),
+            prefix=add_prefix(audio_tower_name, prefix),
         )
 
         self.vocab_size = config.text_config.vocab_size

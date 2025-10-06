@@ -46,6 +46,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaForCausalLM
 from sglang.srt.models.mistral import MistralForCausalLM
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
+from sglang.srt.models.utils import TowerAwareMixin
 from sglang.srt.multimodal.mm_utils import (
     get_anyres_image_grid_shape,
     unpad_image,
@@ -54,7 +55,9 @@ from sglang.srt.multimodal.mm_utils import (
 from sglang.srt.utils import add_prefix, flatten_nested_list, logger
 
 
-class LlavaBaseForCausalLM(nn.Module):
+class LlavaBaseForCausalLM(TowerAwareMixin, nn.Module):
+    tower_names = ("vision_tower",)
+
     def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
         image_sizes = flatten_nested_list(
             [item.image_sizes for item in image_inputs.mm_items]
@@ -475,16 +478,21 @@ class LlavaBaseForCausalLM(nn.Module):
             raise ValueError(f"Unexpected select feature: {self.select_feature}")
 
         # load mm_projector
+        vision_tower_name = self.get_tower_name()
         projector_weights = {
             "model.mm_projector.0": "multi_modal_projector.linear_1",
             "model.mm_projector.2": "multi_modal_projector.linear_2",
-            "model.vision_tower.vision_tower": "vision_tower",
             # Update the vision tower weights if we find them in the checkpoint (it may be finetuned).
             "model.image_newline": "language_model.model.image_newline",
         }
+        projector_weights[f"model.{vision_tower_name}.{vision_tower_name}"] = vision_tower_name
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
-            if "projector" in name or "vision_tower" in name or "image_newline" in name:
+            if (
+                "projector" in name
+                or vision_tower_name in name
+                or "image_newline" in name
+            ):
                 for weight_name, param_name in projector_weights.items():
                     if weight_name in name:
                         name = name.replace(weight_name, param_name)
@@ -733,10 +741,11 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
             quant_config=quant_config,
             prefix=add_prefix("language_model", prefix),
         )
+        vision_tower_name = self.get_tower_name()
         self.vision_tower = vision_model_cls(
             self.vision_config,
             quant_config=quant_config,
-            prefix=add_prefix("vision_tower", prefix),
+            prefix=add_prefix(vision_tower_name, prefix),
         )
 
         if "unpad" in getattr(self.config, "mm_patch_merge_type", ""):

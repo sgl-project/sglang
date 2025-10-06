@@ -33,6 +33,7 @@ from sglang.srt.managers.schedule_batch import (
     global_server_args_dict,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.models.utils import TowerAwareMixin
 from sglang.srt.utils import is_cpu
 
 _is_cpu = is_cpu()
@@ -416,11 +417,13 @@ class Llama4VisionModel(nn.Module):
         return hidden_state
 
 
-class Llama4ForConditionalGeneration(nn.Module):
+class Llama4ForConditionalGeneration(TowerAwareMixin, nn.Module):
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
+
+    tower_names = ("vision_model",)
 
     def __init__(
         self,
@@ -457,10 +460,11 @@ class Llama4ForConditionalGeneration(nn.Module):
                 vision_quant_config = None
             else:
                 vision_quant_config = quant_config
+            vision_tower_name = self.get_tower_name()
             self.vision_model = Llama4VisionModel(
                 config.vision_config,
                 quant_config=vision_quant_config,
-                prefix=add_prefix("vision_model", prefix),
+                prefix=add_prefix(vision_tower_name, prefix),
             )
 
             self.multi_modal_projector = Llama4MultiModalProjector(config)

@@ -33,12 +33,15 @@ from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInp
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
+from sglang.srt.models.utils import TowerAwareMixin
 
 from .dots_vlm_vit import DotsVisionTransformer
 
 
-class DotsVLMForCausalLM(nn.Module):
+class DotsVLMForCausalLM(TowerAwareMixin, nn.Module):
     """DotsVLM model for sglang inference"""
+
+    tower_names = ("vision_tower",)
 
     def __init__(
         self, config: DotsVLMConfig, quant_config: Optional[QuantizationConfig] = None

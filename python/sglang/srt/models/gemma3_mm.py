@@ -42,6 +42,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.gemma3_causal import Gemma3ForCausalLM
 from sglang.srt.models.siglip import SiglipVisionModel
+from sglang.srt.models.utils import TowerAwareMixin
 from sglang.srt.utils import add_prefix
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
@@ -106,8 +107,10 @@ class Gemma3MultiModalProjector(nn.Module):
         return projected_vision_outputs.type_as(vision_outputs)
 
 
-class Gemma3ForConditionalGeneration(PreTrainedModel):
+class Gemma3ForConditionalGeneration(TowerAwareMixin, PreTrainedModel):
     config_class = Gemma3Config
+
+    tower_names = ("vision_tower",)
     """Gemma3 multimodal model for conditional generation."""
 
     # BitandBytes specific attributes
@@ -165,10 +168,11 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         self.config = config
         self.quant_config = quant_config
 
+        vision_tower_name = self.get_tower_name()
         self.vision_tower = SiglipVisionModel(
             config=config.vision_config,
             quant_config=quant_config,
-            prefix=add_prefix("vision_tower", prefix),
+            prefix=add_prefix(vision_tower_name, prefix),
         )
 
         self.multi_modal_projector = Gemma3MultiModalProjector(config)
