@@ -15,11 +15,11 @@ use crate::{
         },
         worker_spec::{WorkerApiResponse, WorkerConfigRequest, WorkerErrorResponse},
     },
-    reasoning_parser::ParserFactory,
+    reasoning_parser::ReasoningParserFactory,
     routers::{router_manager::RouterManager, RouterTrait},
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
     tokenizer::{factory as tokenizer_factory, traits::Tokenizer},
-    tool_parser::ParserRegistry,
+    tool_parser::ToolParserFactory,
 };
 use axum::{
     extract::{Path, Query, Request, State},
@@ -45,8 +45,8 @@ pub struct AppContext {
     pub router_config: RouterConfig,
     pub rate_limiter: Arc<TokenBucket>,
     pub tokenizer: Option<Arc<dyn Tokenizer>>,
-    pub reasoning_parser_factory: Option<ParserFactory>,
-    pub tool_parser_registry: Option<&'static ParserRegistry>,
+    pub reasoning_parser_factory: Option<ReasoningParserFactory>,
+    pub tool_parser_factory: Option<ToolParserFactory>,
     pub worker_registry: Arc<WorkerRegistry>,
     pub policy_registry: Arc<PolicyRegistry>,
     pub router_manager: Option<Arc<RouterManager>>,
@@ -64,7 +64,7 @@ impl AppContext {
         let rate_limit_tokens = rate_limit_tokens_per_second.unwrap_or(max_concurrent_requests);
         let rate_limiter = Arc::new(TokenBucket::new(max_concurrent_requests, rate_limit_tokens));
 
-        let (tokenizer, reasoning_parser_factory, tool_parser_registry) =
+        let (tokenizer, reasoning_parser_factory, tool_parser_factory) =
             if router_config.connection_mode == ConnectionMode::Grpc {
                 let tokenizer_path = router_config
                     .tokenizer_path
@@ -79,10 +79,10 @@ impl AppContext {
                     tokenizer_factory::create_tokenizer(&tokenizer_path)
                         .map_err(|e| format!("Failed to create tokenizer: {e}"))?,
                 );
-                let reasoning_parser_factory = Some(ParserFactory::new());
-                let tool_parser_registry = Some(ParserRegistry::new());
+                let reasoning_parser_factory = Some(ReasoningParserFactory::new());
+                let tool_parser_factory = Some(ToolParserFactory::new());
 
-                (tokenizer, reasoning_parser_factory, tool_parser_registry)
+                (tokenizer, reasoning_parser_factory, tool_parser_factory)
             } else {
                 (None, None, None)
             };
@@ -121,7 +121,7 @@ impl AppContext {
             rate_limiter,
             tokenizer,
             reasoning_parser_factory,
-            tool_parser_registry,
+            tool_parser_factory,
             worker_registry,
             policy_registry,
             router_manager,
@@ -807,9 +807,12 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         config.router_config.cors_allowed_origins.clone(),
     );
 
-    let addr = format!("{}:{}", config.host, config.port);
-    let listener = TcpListener::bind(&addr).await?;
-    info!("Starting server on {}", addr);
+    // TcpListener::bind accepts &str and handles IPv4/IPv6 via ToSocketAddrs
+    let bind_addr = format!("{}:{}", config.host, config.port);
+    info!("Starting server on {}", bind_addr);
+    let listener = TcpListener::bind(&bind_addr)
+        .await
+        .map_err(|e| format!("Failed to bind to {}: {}", bind_addr, e))?;
     serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await

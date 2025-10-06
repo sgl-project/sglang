@@ -47,6 +47,7 @@ if TYPE_CHECKING:
         CombineInput,
         StandardDispatchOutput,
     )
+    from sglang.srt.single_batch_overlap import DownGemmOverlapArgs
 
 if is_cuda():
     from sgl_kernel import scaled_fp4_quant
@@ -79,6 +80,10 @@ CUTEDSL_MOE_SCALAR_INPUT_SCALE = get_bool_env_var(
 )
 USE_CUTLASS_BACKEND_FOR_FP4_GEMM = get_bool_env_var(
     "SGLANG_USE_CUTLASS_BACKEND_FOR_FP4_GEMM"
+)
+# TODO make it true by default when the DeepEP PR is merged
+CUTEDSL_MOE_NVFP4_DISPATCH = get_bool_env_var(
+    "SGLANG_CUTEDSL_MOE_NVFP4_DISPATCH", "false"
 )
 
 # Supported activation schemes for the current configuration
@@ -140,21 +145,11 @@ class ModelOptFp8Config(QuantizationConfig):
             # Flat format (config.json quantization_config)
             # For kv_cache, check if kv_cache_scheme exists and extract algo
             kv_cache_scheme = config.get("kv_cache_scheme")
-
-            kv_cache_type = None
-            kv_cache_bits = None
-            if isinstance(kv_cache_scheme, dict):
-                # Handles the expected format: {"type": "float", "num_bits": 8}
-                kv_cache_type = kv_cache_scheme.get("type")
-                kv_cache_bits = kv_cache_scheme.get("num_bits")
-            elif isinstance(kv_cache_scheme, str):
-                # Handles the shorthand format: "FP8"
-                if kv_cache_scheme.upper() == "FP8":
-                    kv_cache_type = "float"
-                    kv_cache_bits = 8
-
-            # Now, safely use the extracted values
-            if kv_cache_type == "float" and kv_cache_bits == 8:
+            if (
+                kv_cache_scheme
+                and kv_cache_scheme.get("type") == "float"
+                and kv_cache_scheme.get("num_bits") == 8
+            ):
                 kv_cache_quant_method = "FP8"
 
             # Map 'ignore' field to 'exclude_modules'
@@ -604,22 +599,11 @@ class ModelOptFp4Config(QuantizationConfig):
             if not kv_cache_quant_algo:
                 # For config.json format, derive from kv_cache_scheme if available
                 kv_cache_scheme = config.get("kv_cache_scheme")
-
-                kv_cache_type = None
-                kv_cache_bits = None
-                if isinstance(kv_cache_scheme, dict):
-                    # Handles the expected format: {"type": "float", "num_bits": 8}
-                    kv_cache_type = kv_cache_scheme.get("type")
-                    kv_cache_bits = kv_cache_scheme.get("num_bits")
-                elif isinstance(kv_cache_scheme, str):
-                    # Handles the shorthand format: "FP8"
-                    # We can infer the properties from the string.
-                    if kv_cache_scheme.upper() == "FP8":
-                        kv_cache_type = "float"
-                        kv_cache_bits = 8
-
-                # Now, safely use the extracted values in the original logic
-                if kv_cache_type == "float" and kv_cache_bits == 8:
+                if (
+                    kv_cache_scheme
+                    and kv_cache_scheme.get("type") == "float"
+                    and kv_cache_scheme.get("num_bits") == 8
+                ):
                     kv_cache_quant_algo = "FP8"
                 else:
                     kv_cache_quant_algo = "auto"
@@ -1255,6 +1239,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
             w13_input_scale = _slice_scale(w13_input_scale)
             w2_input_scale = _slice_scale(w2_input_scale)
+
+            if CUTEDSL_MOE_NVFP4_DISPATCH:
+                assert torch.all(w13_input_scale == w13_input_scale[0])
+                w13_input_scale = w13_input_scale[0]
         else:
             w13_input_scale = layer.w13_input_scale.max(dim=1).values.to(torch.float32)
             w2_input_scale = layer.w2_input_scale
@@ -1481,6 +1469,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         x: torch.Tensor,
         masked_m: torch.Tensor,
         moe_runner_config: MoeRunnerConfig,
+        down_gemm_overlap_args: Optional["DownGemmOverlapArgs"],
     ) -> torch.Tensor:
         assert (
             moe_runner_config.activation == "silu"
@@ -1497,7 +1486,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         out = flashinfer_cutedsl_moe_masked(
             hidden_states=x,
-            input_global_scale=layer.w13_input_scale_quant,
+            input_global_scale=(
+                None if CUTEDSL_MOE_NVFP4_DISPATCH else layer.w13_input_scale_quant
+            ),
             w1=layer.w13_weight,
             w1_blockscale=layer.w13_blockscale_swizzled,
             w1_alpha=layer.g1_alphas,
@@ -1506,5 +1497,14 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w2_blockscale=layer.w2_blockscale_swizzled,
             w2_alpha=layer.g2_alphas,
             masked_m=masked_m,
+            **(
+                dict(
+                    down_sm_count=down_gemm_overlap_args.num_sms,
+                    down_signals=down_gemm_overlap_args.signal,
+                    down_start_event=down_gemm_overlap_args.start_event,
+                )
+                if down_gemm_overlap_args is not None
+                else {}
+            ),
         )
         return out

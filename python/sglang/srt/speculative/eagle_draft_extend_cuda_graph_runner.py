@@ -21,7 +21,8 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.speculative.eagle_utils import EagleDraftInput, fast_topk
+from sglang.srt.speculative.eagle_info import EagleDraftInput
+from sglang.srt.speculative.spec_utils import fast_topk
 from sglang.srt.utils import (
     require_attn_tp_gather,
     require_gathered_buffer,
@@ -331,6 +332,7 @@ class EAGLEDraftExtendCudaGraphRunner:
         if bs * self.num_tokens_per_bs != num_tokens:
             self.seq_lens.fill_(self.seq_len_fill_value)
             self.out_cache_loc.zero_()
+            self.positions.zero_()
             self.accept_length.fill_(1)
             self.extend_seq_lens.fill_(1)
 
