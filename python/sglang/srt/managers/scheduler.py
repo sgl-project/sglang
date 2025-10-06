@@ -958,6 +958,17 @@ class Scheduler(
         ).stream(self.copy_stream)
 
         self.future_map = FutureMap(self.max_running_requests, self.device)
+        self.batch_record_buf = [None] * 2
+        self.batch_record_ct = 0
+
+    def record_batch_in_overlap(self, model_worker_batch: ModelWorkerBatch):
+        # FIXME(lsyin): hacky way to keep a reference to avoid GPU tensors being freed by torch GC
+        # NOTE: More Reliable: record all tensors into the forward stream
+        # NOTE: - for all future tensors, we shall always read from future map
+        #       - for all non-future tensors (produced only by schedule stream),
+        #       we shall keep its reference not being release during all the forwarding pass
+        self.batch_record_ct = (self.batch_record_ct + 1) % 2
+        self.batch_record_buf[self.batch_record_ct] = model_worker_batch
 
     def init_moe_config(self):
         if hasattr(self.model_config.hf_config, "num_experts_per_tok"):
@@ -2085,6 +2096,7 @@ class Scheduler(
                 # FIXME: remove this assert
                 assert isinstance(batch_or_worker_batch, ModelWorkerBatch)
                 model_worker_batch = batch_or_worker_batch
+                self.record_batch_in_overlap(model_worker_batch)
 
                 # Sampling info will be modified during forward
                 model_worker_batch.sampling_info = self.tp_worker.cur_sampling_info = (
