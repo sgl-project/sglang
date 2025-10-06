@@ -110,7 +110,7 @@ def get_rdma_devices_args():
         gpu_indices = [
             int(idx.strip()) for idx in cuda_visible_devices.split(",") if idx.strip()
         ]
-        if not gpu_indices or len(gpu_indices) >= 4:
+        if not gpu_indices or len(gpu_indices) > 4:
             return "mlx5_roce0,mlx5_roce4"
     except ValueError:
         warnings.warn(f"Invalid CUDA_VISIBLE_DEVICES format: {cuda_visible_devices}")
