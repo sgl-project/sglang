@@ -125,6 +125,7 @@ suites = {
         TestFile("test_vlm_input_format.py", 300),
         TestFile("test_vision_openai_server_a.py", 724),
         TestFile("test_vision_openai_server_b.py", 446),
+        TestFile("test_modelopt_loader.py", 30),
     ],
     "per-commit-2-gpu": [
         TestFile("lora/test_lora_tp.py", 116),
