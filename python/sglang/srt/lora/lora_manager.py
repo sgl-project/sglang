@@ -420,15 +420,9 @@ class LoRAManager:
 
     def should_skip_lora_for_vision_model(self, module_name):
         # Skip vision/audio components for all multimodal models TODO: maybe need to support other multimodal models
-        vision_prefixes = [
-            "vision_model",
-            "vision_tower",
-            "multi_modal_projector",
-        ]
-        return any(
-            module_name.startswith(prefix) or f".{prefix}." in module_name
-            for prefix in vision_prefixes
-        )
+        vision_prefixes = {"vision_model", "vision_tower", "multi_modal_projector"}
+        module_parts = module_name.split(".")
+        return any(part in vision_prefixes for part in module_parts)
 
     def init_lora_modules(self):
         # Look-up table that essentially maps (layer_index, module_name) to the corresponding LoRA module.
