@@ -89,22 +89,19 @@ class SchedulerProfilerMixin:
         self.profile_steps = num_steps
 
         if self.profile_by_stage:
-            # Set target counts based on which stage we want to profile
             if self.profile_stage == "prefill":
                 self.profiler_target_prefill_ct = num_steps
-                self.profiler_target_decode_ct = None  # Don't profile decode
+                self.profiler_target_decode_ct = None 
             elif self.profile_stage == "decode":
-                self.profiler_target_prefill_ct = None  # Don't profile prefill
+                self.profiler_target_prefill_ct = None
                 self.profiler_target_decode_ct = num_steps
-            else:  # profile both stages
+            else:
                 self.profiler_target_prefill_ct = num_steps
                 self.profiler_target_decode_ct = num_steps
 
-            # Reset counters
             self.profiler_prefill_ct = 0
             self.profiler_decode_ct = 0
         else:
-            # Traditional profiling mode
             if start_step:
                 self.profiler_target_forward_ct = (
                     self.profiler_start_forward_ct + num_steps
