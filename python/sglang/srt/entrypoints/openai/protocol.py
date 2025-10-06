@@ -16,12 +16,14 @@
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, TypeAlias, Union
+from typing import Any, Dict, List, NamedTuple, Optional, TypeAlias, Union
 
 from openai.types.responses import (
     ResponseFunctionToolCall,
     ResponseInputItemParam,
     ResponseOutputItem,
+    ResponseOutputMessage,
+    ResponseOutputText,
     ResponseReasoningItem,
 )
 from openai.types.responses.response import ToolChoice
@@ -235,8 +237,8 @@ class CompletionRequest(BaseModel):
     # Priority for the request
     priority: Optional[int] = None
 
-    # For customer metric labels
-    customer_labels: Optional[Dict[str, str]] = None
+    # For custom metric labels
+    custom_labels: Optional[Dict[str, str]] = None
 
     @field_validator("max_tokens")
     @classmethod
@@ -392,7 +394,7 @@ class Function(BaseModel):
     """Function descriptions."""
 
     description: Optional[str] = Field(default=None, examples=[None])
-    name: Optional[str] = None
+    name: str
     parameters: Optional[object] = None
     strict: bool = False
 
@@ -881,6 +883,26 @@ class ResponsesResponse(BaseModel):
     tool_choice: str = "auto"
     tools: List[ResponseTool] = Field(default_factory=list)
 
+    # OpenAI compatibility fields. not all are used at the moment.
+    # Recommend checking https://platform.openai.com/docs/api-reference/responses
+    error: Optional[dict] = None
+    incomplete_details: Optional[dict] = None  # TODO(v) support this input
+    instructions: Optional[str] = None
+    max_output_tokens: Optional[int] = None
+    previous_response_id: Optional[str] = None
+    reasoning: Optional[dict] = (
+        # Unused. No model supports this. For GPT-oss, system prompt sets
+        # the field, not server args.
+        None  # {"effort": Optional[str], "summary": Optional[str]}
+    )
+    store: Optional[bool] = None
+    temperature: Optional[float] = None
+    text: Optional[dict] = None  # e.g. {"format": {"type": "text"}}
+    top_p: Optional[float] = None
+    truncation: Optional[str] = None
+    user: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+
     @classmethod
     def from_request(
         cls,
@@ -895,6 +917,41 @@ class ResponsesResponse(BaseModel):
         usage: Optional[UsageInfo],
     ) -> "ResponsesResponse":
         """Create a response from a request."""
+
+        # Determine if the output is plain text only to set text.format
+        def _is_text_only(
+            items: List[
+                Union[
+                    ResponseOutputItem, ResponseReasoningItem, ResponseFunctionToolCall
+                ]
+            ]
+        ) -> bool:
+            if not items:
+                return False
+            for it in items:
+                # tool call -> not pure text.
+                if isinstance(it, ResponseReasoningItem) or isinstance(
+                    it, ResponseFunctionToolCall
+                ):
+                    return False
+                try:
+                    if isinstance(it, ResponseOutputText):
+                        continue
+                    elif isinstance(it, ResponseOutputMessage):
+                        if not it.content:
+                            continue
+                        for c in it.content:
+                            if not isinstance(c, ResponseOutputText):
+                                return False
+                    else:
+                        # Unknown type, not considered text-only
+                        return False
+                except AttributeError:
+                    return False
+            return True
+
+        text_format = {"format": {"type": "text"}} if _is_text_only(output) else None
+
         return cls(
             id=request.request_id,
             created_at=created_time,
@@ -905,6 +962,23 @@ class ResponsesResponse(BaseModel):
             parallel_tool_calls=request.parallel_tool_calls or True,
             tool_choice=request.tool_choice,
             tools=request.tools,
+            # fields for parity with v1/responses
+            error=None,
+            incomplete_details=None,
+            instructions=request.instructions,
+            max_output_tokens=request.max_output_tokens,
+            previous_response_id=request.previous_response_id,  # TODO(v): ensure this is propagated if retrieved from store
+            reasoning={
+                "effort": request.reasoning.effort if request.reasoning else None,
+                "summary": None,  # unused
+            },
+            store=request.store,
+            temperature=request.temperature,
+            text=text_format,  # TODO(v): Expand coverage per https://platform.openai.com/docs/api-reference/responses/list
+            top_p=request.top_p,
+            truncation=request.truncation,
+            user=request.user,
+            metadata=request.metadata or {},
         )
 
 
@@ -941,6 +1015,16 @@ class MessageProcessingResult:
     modalities: List[str]
     stop: List[str]
     tool_call_constraint: Optional[Any] = None
+
+
+class ToolCallProcessingResult(NamedTuple):
+    """Result of processing tool calls in a response."""
+
+    tool_calls: Optional[
+        List[Any]
+    ]  # List of ToolCall objects or None if parsing failed
+    remaining_text: str  # Text remaining after parsing tool calls
+    finish_reason: Dict[str, Any]  # Updated finish reason dictionary
 
 
 class ResponseReasoningTextContent(BaseModel):
