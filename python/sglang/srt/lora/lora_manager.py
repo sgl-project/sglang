@@ -419,13 +419,10 @@ class LoRAManager:
         return lora_module
 
     def should_skip_lora_for_vision_model(self, module_name):
-        # Skip vision/audio components for all multimodal models
+        # Skip vision/audio components for all multimodal models TODO: maybe need to support other multimodal models
         vision_prefixes = [
             "vision_model",
             "vision_tower",
-            "embed_vision",
-            "audio_tower",
-            "embed_audio",
             "multi_modal_projector",
         ]
         return any(
