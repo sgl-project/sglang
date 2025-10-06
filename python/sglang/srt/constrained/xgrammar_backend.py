@@ -214,7 +214,9 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                 # Note: This builtin JSON grammar includes *all* valid JSON (including, for example, arrays at the root)
                 ctx = self.grammar_compiler.compile_builtin_json_grammar()
             else:
-                ctx = self.grammar_compiler.compile_json_schema(schema=key_string, any_whitespace=self.any_whitespace)
+                ctx = self.grammar_compiler.compile_json_schema(
+                    schema=key_string, any_whitespace=self.any_whitespace
+                )
 
         except (RuntimeError, json.decoder.JSONDecodeError) as e:
             logging.error(f"Hit invalid json_schema: {key_string=}, {e=}")
