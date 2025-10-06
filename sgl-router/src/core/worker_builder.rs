@@ -96,22 +96,33 @@ impl BasicWorkerBuilder {
 
     /// Build the BasicWorker instance
     pub fn build(self) -> BasicWorker {
-        use std::borrow::Cow;
         use std::sync::{
             atomic::{AtomicBool, AtomicUsize},
             Arc,
         };
         use tokio::sync::{Mutex, RwLock};
 
-        let url_to_parse = if self.url.contains("://") {
-            Cow::from(&self.url)
-        } else {
-            Cow::from(format!("http://{}", self.url))
-        };
-
-        let bootstrap_host = match url::Url::parse(&url_to_parse) {
+        let bootstrap_host = match url::Url::parse(&self.url) {
             Ok(parsed) => parsed.host_str().unwrap_or("localhost").to_string(),
-            Err(_) => "localhost".to_string(),
+            Err(_) if !self.url.contains("://") => {
+                match url::Url::parse(&format!("http://{}", self.url)) {
+                    Ok(parsed) => parsed.host_str().unwrap_or("localhost").to_string(),
+                    Err(_) => {
+                        tracing::warn!(
+                            "Failed to parse URL '{}', defaulting to localhost",
+                            self.url
+                        );
+                        "localhost".to_string()
+                    }
+                }
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "Failed to parse URL '{}', defaulting to localhost",
+                    self.url
+                );
+                "localhost".to_string()
+            }
         };
 
         let bootstrap_port = match self.worker_type {

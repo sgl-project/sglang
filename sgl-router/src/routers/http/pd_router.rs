@@ -186,12 +186,6 @@ impl PDRouter {
         prefill_worker: &dyn Worker,
         batch_size: Option<usize>,
     ) -> Result<Value, String> {
-        let bootstrap_port = match prefill_worker.worker_type() {
-            crate::core::WorkerType::Prefill { bootstrap_port } => bootstrap_port,
-            _ => None,
-        };
-        let hostname = super::pd_types::get_hostname(prefill_worker.url());
-
         let obj = original
             .as_object_mut()
             .ok_or_else(|| "Request must be a JSON object".to_string())?;
@@ -201,8 +195,8 @@ impl PDRouter {
             let mut ports = Vec::with_capacity(n);
             let mut rooms = Vec::with_capacity(n);
             for _ in 0..n {
-                hosts.push(hostname.clone());
-                ports.push(bootstrap_port);
+                hosts.push(prefill_worker.bootstrap_host());
+                ports.push(prefill_worker.bootstrap_port());
                 rooms.push(super::pd_types::generate_room_id());
             }
             obj.insert(
@@ -228,11 +222,11 @@ impl PDRouter {
         } else {
             obj.insert(
                 "bootstrap_host".to_string(),
-                serde_json::Value::from(hostname),
+                serde_json::Value::from(prefill_worker.bootstrap_host()),
             );
             obj.insert(
                 "bootstrap_port".to_string(),
-                match bootstrap_port {
+                match prefill_worker.bootstrap_port() {
                     Some(v) => serde_json::Value::from(v),
                     None => Value::Null,
                 },
