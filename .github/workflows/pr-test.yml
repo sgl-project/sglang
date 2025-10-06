@@ -155,7 +155,7 @@ jobs:
 
   sgl-kernel-benchmark-test:
     needs: [check-changes, sgl-kernel-build-wheels]
-    if: always() && !failure() && !cancelled()
+    if: needs.check-changes.outputs.sgl_kernel == 'true'
     runs-on: 1-gpu-runner
     env:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
