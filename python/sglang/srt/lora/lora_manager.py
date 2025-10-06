@@ -419,8 +419,19 @@ class LoRAManager:
         return lora_module
 
     def should_skip_lora_for_vision_model(self, module_name):
-        # TODO: support different vision models
-        return module_name.find("vision_model.model") != -1
+        # Skip vision/audio components for all multimodal models
+        vision_prefixes = [
+            "vision_model",
+            "vision_tower",
+            "embed_vision",
+            "audio_tower",
+            "embed_audio",
+            "multi_modal_projector",
+        ]
+        return any(
+            module_name.startswith(prefix) or f".{prefix}." in module_name
+            for prefix in vision_prefixes
+        )
 
     def init_lora_modules(self):
         # Look-up table that essentially maps (layer_index, module_name) to the corresponding LoRA module.
