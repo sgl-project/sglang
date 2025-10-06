@@ -306,7 +306,7 @@ impl GrpcRouter {
         // Check format detection first
         let can_parse = {
             let parser = pooled_parser.lock().await;
-            parser.detect_format(processed_text)
+            parser.has_tool_markers(processed_text)
             // Lock is dropped here
         };
 
