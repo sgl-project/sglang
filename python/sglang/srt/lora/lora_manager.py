@@ -438,8 +438,6 @@ class LoRAManager:
             for prefix in self.tower_module_prefixes
         ):
             return True
-        # Maintain backward compatibility for historical vision model naming.
-        return "vision_model.model" in module_name
 
     def init_lora_modules(self):
         # Look-up table that essentially maps (layer_index, module_name) to the corresponding LoRA module.

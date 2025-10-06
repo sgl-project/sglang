@@ -485,7 +485,9 @@ class LlavaBaseForCausalLM(TowerAwareMixin, nn.Module):
             # Update the vision tower weights if we find them in the checkpoint (it may be finetuned).
             "model.image_newline": "language_model.model.image_newline",
         }
-        projector_weights[f"model.{vision_tower_name}.{vision_tower_name}"] = vision_tower_name
+        projector_weights[f"model.{vision_tower_name}.{vision_tower_name}"] = (
+            vision_tower_name
+        )
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
             if (
