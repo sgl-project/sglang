@@ -296,7 +296,10 @@ def test_deterministic(args):
                 f"Prompt {i} with prefix length {len_prefix[i]}: total samples: {len(outputs[i])}, Unique samples: {len(set(outputs[i]))}"
             )
 
-        return list(map(lambda x: len(set(x)), outputs))
+        results = []
+        for i in range(num_prompts):
+            results.append(len(set(outputs[i])))
+        return results
 
     else:
         raise ValueError(f"Invalid test mode: {args.test_mode}")

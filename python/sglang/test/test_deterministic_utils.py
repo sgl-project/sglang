@@ -1,4 +1,5 @@
 import time
+import unittest
 
 import requests
 
@@ -23,12 +24,15 @@ COMMON_SERVER_ARGS = [
 class TestDeterministicBase(CustomTestCase):
     @classmethod
     def get_server_args(cls):
-        raise NotImplementedError("Subclasses should override the server args")
+        return COMMON_SERVER_ARGS
 
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL
         cls.base_url = DEFAULT_URL_FOR_TEST
+        if "--attention-backend" not in cls.get_server_args():
+            raise unittest.SkipTest("Skip the base test class")
+
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -51,7 +55,8 @@ class TestDeterministicBase(CustomTestCase):
         args.n_start = 10
         args.n_trials = 20
         results = test_deterministic(args)
-        assert all(lambda x: x == 1, results)
+        for result in results:
+            assert result == 1
 
     def test_mixed(self):
         args = BenchArgs()
@@ -61,7 +66,8 @@ class TestDeterministicBase(CustomTestCase):
         args.n_start = 10
         args.n_trials = 20
         results = test_deterministic(args)
-        assert all(lambda x: x == 1, results)
+        for result in results:
+            assert result == 1
 
     def test_prefix(self):
         args = BenchArgs()
@@ -71,4 +77,5 @@ class TestDeterministicBase(CustomTestCase):
         args.n_start = 10
         args.n_trials = 10
         results = test_deterministic(args)
-        assert all(lambda x: x == 1, results)
+        for result in results:
+            assert result == 1
