@@ -89,7 +89,7 @@ def start_cuda_profiler(rank_print):
     """Start CUDA Profiler API for nsys profiling."""
     try:
         torch.cuda.cudart().cudaProfilerStart()
-        rank_print("🚀 CUDA Profiler started (nsys will begin capturing)")
+        rank_print("CUDA Profiler started (nsys will begin capturing)")
     except Exception as e:
         rank_print(f"Failed to start CUDA profiler: {e}")
 
@@ -98,7 +98,7 @@ def stop_cuda_profiler(rank_print):
     """Stop CUDA Profiler API and signal nsys to dump traces."""
     try:
         torch.cuda.cudart().cudaProfilerStop()
-        rank_print("🛑 CUDA Profiler stopped (nsys should dump traces)")
+        rank_print("CUDA Profiler stopped (nsys should dump traces)")
     except Exception as e:
         rank_print(f"Failed to stop CUDA profiler: {e}")
 
