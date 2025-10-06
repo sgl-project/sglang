@@ -812,14 +812,11 @@ class TritonAttnBackend(AttentionBackend):
         if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
             causal = False
 
-        # Deterministic mode: use unified 1-stage kernel
-        if self.enable_deterministic:
-            return self._forward_extend_unified(
-                q, o, layer, forward_batch, causal, logits_soft_cap, sinks
-            )
-
-        # Normal mode: use original 2-stage kernel
-        if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
+        if (
+            layer.sliding_window_size is not None
+            and layer.sliding_window_size > -1
+            and layer.attn_type != AttentionType.ENCODER_ONLY
+        ):
             sliding_window_size = (
                 layer.sliding_window_size
             )  # Needed for sliding window mask
@@ -872,7 +869,11 @@ class TritonAttnBackend(AttentionBackend):
         bs = forward_batch.batch_size
 
         # Determine sliding window settings
-        if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
+        if (
+            layer.sliding_window_size is not None
+            and layer.sliding_window_size > -1
+            and layer.attn_type != AttentionType.ENCODER_ONLY
+        ):
             sliding_window_size = layer.sliding_window_size
             # Note: for unified kernel, we use full kv_indptr (not window)
             prefix_kv_indptr = self.forward_metadata.window_kv_indptr

@@ -144,7 +144,7 @@ class TestEncoderEmbeddingModels(CustomTestCase):
                                 continue
 
                         if model == "answerdotai/ModernBERT-base":
-                            if attention_backend in ("flashinfer", "triton"):
+                            if attention_backend == "flashinfer":
                                 continue
 
                         self.assert_close_prefill_logits(
