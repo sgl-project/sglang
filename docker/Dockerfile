@@ -145,6 +145,9 @@ RUN if [ "$TARGETARCH" = "amd64" ]; then \
       cd flash-mla && \
       git checkout ${FLASHMLA_COMMIT} && \
       git submodule update --init --recursive && \
+      if [ "$CUDA_VERSION" = "12.6.1" ]; then \
+        export FLASH_MLA_DISABLE_SM100=1; \
+      fi && \
       pip install -v . ; \
     fi
 
