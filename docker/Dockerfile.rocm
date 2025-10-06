@@ -1,7 +1,7 @@
 # Usage (to build SGLang ROCm docker image):
-#   docker build --build-arg SGL_BRANCH=v0.5.3rc0 --build-arg GPU_ARCH=gfx942 -t v0.5.3rc0-rocm630-mi30x -f Dockerfile.rocm .
-#   docker build --build-arg SGL_BRANCH=v0.5.3rc0 --build-arg GPU_ARCH=gfx942-rocm700 -t v0.5.3rc0-rocm700-mi30x -f Dockerfile.rocm .
-#   docker build --build-arg SGL_BRANCH=v0.5.3rc0 --build-arg GPU_ARCH=gfx950 -t v0.5.3rc0-rocm700-mi35x -f Dockerfile.rocm .
+#   docker build --build-arg SGL_BRANCH=v0.5.3 --build-arg GPU_ARCH=gfx942 -t v0.5.3-rocm630-mi30x -f Dockerfile.rocm .
+#   docker build --build-arg SGL_BRANCH=v0.5.3 --build-arg GPU_ARCH=gfx942-rocm700 -t v0.5.3-rocm700-mi30x -f Dockerfile.rocm .
+#   docker build --build-arg SGL_BRANCH=v0.5.3 --build-arg GPU_ARCH=gfx950 -t v0.5.3-rocm700-mi35x -f Dockerfile.rocm .
 
 
 # Default base images
@@ -42,7 +42,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT="v0.1.5.post3"
+ENV AITER_COMMIT="v0.1.5.post4"
 ENV NO_DEPS_FLAG="--no-deps"
 
 # ===============================

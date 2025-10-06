@@ -22,16 +22,17 @@ from typing import List, Optional, Set, Union
 import torch
 from transformers import PretrainedConfig
 
-from sglang.srt.hf_transformers_utils import (
+from sglang.srt.environ import envs
+from sglang.srt.layers.quantization import QUANTIZATION_METHODS
+from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import is_hip, retry
+from sglang.srt.utils.hf_transformers_utils import (
     get_config,
     get_context_length,
     get_generation_config,
     get_hf_text_config,
     get_sparse_attention_config,
 )
-from sglang.srt.layers.quantization import QUANTIZATION_METHODS
-from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import get_bool_env_var, is_hip, retry
 from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
@@ -46,6 +47,30 @@ class ModelImpl(str, Enum):
     AUTO = "auto"
     SGLANG = "sglang"
     TRANSFORMERS = "transformers"
+
+
+def is_deepseek_nsa(config: PretrainedConfig) -> bool:
+    return (
+        config.architectures is not None
+        and config.architectures[0]
+        in ["DeepseekV3ForCausalLM", "DeepseekV32ForCausalLM"]
+        and getattr(config, "index_topk", None) is not None
+    )
+
+
+def get_nsa_index_head_dim(config: PretrainedConfig) -> int:
+    assert is_deepseek_nsa(config)
+    return config.index_head_dim
+
+
+def get_nsa_index_topk(config: PretrainedConfig) -> int:
+    assert is_deepseek_nsa(config)
+    return config.index_topk
+
+
+def get_nsa_index_n_heads(config: PretrainedConfig) -> int:
+    assert is_deepseek_nsa(config)
+    return config.index_n_heads
 
 
 class ModelConfig:
@@ -237,7 +262,7 @@ class ModelConfig:
                     f"This may lead to incorrect model outputs or CUDA errors. Note that the derived context_length may differ from max_position_embeddings in the model's config."
                 )
                 if (
-                    get_bool_env_var("SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN")
+                    envs.SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN.get()
                     or is_in_ci()  # FIXME: fix this special case
                 ):
                     logger.warning(msg)
@@ -270,6 +295,7 @@ class ModelConfig:
         # FIXME: temporary special judge for MLA architecture
         if (
             "DeepseekV2ForCausalLM" in self.hf_config.architectures
+            or "DeepseekV32ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLMNextN" in self.hf_config.architectures
             or "LongcatFlashForCausalLM" in self.hf_config.architectures
@@ -282,6 +308,11 @@ class ModelConfig:
             self.qk_nope_head_dim = self.hf_config.qk_nope_head_dim
             self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
             self.v_head_dim = self.hf_config.v_head_dim
+            self.index_head_dim = (
+                get_nsa_index_head_dim(self.hf_config)
+                if is_deepseek_nsa(self.hf_config)
+                else None
+            )
 
             # Handle rope scaling with yarn
             self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)

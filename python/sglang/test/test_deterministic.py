@@ -29,7 +29,7 @@ class BenchArgs:
     port: int = 30000
     batch_size: int = 1
     temperature: float = 0.0
-    sampling_seed: int = None
+    sampling_seed: int = 42
     max_new_tokens: int = 100
     frequency_penalty: float = 0.0
     presence_penalty: float = 0.0
@@ -96,11 +96,14 @@ def send_single(
             "max_new_tokens": args.max_new_tokens,
             "frequency_penalty": args.frequency_penalty,
             "presence_penalty": args.presence_penalty,
-            "sampling_seed": args.sampling_seed,
         },
         "return_logprob": args.return_logprob,
         "stream": args.stream,
     }
+
+    if args.sampling_seed is not None:
+        # sglang server cannot parse None value for sampling_seed
+        json_data["sampling_params"]["sampling_seed"] = args.sampling_seed
 
     if profile:
         run_profile(
@@ -145,11 +148,13 @@ def send_mixed(args, batch_size: int):
             "max_new_tokens": args.max_new_tokens,
             "frequency_penalty": args.frequency_penalty,
             "presence_penalty": args.presence_penalty,
-            "sampling_seed": args.sampling_seed,
         },
         "return_logprob": args.return_logprob,
         "stream": args.stream,
     }
+
+    if args.sampling_seed is not None:
+        json_data["sampling_params"]["sampling_seed"] = args.sampling_seed
 
     response = requests.post(
         f"http://{args.host}:{args.port}/generate",
@@ -192,11 +197,13 @@ def send_prefix(args, batch_size: int, prompts: List[str]):
             "max_new_tokens": args.max_new_tokens,
             "frequency_penalty": args.frequency_penalty,
             "presence_penalty": args.presence_penalty,
-            "sampling_seed": args.sampling_seed,
         },
         "return_logprob": args.return_logprob,
         "stream": args.stream,
     }
+
+    if args.sampling_seed is not None:
+        json_data["sampling_params"]["sampling_seed"] = args.sampling_seed
 
     response = requests.post(
         f"http://{args.host}:{args.port}/generate",

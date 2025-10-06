@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, List, Optional, Union
+from contextlib import nullcontext
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
 
 import torch
 import triton
@@ -31,13 +32,19 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     is_fp8_fnuz,
     sglang_per_token_group_quant_fp8,
 )
+from sglang.srt.layers.quantization.modelopt_quant import (
+    CUTEDSL_MOE_NVFP4_DISPATCH,
+    ModelOptNvFp4FusedMoEMethod,
+)
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.offloader import get_offloader
+from sglang.srt.single_batch_overlap import DownGemmOverlapArgs
 from sglang.srt.utils import (
     ceil_div,
     dispose_tensor,
     get_bool_env_var,
+    get_int_env_var,
     is_cuda,
     is_hip,
     is_npu,
@@ -453,9 +460,20 @@ class DeepEPMoE(EPMoE):
             topk_idx=topk_idx,
             topk_weights=topk_weights,
             forward_batch=forward_batch,
+            input_global_scale=(
+                self.w13_input_scale_quant
+                if isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
+                and self.quant_method.enable_flashinfer_cutedsl_moe
+                and CUTEDSL_MOE_NVFP4_DISPATCH
+                else None
+            ),
         )
 
-    def moe_impl(self, dispatch_output: DispatchOutput):
+    def moe_impl(
+        self,
+        dispatch_output: DispatchOutput,
+        down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = None,
+    ):
         from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
 
         if _use_aiter:
@@ -470,7 +488,9 @@ class DeepEPMoE(EPMoE):
             return self.forward_deepgemm_contiguous(dispatch_output)
         elif DispatchOutputChecker.format_is_deepep_ll(dispatch_output):
             if get_moe_runner_backend().is_flashinfer_cutedsl():
-                return self.forward_flashinfer_cutedsl(dispatch_output)
+                return self.forward_flashinfer_cutedsl(
+                    dispatch_output, down_gemm_overlap_args=down_gemm_overlap_args
+                )
             assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8
             return self.forward_deepgemm_masked(dispatch_output)
         else:
@@ -484,12 +504,14 @@ class DeepEPMoE(EPMoE):
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
         forward_batch: ForwardBatch,
+        overlap_args: Optional[Dict[str, Any]] = None,
     ):
         return self.deepep_dispatcher.combine(
             hidden_states=hidden_states,
             topk_idx=topk_idx,
             topk_weights=topk_weights,
             forward_batch=forward_batch,
+            overlap_args=overlap_args,
         )
 
     def forward_aiter(
@@ -676,6 +698,7 @@ class DeepEPMoE(EPMoE):
     def forward_flashinfer_cutedsl(
         self,
         dispatch_output: DeepEPLLOutput,
+        down_gemm_overlap_args: Optional[DownGemmOverlapArgs],
     ):
         hidden_states, _, _, masked_m, _ = dispatch_output
         assert self.quant_method is not None
@@ -686,6 +709,7 @@ class DeepEPMoE(EPMoE):
             x=hidden_states,
             masked_m=masked_m,
             moe_runner_config=self.moe_runner_config,
+            down_gemm_overlap_args=down_gemm_overlap_args,
         )
         return output
 
@@ -789,45 +813,69 @@ class DeepEPMoE(EPMoE):
             if isinstance(hidden_states, tuple):
                 per_token_scale = hidden_states[1]
                 hidden_states = hidden_states[0]
-            else:
-                # dynamic quant
-                hidden_states, per_token_scale = torch_npu.npu_dynamic_quant(
-                    hidden_states
-                )
 
             group_list = torch.tensor(num_recv_tokens_per_expert, dtype=torch.int64).to(
                 hidden_states.device
             )
+            if self.w13_weight.dtype != torch.int8:
+                # gmm1: gate_up_proj
+                hidden_states = torch_npu.npu_grouped_matmul(
+                    x=[hidden_states],
+                    weight=[self.w13_weight.permute(0, 2, 1)],
+                    # per_token_scale=[per_token_scale],
+                    split_item=2,
+                    group_list_type=group_list_type,
+                    group_type=0,
+                    group_list=group_list,
+                    output_dtype=output_dtype,
+                )[0]
+                hidden_states = torch_npu.npu_swiglu(hidden_states)
+                # gmm2: down_proj
+                hidden_states = torch_npu.npu_grouped_matmul(
+                    x=[hidden_states],
+                    weight=[self.w2_weight.permute(0, 2, 1)],
+                    split_item=2,
+                    group_list_type=group_list_type,
+                    group_type=0,
+                    group_list=group_list,
+                    output_dtype=output_dtype,
+                )[0]
+            else:
+                if not get_bool_env_var("DEEP_NORMAL_MODE_USE_INT8_QUANT"):
+                    hidden_states, per_token_scale = torch_npu.npu_dynamic_quant(
+                        hidden_states
+                    )
+                # gmm1: gate_up_proj
+                hidden_states = torch_npu.npu_grouped_matmul(
+                    x=[hidden_states],
+                    weight=[self.w13_weight],
+                    scale=[self.w13_weight_scale.to(output_dtype)],
+                    per_token_scale=[per_token_scale],
+                    split_item=2,
+                    group_list_type=group_list_type,
+                    group_type=0,
+                    group_list=group_list,
+                    output_dtype=output_dtype,
+                )[0]
 
-            # gmm1: gate_up_proj
-            hidden_states = torch_npu.npu_grouped_matmul(
-                x=[hidden_states],
-                weight=[self.w13_weight],
-                scale=[self.w13_weight_scale.to(output_dtype)],
-                per_token_scale=[per_token_scale],
-                split_item=2,
-                group_list_type=group_list_type,
-                group_type=0,
-                group_list=group_list,
-                output_dtype=output_dtype,
-            )[0]
+                # act_fn: swiglu
+                hidden_states = torch_npu.npu_swiglu(hidden_states)
+                hidden_states, swiglu_out_scale = torch_npu.npu_dynamic_quant(
+                    hidden_states
+                )
 
-            # act_fn: swiglu
-            hidden_states = torch_npu.npu_swiglu(hidden_states)
-            hidden_states, swiglu_out_scale = torch_npu.npu_dynamic_quant(hidden_states)
-
-            # gmm2: down_proj
-            hidden_states = torch_npu.npu_grouped_matmul(
-                x=[hidden_states],
-                weight=[self.w2_weight],
-                scale=[self.w2_weight_scale.to(output_dtype)],
-                per_token_scale=[swiglu_out_scale],
-                split_item=2,
-                group_list_type=group_list_type,
-                group_type=0,
-                group_list=group_list,
-                output_dtype=output_dtype,
-            )[0]
+                # gmm2: down_proj
+                hidden_states = torch_npu.npu_grouped_matmul(
+                    x=[hidden_states],
+                    weight=[self.w2_weight],
+                    scale=[self.w2_weight_scale.to(output_dtype)],
+                    per_token_scale=[swiglu_out_scale],
+                    split_item=2,
+                    group_list_type=group_list_type,
+                    group_type=0,
+                    group_list=group_list,
+                    output_dtype=output_dtype,
+                )[0]
 
             return hidden_states
 
@@ -836,47 +884,72 @@ class DeepEPMoE(EPMoE):
                 assert isinstance(dispatch_output, DeepEPLLOutput)
             hidden_states, topk_idx, topk_weights, group_list, _ = dispatch_output
 
-            per_token_scale = hidden_states[1]
-            hidden_states = hidden_states[0]
+            if isinstance(hidden_states, tuple):
+                per_token_scale = hidden_states[1]
+                hidden_states = hidden_states[0]
 
             group_list = group_list.to(torch.int64)
 
-            # gmm1: gate_up_proj
-            hidden_states = torch_npu.npu_grouped_matmul(
-                x=[hidden_states],
-                weight=[self.w13_weight],
-                split_item=2,
-                group_list_type=group_list_type,
-                group_type=0,
-                group_list=group_list,
-                output_dtype=torch.int32,
-            )[0]
+            if self.w13_weight.dtype != torch.int8:
+                # gmm1: gate_up_proj
+                hidden_states = torch_npu.npu_grouped_matmul(
+                    x=[hidden_states],
+                    weight=[self.w13_weight.permute(0, 2, 1)],
+                    # per_token_scale=[per_token_scale],
+                    split_item=2,
+                    group_list_type=group_list_type,
+                    group_type=0,
+                    group_list=group_list,
+                    output_dtype=output_dtype,
+                )[0]
+                hidden_states = torch_npu.npu_swiglu(hidden_states)
+                # gmm2: down_proj
+                hidden_states = torch_npu.npu_grouped_matmul(
+                    x=[hidden_states],
+                    weight=[self.w2_weight.permute(0, 2, 1)],
+                    split_item=2,
+                    group_list_type=group_list_type,
+                    group_type=0,
+                    group_list=group_list,
+                    output_dtype=output_dtype,
+                )[0]
+            else:
+                # gmm1: gate_up_proj
+                hidden_states = torch_npu.npu_grouped_matmul(
+                    x=[hidden_states],
+                    weight=[self.w13_weight],
+                    split_item=2,
+                    group_list_type=group_list_type,
+                    group_type=0,
+                    group_list=group_list,
+                    output_dtype=torch.int32,
+                )[0]
 
-            # act_fn: swiglu
-            hidden_states, swiglu_out_scale = torch_npu.npu_dequant_swiglu_quant(
-                x=hidden_states,
-                weight_scale=self.w13_weight_scale.to(torch.float32),
-                activation_scale=per_token_scale,
-                bias=None,
-                quant_scale=None,
-                quant_offset=None,
-                group_index=group_list,
-                activate_left=True,
-                quant_mode=1,
-            )
+                # act_fn: swiglu
+                hidden_states, swiglu_out_scale = torch_npu.npu_dequant_swiglu_quant(
+                    x=hidden_states,
+                    weight_scale=self.w13_weight_scale.to(torch.float32),
+                    activation_scale=per_token_scale,
+                    bias=None,
+                    quant_scale=None,
+                    quant_offset=None,
+                    group_index=group_list,
+                    activate_left=True,
+                    quant_mode=1,
+                )
 
-            # gmm2: down_proj
-            hidden_states = torch_npu.npu_grouped_matmul(
-                x=[hidden_states],
-                weight=[self.w2_weight],
-                scale=[self.w2_weight_scale.to(output_dtype)],
-                per_token_scale=[swiglu_out_scale],
-                split_item=2,
-                group_list_type=group_list_type,
-                group_type=0,
-                group_list=group_list,
-                output_dtype=output_dtype,
-            )[0]
+                # gmm2: down_proj
+                hidden_states = torch_npu.npu_grouped_matmul(
+                    x=[hidden_states],
+                    weight=[self.w2_weight],
+                    scale=[self.w2_weight_scale.to(output_dtype)],
+                    per_token_scale=[swiglu_out_scale],
+                    split_item=2,
+                    group_list_type=group_list_type,
+                    group_type=0,
+                    group_list=group_list,
+                    output_dtype=output_dtype,
+                )[0]
 
             return hidden_states
 
