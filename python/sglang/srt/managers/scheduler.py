@@ -558,7 +558,9 @@ class Scheduler(
         self.kv_transfer_speed_gb_s: float = 0.0
         self.kv_transfer_latency_ms: float = 0.0
         self.sessions: Dict[str, Session] = {}
-        self.default_stream = torch.cuda.current_stream(self.device)
+        self.default_stream: CudaStream = torch.get_device_module(
+            self.device
+        ).current_stream()
         if self.device == "cpu":
             self.default_stream.synchronize = lambda: None  # No-op for CPU
         self.forward_sleep_time = None
