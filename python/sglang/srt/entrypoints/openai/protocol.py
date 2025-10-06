@@ -272,6 +272,7 @@ class CompletionResponse(BaseModel):
     choices: List[CompletionResponseChoice]
     usage: UsageInfo
     metadata: Optional[Dict[str, Any]] = None
+    chutes_verification: Optional[str] = None
 
 
 class CompletionResponseStreamChoice(BaseModel):
@@ -297,6 +298,7 @@ class CompletionStreamResponse(BaseModel):
     model: str
     choices: List[CompletionResponseStreamChoice]
     usage: Optional[UsageInfo] = None
+    chutes_verification: Optional[str] = None
 
 
 class ChatCompletionMessageContentTextPart(BaseModel):
@@ -599,6 +601,7 @@ class ChatCompletionResponse(BaseModel):
     choices: List[ChatCompletionResponseChoice]
     usage: UsageInfo
     metadata: Optional[Dict[str, Any]] = None
+    chutes_verification: Optional[str] = None
 
 
 class DeltaMessage(BaseModel):
@@ -635,6 +638,7 @@ class ChatCompletionStreamResponse(BaseModel):
     model: str
     choices: List[ChatCompletionResponseStreamChoice]
     usage: Optional[UsageInfo] = None
+    chutes_verification: Optional[str] = None
 
 
 class MultimodalEmbeddingInput(BaseModel):
