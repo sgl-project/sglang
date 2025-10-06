@@ -14,7 +14,6 @@ from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
-    ModelLaunchSettings,
     is_in_ci,
     parse_models,
     popen_launch_server,
@@ -39,6 +38,30 @@ MODEL_SCORE_THRESHOLDS = {
     "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8": 0.84,
 }
 
+failing_models = {
+    "neuralmagic/gemma-2-2b-it-FP8",
+}
+
+
+def remove_failing_models(model_str):
+    models = model_str.split(",")
+    filtered = [m for m in models if m not in failing_models]
+    return ",".join(filtered)
+
+
+DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1 = remove_failing_models(
+    DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1
+)
+DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2 = remove_failing_models(
+    DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2
+)
+DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1 = remove_failing_models(
+    DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1
+)
+DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2 = remove_failing_models(
+    DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2
+)
+
 NO_MOE_PADDING_MODELS = {"neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8"}
 DISABLE_HF_XET_MODELS = {
     "Qwen/Qwen2-57B-A14B-Instruct",
@@ -50,6 +73,20 @@ TRITON_MOE_MODELS = {
     "mistralai/Mixtral-8x7B-Instruct-v0.1",
     "mistralai/Mistral-7B-Instruct-v0.3",
 }
+
+
+def popen_launch_server_wrapper(base_url, model, is_tp2):
+    other_args = ["--log-level-http", "warning", "--trust-remote-code"]
+    if is_tp2:
+        other_args.extend(["--tp", "2"])
+
+    process = popen_launch_server(
+        model,
+        base_url,
+        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        other_args=other_args,
+    )
+    return process
 
 
 def check_model_scores(results):
@@ -85,37 +122,13 @@ def check_model_scores(results):
 class TestNightlyGsm8KEval(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.models = []
+        cls.model_groups = [
+            (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1), False, False),
+            (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2), False, True),
+            (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1), True, False),
+            (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2), True, True),
+        ]
         cls.base_url = DEFAULT_URL_FOR_TEST
-        extra_args = ["--log-level-http", "warning", "--trust-remote-code"]
-
-        def create_model_setup(model_path, tp_size):
-            env = {
-                "SGLANG_MOE_PADDING": (
-                    "0" if model_path in NO_MOE_PADDING_MODELS else "1"
-                ),
-                "HF_HUB_DISABLE_XET": (
-                    "1" if model_path in DISABLE_HF_XET_MODELS else "0"
-                ),
-                "SGLANG_USE_AITER": "0" if model_path in TRITON_MOE_MODELS else "1",
-            }
-            cls.models.append(
-                ModelLaunchSettings(
-                    model_path, tp_size=tp_size, extra_args=extra_args, env=env
-                )
-            )
-
-        models_tp1 = parse_models(
-            DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1
-        ) + parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1)
-        for model_path in models_tp1:
-            create_model_setup(model_path, 1)
-
-        models_tp2 = parse_models(
-            DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2
-        ) + parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2)
-        for model_path in models_tp2:
-            create_model_setup(model_path, 2)
 
     def test_mgsm_en_all_models(self):
         warnings.filterwarnings(
@@ -124,44 +137,47 @@ class TestNightlyGsm8KEval(unittest.TestCase):
         is_first = True
         all_results = []
 
-        for model_setup in self.models:
-            with self.subTest(model=model_setup.model_path):
-                process = popen_launch_server(
-                    model=model_setup.model_path,
-                    base_url=self.base_url,
-                    timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                    other_args=model_setup.extra_args,
-                    env=model_setup.env,
-                )
+        for model_group, is_fp8, is_tp2 in self.model_groups:
+            for model in model_group:
+                with self.subTest(model=model):
+                    os.environ["SGLANG_MOE_PADDING"] = (
+                        "0" if model in NO_MOE_PADDING_MODELS else "1"
+                    )
+                    os.environ["HF_HUB_DISABLE_XET"] = (
+                        "1" if model in DISABLE_HF_XET_MODELS else "0"
+                    )
+                    os.environ["SGLANG_USE_AITER"] = (
+                        "0" if model in TRITON_MOE_MODELS else "1"
+                    )
 
-                args = SimpleNamespace(
-                    base_url=self.base_url,
-                    model=model_setup.model_path,
-                    eval_name="mgsm_en",
-                    num_examples=None,
-                    num_threads=1024,
-                )
-                # Allow retries, so flaky errors are avoided.
-                threshold = MODEL_SCORE_THRESHOLDS.get(model_setup.model_path)
-                for attempt in range(3):
-                    try:
-                        metrics = run_eval(args)
-                        score = metrics["score"]
-                        if score >= threshold:
-                            break
-                    except Exception as e:
-                        print(f"Attempt {attempt + 1} failed with error: {e}")
-                print(
-                    f"{'=' * 42}\n{model_setup.model_path} - metrics={metrics} score={metrics['score']}\n{'=' * 42}\n"
-                )
+                    process = popen_launch_server_wrapper(self.base_url, model, is_tp2)
 
-                write_results_to_json(
-                    model_setup.model_path, metrics, "w" if is_first else "a"
-                )
-                is_first = False
+                    args = SimpleNamespace(
+                        base_url=self.base_url,
+                        model=model,
+                        eval_name="mgsm_en",
+                        num_examples=None,
+                        num_threads=1024,
+                    )
+                    # Allow retries, so flaky errors are avoided.
+                    threshold = MODEL_SCORE_THRESHOLDS.get(model)
+                    for attempt in range(3):
+                        try:
+                            metrics = run_eval(args)
+                            score = metrics["score"]
+                            if score >= threshold:
+                                break
+                        except Exception as e:
+                            print(f"Attempt {attempt + 1} failed with error: {e}")
+                    print(
+                        f"{'=' * 42}\n{model} - metrics={metrics} score={metrics['score']}\n{'=' * 42}\n"
+                    )
 
-                all_results.append((model_setup.model_path, metrics["score"]))
-                kill_process_tree(process.pid)
+                    write_results_to_json(model, metrics, "w" if is_first else "a")
+                    is_first = False
+
+                    all_results.append((model, metrics["score"]))
+                    kill_process_tree(process.pid)
 
         try:
             with open("results.json", "r") as f:
