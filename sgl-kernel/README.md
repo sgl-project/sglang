@@ -25,7 +25,6 @@ make build
 ```
 
 Note:
-
 The `sgl-kernel` is rapidly evolving. If you experience a compilation failure, try using `make rebuild`.
 
 ### Build with [ccache](https://github.com/ccache/ccache)

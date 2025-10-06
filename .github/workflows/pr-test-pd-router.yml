@@ -28,7 +28,7 @@ permissions:
 jobs:
   test-disaggregation:
     if: github.event_name != 'pull_request' || (contains(github.event.pull_request.labels.*.name, 'run-ci') && contains(github.event.pull_request.labels.*.name, 'router-benchmark'))
-    runs-on: [h200]
+    runs-on: [8-gpu-h200-oracle]
     timeout-minutes: 45
 
     steps:
