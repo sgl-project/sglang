@@ -32,7 +32,12 @@ import torch.distributed as dist
 from sglang.srt.configs import FalconH1Config, NemotronHConfig, Qwen3NextConfig
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
-from sglang.srt.configs.model_config import AttentionArch, ModelConfig
+from sglang.srt.configs.model_config import (
+    AttentionArch,
+    ModelConfig,
+    get_nsa_index_head_dim,
+    is_deepseek_nsa,
+)
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
 from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.distributed import (
@@ -43,6 +48,7 @@ from sglang.srt.distributed import (
     initialize_model_parallel,
     set_custom_all_reduce,
     set_mscclpp_all_reduce,
+    set_symm_mem_all_reduce,
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
 from sglang.srt.eplb.eplb_manager import EPLBManager
@@ -96,6 +102,7 @@ from sglang.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
     MHATokenToKVPool,
     MLATokenToKVPool,
+    NSATokenToKVPool,
     ReqToTokenPool,
     SWAKVPool,
 )
@@ -157,6 +164,7 @@ MLA_ATTENTION_BACKENDS = [
     "cutlass_mla",
     "trtllm_mla",
     "ascend",
+    "nsa",
 ]
 
 
@@ -649,6 +657,7 @@ class ModelRunner:
             dist_init_method = f"tcp://127.0.0.1:{self.dist_port}"
         set_custom_all_reduce(not self.server_args.disable_custom_all_reduce)
         set_mscclpp_all_reduce(self.server_args.enable_mscclpp)
+        set_symm_mem_all_reduce(self.server_args.enable_torch_symm_mem)
 
         if not self.is_draft_worker:
             if self.device == "cpu":
@@ -1546,6 +1555,7 @@ class ModelRunner:
             assert self.is_draft_worker
 
         # Initialize token_to_kv_pool
+        is_nsa_model = is_deepseek_nsa(self.model_config.hf_config)
         if self.server_args.attention_backend == "ascend":
             if self.use_mla_backend:
                 self.token_to_kv_pool = AscendMLAPagedTokenToKVPool(
@@ -1554,6 +1564,7 @@ class ModelRunner:
                     dtype=self.kv_cache_dtype,
                     kv_lora_rank=self.model_config.kv_lora_rank,
                     qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+                    index_head_dim=self.model_config.index_head_dim,
                     layer_num=self.num_effective_layers,
                     device=self.device,
                     enable_memory_saver=self.server_args.enable_memory_saver,
@@ -1573,7 +1584,22 @@ class ModelRunner:
                     device=self.device,
                     enable_memory_saver=self.server_args.enable_memory_saver,
                 )
+        elif self.use_mla_backend and is_nsa_model:
+            self.token_to_kv_pool = NSATokenToKVPool(
+                self.max_total_num_tokens,
+                page_size=self.page_size,
+                dtype=self.kv_cache_dtype,
+                kv_lora_rank=self.model_config.kv_lora_rank,
+                qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+                layer_num=self.num_effective_layers,
+                device=self.device,
+                enable_memory_saver=self.server_args.enable_memory_saver,
+                start_layer=self.start_layer,
+                end_layer=self.end_layer,
+                index_head_dim=get_nsa_index_head_dim(self.model_config.hf_config),
+            )
         elif self.use_mla_backend:
+            assert not is_nsa_model
             self.token_to_kv_pool = MLATokenToKVPool(
                 self.max_total_num_tokens,
                 page_size=self.page_size,
