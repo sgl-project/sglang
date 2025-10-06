@@ -91,7 +91,7 @@ class SchedulerProfilerMixin:
         if self.profile_by_stage:
             if self.profile_stage == "prefill":
                 self.profiler_target_prefill_ct = num_steps
-                self.profiler_target_decode_ct = None 
+                self.profiler_target_decode_ct = None
             elif self.profile_stage == "decode":
                 self.profiler_target_prefill_ct = None
                 self.profiler_target_decode_ct = num_steps
