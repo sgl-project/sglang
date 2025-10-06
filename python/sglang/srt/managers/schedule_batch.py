@@ -45,8 +45,6 @@ from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
-import triton
-import triton.language as tl
 
 from sglang.global_config import global_config
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
@@ -65,12 +63,13 @@ from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
+from sglang.srt.mem_cache.utils import write_cache_indices
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, TimeStats
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import flatten_nested_list, support_triton
+from sglang.srt.utils import flatten_nested_list
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -1076,6 +1075,75 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         else:
             return out_cache_loc
 
+    def alloc_for_extend(self, reqs: list[Req]):
+        # Extract all needed data from reqs
+        input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
+        extend_num_tokens = sum(len(ids) for ids in input_ids)
+
+        # CPU tensors
+        prefix_lens = torch.tensor(
+            [len(r.prefix_indices) for r in reqs], dtype=torch.int64
+        )
+        seq_lens_cpu = torch.tensor([len(r.fill_ids) for r in reqs], dtype=torch.int64)
+        extend_lens_cpu = seq_lens_cpu - prefix_lens
+
+        # Copy to GPU
+        prefix_lens_device = prefix_lens.to(self.device, non_blocking=True)
+        seq_lens_device = seq_lens_cpu.to(self.device, non_blocking=True)
+        extend_lens_device = extend_lens_cpu.to(self.device, non_blocking=True)
+
+        # Allocate req slots
+        bs = len(reqs)
+        req_pool_indices = self.alloc_req_slots(bs, reqs)
+        req_pool_indices_cpu = torch.tensor(
+            req_pool_indices, dtype=torch.int64, device=self.device
+        )
+        req_pool_indices_device = req_pool_indices_cpu.to(
+            self.device, non_blocking=True
+        )
+
+        # Allocate memory
+        if self.token_to_kv_pool_allocator.page_size == 1:
+            out_cache_loc = self.alloc_token_slots(extend_num_tokens)
+        else:
+            last_loc = [
+                (
+                    r.prefix_indices[-1:]
+                    if len(r.prefix_indices) > 0
+                    else torch.tensor([-1], device=self.device)
+                )
+                for r in reqs
+            ]
+            out_cache_loc = self.alloc_paged_token_slots_extend(
+                prefix_lens_device,
+                prefix_lens,
+                seq_lens_device,
+                seq_lens_cpu,
+                torch.cat(last_loc),
+                extend_num_tokens,
+            )
+
+        # Write allocated tokens to req_to_token_pool
+        write_cache_indices(
+            out_cache_loc,
+            req_pool_indices_device,
+            req_pool_indices_cpu,
+            prefix_lens_device,
+            prefix_lens,
+            seq_lens_device,
+            seq_lens_cpu,
+            extend_lens_device,
+            extend_lens_cpu,
+            [r.prefix_indices for r in reqs],
+            self.req_to_token_pool,
+        )
+
+        # update requests
+        for req, req_pool_index in zip(reqs, req_pool_indices):
+            req.req_pool_idx = req_pool_index
+
+        return out_cache_loc, req_pool_indices_device
+
     def alloc_paged_token_slots_decode(
         self,
         seq_lens: torch.Tensor,
@@ -1106,47 +1174,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return out_cache_loc, state
         else:
             return out_cache_loc
-
-    def write_cache_indices(
-        self,
-        req_pool_indices: List[int],
-        prefix_lens: List[int],
-        seq_lens: List[int],
-        extend_lens: List[int],
-        out_cache_loc: torch.Tensor,
-        req_pool_indices_tensor: torch.Tensor,
-        prefix_lens_tensor: torch.Tensor,
-        seq_lens_tensor: torch.Tensor,
-        extend_lens_tensor: torch.Tensor,
-        prefix_tensors: list[torch.Tensor],
-    ):
-        if support_triton(global_server_args_dict.get("attention_backend")):
-            prefix_pointers = torch.tensor(
-                [t.data_ptr() for t in prefix_tensors], device=self.device
-            )
-            # TODO: some tensors can be reused for ForwardBatchInfo (e.g., extend_lens, cumsum_start)
-            write_req_to_token_pool_triton[(len(req_pool_indices),)](
-                self.req_to_token_pool.req_to_token,
-                req_pool_indices_tensor,
-                prefix_pointers,
-                prefix_lens_tensor,
-                seq_lens_tensor,
-                extend_lens_tensor,
-                out_cache_loc,
-                self.req_to_token_pool.req_to_token.shape[1],
-            )
-        else:
-            pt = 0
-            for i in range(len(req_pool_indices)):
-                self.req_to_token_pool.write(
-                    (req_pool_indices[i], slice(0, prefix_lens[i])),
-                    prefix_tensors[i],
-                )
-                self.req_to_token_pool.write(
-                    (req_pool_indices[i], slice(prefix_lens[i], seq_lens[i])),
-                    out_cache_loc[pt : pt + extend_lens[i]],
-                )
-                pt += extend_lens[i]
 
     def prepare_encoder_info_extend(self, input_ids: List[int], seq_lens: List[int]):
         self.encoder_lens_cpu = []
@@ -1248,10 +1275,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         orig_seq_lens_tensor = torch.tensor(orig_seq_lens, dtype=torch.int32).to(
             self.device, non_blocking=True
         )
-        prefix_lens_tensor = torch.tensor(
-            prefix_lens, dtype=torch.int64, device=self.device
-        )
-        prefix_lens_cpu_tensor = torch.tensor(prefix_lens, dtype=torch.int64)
 
         token_type_ids_tensor = None
         if len(token_type_ids) > 0:
@@ -1259,49 +1282,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 sum(token_type_ids, []), dtype=torch.int64
             ).to(self.device, non_blocking=True)
 
-        extend_lens_tensor = seq_lens_tensor - prefix_lens_tensor
-
-        # Allocate req slots
-        bs = len(self.reqs)
-        req_pool_indices = self.alloc_req_slots(bs, self.reqs)
-        req_pool_indices_tensor = torch.tensor(req_pool_indices, dtype=torch.int64).to(
-            self.device, non_blocking=True
-        )
-
         # Allocate memory
-        if self.token_to_kv_pool_allocator.page_size == 1:
-            out_cache_loc = self.alloc_token_slots(extend_num_tokens)
-        else:
-            last_loc = [
-                (
-                    r.prefix_indices[-1:]
-                    if len(r.prefix_indices) > 0
-                    else torch.tensor([-1], device=self.device)
-                )
-                for r in self.reqs
-            ]
-            out_cache_loc = self.alloc_paged_token_slots_extend(
-                prefix_lens_tensor,
-                prefix_lens_cpu_tensor,
-                seq_lens_tensor,
-                seq_lens_cpu,
-                torch.cat(last_loc),
-                extend_num_tokens,
-            )
-
-        # Write allocated tokens to req_to_token_pool
-        self.write_cache_indices(
-            req_pool_indices,
-            prefix_lens,
-            seq_lens,
-            extend_lens,
-            out_cache_loc,
-            req_pool_indices_tensor,
-            prefix_lens_tensor,
-            seq_lens_tensor,
-            extend_lens_tensor,
-            [r.prefix_indices for r in reqs],
-        )
+        out_cache_loc, req_pool_indices_tensor = self.alloc_for_extend(reqs)
 
         # Set fields
         input_embeds = []
@@ -1309,7 +1291,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         multimodal_inputs = []
 
         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
-            req.req_pool_idx = req_pool_indices[i]
             assert seq_len - pre_len == req.extend_input_len
 
             if pre_len > 0:
@@ -2034,128 +2015,3 @@ class ModelWorkerBatch:
 
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
-
-
-@triton.jit
-def write_req_to_token_pool_triton(
-    req_to_token_ptr,  # [max_batch, max_context_len]
-    req_pool_indices,
-    prefix_tensors,
-    pre_lens,
-    seq_lens,
-    extend_lens,
-    out_cache_loc,
-    req_to_token_ptr_stride: tl.constexpr,
-):
-    BLOCK_SIZE: tl.constexpr = 512
-    pid = tl.program_id(0)
-
-    req_pool_index = tl.load(req_pool_indices + pid)
-    pre_len = tl.load(pre_lens + pid)
-    seq_len = tl.load(seq_lens + pid)
-    prefix_tensor = tl.load(prefix_tensors + pid).to(tl.pointer_type(tl.int64))
-
-    # write prefix
-    num_loop = tl.cdiv(pre_len, BLOCK_SIZE)
-    for i in range(num_loop):
-        offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
-        mask = offset < pre_len
-        value = tl.load(prefix_tensor + offset, mask=mask)
-        tl.store(
-            req_to_token_ptr + req_pool_index * req_to_token_ptr_stride + offset,
-            value,
-            mask=mask,
-        )
-
-    # NOTE: This can be slow for large bs
-    cumsum_start = tl.cast(0, tl.int64)
-    for i in range(pid):
-        cumsum_start += tl.load(extend_lens + i)
-
-    num_loop = tl.cdiv(seq_len - pre_len, BLOCK_SIZE)
-    for i in range(num_loop):
-        offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
-        mask = offset < (seq_len - pre_len)
-        value = tl.load(out_cache_loc + cumsum_start + offset, mask=mask)
-        tl.store(
-            req_to_token_ptr
-            + req_pool_index * req_to_token_ptr_stride
-            + offset
-            + pre_len,
-            value,
-            mask=mask,
-        )
-
-
-def get_last_loc(
-    req_to_token: torch.Tensor,
-    req_pool_indices_tensor: torch.Tensor,
-    prefix_lens_tensor: torch.Tensor,
-) -> torch.Tensor:
-    if (
-        global_server_args_dict["attention_backend"] != "ascend"
-        and global_server_args_dict["attention_backend"] != "torch_native"
-    ):
-        impl = get_last_loc_triton
-    else:
-        impl = get_last_loc_torch
-
-    return impl(req_to_token, req_pool_indices_tensor, prefix_lens_tensor)
-
-
-def get_last_loc_torch(
-    req_to_token: torch.Tensor,
-    req_pool_indices_tensor: torch.Tensor,
-    prefix_lens_tensor: torch.Tensor,
-) -> torch.Tensor:
-    return torch.where(
-        prefix_lens_tensor > 0,
-        req_to_token[req_pool_indices_tensor, prefix_lens_tensor - 1],
-        torch.full_like(prefix_lens_tensor, -1),
-    )
-
-
-@triton.jit
-def get_last_loc_kernel(
-    req_to_token,
-    req_pool_indices_tensor,
-    prefix_lens_tensor,
-    result,
-    num_tokens,
-    req_to_token_stride,
-    BLOCK_SIZE: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    offset = tl.arange(0, BLOCK_SIZE) + pid * BLOCK_SIZE
-    mask = offset < num_tokens
-
-    prefix_lens = tl.load(prefix_lens_tensor + offset, mask=mask, other=0)
-    req_pool_indices = tl.load(req_pool_indices_tensor + offset, mask=mask, other=0)
-
-    token_mask = prefix_lens > 0
-    token_index = req_pool_indices * req_to_token_stride + (prefix_lens - 1)
-    tokens = tl.load(req_to_token + token_index, mask=token_mask, other=-1)
-
-    tl.store(result + offset, tokens, mask=mask)
-
-
-def get_last_loc_triton(
-    req_to_token: torch.Tensor,
-    req_pool_indices_tensor: torch.Tensor,
-    prefix_lens_tensor: torch.Tensor,
-) -> torch.Tensor:
-    BLOCK_SIZE = 256
-    num_tokens = prefix_lens_tensor.shape[0]
-    result = torch.empty_like(prefix_lens_tensor)
-    grid = (triton.cdiv(num_tokens, BLOCK_SIZE),)
-
-    get_last_loc_kernel[grid](
-        req_to_token,
-        req_pool_indices_tensor,
-        prefix_lens_tensor,
-        result,
-        num_tokens,
-        req_to_token.stride(0),
-        BLOCK_SIZE,
-    )
-    return result
