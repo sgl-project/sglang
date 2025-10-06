@@ -1,27 +1,76 @@
 # Attention Backend
 
-SGLang supports multiple attention backends. Each of them has different pros and cons.
+SGLang supports a large variety of attention backends. Each of them has different pros and cons.
 You can test them according to your needs.
 
-## Supporting matrix for different attention backends
+## Supporting Matrix
 
-| **Backend**              | **Page Size > 1** | **Spec Decoding** | **MLA** | **Sliding Window** | **MultiModal** |
-|--------------------------|-------------------|-------------------|---------|--------------------|----------------|
-| **FlashInfer**           | ❌                | ✅                 | ✅      | ✅                 | ✅              |
-| **FA3**                  | ✅                | ✅                 | ✅      | ✅                 | ✅              |
-| **Triton**               | ❌                | ✅                 | ✅      | ✅                 | ❌              |
-| **Torch Native**         | ❌                | ❌                 | ✅      | ❌                 | ❌              |
-| **FlashMLA**             | ✅                | ✅                 | ✅      | ❌                 | ❌              |
-| **TRTLLM MLA**           | ✅                | ❌                 | ✅      | ✅                 | ❌              |
-| **Ascend**               | ✅                | ❌                 | ✅      | ❌                 | ❌              |
-| **Wave**                 | ✅                | ❌                 | ❌      | ❌                 | ❌              |
+| **Backend**               | **Page Size > 1** | **Spec Decoding** | **MLA** | **Sliding Window** | **MultiModal** |
+|---------------------------|-------------------|-------------------|---------|--------------------|----------------|
+| **FlashInfer**            | ❌                | ✅                 | ✅      | ✅                 | ✅              |
+| **FA3**                   | ✅                | ✅                 | ✅      | ✅                 | ✅              |
+| **FA4**                   | ❌                | ❌                 | ✅      | ❌                 | ❌              |
+| **Triton**                | ❌                | ✅                 | ✅      | ✅                 | ❌              |
+| **Torch Native**          | ❌                | ❌                 | ✅      | ❌                 | ❌              |
+| **FlexAttention**         | ❌                | ❌                 | ✅      | ❌                 | ❌              |
+| **FlashMLA**              | ✅                | ✅                 | ✅      | ❌                 | ❌              |
+| **Cutlass MLA**           | ✅                | ✅                 | ✅      | ❌                 | ❌              |
+| **TRTLLM MLA**            | ✅                | ❌                 | ✅      | ✅                 | ❌              |
+| **TRTLLM MHA**            | ✅                | ✅                 | ❌      | ✅                 | ❌              |
+| **Ascend**                | ✅                | ❌                 | ✅      | ❌                 | ❌              |
+| **AITER**                 | ✅                | ✅                 | ✅      | ❌                 | ❌              |
+| **Wave**                  | ✅                | ❌                 | ❌      | ❌                 | ❌              |
 
-**Notes:**
-- TRTLLM MLA only implements decode operations. For prefill operations (including multimodal inputs), it falls back to FlashInfer MLA backend.
+```{important}
+FlashAttention v4 (fa4) is prefill-only for now.
+
+TRTLLM MLA only implements decode operations. For prefill operations, it falls back to FlashInfer MLA backend.
+
+TRTLLM MHA supports speculative decoding with topk ≤ 1 only.
+```
 
 Note: Every kernel backend is compatible with a page size > 1 by specifying an argument such as `--page-size 16`.
 This is because a page size of 16 can be converted to a page size of 1 in the kernel backend.
 The "❌" and "✅" symbols in the table above under "Page Size > 1" indicate whether the kernel actually operates with a page size greater than 1, rather than treating a page size of 16 as a page size of 1.
+
+### Hybrid attention (different backends for prefill vs decode) (Experimental)
+
+```{warning}
+Hybrid attention is an experimental feature.
+```
+
+You can mix-and-match attention backends for prefill and decode. This is useful when one backend excels at prefill and another excels at decode. For the implementation details, please see `python/sglang/srt/layers/attention/hybrid_attn_backend.py`.
+
+```bash
+# Example: Prefill with FA4, Decode with TRTLLM MLA (Blackwell)
+python3 -m sglang.launch_server \
+  --model-path nvidia/DeepSeek-R1-FP4 \
+  --tp 4 \
+  --attention-backend trtllm_mla \
+  --moe-runner-backend flashinfer_trtllm \
+  --quantization modelopt_fp4 \
+  --prefill-attention-backend fa4
+```
+
+#### Speculative decoding with hybrid attention
+
+Hybrid attention also works with speculative decoding. The backend used for draft decoding and target verification depends on `--speculative-attention-mode`:
+
+- `--speculative-attention-mode decode` (recommended): draft/verify use the decode backend.
+- `--speculative-attention-mode prefill` (default): draft/verify use the prefill backend.
+
+Constraints when combining hybrid attention with speculative decoding:
+
+- If any attention backend is `trtllm_mha`, speculative decoding supports only `--speculative-eagle-topk 1`.
+- For paged backends with `--page-size > 1` and `--speculative-eagle-topk > 1`, only `flashinfer` is supported.
+- `flex_attention` is not supported with speculative decoding.
+- CUDA Graph: the decode backend is always captured; the prefill backend is captured only when `--speculative-attention-mode prefill`.
+
+
+```{tip}
+If you set only one of `--prefill-attention-backend` or `--decode-attention-backend`, the unspecified phase inherits `--attention-backend`.
+If both are specified and differ, SGLang automatically enables a hybrid wrapper to dispatch to the chosen backend per phase.
+```
 
 ## User guide
 
