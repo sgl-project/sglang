@@ -6,8 +6,9 @@ import torch
 from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
 
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.model_executor.forward_batch_info import ForwardBatchOutput, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.cpp_ngram.ngram_cache import NgramCache
 from sglang.srt.speculative.ngram_utils import NgramVerifyInput
@@ -207,7 +208,7 @@ class NGRAMWorker:
             batch_tokens.append(put_ids)
         self.ngram_cache.batch_put(batch_tokens)
 
-    def forward_batch_generation(self, batch: ScheduleBatch) -> ForwardBatchOutput:
+    def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:
         self._prepare_for_speculative_decoding(batch)
         model_worker_batch = batch.get_model_worker_batch()
         num_accepted_tokens = 0
@@ -237,7 +238,7 @@ class NGRAMWorker:
                 forward_batch_output.can_run_cuda_graph,
             )
 
-        return ForwardBatchOutput(
+        return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=next_token_ids,
             num_accepted_tokens=num_accepted_tokens,

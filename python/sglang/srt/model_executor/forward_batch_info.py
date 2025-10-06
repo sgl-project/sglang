@@ -902,44 +902,6 @@ class ForwardBatch:
         return self.tbo_split_seq_index is not None
 
 
-@dataclass
-class ForwardBatchOutput:
-    # FIXME(lsyin): unify the forward batch output between different spec and parallelism
-    # need to be more organized
-    logits_output: Optional[LogitsProcessorOutput] = None
-    next_token_ids: Optional[torch.Tensor] = None
-    num_accepted_tokens: Optional[int] = None
-    pp_proxy_tensors: Optional[PPProxyTensors] = None
-    can_run_cuda_graph: bool = False
-
-    # For overlap scheduling
-    copy_done: Optional[torch.cuda.Event] = None
-    delay_sample_launch: bool = False
-    forward_batch: Optional[ForwardBatch] = None
-    future_map_ct: Optional[int] = None
-
-    def copy_to_cpu(self, return_logprob: bool = False):
-        """Copy tensors to CPU in overlap scheduling.
-        Only the tensors which are needed for processing results are copied,
-        e.g., next_token_ids, logits outputs
-        """
-        if return_logprob:
-            if self.logits_output.next_token_logits is not None:
-                self.logits_output.next_token_logits = (
-                    self.logits_output.next_token_logits.to("cpu", non_blocking=True)
-                )
-            if self.logits_output.input_token_logprobs is not None:
-                self.logits_output.input_token_logprobs = (
-                    self.logits_output.input_token_logprobs.to("cpu", non_blocking=True)
-                )
-        if self.logits_output.hidden_states is not None:
-            self.logits_output.hidden_states = self.logits_output.hidden_states.to(
-                "cpu", non_blocking=True
-            )
-        self.next_token_ids = self.next_token_ids.to("cpu", non_blocking=True)
-        self.copy_done.record()
-
-
 def enable_num_token_non_padded(server_args):
     return get_moe_expert_parallel_world_size() > 1
 

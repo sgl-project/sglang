@@ -143,8 +143,6 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
     SchedulerUpdateWeightsMixin,
 )
 from sglang.srt.managers.session_controller import Session
-from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient
 from sglang.srt.managers.utils import validate_input_length
 from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
@@ -152,7 +150,6 @@ from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
-    ForwardBatchOutput,
     ForwardMode,
     PPProxyTensors,
 )
@@ -206,14 +203,15 @@ GRAMMAR_TIMEOUT = float(os.environ.get("SGLANG_GRAMMAR_TIMEOUT", 300))
 
 @dataclass
 class GenerationBatchResult:
-    logits_output: Optional[LogitsProcessorOutput]
-    pp_hidden_states_proxy_tensors: Optional[PPProxyTensors]
-    next_token_ids: Optional[torch.Tensor]
-    can_run_cuda_graph: bool
+    logits_output: Optional[LogitsProcessorOutput] = None
+    pp_hidden_states_proxy_tensors: Optional[PPProxyTensors] = None
+    next_token_ids: Optional[torch.Tensor] = None
+    num_accepted_tokens: Optional[int] = None
+    can_run_cuda_graph: bool = False
 
     # For output processing
-    extend_input_len_per_req: List[int]
-    extend_logprob_start_len_per_req: List[int]
+    extend_input_len_per_req: Optional[List[int]] = None
+    extend_logprob_start_len_per_req: Optional[List[int]] = None
 
     # For overlap scheduling
     copy_done: Optional[torch.cuda.Event] = None
@@ -226,7 +224,6 @@ class GenerationBatchResult:
         Only the tensors which are needed for processing results are copied,
         e.g., next_token_ids, logits outputs
         """
-        # FIXME(lsyin): merge this dataclass with ForwardBatchOutput
         if return_logprob:
             if self.logits_output.next_token_logits is not None:
                 self.logits_output.next_token_logits = (
@@ -244,34 +241,10 @@ class GenerationBatchResult:
         self.copy_done.record()
 
     @classmethod
-    def from_forward_batch_output(
-        cls,
-        forward_batch_output: ForwardBatchOutput,
-        extend_input_len_per_req: List[int],
-        extend_logprob_start_len_per_req: List[int],
-    ):
-        # TODO(lsyin): remove this workaround logic and try to unify output classes
-
-        return cls(
-            logits_output=forward_batch_output.logits_output,
-            pp_hidden_states_proxy_tensors=forward_batch_output.pp_proxy_tensors,
-            next_token_ids=forward_batch_output.next_token_ids,
-            extend_input_len_per_req=extend_input_len_per_req,
-            extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
-            can_run_cuda_graph=forward_batch_output.can_run_cuda_graph,
-            copy_done=forward_batch_output.copy_done,
-            delay_sample_launch=forward_batch_output.delay_sample_launch,
-            forward_batch=forward_batch_output.forward_batch,
-            future_map_ct=forward_batch_output.future_map_ct,
-        )
-
-    @classmethod
     def from_pp_proxy(
         cls, logits_output, next_pp_outputs: PPProxyTensors, can_run_cuda_graph
     ):
-        # TODO(lsyin): also simplify this logic
-        # Current PP implementation in scheduler is not compatible with ForwardBatchOutput
-        # Maybe introduce a ProxyBatchOutput for PP and the original ForwardBatchOutput for TP
+        # TODO(lsyin): refactor PP and avoid using dict
         proxy_dict = next_pp_outputs.tensors
         return cls(
             logits_output=logits_output,
@@ -425,6 +398,8 @@ class Scheduler(
             logger.info("Overlap scheduler is disabled for embedding models.")
 
         # Launch a tensor parallel worker
+
+        from sglang.srt.managers.tp_worker import TpModelWorker
 
         self.tp_worker = TpModelWorker(
             server_args=server_args,
@@ -2175,11 +2150,11 @@ class Scheduler(
             else:
                 extend_logprob_start_len_per_req = None
 
-            return GenerationBatchResult.from_forward_batch_output(
-                forward_batch_output=forward_batch_output,
-                extend_input_len_per_req=extend_input_len_per_req,
-                extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
+            forward_batch_output.extend_input_len_per_req = extend_input_len_per_req
+            forward_batch_output.extend_logprob_start_len_per_req = (
+                extend_logprob_start_len_per_req
             )
+            return forward_batch_output
         else:  # embedding or reward model
             model_worker_batch = batch.get_model_worker_batch()
             embeddings = self.tp_worker.forward_batch_embedding(model_worker_batch)

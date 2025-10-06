@@ -34,13 +34,10 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, global_server_args_dict
+from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.model_executor.forward_batch_info import (
-    ForwardBatch,
-    ForwardBatchOutput,
-    PPProxyTensors,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
@@ -235,7 +232,7 @@ class TpModelWorker:
         self,
         model_worker_batch: ModelWorkerBatch,
         is_verify: bool = False,
-    ) -> ForwardBatchOutput:
+    ) -> GenerationBatchResult:
         # update the consumer index of hicache to the running batch
         self.set_hicache_consumer(model_worker_batch.hicache_consumer_index)
 
@@ -253,7 +250,7 @@ class TpModelWorker:
             logits_output, can_run_cuda_graph = self.model_runner.forward(
                 forward_batch, pp_proxy_tensors=pp_proxy_tensors
             )
-            forward_batch_output = ForwardBatchOutput(
+            forward_batch_output = GenerationBatchResult(
                 logits_output=logits_output,
                 can_run_cuda_graph=can_run_cuda_graph,
             )
@@ -288,8 +285,8 @@ class TpModelWorker:
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
-            return ForwardBatchOutput(
-                pp_proxy_tensors=pp_proxy_tensors,
+            return GenerationBatchResult(
+                pp_hidden_states_proxy_tensors=pp_proxy_tensors,
                 can_run_cuda_graph=can_run_cuda_graph,
             )
 
