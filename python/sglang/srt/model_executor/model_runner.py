@@ -25,9 +25,7 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
-from urllib.parse import urlparse
 
-import requests
 import torch
 import torch.distributed as dist
 
@@ -35,7 +33,6 @@ from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
-from sglang.srt.connector import ConnectorType
 from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.distributed import (
     get_pp_group,
@@ -45,6 +42,7 @@ from sglang.srt.distributed import (
     initialize_model_parallel,
     set_custom_all_reduce,
     set_mscclpp_all_reduce,
+    set_symm_mem_all_reduce,
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
 from sglang.srt.eplb.eplb_manager import EPLBManager
@@ -60,7 +58,10 @@ from sglang.srt.eplb.expert_location import (
     set_global_expert_location_metadata,
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
-from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
+from sglang.srt.layers.attention.attention_registry import (
+    ATTENTION_BACKENDS,
+    attn_backend_wrapper,
+)
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
@@ -104,16 +105,15 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_executor.npu_graph_runner import NPUGraphRunner
 from sglang.srt.model_loader import get_model
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
+from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
+    trigger_init_weights_send_group_for_remote_instance_request,
+)
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.offloader import (
     create_offloader_from_server_args,
     get_offloader,
     set_offloader,
-)
-from sglang.srt.patch_torch import monkey_patch_torch_reductions
-from sglang.srt.remote_instance_weight_loader_utils import (
-    trigger_init_weights_send_group_for_remote_instance_request,
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
@@ -128,7 +128,6 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_cpu_ids_by_node,
     init_custom_process_group,
-    is_blackwell,
     is_fa3_default_architecture,
     is_flashinfer_available,
     is_hip,
@@ -139,9 +138,10 @@ from sglang.srt.utils import (
     log_info_on_rank0,
     monkey_patch_p2p_access_check,
     monkey_patch_vllm_gguf_config,
-    parse_connector_type,
     set_cuda_arch,
+    slow_rank_detector,
 )
+from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorBucket,
     FlattenedTensorMetadata,
@@ -280,6 +280,9 @@ class ModelRunner:
         # CPU offload
         set_offloader(create_offloader_from_server_args(server_args, dp_rank=dp_rank))
 
+        if get_bool_env_var("SGLANG_DETECT_SLOW_RANK"):
+            slow_rank_detector.execute()
+
         # Update deep gemm configure
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
             deep_gemm_wrapper.update_deep_gemm_config(gpu_id, server_args)
@@ -347,7 +350,6 @@ class ModelRunner:
         if self.is_hybrid_gdn:
             logger.warning("Hybrid GDN model detected, disable radix cache")
             self.server_args.disable_radix_cache = True
-            self.server_args.attention_backend = "hybrid_linear_attn"
             if self.server_args.max_mamba_cache_size is None:
                 if self.server_args.max_running_requests is not None:
                     self.server_args.max_mamba_cache_size = (
@@ -530,9 +532,7 @@ class ModelRunner:
                 elif _is_hip:
                     head_num = self.model_config.get_num_kv_heads(self.tp_size)
                     # TODO current aiter only support head number 16 or 128 head number
-                    if (
-                        head_num == 128 or head_num == 16
-                    ) and self.spec_algorithm.is_none():
+                    if head_num == 128 or head_num == 16:
                         server_args.attention_backend = "aiter"
                     else:
                         server_args.attention_backend = "triton"
@@ -612,7 +612,7 @@ class ModelRunner:
                 server_args.hicache_io_backend = "direct"
                 logger.warning(
                     "FlashAttention3 decode backend is not compatible with hierarchical cache. "
-                    f"Setting hicache_io_backend to vanilla I/O, which may lead to suboptimal performance with small page sizes."
+                    "Setting hicache_io_backend to vanilla I/O, which may lead to suboptimal performance with small page sizes."
                 )
 
     def init_torch_distributed(self):
@@ -647,6 +647,7 @@ class ModelRunner:
             dist_init_method = f"tcp://127.0.0.1:{self.dist_port}"
         set_custom_all_reduce(not self.server_args.disable_custom_all_reduce)
         set_mscclpp_all_reduce(self.server_args.enable_mscclpp)
+        set_symm_mem_all_reduce(self.server_args.enable_torch_symm_mem)
 
         if not self.is_draft_worker:
             if self.device == "cpu":
@@ -743,6 +744,10 @@ class ModelRunner:
             load_format=self.server_args.load_format,
             download_dir=self.server_args.download_dir,
             model_loader_extra_config=self.server_args.model_loader_extra_config,
+            tp_rank=self.tp_rank,
+            remote_instance_weight_loader_seed_instance_ip=self.server_args.remote_instance_weight_loader_seed_instance_ip,
+            remote_instance_weight_loader_seed_instance_service_port=self.server_args.remote_instance_weight_loader_seed_instance_service_port,
+            remote_instance_weight_loader_send_weights_group_ports=self.server_args.remote_instance_weight_loader_send_weights_group_ports,
         )
         if self.device == "cpu":
             self.model_config = adjust_config_with_unaligned_cpu_tp(
@@ -770,7 +775,10 @@ class ModelRunner:
         monkey_patch_vllm_parallel_state()
         monkey_patch_isinstance_for_vllm_base_layer()
 
-        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_WEIGHTS):
+        with self.memory_saver_adapter.region(
+            GPU_MEMORY_TYPE_WEIGHTS,
+            enable_cpu_backup=self.server_args.enable_weights_cpu_backup,
+        ):
             self.model = get_model(
                 model_config=self.model_config,
                 load_config=self.load_config,
@@ -1098,7 +1106,7 @@ class ModelRunner:
                 handle.wait()
 
             self.model.load_weights(weights)
-            return True, f"Succeeded to update parameter online."
+            return True, "Succeeded to update parameter online."
 
         except Exception as e:
             error_msg = (
@@ -1287,6 +1295,7 @@ class ModelRunner:
         return self.model_config.hf_config.architectures[0] in [
             "Qwen3NextForCausalLM",
             "Qwen3NextForCausalLMMTP",
+            "FalconH1ForCausalLM",
         ]
 
     def set_num_token_hybrid(self):
@@ -1478,7 +1487,8 @@ class ModelRunner:
 
         if self.max_total_num_tokens <= 0:
             raise RuntimeError(
-                "Not enough memory. Please try to increase --mem-fraction-static."
+                f"Not enough memory. Please try to increase --mem-fraction-static. "
+                f"Current value: {self.server_args.mem_fraction_static=}"
             )
 
         # Initialize req_to_token_pool
@@ -1608,7 +1618,7 @@ class ModelRunner:
                 )
             elif self.is_hybrid_gdn:
                 self.token_to_kv_pool = HybridLinearKVPool(
-                    page_size=self.page_size if _is_npu else 1,
+                    page_size=self.page_size,
                     size=self.max_total_num_tokens,
                     dtype=self.kv_cache_dtype,
                     head_num=self.model_config.get_num_kv_heads(
@@ -1643,10 +1653,9 @@ class ModelRunner:
         # Initialize token_to_kv_pool_allocator
         need_sort = self.server_args.disaggregation_mode in ("decode", "prefill")
         if self.token_to_kv_pool_allocator is None:
-            if _is_npu and self.server_args.attention_backend in [
-                "ascend",
-                "hybrid_linear_attn",
-            ]:
+            if _is_npu and (
+                self.server_args.attention_backend == "ascend" or self.is_hybrid_gdn
+            ):
                 self.token_to_kv_pool_allocator = AscendPagedTokenToKVPoolAllocator(
                     self.max_total_num_tokens,
                     page_size=self.page_size,
@@ -1740,8 +1749,8 @@ class ModelRunner:
                 f"prefill_backend={self.prefill_attention_backend_str}."
             )
             logger.warning(
-                f"Warning: Attention backend specified by --attention-backend or default backend might be overridden."
-                f"The feature of hybrid attention backend is experimental and unstable. Please raise an issue if you encounter any problem."
+                "Warning: Attention backend specified by --attention-backend or default backend might be overridden."
+                "The feature of hybrid attention backend is experimental and unstable. Please raise an issue if you encounter any problem."
             )
         else:
             attn_backend = self._get_attention_backend_from_str(
@@ -1759,7 +1768,8 @@ class ModelRunner:
     def _get_attention_backend_from_str(self, backend_str: str):
         if backend_str not in ATTENTION_BACKENDS:
             raise ValueError(f"Invalid attention backend: {backend_str}")
-        return ATTENTION_BACKENDS[backend_str](self)
+        full_attention_backend = ATTENTION_BACKENDS[backend_str](self)
+        return attn_backend_wrapper(self, full_attention_backend)
 
     def init_double_sparsity_channel_config(self, selected_channel):
         selected_channel = "." + selected_channel + "_proj"

@@ -10,17 +10,13 @@ on:
 jobs:
   publish-x86:
     if: github.repository == 'sgl-project/sglang'
-    environment: 'prod'
+    environment: "prod"
     strategy:
       matrix:
         variant:
-          - cuda_version: '12.6.1'
-            build_type: 'all'
-          - cuda_version: '12.8.1'
-            build_type: 'blackwell'
-          - cuda_version: '12.9.1'
-            build_type: 'blackwell'
-    runs-on: ubuntu-latest
+          - cuda_version: "12.9.1"
+            build_type: "all"
+    runs-on: x64-docker-build-node
     steps:
       - name: Delete huge unnecessary tools folder
         run: rm -rf /opt/hostedtoolcache
@@ -67,8 +63,6 @@ jobs:
 
           if [ "${{ matrix.variant.build_type }}" = "all" ]; then
             tag_suffix=""
-          elif [ "${{ matrix.variant.build_type }}" = "blackwell" ]; then
-            tag_suffix="-b200"
           else
             echo "Unsupported build type"
             exit 1
@@ -82,13 +76,13 @@ jobs:
 
   publish-arm64:
     if: github.repository == 'sgl-project/sglang'
-    environment: 'prod'
+    environment: "prod"
     strategy:
       matrix:
         variant:
-          - cuda_version: '12.9.1'
-            build_type: 'blackwell_aarch'
-    runs-on: ubuntu-22.04-arm
+          - cuda_version: "12.9.1"
+            build_type: "all_aarch64"
+    runs-on: arm-docker-build-node
     steps:
       - name: Delete huge unnecessary tools folder
         run: rm -rf /opt/hostedtoolcache
