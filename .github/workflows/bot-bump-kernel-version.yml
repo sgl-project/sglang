@@ -26,14 +26,12 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Configure Git
+      - name: Configure Git and branch
         run: |
           git config user.name "sglang-bot"
           git config user.email "sglang-bot@users.noreply.github.com"
-
-      - name: Create new branch
-        run: |
-          BRANCH_NAME="bot/bump-kernel-version-${{ github.event.inputs.new_version }}"
+          RANDOM_SUFFIX=$(echo $RANDOM | md5sum | head -c 4)
+          BRANCH_NAME="bot/bump-kernel-version-${{ github.event.inputs.new_version }}-${RANDOM_SUFFIX}"
           git checkout -b "$BRANCH_NAME"
           echo "BRANCH_NAME=$BRANCH_NAME" >> $GITHUB_ENV
 
@@ -41,44 +39,8 @@ jobs:
         run: |
           python scripts/release/bump_kernel_version.py "${{ github.event.inputs.new_version }}"
 
-      - name: Commit changes
-        run: |
-          git add -A
-          git commit -m "chore: bump sgl-kernel version to ${{ github.event.inputs.new_version }}
-
-          This commit updates the sgl-kernel version across all relevant files:
-          - sgl-kernel/pyproject.toml
-          - sgl-kernel/pyproject_cpu.toml
-          - sgl-kernel/pyproject_rocm.toml
-          - sgl-kernel/python/sgl_kernel/version.py
-
-          🤖 Generated with GitHub Actions"
-
-      - name: Push changes
-        run: |
-          git push origin "$BRANCH_NAME"
-
-      - name: Create Pull Request
+      - name: Commit and create PR
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_TAGGING }}
         run: |
-          gh pr create \
-            --title "chore: bump sgl-kernel version to ${{ github.event.inputs.new_version }}" \
-            --body "## Summary
-
-          This PR bumps the sgl-kernel version to \`${{ github.event.inputs.new_version }}\` across all relevant files.
-
-          ## Files Updated
-          - sgl-kernel/pyproject.toml
-          - sgl-kernel/pyproject_cpu.toml
-          - sgl-kernel/pyproject_rocm.toml
-          - sgl-kernel/python/sgl_kernel/version.py
-
-          ## Testing
-          - [ ] Verify all version strings are updated correctly
-          - [ ] Test kernel installation with new version
-          - [ ] Run CI tests
-
-          🤖 Generated with GitHub Actions" \
-            --base main \
-            --head "$BRANCH_NAME"
+          bash scripts/release/commit_and_pr.sh "sgl-kernel" "${{ github.event.inputs.new_version }}" "$BRANCH_NAME"
