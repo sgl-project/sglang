@@ -2099,34 +2099,34 @@ class Scheduler(
                     self.future_map.resolve_future(model_worker_batch)
                     if batch.sampling_info.grammars is not None:
                         model_worker_batch.delay_sample_launch = True
-                    forward_batch_output = self.model_worker.forward_batch_generation(
+                    batch_result = self.model_worker.forward_batch_generation(
                         batch_or_worker_batch
                     )
                     # FIXME(lsyin): maybe move this to forward_batch_generation
-                    forward_batch_output.copy_done = torch.cuda.Event()
+                    batch_result.copy_done = torch.cuda.Event()
                     if not model_worker_batch.delay_sample_launch:
                         self.future_map.store_to_map(
-                            cur_future_map_ct, bs, forward_batch_output.next_token_ids
+                            cur_future_map_ct, bs, batch_result.next_token_ids
                         )
-                        forward_batch_output.copy_to_cpu()
+                        batch_result.copy_to_cpu()
                     else:
-                        forward_batch_output.future_map_ct = cur_future_map_ct
+                        batch_result.future_map_ct = cur_future_map_ct
 
                 # FIXME(lsyin): move this assignment elsewhere
                 maybe_future_next_token_ids = self.future_map.update_next_future(
                     cur_future_map_ct, bs
                 )
             else:
-                forward_batch_output = self.model_worker.forward_batch_generation(
+                batch_result = self.model_worker.forward_batch_generation(
                     batch_or_worker_batch
                 )
-                maybe_future_next_token_ids = forward_batch_output.next_token_ids
+                maybe_future_next_token_ids = batch_result.next_token_ids
                 copy_done = None
 
             if not self.spec_algorithm.is_none():
                 # TODO(lsyin): unify this metric-updating logic with non-spec, and move it to decode processing
                 self.update_spec_metrics(
-                    batch.batch_size(), forward_batch_output.num_accepted_tokens
+                    batch.batch_size(), batch_result.num_accepted_tokens
                 )
 
             # NOTE: maybe_future_next_token_ids is used in ScheduleBatch,
@@ -2150,11 +2150,11 @@ class Scheduler(
             else:
                 extend_logprob_start_len_per_req = None
 
-            forward_batch_output.extend_input_len_per_req = extend_input_len_per_req
-            forward_batch_output.extend_logprob_start_len_per_req = (
+            batch_result.extend_input_len_per_req = extend_input_len_per_req
+            batch_result.extend_logprob_start_len_per_req = (
                 extend_logprob_start_len_per_req
             )
-            return forward_batch_output
+            return batch_result
         else:  # embedding or reward model
             model_worker_batch = batch.get_model_worker_batch()
             embeddings = self.tp_worker.forward_batch_embedding(model_worker_batch)

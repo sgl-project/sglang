@@ -250,23 +250,23 @@ class TpModelWorker:
             logits_output, can_run_cuda_graph = self.model_runner.forward(
                 forward_batch, pp_proxy_tensors=pp_proxy_tensors
             )
-            forward_batch_output = GenerationBatchResult(
+            batch_result = GenerationBatchResult(
                 logits_output=logits_output,
                 can_run_cuda_graph=can_run_cuda_graph,
             )
 
             if is_verify:
                 # Skip sampling and return logits for target forward
-                return forward_batch_output
+                return batch_result
 
             if model_worker_batch.delay_sample_launch:
-                forward_batch_output.delay_sample_launch = True
-                forward_batch_output.forward_batch = forward_batch
-                return forward_batch_output
+                batch_result.delay_sample_launch = True
+                batch_result.forward_batch = forward_batch
+                return batch_result
 
             if model_worker_batch.is_prefill_only:
                 # For prefill-only requests, create dummy token IDs on CPU
-                forward_batch_output.next_token_ids = torch.zeros_like(
+                batch_result.next_token_ids = torch.zeros_like(
                     model_worker_batch.input_ids, dtype=torch.long
                 )
                 if model_worker_batch.return_logprob:
@@ -275,11 +275,11 @@ class TpModelWorker:
                         logits_output, model_worker_batch
                     )
             else:
-                forward_batch_output.next_token_ids = self.model_runner.sample(
+                batch_result.next_token_ids = self.model_runner.sample(
                     logits_output, forward_batch
                 )
 
-            return forward_batch_output
+            return batch_result
         else:
             pp_proxy_tensors, can_run_cuda_graph = self.model_runner.forward(
                 forward_batch,
