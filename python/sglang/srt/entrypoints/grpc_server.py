@@ -333,11 +333,11 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 input_ids=input_ids,
                 sampling_params=SGLSamplingParams(max_new_tokens=1, temperature=0.0),
                 stream=False,
-                mm_inputs=None,
+                mm_inputs={},
                 return_logprob=False,
                 logprob_start_len=-1,
                 top_logprobs_num=0,
-                token_ids_logprob=None,
+                token_ids_logprob=[],
             )
 
             if self.server_args.disaggregation_mode != DisaggregationMode.NULL:
@@ -516,7 +516,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             rid=grpc_req.request_id,
             input_text=input_text,
             input_ids=input_ids,
-            mm_inputs=None,  # TODO: implement mm support
+            mm_inputs={},  # TODO: implement mm support
             sampling_params=sampling_params,
             return_logprob=grpc_req.return_logprob,
             logprob_start_len=(
@@ -528,7 +528,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             stream=grpc_req.stream or False,
             lora_id=grpc_req.lora_id if grpc_req.lora_id else None,
             token_ids_logprob=(
-                list(grpc_req.token_ids_logprob) if grpc_req.token_ids_logprob else None
+                list(grpc_req.token_ids_logprob) if grpc_req.token_ids_logprob else []
             ),
             bootstrap_host=bootstrap_host,
             bootstrap_port=bootstrap_port,
