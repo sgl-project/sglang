@@ -469,7 +469,10 @@ impl GrpcPDRouter {
         let prefill_stream = match prefill_result {
             Ok(s) => s,
             Err(e) => {
-                return utils::internal_error_message(format!("Prefill worker failed to start: {}", e));
+                return utils::internal_error_message(format!(
+                    "Prefill worker failed to start: {}",
+                    e
+                ));
             }
         };
 
@@ -477,7 +480,10 @@ impl GrpcPDRouter {
         let decode_stream = match decode_result {
             Ok(s) => s,
             Err(e) => {
-                return utils::internal_error_message(format!("Decode worker failed to start: {}", e));
+                return utils::internal_error_message(format!(
+                    "Decode worker failed to start: {}",
+                    e
+                ));
             }
         };
 
@@ -565,7 +571,10 @@ impl GrpcPDRouter {
         let prefill_stream = match prefill_result {
             Ok(s) => s,
             Err(e) => {
-                return utils::internal_error_message(format!("Prefill worker failed to start: {}", e));
+                return utils::internal_error_message(format!(
+                    "Prefill worker failed to start: {}",
+                    e
+                ));
             }
         };
 
@@ -573,7 +582,10 @@ impl GrpcPDRouter {
         let decode_stream = match decode_result {
             Ok(s) => s,
             Err(e) => {
-                return utils::internal_error_message(format!("Decode worker failed to start: {}", e));
+                return utils::internal_error_message(format!(
+                    "Decode worker failed to start: {}",
+                    e
+                ));
             }
         };
 

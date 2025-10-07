@@ -139,7 +139,10 @@ impl GrpcRouter {
         {
             Some(w) => w,
             None => {
-                return utils::service_unavailable_error(format!("No available workers for model: {:?}", model_id));
+                return utils::service_unavailable_error(format!(
+                    "No available workers for model: {:?}",
+                    model_id
+                ));
             }
         };
 
@@ -198,7 +201,10 @@ impl GrpcRouter {
         let worker = match self.select_worker_for_request(model_id, original_text.as_deref()) {
             Some(w) => w,
             None => {
-                return utils::service_unavailable_error(format!("No available workers for model: {:?}", model_id));
+                return utils::service_unavailable_error(format!(
+                    "No available workers for model: {:?}",
+                    model_id
+                ));
             }
         };
 
@@ -1268,7 +1274,10 @@ impl GrpcRouter {
             let outputs = match stop_decoder.process_tokens(&complete.output_ids) {
                 Ok(outputs) => outputs,
                 Err(e) => {
-                    return utils::internal_error_message(format!("Failed to process tokens: {}", e))
+                    return utils::internal_error_message(format!(
+                        "Failed to process tokens: {}",
+                        e
+                    ))
                 }
             };
 
