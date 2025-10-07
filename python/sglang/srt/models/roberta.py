@@ -228,6 +228,7 @@ class XLMRobertaModel(nn.Module):
                 config.pad_token_id,
                 # self.config.unk_token_id # not available in the XLMRobertaConfig
             ]
+            self._special_tokens = [t for t in self._special_tokens if t is not None]
         else:
             self._is_sparse = False
             self.pooler = Pooler(pooling_type=PoolingType.CLS, normalize=True)
