@@ -79,7 +79,7 @@ class LRUEvictionPolicy(EvictionPolicy):
                 return uid
 
         # Should never reach here if candidates is non-empty
-        return None
+        assert False, f"Failed to select LRU victim from candidates: {candidates}"
 
     def remove(self, uid: Optional[str]) -> None:
         if uid is not None:
@@ -91,13 +91,17 @@ class FIFOEvictionPolicy(EvictionPolicy):
     """FIFO eviction policy - for backward compatibility."""
 
     def __init__(self):
-        self.insertion_order = OrderedDict()  # key=uid, value=insertion_time
+        self.insertion_order = (
+            OrderedDict()
+        )  # key=uid, OrderedDict maintains insertion order
         self.eviction_count = 0
 
     def mark_used(self, uid: Optional[str]) -> None:
-        """For FIFO, we only track insertion (timestamp)"""
+        """For FIFO, we only track insertion order (not access time)."""
         if uid is not None and uid not in self.insertion_order:
-            self.insertion_order[uid] = time.monotonic()
+            self.insertion_order[uid] = (
+                True  # Value unused, OrderedDict tracks insertion order
+            )
 
     def select_victim(self, candidates: Set[Optional[str]]) -> Optional[str]:
         """Select the first inserted adapter from candidates."""
@@ -117,7 +121,7 @@ class FIFOEvictionPolicy(EvictionPolicy):
                 return uid
 
         # Should never reach here if candidates is non-empty
-        return None
+        assert False, f"Failed to select FIFO victim from candidates: {candidates}"
 
     def remove(self, uid: Optional[str]) -> None:
         if uid is not None:

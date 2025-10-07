@@ -134,12 +134,12 @@ class LoRAManager:
             lora_ref.lora_id not in self.loras
         ), f"LoRA adapter with ID {lora_ref.lora_id} is already loaded. This should have been verified before request is sent to the backend."
 
-        # Check if pinning this adapter would exceed capacity
-        if lora_ref.pinned and self.num_pinned_loras >= self.max_loras_per_batch:
+        if lora_ref.pinned and self.num_pinned_loras >= self.max_loras_per_batch - 1:
             return self.create_lora_update_result(
                 success=False,
                 error_message=(
                     f"Already have {self.num_pinned_loras} pinned adapters, "
+                    f"max allowed is {self.max_loras_per_batch - 1} (reserving 1 slot for dynamic use). "
                     f"Please unpin some adapters or increase max_loras_per_batch."
                 ),
             )

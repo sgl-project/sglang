@@ -206,13 +206,14 @@ class LoRAMemoryPool:
                 uid = self.buffer_id_to_uid[buffer_id]
 
                 # Skip if this adapter is needed by current batch
+                # TODO (lifuhuang): we might consider supporting pinning base model (uid == None) in the future.
                 if uid in cur_uids:
                     continue
 
-                # Skip if this adapter is pinned
+                # Skip if this adapter is pinned (base model cannot be pinned, so can be evicted)
                 if uid is not None:
                     lora_ref = lora_refs.get(uid)
-                    if lora_ref and lora_ref.pinned:  # None (base model) can be evicted
+                    if lora_ref and lora_ref.pinned:
                         continue
                 candidates.add(uid)
 
