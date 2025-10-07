@@ -749,6 +749,7 @@ class SWAKVPool(KVCache):
         self,
         size: int,
         size_swa: int,
+        dtype: torch.dtype,
         swa_attention_layer_ids: List[int],
         full_attention_layer_ids: List[int],
         enable_kvcache_transpose: bool,
@@ -757,6 +758,7 @@ class SWAKVPool(KVCache):
     ):
         self.size = size
         self.size_swa = size_swa
+        self.dtype = dtype
         self.swa_layer_nums = len(swa_attention_layer_ids)
         self.full_layer_nums = len(full_attention_layer_ids)
         kwargs["page_size"] = 1
@@ -766,11 +768,13 @@ class SWAKVPool(KVCache):
 
         self.swa_kv_pool = token_to_kv_pool_class(
             size=size_swa,
+            dtype=dtype,
             layer_num=self.swa_layer_nums,
             **kwargs,
         )
         self.full_kv_pool = token_to_kv_pool_class(
             size=size,
+            dtype=dtype,
             layer_num=self.full_layer_nums,
             **kwargs,
         )

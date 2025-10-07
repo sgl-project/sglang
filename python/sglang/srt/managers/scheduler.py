@@ -777,6 +777,7 @@ class Scheduler(
                     sliding_window_size=self.sliding_window_size,
                     page_size=self.page_size,
                     disable=server_args.disable_radix_cache,
+                    is_eagle=self.spec_algorithm.is_eagle(),
                 )
             elif server_args.enable_lmcache:
                 from sglang.srt.mem_cache.storage.lmcache.lmc_radix_cache import (
