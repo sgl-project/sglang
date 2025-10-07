@@ -28,8 +28,8 @@ impl SglangSchedulerClient {
         debug!("Connecting to SGLang scheduler at {}", endpoint);
 
         // Convert grpc:// to http:// for tonic
-        let http_endpoint = if endpoint.starts_with("grpc://") {
-            endpoint.replace("grpc://", "http://")
+        let http_endpoint = if let Some(addr) = endpoint.strip_prefix("grpc://") {
+            format!("http://{}", addr)
         } else {
             endpoint.to_string()
         };
@@ -42,8 +42,8 @@ impl SglangSchedulerClient {
             .tcp_keepalive(Some(Duration::from_secs(60)))
             .tcp_nodelay(true)
             .http2_adaptive_window(true)
-            .initial_stream_window_size(Some(16 * 1024 * 1024))  // 16MB
-            .initial_connection_window_size(Some(32 * 1024 * 1024))  // 32MB
+            .initial_stream_window_size(Some(16 * 1024 * 1024)) // 16MB
+            .initial_connection_window_size(Some(32 * 1024 * 1024)) // 32MB
             .connect()
             .await?;
 
