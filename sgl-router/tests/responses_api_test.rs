@@ -276,6 +276,8 @@ async fn test_conversations_crud_basic() {
         tokenizer_path: None,
         history_backend: sglang_router_rs::config::HistoryBackend::Memory,
         oracle: None,
+        reasoning_parser: None,
+        tool_call_parser: None,
     };
 
     let ctx = AppContext::new(router_cfg, reqwest::Client::new(), 8, None).expect("ctx");
