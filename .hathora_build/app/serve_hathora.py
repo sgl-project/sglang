@@ -324,7 +324,7 @@ async def lifespan(app: FastAPI):
             if concurrency <= 16:
                 return 16, 0.78, 4096
             if concurrency <= 32:
-                return 8, 0.75, 2048
+                return 16, 0.75, 2048
             # very high concurrency: keep graphs small and more headroom
             return 8, 0.72, 2048
 
@@ -343,6 +343,21 @@ async def lifespan(app: FastAPI):
                     _auto_profile_used = True
             except Exception:
                 pass
+
+        # Allow forcing max_micro_batch_size via env; otherwise scale with concurrency heuristic
+        try:
+            _mm_env = os.environ.get("MAX_MICRO_BATCH_SIZE")
+            _max_micro_batch = int(_mm_env) if _mm_env else None
+        except Exception:
+            _max_micro_batch = None
+        if _max_micro_batch is None:
+            try:
+                if _concurrency_env is not None:
+                    _c = int(_concurrency_env)
+                    # Favor larger micro-batches at moderate concurrency; cap at 16 for stability
+                    _max_micro_batch = max(4, min(16, _c // 2))
+            except Exception:
+                _max_micro_batch = None
 
         engine = sgl.Engine(
             model_path=CONFIG.model_id,
@@ -387,6 +402,8 @@ async def lifespan(app: FastAPI):
             cuda_graph_max_bs=_cuda_graph_max_bs,
             # Optional chunked prefill size tuning
             chunked_prefill_size=_chunked_prefill_size,
+            # Encourage larger micro-batches for decode
+            max_micro_batch_size=_max_micro_batch,
         )
 
         # Log chosen auto profile if applied
@@ -1321,6 +1338,8 @@ if __name__ == "__main__":
         host=CONFIG.host,
         port=CONFIG.port,
         log_level=LOG_LEVEL.lower(),
-        access_log=True
+        access_log=True,
+        loop="uvloop",
+        timeout_keep_alive=10,
+        workers=int(os.environ.get("TOKENIZER_WORKERS", os.cpu_count() or 1)) if os.environ.get("TOKENIZER_WORKERS") else 1,
     )
-    
