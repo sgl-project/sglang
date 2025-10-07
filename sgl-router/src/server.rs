@@ -57,6 +57,8 @@ pub struct AppContext {
     pub response_storage: SharedResponseStorage,
     pub conversation_storage: SharedConversationStorage,
     pub load_monitor: Option<Arc<LoadMonitor>>,
+    pub configured_reasoning_parser: Option<String>,
+    pub configured_tool_parser: Option<String>,
 }
 
 impl AppContext {
@@ -135,6 +137,9 @@ impl AppContext {
             router_config.worker_startup_check_interval_secs,
         )));
 
+        let configured_reasoning_parser = router_config.reasoning_parser.clone();
+        let configured_tool_parser = router_config.tool_call_parser.clone();
+
         Ok(Self {
             client,
             router_config,
@@ -148,6 +153,8 @@ impl AppContext {
             response_storage,
             conversation_storage,
             load_monitor,
+            configured_reasoning_parser,
+            configured_tool_parser,
         })
     }
 }

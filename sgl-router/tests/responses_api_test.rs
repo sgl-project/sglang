@@ -76,6 +76,8 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
         tokenizer_path: None,
         history_backend: sglang_router_rs::config::HistoryBackend::Memory,
         oracle: None,
+        reasoning_parser: None,
+        tool_call_parser: None,
     };
 
     // Create router and context
@@ -600,6 +602,8 @@ async fn test_multi_turn_loop_with_mcp() {
         tokenizer_path: None,
         history_backend: sglang_router_rs::config::HistoryBackend::Memory,
         oracle: None,
+        reasoning_parser: None,
+        tool_call_parser: None,
     };
 
     let ctx = AppContext::new(router_cfg, reqwest::Client::new(), 64, None).expect("ctx");
@@ -778,6 +782,8 @@ async fn test_max_tool_calls_limit() {
         tokenizer_path: None,
         history_backend: sglang_router_rs::config::HistoryBackend::Memory,
         oracle: None,
+        reasoning_parser: None,
+        tool_call_parser: None,
     };
 
     let ctx = AppContext::new(router_cfg, reqwest::Client::new(), 64, None).expect("ctx");
@@ -918,6 +924,8 @@ async fn setup_streaming_mcp_test() -> (
         tokenizer_path: None,
         history_backend: sglang_router_rs::config::HistoryBackend::Memory,
         oracle: None,
+        reasoning_parser: None,
+        tool_call_parser: None,
     };
 
     let ctx = AppContext::new(router_cfg, reqwest::Client::new(), 64, None).expect("ctx");
