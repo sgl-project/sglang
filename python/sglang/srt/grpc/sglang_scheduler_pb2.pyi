@@ -470,8 +470,8 @@ class GetServerInfoRequest(_message.Message):
     def __init__(self) -> None: ...
 
 class GetServerInfoResponse(_message.Message):
-    __slots__ = ("server_args_json", "scheduler_info", "active_requests", "is_paused", "last_receive_timestamp", "uptime_seconds", "sglang_version", "server_type", "start_time")
-    SERVER_ARGS_JSON_FIELD_NUMBER: _ClassVar[int]
+    __slots__ = ("server_args", "scheduler_info", "active_requests", "is_paused", "last_receive_timestamp", "uptime_seconds", "sglang_version", "server_type", "start_time")
+    SERVER_ARGS_FIELD_NUMBER: _ClassVar[int]
     SCHEDULER_INFO_FIELD_NUMBER: _ClassVar[int]
     ACTIVE_REQUESTS_FIELD_NUMBER: _ClassVar[int]
     IS_PAUSED_FIELD_NUMBER: _ClassVar[int]
@@ -480,7 +480,7 @@ class GetServerInfoResponse(_message.Message):
     SGLANG_VERSION_FIELD_NUMBER: _ClassVar[int]
     SERVER_TYPE_FIELD_NUMBER: _ClassVar[int]
     START_TIME_FIELD_NUMBER: _ClassVar[int]
-    server_args_json: str
+    server_args: _struct_pb2.Struct
     scheduler_info: _struct_pb2.Struct
     active_requests: int
     is_paused: bool
@@ -489,4 +489,4 @@ class GetServerInfoResponse(_message.Message):
     sglang_version: str
     server_type: str
     start_time: _timestamp_pb2.Timestamp
-    def __init__(self, server_args_json: _Optional[str] = ..., scheduler_info: _Optional[_Union[_struct_pb2.Struct, _Mapping]] = ..., active_requests: _Optional[int] = ..., is_paused: bool = ..., last_receive_timestamp: _Optional[float] = ..., uptime_seconds: _Optional[float] = ..., sglang_version: _Optional[str] = ..., server_type: _Optional[str] = ..., start_time: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ...) -> None: ...
+    def __init__(self, server_args: _Optional[_Union[_struct_pb2.Struct, _Mapping]] = ..., scheduler_info: _Optional[_Union[_struct_pb2.Struct, _Mapping]] = ..., active_requests: _Optional[int] = ..., is_paused: bool = ..., last_receive_timestamp: _Optional[float] = ..., uptime_seconds: _Optional[float] = ..., sglang_version: _Optional[str] = ..., server_type: _Optional[str] = ..., start_time: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ...) -> None: ...

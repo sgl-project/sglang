@@ -436,8 +436,8 @@ message GetModelInfoResponse {
 message GetServerInfoRequest {}
 
 message GetServerInfoResponse {
-  // Server configuration (as JSON for flexibility)
-  string server_args_json = 1;
+  // Server configuration (as structured data)
+  google.protobuf.Struct server_args = 1;
 
   // Scheduler metrics (from scheduler initialization)
   google.protobuf.Struct scheduler_info = 2;

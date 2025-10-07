@@ -449,16 +449,31 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
 
         try:
             import dataclasses
-            import json
 
             from google.protobuf.struct_pb2 import Struct
             from google.protobuf.timestamp_pb2 import Timestamp
 
             import sglang
 
-            # Serialize server_args to JSON
+            # Convert server_args to Struct
             server_args_dict = dataclasses.asdict(self.server_args)
-            server_args_json = json.dumps(server_args_dict, default=str)
+            server_args_struct = Struct()
+
+            # Convert all values to JSON-serializable format
+            def make_serializable(obj):
+                if obj is None:
+                    return None
+                elif isinstance(obj, (str, int, float, bool)):
+                    return obj
+                elif isinstance(obj, (list, tuple)):
+                    return [make_serializable(item) for item in obj]
+                elif isinstance(obj, dict):
+                    return {k: make_serializable(v) for k, v in obj.items()}
+                else:
+                    return str(obj)
+
+            serializable_args = make_serializable(server_args_dict)
+            server_args_struct.update(serializable_args)
 
             # Convert scheduler_info to Struct
             scheduler_info_struct = Struct()
@@ -475,7 +490,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             start_timestamp.FromSeconds(int(self.start_time))
 
             return sglang_scheduler_pb2.GetServerInfoResponse(
-                server_args_json=server_args_json,
+                server_args=server_args_struct,
                 scheduler_info=scheduler_info_struct,
                 active_requests=manager_state["active_requests"],
                 is_paused=manager_state["paused"],
