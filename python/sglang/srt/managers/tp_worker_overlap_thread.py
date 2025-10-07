@@ -232,12 +232,8 @@ class TpModelWorkerClient:
         self, model_worker_batch: ModelWorkerBatch
     ) -> ForwardBatchOutput:
         # Create a new copy of sampling_info because it will be updated in-place by the scheduler for the next batch.
-        sampling_info = model_worker_batch.sampling_info
-        sampling_info.update_penalties()
-        model_worker_batch.sampling_info = self.cur_sampling_info = dataclasses.replace(
-            sampling_info,
-            sampling_info_done=threading.Event(),
-            penalizer_orchestrator=None,
+        model_worker_batch.sampling_info = self.cur_sampling_info = (
+            model_worker_batch.sampling_info.copy_for_forward()
         )
 
         # A cuda stream sync here to avoid the cuda illegal memory access error.
