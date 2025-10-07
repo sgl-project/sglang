@@ -42,6 +42,8 @@ use std::{
 use tokio::{net::TcpListener, signal, spawn};
 use tracing::{error, info, warn, Level};
 
+const MAX_METADATA_PROPERTIES: usize = 16;
+
 #[derive(Clone)]
 pub struct AppContext {
     pub client: Client,
@@ -398,16 +400,39 @@ async fn v1_conversations_update(
     _headers: http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    let metadata = match extract_metadata(&body) {
-        Ok(meta) => meta,
+    let id = ConversationId::from_string(conversation_id.clone());
+    let existing = match state
+        .context
+        .conversation_storage
+        .get_conversation(&id)
+        .await
+    {
+        Ok(Some(conv)) => conv,
+        Ok(None) => return not_found_response(&conversation_id),
+        Err(err) => return storage_error_response(err),
+    };
+
+    let patch = match parse_metadata_patch(&body) {
+        Ok(patch) => patch,
         Err(resp) => return resp,
     };
 
-    let id = ConversationId::from_string(conversation_id.clone());
+    let merged_metadata = match patch {
+        MetadataPatch::NoChange => {
+            return (StatusCode::OK, Json(conversation_to_json(&existing))).into_response();
+        }
+        other => match apply_metadata_patch(existing.metadata.clone(), other) {
+            Ok(result) => result,
+            Err(ValidationError { previous, updated }) => {
+                return metadata_too_many_properties_error(previous, updated);
+            }
+        },
+    };
+
     match state
         .context
         .conversation_storage
-        .update_conversation(&id, metadata)
+        .update_conversation(&id, merged_metadata)
         .await
     {
         Ok(Some(conversation)) => {
@@ -445,21 +470,74 @@ async fn v1_conversations_delete(
 }
 
 fn extract_metadata(payload: &Value) -> Result<Option<ConversationMetadata>, Response> {
+    parse_metadata_create(payload)
+}
+
+fn parse_metadata_create(payload: &Value) -> Result<Option<ConversationMetadata>, Response> {
     match payload.get("metadata") {
-        Some(Value::Object(map)) => Ok(Some(map.clone())),
+        Some(Value::Object(map)) => {
+            if map.len() > MAX_METADATA_PROPERTIES {
+                return Err(metadata_too_many_properties_error(0, map.len()));
+            }
+            Ok(Some(map.clone()))
+        }
         Some(Value::Null) | None => Ok(None),
-        Some(other) => Err((
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "error": {
-                    "message": format!(
-                        "metadata must be an object or null, got {}",
-                        other
-                    ),
+        Some(other) => Err(invalid_metadata_type_response(other.clone())),
+    }
+}
+
+#[derive(Debug)]
+enum MetadataPatch {
+    NoChange,
+    ClearAll,
+    Merge(ConversationMetadata),
+}
+
+#[derive(Debug)]
+struct ValidationError {
+    previous: usize,
+    updated: usize,
+}
+
+fn parse_metadata_patch(payload: &Value) -> Result<MetadataPatch, Response> {
+    match payload.get("metadata") {
+        None => Ok(MetadataPatch::NoChange),
+        Some(Value::Null) => Ok(MetadataPatch::ClearAll),
+        Some(Value::Object(map)) => Ok(MetadataPatch::Merge(map.clone())),
+        Some(other) => Err(invalid_metadata_type_response(other.clone())),
+    }
+}
+
+fn apply_metadata_patch(
+    existing: Option<ConversationMetadata>,
+    patch: MetadataPatch,
+) -> Result<Option<ConversationMetadata>, ValidationError> {
+    match patch {
+        MetadataPatch::NoChange => Ok(existing),
+        MetadataPatch::ClearAll => Ok(None),
+        MetadataPatch::Merge(updates) => {
+            let mut merged = existing.unwrap_or_default();
+            let previous = merged.len();
+
+            for (key, value) in updates.into_iter() {
+                if value.is_null() {
+                    merged.remove(&key);
+                } else {
+                    merged.insert(key, value);
                 }
-            })),
-        )
-            .into_response()),
+            }
+
+            let updated = merged.len();
+            if updated > MAX_METADATA_PROPERTIES {
+                return Err(ValidationError { previous, updated });
+            }
+
+            if merged.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(merged))
+            }
+        }
     }
 }
 
@@ -503,6 +581,54 @@ fn storage_error_response(err: ConversationStorageError) -> Response {
                 "type": "internal_error",
                 "param": Value::Null,
                 "code": Value::Null
+            }
+        })),
+    )
+        .into_response()
+}
+
+fn invalid_metadata_type_response(value: Value) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": {
+                "message": format!(
+                    "Invalid 'metadata': expected object or null but got {}",
+                    value
+                ),
+                "type": "invalid_request_error",
+                "param": "metadata",
+                "code": "metadata_invalid_type"
+            }
+        })),
+    )
+        .into_response()
+}
+
+fn metadata_too_many_properties_error(previous: usize, updated: usize) -> Response {
+    let message = if previous == 0 {
+        format!(
+            "too many properties. Metadata can have at most {} properties, but you provided {} properties.",
+            MAX_METADATA_PROPERTIES, updated
+        )
+    } else {
+        format!(
+            "too many properties after update. Metadata can have at most {} properties, but your update resulted in an object with {} properties (up from {} properties before).",
+            MAX_METADATA_PROPERTIES, updated, previous
+        )
+    };
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": {
+                "message": format!("Invalid 'metadata': {}", message),
+                "type": "invalid_request_error",
+                "param": "metadata",
+                "code": "metadata_max_properties_exceeded",
+                "extra": {
+                    "previous_property_count": previous,
+                    "updated_property_count": updated
+                }
             }
         })),
     )

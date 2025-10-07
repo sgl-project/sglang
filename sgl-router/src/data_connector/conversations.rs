@@ -1,24 +1,18 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use rand::random;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value};
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 
-/// Identifier for stored conversations (`conv_{hex}` format aligning with OpenAI IDs)
+/// Identifier for stored conversations (`conv_{ulid}` format aligning with OpenAI IDs)
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
 pub struct ConversationId(pub String);
 
 impl ConversationId {
     pub fn new() -> Self {
-        let bytes: [u8; 32] = random();
-        let mut hex = String::with_capacity(64);
-        for byte in &bytes {
-            use std::fmt::Write;
-            write!(&mut hex, "{:02x}", byte).expect("write to string");
-        }
-        Self(format!("conv_{}", hex))
+        let ulid = ulid::Ulid::new().to_string();
+        Self(format!("conv_{}", ulid))
     }
 
     pub fn from_string(value: String) -> Self {
