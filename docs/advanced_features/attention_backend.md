@@ -70,7 +70,7 @@ Hybrid attention also works with speculative decoding. The backend used for draf
 Constraints when combining hybrid attention with speculative decoding:
 
 - If any attention backend is `trtllm_mha`, speculative decoding supports only `--speculative-eagle-topk 1`.
-- For paged backends with `--page-size > 1` and `--speculative-eagle-topk > 1`, only `flashinfer` is supported.
+- For paged backends with `--page-size > 1` and `--speculative-eagle-topk > 1`, only the `flashinfer` backend is supported.
 - `flex_attention` is not supported with speculative decoding.
 - CUDA Graph: the decode backend is always captured; the prefill backend is captured only when `--speculative-attention-mode prefill`.
 
