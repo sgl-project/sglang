@@ -1874,7 +1874,8 @@ class ServerArgs:
             default=ServerArgs.sampling_defaults,
             help="Where to get default sampling parameters. "
             "'openai' uses SGLang/OpenAI defaults (temperature=1.0, top_p=1.0, etc.). "
-            "'model' uses the model's generation_config.json if available.",
+            "'model' uses the model's generation_config.json to get the recommended "
+            "sampling parameters if available. Default is 'model'.",
         )
         parser.add_argument(
             "--tool-server",
