@@ -173,8 +173,6 @@ class SchedulerOutputProcessorMixin:
                                 )
                             logprob_pt += num_input_logprobs
 
-            self.set_next_batch_sampling_info_done(batch)
-
         else:  # embedding or reward model
             embeddings = result.embeddings.tolist()
 
@@ -295,7 +293,6 @@ class SchedulerOutputProcessorMixin:
                     self.abort_request(AbortReq(rid=req.rid))
                 req.grammar.finished = req.finished()
 
-        self.set_next_batch_sampling_info_done(batch)
         self.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
 
