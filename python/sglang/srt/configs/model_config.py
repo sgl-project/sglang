@@ -90,6 +90,7 @@ class ModelConfig:
         is_draft_model: bool = False,
         hybrid_kvcache_ratio: Optional[float] = None,
         model_impl: Union[str, ModelImpl] = ModelImpl.AUTO,
+        sampling_defaults: str = "default",
     ) -> None:
         # Parse args
         self.model_path = model_path
@@ -98,6 +99,7 @@ class ModelConfig:
         self.modelopt_quant = modelopt_quant
         self.is_draft_model = is_draft_model
         self.model_impl = model_impl
+        self.sampling_defaults = sampling_defaults
 
         # Get hf config
         self._maybe_pull_model_tokenizer_from_remote()
@@ -214,6 +216,7 @@ class ModelConfig:
             modelopt_quant=server_args.modelopt_quant,
             hybrid_kvcache_ratio=server_args.hybrid_kvcache_ratio,
             model_impl=server_args.model_impl,
+            sampling_defaults=server_args.sampling_defaults,
             **kwargs,
         )
 
@@ -664,11 +667,15 @@ class ModelConfig:
         Get default sampling parameters from the model's generation config.
 
         This method returns non-default sampling parameters from the model's
-        generation_config.json.
+        generation_config.json when sampling_defaults is set to "model".
 
         Returns:
             A dictionary containing the non-default sampling parameters.
         """
+        # Only use model's generation config if sampling_defaults is set to "model"
+        if self.sampling_defaults != "model":
+            return {}
+
         if self.hf_generation_config is None:
             return {}
 

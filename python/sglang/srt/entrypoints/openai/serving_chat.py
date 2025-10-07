@@ -457,7 +457,9 @@ class OpenAIServingChat(OpenAIServingBase):
             "min_p": get_param(request.min_p, "min_p"),
             "presence_penalty": request.presence_penalty,
             "frequency_penalty": request.frequency_penalty,
-            "repetition_penalty": get_param(request.repetition_penalty, "repetition_penalty"),
+            "repetition_penalty": get_param(
+                request.repetition_penalty, "repetition_penalty"
+            ),
             "regex": request.regex,
             "ebnf": request.ebnf,
             "n": request.n,
