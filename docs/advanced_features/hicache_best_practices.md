@@ -4,76 +4,33 @@
 
 SGLang HiCache extends the traditional RadixAttention with a three-tier hierarchical KV caching system that dramatically improves performance for long-context and multi-turn conversation scenarios. By intelligently managing KV caches across GPU memory, host memory, and external storage backends, HiCache addresses the fundamental capacity bottleneck that limits cache hit rates in conventional systems.
 
-### Real-World Performance Gains
-
-Based on community feedback and benchmarks:
-
-- **Coding Agent Scenarios**: In Qwen3-Coder-480B deployments with 25K+ token dialogues, integrating HiCache with DeepSeek 3FS achieved:
-  - **56% reduction in TTFT** (Time to First Token)
-  - **2× inference throughput improvement**
-  - **Cache hit rate increased from 40% to 80%**
-
-- **General QA Scenarios**: DeepSeek-R1-671B with Mooncake backend showed:
-  - **84% reduction in TTFT** compared to full re-computation
-
-## Architecture Overview
-
-HiCache implements a three-tier memory hierarchy:
-
-![HiCache Architecture Overview](https://lmsys.org/images/blog/hicache/hicache_overview.png)
-
-*Figure 1: SGLang HiCache three-tier architecture with GPU memory (L1), host memory (L2), and storage backend (L3)*
-
-### Key Components
-
-1. **HiRadixTree**: Acts as a page table for referencing KV caches across all tiers
-2. **Cache Controller**: Automatically manages data movement between tiers
-3. **Storage Backends**: Pluggable interfaces for various storage solutions
-4. **Optimized Data Plane**: GPU-assisted I/O kernels and zero-copy mechanisms
-
-## Supported Storage Backends
-
-HiCache supports multiple storage backends through a clean, generic interface:
-
-### Production-Ready Backends
-
-1. **DeepSeek 3FS (HF3FS)**: Kubernetes-native distributed storage solution with operator-based deployment
-
-2. **Mooncake**: High-performance distributed KV cache with RDMA support and zero-copy transfers
-
-3. **AIBrix KVCache**: Enterprise-grade distributed caching supporting multiple backends (Infinistore, PrisKV)
-
-4. **NIXL**: Transfer library that bridges various storage backends including GPU-direct storage and cloud object storage
-
-### Development/Testing Backend
-
-5. **HiCacheFile**: Simple file-based storage for development, testing, and single-node deployments
-
 ## Configuration Guidelines
 
-### Core HiCache Parameters
+## Core HiCache Parameters
 
 ```bash
 # Essential HiCache flags
---enable-hierarchical-cache         # Enable HiCache
---hicache-ratio 2                   # Host memory ratio (2x GPU memory)
---page-size 64                      # Page size for cache management
---hicache-storage-backend           # Storage backend (e.g., hf3fs, mooncake, etc.)
+--page-size 64                        # Page size for cache management
+--enable-hierarchical-cache           # Enable HiCache
+--hicache-ratio 2                     # Host memory ratio (2x GPU memory)
+--hicache-size 100                    # Host memory size in GBs, will override the above ratio
+--hicache-io-backend kernel           # The I/O backend of moving data between CPU and GPU
+--hicache-write-policy write_through  # Cache write policy from GPU to CPU
+--hicache-storage-backend             # Optional storage backend (e.g., hf3fs, mooncake, etc.)
 ```
+
+## Key Configurations with Storage Backends Enabled
 
 ### Memory Layout Optimization
 
 ```bash
 # Page-first: Optimized for I/O efficiency with zero-copy (recommended with kernel backend)
 --hicache-mem-layout page_first
-
 # Page-first-direct: Optimized for direct I/O operations (Compatible with fa3 and same zero-copy performance as page_first)
 --hicache-mem-layout page_first_direct
-
 # Layer-first
 --hicache-mem-layout layer_first
 ```
-
 **Layout Compatibility:**
 - `page_first`: Only compatible with `kernel` I/O backend, automatically switches to `layer_first` with `direct` backend
 - `page_first_direct`: Specifically designed for `direct` I/O backend with optimized memory organization
@@ -83,15 +40,11 @@ HiCache supports multiple storage backends through a clean, generic interface:
 ```bash
 # Best-effort: Terminate prefetch when needed
 --hicache-storage-prefetch-policy best_effort
-
 # Wait-complete: Ensure complete prefetch, higher cache reuse
 --hicache-storage-prefetch-policy wait_complete
-
 # Timeout: Balance between completion and best-effort
 --hicache-storage-prefetch-policy timeout
 ```
-
-## Deployment Guidelines
 
 ### Deployment with HF3FS
 
