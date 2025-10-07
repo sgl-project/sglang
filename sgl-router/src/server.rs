@@ -115,13 +115,15 @@ impl AppContext {
                     "oracle configuration is required when history_backend=oracle".to_string()
                 })?;
 
-                let response_storage = OracleResponseStorage::new(oracle_cfg.clone()).map_err(|err| {
-                    format!("failed to initialize Oracle response storage: {err}")
-                })?;
+                let response_storage =
+                    OracleResponseStorage::new(oracle_cfg.clone()).map_err(|err| {
+                        format!("failed to initialize Oracle response storage: {err}")
+                    })?;
 
-                let conversation_storage = OracleConversationStorage::new(oracle_cfg).map_err(|err| {
-                    format!("failed to initialize Oracle conversation storage: {err}")
-                })?;
+                let conversation_storage =
+                    OracleConversationStorage::new(oracle_cfg).map_err(|err| {
+                        format!("failed to initialize Oracle conversation storage: {err}")
+                    })?;
 
                 (Arc::new(response_storage), Arc::new(conversation_storage))
             }

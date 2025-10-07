@@ -6,7 +6,7 @@ use crate::data_connector::conversations::{
 use async_trait::async_trait;
 use chrono::Utc;
 use deadpool::managed::{Manager, Metrics, Pool, PoolError, RecycleError, RecycleResult};
-use oracle::Connection;
+use oracle::{sql_type::OracleType, Connection};
 use serde_json::Value;
 use std::path::Path;
 use std::sync::Arc;
@@ -138,22 +138,44 @@ impl ConversationStorage for OracleConversationStorage {
     ) -> Result<Option<Conversation>> {
         let id_str = id.0.clone();
         let metadata_json = metadata.as_ref().map(serde_json::to_string).transpose()?;
+        let conversation_id = id.clone();
+        let updated_metadata = metadata.clone();
 
-        let updated_rows = self
-            .with_connection(move |conn| {
-                conn.execute(
-                    "UPDATE conversations SET metadata = :1 WHERE id = :2",
-                    &[&metadata_json, &id_str],
+        self.with_connection(move |conn| {
+            let mut stmt = conn
+                .statement(
+                    "UPDATE conversations \
+                         SET metadata = :1 \
+                         WHERE id = :2 \
+                         RETURNING created_at INTO :3",
                 )
-                .map_err(map_oracle_error)
-            })
-            .await?;
+                .build()
+                .map_err(map_oracle_error)?;
 
-        if updated_rows.row_count().map_err(map_oracle_error)? == 0 {
-            return Ok(None);
-        }
+            stmt.bind(3, &OracleType::TimestampTZ(6))
+                .map_err(map_oracle_error)?;
+            stmt.execute(&[&metadata_json, &id_str])
+                .map_err(map_oracle_error)?;
 
-        self.get_conversation(id).await
+            if stmt.row_count().map_err(map_oracle_error)? == 0 {
+                return Ok(None);
+            }
+
+            let mut created_at: Vec<chrono::DateTime<Utc>> =
+                stmt.returned_values(3).map_err(map_oracle_error)?;
+            let created_at = created_at.pop().ok_or_else(|| {
+                ConversationStorageError::StorageError(
+                    "Oracle update did not return created_at".to_string(),
+                )
+            })?;
+
+            Ok(Some(Conversation::with_parts(
+                conversation_id,
+                created_at,
+                updated_metadata,
+            )))
+        })
+        .await
     }
 
     async fn delete_conversation(&self, id: &ConversationId) -> Result<bool> {
