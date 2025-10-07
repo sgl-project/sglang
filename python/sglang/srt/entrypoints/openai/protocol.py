@@ -466,6 +466,38 @@ class ChatCompletionRequest(BaseModel):
         "Currently only supported for OpenAI models in the harmony path, i.e GPT-OSS models.",
     )
 
+    # Extra parameters for SRT backend only and will be ignored by OpenAI models.
+    top_k: Optional[int] = None
+    min_p: Optional[float] = None
+    min_tokens: int = 0
+    regex: Optional[str] = None
+    ebnf: Optional[str] = None
+    repetition_penalty: Optional[float] = None
+    stop_token_ids: Optional[List[int]] = None
+    no_stop_trim: bool = False
+    ignore_eos: bool = False
+    continue_final_message: bool = False
+    skip_special_tokens: bool = True
+    lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
+    session_params: Optional[Dict] = None
+    separate_reasoning: bool = True
+    stream_reasoning: bool = True
+    chat_template_kwargs: Optional[Dict] = None
+
+    # For request id
+    rid: Optional[Union[List[str], str]] = None
+    # Extra key for classifying the request (e.g. cache_salt)
+    extra_key: Optional[Union[List[str], str]] = None
+    # Cache salt for request caching
+    cache_salt: Optional[Union[List[str], str]] = None
+    # Priority for the request
+    priority: Optional[int] = None
+
+    # For PD disaggregation
+    bootstrap_host: Optional[Union[List[str], str]] = None
+    bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
+    bootstrap_room: Optional[Union[List[int], int]] = None
+
     # OpenAI/SGLang default sampling parameters
     _DEFAULT_SAMPLING_PARAMS = {
         "temperature": 1.0,
@@ -544,38 +576,6 @@ class ChatCompletionRequest(BaseModel):
             }
 
         return values
-
-    # Extra parameters for SRT backend only and will be ignored by OpenAI models.
-    top_k: Optional[int] = None
-    min_p: Optional[float] = None
-    min_tokens: int = 0
-    regex: Optional[str] = None
-    ebnf: Optional[str] = None
-    repetition_penalty: Optional[float] = None
-    stop_token_ids: Optional[List[int]] = None
-    no_stop_trim: bool = False
-    ignore_eos: bool = False
-    continue_final_message: bool = False
-    skip_special_tokens: bool = True
-    lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
-    session_params: Optional[Dict] = None
-    separate_reasoning: bool = True
-    stream_reasoning: bool = True
-    chat_template_kwargs: Optional[Dict] = None
-
-    # For request id
-    rid: Optional[Union[List[str], str]] = None
-    # Extra key for classifying the request (e.g. cache_salt)
-    extra_key: Optional[Union[List[str], str]] = None
-    # Cache salt for request caching
-    cache_salt: Optional[Union[List[str], str]] = None
-    # Priority for the request
-    priority: Optional[int] = None
-
-    # For PD disaggregation
-    bootstrap_host: Optional[Union[List[str], str]] = None
-    bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
-    bootstrap_room: Optional[Union[List[int], int]] = None
 
     def to_sampling_params(
         self,
