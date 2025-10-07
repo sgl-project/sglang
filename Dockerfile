@@ -1,20 +1,14 @@
-# SGLang Hathora Deployment Dockerfile
-# Use a slim Python image to keep the container size small
 FROM python:3.10-slim
 
-# Set the working directory
 WORKDIR /app
 
-# Install gcloud CLI
-RUN apt-get update && apt-get install -y --no-install-recommends curl gnupg ca-certificates dnsutils libnuma1 numactl \
-    && apt-get clean && rm -rf /var/lib/apt/lists/*
-
-# Install NVIDIA CUDA Toolkit 12.8 (for DeepGEMM JIT and CUDA tools)
-RUN apt-get update && apt-get install -y --no-install-recommends wget && \
+# System deps needed by runtime and healthcheck + NVIDIA CUDA Toolkit 12.8
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl gnupg ca-certificates dnsutils libnuma1 numactl wget && \
     wget -qO /tmp/cuda-keyring.deb https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-keyring_1.1-1_all.deb && \
     dpkg -i /tmp/cuda-keyring.deb && rm -f /tmp/cuda-keyring.deb && \
     apt-get update && apt-get install -y --no-install-recommends cuda-toolkit-12-8 && \
-    rm -rf /var/lib/apt/lists/*
+    apt-get clean && rm -rf /var/lib/apt/lists/*
 
 ENV CUDA_HOME=/usr/local/cuda
 ENV PATH="${CUDA_HOME}/bin:${PATH}"
@@ -31,19 +25,22 @@ ENV TORCH_NCCL_ASYNC_ERROR_HANDLING=1 \
     NCCL_MIN_NCHANNELS=1 \
     NCCL_MAX_NCHANNELS=1
 
-# Copy the application code
-COPY .hathora_build/app/requirements.txt ./requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
+# Install deps, breaking this out to optimize cache hits
+COPY python/pyproject.toml /opt/sglang-src/python/pyproject.toml
+RUN pip install --no-cache-dir tomli && \
+    python -c "import tomli; d=tomli.load(open('/opt/sglang-src/python/pyproject.toml','rb')); reqs=list(d.get('project',{}).get('dependencies',[])); e=d.get('project',{}).get('optional-dependencies',{}); reqs+=e.get('test',[]); reqs+=e.get('decord',[]); print('\\n'.join(reqs))" > /tmp/sglang-reqs.txt && \
+    pip install --no-cache-dir -r /tmp/sglang-reqs.txt
 
-# Install SGLang from local source
+COPY .hathora_build/app/requirements.txt ./requirements.txt
+RUN pip install --no-cache-dir -r ./requirements.txt
+
+# Move app code and build. 
+COPY .hathora_build/app/* /app/
+RUN chmod +x /app/entrypoint.sh
+
 COPY python /opt/sglang-src/python
 RUN pip install --no-cache-dir -e /opt/sglang-src/python[all]
 
-
-COPY .hathora_build/app/* .
-RUN chmod +x ./entrypoint.sh
-
-# Expose the port the app runs on
 EXPOSE 8000
 
 # Healthcheck for orchestrators

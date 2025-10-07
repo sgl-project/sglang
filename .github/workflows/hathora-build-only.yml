@@ -1,0 +1,27 @@
+name: Hathora Build Only
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  hathora-build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22.4'
+      - run: go install github.com/hathora/ci/hathora@latest
+
+      - name: Create Hathora build (no deploy)
+        env:
+          HATHORA_TOKEN: ${{ secrets.HATHORA_TOKEN }}
+        run: |
+          hathora build create
