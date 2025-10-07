@@ -22,11 +22,6 @@ import torch
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import get_pp_group, get_world_group
-from sglang.srt.hf_transformers_utils import (
-    get_processor,
-    get_tokenizer,
-    get_tokenizer_from_processor,
-)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
@@ -43,11 +38,20 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, global_server_args_dict
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    ForwardBatchOutput,
+    PPProxyTensors,
+)
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.patch_torch import monkey_patch_torch_reductions
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
+from sglang.srt.utils.hf_transformers_utils import (
+    get_processor,
+    get_tokenizer,
+    get_tokenizer_from_processor,
+)
+from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
@@ -91,7 +95,6 @@ class TpModelWorker:
                 else server_args.speculative_draft_model_revision
             ),
             is_draft_model=is_draft_worker,
-            tp_rank=tp_rank,
         )
 
         self.model_runner = ModelRunner(
@@ -234,10 +237,8 @@ class TpModelWorker:
         self,
         model_worker_batch: ModelWorkerBatch,
         launch_done: Optional[threading.Event] = None,
-        skip_sample: bool = False,
-    ) -> Tuple[
-        Union[LogitsProcessorOutput, torch.Tensor], Optional[torch.Tensor], bool
-    ]:
+        is_verify: bool = False,
+    ) -> ForwardBatchOutput:
         # update the consumer index of hicache to the running batch
         self.set_hicache_consumer(model_worker_batch.hicache_consumer_index)
 
@@ -258,27 +259,31 @@ class TpModelWorker:
             if launch_done is not None:
                 launch_done.set()
 
-            if skip_sample:
-                next_token_ids = None
-                # For prefill-only requests, we still need to compute logprobs even when sampling is skipped
-                if (
-                    model_worker_batch.is_prefill_only
-                    and model_worker_batch.return_logprob
-                ):
-                    # Compute logprobs without full sampling
-                    self.model_runner.compute_logprobs_only(
-                        logits_output, model_worker_batch
-                    )
-            else:
-                next_token_ids = self.model_runner.sample(logits_output, forward_batch)
+            skip_sample = is_verify or model_worker_batch.is_prefill_only
+            next_token_ids = None
 
-            return logits_output, next_token_ids, can_run_cuda_graph
+            if not skip_sample:
+                next_token_ids = self.model_runner.sample(logits_output, forward_batch)
+            elif model_worker_batch.return_logprob and not is_verify:
+                # NOTE: Compute logprobs without full sampling
+                self.model_runner.compute_logprobs_only(
+                    logits_output, model_worker_batch
+                )
+
+            return ForwardBatchOutput(
+                logits_output=logits_output,
+                next_token_ids=next_token_ids,
+                can_run_cuda_graph=can_run_cuda_graph,
+            )
         else:
             pp_proxy_tensors, can_run_cuda_graph = self.model_runner.forward(
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
-            return pp_proxy_tensors.tensors, None, can_run_cuda_graph
+            return ForwardBatchOutput(
+                pp_proxy_tensors=pp_proxy_tensors,
+                can_run_cuda_graph=can_run_cuda_graph,
+            )
 
     def forward_batch_embedding(self, model_worker_batch: ModelWorkerBatch):
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)

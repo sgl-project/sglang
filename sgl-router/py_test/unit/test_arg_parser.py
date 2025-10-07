@@ -22,7 +22,7 @@ class TestRouterArgs:
         args = RouterArgs()
 
         # Test basic defaults
-        assert args.host == "127.0.0.1"
+        assert args.host == "0.0.0.0"
         assert args.port == 30000
         assert args.policy == "cache_aware"
         assert args.worker_urls == []
