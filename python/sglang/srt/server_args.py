@@ -1396,58 +1396,6 @@ class ServerArgs:
             help="Whether or not to allow for custom models defined on the Hub in their own modeling files.",
         )
         parser.add_argument(
-            "--dtype",
-            type=str,
-            default=ServerArgs.dtype,
-            choices=["auto", "half", "float16", "bfloat16", "float", "float32"],
-            help="Data type for model weights and activations.\n\n"
-            '* "auto" will use FP16 precision for FP32 and FP16 models, and '
-            "BF16 precision for BF16 models.\n"
-            '* "half" for FP16. Recommended for AWQ quantization.\n'
-            '* "float16" is the same as "half".\n'
-            '* "bfloat16" for a balance between precision and range.\n'
-            '* "float" is shorthand for FP32 precision.\n'
-            '* "float32" for FP32 precision.',
-        )
-        parser.add_argument(
-            "--kv-cache-dtype",
-            type=str,
-            default=ServerArgs.kv_cache_dtype,
-            choices=["auto", "fp8_e5m2", "fp8_e4m3"],
-            help='Data type for kv cache storage. "auto" will use model data type. "fp8_e5m2" and "fp8_e4m3" is supported for CUDA 11.8+.',
-        )
-        parser.add_argument(
-            "--quantization",
-            type=str,
-            default=ServerArgs.quantization,
-            choices=[
-                "awq",
-                "fp8",
-                "gptq",
-                "marlin",
-                "gptq_marlin",
-                "awq_marlin",
-                "bitsandbytes",
-                "gguf",
-                "modelopt_fp8",  # TODO: set default for modelopt quantization,
-                "modelopt_fp4",
-                "w8a8_int8",
-                "w8a8_fp8",
-                "moe_wna16",
-                "qoq",
-            ],
-            help="The quantization method.",
-        )
-        parser.add_argument(
-            "--quantization-param-path",
-            type=nullable_str,
-            default=None,
-            help="Path to the JSON file containing the KV cache "
-            "scaling factors. This should generally be supplied, when "
-            "KV cache dtype is FP8. Otherwise, KV cache scaling factors "
-            "default to 1.0, which may cause accuracy issues. ",
-        )
-        parser.add_argument(
             "--context-length",
             type=int,
             default=ServerArgs.context_length,
