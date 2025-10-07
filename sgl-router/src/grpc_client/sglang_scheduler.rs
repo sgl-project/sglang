@@ -28,14 +28,22 @@ impl SglangSchedulerClient {
         debug!("Connecting to SGLang scheduler at {}", endpoint);
 
         // Convert grpc:// to http:// for tonic
-        let http_endpoint = if endpoint.starts_with("grpc://") {
-            endpoint.replace("grpc://", "http://")
+        let http_endpoint = if let Some(addr) = endpoint.strip_prefix("grpc://") {
+            format!("http://{}", addr)
         } else {
             endpoint.to_string()
         };
 
         let channel = Channel::from_shared(http_endpoint)?
             .timeout(Duration::from_secs(30))
+            .http2_keep_alive_interval(Duration::from_secs(30))
+            .keep_alive_timeout(Duration::from_secs(10))
+            .keep_alive_while_idle(true)
+            .tcp_keepalive(Some(Duration::from_secs(60)))
+            .tcp_nodelay(true)
+            .http2_adaptive_window(true)
+            .initial_stream_window_size(Some(16 * 1024 * 1024)) // 16MB
+            .initial_connection_window_size(Some(32 * 1024 * 1024)) // 32MB
             .connect()
             .await?;
 
@@ -82,6 +90,30 @@ impl SglangSchedulerClient {
 
         self.client.abort(request).await?;
         Ok(())
+    }
+
+    /// Get model information
+    pub async fn get_model_info(
+        &mut self,
+    ) -> Result<proto::GetModelInfoResponse, Box<dyn std::error::Error + Send + Sync>> {
+        debug!("Requesting model info");
+        let request = Request::new(proto::GetModelInfoRequest {});
+
+        let response = self.client.get_model_info(request).await?;
+        debug!("Model info response received");
+        Ok(response.into_inner())
+    }
+
+    /// Get server information
+    pub async fn get_server_info(
+        &mut self,
+    ) -> Result<proto::GetServerInfoResponse, Box<dyn std::error::Error + Send + Sync>> {
+        debug!("Requesting server info");
+        let request = Request::new(proto::GetServerInfoRequest {});
+
+        let response = self.client.get_server_info(request).await?;
+        debug!("Server info response received");
+        Ok(response.into_inner())
     }
 
     /// Build a single SGLang GenerateRequest from OpenAI ChatCompletionRequest
@@ -189,6 +221,7 @@ impl SglangSchedulerClient {
             stop: stop_sequences,
             stop_token_ids: request.stop_token_ids.clone().unwrap_or_default(),
             skip_special_tokens,
+            spaces_between_special_tokens: true, // Default from Python SamplingParams
             ignore_eos: request.ignore_eos,
             no_stop_trim: request.no_stop_trim,
             n: request.n.unwrap_or(1) as i32,
@@ -288,6 +321,8 @@ impl SglangSchedulerClient {
             top_k: -1,
             repetition_penalty: 1.0,
             n: 1,
+            skip_special_tokens: true,
+            spaces_between_special_tokens: true,
             ..Default::default()
         };
 
@@ -340,6 +375,12 @@ impl SglangSchedulerClient {
         if let Some(min_tokens) = p.min_tokens {
             sampling.min_new_tokens = i32::try_from(min_tokens)
                 .map_err(|_| "min_tokens must fit into a 32-bit signed integer".to_string())?;
+        }
+
+        // Handle n with conversion
+        if let Some(n) = p.n {
+            sampling.n = i32::try_from(n)
+                .map_err(|_| "n must fit into a 32-bit signed integer".to_string())?;
         }
 
         // Handle constraints (exactly one allowed)
@@ -425,10 +466,24 @@ mod tests {
     #[test]
     fn test_sampling_params_defaults() {
         let params = proto::SamplingParams::default();
+        // Numeric fields have proto defaults (0)
         assert_eq!(params.temperature, 0.0);
-        assert_eq!(params.max_new_tokens, None);
         assert_eq!(params.top_p, 0.0);
         assert_eq!(params.top_k, 0);
+        assert_eq!(params.repetition_penalty, 0.0);
+        assert_eq!(params.n, 0);
+        // Bool fields have proto defaults (false)
+        assert!(!params.skip_special_tokens);
+        assert!(!params.spaces_between_special_tokens);
+        assert!(!params.ignore_eos);
+        assert!(!params.no_stop_trim);
+        // Optional int fields should be None
+        assert_eq!(params.max_new_tokens, None);
+        assert_eq!(params.stream_interval, None);
+        // Other non-optional fields
+        assert_eq!(params.min_p, 0.0);
+        assert_eq!(params.frequency_penalty, 0.0);
+        assert_eq!(params.presence_penalty, 0.0);
         assert!(params.stop.is_empty());
     }
 

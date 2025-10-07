@@ -75,10 +75,6 @@ class ForwardMode(IntEnum):
     # Used in speculative decoding: extend a batch in the draft model.
     DRAFT_EXTEND = auto()
 
-    # A dummy first batch to start the pipeline for overlap scheduler.
-    # It is now used for triggering the sampling_info_done event for the first prefill batch.
-    DUMMY_FIRST = auto()
-
     # Split Prefill for PD multiplexing
     SPLIT_PREFILL = auto()
 
@@ -127,9 +123,6 @@ class ForwardMode(IntEnum):
 
     def is_cpu_graph(self):
         return self == ForwardMode.DECODE
-
-    def is_dummy_first(self):
-        return self == ForwardMode.DUMMY_FIRST
 
     def is_split_prefill(self):
         return self == ForwardMode.SPLIT_PREFILL
@@ -293,6 +286,7 @@ class ForwardBatch:
     # For padding
     padded_static_len: int = -1  # -1 if not padded
     num_token_non_padded: Optional[torch.Tensor] = None  # scalar tensor
+    num_token_non_padded_cpu: int = None
 
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None
@@ -354,6 +348,7 @@ class ForwardBatch:
             ret.num_token_non_padded = torch.tensor(
                 len(batch.input_ids), dtype=torch.int32
             ).to(device, non_blocking=True)
+        ret.num_token_non_padded_cpu = len(batch.input_ids)
 
         # For MLP sync
         if batch.global_num_tokens is not None:

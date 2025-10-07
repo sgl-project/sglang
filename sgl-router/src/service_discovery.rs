@@ -539,10 +539,12 @@ mod tests {
             )),
             tokenizer: None,
             reasoning_parser_factory: None,
-            tool_parser_registry: None,
+            tool_parser_factory: None,
             router_manager: None,
             response_storage: Arc::new(crate::data_connector::MemoryResponseStorage::new()),
             load_monitor: None,
+            configured_reasoning_parser: None,
+            configured_tool_parser: None,
         })
     }
 
