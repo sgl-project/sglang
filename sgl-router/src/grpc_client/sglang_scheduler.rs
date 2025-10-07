@@ -202,6 +202,7 @@ impl SglangSchedulerClient {
             stop: stop_sequences,
             stop_token_ids: request.stop_token_ids.clone().unwrap_or_default(),
             skip_special_tokens,
+            spaces_between_special_tokens: true, // Default from Python SamplingParams
             ignore_eos: request.ignore_eos,
             no_stop_trim: request.no_stop_trim,
             n: request.n.unwrap_or(1) as i32,
@@ -301,6 +302,8 @@ impl SglangSchedulerClient {
             top_k: -1,
             repetition_penalty: 1.0,
             n: 1,
+            skip_special_tokens: true,
+            spaces_between_special_tokens: true,
             ..Default::default()
         };
 
@@ -444,10 +447,24 @@ mod tests {
     #[test]
     fn test_sampling_params_defaults() {
         let params = proto::SamplingParams::default();
+        // Numeric fields have proto defaults (0)
         assert_eq!(params.temperature, 0.0);
-        assert_eq!(params.max_new_tokens, None);
         assert_eq!(params.top_p, 0.0);
         assert_eq!(params.top_k, 0);
+        assert_eq!(params.repetition_penalty, 0.0);
+        assert_eq!(params.n, 0);
+        // Bool fields have proto defaults (false)
+        assert!(!params.skip_special_tokens);
+        assert!(!params.spaces_between_special_tokens);
+        assert!(!params.ignore_eos);
+        assert!(!params.no_stop_trim);
+        // Optional int fields should be None
+        assert_eq!(params.max_new_tokens, None);
+        assert_eq!(params.stream_interval, None);
+        // Other non-optional fields
+        assert_eq!(params.min_p, 0.0);
+        assert_eq!(params.frequency_penalty, 0.0);
+        assert_eq!(params.presence_penalty, 0.0);
         assert!(params.stop.is_empty());
     }
 
