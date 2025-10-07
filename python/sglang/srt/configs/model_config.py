@@ -672,7 +672,6 @@ class ModelConfig:
         Returns:
             A dictionary containing the non-default sampling parameters.
         """
-        # Only use model's generation config if sampling_defaults is set to "model"
         if self.sampling_defaults != "model":
             return {}
 
