@@ -425,15 +425,6 @@ class ToolChoice(BaseModel):
 
 
 class ChatCompletionRequest(BaseModel):
-    # OpenAI/SGLang default sampling parameters
-    _DEFAULT_SAMPLING_PARAMS = {
-        "temperature": 1.0,
-        "top_p": 1.0,
-        "top_k": -1,
-        "min_p": 0.0,
-        "repetition_penalty": 1.0,
-    }
-
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
     messages: List[ChatCompletionMessageParam]
@@ -474,6 +465,15 @@ class ChatCompletionRequest(BaseModel):
         "result in faster responses and fewer tokens used on reasoning in a response. "
         "Currently only supported for OpenAI models in the harmony path, i.e GPT-OSS models.",
     )
+
+    # OpenAI/SGLang default sampling parameters
+    _DEFAULT_SAMPLING_PARAMS = {
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "top_k": -1,
+        "min_p": 0.0,
+        "repetition_penalty": 1.0,
+    }
 
     @model_validator(mode="before")
     @classmethod
