@@ -1,0 +1,115 @@
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use rand::random;
+use serde::{Deserialize, Serialize};
+use serde_json::{Map as JsonMap, Value};
+use std::fmt::{Display, Formatter};
+use std::sync::Arc;
+
+/// Identifier for stored conversations (`conv_{hex}` format aligning with OpenAI IDs)
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
+pub struct ConversationId(pub String);
+
+impl ConversationId {
+    pub fn new() -> Self {
+        let bytes: [u8; 32] = random();
+        let mut hex = String::with_capacity(64);
+        for byte in &bytes {
+            use std::fmt::Write;
+            write!(&mut hex, "{:02x}", byte).expect("write to string");
+        }
+        Self(format!("conv_{}", hex))
+    }
+
+    pub fn from_string(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl Default for ConversationId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Display for ConversationId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Metadata payload persisted with a conversation
+pub type ConversationMetadata = JsonMap<String, Value>;
+
+/// Input payload for creating a conversation
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NewConversation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<ConversationMetadata>,
+}
+
+/// Stored conversation data structure
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Conversation {
+    pub id: ConversationId,
+    pub created_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<ConversationMetadata>,
+}
+
+impl Conversation {
+    pub fn new(new_conversation: NewConversation) -> Self {
+        Self {
+            id: ConversationId::new(),
+            created_at: Utc::now(),
+            metadata: new_conversation.metadata,
+        }
+    }
+
+    pub fn with_parts(
+        id: ConversationId,
+        created_at: DateTime<Utc>,
+        metadata: Option<ConversationMetadata>,
+    ) -> Self {
+        Self {
+            id,
+            created_at,
+            metadata,
+        }
+    }
+}
+
+/// Result alias for conversation storage operations
+pub type Result<T> = std::result::Result<T, ConversationStorageError>;
+
+/// Error type for conversation storage operations
+#[derive(Debug, thiserror::Error)]
+pub enum ConversationStorageError {
+    #[error("Conversation not found: {0}")]
+    ConversationNotFound(String),
+
+    #[error("Storage error: {0}")]
+    StorageError(String),
+
+    #[error("Serialization error: {0}")]
+    SerializationError(#[from] serde_json::Error),
+}
+
+/// Trait describing the CRUD interface for conversation storage backends
+#[async_trait]
+pub trait ConversationStorage: Send + Sync + 'static {
+    async fn create_conversation(&self, input: NewConversation) -> Result<Conversation>;
+
+    async fn get_conversation(&self, id: &ConversationId) -> Result<Option<Conversation>>;
+
+    async fn update_conversation(
+        &self,
+        id: &ConversationId,
+        metadata: Option<ConversationMetadata>,
+    ) -> Result<Option<Conversation>>;
+
+    async fn delete_conversation(&self, id: &ConversationId) -> Result<bool>;
+}
+
+/// Shared pointer alias for conversation storage
+pub type SharedConversationStorage = Arc<dyn ConversationStorage>;

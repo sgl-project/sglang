@@ -2,7 +2,10 @@ use crate::{
     config::{ConnectionMode, HistoryBackend, RouterConfig, RoutingMode},
     core::{LoadMonitor, WorkerManager, WorkerRegistry, WorkerType},
     data_connector::{
-        MemoryResponseStorage, NoOpResponseStorage, OracleResponseStorage, SharedResponseStorage,
+        Conversation, ConversationId, ConversationMetadata, ConversationStorageError,
+        MemoryConversationStorage, MemoryResponseStorage, NewConversation, NoOpConversationStorage,
+        NoOpResponseStorage, OracleConversationStorage, OracleResponseStorage,
+        SharedConversationStorage, SharedResponseStorage,
     },
     logging::{self, LoggingConfig},
     metrics::{self, PrometheusConfig},
@@ -51,6 +54,7 @@ pub struct AppContext {
     pub policy_registry: Arc<PolicyRegistry>,
     pub router_manager: Option<Arc<RouterManager>>,
     pub response_storage: SharedResponseStorage,
+    pub conversation_storage: SharedConversationStorage,
     pub load_monitor: Option<Arc<LoadMonitor>>,
 }
 
@@ -108,6 +112,23 @@ impl AppContext {
             }
         };
 
+        let conversation_storage: SharedConversationStorage = match router_config.history_backend {
+            HistoryBackend::Memory => Arc::new(MemoryConversationStorage::new()),
+            HistoryBackend::None => Arc::new(NoOpConversationStorage::new()),
+            HistoryBackend::Oracle => {
+                let oracle_cfg = router_config.oracle.clone().ok_or_else(|| {
+                    "oracle configuration is required when history_backend=oracle".to_string()
+                })?;
+
+                let storage =
+                    OracleConversationStorage::new(oracle_cfg.clone()).map_err(|err| {
+                        format!("failed to initialize Oracle conversation storage: {err}")
+                    })?;
+
+                Arc::new(storage)
+            }
+        };
+
         let load_monitor = Some(Arc::new(LoadMonitor::new(
             worker_registry.clone(),
             policy_registry.clone(),
@@ -126,6 +147,7 @@ impl AppContext {
             policy_registry,
             router_manager,
             response_storage,
+            conversation_storage,
             load_monitor,
         })
     }
@@ -325,6 +347,166 @@ async fn v1_responses_list_input_items(
         .router
         .list_response_input_items(Some(&headers), &response_id)
         .await
+}
+
+async fn v1_conversations_create(
+    State(state): State<Arc<AppState>>,
+    _headers: http::HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let metadata = match extract_metadata(&body) {
+        Ok(meta) => meta,
+        Err(resp) => return resp,
+    };
+
+    match state
+        .context
+        .conversation_storage
+        .create_conversation(NewConversation { metadata })
+        .await
+    {
+        Ok(conversation) => {
+            (StatusCode::OK, Json(conversation_to_json(&conversation))).into_response()
+        }
+        Err(err) => storage_error_response(err),
+    }
+}
+
+async fn v1_conversations_get(
+    State(state): State<Arc<AppState>>,
+    Path(conversation_id): Path<String>,
+    _headers: http::HeaderMap,
+) -> Response {
+    let id = ConversationId::from_string(conversation_id.clone());
+    match state
+        .context
+        .conversation_storage
+        .get_conversation(&id)
+        .await
+    {
+        Ok(Some(conversation)) => {
+            (StatusCode::OK, Json(conversation_to_json(&conversation))).into_response()
+        }
+        Ok(None) => not_found_response(&conversation_id),
+        Err(err) => storage_error_response(err),
+    }
+}
+
+async fn v1_conversations_update(
+    State(state): State<Arc<AppState>>,
+    Path(conversation_id): Path<String>,
+    _headers: http::HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let metadata = match extract_metadata(&body) {
+        Ok(meta) => meta,
+        Err(resp) => return resp,
+    };
+
+    let id = ConversationId::from_string(conversation_id.clone());
+    match state
+        .context
+        .conversation_storage
+        .update_conversation(&id, metadata)
+        .await
+    {
+        Ok(Some(conversation)) => {
+            (StatusCode::OK, Json(conversation_to_json(&conversation))).into_response()
+        }
+        Ok(None) => not_found_response(&conversation_id),
+        Err(err) => storage_error_response(err),
+    }
+}
+
+async fn v1_conversations_delete(
+    State(state): State<Arc<AppState>>,
+    Path(conversation_id): Path<String>,
+    _headers: http::HeaderMap,
+) -> Response {
+    let id = ConversationId::from_string(conversation_id.clone());
+    match state
+        .context
+        .conversation_storage
+        .delete_conversation(&id)
+        .await
+    {
+        Ok(true) => (
+            StatusCode::OK,
+            Json(json!({
+                "id": conversation_id,
+                "object": "conversation.deleted",
+                "deleted": true,
+            })),
+        )
+            .into_response(),
+        Ok(false) => not_found_response(conversation_id.as_str()),
+        Err(err) => storage_error_response(err),
+    }
+}
+
+fn extract_metadata(payload: &Value) -> Result<Option<ConversationMetadata>, Response> {
+    match payload.get("metadata") {
+        Some(Value::Object(map)) => Ok(Some(map.clone())),
+        Some(Value::Null) | None => Ok(None),
+        Some(other) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": {
+                    "message": format!(
+                        "metadata must be an object or null, got {}",
+                        other
+                    ),
+                }
+            })),
+        )
+            .into_response()),
+    }
+}
+
+fn conversation_to_json(conversation: &Conversation) -> Value {
+    json!({
+        "id": conversation.id.0,
+        "object": "conversation",
+        "created_at": conversation.created_at.timestamp(),
+        "metadata": conversation
+            .metadata
+            .clone()
+            .map(Value::Object)
+            .unwrap_or(Value::Null),
+    })
+}
+
+fn not_found_response(conversation_id: &str) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({
+            "error": {
+                "message": format!(
+                    "Conversation with id '{}' not found.",
+                    conversation_id
+                ),
+                "type": "invalid_request_error",
+                "param": Value::Null,
+                "code": Value::Null
+            }
+        })),
+    )
+        .into_response()
+}
+
+fn storage_error_response(err: ConversationStorageError) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({
+            "error": {
+                "message": err.to_string(),
+                "type": "internal_error",
+                "param": Value::Null,
+                "code": Value::Null
+            }
+        })),
+    )
+        .into_response()
 }
 
 #[derive(Deserialize)]
@@ -593,6 +775,19 @@ pub fn build_app(
         .route(
             "/v1/responses/{response_id}/input",
             get(v1_responses_list_input_items),
+        )
+        .route("/v1/conversations", post(v1_conversations_create))
+        .route(
+            "/v1/conversations/{conversation_id}",
+            get(v1_conversations_get),
+        )
+        .route(
+            "/v1/conversations/{conversation_id}",
+            post(v1_conversations_update),
+        )
+        .route(
+            "/v1/conversations/{conversation_id}",
+            delete(v1_conversations_delete),
         )
         .route_layer(axum::middleware::from_fn_with_state(
             app_state.clone(),
