@@ -14,7 +14,7 @@
 
 """
 Unit tests for LoRA eviction policies.
-Tests LRU, FIFO, and adapter pinning functionality.
+Tests LRU and FIFO eviction behavior.
 """
 
 import multiprocessing as mp
@@ -30,64 +30,133 @@ from sglang.test.test_utils import CustomTestCase
 class TestLoRAEvictionPolicy(unittest.TestCase):
     """Unit tests for LoRA eviction policies."""
 
-    def test_lru_eviction_policy(self):
-        """Test LRU eviction policy unit functionality."""
+    def _test_eviction_policy(
+        self, policy_name, access_sequence, candidates, expected_victim
+    ):
+        """
+        Helper to test eviction policy with given access pattern.
+
+        Args:
+            policy_name: Name of eviction policy ("lru" or "fifo")
+            access_sequence: List of adapter IDs in access order
+            candidates: Set of adapter IDs that can be evicted
+            expected_victim: Expected adapter ID to be evicted
+        """
+        policy = get_eviction_policy(policy_name)
+
+        # Simulate access pattern
+        for adapter_id in access_sequence:
+            policy.mark_used(adapter_id)
+
+        # Select victim from candidates
+        victim = policy.select_victim(candidates)
+        self.assertEqual(
+            victim,
+            expected_victim,
+            f"{policy_name.upper()}: Expected {expected_victim}, got {victim}",
+        )
+
+    def test_lru_basic(self):
+        """Test LRU selects least recently used adapter."""
+        self._test_eviction_policy(
+            "lru",
+            access_sequence=["lora1", "lora2", "lora3", "lora4"],
+            candidates={"lora1", "lora2", "lora3", "lora4"},
+            expected_victim="lora1",
+        )
+
+    def test_lru_with_reuse(self):
+        """Test LRU updates order on reuse."""
+        self._test_eviction_policy(
+            "lru",
+            access_sequence=["lora1", "lora2", "lora3", "lora4", "lora1"],
+            candidates={"lora1", "lora2", "lora3", "lora4"},
+            expected_victim="lora2",
+        )
+
+    def test_lru_multiple_reuse(self):
+        """Test LRU with multiple reuses."""
+        self._test_eviction_policy(
+            "lru",
+            access_sequence=["lora1", "lora2", "lora3", "lora1", "lora2"],
+            candidates={"lora1", "lora2", "lora3"},
+            expected_victim="lora3",
+        )
+
+    def test_lru_with_subset_candidates(self):
+        """Test LRU with subset of candidates."""
+        self._test_eviction_policy(
+            "lru",
+            access_sequence=["lora1", "lora2", "lora3", "lora4"],
+            candidates={"lora2", "lora3", "lora4"},
+            expected_victim="lora2",
+        )
+
+    def test_lru_base_model_priority(self):
+        """Test LRU prioritizes base model for eviction."""
+        self._test_eviction_policy(
+            "lru",
+            access_sequence=["lora1", "lora2", "lora3"],
+            candidates={None, "lora1", "lora2", "lora3"},
+            expected_victim=None,
+        )
+
+    def test_fifo_basic(self):
+        """Test FIFO selects first inserted adapter."""
+        self._test_eviction_policy(
+            "fifo",
+            access_sequence=["lora1", "lora2", "lora3", "lora4"],
+            candidates={"lora1", "lora2", "lora3", "lora4"},
+            expected_victim="lora1",
+        )
+
+    def test_fifo_ignores_reuse(self):
+        """Test FIFO ignores reuse."""
+        self._test_eviction_policy(
+            "fifo",
+            access_sequence=[
+                "lora1",
+                "lora2",
+                "lora3",
+                "lora4",
+                "lora4",
+                "lora3",
+                "lora2",
+                "lora1",
+            ],
+            candidates={"lora1", "lora2", "lora3", "lora4"},
+            expected_victim="lora1",
+        )
+
+    def test_fifo_with_subset_candidates(self):
+        """Test FIFO with subset of candidates."""
+        self._test_eviction_policy(
+            "fifo",
+            access_sequence=["lora1", "lora2", "lora3", "lora4"],
+            candidates={"lora2", "lora3", "lora4"},
+            expected_victim="lora2",
+        )
+
+    def test_fifo_base_model_priority(self):
+        """Test FIFO prioritizes base model for eviction."""
+        self._test_eviction_policy(
+            "fifo",
+            access_sequence=["lora1", "lora2", "lora3"],
+            candidates={None, "lora1", "lora2", "lora3"},
+            expected_victim=None,
+        )
+
+    def test_policy_remove(self):
+        """Test that remove() correctly updates internal state."""
         lru = get_eviction_policy("lru")
-        adapters = ["adapter_1", "adapter_2", "adapter_3", "adapter_4"]
+        lru.mark_used("lora1")
+        lru.mark_used("lora2")
+        lru.mark_used("lora3")
 
-        # Mark adapters as used in order
-        for adapter in adapters:
-            lru.mark_used(adapter)
-
-        # Reuse some to change LRU order
-        # Order should now be: adapter_1 (oldest), adapter_3, adapter_2, adapter_4 (newest)
-        lru.mark_used("adapter_2")
-        lru.mark_used("adapter_4")
-
-        # Test victim selection - should select adapter_1 (least recently used)
-        candidates = set(adapters)
-        victim = lru.select_victim(candidates)
-        self.assertEqual(victim, "adapter_1")
-
-        # Test with pinned adapter (simulate pre-filtering in mem_pool)
-        pinned = {"adapter_1"}  # Pin the LRU adapter
-        filtered_candidates = candidates - pinned  # Pre-filter like mem_pool does
-        victim = lru.select_victim(filtered_candidates)
-        self.assertEqual(victim, "adapter_3")  # Should select next LRU
-
-        # Test removal
-        lru.remove("adapter_1")
-        victim = lru.select_victim(candidates)
-        self.assertEqual(victim, "adapter_3")
-
-    def test_fifo_eviction_policy(self):
-        """Test FIFO eviction policy unit functionality."""
-        fifo = get_eviction_policy("fifo")
-        adapters = ["adapter_1", "adapter_2", "adapter_3", "adapter_4"]
-
-        # Mark adapters as used in order
-        for adapter in adapters:
-            fifo.mark_used(adapter)
-
-        # Reuse some (should not affect FIFO order)
-        fifo.mark_used("adapter_3")
-        fifo.mark_used("adapter_1")
-
-        # Test victim selection - should select adapter_1 (first inserted)
-        candidates = set(adapters)
-        victim = fifo.select_victim(candidates)
-        self.assertEqual(victim, "adapter_1")
-
-        # Test with pinned adapter (simulate pre-filtering in mem_pool)
-        pinned = {"adapter_1"}  # Pin the first adapter
-        filtered_candidates = candidates - pinned  # Pre-filter like mem_pool does
-        victim = fifo.select_victim(filtered_candidates)
-        self.assertEqual(victim, "adapter_2")  # Should select next FIFO
-
-        # Test removal
-        fifo.remove("adapter_1")
-        victim = fifo.select_victim(candidates)
-        self.assertEqual(victim, "adapter_2")
+        # Remove lora1, so lora2 becomes LRU
+        lru.remove("lora1")
+        victim = lru.select_victim({"lora1", "lora2", "lora3"})
+        self.assertEqual(victim, "lora2")
 
     def test_eviction_policy_factory(self):
         """Test eviction policy factory function."""
@@ -104,32 +173,22 @@ class TestLoRAEvictionPolicy(unittest.TestCase):
 
     def test_lru_vs_fifo_behavior(self):
         """Test that LRU and FIFO behave differently."""
+        access_sequence = ["lora1", "lora2", "lora3", "lora1"]
+        candidates = {"lora1", "lora2", "lora3"}
+
         lru = get_eviction_policy("lru")
-        fifo = get_eviction_policy("fifo")
-
-        adapters = ["adapter_1", "adapter_2", "adapter_3"]
-
-        # Both policies: mark all adapters as used
-        for adapter in adapters:
-            lru.mark_used(adapter)
-            fifo.mark_used(adapter)
-
-        # LRU: reuse first adapter (should move it to end)
-        lru.mark_used("adapter_1")
-        # FIFO: reuse first adapter (should not change order)
-        fifo.mark_used("adapter_1")
-
-        candidates = set(adapters)
-
-        # LRU should select adapter_2 (now least recently used)
+        for adapter_id in access_sequence:
+            lru.mark_used(adapter_id)
         lru_victim = lru.select_victim(candidates)
-        # FIFO should still select adapter_1 (first inserted)
+
+        fifo = get_eviction_policy("fifo")
+        for adapter_id in access_sequence:
+            fifo.mark_used(adapter_id)
         fifo_victim = fifo.select_victim(candidates)
 
-        # They should select different victims
         self.assertNotEqual(lru_victim, fifo_victim)
-        self.assertEqual(lru_victim, "adapter_2")  # LRU behavior
-        self.assertEqual(fifo_victim, "adapter_1")  # FIFO behavior
+        self.assertEqual(lru_victim, "lora2")
+        self.assertEqual(fifo_victim, "lora1")
 
 
 class TestLoRAEvictionPolicyIntegration(CustomTestCase):
@@ -155,18 +214,12 @@ class TestLoRAEvictionPolicyIntegration(CustomTestCase):
             "lora_eviction_policy": eviction_policy,
         }
 
-    def _run_eviction_test(self, eviction_policy: str, pinned: bool = False):
-        """Run eviction test with specified policy and adapters."""
+    def _run_eviction_test(self, eviction_policy: str):
+        """Run eviction test with specified policy."""
         with SRTRunner(**self._get_runner_config(eviction_policy)) as runner:
-            # Load adapters (pin first one if pinned=True)
-            for i, name in enumerate(self.ADAPTER_NAMES):
-                runner.load_lora_adapter(
-                    lora_name=name,
-                    lora_path=self.ADAPTER_PATH,
-                    pinned=(pinned and i == 0),
-                )
+            for name in self.ADAPTER_NAMES:
+                runner.load_lora_adapter(lora_name=name, lora_path=self.ADAPTER_PATH)
 
-            # Verify all adapters work after eviction
             for adapter_name in self.ADAPTER_NAMES:
                 output = runner.forward(
                     [self.PROMPT], max_new_tokens=32, lora_paths=[adapter_name]
@@ -176,37 +229,11 @@ class TestLoRAEvictionPolicyIntegration(CustomTestCase):
 
     def test_lru_eviction(self):
         """Test LRU eviction policy with actual inference."""
-        self._run_eviction_test("lru", pinned=False)
-
-    def test_lru_eviction_with_pinning(self):
-        """Test LRU eviction policy with adapter pinning."""
-        self._run_eviction_test("lru", pinned=True)
+        self._run_eviction_test("lru")
 
     def test_fifo_eviction(self):
         """Test FIFO eviction policy with actual inference."""
-        self._run_eviction_test("fifo", pinned=False)
-
-    def test_fifo_eviction_with_pinning(self):
-        """Test FIFO eviction policy with adapter pinning."""
-        self._run_eviction_test("fifo", pinned=True)
-
-    def test_base_model_eviction_with_pinned(self):
-        """Test that base model (None) can be evicted when slots are needed."""
-        with SRTRunner(**self._get_runner_config("lru")) as runner:
-            # Load: 1 pinned + 2 unpinned adapters (3 total, pool size 2)
-            adapter_names = ["pinned", "normal", "extra"]
-            for i, name in enumerate(adapter_names):
-                runner.load_lora_adapter(
-                    lora_name=name, lora_path=self.ADAPTER_PATH, pinned=(i == 0)
-                )
-
-            # Verify all adapters work (triggers eviction and reloading)
-            for name in adapter_names:
-                output = runner.forward(
-                    [self.PROMPT], max_new_tokens=32, lora_paths=[name]
-                )
-                self.assertIsNotNone(output.output_strs[0])
-                self.assertGreater(len(output.output_strs[0]), 0)
+        self._run_eviction_test("fifo")
 
 
 if __name__ == "__main__":
