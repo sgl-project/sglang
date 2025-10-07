@@ -487,7 +487,7 @@ def make_layers(
     # circula imports
     from sglang.srt.distributed import get_pp_indices
     from sglang.srt.layers.utils import PPMissingLayer
-    from sglang.srt.offloader import get_offloader
+    from sglang.srt.utils.offloader import get_offloader
 
     assert not pp_size or num_hidden_layers >= pp_size
     start_layer, end_layer = (
