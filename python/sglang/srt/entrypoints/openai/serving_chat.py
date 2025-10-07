@@ -66,40 +66,6 @@ class OpenAIServingChat(OpenAIServingBase):
         self.tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
         self.reasoning_parser = self.tokenizer_manager.server_args.reasoning_parser
 
-        # Get default sampling parameters from model's generation config
-        self.default_sampling_params = (
-            self.tokenizer_manager.model_config.get_default_sampling_params()
-        )
-        if self.default_sampling_params:
-            logger.info(
-                f"Using default chat sampling params from model generation config: {self.default_sampling_params}",
-            )
-            self._override_chat_protocol_defaults()
-
-    def _override_chat_protocol_defaults(self) -> None:
-        """Override protocol-level defaults with model-specific sampling defaults."""
-        overrides_applied = {}
-        for param_name, param_default in self.default_sampling_params.items():
-            if param_default is None:
-                continue
-            field_info = ChatCompletionRequest.model_fields.get(param_name)
-            if field_info is None or field_info.is_required():
-                continue
-            current_default = field_info.default
-            if current_default == param_default:
-                continue
-            field_info.default = param_default
-            overrides_applied[param_name] = current_default
-        if overrides_applied:
-            ChatCompletionRequest.model_rebuild(force=True)
-            logger.debug(
-                "Overrode chat protocol defaults with model defaults: %s",
-                {
-                    name: {"previous": previous, "current": ChatCompletionRequest.model_fields[name].default}
-                    for name, previous in overrides_applied.items()
-                },
-            )
-
     def _request_id_prefix(self) -> str:
         return "chatcmpl-"
 

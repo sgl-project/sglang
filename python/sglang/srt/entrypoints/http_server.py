@@ -191,6 +191,39 @@ async def init_multi_tokenizer() -> ServerArgs:
     return server_args
 
 
+def _override_protocol_defaults_from_model() -> None:
+    """Override ChatCompletionRequest defaults with model generation_config at server startup."""
+
+    model_config = _global_state.tokenizer_manager.model_config
+    default_sampling_params = model_config.get_default_sampling_params()
+
+    if not default_sampling_params:
+        return
+
+    overrides_applied = {}
+    for param_name, param_default in default_sampling_params.items():
+        if param_default is None:
+            continue
+        field_info = ChatCompletionRequest.model_fields.get(param_name)
+        if field_info is None:
+            continue
+        original_default = field_info.default
+        if original_default == param_default:
+            continue
+        field_info.default = param_default
+        overrides_applied[param_name] = {
+            "previous": original_default,
+            "new": param_default,
+        }
+
+    if overrides_applied:
+        # Rebuild the model to apply the new defaults
+        ChatCompletionRequest.model_rebuild(force=True)
+        logger.info(
+            f"Overrode ChatCompletionRequest defaults with model defaults: {overrides_applied}"
+        )
+
+
 @asynccontextmanager
 async def lifespan(fast_api_app: FastAPI):
     if not getattr(fast_api_app, "is_single_tokenizer_mode", False):
@@ -212,6 +245,9 @@ async def lifespan(fast_api_app: FastAPI):
                 None,  # launch_callback not needed in worker
             ),
         )
+
+    # Override protocol defaults with model-specific defaults before creating handlers
+    _override_protocol_defaults_from_model()
 
     # Initialize OpenAI serving handlers
     fast_api_app.state.openai_serving_completion = OpenAIServingCompletion(
