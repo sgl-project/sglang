@@ -66,6 +66,15 @@ class OpenAIServingChat(OpenAIServingBase):
         self.tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
         self.reasoning_parser = self.tokenizer_manager.server_args.reasoning_parser
 
+        # Get default sampling parameters from model's generation config
+        self.default_sampling_params = (
+            self.tokenizer_manager.model_config.get_default_sampling_params()
+        )
+        if self.default_sampling_params:
+            logger.info(
+                f"Using default chat sampling params from model generation config: {self.default_sampling_params}",
+            )
+
     def _request_id_prefix(self) -> str:
         return "chatcmpl-"
 
@@ -418,18 +427,37 @@ class OpenAIServingChat(OpenAIServingBase):
     ) -> Dict[str, Any]:
         """Build sampling parameters for the request"""
 
+        # Map of request parameters to their Pydantic defaults
+        # If request value == default, we'll use generation config instead
+        request_defaults = {
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "top_k": -1,
+            "min_p": 0.0,
+            "repetition_penalty": 1.0,
+        }
+
+        # Helper to get parameter value with generation config fallback
+        def get_param(request_value, param_name):
+            if param_name in request_defaults:
+                if request_value != request_defaults[param_name]:
+                    return request_value
+                if param_name in self.default_sampling_params:
+                    return self.default_sampling_params[param_name]
+            return request_value
+
         sampling_params = {
-            "temperature": request.temperature,
+            "temperature": get_param(request.temperature, "temperature"),
             "max_new_tokens": request.max_tokens or request.max_completion_tokens,
             "min_new_tokens": request.min_tokens,
             "stop": stop,
             "stop_token_ids": request.stop_token_ids,
-            "top_p": request.top_p,
-            "top_k": request.top_k,
-            "min_p": request.min_p,
+            "top_p": get_param(request.top_p, "top_p"),
+            "top_k": get_param(request.top_k, "top_k"),
+            "min_p": get_param(request.min_p, "min_p"),
             "presence_penalty": request.presence_penalty,
             "frequency_penalty": request.frequency_penalty,
-            "repetition_penalty": request.repetition_penalty,
+            "repetition_penalty": get_param(request.repetition_penalty, "repetition_penalty"),
             "regex": request.regex,
             "ebnf": request.ebnf,
             "n": request.n,

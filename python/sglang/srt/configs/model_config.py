@@ -17,7 +17,7 @@ import logging
 import math
 import os
 from enum import Enum, IntEnum, auto
-from typing import Dict, List, Optional, Set, Union
+from typing import Any, Dict, List, Optional, Set, Union
 
 import torch
 from transformers import PretrainedConfig
@@ -658,6 +658,35 @@ class ModelConfig:
                 )
                 eos_ids = eos_ids | generation_eos_ids
         return eos_ids
+
+    def get_default_sampling_params(self) -> dict[str, Any]:
+        """
+        Get default sampling parameters from the model's generation config.
+
+        This method returns non-default sampling parameters from the model's
+        generation_config.json.
+
+        Returns:
+            A dictionary containing the non-default sampling parameters.
+        """
+        if self.hf_generation_config is None:
+            return {}
+
+        config = self.hf_generation_config.to_dict()
+
+        available_params = [
+            "repetition_penalty",
+            "temperature",
+            "top_k",
+            "top_p",
+            "min_p",
+        ]
+
+        default_sampling_params = {
+            p: config.get(p) for p in available_params if config.get(p) is not None
+        }
+
+        return default_sampling_params
 
     def _maybe_pull_model_tokenizer_from_remote(self) -> None:
         """

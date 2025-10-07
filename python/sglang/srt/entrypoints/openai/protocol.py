@@ -445,7 +445,7 @@ class ChatCompletionRequest(BaseModel):
     stop: Optional[Union[str, List[str]]] = None
     stream: bool = False
     stream_options: Optional[StreamOptions] = None
-    temperature: float = 0.7
+    temperature: float = 1.0
     top_p: float = 1.0
     user: Optional[str] = None
     tools: Optional[List[Tool]] = Field(default=None, examples=[None])
