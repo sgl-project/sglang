@@ -52,6 +52,10 @@ pub struct AppContext {
     pub router_manager: Option<Arc<RouterManager>>,
     pub response_storage: SharedResponseStorage,
     pub load_monitor: Option<Arc<LoadMonitor>>,
+    /// Configured reasoning parser name (e.g., "deepseek_r1", "qwen3")
+    pub configured_reasoning_parser: Option<String>,
+    /// Configured tool call parser name (e.g., "hermes", "functionary")
+    pub configured_tool_parser: Option<String>,
 }
 
 impl AppContext {
@@ -115,6 +119,9 @@ impl AppContext {
             router_config.worker_startup_check_interval_secs,
         )));
 
+        let configured_reasoning_parser = router_config.reasoning_parser.clone();
+        let configured_tool_parser = router_config.tool_call_parser.clone();
+
         Ok(Self {
             client,
             router_config,
@@ -127,6 +134,8 @@ impl AppContext {
             router_manager,
             response_storage,
             load_monitor,
+            configured_reasoning_parser,
+            configured_tool_parser,
         })
     }
 }
