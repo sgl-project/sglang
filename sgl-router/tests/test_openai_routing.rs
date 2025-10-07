@@ -252,7 +252,7 @@ async fn test_openai_router_responses_with_mock() {
     );
 
     let stored1 = storage
-        .get_response(&ResponseId::from_string(resp1_id.clone()))
+        .get_response(&ResponseId::from(resp1_id.clone()))
         .await
         .unwrap()
         .expect("first response missing");
@@ -261,7 +261,7 @@ async fn test_openai_router_responses_with_mock() {
     assert!(stored1.previous_response_id.is_none());
 
     let stored2 = storage
-        .get_response(&ResponseId::from_string(resp2_id.to_string()))
+        .get_response(&ResponseId::from(resp2_id))
         .await
         .unwrap()
         .expect("second response missing");
@@ -463,7 +463,7 @@ async fn test_openai_router_responses_streaming_with_mock() {
         "Earlier answer".to_string(),
         None,
     );
-    previous.id = ResponseId::from_string("resp_prev_chain".to_string());
+    previous.id = ResponseId::from("resp_prev_chain");
     storage.store_response(previous).await.unwrap();
 
     let router = OpenAIRouter::new(base_url, None, storage.clone())
@@ -504,7 +504,7 @@ async fn test_openai_router_responses_streaming_with_mock() {
     assert!(body_text.contains("Once upon a streamed unicorn adventure."));
 
     // Wait for the storage task to persist the streaming response.
-    let target_id = ResponseId::from_string("resp_stream_123".to_string());
+    let target_id = ResponseId::from("resp_stream_123");
     let stored = loop {
         if let Some(resp) = storage.get_response(&target_id).await.unwrap() {
             break resp;

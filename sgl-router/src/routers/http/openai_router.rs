@@ -2337,16 +2337,16 @@ impl OpenAIRouter {
         stored_response.previous_response_id = response_json
             .get("previous_response_id")
             .and_then(|v| v.as_str())
-            .map(|s| ResponseId::from_string(s.to_string()))
+            .map(ResponseId::from)
             .or_else(|| {
                 original_body
                     .previous_response_id
                     .as_ref()
-                    .map(|id| ResponseId::from_string(id.clone()))
+                    .map(|id| ResponseId::from(id.as_str()))
             });
 
         if let Some(id_str) = response_json.get("id").and_then(|v| v.as_str()) {
-            stored_response.id = ResponseId::from_string(id_str.to_string());
+            stored_response.id = ResponseId::from(id_str);
         }
 
         stored_response.raw_response = response_json.clone();
@@ -3393,7 +3393,7 @@ impl super::super::RouterTrait for OpenAIRouter {
         // Handle previous_response_id by loading prior context
         let mut conversation_items: Option<Vec<ResponseInputOutputItem>> = None;
         if let Some(prev_id_str) = request_body.previous_response_id.clone() {
-            let prev_id = ResponseId::from_string(prev_id_str.clone());
+            let prev_id = ResponseId::from(prev_id_str.as_str());
             match self
                 .response_storage
                 .get_response_chain(&prev_id, None)
@@ -3516,7 +3516,7 @@ impl super::super::RouterTrait for OpenAIRouter {
         response_id: &str,
         params: &ResponsesGetParams,
     ) -> Response {
-        let stored_id = ResponseId::from_string(response_id.to_string());
+        let stored_id = ResponseId::from(response_id);
         if let Ok(Some(stored_response)) = self.response_storage.get_response(&stored_id).await {
             let stream_requested = params.stream.unwrap_or(false);
             let raw_value = stored_response.raw_response.clone();

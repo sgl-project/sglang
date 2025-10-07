@@ -14,15 +14,17 @@ impl ConversationId {
         let ulid = ulid::Ulid::new().to_string();
         Self(format!("conv_{}", ulid))
     }
-
-    pub fn from_string(value: String) -> Self {
-        Self(value)
-    }
 }
 
 impl Default for ConversationId {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl From<String> for ConversationId {
+    fn from(value: String) -> Self {
+        Self(value)
     }
 }
 

@@ -377,7 +377,7 @@ async fn v1_conversations_get(
     Path(conversation_id): Path<String>,
     _headers: http::HeaderMap,
 ) -> Response {
-    let id = ConversationId::from_string(conversation_id.clone());
+    let id: ConversationId = conversation_id.clone().into();
     match state
         .context
         .conversation_storage
@@ -398,7 +398,7 @@ async fn v1_conversations_update(
     _headers: http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    let id = ConversationId::from_string(conversation_id.clone());
+    let id: ConversationId = conversation_id.clone().into();
     let existing = match state
         .context
         .conversation_storage
@@ -446,7 +446,7 @@ async fn v1_conversations_delete(
     Path(conversation_id): Path<String>,
     _headers: http::HeaderMap,
 ) -> Response {
-    let id = ConversationId::from_string(conversation_id.clone());
+    let id: ConversationId = conversation_id.clone().into();
     match state
         .context
         .conversation_storage
