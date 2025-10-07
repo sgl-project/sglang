@@ -27,27 +27,8 @@ impl SglangSchedulerClient {
     pub async fn connect(endpoint: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         debug!("Connecting to SGLang scheduler at {}", endpoint);
 
-        // Convert grpc:// to http:// for tonic, preserving IPv6 bracket notation
-        let http_endpoint = if endpoint.starts_with("grpc://") {
-            // Use proper URL parsing to preserve IPv6 brackets
-            match url::Url::parse(endpoint) {
-                Ok(mut parsed) => {
-                    let _ = parsed.set_scheme("http");
-                    parsed.to_string()
-                }
-                Err(_) => {
-                    warn!(
-                        "Failed to parse gRPC endpoint '{}', using simple string replacement",
-                        endpoint
-                    );
-                    endpoint.replace("grpc://", "http://")
-                }
-            }
-        } else {
-            endpoint.to_string()
-        };
-
-        let channel = Channel::from_shared(http_endpoint)?
+        // Endpoint is always grpc:// - tonic handles this natively
+        let channel = Channel::from_shared(endpoint.to_string())?
             .timeout(Duration::from_secs(30))
             .connect()
             .await?;
