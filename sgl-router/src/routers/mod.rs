@@ -13,6 +13,7 @@ use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest,
     ResponsesGetParams, ResponsesRequest,
 };
+use serde_json::Value;
 
 pub mod factory;
 pub mod grpc;
@@ -125,6 +126,52 @@ pub trait RouterTrait: Send + Sync + Debug {
         body: &RerankRequest,
         model_id: Option<&str>,
     ) -> Response;
+
+    // Conversations API
+    async fn create_conversation(&self, _headers: Option<&HeaderMap>, _body: &Value) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Conversations create endpoint not implemented",
+        )
+            .into_response()
+    }
+
+    async fn get_conversation(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _conversation_id: &str,
+    ) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Conversations get endpoint not implemented",
+        )
+            .into_response()
+    }
+
+    async fn update_conversation(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _conversation_id: &str,
+        _body: &Value,
+    ) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Conversations update endpoint not implemented",
+        )
+            .into_response()
+    }
+
+    async fn delete_conversation(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _conversation_id: &str,
+    ) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Conversations delete endpoint not implemented",
+        )
+            .into_response()
+    }
 
     /// Get router type name
     fn router_type(&self) -> &'static str;
