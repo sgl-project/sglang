@@ -453,7 +453,7 @@ class RouterArgs:
             f"--{prefix}reasoning-parser",
             type=str,
             default=None,
-            help="Specify the parser for reasoning models (e.g., deepseek-r1, qwq)",
+            help="Specify the parser for reasoning models (e.g., deepseek-r1, qwen3)",
         )
         parser.add_argument(
             f"--{prefix}tool-call-parser",

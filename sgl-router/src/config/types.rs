@@ -73,7 +73,7 @@ pub struct RouterConfig {
     /// Oracle history backend configuration (required when `history_backend` = "oracle")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oracle: Option<OracleConfig>,
-    /// Parser for reasoning models (e.g., deepseek-r1, qwq)
+    /// Parser for reasoning models (e.g., deepseek-r1, qwen3)
     pub reasoning_parser: Option<String>,
     /// Parser for handling tool-call interactions
     pub tool_call_parser: Option<String>,
