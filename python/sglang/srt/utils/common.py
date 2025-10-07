@@ -1533,6 +1533,15 @@ def get_cpu_memory_capacity():
         return float(numa_mem // (1 << 20))
 
 
+def get_xpu_memory_capacity():
+    assert torch.xpu.is_available(), "XPU device is not available"
+    memory_values = [
+        torch.xpu.get_device_properties(i).total_memory
+        for i in range(torch.xpu.device_count())
+    ]
+    return min(memory_values) // 1024 // 1024  # unit: MB
+
+
 def get_device_memory_capacity(device: str = None):
     if is_cuda():
         gpu_mem = get_nvgpu_memory_capacity()
@@ -1542,6 +1551,8 @@ def get_device_memory_capacity(device: str = None):
         gpu_mem = get_hpu_memory_capacity()
     elif device == "npu":
         gpu_mem = get_npu_memory_capacity()
+    elif is_xpu():
+        gpu_mem = get_xpu_memory_capacity()
     elif device == "cpu":
         gpu_mem = get_cpu_memory_capacity()
     else:
