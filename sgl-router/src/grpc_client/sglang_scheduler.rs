@@ -27,8 +27,14 @@ impl SglangSchedulerClient {
     pub async fn connect(endpoint: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         debug!("Connecting to SGLang scheduler at {}", endpoint);
 
-        // Endpoint is always grpc:// - tonic handles this natively
-        let channel = Channel::from_shared(endpoint.to_string())?
+        // Convert grpc:// to http:// for tonic
+        let http_endpoint = if endpoint.starts_with("grpc://") {
+            endpoint.replace("grpc://", "http://")
+        } else {
+            endpoint.to_string()
+        };
+
+        let channel = Channel::from_shared(http_endpoint)?
             .timeout(Duration::from_secs(30))
             .connect()
             .await?;
