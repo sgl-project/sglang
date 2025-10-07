@@ -46,6 +46,57 @@ SGLang HiCache extends the traditional RadixAttention with a three-tier hierarch
 --hicache-storage-prefetch-policy timeout
 ```
 
+### Integration with PD Disaggregation
+
+HiCache works seamlessly with PD Disaggregation. You can choose between two configurations:
+
+1. **Prefill-only HiCache**: Enable HiCache only on Prefill nodes, allowing KV cache sharing among Prefill instances
+2. **Full HiCache with async offloading**: Enable HiCache on Prefill nodes and async KV cache offloading on Decode nodes, allowing Prefill nodes to reuse KV caches from Decode nodes in multi-turn dialogue scenarios
+
+```bash
+# Prefill node with HiCache enabled for cross-prefill sharing (ideal for SystemPrompt scenarios)
+python3 -m sglang.launch_server \
+  --model-path /xxx/DeepSeek-R1/ \
+  --tp 8 \
+  --host 0.0.0.0 \
+  --port 10000 \
+  --enable-metrics \
+  --enable-cache-report \
+  --mem-fraction-static 0.85 \
+  --page-size 64 \
+  --enable-hierarchical-cache \
+  --hicache-ratio 2 \
+  --hicache-size 0 \
+  --hicache-io-backend direct \
+  --hicache-write-policy write_through \
+  --hicache-storage-backend hf3fs \
+  --hicache-storage-prefetch-policy wait_complete \
+  --disaggregation-ib-device mlx5_0 \
+  --disaggregation-mode prefill \
+  --disaggregation-transfer-backend mooncake
+
+# Decode node with async offloading enabled for KV cache reuse by Prefill (ideal for multi-turn conversations)
+python3 -m sglang.launch_server \
+  --model-path /xxx/DeepSeek-R1/ \
+  --tp 8 \
+  --host 0.0.0.0 \
+  --port 10000 \
+  --enable-metrics \
+  --enable-cache-report \
+  --page-size 64 \
+  --hicache-ratio 2 \
+  --hicache-size 0 \
+  --hicache-io-backend direct \
+  --hicache-write-policy write_through \
+  --hicache-storage-backend hf3fs \
+  --hicache-storage-prefetch-policy wait_complete \
+  --disaggregation-decode-enable-offload-kvcache \  # Enable async KV cache offloading in decode node
+  --disaggregation-ib-device mlx5_0 \
+  --disaggregation-mode decode \
+  --disaggregation-transfer-backend mooncake
+```
+
+
 ### Deployment with HF3FS
 
 Here is an example of deploying DeepSeek-R1 with HiCache-HF3FS. For more details, see the [HF3FS Documentation](../../python/sglang/srt/mem_cache/storage/hf3fs/docs/README.md).
@@ -96,55 +147,6 @@ python3 -m sglang.launch_server \
   --hicache-storage-prefetch-policy timeout
 ```
 
-### Integration with PD Disaggregation
-
-HiCache works seamlessly with PD Disaggregation. You can choose between two configurations:
-
-1. **Prefill-only HiCache**: Enable HiCache only on Prefill nodes, allowing KV cache sharing among Prefill instances
-2. **Full HiCache with async offloading**: Enable HiCache on Prefill nodes and async KV cache offloading on Decode nodes, allowing Prefill nodes to reuse KV caches from Decode nodes in multi-turn dialogue scenarios
-
-```bash
-# Prefill node with HiCache enabled for cross-prefill sharing (ideal for SystemPrompt scenarios)
-python3 -m sglang.launch_server \
-  --model-path /xxx/DeepSeek-R1/ \
-  --tp 8 \
-  --host 0.0.0.0 \
-  --port 10000 \
-  --enable-metrics \
-  --enable-cache-report \
-  --mem-fraction-static 0.85 \
-  --page-size 64 \
-  --enable-hierarchical-cache \
-  --hicache-ratio 2 \
-  --hicache-size 0 \
-  --hicache-io-backend direct \
-  --hicache-write-policy write_through \
-  --hicache-storage-backend hf3fs \
-  --hicache-storage-prefetch-policy wait_complete \
-  --disaggregation-ib-device mlx5_0 \
-  --disaggregation-mode prefill \
-  --disaggregation-transfer-backend mooncake
-
-# Decode node with async offloading enabled for KV cache reuse by Prefill (ideal for multi-turn conversations)
-python3 -m sglang.launch_server \
-  --model-path /xxx/DeepSeek-R1/ \
-  --tp 8 \
-  --host 0.0.0.0 \
-  --port 10000 \
-  --enable-metrics \
-  --enable-cache-report \
-  --page-size 64 \
-  --hicache-ratio 2 \
-  --hicache-size 0 \
-  --hicache-io-backend direct \
-  --hicache-write-policy write_through \
-  --hicache-storage-backend hf3fs \
-  --hicache-storage-prefetch-policy wait_complete \
-  --disaggregation-decode-enable-offload-kvcache \  # Enable async KV cache offloading in decode node
-  --disaggregation-ib-device mlx5_0 \
-  --disaggregation-mode decode \
-  --disaggregation-transfer-backend mooncake
-```
 
 ## Custom Storage Backend Integration
 
