@@ -21,8 +21,8 @@ import zmq.asyncio
 
 from sglang.srt.managers.io_struct import (
     AbortReq,
-    BatchEmbeddingOut,
-    BatchTokenIDOut,
+    BatchEmbeddingOutput,
+    BatchTokenIDOutput,
     HealthCheckOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -110,6 +110,7 @@ class GrpcRequestManager:
         self,
         server_args: ServerArgs,
         port_args: PortArgs,
+        bootstrap_server=None,
     ):
         """Initialize the gRPC request manager."""
         self.server_args = server_args
@@ -146,11 +147,19 @@ class GrpcRequestManager:
         self.crash_dump_request_list = []
         self.crash_dump_performed = False
 
+        # Bootstrap server (passed from serve_grpc, not started here)
+        self.bootstrap_server = bootstrap_server
+
         logger.info(
             f"GrpcRequestManager initialized with ZMQ IPC: "
             f"recv={port_args.detokenizer_ipc_name}, "
             f"send={port_args.scheduler_input_ipc_name}"
         )
+        if self.bootstrap_server:
+            logger.info(
+                f"Bootstrap server initialized for disaggregation mode: "
+                f"{server_args.disaggregation_mode}"
+            )
 
     async def generate_request(
         self,
@@ -458,9 +467,9 @@ class GrpcRequestManager:
                         await self.is_pause_cond.wait()
 
                 # Handle different output types
-                if isinstance(recv_obj, BatchTokenIDOut):
+                if isinstance(recv_obj, BatchTokenIDOutput):
                     await self._handle_batch_output(recv_obj)
-                elif isinstance(recv_obj, BatchEmbeddingOut):
+                elif isinstance(recv_obj, BatchEmbeddingOutput):
                     await self._handle_embedding_output(recv_obj)
                 elif isinstance(recv_obj, HealthCheckOutput):
                     await self._handle_health_check_output(recv_obj)
@@ -489,7 +498,7 @@ class GrpcRequestManager:
     def _convert_logprob_style(
         self,
         state: GrpcReqState,
-        batch_out: BatchTokenIDOut,
+        batch_out: BatchTokenIDOutput,
         batch_index: int,
     ):
         """
@@ -536,7 +545,7 @@ class GrpcRequestManager:
                 batch_out.output_top_logprobs_idx[batch_index]
             )
 
-    async def _handle_batch_output(self, batch_out: BatchTokenIDOut):
+    async def _handle_batch_output(self, batch_out: BatchTokenIDOutput):
         """Handle batch generation output from scheduler."""
         # Process each request in the batch
         for i, rid in enumerate(batch_out.rids):
@@ -569,7 +578,7 @@ class GrpcRequestManager:
                         batch_out.cached_tokens[i] if batch_out.cached_tokens else 0
                     ),
                     "finish_reason": (
-                        str(batch_out.finished_reasons[i])
+                        batch_out.finished_reasons[i]
                         if batch_out.finished_reasons[i]
                         else None
                     ),
@@ -657,7 +666,7 @@ class GrpcRequestManager:
 
                 asyncio.create_task(cleanup())
 
-    async def _handle_embedding_output(self, batch_out: BatchEmbeddingOut):
+    async def _handle_embedding_output(self, batch_out: BatchEmbeddingOutput):
         """Handle batch embedding output from scheduler."""
         for i, rid in enumerate(batch_out.rids):
             if rid not in self.rid_to_state:
@@ -758,6 +767,22 @@ class GrpcRequestManager:
                 )
                 state.finished = True
                 state.event.set()
+
+        # Wait for tasks to complete
+        if self.asyncio_tasks:
+            await asyncio.gather(*list(self.asyncio_tasks), return_exceptions=True)
+
+        # Shutdown bootstrap server if running
+        if self.bootstrap_server:
+            logger.info("Shutting down bootstrap server")
+            try:
+                if hasattr(self.bootstrap_server, "shutdown"):
+                    if asyncio.iscoroutinefunction(self.bootstrap_server.shutdown):
+                        await self.bootstrap_server.shutdown()
+                    else:
+                        self.bootstrap_server.shutdown()
+            except Exception as e:
+                logger.warning(f"Error shutting down bootstrap server: {e}")
 
         # Close ZMQ sockets
         self.recv_from_scheduler.close()

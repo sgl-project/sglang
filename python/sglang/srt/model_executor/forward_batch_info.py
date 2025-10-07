@@ -293,6 +293,7 @@ class ForwardBatch:
     # For padding
     padded_static_len: int = -1  # -1 if not padded
     num_token_non_padded: Optional[torch.Tensor] = None  # scalar tensor
+    num_token_non_padded_cpu: int = None
 
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None
@@ -354,6 +355,7 @@ class ForwardBatch:
             ret.num_token_non_padded = torch.tensor(
                 len(batch.input_ids), dtype=torch.int32
             ).to(device, non_blocking=True)
+        ret.num_token_non_padded_cpu = len(batch.input_ids)
 
         # For MLP sync
         if batch.global_num_tokens is not None:
@@ -898,6 +900,17 @@ class ForwardBatch:
     @property
     def can_run_tbo(self):
         return self.tbo_split_seq_index is not None
+
+
+@dataclass
+class ForwardBatchOutput:
+    # FIXME(lsyin): unify the forward batch output between different spec and parallelism
+    # need to be more organized
+    logits_output: Optional[torch.Tensor] = None
+    next_token_ids: Optional[torch.Tensor] = None
+    num_accepted_tokens: Optional[int] = None
+    pp_proxy_tensors: Optional[PPProxyTensors] = None
+    can_run_cuda_graph: bool = False
 
 
 def enable_num_token_non_padded(server_args):

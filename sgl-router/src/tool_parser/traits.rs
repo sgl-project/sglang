@@ -1,7 +1,7 @@
+use crate::protocols::spec::Tool;
 use crate::tool_parser::{
     errors::ToolParserResult,
-    state::ParseState,
-    types::{StreamResult, ToolCall},
+    types::{StreamingParseResult, ToolCall},
 };
 use async_trait::async_trait;
 
@@ -13,18 +13,29 @@ pub trait ToolParser: Send + Sync {
     async fn parse_complete(&self, output: &str) -> ToolParserResult<(String, Vec<ToolCall>)>;
 
     /// Parse tool calls from model output (streaming)
+    /// Parsers now maintain internal state, so self is mutable
+    ///
+    /// # Arguments
+    /// * `chunk` - New text chunk from model output
+    /// * `tools` - List of available tools for validation
     async fn parse_incremental(
-        &self,
+        &mut self,
         chunk: &str,
-        state: &mut ParseState,
-    ) -> ToolParserResult<StreamResult>;
+        tools: &[Tool],
+    ) -> ToolParserResult<StreamingParseResult>;
 
     /// Check if text contains tool calls in this parser's format
-    fn detect_format(&self, text: &str) -> bool;
+    fn has_tool_markers(&self, text: &str) -> bool;
 
     /// Optionally expose a token-aware parser implementation.
     /// Default returns `None`, meaning the parser only supports text input.
     fn as_token_parser(&self) -> Option<&dyn TokenToolParser> {
+        None
+    }
+
+    /// Get unstreamed tool call arguments
+    /// Returns tool call items for arguments that have been parsed but not yet streamed
+    fn get_unstreamed_tool_args(&self) -> Option<Vec<crate::tool_parser::types::ToolCallItem>> {
         None
     }
 }
@@ -50,9 +61,10 @@ pub trait TokenToolParser: ToolParser {
     ) -> ToolParserResult<(String, Vec<ToolCall>)>;
 
     /// Streaming parser entrypoint for token chunks.
+    /// Parsers maintain internal state, so self is mutable
     async fn parse_incremental_tokens(
-        &self,
+        &mut self,
         tokens: &[u32],
-        state: &mut ParseState,
-    ) -> ToolParserResult<StreamResult>;
+        tools: &[Tool],
+    ) -> ToolParserResult<StreamingParseResult>;
 }
