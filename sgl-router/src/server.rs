@@ -2,8 +2,7 @@ use crate::{
     config::{ConnectionMode, HistoryBackend, RouterConfig, RoutingMode},
     core::{LoadMonitor, WorkerManager, WorkerRegistry, WorkerType},
     data_connector::{
-        Conversation, ConversationId, ConversationMetadata, ConversationStorageError,
-        MemoryConversationStorage, MemoryResponseStorage, NewConversation, NoOpConversationStorage,
+        MemoryConversationStorage, MemoryResponseStorage, NoOpConversationStorage,
         NoOpResponseStorage, OracleConversationStorage, OracleResponseStorage,
         SharedConversationStorage, SharedResponseStorage,
     },
@@ -33,7 +32,7 @@ use axum::{
 };
 use reqwest::Client;
 use serde::Deserialize;
-use serde_json::{json, to_value, Value};
+use serde_json::{json, Value};
 use std::{
     sync::atomic::{AtomicBool, Ordering},
     sync::Arc,
@@ -42,7 +41,7 @@ use std::{
 use tokio::{net::TcpListener, signal, spawn};
 use tracing::{error, info, warn, Level};
 
-const MAX_METADATA_PROPERTIES: usize = 16;
+//
 
 #[derive(Clone)]
 pub struct AppContext {
@@ -351,284 +350,47 @@ async fn v1_responses_list_input_items(
 
 async fn v1_conversations_create(
     State(state): State<Arc<AppState>>,
-    _headers: http::HeaderMap,
+    headers: http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    let metadata = match extract_metadata(&body) {
-        Ok(meta) => meta,
-        Err(resp) => return *resp,
-    };
-
-    match state
-        .context
-        .conversation_storage
-        .create_conversation(NewConversation { metadata })
+    state
+        .router
+        .create_conversation(Some(&headers), &body)
         .await
-    {
-        Ok(conversation) => {
-            (StatusCode::OK, Json(conversation_to_json(&conversation))).into_response()
-        }
-        Err(err) => storage_error_response(err),
-    }
 }
 
 async fn v1_conversations_get(
     State(state): State<Arc<AppState>>,
     Path(conversation_id): Path<String>,
-    _headers: http::HeaderMap,
+    headers: http::HeaderMap,
 ) -> Response {
-    let id: ConversationId = conversation_id.clone().into();
-    match state
-        .context
-        .conversation_storage
-        .get_conversation(&id)
+    state
+        .router
+        .get_conversation(Some(&headers), &conversation_id)
         .await
-    {
-        Ok(Some(conversation)) => {
-            (StatusCode::OK, Json(conversation_to_json(&conversation))).into_response()
-        }
-        Ok(None) => not_found_response(&conversation_id),
-        Err(err) => storage_error_response(err),
-    }
 }
 
 async fn v1_conversations_update(
     State(state): State<Arc<AppState>>,
     Path(conversation_id): Path<String>,
-    _headers: http::HeaderMap,
+    headers: http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    let id: ConversationId = conversation_id.clone().into();
-    let existing = match state
-        .context
-        .conversation_storage
-        .get_conversation(&id)
+    state
+        .router
+        .update_conversation(Some(&headers), &conversation_id, &body)
         .await
-    {
-        Ok(Some(conv)) => conv,
-        Ok(None) => return not_found_response(&conversation_id),
-        Err(err) => return storage_error_response(err),
-    };
-
-    let patch = match parse_metadata_patch(&body) {
-        Ok(patch) => patch,
-        Err(resp) => return *resp,
-    };
-
-    let merged_metadata = match patch {
-        MetadataPatch::NoChange => {
-            return (StatusCode::OK, Json(conversation_to_json(&existing))).into_response();
-        }
-        other => match apply_metadata_patch(existing.metadata.clone(), other) {
-            Ok(result) => result,
-            Err(ValidationError { previous, updated }) => {
-                return metadata_too_many_properties_error(previous, updated);
-            }
-        },
-    };
-
-    match state
-        .context
-        .conversation_storage
-        .update_conversation(&id, merged_metadata)
-        .await
-    {
-        Ok(Some(conversation)) => {
-            (StatusCode::OK, Json(conversation_to_json(&conversation))).into_response()
-        }
-        Ok(None) => not_found_response(&conversation_id),
-        Err(err) => storage_error_response(err),
-    }
 }
 
 async fn v1_conversations_delete(
     State(state): State<Arc<AppState>>,
     Path(conversation_id): Path<String>,
-    _headers: http::HeaderMap,
+    headers: http::HeaderMap,
 ) -> Response {
-    let id: ConversationId = conversation_id.clone().into();
-    match state
-        .context
-        .conversation_storage
-        .delete_conversation(&id)
+    state
+        .router
+        .delete_conversation(Some(&headers), &conversation_id)
         .await
-    {
-        Ok(true) => (
-            StatusCode::OK,
-            Json(json!({
-                "id": conversation_id,
-                "object": "conversation.deleted",
-                "deleted": true,
-            })),
-        )
-            .into_response(),
-        Ok(false) => not_found_response(conversation_id.as_str()),
-        Err(err) => storage_error_response(err),
-    }
-}
-
-type MetadataResult<T> = Result<T, Box<Response>>;
-
-fn extract_metadata(payload: &Value) -> MetadataResult<Option<ConversationMetadata>> {
-    parse_metadata_create(payload)
-}
-
-fn parse_metadata_create(payload: &Value) -> MetadataResult<Option<ConversationMetadata>> {
-    match payload.get("metadata") {
-        Some(Value::Object(map)) => {
-            if map.len() > MAX_METADATA_PROPERTIES {
-                return Err(Box::new(metadata_too_many_properties_error(0, map.len())));
-            }
-            Ok(Some(map.clone()))
-        }
-        Some(Value::Null) | None => Ok(None),
-        Some(other) => Err(Box::new(invalid_metadata_type_response(other.clone()))),
-    }
-}
-
-#[derive(Debug)]
-enum MetadataPatch {
-    NoChange,
-    ClearAll,
-    Merge(ConversationMetadata),
-}
-
-#[derive(Debug)]
-struct ValidationError {
-    previous: usize,
-    updated: usize,
-}
-
-fn parse_metadata_patch(payload: &Value) -> MetadataResult<MetadataPatch> {
-    match payload.get("metadata") {
-        None => Ok(MetadataPatch::NoChange),
-        Some(Value::Null) => Ok(MetadataPatch::ClearAll),
-        Some(Value::Object(map)) => Ok(MetadataPatch::Merge(map.clone())),
-        Some(other) => Err(Box::new(invalid_metadata_type_response(other.clone()))),
-    }
-}
-
-fn apply_metadata_patch(
-    existing: Option<ConversationMetadata>,
-    patch: MetadataPatch,
-) -> Result<Option<ConversationMetadata>, ValidationError> {
-    match patch {
-        MetadataPatch::NoChange => Ok(existing),
-        MetadataPatch::ClearAll => Ok(None),
-        MetadataPatch::Merge(updates) => {
-            let mut merged = existing.unwrap_or_default();
-            let previous = merged.len();
-
-            for (key, value) in updates.into_iter() {
-                if value.is_null() {
-                    merged.remove(&key);
-                } else {
-                    merged.insert(key, value);
-                }
-            }
-
-            let updated = merged.len();
-            if updated > MAX_METADATA_PROPERTIES {
-                return Err(ValidationError { previous, updated });
-            }
-
-            if merged.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(merged))
-            }
-        }
-    }
-}
-
-fn conversation_to_json(conversation: &Conversation) -> Value {
-    json!({
-        "id": conversation.id.0,
-        "object": "conversation",
-        "created_at": conversation.created_at.timestamp(),
-        "metadata": to_value(&conversation.metadata).unwrap_or(Value::Null),
-    })
-}
-
-fn not_found_response(conversation_id: &str) -> Response {
-    (
-        StatusCode::NOT_FOUND,
-        Json(json!({
-            "error": {
-                "message": format!(
-                    "Conversation with id '{}' not found.",
-                    conversation_id
-                ),
-                "type": "invalid_request_error",
-                "param": Value::Null,
-                "code": Value::Null
-            }
-        })),
-    )
-        .into_response()
-}
-
-fn storage_error_response(err: ConversationStorageError) -> Response {
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({
-            "error": {
-                "message": err.to_string(),
-                "type": "internal_error",
-                "param": Value::Null,
-                "code": Value::Null
-            }
-        })),
-    )
-        .into_response()
-}
-
-fn invalid_metadata_type_response(value: Value) -> Response {
-    (
-        StatusCode::BAD_REQUEST,
-        Json(json!({
-            "error": {
-                "message": format!(
-                    "Invalid 'metadata': expected object or null but got {}",
-                    value
-                ),
-                "type": "invalid_request_error",
-                "param": "metadata",
-                "code": "metadata_invalid_type"
-            }
-        })),
-    )
-        .into_response()
-}
-
-fn metadata_too_many_properties_error(previous: usize, updated: usize) -> Response {
-    let message = if previous == 0 {
-        format!(
-            "too many properties. Metadata can have at most {} properties, but you provided {} properties.",
-            MAX_METADATA_PROPERTIES, updated
-        )
-    } else {
-        format!(
-            "too many properties after update. Metadata can have at most {} properties, but your update resulted in an object with {} properties (up from {} properties before).",
-            MAX_METADATA_PROPERTIES, updated, previous
-        )
-    };
-    (
-        StatusCode::BAD_REQUEST,
-        Json(json!({
-            "error": {
-                "message": format!("Invalid 'metadata': {}", message),
-                "type": "invalid_request_error",
-                "param": "metadata",
-                "code": "metadata_max_properties_exceeded",
-                "extra": {
-                    "previous_property_count": previous,
-                    "updated_property_count": updated
-                }
-            }
-        })),
-    )
-        .into_response()
 }
 
 #[derive(Deserialize)]
