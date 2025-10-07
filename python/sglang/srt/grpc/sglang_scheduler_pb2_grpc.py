@@ -59,6 +59,16 @@ class SglangSchedulerStub(object):
                 request_serializer=sglang__scheduler__pb2.AbortRequest.SerializeToString,
                 response_deserializer=sglang__scheduler__pb2.AbortResponse.FromString,
                 _registered_method=True)
+        self.GetModelInfo = channel.unary_unary(
+                '/sglang.grpc.scheduler.SglangScheduler/GetModelInfo',
+                request_serializer=sglang__scheduler__pb2.GetModelInfoRequest.SerializeToString,
+                response_deserializer=sglang__scheduler__pb2.GetModelInfoResponse.FromString,
+                _registered_method=True)
+        self.GetServerInfo = channel.unary_unary(
+                '/sglang.grpc.scheduler.SglangScheduler/GetServerInfo',
+                request_serializer=sglang__scheduler__pb2.GetServerInfoRequest.SerializeToString,
+                response_deserializer=sglang__scheduler__pb2.GetServerInfoResponse.FromString,
+                _registered_method=True)
 
 
 class SglangSchedulerServicer(object):
@@ -94,6 +104,20 @@ class SglangSchedulerServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def GetModelInfo(self, request, context):
+        """Get model information
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetServerInfo(self, request, context):
+        """Get server information
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_SglangSchedulerServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -116,6 +140,16 @@ def add_SglangSchedulerServicer_to_server(servicer, server):
                     servicer.Abort,
                     request_deserializer=sglang__scheduler__pb2.AbortRequest.FromString,
                     response_serializer=sglang__scheduler__pb2.AbortResponse.SerializeToString,
+            ),
+            'GetModelInfo': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetModelInfo,
+                    request_deserializer=sglang__scheduler__pb2.GetModelInfoRequest.FromString,
+                    response_serializer=sglang__scheduler__pb2.GetModelInfoResponse.SerializeToString,
+            ),
+            'GetServerInfo': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetServerInfo,
+                    request_deserializer=sglang__scheduler__pb2.GetServerInfoRequest.FromString,
+                    response_serializer=sglang__scheduler__pb2.GetServerInfoResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -228,6 +262,60 @@ class SglangScheduler(object):
             '/sglang.grpc.scheduler.SglangScheduler/Abort',
             sglang__scheduler__pb2.AbortRequest.SerializeToString,
             sglang__scheduler__pb2.AbortResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetModelInfo(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/sglang.grpc.scheduler.SglangScheduler/GetModelInfo',
+            sglang__scheduler__pb2.GetModelInfoRequest.SerializeToString,
+            sglang__scheduler__pb2.GetModelInfoResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetServerInfo(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/sglang.grpc.scheduler.SglangScheduler/GetServerInfo',
+            sglang__scheduler__pb2.GetServerInfoRequest.SerializeToString,
+            sglang__scheduler__pb2.GetServerInfoResponse.FromString,
             options,
             channel_credentials,
             insecure,

@@ -1,6 +1,9 @@
 //! GLM-4 MoE Parser Integration Tests
 
-use sglang_router_rs::tool_parser::{Glm4MoeParser, ParseState, StreamResult, ToolParser};
+use sglang_router_rs::tool_parser::{Glm4MoeParser, ToolParser};
+
+mod common;
+use common::create_test_tools;
 
 #[tokio::test]
 async fn test_glm4_complete_parsing() {
@@ -15,11 +18,12 @@ async fn test_glm4_complete_parsing() {
 </tool_call>
 The weather will be..."#;
 
-    let result = parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 1);
-    assert_eq!(result[0].function.name, "get_weather");
+    let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(normal_text, "Let me search for that.\n");
+    assert_eq!(tools[0].function.name, "get_weather");
 
-    let args: serde_json::Value = serde_json::from_str(&result[0].function.arguments).unwrap();
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
     assert_eq!(args["city"], "Beijing");
     assert_eq!(args["date"], "2024-12-25");
 }
@@ -39,10 +43,11 @@ async fn test_glm4_multiple_tools() {
 <arg_value>zh</arg_value>
 </tool_call>"#;
 
-    let result = parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 2);
-    assert_eq!(result[0].function.name, "search");
-    assert_eq!(result[1].function.name, "translate");
+    let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 2);
+    assert_eq!(normal_text, "");
+    assert_eq!(tools[0].function.name, "search");
+    assert_eq!(tools[1].function.name, "translate");
 }
 
 #[tokio::test]
@@ -62,10 +67,11 @@ async fn test_glm4_type_conversion() {
 <arg_value>string value</arg_value>
 </tool_call>"#;
 
-    let result = parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 1);
+    let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(normal_text, "");
 
-    let args: serde_json::Value = serde_json::from_str(&result[0].function.arguments).unwrap();
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
     assert_eq!(args["count"], 42);
     assert_eq!(args["rate"], 1.5);
     assert_eq!(args["enabled"], true);
@@ -75,8 +81,9 @@ async fn test_glm4_type_conversion() {
 
 #[tokio::test]
 async fn test_glm4_streaming() {
-    let parser = Glm4MoeParser::new();
-    let mut state = ParseState::new();
+    let mut parser = Glm4MoeParser::new();
+
+    let tools = create_test_tools();
 
     // Simulate streaming chunks
     let chunks = vec![
@@ -90,25 +97,19 @@ async fn test_glm4_streaming() {
     ];
 
     let mut found_name = false;
-    let mut found_complete = false;
 
     for chunk in chunks {
-        let result = parser.parse_incremental(chunk, &mut state).await.unwrap();
+        let result = parser.parse_incremental(chunk, &tools).await.unwrap();
 
-        match result {
-            StreamResult::ToolName { name, .. } => {
+        for call in result.calls {
+            if let Some(name) = call.name {
                 assert_eq!(name, "get_weather");
                 found_name = true;
             }
-            StreamResult::ToolComplete(tool) => {
-                assert_eq!(tool.function.name, "get_weather");
-                found_complete = true;
-            }
-            _ => {}
         }
     }
 
-    assert!(found_name || found_complete);
+    assert!(found_name, "Should have found tool name during streaming");
 }
 
 #[test]
@@ -116,13 +117,13 @@ fn test_glm4_format_detection() {
     let parser = Glm4MoeParser::new();
 
     // Should detect GLM-4 format
-    assert!(parser.detect_format("<tool_call>"));
-    assert!(parser.detect_format("text with <tool_call> marker"));
+    assert!(parser.has_tool_markers("<tool_call>"));
+    assert!(parser.has_tool_markers("text with <tool_call> marker"));
 
     // Should not detect other formats
-    assert!(!parser.detect_format("[TOOL_CALLS]"));
-    assert!(!parser.detect_format("<｜tool▁calls▁begin｜>"));
-    assert!(!parser.detect_format("plain text"));
+    assert!(!parser.has_tool_markers("[TOOL_CALLS]"));
+    assert!(!parser.has_tool_markers("<｜tool▁calls▁begin｜>"));
+    assert!(!parser.has_tool_markers("plain text"));
 }
 
 #[tokio::test]
@@ -138,10 +139,10 @@ async fn test_glm4_python_literal_values() {
 <arg_value>None</arg_value>
 </tool_call>"#;
 
-    let result = parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 1);
+    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
 
-    let args: serde_json::Value = serde_json::from_str(&result[0].function.arguments).unwrap();
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
     assert_eq!(args["debug"], true);
     assert_eq!(args["verbose"], false);
     assert_eq!(args["optional"], serde_json::Value::Null);
@@ -160,11 +161,11 @@ async fn test_python_literals() {
 <arg_value>None</arg_value>
 </tool_call>"#;
 
-    let result = parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 1);
-    assert_eq!(result[0].function.name, "test_func");
+    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].function.name, "test_func");
 
-    let args: serde_json::Value = serde_json::from_str(&result[0].function.arguments).unwrap();
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
     assert_eq!(args["bool_true"], true);
     assert_eq!(args["bool_false"], false);
     assert_eq!(args["none_val"], serde_json::Value::Null);
@@ -181,10 +182,10 @@ async fn test_nested_values() {
 <arg_value>[1, 2, 3]</arg_value>
 </tool_call>"#;
 
-    let result = parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 1);
+    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
 
-    let args: serde_json::Value = serde_json::from_str(&result[0].function.arguments).unwrap();
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
     assert!(args["data"].is_object());
     assert!(args["list"].is_array());
 }
