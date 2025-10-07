@@ -37,10 +37,22 @@ import numpy as np
 import requests
 import safetensors.torch
 import torch
+
+# Try to import accelerate (optional dependency)
+try:
+    from accelerate import infer_auto_device_map, init_empty_weights
+    from accelerate.utils import get_max_memory
+
+    HAS_ACCELERATE = True
+except ImportError:
+    HAS_ACCELERATE = False
+    infer_auto_device_map = None
+    init_empty_weights = None
+    get_max_memory = None
+
 from huggingface_hub import HfApi, hf_hub_download
 from torch import nn
-from tqdm.auto import tqdm
-from transformers import AutoModelForCausalLM
+from transformers import AutoConfig, AutoModelForCausalLM
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
@@ -54,6 +66,8 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     trigger_transferring_weights_request,
 )
@@ -61,6 +75,11 @@ from sglang.srt.model_loader.utils import (
     get_model_architecture,
     post_load_weights,
     set_default_torch_dtype,
+)
+
+# Constants for memory management
+DEFAULT_GPU_MEMORY_FRACTION_FOR_CALIBRATION = (
+    0.8  # Reserve 20% GPU memory headroom for ModelOpt calibration
 )
 from sglang.srt.model_loader.weight_utils import (
     _BAR_FORMAT,
@@ -94,6 +113,8 @@ if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 _is_npu = is_npu()
+# ModelOpt: QUANT_CFG_CHOICES is imported from modelopt_utils.py
+# which contains the complete mapping of quantization config choices
 
 
 @contextmanager
@@ -477,12 +498,78 @@ class DefaultModelLoader(BaseModelLoader):
             model_config.model_path, model_config.revision, fall_back_to_pt=True
         )
 
+    def _load_modelopt_base_model(self, model_config: ModelConfig) -> nn.Module:
+        """Load and prepare the base model for ModelOpt quantization.
+
+        This method handles the common model loading logic shared between
+        DefaultModelLoader (conditional) and ModelOptModelLoader (dedicated).
+        """
+        if not HAS_ACCELERATE:
+            raise ImportError(
+                "accelerate is required for ModelOpt quantization. "
+                "Please install it with: pip install accelerate"
+            )
+
+        hf_config = AutoConfig.from_pretrained(
+            model_config.model_path, trust_remote_code=True
+        )
+        with init_empty_weights():
+            torch_dtype = getattr(hf_config, "torch_dtype", torch.float16)
+            model = AutoModelForCausalLM.from_config(
+                hf_config, torch_dtype=torch_dtype, trust_remote_code=True
+            )
+        max_memory = get_max_memory()
+        inferred_device_map = infer_auto_device_map(model, max_memory=max_memory)
+
+        on_cpu = "cpu" in inferred_device_map.values()
+        model_kwargs = {"torch_dtype": "auto"}
+        device_map = "auto"
+
+        if on_cpu:
+            for device in max_memory.keys():
+                if isinstance(device, int):
+                    max_memory[device] *= DEFAULT_GPU_MEMORY_FRACTION_FOR_CALIBRATION
+
+            logger.warning(
+                "Model does not fit to the GPU mem. "
+                f"We apply the following memory limit for calibration: \n{max_memory}\n"
+                f"If you hit GPU OOM issue, please adjust the memory fraction "
+                f"(currently {DEFAULT_GPU_MEMORY_FRACTION_FOR_CALIBRATION}) or "
+                "reduce the calibration `batch_size` manually."
+            )
+            model_kwargs["max_memory"] = max_memory
+
+        model = AutoModelForCausalLM.from_pretrained(
+            model_config.model_path,
+            device_map=device_map,
+            **model_kwargs,
+            trust_remote_code=True,
+        )
+        logger.info(f"ModelOpt quantization requested: {model_config.modelopt_quant}")
+
+        quant_choice_str = model_config.modelopt_quant
+        if not isinstance(quant_choice_str, str):
+            raise TypeError(
+                f"modelopt_quant must be a string preset key (e.g., 'fp8'), "
+                f"got {type(quant_choice_str)}"
+            )
+
+        return model
+
     def load_model(
         self,
         *,
         model_config: ModelConfig,
         device_config: DeviceConfig,
     ) -> nn.Module:
+
+        if hasattr(model_config, "modelopt_quant") and model_config.modelopt_quant:
+            # Load base model using shared method
+            model = self._load_modelopt_base_model(model_config)
+            # Note: DefaultModelLoader doesn't do additional quantization processing
+            # For full ModelOpt quantization, use ModelOptModelLoader
+            return model.eval()
+
         target_device = torch.device(device_config.device)
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
@@ -491,9 +578,9 @@ class DefaultModelLoader(BaseModelLoader):
                     self.load_config,
                 )
 
-        self.load_weights_and_postprocess(
-            model, self._get_all_weights(model_config, model), target_device
-        )
+            self.load_weights_and_postprocess(
+                model, self._get_all_weights(model_config, model), target_device
+            )
 
         return model.eval()
 
@@ -1668,8 +1755,102 @@ def load_model_with_cpu_quantization(
     return model.eval()
 
 
-def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:
+class ModelOptModelLoader(DefaultModelLoader):
+    """
+    Model loader that applies NVIDIA Model Optimizer quantization
+    """
+
+    def __init__(self, load_config: LoadConfig):
+        super().__init__(load_config)
+        # Any ModelOpt specific initialization if needed
+
+    def load_model(
+        self,
+        *,
+        model_config: ModelConfig,
+        device_config: DeviceConfig,
+    ) -> nn.Module:
+
+        logger.info("ModelOptModelLoader: Loading base model...")
+
+        # Use shared method from parent class to load base model
+        model = self._load_modelopt_base_model(model_config)
+
+        # Import ModelOpt modules (already done in _load_modelopt_base_model, but needed here for quantization)
+        try:
+            import modelopt.torch.quantization as mtq
+            from modelopt.torch.utils.dataset_utils import create_forward_loop
+        except ImportError:
+            logger.error(
+                "NVIDIA Model Optimizer (modelopt) library not found. "
+                "Please install it to use 'modelopt_quant' feature."
+            )
+            raise
+
+        quant_choice_str = model_config.modelopt_quant
+
+        quant_cfg_name = QUANT_CFG_CHOICES.get(quant_choice_str)
+        if not quant_cfg_name:
+            raise ValueError(
+                f"Invalid modelopt_quant choice: '{quant_choice_str}'. "
+                f"Available choices in QUANT_CFG_CHOICES: {list(QUANT_CFG_CHOICES.keys())}. "
+                "Ensure QUANT_CFG_CHOICES is correctly defined with mappings to "
+                "attribute names of config objects in modelopt.torch.quantization."
+            )
+
+        try:
+            # getattr will fetch the config object, e.g., mtq.FP8_DEFAULT_CFG
+            quant_cfg = getattr(mtq, quant_cfg_name)
+        except AttributeError:
+            raise AttributeError(
+                f"ModelOpt quantization config attribute '{quant_cfg_name}' "
+                f"(from choice '{quant_choice_str}') not found in modelopt.torch.quantization module. "
+                "Please verify QUANT_CFG_CHOICES and the ModelOpt library."
+            )
+
+        # For now, assume no calibration. Calibration setup is a separate, more complex step.
+        use_calibration = False  # This would ideally be a configurable parameter
+        calib_dataloader = None  # This would need to be provided/configured
+
+        calibrate_loop = (
+            create_forward_loop(dataloader=calib_dataloader)
+            if use_calibration
+            else None
+        )
+
+        if use_calibration and calib_dataloader is None:
+            logger.warning(
+                "ModelOpt calibration requested but no calib_dataloader provided. "
+                "Proceeding without calibration. Quantization accuracy may be affected."
+            )
+
+        logger.info(
+            f"Quantizing model with ModelOpt using config attribute: mtq.{quant_cfg_name}"
+        )
+
+        try:
+            model = mtq.quantize(model, quant_cfg, forward_loop=calibrate_loop)
+            logger.info("Model successfully quantized with ModelOpt.")
+        except Exception as e:
+            logger.error(f"Error during ModelOpt mtq.quantize call: {e}")
+            raise
+        mtq.print_quant_summary(model)
+
+        return model.eval()
+
+
+def get_model_loader(
+    load_config: LoadConfig, model_config: Optional[ModelConfig] = None
+) -> BaseModelLoader:
     """Get a model loader based on the load format."""
+
+    if (
+        model_config
+        and hasattr(model_config, "modelopt_quant")
+        and model_config.modelopt_quant
+    ):
+        logger.info("Using ModelOptModelLoader due to 'modelopt_quant' config.")
+        return ModelOptModelLoader(load_config)
 
     if isinstance(load_config.load_format, type):
         return load_config.load_format(load_config)
