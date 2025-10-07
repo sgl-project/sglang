@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import Optional
 
 import torch
 
@@ -18,6 +19,7 @@ def _resolve_future_token_ids(input_ids, future_token_ids_map):
 @dataclass
 class FutureIndices:
     indices: torch.Tensor
+    interval: Optional[slice] = None
 
 
 class FutureMap:
@@ -44,10 +46,10 @@ class FutureMap:
         start = cur_future_ct + 1
         end = cur_future_ct + 1 + bs
         indices = torch.arange(start, end, dtype=torch.int64, device=self.device)
-        return FutureIndices(indices)
+        return FutureIndices(indices=indices, interval=slice(start, end))
 
     def resolve_future(self, model_worker_batch: ModelWorkerBatch):
         _resolve_future_token_ids(model_worker_batch.input_ids, self.token_ids_buf)
 
     def store_to_map(self, future_indices: FutureIndices, next_token_ids: torch.Tensor):
-        self.token_ids_buf[future_indices.indices] = next_token_ids
+        self.token_ids_buf[future_indices.interval] = next_token_ids
