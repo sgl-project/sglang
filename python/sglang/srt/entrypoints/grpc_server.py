@@ -501,6 +501,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
 
         # Convert sampling params
         sampling_params = self._convert_sampling_params(grpc_req.sampling_params)
+        sampling_params.normalize(tokenizer=None)
 
         # Extract disaggregated params if present
         bootstrap_host = None
