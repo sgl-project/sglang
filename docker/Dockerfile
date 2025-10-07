@@ -3,6 +3,11 @@ FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04 AS base
 ARG TARGETARCH
 
 ARG BUILD_TYPE=all
+# Control whether to install vLLM via pip during the image build.
+# Set to "true" to install; defaults to "false".
+ARG INSTALL_VLLM=false
+# Optional: pin a specific vLLM version, e.g., "0.6.4". Leave empty for latest.
+ARG VLLM_VERSION=""
 ARG BRANCH_TYPE=remote
 ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
 ARG FLASHMLA_COMMIT=1408756a88e52a25196b759eaf8db89d2b51b5a1
@@ -70,6 +75,8 @@ FROM base AS build-image
 # Install SGLang
 WORKDIR /sgl-workspace
 ARG BRANCH_TYPE
+ARG INSTALL_VLLM
+ARG VLLM_VERSION
 COPY --from=local_src /src /tmp/local_src
 RUN if [ "$BRANCH_TYPE" = "local" ]; then \
         cp -r /tmp/local_src /sgl-workspace/sglang; \
@@ -93,7 +100,14 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5li
    fi \
  && python3 -m pip install --no-cache-dir -e "python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
  && python3 -m pip install --no-cache-dir nvidia-nccl-cu12==2.27.6 --force-reinstall --no-deps \
- && FLASHINFER_LOGGING_LEVEL=warning python3 -m flashinfer --download-cubin
+ && FLASHINFER_LOGGING_LEVEL=warning python3 -m flashinfer --download-cubin \
+ && if [ "${INSTALL_VLLM}" = "true" ]; then \
+      if [ -n "${VLLM_VERSION}" ]; then \
+        python3 -m pip install --no-cache-dir vllm==${VLLM_VERSION}; \
+      else \
+        python3 -m pip install --no-cache-dir vllm; \
+      fi; \
+    fi
 
 
 # Download NVSHMEM source files
