@@ -427,14 +427,10 @@ class OpenAIServingChat(OpenAIServingBase):
     ) -> Dict[str, Any]:
         """Build sampling parameters for the request"""
 
-        # Map of request parameters to their Pydantic defaults
-        # If request value == default, we'll use generation config instead
+        # Get defaults directly from the ChatCompletionRequest
         request_defaults = {
-            "temperature": 1.0,
-            "top_p": 1.0,
-            "top_k": -1,
-            "min_p": 0.0,
-            "repetition_penalty": 1.0,
+            p: ChatCompletionRequest.model_fields[p].default
+            for p in ("temperature", "top_p", "top_k", "min_p", "repetition_penalty")
         }
 
         # Helper to get parameter value with generation config fallback
