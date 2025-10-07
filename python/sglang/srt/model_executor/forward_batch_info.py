@@ -75,10 +75,6 @@ class ForwardMode(IntEnum):
     # Used in speculative decoding: extend a batch in the draft model.
     DRAFT_EXTEND = auto()
 
-    # A dummy first batch to start the pipeline for overlap scheduler.
-    # It is now used for triggering the sampling_info_done event for the first prefill batch.
-    DUMMY_FIRST = auto()
-
     # Split Prefill for PD multiplexing
     SPLIT_PREFILL = auto()
 
@@ -127,9 +123,6 @@ class ForwardMode(IntEnum):
 
     def is_cpu_graph(self):
         return self == ForwardMode.DECODE
-
-    def is_dummy_first(self):
-        return self == ForwardMode.DUMMY_FIRST
 
     def is_split_prefill(self):
         return self == ForwardMode.SPLIT_PREFILL
