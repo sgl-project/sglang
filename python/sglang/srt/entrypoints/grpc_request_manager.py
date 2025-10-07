@@ -80,6 +80,10 @@ class GrpcReqState:
     last_time: float = 0.0
     last_completion_tokens: int = 1
 
+    # perf_counter equivalents for accurate time calculations
+    finished_time_perf: float = 0.0
+    first_token_time_perf: float = 0.0
+
     # Streaming state
     stream_finished: bool = False
     input_logprobs_sent: bool = False  # Track if input logprobs were sent in streaming
@@ -556,8 +560,10 @@ class GrpcRequestManager:
 
             # Update metrics
             now = time.time()
+            now_perf_counter = time.perf_counter()
             if state.first_token_time == 0.0:
                 state.first_token_time = now
+                state.first_token_time_perf = now_perf_counter
             state.last_time = now
 
             # Extract output for this request
@@ -655,6 +661,7 @@ class GrpcRequestManager:
             if output_data["finished"]:
                 state.finished = True
                 state.finished_time = now
+                state.finished_time_perf = now_perf_counter
                 state.stream_finished = True
                 state.event.set()
 
@@ -692,6 +699,7 @@ class GrpcRequestManager:
             # Mark as finished
             state.finished = True
             state.finished_time = time.time()
+            state.finished_time_perf = time.perf_counter()
             state.event.set()
 
     async def _handle_health_check_output(self, health_out: HealthCheckOutput):
@@ -724,6 +732,7 @@ class GrpcRequestManager:
         # Mark as finished
         state.finished = True
         state.finished_time = time.time()
+        state.finished_time_perf = time.perf_counter()
         state.event.set()
 
     async def _send_to_scheduler(self, obj):

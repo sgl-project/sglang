@@ -145,6 +145,9 @@ class GenerateReqInput(BaseReq):
     bootstrap_room: Optional[Union[List[int], int]] = None
     bootstrap_pair_key: Optional[Union[List[str], str]] = None
 
+    # Validation step duration
+    validation_time: Optional[float] = None
+
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
 
@@ -558,6 +561,7 @@ class GenerateReqInput(BaseReq):
                 if self.bootstrap_pair_key is not None
                 else None
             ),
+            validation_time=self.validation_time,
             data_parallel_rank=(
                 self.data_parallel_rank if self.data_parallel_rank is not None else None
             ),
@@ -673,6 +677,8 @@ class EmbeddingReqInput(BaseReq):
     log_metrics: bool = True
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
+    # Validation step duration
+    validation_time: Optional[float] = None
     # For cross-encoder requests
     is_cross_encoder_request: bool = False
     # Priority for the request
@@ -759,6 +765,7 @@ class EmbeddingReqInput(BaseReq):
             video_data=self.video_data[i] if self.video_data is not None else None,
             sampling_params=self.sampling_params[i],
             rid=self.rid[i],
+            validation_time=self.validation_time,
         )
 
 
@@ -839,6 +846,16 @@ class BatchTokenIDOutput(BaseBatchReq):
     placeholder_tokens_idx: List[Optional[List[int]]]
     placeholder_tokens_val: List[Optional[List[int]]]
 
+    # Queue duration
+    queue_time: List[Optional[float]]
+
+    # Inference start time
+    inference_start_time: List[Optional[float]]
+
+    # Prefill timing metrics
+    prefill_delay: List[Optional[float]]
+    prefill_latency: List[Optional[float]]
+
 
 @dataclass
 class BatchMultimodalDecodeReq(BaseBatchReq):
@@ -863,6 +880,16 @@ class BatchMultimodalDecodeReq(BaseBatchReq):
     # Placeholder token info
     placeholder_tokens_idx: List[Optional[List[int]]]
     placeholder_tokens_val: List[Optional[List[int]]]
+
+    # Queue duration
+    queue_time: List[Optional[float]]
+
+    # Inference start time
+    inference_start_time: List[Optional[float]]
+
+    # Prefill timing metrics
+    prefill_delay: List[Optional[float]]
+    prefill_latency: List[Optional[float]]
 
     return_bytes: bool = False
 
@@ -902,6 +929,16 @@ class BatchStrOutput(BaseBatchReq):
     placeholder_tokens_idx: List[Optional[List[int]]]
     placeholder_tokens_val: List[Optional[List[int]]]
 
+    # Queue duration
+    queue_time: List[Optional[float]]
+
+    # Inference start time
+    inference_start_time: List[Optional[float]]
+
+    # Prefill timing metrics
+    prefill_delay: List[Optional[float]]
+    prefill_latency: List[Optional[float]]
+
 
 @dataclass
 class BatchMultimodalOutput(BaseBatchReq):
@@ -925,6 +962,16 @@ class BatchMultimodalOutput(BaseBatchReq):
     placeholder_tokens_idx: List[Optional[List[int]]]
     placeholder_tokens_val: List[Optional[List[int]]]
 
+    # Queue duration
+    queue_time: List[Optional[float]]
+
+    # Inference start time
+    inference_start_time: List[Optional[float]]
+
+    # Prefill timing metrics
+    prefill_delay: List[Optional[float]]
+    prefill_latency: List[Optional[float]]
+
     return_bytes: List[bool]
 
 
@@ -940,6 +987,16 @@ class BatchEmbeddingOutput(BaseBatchReq):
     # Placeholder token info
     placeholder_tokens_idx: List[Optional[List[int]]]
     placeholder_tokens_val: List[Optional[List[int]]]
+
+    # Queue duration
+    queue_time: List[Optional[float]]
+
+    # Inference start time
+    inference_start_time: List[Optional[float]]
+
+    # Prefill timing metrics
+    prefill_delay: List[Optional[float]]
+    prefill_latency: List[Optional[float]]
 
 
 @dataclass
