@@ -407,12 +407,32 @@ impl GrpcRouter {
 
     fn internal_error_static(msg: &'static str) -> Response {
         error!("{}", msg);
-        (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response()
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": {
+                    "message": msg,
+                    "type": "internal_error",
+                    "code": 500
+                }
+            })),
+        )
+            .into_response()
     }
 
     fn internal_error_message(message: String) -> Response {
         error!("{}", message);
-        (StatusCode::INTERNAL_SERVER_ERROR, message).into_response()
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": {
+                    "message": message,
+                    "type": "internal_error",
+                    "code": 500
+                }
+            })),
+        )
+            .into_response()
     }
 
     /// Count the number of tool calls in the request message history
@@ -740,12 +760,7 @@ impl GrpcRouter {
         let mut grpc_stream = match client.generate(request).await {
             Ok(stream) => stream,
             Err(e) => {
-                error!("Failed to start generation: {}", e);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Generation failed: {}", e),
-                )
-                    .into_response();
+                return Self::internal_error_message(format!("Generation failed: {}", e));
             }
         };
 
