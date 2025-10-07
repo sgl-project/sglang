@@ -82,10 +82,9 @@ impl OracleConversationStorage {
 impl ConversationStorage for OracleConversationStorage {
     async fn create_conversation(&self, input: NewConversation) -> Result<Conversation> {
         let conversation = Conversation::new(input);
-        let record = conversation.clone();
-        let id_str = record.id.0.clone();
-        let created_at = record.created_at;
-        let metadata_json = record
+        let id_str = conversation.id.0.clone();
+        let created_at = conversation.created_at;
+        let metadata_json = conversation
             .metadata
             .as_ref()
             .map(serde_json::to_string)
@@ -101,7 +100,7 @@ impl ConversationStorage for OracleConversationStorage {
         })
         .await?;
 
-        Ok(record)
+        Ok(conversation)
     }
 
     async fn get_conversation(&self, id: &ConversationId) -> Result<Option<Conversation>> {
@@ -139,7 +138,6 @@ impl ConversationStorage for OracleConversationStorage {
         let id_str = id.0.clone();
         let metadata_json = metadata.as_ref().map(serde_json::to_string).transpose()?;
         let conversation_id = id.clone();
-        let updated_metadata = metadata.clone();
 
         self.with_connection(move |conn| {
             let mut stmt = conn
@@ -172,7 +170,7 @@ impl ConversationStorage for OracleConversationStorage {
             Ok(Some(Conversation::with_parts(
                 conversation_id,
                 created_at,
-                updated_metadata,
+                metadata,
             )))
         })
         .await

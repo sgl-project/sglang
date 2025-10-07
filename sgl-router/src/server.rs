@@ -33,7 +33,7 @@ use axum::{
 };
 use reqwest::Client;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{json, to_value, Value};
 use std::{
     sync::atomic::{AtomicBool, Ordering},
     sync::Arc,
@@ -546,11 +546,7 @@ fn conversation_to_json(conversation: &Conversation) -> Value {
         "id": conversation.id.0,
         "object": "conversation",
         "created_at": conversation.created_at.timestamp(),
-        "metadata": conversation
-            .metadata
-            .clone()
-            .map(Value::Object)
-            .unwrap_or(Value::Null),
+        "metadata": to_value(&conversation.metadata).unwrap_or(Value::Null),
     })
 }
 
