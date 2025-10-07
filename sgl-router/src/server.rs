@@ -905,15 +905,9 @@ pub fn build_app(
         .route("/v1/conversations", post(v1_conversations_create))
         .route(
             "/v1/conversations/{conversation_id}",
-            get(v1_conversations_get),
-        )
-        .route(
-            "/v1/conversations/{conversation_id}",
-            post(v1_conversations_update),
-        )
-        .route(
-            "/v1/conversations/{conversation_id}",
-            delete(v1_conversations_delete),
+            get(v1_conversations_get)
+                .post(v1_conversations_update)
+                .delete(v1_conversations_delete),
         )
         .route_layer(axum::middleware::from_fn_with_state(
             app_state.clone(),
