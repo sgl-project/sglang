@@ -202,7 +202,7 @@ inline int getMultiProcessorCount() {
 void scaled_fp4_quant_sm100a(
     torch::Tensor& output, torch::Tensor const& input, torch::Tensor& output_sf, torch::Tensor const& input_sf) {
   auto sm_version = getSMVersion();
-  TORCH_CHECK(sm_version == 100 || sm_version == 103, "fp4_quant is only supported on sm100a/sm103a");
+  TORCH_CHECK(sm_version >= 100, "fp4_quant is only supported on sm100+");
 
   int32_t m = input.size(0);
   int32_t n = input.size(1);

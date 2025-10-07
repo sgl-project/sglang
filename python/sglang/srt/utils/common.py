@@ -409,7 +409,16 @@ def get_available_gpu_memory(
 
         if empty_cache:
             torch.cuda.empty_cache()
-        free_gpu_memory, _ = torch.cuda.mem_get_info(gpu_id)
+        shared_sysmem_device_mem_sms = (110, 121)  # Thor, Spark
+        if get_device_sm() in shared_sysmem_device_mem_sms:
+            # On these devices, which use sysmem as device mem, torch.cuda.mem_get_info()
+            # only reports "free" memory, which can be lower than what is actually
+            # available due to not including cache memory. So we use the system available
+            # memory metric instead.
+            free_gpu_memory = psutil.virtual_memory().available
+        else:
+            free_gpu_memory, _ = torch.cuda.mem_get_info(gpu_id)
+
 
     elif device == "xpu":
         num_gpus = torch.xpu.device_count()
