@@ -641,6 +641,64 @@ pub fn generate_tool_call_id(
     }
 }
 
+/// Get the appropriate reasoning parser for a model
+///
+/// If a parser name is explicitly configured, use that parser.
+/// Otherwise, auto-detect based on the model name.
+pub fn get_reasoning_parser(
+    reasoning_parser_factory: &crate::reasoning_parser::ReasoningParserFactory,
+    configured_parser: Option<&String>,
+    model: &str,
+) -> crate::reasoning_parser::PooledParser {
+    use tracing::warn;
+
+    if let Some(parser_name) = configured_parser {
+        // Use configured parser if specified
+        reasoning_parser_factory
+            .registry()
+            .get_pooled_parser(parser_name)
+            .unwrap_or_else(|| {
+                warn!(
+                    "Configured reasoning parser '{}' not found, falling back to model-based selection",
+                    parser_name
+                );
+                reasoning_parser_factory.get_pooled(model)
+            })
+    } else {
+        // Auto-detect based on model
+        reasoning_parser_factory.get_pooled(model)
+    }
+}
+
+/// Get the appropriate tool parser for a model
+///
+/// If a parser name is explicitly configured, use that parser.
+/// Otherwise, auto-detect based on the model name.
+pub fn get_tool_parser(
+    tool_parser_factory: &crate::tool_parser::ToolParserFactory,
+    configured_parser: Option<&String>,
+    model: &str,
+) -> crate::tool_parser::PooledToolParser {
+    use tracing::warn;
+
+    if let Some(parser_name) = configured_parser {
+        // Use configured parser if specified
+        tool_parser_factory
+            .registry()
+            .get_pooled_parser(parser_name)
+            .unwrap_or_else(|| {
+                warn!(
+                    "Configured tool parser '{}' not found, falling back to model-based selection",
+                    parser_name
+                );
+                tool_parser_factory.get_pooled(model)
+            })
+    } else {
+        // Auto-detect based on model
+        tool_parser_factory.get_pooled(model)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

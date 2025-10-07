@@ -45,6 +45,7 @@ The core features include:
    advanced_features/quantization.md
    advanced_features/lora.ipynb
    advanced_features/pd_disaggregation.md
+   advanced_features/hicache.rst
    advanced_features/vlm_query.ipynb
    advanced_features/router.md
    advanced_features/observability.md

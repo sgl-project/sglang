@@ -86,6 +86,9 @@ class RouterArgs:
     # Tokenizer configuration
     model_path: Optional[str] = None
     tokenizer_path: Optional[str] = None
+    # Parser configuration
+    reasoning_parser: Optional[str] = None
+    tool_call_parser: Optional[str] = None
 
     @staticmethod
     def add_cli_args(
@@ -445,6 +448,18 @@ class RouterArgs:
             type=str,
             default=None,
             help="Explicit tokenizer path (overrides model_path tokenizer if provided)",
+        )
+        parser.add_argument(
+            f"--{prefix}reasoning-parser",
+            type=str,
+            default=None,
+            help="Specify the parser for reasoning models (e.g., deepseek-r1, qwen3)",
+        )
+        parser.add_argument(
+            f"--{prefix}tool-call-parser",
+            type=str,
+            default=None,
+            help="Specify the parser for handling tool-call interactions",
         )
 
     @classmethod

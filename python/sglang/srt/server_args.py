@@ -528,7 +528,13 @@ class ServerArgs:
         self._handle_other_validations()
 
     def _handle_deprecated_args(self):
-        pass
+        # handle deprecated tool call parsers
+        deprecated_tool_call_parsers = {"qwen25": "qwen", "glm45": "glm"}
+        if self.tool_call_parser in deprecated_tool_call_parsers:
+            logger.warning(
+                f"The tool_call_parser '{self.tool_call_parser}' is deprecated. Please use '{deprecated_tool_call_parsers[self.tool_call_parser]}' instead."
+            )
+            self.tool_call_parser = deprecated_tool_call_parsers[self.tool_call_parser]
 
     def _handle_missing_default_values(self):
         if self.tokenizer_path is None:
