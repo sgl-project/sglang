@@ -3681,7 +3681,7 @@ impl super::super::RouterTrait for OpenAIRouter {
     }
 
     async fn create_conversation(&self, _headers: Option<&HeaderMap>, body: &Value) -> Response {
-        // Parse metadata: allow object or null/absent
+        // TODO: move this spec validation to the right place
         let metadata = match body.get("metadata") {
             Some(Value::Object(map)) => {
                 if map.len() > MAX_METADATA_PROPERTIES {
