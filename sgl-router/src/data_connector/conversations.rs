@@ -6,14 +6,13 @@ use serde_json::{Map as JsonMap, Value};
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 
-/// Identifier for stored conversations (matches OpenAI `exaconv_{hex}` format)
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
 pub struct ConversationId(pub String);
 
 impl ConversationId {
     pub fn new() -> Self {
         let mut rng = rand::rng();
-        let mut bytes = [0u8; 30];
+        let mut bytes = [0u8; 24];
         rng.fill_bytes(&mut bytes);
         let hex_string: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
         Self(format!("conv_{}", hex_string))
