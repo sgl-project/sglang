@@ -279,7 +279,7 @@ class XLMRobertaModel(nn.Module):
             local_dir = download_from_hf(model_path_or_dir, allow_patterns=sparse_head)
             path = os.path.join(local_dir, sparse_head)
 
-        print(f"Loading Sparse Head: {path}")
+        logger.info(f"Loading Sparse Head: {path}")
 
         state_dict = torch.load(path)
         return state_dict
