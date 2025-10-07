@@ -1,7 +1,7 @@
 use std::convert::TryFrom;
 use std::time::Duration;
 use tonic::{transport::Channel, Request};
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::protocols::spec::{
     ChatCompletionRequest, GenerateRequest, ResponseFormat,
