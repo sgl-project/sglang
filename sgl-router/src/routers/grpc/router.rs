@@ -113,8 +113,7 @@ impl GrpcRouter {
         let processed_messages = match utils::process_chat_messages(&body_ref, &*self.tokenizer) {
             Ok(msgs) => msgs,
             Err(e) => {
-                error!("Failed to process chat messages: {}", e);
-                return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+                return utils::bad_request_error(e.to_string());
             }
         };
 
@@ -122,12 +121,7 @@ impl GrpcRouter {
         let encoding = match self.tokenizer.encode(&processed_messages.text) {
             Ok(encoding) => encoding,
             Err(e) => {
-                error!("Tokenization failed: {}", e);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Tokenization failed: {}", e),
-                )
-                    .into_response();
+                return utils::internal_error_message(format!("Tokenization failed: {}", e));
             }
         };
 
@@ -145,8 +139,10 @@ impl GrpcRouter {
         {
             Some(w) => w,
             None => {
-                warn!("No available workers for model: {:?}", model_id);
-                return (StatusCode::SERVICE_UNAVAILABLE, "No available workers").into_response();
+                return utils::service_unavailable_error(format!(
+                    "No available workers for model: {:?}",
+                    model_id
+                ));
             }
         };
 
@@ -170,12 +166,7 @@ impl GrpcRouter {
         ) {
             Ok(request) => request,
             Err(e) => {
-                error!("Failed to build gRPC request: {}", e);
-                return (
-                    StatusCode::BAD_REQUEST,
-                    format!("Invalid request parameters: {}", e),
-                )
-                    .into_response();
+                return utils::bad_request_error(format!("Invalid request parameters: {}", e));
             }
         };
 
@@ -200,8 +191,7 @@ impl GrpcRouter {
         let (original_text, token_ids) = match self.resolve_generate_input(body) {
             Ok(res) => res,
             Err(msg) => {
-                error!("Invalid generate request: {}", msg);
-                return (StatusCode::BAD_REQUEST, msg).into_response();
+                return utils::bad_request_error(msg);
             }
         };
 
@@ -211,8 +201,10 @@ impl GrpcRouter {
         let worker = match self.select_worker_for_request(model_id, original_text.as_deref()) {
             Some(w) => w,
             None => {
-                warn!("No available workers for model: {:?}", model_id);
-                return (StatusCode::SERVICE_UNAVAILABLE, "No available workers").into_response();
+                return utils::service_unavailable_error(format!(
+                    "No available workers for model: {:?}",
+                    model_id
+                ));
             }
         };
 
@@ -238,8 +230,7 @@ impl GrpcRouter {
         ) {
             Ok(req) => req,
             Err(e) => {
-                error!("Failed to build generate request: {}", e);
-                return (StatusCode::BAD_REQUEST, e).into_response();
+                return utils::bad_request_error(e);
             }
         };
 
@@ -403,16 +394,6 @@ impl GrpcRouter {
             .encode(text)
             .map_err(|e| format!("Tokenization failed: {}", e))?;
         Ok((text.to_string(), encoding.token_ids().to_vec()))
-    }
-
-    fn internal_error_static(msg: &'static str) -> Response {
-        error!("{}", msg);
-        (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response()
-    }
-
-    fn internal_error_message(message: String) -> Response {
-        error!("{}", message);
-        (StatusCode::INTERNAL_SERVER_ERROR, message).into_response()
     }
 
     /// Count the number of tool calls in the request message history
@@ -740,12 +721,7 @@ impl GrpcRouter {
         let mut grpc_stream = match client.generate(request).await {
             Ok(stream) => stream,
             Err(e) => {
-                error!("Failed to start generation: {}", e);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Generation failed: {}", e),
-                )
-                    .into_response();
+                return utils::internal_error_message(format!("Generation failed: {}", e));
             }
         };
 
@@ -1183,7 +1159,7 @@ impl GrpcRouter {
         let stream = match client.generate(request).await {
             Ok(s) => s,
             Err(e) => {
-                return Self::internal_error_message(format!("Failed to start generation: {}", e))
+                return utils::internal_error_message(format!("Failed to start generation: {}", e))
             }
         };
 
@@ -1193,7 +1169,7 @@ impl GrpcRouter {
         };
 
         if all_responses.is_empty() {
-            return Self::internal_error_static("No responses from server");
+            return utils::internal_error_static("No responses from server");
         }
 
         // Process each response into a ChatChoice
@@ -1212,7 +1188,7 @@ impl GrpcRouter {
             {
                 Ok(choice) => choices.push(choice),
                 Err(e) => {
-                    return Self::internal_error_message(format!(
+                    return utils::internal_error_message(format!(
                         "Failed to process choice {}: {}",
                         index, e
                     ));
@@ -1265,7 +1241,7 @@ impl GrpcRouter {
         let stream = match client.generate(request).await {
             Ok(stream) => stream,
             Err(e) => {
-                return Self::internal_error_message(format!("Failed to start generation: {}", e))
+                return utils::internal_error_message(format!("Failed to start generation: {}", e))
             }
         };
 
@@ -1276,7 +1252,7 @@ impl GrpcRouter {
         };
 
         if responses.is_empty() {
-            return Self::internal_error_static("No completion received from scheduler");
+            return utils::internal_error_static("No completion received from scheduler");
         }
 
         // Create stop decoder from sampling params
@@ -1298,7 +1274,10 @@ impl GrpcRouter {
             let outputs = match stop_decoder.process_tokens(&complete.output_ids) {
                 Ok(outputs) => outputs,
                 Err(e) => {
-                    return Self::internal_error_message(format!("Failed to process tokens: {}", e))
+                    return utils::internal_error_message(format!(
+                        "Failed to process tokens: {}",
+                        e
+                    ))
                 }
             };
 
@@ -1377,7 +1356,7 @@ impl GrpcRouter {
         let stream = match client.generate(request).await {
             Ok(stream) => stream,
             Err(e) => {
-                return Self::internal_error_message(format!("Failed to start generation: {}", e))
+                return utils::internal_error_message(format!("Failed to start generation: {}", e))
             }
         };
 
