@@ -60,7 +60,13 @@ from sglang.srt.mem_cache.allocator import (
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
-from sglang.srt.mem_cache.common import write_cache_indices
+from sglang.srt.mem_cache.common import (
+    alloc_paged_token_slots_decode,
+    alloc_paged_token_slots_extend,
+    alloc_req_slots,
+    alloc_token_slots,
+    write_cache_indices,
+)
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
@@ -862,7 +868,7 @@ def alloc_for_extend(
 
     # Allocate req slots
     bs = len(reqs)
-    req_pool_indices = batch.alloc_req_slots(bs, reqs)
+    req_pool_indices = alloc_req_slots(batch.req_to_token_pool, bs, reqs)
     req_pool_indices = torch.tensor(
         req_pool_indices, dtype=torch.int64, device=batch.device
     )
@@ -870,7 +876,10 @@ def alloc_for_extend(
 
     # Allocate memory
     if batch.token_to_kv_pool_allocator.page_size == 1:
-        out_cache_loc: torch.Tensor = batch.alloc_token_slots(extend_num_tokens)
+        out_cache_loc: torch.Tensor = alloc_token_slots(
+            batch.tree_cache,
+            extend_num_tokens,
+        )
     else:
         last_loc = [
             (
@@ -880,13 +889,14 @@ def alloc_for_extend(
             )
             for r in reqs
         ]
-        out_cache_loc: torch.Tensor = batch.alloc_paged_token_slots_extend(
-            prefix_lens_device,
-            prefix_lens_cpu,
-            seq_lens_device,
-            seq_lens_cpu,
-            torch.cat(last_loc),
-            extend_num_tokens,
+        out_cache_loc: torch.Tensor = alloc_paged_token_slots_extend(
+            tree_cache=batch.tree_cache,
+            prefix_lens=prefix_lens_device,
+            prefix_lens_cpu=prefix_lens_cpu,
+            seq_lens=seq_lens_device,
+            seq_lens_cpu=seq_lens_cpu,
+            last_loc=torch.cat(last_loc),
+            extend_num_tokens=extend_num_tokens,
         )
 
     # Write allocated tokens to req_to_token_pool
@@ -912,21 +922,26 @@ def alloc_for_extend(
 
 
 def alloc_for_decode(batch: "ScheduleBatch", token_per_req: int):
-
     bs = len(batch.reqs)
     seq_lens = batch.seq_lens
     req_pool_indices = batch.req_pool_indices
 
     # Allocate token slots
     if batch.token_to_kv_pool_allocator.page_size == 1:
-        out_cache_loc = batch.alloc_token_slots(bs * token_per_req)
+        out_cache_loc = alloc_token_slots(
+            batch.tree_cache,
+            bs * token_per_req,
+        )
     else:
         # Get the last token's KV cache location
         last_loc = batch.req_to_token_pool.req_to_token[req_pool_indices, seq_lens - 1]
         # Prepare tensors for allocation
         seq_lens_next = seq_lens + token_per_req
-        out_cache_loc = batch.alloc_paged_token_slots_decode(
-            seq_lens_next, batch.seq_lens_cpu + token_per_req, last_loc
+        out_cache_loc = alloc_paged_token_slots_decode(
+            batch.tree_cache,
+            seq_lens_next,
+            batch.seq_lens_cpu + token_per_req,
+            last_loc,
         )
 
     if batch.model_config.is_encoder_decoder:
@@ -1091,117 +1106,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def is_empty(self):
         return len(self.reqs) == 0
-
-    def alloc_req_slots(self, num_reqs: int, reqs: Optional[List[Req]] = None):
-        if isinstance(self.req_to_token_pool, HybridReqToTokenPool):
-            req_pool_indices = self.req_to_token_pool.alloc(num_reqs, reqs)
-        else:
-            req_pool_indices = self.req_to_token_pool.alloc(num_reqs)
-        if req_pool_indices is None:
-            raise RuntimeError(
-                "alloc_req_slots runs out of memory. "
-                "Please set a smaller number for `--max-running-requests`. "
-                f"{self.req_to_token_pool.available_size()=}, "
-                f"{num_reqs=}, "
-            )
-        return req_pool_indices
-
-    def alloc_token_slots(self, num_tokens: int, backup_state: bool = False):
-        self._evict_tree_cache_if_needed(num_tokens)
-
-        if backup_state:
-            state = self.token_to_kv_pool_allocator.backup_state()
-
-        out_cache_loc = self.token_to_kv_pool_allocator.alloc(num_tokens)
-        if out_cache_loc is None:
-            phase_str = "Prefill" if self.forward_mode.is_extend() else "Decode"
-            error_msg = (
-                f"{phase_str} out of memory. Try to lower your batch size.\n"
-                f"Try to allocate {num_tokens} tokens.\n"
-                f"{self._available_and_evictable_str()}"
-            )
-            logger.error(error_msg)
-            if self.tree_cache is not None:
-                self.tree_cache.pretty_print()
-            raise RuntimeError(error_msg)
-
-        if backup_state:
-            return out_cache_loc, state
-        else:
-            return out_cache_loc
-
-    def alloc_paged_token_slots_extend(
-        self,
-        prefix_lens: torch.Tensor,
-        prefix_lens_cpu: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
-        last_loc: torch.Tensor,
-        extend_num_tokens: int,
-        backup_state: bool = False,
-    ):
-        # Over estimate the number of tokens: assume each request needs a new page.
-        num_tokens = (
-            extend_num_tokens
-            + len(seq_lens_cpu) * self.token_to_kv_pool_allocator.page_size
-        )
-        self._evict_tree_cache_if_needed(num_tokens)
-
-        if backup_state:
-            state = self.token_to_kv_pool_allocator.backup_state()
-
-        out_cache_loc = self.token_to_kv_pool_allocator.alloc_extend(
-            prefix_lens,
-            prefix_lens_cpu,
-            seq_lens,
-            seq_lens_cpu,
-            last_loc,
-            extend_num_tokens,
-        )
-        if out_cache_loc is None:
-            error_msg = (
-                f"Prefill out of memory. Try to lower your batch size.\n"
-                f"Try to allocate {extend_num_tokens} tokens.\n"
-                f"{self._available_and_evictable_str()}"
-            )
-            logger.error(error_msg)
-            raise RuntimeError(error_msg)
-
-        if backup_state:
-            return out_cache_loc, state
-        else:
-            return out_cache_loc
-
-    def alloc_paged_token_slots_decode(
-        self,
-        seq_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
-        last_loc: torch.Tensor,
-        backup_state: bool = False,
-    ):
-        # Over estimate the number of tokens: assume each request needs a new page.
-        num_tokens = len(seq_lens) * self.token_to_kv_pool_allocator.page_size
-        self._evict_tree_cache_if_needed(num_tokens)
-
-        if backup_state:
-            state = self.token_to_kv_pool_allocator.backup_state()
-
-        out_cache_loc = self.token_to_kv_pool_allocator.alloc_decode(
-            seq_lens, seq_lens_cpu, last_loc
-        )
-        if out_cache_loc is None:
-            error_msg = (
-                f"Decode out of memory. Try to lower your batch size.\n"
-                f"Try to allocate {len(seq_lens)} tokens.\n"
-                f"{self._available_and_evictable_str()}"
-            )
-            logger.error(error_msg)
-            raise RuntimeError(error_msg)
-
-        if backup_state:
-            return out_cache_loc, state
-        else:
-            return out_cache_loc
 
     def prepare_encoder_info_extend(self, input_ids: List[int], seq_lens: List[int]):
         self.encoder_lens_cpu = []

@@ -7,6 +7,11 @@ from typing import Optional, Tuple
 import torch
 import triton
 
+from sglang.srt.mem_cache.common import (
+    alloc_paged_token_slots_extend,
+    alloc_token_slots,
+)
+
 logger = logging.getLogger(__name__)
 
 from dataclasses import dataclass
@@ -71,7 +76,10 @@ class NgramVerifyInput(SpecInput):
         batch.input_ids = self.draft_token
 
         if page_size == 1:
-            batch.out_cache_loc = batch.alloc_token_slots(len(batch.input_ids))
+            batch.out_cache_loc = alloc_token_slots(
+                batch.tree_cache,
+                len(batch.input_ids),
+            )
             end_offset = batch.seq_lens + self.draft_token_num
         else:
             # TODO(lsyin): add prefix lens cpu here to support page size > 1
@@ -84,7 +92,8 @@ class NgramVerifyInput(SpecInput):
                 batch.req_pool_indices,
                 prefix_lens,
             )
-            batch.out_cache_loc = batch.alloc_paged_token_slots_extend(
+            batch.out_cache_loc = alloc_paged_token_slots_extend(
+                batch.tree_cache,
                 prefix_lens,
                 prefix_lens_cpu,
                 end_offset,

@@ -1,10 +1,21 @@
+from __future__ import annotations
+
+import logging
+from typing import TYPE_CHECKING
+
 import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import support_triton
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req
+
+logger = logging.getLogger(__name__)
 
 GLOBAL_SERVER_ARGS_KEYS = ["attention_backend"]
 
@@ -181,3 +192,135 @@ def get_last_loc_triton(
         BLOCK_SIZE,
     )
     return result
+
+
+def alloc_token_slots(
+    tree_cache: BasePrefixCache,
+    num_tokens: int,
+    backup_state: bool = False,
+):
+    allocator = tree_cache.token_to_kv_pool_allocator
+    _evict_from_tree_cache(tree_cache, num_tokens)
+
+    state = None
+    if backup_state:
+        state = allocator.backup_state()
+
+    out_cache_loc = allocator.alloc(num_tokens)
+
+    if out_cache_loc is None:
+        return None
+
+    return (out_cache_loc, state) if backup_state else out_cache_loc
+
+
+def _evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
+    """Helper to evict from tree cache if needed. Handles both hybrid and standard allocators."""
+    if tree_cache is None:
+        return
+
+    # Check if this is ChunkCache or SWAChunkCache - these don't support eviction
+    from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
+
+    if isinstance(tree_cache, (SWAChunkCache, ChunkCache)):
+        return
+
+    allocator = tree_cache.token_to_kv_pool_allocator
+
+    # Check if this is a hybrid allocator
+    if hasattr(allocator, "full_available_size"):
+        # Hybrid allocator
+        full_available_size = allocator.full_available_size()
+        swa_available_size = allocator.swa_available_size()
+
+        if full_available_size < num_tokens or swa_available_size < num_tokens:
+            full_num_tokens = max(0, num_tokens - full_available_size)
+            swa_num_tokens = max(0, num_tokens - swa_available_size)
+            tree_cache.evict(full_num_tokens, swa_num_tokens)
+    else:
+        # Standard allocator
+        if allocator.available_size() < num_tokens:
+            tree_cache.evict(num_tokens)
+
+
+def alloc_paged_token_slots_decode(
+    tree_cache: BasePrefixCache,
+    seq_lens: torch.Tensor,
+    seq_lens_cpu: torch.Tensor,
+    last_loc: torch.Tensor,
+    backup_state: bool = False,
+):
+    """Allocate paged token slots for decode with overestimation for safety."""
+    allocator = tree_cache.token_to_kv_pool_allocator
+    # Over estimate the number of tokens: assume each request needs a new page.
+    num_tokens = len(seq_lens) * allocator.page_size
+    _evict_from_tree_cache(tree_cache, num_tokens)
+
+    state = None
+    if backup_state:
+        state = allocator.backup_state()
+
+    out_cache_loc = allocator.alloc_decode(seq_lens, seq_lens_cpu, last_loc)
+
+    if out_cache_loc is None:
+        return None
+
+    return (out_cache_loc, state) if backup_state else out_cache_loc
+
+
+def alloc_paged_token_slots_extend(
+    tree_cache: BasePrefixCache,
+    prefix_lens: torch.Tensor,
+    prefix_lens_cpu: torch.Tensor,
+    seq_lens: torch.Tensor,
+    seq_lens_cpu: torch.Tensor,
+    last_loc: torch.Tensor,
+    extend_num_tokens: int,
+    backup_state: bool = False,
+):
+    # Over estimate the number of tokens: assume each request needs a new page.
+    allocator = tree_cache.token_to_kv_pool_allocator
+    num_tokens = extend_num_tokens + len(seq_lens_cpu) * allocator.page_size
+    _evict_from_tree_cache(tree_cache, num_tokens)
+
+    state = None
+    if backup_state:
+        state = allocator.backup_state()
+
+    out_cache_loc = allocator.alloc_extend(
+        prefix_lens,
+        prefix_lens_cpu,
+        seq_lens,
+        seq_lens_cpu,
+        last_loc,
+        extend_num_tokens,
+    )
+
+    if out_cache_loc is None:
+        return None
+
+    return (out_cache_loc, state) if backup_state else out_cache_loc
+
+
+def alloc_req_slots(
+    req_to_token_pool: ReqToTokenPool,
+    num_reqs: int,
+    reqs: list[Req] | None,
+) -> list[int]:
+    """Allocate request slots from the pool."""
+    match req_to_token_pool:
+        case ReqToTokenPool():
+            req_pool_indices = req_to_token_pool.alloc(num_reqs)
+        case HybridReqToTokenPool():
+            req_pool_indices = req_to_token_pool.alloc(num_reqs, reqs)
+        case _:
+            raise ValueError(f"Unknown {type(req_to_token_pool)=}")
+
+    if req_pool_indices is None:
+        raise RuntimeError(
+            "alloc_req_slots runs out of memory. "
+            "Please set a smaller number for `--max-running-requests`. "
+            f"{req_to_token_pool.available_size()=}, "
+            f"{num_reqs=}, "
+        )
+    return req_pool_indices
