@@ -826,6 +826,8 @@ fn oracle_config_validation_requires_config_when_enabled() {
         },
         history_backend: HistoryBackend::Oracle,
         oracle: None,
+        reasoning_parser: None,
+        tool_call_parser: None,
         ..Default::default()
     };
 
