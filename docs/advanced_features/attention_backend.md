@@ -75,10 +75,12 @@ Constraints when combining hybrid attention with speculative decoding:
 - CUDA Graph: the decode backend is always captured; the prefill backend is captured only when `--speculative-attention-mode prefill`.
 
 
-```{tip}
-If you set only one of `--prefill-attention-backend` or `--decode-attention-backend`, the unspecified phase inherits `--attention-backend`.
-If both are specified and differ, SGLang automatically enables a hybrid wrapper to dispatch to the chosen backend per phase.
-```
+SGLang determines the attention backend for the prefill and decode phases as follows:
+
+- **Prefill Phase**: Uses the backend specified by `--prefill-attention-backend`. If not set, it falls back to the value of `--attention-backend`.
+- **Decode Phase**: Uses the backend specified by `--decode-attention-backend`. If not set, it falls back to the value of `--attention-backend`.
+
+If the resulting backends for the prefill and decode phases are different, SGLang automatically enables a hybrid attention wrapper to manage them.
 
 ## User guide
 
