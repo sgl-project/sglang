@@ -4,39 +4,77 @@
 //! across both regular and prefill-decode (PD) routing modes.
 
 use crate::core::Worker;
+use axum::http::HeaderMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 
 mod cache_aware;
 mod factory;
+mod load_aware;
 mod power_of_two;
 mod random;
 mod registry;
 mod round_robin;
+mod rule_based;
 
 pub use cache_aware::CacheAwarePolicy;
 pub use factory::PolicyFactory;
+pub use load_aware::LoadAwarePolicy;
 pub use power_of_two::PowerOfTwoPolicy;
 pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;
 pub use round_robin::RoundRobinPolicy;
+pub use rule_based::RuleBasedPolicy;
+
+/// Routing context that bundles request information for header-aware policies
+#[derive(Debug, Clone)]
+pub struct RoutingContext<'a> {
+    /// Request headers (optional, may not be present for all routing calls)
+    pub headers: Option<&'a HeaderMap>,
+    /// Request text for cache-aware routing (optional)
+    pub request_text: Option<&'a str>,
+    /// Model ID for model-specific routing (optional)
+    pub model_id: Option<&'a str>,
+}
+
+impl<'a> RoutingContext<'a> {
+    /// Create a new routing context
+    pub fn new(
+        headers: Option<&'a HeaderMap>,
+        request_text: Option<&'a str>,
+        model_id: Option<&'a str>,
+    ) -> Self {
+        Self {
+            headers,
+            request_text,
+            model_id,
+        }
+    }
+
+    /// Create a minimal context with just request text (for backward compatibility)
+    pub fn from_text(request_text: Option<&'a str>) -> Self {
+        Self {
+            headers: None,
+            request_text,
+            model_id: None,
+        }
+    }
+}
 
 /// Core trait for load balancing policies
 ///
 /// This trait provides a unified interface for implementing routing algorithms
 /// that can work with both regular single-worker selection and PD dual-worker selection.
 pub trait LoadBalancingPolicy: Send + Sync + Debug {
-    /// Select a single worker from the available workers
+    /// Select a single worker from the available workers using routing context
     ///
     /// This is used for regular routing mode where requests go to a single worker.
-    /// Now uses Arc<dyn Worker> for better performance and to avoid unnecessary cloning.
-    fn select_worker(
-        &self,
-        workers: &[Arc<dyn Worker>],
-        request_text: Option<&str>,
-    ) -> Option<usize>;
+    /// Uses RoutingContext to provide request headers, text, and model information
+    /// for routing decisions.
+    fn select_worker(&self, workers: &[Arc<dyn Worker>], context: &RoutingContext)
+        -> Option<usize>;
 
-    /// Select a pair of workers (prefill and decode) for PD routing
+    /// Select a pair of workers (prefill and decode) for PD routing using routing context
     ///
     /// Returns indices of (prefill_worker, decode_worker) from their respective arrays.
     /// Default implementation uses select_worker for each array independently.
@@ -44,11 +82,11 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         &self,
         prefill_workers: &[Arc<dyn Worker>],
         decode_workers: &[Arc<dyn Worker>],
-        request_text: Option<&str>,
+        context: &RoutingContext,
     ) -> Option<(usize, usize)> {
         // Default implementation: independently select from each pool
-        let prefill_idx = self.select_worker(prefill_workers, request_text)?;
-        let decode_idx = self.select_worker(decode_workers, request_text)?;
+        let prefill_idx = self.select_worker(prefill_workers, context)?;
+        let decode_idx = self.select_worker(decode_workers, context)?;
         Some((prefill_idx, decode_idx))
     }
 

@@ -261,6 +261,12 @@ pub enum PolicyConfig {
         /// Interval for load monitoring (seconds)
         load_check_interval_secs: u64,
     },
+
+    #[serde(rename = "load_aware")]
+    LoadAware,
+
+    #[serde(rename = "rule_based")]
+    RuleBased,
 }
 
 impl PolicyConfig {
@@ -270,6 +276,8 @@ impl PolicyConfig {
             PolicyConfig::RoundRobin => "round_robin",
             PolicyConfig::CacheAware { .. } => "cache_aware",
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
+            PolicyConfig::LoadAware => "load_aware",
+            PolicyConfig::RuleBased => "rule_based",
         }
     }
 }
@@ -670,6 +678,10 @@ mod tests {
             load_check_interval_secs: 60,
         };
         assert_eq!(power_of_two.name(), "power_of_two");
+
+        assert_eq!(PolicyConfig::LoadAware.name(), "load_aware");
+
+        assert_eq!(PolicyConfig::RuleBased.name(), "rule_based");
     }
 
     #[test]
@@ -696,6 +708,16 @@ mod tests {
         let json = serde_json::to_string(&power_of_two).unwrap();
         assert!(json.contains("\"type\":\"power_of_two\""));
         assert!(json.contains("\"load_check_interval_secs\":60"));
+
+        // Test LoadAware
+        let load_aware = PolicyConfig::LoadAware;
+        let json = serde_json::to_string(&load_aware).unwrap();
+        assert_eq!(json, r#"{"type":"load_aware"}"#);
+
+        // Test RuleBased
+        let rule_based = PolicyConfig::RuleBased;
+        let json = serde_json::to_string(&rule_based).unwrap();
+        assert_eq!(json, r#"{"type":"rule_based"}"#);
     }
 
     #[test]
@@ -741,6 +763,19 @@ mod tests {
             _ => panic!("Expected PowerOfTwo"),
         }
     }
+
+    #[test]
+    fn test_rule_based_simple() {
+        // RuleBased is now a simple variant with no parameters
+        let rule_based = PolicyConfig::RuleBased;
+        assert_eq!(rule_based.name(), "rule_based");
+
+        // Test serialization
+        let json = serde_json::to_string(&rule_based).unwrap();
+        assert_eq!(json, r#"{"type":"rule_based"}"#);
+    }
+
+    // ============= DiscoveryConfig Tests =============
 
     #[test]
     fn test_discovery_config_default() {

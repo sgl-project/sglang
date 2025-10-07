@@ -1,8 +1,8 @@
 //! Factory for creating load balancing policies
 
 use super::{
-    CacheAwareConfig, CacheAwarePolicy, LoadBalancingPolicy, PowerOfTwoPolicy, RandomPolicy,
-    RoundRobinPolicy,
+    CacheAwareConfig, CacheAwarePolicy, LoadAwarePolicy, LoadBalancingPolicy, PowerOfTwoPolicy,
+    RandomPolicy, RoundRobinPolicy, RuleBasedPolicy,
 };
 use crate::config::PolicyConfig;
 use std::sync::Arc;
@@ -33,6 +33,8 @@ impl PolicyFactory {
                 };
                 Arc::new(CacheAwarePolicy::with_config(config))
             }
+            PolicyConfig::LoadAware => Arc::new(LoadAwarePolicy::new()),
+            PolicyConfig::RuleBased => Arc::new(RuleBasedPolicy::new()),
         }
     }
 
@@ -43,6 +45,8 @@ impl PolicyFactory {
             "round_robin" | "roundrobin" => Some(Arc::new(RoundRobinPolicy::new())),
             "power_of_two" | "poweroftwo" => Some(Arc::new(PowerOfTwoPolicy::new())),
             "cache_aware" | "cacheaware" => Some(Arc::new(CacheAwarePolicy::new())),
+            "load_aware" | "loadaware" => Some(Arc::new(LoadAwarePolicy::new())),
+            "rule_based" | "rulebased" => Some(Arc::new(RuleBasedPolicy::default())),
             _ => None,
         }
     }
@@ -73,6 +77,14 @@ mod tests {
             max_tree_size: 1000,
         });
         assert_eq!(policy.name(), "cache_aware");
+
+        // Test LoadAware
+        let policy = PolicyFactory::create_from_config(&PolicyConfig::LoadAware);
+        assert_eq!(policy.name(), "load_aware");
+
+        // Test RuleBased
+        let policy = PolicyFactory::create_from_config(&PolicyConfig::RuleBased);
+        assert_eq!(policy.name(), "rule_based");
     }
 
     #[test]
@@ -86,5 +98,9 @@ mod tests {
         assert!(PolicyFactory::create_by_name("cache_aware").is_some());
         assert!(PolicyFactory::create_by_name("CacheAware").is_some());
         assert!(PolicyFactory::create_by_name("unknown").is_none());
+        assert!(PolicyFactory::create_by_name("rule_based").is_some());
+        assert!(PolicyFactory::create_by_name("RuleBased").is_some());
+        assert!(PolicyFactory::create_by_name("load_aware").is_some());
+        assert!(PolicyFactory::create_by_name("LoadAware").is_some());
     }
 }

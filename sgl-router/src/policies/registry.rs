@@ -5,8 +5,8 @@
 /// All subsequent workers of the same model use the established policy.
 /// When the last worker of a model is removed, the policy mapping is cleaned up.
 use super::{
-    CacheAwareConfig, CacheAwarePolicy, LoadBalancingPolicy, PowerOfTwoPolicy, RandomPolicy,
-    RoundRobinPolicy,
+    CacheAwareConfig, CacheAwarePolicy, LoadAwarePolicy, LoadBalancingPolicy, PowerOfTwoPolicy,
+    RandomPolicy, RoundRobinPolicy, RuleBasedPolicy,
 };
 use crate::config::types::PolicyConfig;
 use crate::core::Worker;
@@ -169,10 +169,12 @@ impl PolicyRegistry {
     /// Create a policy from a type string
     fn create_policy_from_type(&self, policy_type: &str) -> Arc<dyn LoadBalancingPolicy> {
         match policy_type {
-            "round_robin" => Arc::new(RoundRobinPolicy::new()),
-            "random" => Arc::new(RandomPolicy::new()),
             "cache_aware" => Arc::new(CacheAwarePolicy::new()),
+            "load_aware" => Arc::new(LoadAwarePolicy::new()),
             "power_of_two" => Arc::new(PowerOfTwoPolicy::new()),
+            "random" => Arc::new(RandomPolicy::new()),
+            "round_robin" => Arc::new(RoundRobinPolicy::new()),
+            "rule_based" => Arc::new(RuleBasedPolicy::default()),
             _ => {
                 warn!("Unknown policy type '{}', using default", policy_type);
                 Arc::clone(&self.default_policy)
@@ -202,6 +204,8 @@ impl PolicyRegistry {
                 Arc::new(CacheAwarePolicy::with_config(cache_config))
             }
             PolicyConfig::PowerOfTwo { .. } => Arc::new(PowerOfTwoPolicy::new()),
+            PolicyConfig::LoadAware => Arc::new(LoadAwarePolicy::new()),
+            PolicyConfig::RuleBased => Arc::new(RuleBasedPolicy::new()),
         }
     }
 

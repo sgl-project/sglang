@@ -1,6 +1,6 @@
 //! Round-robin load balancing policy
 
-use super::{get_healthy_worker_indices, LoadBalancingPolicy};
+use super::{get_healthy_worker_indices, LoadBalancingPolicy, RoutingContext};
 use crate::core::Worker;
 use crate::metrics::RouterMetrics;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -26,7 +26,7 @@ impl LoadBalancingPolicy for RoundRobinPolicy {
     fn select_worker(
         &self,
         workers: &[Arc<dyn Worker>],
-        _request_text: Option<&str>,
+        _context: &RoutingContext,
     ) -> Option<usize> {
         let healthy_indices = get_healthy_worker_indices(workers);
 
@@ -84,11 +84,12 @@ mod tests {
         ];
 
         // Should select workers in order: 0, 1, 2, 0, 1, 2, ...
-        assert_eq!(policy.select_worker(&workers, None), Some(0));
-        assert_eq!(policy.select_worker(&workers, None), Some(1));
-        assert_eq!(policy.select_worker(&workers, None), Some(2));
-        assert_eq!(policy.select_worker(&workers, None), Some(0));
-        assert_eq!(policy.select_worker(&workers, None), Some(1));
+        let context = super::RoutingContext::from_text(None);
+        assert_eq!(policy.select_worker(&workers, &context), Some(0));
+        assert_eq!(policy.select_worker(&workers, &context), Some(1));
+        assert_eq!(policy.select_worker(&workers, &context), Some(2));
+        assert_eq!(policy.select_worker(&workers, &context), Some(0));
+        assert_eq!(policy.select_worker(&workers, &context), Some(1));
     }
 
     #[test]
@@ -116,10 +117,11 @@ mod tests {
         workers[1].set_healthy(false);
 
         // Should skip unhealthy worker: 0, 2, 0, 2, ...
-        assert_eq!(policy.select_worker(&workers, None), Some(0));
-        assert_eq!(policy.select_worker(&workers, None), Some(2));
-        assert_eq!(policy.select_worker(&workers, None), Some(0));
-        assert_eq!(policy.select_worker(&workers, None), Some(2));
+        let context = super::RoutingContext::from_text(None);
+        assert_eq!(policy.select_worker(&workers, &context), Some(0));
+        assert_eq!(policy.select_worker(&workers, &context), Some(2));
+        assert_eq!(policy.select_worker(&workers, &context), Some(0));
+        assert_eq!(policy.select_worker(&workers, &context), Some(2));
     }
 
     #[test]
@@ -139,11 +141,12 @@ mod tests {
         ];
 
         // Advance the counter
-        assert_eq!(policy.select_worker(&workers, None), Some(0));
-        assert_eq!(policy.select_worker(&workers, None), Some(1));
+        let context = super::RoutingContext::from_text(None);
+        assert_eq!(policy.select_worker(&workers, &context), Some(0));
+        assert_eq!(policy.select_worker(&workers, &context), Some(1));
 
         // Reset should start from beginning
         policy.reset();
-        assert_eq!(policy.select_worker(&workers, None), Some(0));
+        assert_eq!(policy.select_worker(&workers, &context), Some(0));
     }
 }
