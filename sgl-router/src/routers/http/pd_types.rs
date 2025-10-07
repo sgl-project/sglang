@@ -32,14 +32,6 @@ pub fn api_path(url: &str, api_path: &str) -> String {
     }
 }
 
-pub fn get_hostname(url: &str) -> String {
-    // Simple hostname extraction without external dependencies
-    let url = url
-        .trim_start_matches("http://")
-        .trim_start_matches("https://");
-    url.split(':').next().unwrap_or("localhost").to_string()
-}
-
 use serde::Serialize;
 
 // Optimized bootstrap wrapper for single requests

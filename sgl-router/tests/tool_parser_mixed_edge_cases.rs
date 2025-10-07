@@ -4,9 +4,11 @@
 
 use serde_json::json;
 use sglang_router_rs::tool_parser::{
-    JsonParser, LlamaParser, MistralParser, ParseState, PythonicParser, QwenParser, StreamResult,
-    ToolParser,
+    JsonParser, LlamaParser, MistralParser, PythonicParser, QwenParser, ToolParser,
 };
+
+mod common;
+use common::create_test_tools;
 
 #[tokio::test]
 async fn test_mixed_formats_in_text() {
@@ -152,25 +154,22 @@ async fn test_special_json_values() {
 
 #[tokio::test]
 async fn test_parser_recovery_after_invalid_input() {
-    let mut state = ParseState::new();
-    let parser = JsonParser::new();
+    let mut parser = JsonParser::new();
+    let tools = create_test_tools();
 
     // Send invalid JSON first
-    let _ = parser.parse_incremental(r#"{"broken": "#, &mut state).await;
+    let _ = parser.parse_incremental(r#"{"broken": "#, &tools).await;
 
-    // Clear state and try valid JSON
-    state.buffer.clear();
-    let result = parser
-        .parse_incremental(r#"{"name": "valid", "arguments": {}}"#, &mut state)
+    // Create a new parser instance for clean state
+    let mut parser2 = JsonParser::new();
+    let result = parser2
+        .parse_incremental(r#"{"name": "valid", "arguments": {}}"#, &tools)
         .await
         .unwrap();
 
-    match result {
-        StreamResult::ToolComplete(tool) => {
-            assert_eq!(tool.function.name, "valid");
-        }
-        _ => {
-            // Might be incomplete depending on implementation
+    if !result.calls.is_empty() {
+        if let Some(name) = &result.calls[0].name {
+            assert_eq!(name, "valid");
         }
     }
 }

@@ -14,13 +14,16 @@ from concurrent import futures
 from typing import AsyncIterator, Dict, Optional, Tuple
 
 import grpc
+from google.protobuf.json_format import MessageToDict
 from grpc_reflection.v1alpha import reflection
 
+from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.entrypoints.grpc_request_manager import GrpcRequestManager
 from sglang.srt.grpc import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
 from sglang.srt.managers.data_parallel_controller import (
     run_data_parallel_controller_process,
 )
+from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -112,7 +115,6 @@ def _launch_scheduler_process_only(
                         pp_rank,
                         None,
                         writer,
-                        None,
                     ),
                 )
 
@@ -332,6 +334,10 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 token_ids_logprob=None,
             )
 
+            if self.server_args.disaggregation_mode != DisaggregationMode.NULL:
+                health_request.bootstrap_host = FAKE_BOOTSTRAP_HOST
+                health_request.bootstrap_room = 0
+
             logger.info(f"Sending health check request to request manager...")
 
             # Submit and wait for response
@@ -407,6 +413,15 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         # Convert sampling params
         sampling_params = self._convert_sampling_params(grpc_req.sampling_params)
 
+        # Extract disaggregated params if present
+        bootstrap_host = None
+        bootstrap_port = None
+        bootstrap_room = None
+        if grpc_req.HasField("disaggregated_params"):
+            bootstrap_host = grpc_req.disaggregated_params.bootstrap_host or None
+            bootstrap_port = grpc_req.disaggregated_params.bootstrap_port or None
+            bootstrap_room = grpc_req.disaggregated_params.bootstrap_room or None
+
         # Create request
         return TokenizedGenerateReqInput(
             rid=grpc_req.request_id,
@@ -426,6 +441,9 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             token_ids_logprob=(
                 list(grpc_req.token_ids_logprob) if grpc_req.token_ids_logprob else None
             ),
+            bootstrap_host=bootstrap_host,
+            bootstrap_port=bootstrap_port,
+            bootstrap_room=bootstrap_room,
         )
 
     def _convert_embed_request(
@@ -466,28 +484,52 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         elif grpc_params.HasField("structural_tag"):
             structural_tag = grpc_params.structural_tag
 
+        # Handle optional parameters conversion
+        custom_params = (
+            MessageToDict(grpc_params.custom_params)
+            if grpc_params.HasField("custom_params")
+            else None
+        )
+        max_new_tokens = (
+            grpc_params.max_new_tokens
+            if grpc_params.HasField("max_new_tokens")
+            else None
+        )
+        stream_interval = (
+            grpc_params.stream_interval
+            if grpc_params.HasField("stream_interval")
+            else None
+        )
+        logit_bias = dict(grpc_params.logit_bias) if grpc_params.logit_bias else None
+        stop = list(grpc_params.stop) if grpc_params.stop else None
+        stop_token_ids = (
+            list(grpc_params.stop_token_ids) if grpc_params.stop_token_ids else None
+        )
+
         return SGLSamplingParams(
-            temperature=grpc_params.temperature or 1.0,
-            top_p=grpc_params.top_p or 1.0,
-            top_k=grpc_params.top_k or -1,
-            min_p=grpc_params.min_p or 0.0,
-            frequency_penalty=grpc_params.frequency_penalty or 0.0,
-            presence_penalty=grpc_params.presence_penalty or 0.0,
-            repetition_penalty=grpc_params.repetition_penalty or 1.0,
-            max_new_tokens=grpc_params.max_new_tokens or 128,
-            min_new_tokens=grpc_params.min_new_tokens or 0,
-            stop=list(grpc_params.stop) if grpc_params.stop else [],
-            stop_token_ids=(
-                list(grpc_params.stop_token_ids) if grpc_params.stop_token_ids else []
-            ),
+            temperature=grpc_params.temperature,
+            top_p=grpc_params.top_p,
+            top_k=grpc_params.top_k,
+            min_p=grpc_params.min_p,
+            frequency_penalty=grpc_params.frequency_penalty,
+            presence_penalty=grpc_params.presence_penalty,
+            repetition_penalty=grpc_params.repetition_penalty,
+            max_new_tokens=max_new_tokens,
+            min_new_tokens=grpc_params.min_new_tokens,
+            stop=stop,
+            stop_token_ids=stop_token_ids,
             skip_special_tokens=grpc_params.skip_special_tokens,
             spaces_between_special_tokens=grpc_params.spaces_between_special_tokens,
+            no_stop_trim=grpc_params.no_stop_trim,
             regex=regex,
             json_schema=json_schema,
             ebnf=ebnf_grammar,
             structural_tag=structural_tag,
-            n=grpc_params.n or 1,
+            n=grpc_params.n,
             ignore_eos=grpc_params.ignore_eos,
+            stream_interval=stream_interval,
+            logit_bias=logit_bias,
+            custom_params=custom_params,
         )
 
     def _convert_output_logprobs_to_proto(
@@ -583,6 +625,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 cached_tokens=meta_info.get("cached_tokens", 0),
                 output_logprobs=output_logprobs_proto,
                 input_logprobs=input_logprobs_proto,
+                index=output.get("index", 0),
             ),
         )
 
@@ -640,6 +683,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 cached_tokens=meta_info.get("cached_tokens", 0),
                 output_logprobs=output_logprobs_proto,
                 input_logprobs=input_logprobs_proto,
+                index=output.get("index", 0),
                 **matched_stop_kwargs,
             ),
         )
@@ -657,6 +701,16 @@ async def serve_grpc(
     model_info: Optional[Dict] = None,
 ):
     """Start the standalone gRPC server with integrated scheduler."""
+
+    # Start bootstrap server BEFORE launching scheduler processes (only in PREFILL mode)
+    # This ensures the bootstrap server is ready when prefill schedulers try to register
+    bootstrap_server = None
+    if server_args.disaggregation_mode == "prefill":
+        bootstrap_server = start_disagg_service(server_args)
+        if bootstrap_server:
+            logger.info(
+                f"Bootstrap server started for disaggregation mode on {server_args.host}:{server_args.disaggregation_bootstrap_port}"
+            )
 
     # Launch only the scheduler process(es) (no tokenizer/detokenizer needed for gRPC)
     logger.info("Launching scheduler process(es)...")
@@ -681,9 +735,11 @@ async def serve_grpc(
         }
 
     # Create request manager with the correct port args
+    # Note: We pass None for bootstrap_server since it's already started above
     request_manager = GrpcRequestManager(
         server_args=server_args,
         port_args=port_args,
+        bootstrap_server=bootstrap_server,
     )
 
     # Create gRPC server
@@ -763,55 +819,9 @@ def main():
     mp.set_start_method("spawn", force=True)
 
     parser = argparse.ArgumentParser(description="SGLang Standalone gRPC Server")
-
-    # Server arguments
-    parser.add_argument("--host", type=str, default="0.0.0.0", help="Host to bind to")
-    parser.add_argument("--port", type=int, default=30000, help="gRPC server port")
-
-    # Model arguments
-    parser.add_argument("--model-path", type=str, required=True, help="Model path")
-    parser.add_argument("--tokenizer-path", type=str, help="Tokenizer path")
-    parser.add_argument("--context-length", type=int, help="Context length")
-    parser.add_argument("--tp-size", type=int, default=1, help="Tensor parallel size")
-    parser.add_argument("--dp-size", type=int, default=1, help="Data parallel size")
-
-    # Runtime arguments
-    parser.add_argument(
-        "--max-running-requests", type=int, default=2048, help="Max concurrent requests"
-    )
-    parser.add_argument(
-        "--max-total-tokens", type=int, default=1000000, help="Max total tokens"
-    )
-    parser.add_argument(
-        "--max-prefill-tokens", type=int, default=16384, help="Max prefill tokens"
-    )
-    parser.add_argument(
-        "--attention-backend", type=str, default="flashinfer", help="Attention backend"
-    )
-    parser.add_argument("--lora-paths", type=str, help="LoRA adapter paths")
-
-    # Logging
-    parser.add_argument("--log-level", type=str, default="INFO", help="Logging level")
-
+    ServerArgs.add_cli_args(parser)
     args = parser.parse_args()
-
-    # Convert to ServerArgs with gRPC host and port
-    server_args = ServerArgs(
-        model_path=args.model_path,
-        tokenizer_path=args.tokenizer_path or args.model_path,
-        context_length=args.context_length,
-        tp_size=args.tp_size,
-        dp_size=args.dp_size,
-        max_running_requests=args.max_running_requests,
-        max_total_tokens=args.max_total_tokens,
-        max_prefill_tokens=args.max_prefill_tokens,
-        attention_backend=args.attention_backend,
-        lora_paths=args.lora_paths.split(",") if args.lora_paths else None,
-        log_level=args.log_level,
-        # Override with gRPC server host and port
-        host=args.host,
-        port=args.port,
-    )
+    server_args = ServerArgs.from_cli_args(args)
 
     # Run server
     asyncio.run(
