@@ -209,17 +209,18 @@ class XLMRobertaModel(nn.Module):
         config: RobertaConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        use_bge_m3_sparse: Optional[bool] = None,
+        sparse_head: Optional[str] = None,
         model_path: Optional[str] = None,
     ):
         super().__init__()
         self.roberta = XLMRobertaBaseModel(
             config=config, quant_config=quant_config, prefix=prefix
         )
-        if use_bge_m3_sparse:
-            self._model_path = model_path
-            self.pooler = SparsePooler(config=config)
+        if sparse_head is not none:
             self._is_sparse = True
+            self._model_path = model_path
+            self._sparse_head = sparse_head
+            self.pooler = SparsePooler(config=config)
             # Zero out special tokens
             self._special_tokens = [
                 config.bos_token_id,
@@ -228,8 +229,8 @@ class XLMRobertaModel(nn.Module):
                 # self.config.unk_token_id # not available in the XLMRobertaConfig
             ]
         else:
-            self.pooler = Pooler(pooling_type=PoolingType.CLS, normalize=True)
             self._is_sparse = False
+            self.pooler = Pooler(pooling_type=PoolingType.CLS, normalize=True)
 
     def forward(
         self,
@@ -255,31 +256,29 @@ class XLMRobertaModel(nn.Module):
         self.roberta.load_weights(weights)
 
         if self._is_sparse:
-            sparse_dict = XLMRobertaModel._load_sparse_linear(self._model_path)
+            sparse_dict = XLMRobertaModel._load_sparse_linear(
+                self._model_path, self._sparse_head
+            )
             self.pooler.load_weights(sparse_dict)
 
     @staticmethod
-    def _load_sparse_linear(model_path_or_dir: str) -> dict:
+    def _load_sparse_linear(model_path_or_dir: str, sparse_head: str) -> dict:
         """
-        Load sparse_linear.pt from local dir, file, or HF Hub.
+        Load sparse_head from local dir or HF Hub.
         Returns a state_dict suitable for nn.Linear.load_state_dict().
         """
         if os.path.isdir(model_path_or_dir):
-            path = os.path.join(model_path_or_dir, "sparse_linear.pt")
+            path = os.path.join(model_path_or_dir, sparse_head)
             if not os.path.exists(path):
                 raise FileNotFoundError(
-                    f"'sparse_linear.pt' not found in {model_path_or_dir}"
+                    f"'{sparse_head}' not found in {model_path_or_dir}"
                 )
-        elif os.path.isfile(model_path_or_dir):
-            path = model_path_or_dir
-            if os.path.basename(path) != "sparse_linear.pt":
-                raise ValueError(f"Expected 'sparse_linear.pt', got {path}")
         else:
             # remote → use SGLang HF utility
-            local_dir = download_from_hf(
-                model_path_or_dir, allow_patterns="sparse_linear.pt"
-            )
-            path = os.path.join(local_dir, "sparse_linear.pt")
+            local_dir = download_from_hf(model_path_or_dir, allow_patterns=sparse_head)
+            path = os.path.join(local_dir, sparse_head)
+
+        print(f"Loading Sparse Head: {path}")
 
         state_dict = torch.load(path)
         return state_dict
