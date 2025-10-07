@@ -131,11 +131,25 @@ impl<'a> Detector<'a> {
         }
     }
 
-    /// Check if expr accesses .content on any variable in our scope
+    /// Check if expr accesses .content on any variable in our scope, or any descendant of it.
     fn is_any_scope_var_content(&self, expr: &Expr) -> bool {
-        self.scope_set
-            .iter()
-            .any(|v| Self::is_var_dot_content(expr, v))
+        let mut current_expr = expr;
+        loop {
+            // Check if current level matches <scopeVar>.content
+            if self
+                .scope_set
+                .iter()
+                .any(|v| Self::is_var_dot_content(current_expr, v))
+            {
+                return true;
+            }
+            // Walk up the expression tree
+            match current_expr {
+                Expr::GetAttr(g) => current_expr = &g.expr,
+                Expr::GetItem(g) => current_expr = &g.expr,
+                _ => return false,
+            }
+        }
     }
 
     fn walk_stmt(&mut self, stmt: &Stmt) {
@@ -216,6 +230,10 @@ impl<'a> Detector<'a> {
     }
 
     fn inspect_expr_for_structure(&mut self, expr: &Expr) {
+        if self.flags.saw_structure {
+            return;
+        }
+
         match expr {
             // content[0] or message.content[0]
             Expr::GetItem(gi) => {
@@ -258,12 +276,25 @@ impl<'a> Detector<'a> {
                 // Keep walking; nested expressions can hide structure checks
                 self.inspect_expr_for_structure(&g.expr);
             }
+            // Handle binary operations like: if (message.content is string) and other_cond
+            Expr::BinOp(op) => {
+                self.inspect_expr_for_structure(&op.left);
+                self.inspect_expr_for_structure(&op.right);
+            }
+            // Handle unary operations like: if not (message.content is string)
+            Expr::UnaryOp(op) => {
+                self.inspect_expr_for_structure(&op.expr);
+            }
             _ => {}
         }
     }
 
     fn scan_macro_body(body: &[Stmt], has_type_check: &mut bool, has_loop: &mut bool) {
         for s in body {
+            if *has_type_check && *has_loop {
+                return;
+            }
+
             match s {
                 Stmt::IfCond(ic) => {
                     if matches!(&ic.expr, Expr::Test(_)) {
