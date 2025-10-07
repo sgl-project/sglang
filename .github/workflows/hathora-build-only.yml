@@ -17,11 +17,11 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.22.4'
-      - run: go install github.com/hathora/ci/hathora@latest
+          go-version: '1.24.7'
+      - run: go install github.com/hathora/ci/hathora@0.3.4
 
       - name: Create Hathora build (no deploy)
         env:
           HATHORA_TOKEN: ${{ secrets.HATHORA_TOKEN }}
         run: |
-          hathora build create
+          hathora build create --build-tag "sglang-${{ github.sha }}"
