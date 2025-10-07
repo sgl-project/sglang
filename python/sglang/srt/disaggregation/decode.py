@@ -783,16 +783,6 @@ class SchedulerDisaggregationDecodeMixin:
                         self.prepare_mlp_sync_batch(batch)
                     result = self.run_batch(batch)
                     self.result_queue.append((batch.copy(), result))
-
-                    if (self.last_batch is None) or (not self.last_batch_in_queue):
-                        # Create a dummy first batch to start the pipeline for overlap schedule.
-                        # It is now used for triggering the sampling_info_done event.
-                        tmp_batch = ScheduleBatch(
-                            reqs=None,
-                            forward_mode=ForwardMode.DUMMY_FIRST,
-                            next_batch_sampling_info=self.tp_worker.cur_sampling_info,
-                        )
-                        self.set_next_batch_sampling_info_done(tmp_batch)
                     last_batch_in_queue = True
 
             elif prepare_mlp_sync_flag:
@@ -806,9 +796,6 @@ class SchedulerDisaggregationDecodeMixin:
             # Process the results of the previous batch but skip if the last batch is extend
             if self.last_batch and self.last_batch_in_queue:
                 tmp_batch, tmp_result = self.result_queue.popleft()
-                tmp_batch.next_batch_sampling_info = (
-                    self.tp_worker.cur_sampling_info if batch else None
-                )
                 self.process_batch_result(tmp_batch, tmp_result)
 
             queue_size = (
