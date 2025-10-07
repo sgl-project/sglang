@@ -27,6 +27,11 @@ service SglangScheduler {
 // =====================
 
 // Sampling parameters matching SGLang's SamplingParams
+//
+// IMPORTANT: Do not use SamplingParams::default() directly!
+// The proto3 defaults (0 for numeric fields) do NOT match the semantic defaults
+// (temperature=1.0, top_p=1.0, top_k=-1, etc.). Always construct with explicit values
+// or use the conversion functions in sglang_scheduler.rs / grpc_server.py.
 message SamplingParams {
   float temperature = 1;
   float top_p = 2;
@@ -50,24 +55,18 @@ message SamplingParams {
     string structural_tag = 16;
   }
 
-  // LoRA adapter
-  string lora_path = 17;
-
   // Speculative decoding
-  int32 n = 18;  // Number of samples
-
-  // Token healing
-  bool token_healing = 19;
+  int32 n = 17;  // Number of samples
 
   // Additional parameters
-  int32 min_new_tokens = 20;
-  bool ignore_eos = 21;
-  bool no_stop_trim = 22;
-  int32 stream_interval = 23;
-  map<string, float> logit_bias = 24;
+  int32 min_new_tokens = 18;
+  bool ignore_eos = 19;
+  bool no_stop_trim = 20;
+  optional int32 stream_interval = 21;
+  map<string, float> logit_bias = 22;
 
   // Custom parameters for extensibility
-  google.protobuf.Struct custom_params = 25;
+  google.protobuf.Struct custom_params = 23;
 }
 
 
