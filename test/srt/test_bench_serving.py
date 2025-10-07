@@ -430,7 +430,7 @@ class TestBenchServing(CustomTestCase):
                 "--quantization",
                 "fp8",
                 "--pp-size",
-                2,
+                "2",
             ],
             need_warmup=False,
             seed=42,
