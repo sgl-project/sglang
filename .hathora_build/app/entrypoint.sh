@@ -54,7 +54,6 @@ log "MAX_TOTAL_TOKENS: $MAX_TOTAL_TOKENS"
 log "MAX_QUEUED_REQUESTS: $MAX_QUEUED_REQUESTS"
 log "LOG_LEVEL: $LOG_LEVEL"
 log "ENABLE_METRICS: $ENABLE_METRICS"
-log "H100_ONLY: $H100_ONLY"
 log "AUTO_USE_FP8_ON_H100: $AUTO_USE_FP8_ON_H100"
 if [[ -n "${CONCURRENCY}" ]]; then
   log "CONCURRENCY: ${CONCURRENCY}"
@@ -167,12 +166,7 @@ log "NCCL tuning: channels=${channels}, buffsize=${buffsize} bytes, shm=${SHM_BY
 # Detect GPUs and optionally enforce H100-only
 GPU_NAMES=$(nvidia-smi --query-gpu=name --format=csv,noheader | tr '\n' ',' || true)
 log "Detected GPUs: ${GPU_NAMES}"
-if [[ "${H100_ONLY}" == "true" ]]; then
-  if ! nvidia-smi --query-gpu=name --format=csv,noheader | grep -q "H100"; then
-    log "Non-H100 GPU detected while H100_ONLY=true. Exiting."
-    exit 1
-  fi
-fi
+:
 
 
 # Extra diagnostics to investigate NCCL/SHM issues

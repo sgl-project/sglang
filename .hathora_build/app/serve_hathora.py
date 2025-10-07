@@ -92,6 +92,11 @@ def _load_deployment_config() -> DeploymentConfig:
             elif "eagle3" in _model_path_env:
                 _spec_algo_default = "EAGLE3"  # single-model eagle3
 
+    _ees = os.environ.get("ENABLE_EXPANDABLE_SEGMENTS", "true").lower() in ("1", "true", "yes")
+    _ems = os.environ.get("ENABLE_MEMORY_SAVER", "true").lower() in ("1", "true", "yes")
+    if _ees:
+        _ems = False
+
     return DeploymentConfig(
         hf_token=os.environ.get("HF_TOKEN"),
         model_id=os.environ.get("MODEL_PATH"),
@@ -115,12 +120,11 @@ def _load_deployment_config() -> DeploymentConfig:
         log_requests=os.environ.get("LOG_REQUESTS", "true").lower() in ("1", "true", "yes"),
         enable_p2p_check=os.environ.get("ENABLE_P2P_CHECK", "false").lower() in ("1", "true", "yes"),
         enable_torch_compile=os.environ.get("ENABLE_TORCH_COMPILE", "false").lower() in ("1", "true", "yes"),
-        # Allow L4 in prod by default; can still force H100 via env
-        h100_only=os.environ.get("H100_ONLY", "false").lower() in ("1", "true", "yes"),
+        # H100-only enforcement removed; always allow
+        h100_only=False,
         auto_use_fp8_on_h100=os.environ.get("AUTO_USE_FP8_ON_H100", "true").lower() in ("1", "true", "yes"),
-        # Memory saver and allocator behavior
-        enable_memory_saver=os.environ.get("ENABLE_MEMORY_SAVER", "true").lower() in ("1", "true", "yes"),
-        enable_expandable_segments=os.environ.get("ENABLE_EXPANDABLE_SEGMENTS", "true").lower() in ("1", "true", "yes"),
+        enable_memory_saver=_ems,
+        enable_expandable_segments=_ees,
         autoscale_target_tokens_per_s=(
             float(os.environ["AUTOSCALE_TARGET_TOKENS_PER_S"]) if os.environ.get("AUTOSCALE_TARGET_TOKENS_PER_S") else None
         ),
@@ -141,9 +145,7 @@ def _load_deployment_config() -> DeploymentConfig:
 
 CONFIG = _load_deployment_config()
 
-if CONFIG.h100_only and not _is_h100_only():
-    logger.error("H100-only constraint violated: non-H100 GPU detected")
-    raise SystemExit(1)
+# H100-only enforcement removed
 
 if CONFIG.hf_token:
     os.environ["HF_TOKEN"] = CONFIG.hf_token
@@ -295,7 +297,11 @@ async def lifespan(app: FastAPI):
             _cuda_graph_max_bs = int(os.environ.get("CUDA_GRAPH_MAX_BS")) if os.environ.get("CUDA_GRAPH_MAX_BS") else None
         except Exception:
             _cuda_graph_max_bs = None
-        # If a generic CONCURRENCY/MAX_CONCURRENCY is provided and explicit knobs are not set, use it for both
+        try:
+            _chunked_prefill_env = os.environ.get("CHUNKED_PREFILL_SIZE")
+            _chunked_prefill_size = int(_chunked_prefill_env) if _chunked_prefill_env else None
+        except Exception:
+            _chunked_prefill_size = None
         try:
             _concurrency_env = os.environ.get("CONCURRENCY") or os.environ.get("MAX_CONCURRENCY")
             if _concurrency_env is not None:
@@ -306,6 +312,37 @@ async def lifespan(app: FastAPI):
                     _cuda_graph_max_bs = _concurrency_val
         except Exception:
             pass
+
+        def _select_profile(concurrency: int) -> tuple[int, float, int]:
+            # returns (cuda_graph_max_bs, mem_fraction_static, chunked_prefill_size)
+            if concurrency <= 0:
+                return 8, 0.8, 4096
+            if concurrency <= 4:
+                return 8, 0.85, 4096
+            if concurrency <= 8:
+                return 16, 0.80, 4096
+            if concurrency <= 16:
+                return 16, 0.78, 4096
+            if concurrency <= 32:
+                return 8, 0.75, 2048
+            # very high concurrency: keep graphs small and more headroom
+            return 8, 0.72, 2048
+
+        _auto_profile_used = False
+        if (_cuda_graph_max_bs is None) or (CONFIG.mem_fraction_static is None) or (_chunked_prefill_size is None):
+            try:
+                if _concurrency_env is not None:
+                    _c = int(_concurrency_env)
+                    prof_bs, prof_mem, prof_chunk = _select_profile(_c)
+                    if _cuda_graph_max_bs is None:
+                        _cuda_graph_max_bs = min(max(1, prof_bs), max(1, _c))
+                    if CONFIG.mem_fraction_static is None:
+                        CONFIG.mem_fraction_static = float(prof_mem)
+                    if _chunked_prefill_size is None:
+                        _chunked_prefill_size = int(prof_chunk)
+                    _auto_profile_used = True
+            except Exception:
+                pass
 
         engine = sgl.Engine(
             model_path=CONFIG.model_id,
@@ -348,7 +385,20 @@ async def lifespan(app: FastAPI):
             speculative_attention_mode=(CONFIG.speculative_attention_mode or "prefill"),
             # Optional CUDA graph max batch size for capture expansion
             cuda_graph_max_bs=_cuda_graph_max_bs,
+            # Optional chunked prefill size tuning
+            chunked_prefill_size=_chunked_prefill_size,
         )
+
+        # Log chosen auto profile if applied
+        if _auto_profile_used:
+            try:
+                logger.info(
+                    f"Auto profile applied based on CONCURRENCY={_concurrency_env}: "
+                    f"cuda_graph_max_bs={_cuda_graph_max_bs}, mem_fraction_static={CONFIG.mem_fraction_static}, "
+                    f"chunked_prefill_size={_chunked_prefill_size}"
+                )
+            except Exception:
+                pass
         # Optional warmup to avoid first-request latency
         try:
             warmup_on_start = os.environ.get("WARMUP_ON_START", "1").lower() in ("1", "true", "yes")
@@ -1273,3 +1323,4 @@ if __name__ == "__main__":
         log_level=LOG_LEVEL.lower(),
         access_log=True
     )
+    
