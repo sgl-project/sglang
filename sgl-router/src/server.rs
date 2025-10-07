@@ -52,6 +52,8 @@ pub struct AppContext {
     pub router_manager: Option<Arc<RouterManager>>,
     pub response_storage: SharedResponseStorage,
     pub load_monitor: Option<Arc<LoadMonitor>>,
+    pub configured_reasoning_parser: Option<String>,
+    pub configured_tool_parser: Option<String>,
 }
 
 impl AppContext {
@@ -115,6 +117,9 @@ impl AppContext {
             router_config.worker_startup_check_interval_secs,
         )));
 
+        let configured_reasoning_parser = router_config.reasoning_parser.clone();
+        let configured_tool_parser = router_config.tool_call_parser.clone();
+
         Ok(Self {
             client,
             router_config,
@@ -127,6 +132,8 @@ impl AppContext {
             router_manager,
             response_storage,
             load_monitor,
+            configured_reasoning_parser,
+            configured_tool_parser,
         })
     }
 }
@@ -807,9 +814,12 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         config.router_config.cors_allowed_origins.clone(),
     );
 
-    let addr = format!("{}:{}", config.host, config.port);
-    let listener = TcpListener::bind(&addr).await?;
-    info!("Starting server on {}", addr);
+    // TcpListener::bind accepts &str and handles IPv4/IPv6 via ToSocketAddrs
+    let bind_addr = format!("{}:{}", config.host, config.port);
+    info!("Starting server on {}", bind_addr);
+    let listener = TcpListener::bind(&bind_addr)
+        .await
+        .map_err(|e| format!("Failed to bind to {}: {}", bind_addr, e))?;
     serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await

@@ -5,7 +5,6 @@ mod test_pd_routing {
         CircuitBreakerConfig, ConnectionMode, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
     };
     use sglang_router_rs::core::{BasicWorkerBuilder, Worker, WorkerType};
-    use sglang_router_rs::routers::http::pd_types::get_hostname;
     use sglang_router_rs::routers::http::pd_types::PDSelectionPolicy;
     use sglang_router_rs::routers::RouterFactory;
 
@@ -196,6 +195,8 @@ mod test_pd_routing {
                 tokenizer_path: None,
                 history_backend: sglang_router_rs::config::HistoryBackend::Memory,
                 oracle: None,
+                reasoning_parser: None,
+                tool_call_parser: None,
             };
 
             let app_context =
@@ -286,7 +287,7 @@ mod test_pd_routing {
             _ => None,
         };
 
-        single_json["bootstrap_host"] = json!(get_hostname(prefill_worker.url()));
+        single_json["bootstrap_host"] = json!(prefill_worker.bootstrap_host());
         single_json["bootstrap_port"] = json!(bootstrap_port);
         single_json["bootstrap_room"] = json!(12345u64); // Random room ID
 
@@ -301,7 +302,7 @@ mod test_pd_routing {
         });
 
         let batch_size = 3;
-        let hostname = get_hostname(prefill_worker.url());
+        let hostname = prefill_worker.bootstrap_host();
         batch_json["bootstrap_host"] = json!(vec![hostname; batch_size]);
         batch_json["bootstrap_port"] = json!(vec![bootstrap_port; batch_size]);
         batch_json["bootstrap_room"] = json!(vec![111u64, 222u64, 333u64]);
@@ -341,22 +342,6 @@ mod test_pd_routing {
         assert_eq!(parsed["bootstrap_host"], "prefill1");
         assert_eq!(parsed["bootstrap_port"], 9000);
         assert_eq!(parsed["bootstrap_room"], 12345);
-    }
-
-    #[test]
-    fn test_hostname_extraction() {
-        let test_cases = vec![
-            ("http://localhost:8080", "localhost"),
-            ("http://10.0.0.1:8080", "10.0.0.1"),
-            ("https://api.example.com:443", "api.example.com"),
-            ("http://prefill-server", "prefill-server"),
-            ("http://[::1]:8080", "["),  // IPv6 edge case
-            ("prefill:8080", "prefill"), // No protocol
-        ];
-
-        for (url, expected_hostname) in test_cases {
-            assert_eq!(get_hostname(url), expected_hostname);
-        }
     }
 
     #[test]
@@ -644,7 +629,7 @@ mod test_pd_routing {
             _ => None,
         };
         let batch_size = 16;
-        let hostname = get_hostname(prefill_worker.url());
+        let hostname = prefill_worker.bootstrap_host();
 
         benchmark_request["bootstrap_host"] = json!(vec![hostname; batch_size]);
         benchmark_request["bootstrap_port"] = json!(vec![bootstrap_port; batch_size]);
@@ -769,7 +754,7 @@ mod test_pd_routing {
                 WorkerType::Prefill { bootstrap_port } => bootstrap_port,
                 _ => None,
             };
-            let hostname = get_hostname(prefill_worker.url());
+            let hostname = prefill_worker.bootstrap_host();
 
             large_batch_request["bootstrap_host"] = json!(vec![hostname; batch_size]);
             large_batch_request["bootstrap_port"] = json!(vec![bootstrap_port; batch_size]);
