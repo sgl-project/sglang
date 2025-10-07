@@ -74,31 +74,6 @@ class OpenAIServingChat(OpenAIServingBase):
             logger.info(
                 f"Using default chat sampling params from model generation config: {self.default_sampling_params}",
             )
-            self._override_chat_protocol_defaults()
-
-    def _override_chat_protocol_defaults(self) -> None:
-        """Override protocol-level defaults with model-specific sampling defaults."""
-        overrides_applied = {}
-        for param_name, param_default in self.default_sampling_params.items():
-            if param_default is None:
-                continue
-            field_info = ChatCompletionRequest.model_fields.get(param_name)
-            if field_info is None or field_info.is_required():
-                continue
-            current_default = field_info.default
-            if current_default == param_default:
-                continue
-            field_info.default = param_default
-            overrides_applied[param_name] = current_default
-        if overrides_applied:
-            ChatCompletionRequest.model_rebuild(force=True)
-            logger.debug(
-                "Overrode chat protocol defaults with model defaults: %s",
-                {
-                    name: {"previous": previous, "current": ChatCompletionRequest.model_fields[name].default}
-                    for name, previous in overrides_applied.items()
-                },
-            )
 
     def _request_id_prefix(self) -> str:
         return "chatcmpl-"
@@ -451,18 +426,36 @@ class OpenAIServingChat(OpenAIServingBase):
         tool_call_constraint: Optional[Any],
     ) -> Dict[str, Any]:
         """Build sampling parameters for the request"""
+
+        # Get defaults directly from the ChatCompletionRequest
+        request_defaults = {
+            p: ChatCompletionRequest.model_fields[p].default
+            for p in ("temperature", "top_p", "top_k", "min_p", "repetition_penalty")
+        }
+
+        # Helper to get parameter value with generation config fallback
+        def get_param(request_value, param_name):
+            if param_name in request_defaults:
+                if request_value != request_defaults[param_name]:
+                    return request_value
+                if param_name in self.default_sampling_params:
+                    return self.default_sampling_params[param_name]
+            return request_value
+
         sampling_params = {
-            "temperature": request.temperature,
+            "temperature": get_param(request.temperature, "temperature"),
             "max_new_tokens": request.max_tokens or request.max_completion_tokens,
             "min_new_tokens": request.min_tokens,
             "stop": stop,
             "stop_token_ids": request.stop_token_ids,
-            "top_p": request.top_p,
-            "top_k": request.top_k,
-            "min_p": request.min_p,
+            "top_p": get_param(request.top_p, "top_p"),
+            "top_k": get_param(request.top_k, "top_k"),
+            "min_p": get_param(request.min_p, "min_p"),
             "presence_penalty": request.presence_penalty,
             "frequency_penalty": request.frequency_penalty,
-            "repetition_penalty": request.repetition_penalty,
+            "repetition_penalty": get_param(
+                request.repetition_penalty, "repetition_penalty"
+            ),
             "regex": request.regex,
             "ebnf": request.ebnf,
             "n": request.n,
