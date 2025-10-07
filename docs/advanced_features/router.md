@@ -442,7 +442,7 @@ When Prometheus is enabled, the router provides several key metrics for observab
 1. **Workers not connecting**: Ensure workers are fully initialized before starting the router. Use `--worker-startup-timeout-secs` to increase wait time.
 
 2. **High latency**:
-   - **Most common cause**: Load Imbalanced.
+   - **A common cause**: Load Imbalanced.
    - Check the `sgl_router_processed_requests_total` metric grouped by `worker`.
    - Cache-aware routing might be prioritizing cache hits too aggressively.
    - Try adjusting `--balance-abs-threshold` and `--balance-rel-threshold`.
