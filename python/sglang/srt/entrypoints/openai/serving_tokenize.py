@@ -23,7 +23,7 @@ class OpenAIServingTokenize(OpenAIServingBase):
         return "tok-"
 
     def _convert_to_internal_request(
-        self, request: TokenizeRequest
+        self, request: TokenizeRequest, raw_request: Request
     ) -> tuple[TokenizeRequest, TokenizeRequest]:
         return request, request
 
@@ -77,7 +77,7 @@ class OpenAIServingDetokenize(OpenAIServingBase):
         return "detok-"
 
     def _convert_to_internal_request(
-        self, request: DetokenizeRequest
+        self, request: DetokenizeRequest, raw_request: Request
     ) -> tuple[DetokenizeRequest, DetokenizeRequest]:
         return request, request
 
