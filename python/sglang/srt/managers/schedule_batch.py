@@ -2033,9 +2033,6 @@ class ModelWorkerBatch:
     # For matryoshka embeddings
     dimensions: Optional[list[int]] = None
 
-    # Overlap event
-    launch_done: Optional[threading.Event] = None
-
     # Overlap scheduler related
     delay_sample_launch: bool = False
 
