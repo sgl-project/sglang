@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import itertools
+import logging
 import os
 from typing import Iterable, Optional, Tuple
 
@@ -15,6 +16,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.bert import BertEncoder
 from sglang.srt.utils.hf_transformers_utils import download_from_hf
+
+logger = logging.getLogger(__name__)
 
 RobertaConfig = None
 
