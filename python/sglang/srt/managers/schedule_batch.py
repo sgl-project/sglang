@@ -60,10 +60,10 @@ from sglang.srt.mem_cache.allocator import (
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
+from sglang.srt.mem_cache.common import write_cache_indices
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
-from sglang.srt.mem_cache.utils import write_cache_indices
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, TimeStats
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -844,6 +844,103 @@ class Req:
         )
 
 
+def alloc_for_extend(
+    batch: "ScheduleBatch",
+    reqs: list[Req],
+    prefix_lens: list[int],
+    seq_lens_cpu: torch.Tensor,
+    extend_num_tokens: int,
+):
+    # Convert to tensors
+    prefix_lens_cpu = torch.tensor(prefix_lens, dtype=torch.int64)
+    extend_lens_cpu = seq_lens_cpu - prefix_lens_cpu
+
+    # Copy to GPU
+    prefix_lens_device = prefix_lens_cpu.to(batch.device, non_blocking=True)
+    seq_lens_device = seq_lens_cpu.to(batch.device, non_blocking=True)
+    extend_lens_device = extend_lens_cpu.to(batch.device, non_blocking=True)
+
+    # Allocate req slots
+    bs = len(reqs)
+    req_pool_indices = batch.alloc_req_slots(bs, reqs)
+    req_pool_indices = torch.tensor(
+        req_pool_indices, dtype=torch.int64, device=batch.device
+    )
+    req_pool_indices_device = req_pool_indices.to(batch.device, non_blocking=True)
+
+    # Allocate memory
+    if batch.token_to_kv_pool_allocator.page_size == 1:
+        out_cache_loc: torch.Tensor = batch.alloc_token_slots(extend_num_tokens)
+    else:
+        last_loc = [
+            (
+                r.prefix_indices[-1:]
+                if len(r.prefix_indices) > 0
+                else torch.tensor([-1], device=batch.device)
+            )
+            for r in reqs
+        ]
+        out_cache_loc: torch.Tensor = batch.alloc_paged_token_slots_extend(
+            prefix_lens_device,
+            prefix_lens_cpu,
+            seq_lens_device,
+            seq_lens_cpu,
+            torch.cat(last_loc),
+            extend_num_tokens,
+        )
+
+    # Write allocated tokens to req_to_token_pool
+    write_cache_indices(
+        out_cache_loc,
+        req_pool_indices_device,
+        req_pool_indices,
+        prefix_lens_device,
+        prefix_lens_cpu,
+        seq_lens_device,
+        seq_lens_cpu,
+        extend_lens_device,
+        extend_lens_cpu,
+        [r.prefix_indices for r in reqs],
+        batch.req_to_token_pool,
+    )
+
+    # update requests
+    for req, req_pool_index in zip(reqs, req_pool_indices.tolist()):
+        req.req_pool_idx = req_pool_index
+
+    return out_cache_loc, req_pool_indices_device
+
+
+def alloc_for_decode(batch: "ScheduleBatch", token_per_req: int):
+
+    bs = len(batch.reqs)
+    seq_lens = batch.seq_lens
+    req_pool_indices = batch.req_pool_indices
+
+    # Allocate token slots
+    if batch.token_to_kv_pool_allocator.page_size == 1:
+        out_cache_loc = batch.alloc_token_slots(bs * token_per_req)
+    else:
+        # Get the last token's KV cache location
+        last_loc = batch.req_to_token_pool.req_to_token[req_pool_indices, seq_lens - 1]
+        # Prepare tensors for allocation
+        seq_lens_next = seq_lens + token_per_req
+        out_cache_loc = batch.alloc_paged_token_slots_decode(
+            seq_lens_next, batch.seq_lens_cpu + token_per_req, last_loc
+        )
+
+    if batch.model_config.is_encoder_decoder:
+        locs = batch.encoder_lens + seq_lens
+    else:
+        locs = seq_lens.clone()
+
+    batch.req_to_token_pool.write(
+        (req_pool_indices, locs), out_cache_loc.to(torch.int32)
+    )
+
+    return out_cache_loc
+
+
 @dataclasses.dataclass
 class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     """Store all information of a batch on the scheduler."""
@@ -1075,75 +1172,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         else:
             return out_cache_loc
 
-    def alloc_for_extend(self, reqs: list[Req]):
-        # Extract all needed data from reqs
-        input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
-        extend_num_tokens = sum(len(ids) for ids in input_ids)
-
-        # CPU tensors
-        prefix_lens = torch.tensor(
-            [len(r.prefix_indices) for r in reqs], dtype=torch.int64
-        )
-        seq_lens_cpu = torch.tensor([len(r.fill_ids) for r in reqs], dtype=torch.int64)
-        extend_lens_cpu = seq_lens_cpu - prefix_lens
-
-        # Copy to GPU
-        prefix_lens_device = prefix_lens.to(self.device, non_blocking=True)
-        seq_lens_device = seq_lens_cpu.to(self.device, non_blocking=True)
-        extend_lens_device = extend_lens_cpu.to(self.device, non_blocking=True)
-
-        # Allocate req slots
-        bs = len(reqs)
-        req_pool_indices = self.alloc_req_slots(bs, reqs)
-        req_pool_indices_cpu = torch.tensor(
-            req_pool_indices, dtype=torch.int64, device=self.device
-        )
-        req_pool_indices_device = req_pool_indices_cpu.to(
-            self.device, non_blocking=True
-        )
-
-        # Allocate memory
-        if self.token_to_kv_pool_allocator.page_size == 1:
-            out_cache_loc = self.alloc_token_slots(extend_num_tokens)
-        else:
-            last_loc = [
-                (
-                    r.prefix_indices[-1:]
-                    if len(r.prefix_indices) > 0
-                    else torch.tensor([-1], device=self.device)
-                )
-                for r in reqs
-            ]
-            out_cache_loc = self.alloc_paged_token_slots_extend(
-                prefix_lens_device,
-                prefix_lens,
-                seq_lens_device,
-                seq_lens_cpu,
-                torch.cat(last_loc),
-                extend_num_tokens,
-            )
-
-        # Write allocated tokens to req_to_token_pool
-        write_cache_indices(
-            out_cache_loc,
-            req_pool_indices_device,
-            req_pool_indices_cpu,
-            prefix_lens_device,
-            prefix_lens,
-            seq_lens_device,
-            seq_lens_cpu,
-            extend_lens_device,
-            extend_lens_cpu,
-            [r.prefix_indices for r in reqs],
-            self.req_to_token_pool,
-        )
-
-        # update requests
-        for req, req_pool_index in zip(reqs, req_pool_indices):
-            req.req_pool_idx = req_pool_index
-
-        return out_cache_loc, req_pool_indices_device
-
     def alloc_paged_token_slots_decode(
         self,
         seq_lens: torch.Tensor,
@@ -1283,7 +1311,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             ).to(self.device, non_blocking=True)
 
         # Allocate memory
-        out_cache_loc, req_pool_indices_tensor = self.alloc_for_extend(reqs)
+        out_cache_loc, req_pool_indices_tensor = alloc_for_extend(
+            self, reqs, prefix_lens, seq_lens_cpu, extend_num_tokens
+        )
 
         # Set fields
         input_embeds = []
@@ -1657,11 +1687,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.output_ids = None
 
         if self.model_config.is_encoder_decoder:
-            locs = self.encoder_lens + self.seq_lens
             self.prepare_encoder_info_decode()
-        else:
-            locs = self.seq_lens.clone()
 
+        # free memory
+        if isinstance(self.tree_cache, SWAChunkCache):
+            for req in self.reqs:
+                self.tree_cache.evict_swa(
+                    req, req.seqlen - 1, self.model_config.attention_chunk_size
+                )
+
+        # Allocate memory based on current state
+        self.out_cache_loc = alloc_for_decode(self, 1)  # allocate 1 token per request
+
+        # Update seq_lens after allocation
         if self.enable_overlap:
             # Do not use in-place operations in the overlap mode
             self.seq_lens = self.seq_lens + 1
@@ -1673,28 +1711,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.seq_lens_cpu.add_(1)
             self.orig_seq_lens.add_(1)
         self.seq_lens_sum += bs
-
-        # free memory
-        if isinstance(self.tree_cache, SWAChunkCache):
-            for req in self.reqs:
-                self.tree_cache.evict_swa(
-                    req, req.seqlen - 1, self.model_config.attention_chunk_size
-                )
-
-        # Allocate memory
-        if self.token_to_kv_pool_allocator.page_size == 1:
-            self.out_cache_loc = self.alloc_token_slots(bs)
-        else:
-            last_loc = self.req_to_token_pool.req_to_token[
-                self.req_pool_indices, self.seq_lens - 2
-            ]
-            self.out_cache_loc = self.alloc_paged_token_slots_decode(
-                self.seq_lens, self.seq_lens_cpu, last_loc
-            )
-
-        self.req_to_token_pool.write(
-            (self.req_pool_indices, locs), self.out_cache_loc.to(torch.int32)
-        )
 
     def filter_batch(
         self,
