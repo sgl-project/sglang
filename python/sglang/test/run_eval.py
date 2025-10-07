@@ -207,7 +207,7 @@ if __name__ == "__main__":
         choices=THINKING_MODE_CHOICES,
         help="Enable thinking mode in Deepseek R1, V3.1/3.2, or Qwen3",
     )
-    
+
     # LongBench-v2 specific arguments
     parser.add_argument(
         "--dataset-path",
