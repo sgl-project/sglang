@@ -542,6 +542,7 @@ mod tests {
             tool_parser_factory: None,
             router_manager: None,
             response_storage: Arc::new(crate::data_connector::MemoryResponseStorage::new()),
+            conversation_storage: Arc::new(crate::data_connector::MemoryConversationStorage::new()),
             load_monitor: None,
             configured_reasoning_parser: None,
             configured_tool_parser: None,
