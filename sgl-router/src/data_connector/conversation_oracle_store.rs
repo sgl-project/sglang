@@ -88,7 +88,7 @@ impl ConversationStorage for OracleConversationStorage {
         let metadata_json = record
             .metadata
             .as_ref()
-            .map(|meta| serde_json::to_string(meta))
+            .map(serde_json::to_string)
             .transpose()?;
 
         self.with_connection(move |conn| {
@@ -137,10 +137,7 @@ impl ConversationStorage for OracleConversationStorage {
         metadata: Option<ConversationMetadata>,
     ) -> Result<Option<Conversation>> {
         let id_str = id.0.clone();
-        let metadata_json = metadata
-            .as_ref()
-            .map(|meta| serde_json::to_string(meta))
-            .transpose()?;
+        let metadata_json = metadata.as_ref().map(serde_json::to_string).transpose()?;
 
         let updated_rows = self
             .with_connection(move |conn| {
