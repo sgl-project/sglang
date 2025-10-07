@@ -370,6 +370,15 @@ class SamplingBatchInfo:
         self.need_top_k_sampling |= other.need_top_k_sampling
         self.need_min_p_sampling |= other.need_min_p_sampling
 
+    def copy_for_forward(self):
+        # Accumulate the penalty into a pre-allocated buffer to get rid of the dependency of `penalizer_orchestrator` later
+        self.update_penalties()
+        return dataclasses.replace(
+            self,
+            sampling_info_done=threading.Event(),
+            penalizer_orchestrator=None,
+        )
+
 
 def merge_bias_tensor(
     lhs: Optional[torch.Tensor],

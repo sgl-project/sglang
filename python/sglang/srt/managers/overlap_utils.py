@@ -37,8 +37,7 @@ class FutureMap:
         return cur_future_ct
 
     def resolve_future(self, model_worker_batch: ModelWorkerBatch):
-        input_ids = model_worker_batch.input_ids
-        _resolve_future_token_ids(input_ids, self.token_ids_buf)
+        _resolve_future_token_ids(model_worker_batch.input_ids, self.token_ids_buf)
 
     def update_next_future(self, future_ct: int, bs: int):
         return torch.arange(
