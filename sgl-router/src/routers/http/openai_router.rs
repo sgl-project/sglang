@@ -3646,10 +3646,6 @@ impl super::super::RouterTrait for OpenAIRouter {
         }
     }
 
-    fn router_type(&self) -> &'static str {
-        "openai"
-    }
-
     async fn route_embeddings(
         &self,
         _headers: Option<&HeaderMap>,
@@ -3674,5 +3670,9 @@ impl super::super::RouterTrait for OpenAIRouter {
             "Rerank endpoint not supported for OpenAI backend",
         )
             .into_response()
+    }
+
+    fn router_type(&self) -> &'static str {
+        "openai"
     }
 }
