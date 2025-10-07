@@ -207,6 +207,9 @@ class Envs:
     SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE = EnvInt(4096)
     SGLANG_TRITON_DECODE_SPLIT_TILE_SIZE = EnvInt(256)
 
+    # Sparse Embeddings
+    SGLANG_EMBEDDINGS_SPARSE_HEAD = EnvStr(None)
+
     # fmt: on
 
 
