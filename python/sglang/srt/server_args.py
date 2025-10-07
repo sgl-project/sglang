@@ -118,7 +118,9 @@ GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton"]
 
 DEFAULT_LORA_EVICTION_POLICY = "lru"
+
 NSA_CHOICES = ["flashmla_prefill", "flashmla_decode", "fa3", "tilelang", "aiter"]
+
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu"]
 
 
