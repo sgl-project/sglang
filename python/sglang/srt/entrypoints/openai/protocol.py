@@ -13,6 +13,7 @@
 # ==============================================================================
 """Pydantic models for OpenAI API protocol"""
 
+import logging
 import time
 import uuid
 from dataclasses import dataclass
@@ -36,6 +37,10 @@ from pydantic import (
     model_validator,
 )
 from typing_extensions import Literal
+
+from sglang.utils import convert_json_schema_to_str
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL_NAME = "default"
 
@@ -420,6 +425,15 @@ class ToolChoice(BaseModel):
 
 
 class ChatCompletionRequest(BaseModel):
+    # OpenAI/SGLang default sampling parameters
+    _DEFAULT_SAMPLING_PARAMS = {
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "top_k": -1,
+        "min_p": 0.0,
+        "repetition_penalty": 1.0,
+    }
+
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
     messages: List[ChatCompletionMessageParam]
@@ -445,8 +459,8 @@ class ChatCompletionRequest(BaseModel):
     stop: Optional[Union[str, List[str]]] = None
     stream: bool = False
     stream_options: Optional[StreamOptions] = None
-    temperature: float = 1.0
-    top_p: float = 1.0
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
     user: Optional[str] = None
     tools: Optional[List[Tool]] = Field(default=None, examples=[None])
     tool_choice: Union[ToolChoice, Literal["auto", "required", "none"]] = Field(
@@ -532,12 +546,12 @@ class ChatCompletionRequest(BaseModel):
         return values
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
-    top_k: int = -1
-    min_p: float = 0.0
+    top_k: Optional[int] = None
+    min_p: Optional[float] = None
     min_tokens: int = 0
     regex: Optional[str] = None
     ebnf: Optional[str] = None
-    repetition_penalty: float = 1.0
+    repetition_penalty: Optional[float] = None
     stop_token_ids: Optional[List[int]] = None
     no_stop_trim: bool = False
     ignore_eos: bool = False
@@ -562,6 +576,82 @@ class ChatCompletionRequest(BaseModel):
     bootstrap_host: Optional[Union[List[str], str]] = None
     bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
     bootstrap_room: Optional[Union[List[int], int]] = None
+
+    def to_sampling_params(
+        self,
+        stop: List[str],
+        model_generation_config: Dict[str, Any],
+        tool_call_constraint: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """
+        Convert request to sampling parameters.
+        Priority: user value > model generation_config > OpenAI defaults
+        """
+
+        def get_param(param_name: str):
+            value = getattr(self, param_name)
+            if value is None:
+                return model_generation_config.get(
+                    param_name, self._DEFAULT_SAMPLING_PARAMS[param_name]
+                )
+            return value
+
+        sampling_params = {
+            "temperature": get_param("temperature"),
+            "max_new_tokens": self.max_tokens or self.max_completion_tokens,
+            "min_new_tokens": self.min_tokens,
+            "stop": stop,
+            "stop_token_ids": self.stop_token_ids,
+            "top_p": get_param("top_p"),
+            "top_k": get_param("top_k"),
+            "min_p": get_param("min_p"),
+            "presence_penalty": self.presence_penalty,
+            "frequency_penalty": self.frequency_penalty,
+            "repetition_penalty": get_param("repetition_penalty"),
+            "regex": self.regex,
+            "ebnf": self.ebnf,
+            "n": self.n,
+            "no_stop_trim": self.no_stop_trim,
+            "ignore_eos": self.ignore_eos,
+            "skip_special_tokens": self.skip_special_tokens,
+            "logit_bias": self.logit_bias,
+        }
+
+        if self.response_format and self.response_format.type == "json_schema":
+            sampling_params["json_schema"] = convert_json_schema_to_str(
+                self.response_format.json_schema.schema_
+            )
+        elif self.response_format and self.response_format.type == "json_object":
+            sampling_params["json_schema"] = '{"type": "object"}'
+        elif self.response_format and self.response_format.type == "structural_tag":
+            sampling_params["structural_tag"] = convert_json_schema_to_str(
+                self.response_format.model_dump(by_alias=True)
+            )
+
+        # Check if there are already existing output constraints
+        has_existing_constraints = (
+            sampling_params.get("regex")
+            or sampling_params.get("ebnf")
+            or sampling_params.get("structural_tag")
+            or sampling_params.get("json_schema")
+        )
+
+        if tool_call_constraint and has_existing_constraints:
+            logger.warning("Constrained decoding is not compatible with tool calls.")
+        elif tool_call_constraint:
+            constraint_type, constraint_value = tool_call_constraint
+            if constraint_type == "structural_tag":
+                sampling_params[constraint_type] = convert_json_schema_to_str(
+                    constraint_value.model_dump(by_alias=True)
+                )
+            elif constraint_type == "json_schema":
+                sampling_params[constraint_type] = convert_json_schema_to_str(
+                    constraint_value
+                )
+            else:
+                sampling_params[constraint_type] = constraint_value
+
+        return sampling_params
 
 
 class ChatMessage(BaseModel):
