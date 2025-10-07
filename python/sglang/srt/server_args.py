@@ -252,7 +252,7 @@ class ServerArgs:
     reasoning_parser: Optional[str] = None
     tool_call_parser: Optional[str] = None
     tool_server: Optional[str] = None
-    sampling_defaults: str = "default"
+    sampling_defaults: str = "model"
 
     # Data parallelism
     dp_size: int = 1
@@ -1870,10 +1870,10 @@ class ServerArgs:
         parser.add_argument(
             "--sampling-defaults",
             type=str,
-            choices=["default", "model"],
+            choices=["openai", "model"],
             default=ServerArgs.sampling_defaults,
             help="Where to get default sampling parameters. "
-            "'default' uses SGLang/OpenAI defaults (temperature=1.0, top_p=1.0, etc.). "
+            "'openai' uses SGLang/OpenAI defaults (temperature=1.0, top_p=1.0, etc.). "
             "'model' uses the model's generation_config.json if available.",
         )
         parser.add_argument(

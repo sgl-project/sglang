@@ -90,7 +90,7 @@ class ModelConfig:
         is_draft_model: bool = False,
         hybrid_kvcache_ratio: Optional[float] = None,
         model_impl: Union[str, ModelImpl] = ModelImpl.AUTO,
-        sampling_defaults: str = "default",
+        sampling_defaults: str = "openai",
     ) -> None:
         # Parse args
         self.model_path = model_path
