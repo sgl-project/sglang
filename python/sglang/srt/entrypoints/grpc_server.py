@@ -449,7 +449,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 return None
             elif isinstance(obj, (str, int, float, bool)):
                 return obj
-            elif isinstance(obj, (list, tuple)):
+            elif isinstance(obj, (list, tuple, set)):
                 return [make_serializable(item) for item in obj]
             elif isinstance(obj, dict):
                 return {k: make_serializable(v) for k, v in obj.items()}
