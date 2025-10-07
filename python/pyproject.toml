@@ -46,7 +46,7 @@ dependencies = [
   "py-spy",
   "pybase64",
   "pydantic",
-  "pynvml",
+  "nvidia-ml-py",
   "python-multipart",
   "pyzmq>=25.1.2",
   "requests",
