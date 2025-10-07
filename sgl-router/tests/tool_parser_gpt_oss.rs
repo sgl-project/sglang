@@ -109,14 +109,14 @@ fn test_gpt_oss_format_detection() {
     let parser = GptOssParser::new();
 
     // Should detect GPT-OSS format
-    assert!(parser.detect_format("<|channel|>commentary to="));
-    assert!(parser.detect_format("<|channel|>commentary"));
-    assert!(parser.detect_format("text with <|channel|>commentary to= marker"));
+    assert!(parser.has_tool_markers("<|channel|>commentary to="));
+    assert!(parser.has_tool_markers("<|channel|>commentary"));
+    assert!(parser.has_tool_markers("text with <|channel|>commentary to= marker"));
 
     // Should not detect other formats
-    assert!(!parser.detect_format("[TOOL_CALLS]"));
-    assert!(!parser.detect_format("<tool_call>"));
-    assert!(!parser.detect_format("plain text"));
+    assert!(!parser.has_tool_markers("[TOOL_CALLS]"));
+    assert!(!parser.has_tool_markers("<tool_call>"));
+    assert!(!parser.has_tool_markers("plain text"));
 }
 
 #[tokio::test]
