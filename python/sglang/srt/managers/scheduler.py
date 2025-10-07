@@ -763,6 +763,7 @@ class Scheduler(
                     model_name=server_args.served_model_name,
                     storage_backend_extra_config=server_args.hicache_storage_backend_extra_config,
                     is_eagle=self.spec_algorithm.is_eagle(),
+                    hicache_storage_pass_prefix_keys=server_args.hicache_storage_pass_prefix_keys,
                 )
                 self.tp_worker.register_hicache_layer_transfer_counter(
                     self.tree_cache.cache_controller.layer_done_counter
@@ -1456,8 +1457,17 @@ class Scheduler(
                 last_hash = req.last_host_node.get_last_hash_value()
                 matched_len = len(req.prefix_indices) + req.host_hit_length
                 new_input_tokens = req.fill_ids[matched_len:]
+                previous_keys = (
+                    req.last_node.get_prefix_hash_values(req.last_node.parent)
+                    if self.server_args.hicache_storage_pass_prefix_keys
+                    else None
+                )
                 self.tree_cache.prefetch_from_storage(
-                    req.rid, req.last_host_node, new_input_tokens, last_hash
+                    req.rid,
+                    req.last_host_node,
+                    new_input_tokens,
+                    last_hash,
+                    previous_keys,
                 )
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):

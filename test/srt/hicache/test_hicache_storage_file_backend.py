@@ -78,6 +78,7 @@ class HiCacheStorageBaseMixin:
             "--enable-cache-report": True,
             "--hicache-storage-prefetch-policy": "wait_complete",
             "--hicache-storage-backend": "file",
+            "--hicache-storage-pass-prefix-keys": True,
         }
 
     @classmethod

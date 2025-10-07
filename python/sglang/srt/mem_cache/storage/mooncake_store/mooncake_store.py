@@ -399,7 +399,9 @@ class MooncakeStore(HiCacheStorage):
         exist_result = self._batch_exist([key])
         return exist_result[0] == 1
 
-    def batch_exists(self, keys) -> int:
+    def batch_exists(
+        self, keys, extra_info: Optional[HiCacheStorageExtraInfo] = None
+    ) -> int:
         if self.is_mla_backend:
             query_keys = [f"{key}_k" for key in keys]
             key_multiplier = 1

@@ -36,6 +36,7 @@ class HiCacheStorageConfig:
 
 @dataclass
 class HiCacheStorageExtraInfo:
+    prefix_keys: Optional[List[str]] = (None,)
     extra_info: Optional[dict] = None
 
 
@@ -139,7 +140,9 @@ class HiCacheStorage(ABC):
         pass
 
     # TODO: Use a finer-grained return type (e.g., List[bool])
-    def batch_exists(self, keys: List[str]) -> int:
+    def batch_exists(
+        self, keys: List[str], extra_info: Optional[HiCacheStorageExtraInfo] = None
+    ) -> int:
         """
         Check if the keys exist in the storage.
         return the number of consecutive existing keys from the start.
