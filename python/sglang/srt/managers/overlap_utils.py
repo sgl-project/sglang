@@ -46,23 +46,8 @@ class FutureMap:
         indices = torch.arange(start, end, dtype=torch.int64, device=self.device)
         return FutureIndices(indices)
 
-    def update_ct(self, bs: int) -> int:
-        """Update the circular buffer pointer and return the current pointer."""
-        cur_future_ct = self.future_ct
-        self.future_ct = (cur_future_ct + bs) % self.future_limit
-        return cur_future_ct
-
     def resolve_future(self, model_worker_batch: ModelWorkerBatch):
         _resolve_future_token_ids(model_worker_batch.input_ids, self.token_ids_buf)
-
-    def update_next_future(self, future_ct: int, bs: int):
-        return torch.arange(
-            -(future_ct + 1),
-            -(future_ct + 1 + bs),
-            -1,
-            dtype=torch.int64,
-            device=self.device,
-        )
 
     def store_to_map(self, future_indices: FutureIndices, next_token_ids: torch.Tensor):
         self.token_ids_buf[future_indices.indices] = next_token_ids
