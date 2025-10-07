@@ -17,6 +17,18 @@ from sglang.srt.server_args import ServerArgs
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
+JINJA2_EXCEPTIONS = (
+    jinja2.exceptions.TemplateError,
+    jinja2.exceptions.TemplateNotFound,
+    jinja2.exceptions.TemplatesNotFound,
+    jinja2.exceptions.TemplateSyntaxError,
+    jinja2.exceptions.TemplateAssertionError,
+    jinja2.exceptions.TemplateRuntimeError,
+    jinja2.exceptions.UndefinedError,
+    jinja2.exceptions.SecurityError,
+    jinja2.exceptions.FilterArgumentError,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -50,7 +62,7 @@ class OpenAIServingBase(ABC):
                 adapted_request, processed_request = self._convert_to_internal_request(
                     request, raw_request
                 )
-            except jinja2.exceptions.TemplateError as exc:
+            except JINJA2_EXCEPTIONS as exc:
                 return self.create_error_response(
                     message=str(exc), err_type="400", status_code=400
                 )
