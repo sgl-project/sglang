@@ -98,36 +98,32 @@ impl AppContext {
 
         let router_manager = None;
 
-        let response_storage: SharedResponseStorage = match router_config.history_backend {
-            HistoryBackend::Memory => Arc::new(MemoryResponseStorage::new()),
-            HistoryBackend::None => Arc::new(NoOpResponseStorage::new()),
+        let (response_storage, conversation_storage): (
+            SharedResponseStorage,
+            SharedConversationStorage,
+        ) = match router_config.history_backend {
+            HistoryBackend::Memory => (
+                Arc::new(MemoryResponseStorage::new()),
+                Arc::new(MemoryConversationStorage::new()),
+            ),
+            HistoryBackend::None => (
+                Arc::new(NoOpResponseStorage::new()),
+                Arc::new(NoOpConversationStorage::new()),
+            ),
             HistoryBackend::Oracle => {
                 let oracle_cfg = router_config.oracle.clone().ok_or_else(|| {
                     "oracle configuration is required when history_backend=oracle".to_string()
                 })?;
 
-                let storage = OracleResponseStorage::new(oracle_cfg).map_err(|err| {
+                let response_storage = OracleResponseStorage::new(oracle_cfg.clone()).map_err(|err| {
                     format!("failed to initialize Oracle response storage: {err}")
                 })?;
 
-                Arc::new(storage)
-            }
-        };
-
-        let conversation_storage: SharedConversationStorage = match router_config.history_backend {
-            HistoryBackend::Memory => Arc::new(MemoryConversationStorage::new()),
-            HistoryBackend::None => Arc::new(NoOpConversationStorage::new()),
-            HistoryBackend::Oracle => {
-                let oracle_cfg = router_config.oracle.clone().ok_or_else(|| {
-                    "oracle configuration is required when history_backend=oracle".to_string()
+                let conversation_storage = OracleConversationStorage::new(oracle_cfg).map_err(|err| {
+                    format!("failed to initialize Oracle conversation storage: {err}")
                 })?;
 
-                let storage =
-                    OracleConversationStorage::new(oracle_cfg.clone()).map_err(|err| {
-                        format!("failed to initialize Oracle conversation storage: {err}")
-                    })?;
-
-                Arc::new(storage)
+                (Arc::new(response_storage), Arc::new(conversation_storage))
             }
         };
 
@@ -358,7 +354,7 @@ async fn v1_conversations_create(
 ) -> Response {
     let metadata = match extract_metadata(&body) {
         Ok(meta) => meta,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     match state
@@ -414,7 +410,7 @@ async fn v1_conversations_update(
 
     let patch = match parse_metadata_patch(&body) {
         Ok(patch) => patch,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     let merged_metadata = match patch {
@@ -469,20 +465,22 @@ async fn v1_conversations_delete(
     }
 }
 
-fn extract_metadata(payload: &Value) -> Result<Option<ConversationMetadata>, Response> {
+type MetadataResult<T> = Result<T, Box<Response>>;
+
+fn extract_metadata(payload: &Value) -> MetadataResult<Option<ConversationMetadata>> {
     parse_metadata_create(payload)
 }
 
-fn parse_metadata_create(payload: &Value) -> Result<Option<ConversationMetadata>, Response> {
+fn parse_metadata_create(payload: &Value) -> MetadataResult<Option<ConversationMetadata>> {
     match payload.get("metadata") {
         Some(Value::Object(map)) => {
             if map.len() > MAX_METADATA_PROPERTIES {
-                return Err(metadata_too_many_properties_error(0, map.len()));
+                return Err(Box::new(metadata_too_many_properties_error(0, map.len())));
             }
             Ok(Some(map.clone()))
         }
         Some(Value::Null) | None => Ok(None),
-        Some(other) => Err(invalid_metadata_type_response(other.clone())),
+        Some(other) => Err(Box::new(invalid_metadata_type_response(other.clone()))),
     }
 }
 
@@ -499,12 +497,12 @@ struct ValidationError {
     updated: usize,
 }
 
-fn parse_metadata_patch(payload: &Value) -> Result<MetadataPatch, Response> {
+fn parse_metadata_patch(payload: &Value) -> MetadataResult<MetadataPatch> {
     match payload.get("metadata") {
         None => Ok(MetadataPatch::NoChange),
         Some(Value::Null) => Ok(MetadataPatch::ClearAll),
         Some(Value::Object(map)) => Ok(MetadataPatch::Merge(map.clone())),
-        Some(other) => Err(invalid_metadata_type_response(other.clone())),
+        Some(other) => Err(Box::new(invalid_metadata_type_response(other.clone()))),
     }
 }
 
