@@ -255,47 +255,21 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             multimodal_tokens=self.mm_tokens,
         )
 
-        import concurrent.futures
-        import os
-
-        _IMG_POOL = concurrent.futures.ThreadPoolExecutor(
-            max_workers=min(8, os.cpu_count() or 8), thread_name_prefix="img"
-        )
-        _VID_POOL = concurrent.futures.ThreadPoolExecutor(
-            max_workers=min(8, os.cpu_count() or 8), thread_name_prefix="vid"
-        )
-
-        loop = asyncio.get_running_loop()
-
         # Qwen-specific: resize images if they are raw Image objects
         if base_output.images and isinstance(base_output.images[0], Image.Image):
-            base_output.images = await asyncio.gather(
-                *[
-                    loop.run_in_executor(
-                        _IMG_POOL,
-                        resize_image,
-                        img,
-                        MIN_PIXELS,
-                        MAX_PIXELS,
-                        IMAGE_FACTOR,
-                    )
-                    for img in base_output.images
-                ]
-            )
+            resize_tasks = [resize_image_async(image) for image in base_output.images]
+            base_output.images = await asyncio.gather(*resize_tasks)
 
         if base_output.videos:
-            base_output.videos = await asyncio.gather(
-                *[
-                    loop.run_in_executor(_VID_POOL, preprocess_video, vr)
-                    for vr in base_output.videos
-                ]
-            )
+            base_output.videos = [
+                await preprocess_video(video) for video in base_output.videos
+            ]
 
         mm_items, input_ids, ret = self.process_and_combine_mm_data(
             base_output, self.mm_tokens
         )
 
-        input_ids = input_ids.view(-1)
+        input_ids = input_ids.flatten()
         mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
             spatial_merge_size=self.hf_config.vision_config.spatial_merge_size,
             image_token_id=self.mm_tokens.image_token_id,
