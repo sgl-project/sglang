@@ -194,8 +194,7 @@ impl GrpcPDRouter {
         let (original_text, token_ids) = match self.resolve_generate_input(body) {
             Ok(res) => res,
             Err(msg) => {
-                error!("Invalid generate request: {}", msg);
-                return (StatusCode::BAD_REQUEST, msg).into_response();
+                return utils::bad_request_error(msg);
             }
         };
 
@@ -208,8 +207,7 @@ impl GrpcPDRouter {
         {
             Ok(pair) => pair,
             Err(e) => {
-                warn!("Failed to select PD worker pair: {}", e);
-                return (StatusCode::SERVICE_UNAVAILABLE, e).into_response();
+                return utils::service_unavailable_error(e);
             }
         };
 
@@ -244,15 +242,13 @@ impl GrpcPDRouter {
         ) {
             Ok(req) => req,
             Err(e) => {
-                error!("Failed to build generate request: {}", e);
-                return (StatusCode::BAD_REQUEST, e).into_response();
+                return utils::bad_request_error(e);
             }
         };
 
         // Step 5: Inject bootstrap metadata
         if let Err(e) = Self::inject_bootstrap_metadata(&mut request, &*prefill_worker) {
-            error!("Failed to inject bootstrap metadata: {}", e);
-            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+            return utils::internal_error_message(e);
         }
 
         // Step 6: Get weight version for response metadata
@@ -334,8 +330,7 @@ impl GrpcPDRouter {
         let processed_messages = match utils::process_chat_messages(&body_ref, &*self.tokenizer) {
             Ok(msgs) => msgs,
             Err(e) => {
-                error!("Failed to process chat messages: {}", e);
-                return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+                return utils::bad_request_error(e.to_string());
             }
         };
 
@@ -343,12 +338,7 @@ impl GrpcPDRouter {
         let encoding = match self.tokenizer.encode(&processed_messages.text) {
             Ok(encoding) => encoding,
             Err(e) => {
-                error!("Tokenization failed: {}", e);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Tokenization failed: {}", e),
-                )
-                    .into_response();
+                return utils::internal_error_message(format!("Tokenization failed: {}", e));
             }
         };
 
@@ -368,8 +358,7 @@ impl GrpcPDRouter {
         {
             Ok(pair) => pair,
             Err(e) => {
-                warn!("Failed to select PD worker pair: {}", e);
-                return (StatusCode::SERVICE_UNAVAILABLE, e).into_response();
+                return utils::service_unavailable_error(e);
             }
         };
 
@@ -402,19 +391,13 @@ impl GrpcPDRouter {
         ) {
             Ok(request) => request,
             Err(e) => {
-                error!("Failed to build gRPC request: {}", e);
-                return (
-                    StatusCode::BAD_REQUEST,
-                    format!("Invalid request parameters: {}", e),
-                )
-                    .into_response();
+                return utils::bad_request_error(format!("Invalid request parameters: {}", e));
             }
         };
 
         // Step 8: Inject bootstrap metadata into the request
         if let Err(e) = Self::inject_bootstrap_metadata(&mut request, &*prefill_worker) {
-            error!("Failed to inject bootstrap metadata: {}", e);
-            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+            return utils::internal_error_message(e);
         }
 
         // Step 9: Handle streaming vs non-streaming
@@ -486,12 +469,10 @@ impl GrpcPDRouter {
         let prefill_stream = match prefill_result {
             Ok(s) => s,
             Err(e) => {
-                error!("Failed to start prefill generation: {}", e);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Prefill worker failed to start: {}", e),
-                )
-                    .into_response();
+                return utils::internal_error_message(format!(
+                    "Prefill worker failed to start: {}",
+                    e
+                ));
             }
         };
 
@@ -499,12 +480,10 @@ impl GrpcPDRouter {
         let decode_stream = match decode_result {
             Ok(s) => s,
             Err(e) => {
-                error!("Failed to start decode generation: {}", e);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Decode worker failed to start: {}", e),
-                )
-                    .into_response();
+                return utils::internal_error_message(format!(
+                    "Decode worker failed to start: {}",
+                    e
+                ));
             }
         };
 
@@ -592,12 +571,10 @@ impl GrpcPDRouter {
         let prefill_stream = match prefill_result {
             Ok(s) => s,
             Err(e) => {
-                error!("Failed to start prefill generation: {}", e);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Prefill worker failed to start: {}", e),
-                )
-                    .into_response();
+                return utils::internal_error_message(format!(
+                    "Prefill worker failed to start: {}",
+                    e
+                ));
             }
         };
 
@@ -605,12 +582,10 @@ impl GrpcPDRouter {
         let decode_stream = match decode_result {
             Ok(s) => s,
             Err(e) => {
-                error!("Failed to start decode generation: {}", e);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Decode worker failed to start: {}", e),
-                )
-                    .into_response();
+                return utils::internal_error_message(format!(
+                    "Decode worker failed to start: {}",
+                    e
+                ));
             }
         };
 
