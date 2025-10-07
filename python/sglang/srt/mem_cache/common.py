@@ -324,3 +324,142 @@ def alloc_req_slots(
             f"{num_reqs=}, "
         )
     return req_pool_indices
+
+
+def alloc_extend_batch(batch) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Allocate KV cache for extend batch and write to req_to_token_pool.
+
+    Pure allocation function - no request traversal or computation.
+    All data must be pre-computed by caller and set on batch fields.
+
+    This is a batch-level operation because:
+    - req_to_token_pool lives on GPU
+    - Allocation and write use triton kernels for efficiency
+    - Triton kernels operate on batched GPU tensors
+
+    Expected batch fields (must be set before calling):
+    - prefix_lens: list[int]
+    - extend_lens: list[int]
+    - extend_num_tokens: int
+    - seq_lens_cpu: torch.Tensor
+    - prefix_indices_list: list[torch.Tensor]
+    - reqs: list[Req] (only for alloc_req_slots)
+
+    Returns:
+        out_cache_loc: allocated KV cache locations
+        req_pool_indices: request pool indices (GPU tensor)
+    """
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
+
+    assert isinstance(batch, ScheduleBatch)
+    bs = len(batch.reqs)
+
+    # Convert batch data to tensors
+    prefix_lens_cpu = torch.tensor(batch.prefix_lens, dtype=torch.int64)
+    seq_lens_cpu = batch.seq_lens_cpu
+    extend_lens_cpu = seq_lens_cpu - prefix_lens_cpu
+
+    # Copy to GPU
+    seq_lens_device = seq_lens_cpu.to(batch.device, non_blocking=True)
+    prefix_lens_device = prefix_lens_cpu.to(batch.device, non_blocking=True)
+    extend_lens_device = extend_lens_cpu.to(batch.device, non_blocking=True)
+
+    # Allocate req slots
+    req_pool_indices = alloc_req_slots(batch.req_to_token_pool, bs, batch.reqs)
+    req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
+    req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
+
+    # Allocate KV cache - abstract page_size branching
+    page_size = batch.token_to_kv_pool_allocator.page_size
+    if page_size == 1:
+        out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
+    else:
+        # Build last_loc from prefix_indices_list
+        last_loc = [
+            (
+                prefix_indices[-1:]
+                if len(prefix_indices) > 0
+                else torch.tensor([-1], device=batch.device)
+            )
+            for prefix_indices in batch.prefix_indices_list
+        ]
+        out_cache_loc = alloc_paged_token_slots_extend(
+            tree_cache=batch.tree_cache,
+            prefix_lens=prefix_lens_device,
+            prefix_lens_cpu=prefix_lens_cpu,
+            seq_lens=seq_lens_device,
+            seq_lens_cpu=seq_lens_cpu,
+            last_loc=torch.cat(last_loc),
+            extend_num_tokens=batch.extend_num_tokens,
+        )
+
+    # Write allocated locations to req_to_token_pool
+    write_cache_indices(
+        out_cache_loc,
+        req_pool_indices_device,
+        req_pool_indices_cpu,
+        prefix_lens_device,
+        prefix_lens_cpu,
+        seq_lens_device,
+        seq_lens_cpu,
+        extend_lens_device,
+        extend_lens_cpu,
+        batch.prefix_indices_list,
+        batch.req_to_token_pool,
+    )
+
+    # Update requests with pool indices
+    for req, req_pool_index in zip(batch.reqs, req_pool_indices):
+        req.req_pool_idx = req_pool_index
+
+    return out_cache_loc, req_pool_indices_device
+
+
+def alloc_decode_batch(batch, token_per_req: int = 1) -> torch.Tensor:
+    """
+    Allocate KV cache for decode batch and write to req_to_token_pool.
+
+    This is a batch-level operation for the same reasons as alloc_extend_batch.
+
+    Args:
+        batch: ScheduleBatch with requests
+        token_per_req: number of tokens to allocate per request (usually 1)
+
+    Returns:
+        out_cache_loc: allocated KV cache locations
+    """
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
+
+    assert isinstance(batch, ScheduleBatch)
+    bs = len(batch.reqs)
+    seq_lens = batch.seq_lens
+    req_pool_indices = batch.req_pool_indices
+
+    # Allocate KV cache - branch on page_size
+    page_size = batch.token_to_kv_pool_allocator.page_size
+    if page_size == 1:
+        # Non-paged allocation
+        out_cache_loc = alloc_token_slots(batch.tree_cache, bs * token_per_req)
+    else:
+        # Paged allocation
+        last_loc = batch.req_to_token_pool.req_to_token[req_pool_indices, seq_lens - 1]
+        seq_lens_next = seq_lens + token_per_req
+        out_cache_loc = alloc_paged_token_slots_decode(
+            batch.tree_cache,
+            seq_lens_next,
+            batch.seq_lens_cpu + token_per_req,
+            last_loc,
+        )
+
+    # Write to req_to_token_pool
+    if batch.model_config.is_encoder_decoder:
+        locs = batch.encoder_lens + seq_lens
+    else:
+        locs = seq_lens.clone()
+
+    batch.req_to_token_pool.write(
+        (req_pool_indices, locs), out_cache_loc.to(torch.int32)
+    )
+
+    return out_cache_loc
