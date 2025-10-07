@@ -97,7 +97,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "ep_num_redundant_experts",
     "enable_nan_detection",
     "flashinfer_mla_disable_ragged",
-    "max_micro_batch_size",
+    "pp_max_micro_batch_size",
     "disable_shared_experts_fusion",
     "sampling_backend",
     "speculative_accept_threshold_single",
@@ -112,6 +112,8 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "enable_custom_logit_processor",
     "disaggregation_mode",
     "enable_deterministic_inference",
+    "nsa_prefill",
+    "nsa_decode",
 ]
 
 # Put some global args for easy access
@@ -663,7 +665,11 @@ class Req:
     @property
     def is_prefill_only(self) -> bool:
         """Check if this request is prefill-only (no token generation needed)."""
-        return self.sampling_params.max_new_tokens == 0
+        # NOTE: when spec is enabled, prefill_only optimizations are disabled
+        return (
+            self.sampling_params.max_new_tokens == 0
+            and global_server_args_dict["speculative_algorithm"] is None
+        )
 
     def add_latency(self, stage: RequestStage):
         if self.metrics_collector is None:
