@@ -2115,7 +2115,9 @@ class Scheduler(
                         batch_or_worker_batch
                     )
                     # FIXME(lsyin): maybe move this to forward_batch_generation
-                    batch_result.copy_done = torch.cuda.Event()
+                    batch_result.copy_done = torch.get_device_module(
+                        self.device
+                    ).Event()
                     if not model_worker_batch.delay_sample_launch:
                         self.future_map.store_to_map(
                             cur_future_map_ct, bs, batch_result.next_token_ids
