@@ -53,9 +53,7 @@ pub struct GrpcRouter {
     dp_aware: bool,
     api_key: Option<String>,
     retry_config: RetryConfig,
-    /// Configured reasoning parser name (if specified)
     configured_reasoning_parser: Option<String>,
-    /// Configured tool parser name (if specified)
     configured_tool_parser: Option<String>,
 }
 
@@ -94,46 +92,6 @@ impl GrpcRouter {
             configured_reasoning_parser: ctx.configured_reasoning_parser.clone(),
             configured_tool_parser: ctx.configured_tool_parser.clone(),
         })
-    }
-
-    /// Get the appropriate reasoning parser for the model
-    fn get_reasoning_parser(&self, model: &str) -> crate::reasoning_parser::PooledParser {
-        if let Some(ref parser_name) = self.configured_reasoning_parser {
-            // Use configured parser if specified
-            self.reasoning_parser_factory
-                .registry()
-                .get_pooled_parser(parser_name)
-                .unwrap_or_else(|| {
-                    warn!(
-                        "Configured reasoning parser '{}' not found, falling back to model-based selection",
-                        parser_name
-                    );
-                    self.reasoning_parser_factory.get_pooled(model)
-                })
-        } else {
-            // Auto-detect based on model
-            self.reasoning_parser_factory.get_pooled(model)
-        }
-    }
-
-    /// Get the appropriate tool parser for the model
-    fn get_tool_parser(&self, model: &str) -> crate::tool_parser::PooledToolParser {
-        if let Some(ref parser_name) = self.configured_tool_parser {
-            // Use configured parser if specified
-            self.tool_parser_factory
-                .registry()
-                .get_pooled_parser(parser_name)
-                .unwrap_or_else(|| {
-                    warn!(
-                        "Configured tool parser '{}' not found, falling back to model-based selection",
-                        parser_name
-                    );
-                    self.tool_parser_factory.get_pooled(model)
-                })
-        } else {
-            // Auto-detect based on model
-            self.tool_parser_factory.get_pooled(model)
-        }
     }
 
     /// Main route_chat implementation
@@ -347,7 +305,11 @@ impl GrpcRouter {
         history_tool_calls_count: usize,
     ) -> (Option<Vec<ToolCall>>, String) {
         // Get pooled parser for this model
-        let pooled_parser = self.get_tool_parser(model);
+        let pooled_parser = utils::get_tool_parser(
+            &self.tool_parser_factory,
+            self.configured_tool_parser.as_ref(),
+            model,
+        );
 
         // Check format detection first
         let can_parse = {
@@ -542,9 +504,13 @@ impl GrpcRouter {
         created: u64,
     ) -> (String, Option<ChatCompletionStreamResponse>, bool) {
         // Get or create parser for this index
-        reasoning_parsers
-            .entry(index)
-            .or_insert_with(|| self.get_reasoning_parser(model));
+        reasoning_parsers.entry(index).or_insert_with(|| {
+            utils::get_reasoning_parser(
+                &self.reasoning_parser_factory,
+                self.configured_reasoning_parser.as_ref(),
+                model,
+            )
+        });
 
         if let Some(pooled_parser) = reasoning_parsers.get(&index) {
             let (parse_result, in_reasoning) = {
@@ -615,9 +581,13 @@ impl GrpcRouter {
         let mut chunks = Vec::new();
 
         // Get or create parser for this index
-        tool_parsers
-            .entry(index)
-            .or_insert_with(|| self.get_tool_parser(model));
+        tool_parsers.entry(index).or_insert_with(|| {
+            utils::get_tool_parser(
+                &self.tool_parser_factory,
+                self.configured_tool_parser.as_ref(),
+                model,
+            )
+        });
 
         if let Some(pooled_parser) = tool_parsers.get(&index) {
             let mut parser = pooled_parser.lock().await;
@@ -1661,7 +1631,11 @@ impl GrpcRouter {
 
         // Check if reasoning parsing is enabled and separate_reasoning is requested
         if original_request.separate_reasoning {
-            let pooled_parser = self.get_reasoning_parser(&original_request.model);
+            let pooled_parser = utils::get_reasoning_parser(
+                &self.reasoning_parser_factory,
+                self.configured_reasoning_parser.as_ref(),
+                &original_request.model,
+            );
 
             let mut parser = pooled_parser
                 .lock()

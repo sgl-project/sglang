@@ -52,9 +52,7 @@ pub struct AppContext {
     pub router_manager: Option<Arc<RouterManager>>,
     pub response_storage: SharedResponseStorage,
     pub load_monitor: Option<Arc<LoadMonitor>>,
-    /// Configured reasoning parser name (e.g., "deepseek_r1", "qwen3")
     pub configured_reasoning_parser: Option<String>,
-    /// Configured tool call parser name (e.g., "hermes", "functionary")
     pub configured_tool_parser: Option<String>,
 }
 
