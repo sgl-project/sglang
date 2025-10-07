@@ -81,6 +81,7 @@ from sglang.srt.model_loader.utils import (
 DEFAULT_GPU_MEMORY_FRACTION_FOR_CALIBRATION = (
     0.8  # Reserve 20% GPU memory headroom for ModelOpt calibration
 )
+from sglang.srt.environ import envs
 from sglang.srt.model_loader.weight_utils import (
     _BAR_FORMAT,
     default_weight_loader,
@@ -256,9 +257,9 @@ def _initialize_model(
         "quant_config": quant_config,
     }
 
-    # Only add use_bge_m3_sparse to kwargs if it is set in model_config
-    if getattr(model_config, "use_bge_m3_sparse", False):
-        kwargs["use_bge_m3_sparse"] = model_config.use_bge_m3_sparse
+    # Only add sparse head kwargs if envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set()
+    if envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set():
+        kwargs["sparse_head"] = envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.value
         kwargs["model_path"] = model_config.model_path
 
     return model_class(**kwargs)

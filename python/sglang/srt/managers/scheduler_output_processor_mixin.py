@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 import torch
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -174,7 +175,7 @@ class SchedulerOutputProcessorMixin:
                             logprob_pt += num_input_logprobs
 
         else:  # embedding or reward model
-            is_sparse = getattr(self.server_args, "use_bge_m3_sparse", False)
+            is_sparse = envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set()
 
             embedding = result.embeddings
 
