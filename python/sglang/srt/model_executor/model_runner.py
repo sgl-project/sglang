@@ -1672,6 +1672,9 @@ class ModelRunner:
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
+                    enable_kv_cache_copy=(
+                        self.server_args.speculative_algorithm is not None
+                    ),
                 )
 
         # Initialize token_to_kv_pool_allocator
@@ -1743,16 +1746,10 @@ class ModelRunner:
 
     def _get_attention_backend(self):
         """Init attention kernel backend."""
-        self.decode_attention_backend_str = (
-            self.server_args.decode_attention_backend
-            if self.server_args.decode_attention_backend
-            else self.server_args.attention_backend
+        self.prefill_attention_backend_str, self.decode_attention_backend_str = (
+            self.server_args.get_attention_backends()
         )
-        self.prefill_attention_backend_str = (
-            self.server_args.prefill_attention_backend
-            if self.server_args.prefill_attention_backend
-            else self.server_args.attention_backend
-        )
+
         if self.decode_attention_backend_str != self.prefill_attention_backend_str:
             from sglang.srt.layers.attention.hybrid_attn_backend import (
                 HybridAttnBackend,
@@ -2057,15 +2054,11 @@ class ModelRunner:
     def _preprocess_logits(
         self, logits_output: LogitsProcessorOutput, sampling_info: SamplingBatchInfo
     ):
-        # Apply logit bias
-        if sampling_info.sampling_info_done:
-            # Overlap mode: the function update_regex_vocab_mask was executed
-            # in process_batch_result of the last batch.
-            if sampling_info.grammars:
-                sampling_info.sampling_info_done.wait()
-        else:
-            # Normal mode: Put CPU-heavy tasks here. They will be overlapped with the forward pass.
-            sampling_info.update_regex_vocab_mask()
+        # NOTE: In overlap mode, the function update_regex_vocab_mask (in sample)
+        #       was executed after we processed last batch's results.
+
+        # Calculate logits bias and apply it to next_token_logits.
+        sampling_info.update_regex_vocab_mask()
         sampling_info.apply_logits_bias(logits_output.next_token_logits)
 
     def sample(
