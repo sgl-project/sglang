@@ -204,6 +204,7 @@ class ServerArgs:
     # Runtime options
     device: Optional[str] = None
     elastic_ep_backend: Literal[None, "mooncake"] = None
+    mooncake_ib_device: Optional[str] = None
     tp_size: int = 1
     pp_size: int = 1
     pp_max_micro_batch_size: Optional[int] = None
@@ -1604,6 +1605,14 @@ class ServerArgs:
             default=ServerArgs.elastic_ep_backend,
             choices=["none", "mooncake"],
             help="Specify the collective communication backend for elastic EP. Currently supports 'mooncake'.",
+        )
+        parser.add_argument(
+            "--mooncake-ib-device",
+            type=str,
+            default=ServerArgs.mooncake_ib_device,
+            help="The InfiniBand devices for Mooncake Backend transfer, accepts multiple comma-separated devices "
+            "(e.g., --mooncake-ib-device mlx5_0,mlx5_1). "
+            "Default is None, which triggers automatic device detection when Mooncake Backend is enabled.",
         )
         parser.add_argument(
             "--tensor-parallel-size",

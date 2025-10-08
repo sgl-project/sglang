@@ -141,6 +141,7 @@ suites = {
         TestFile("hicache/test_hicache_storage_3fs_backend.py", 200),
     ],
     "per-commit-4-gpu": [
+        TestFile("ep/test_mooncake_ep_small.py", 450),
         TestFile("test_gpt_oss_4gpu.py", 300),
         TestFile("test_local_attn.py", 411),
         TestFile("test_pp_single_node.py", 481),

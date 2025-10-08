@@ -636,6 +636,14 @@ class ModelRunner:
         if self.device == "cuda":
             if self.server_args.elastic_ep_backend == "mooncake":
                 backend = "mooncake"
+                if self.server_args.mooncake_ib_device:
+                    mooncake_ib_device = self.server_args.mooncake_ib_device.split(",")
+                    try:
+                        from mooncake import ep as mooncake_ep
+
+                        mooncake_ep.set_device_filter(mooncake_ib_device)
+                    except:
+                        pass  # A warning will be raised in `init_distributed_environment`
             else:
                 backend = "nccl"
         elif self.device == "xpu":

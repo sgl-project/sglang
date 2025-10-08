@@ -332,6 +332,7 @@ class MooncakeEPDispatcher(BaseDispatcher):
     def dispatch_a(
         self,
         hidden_states: torch.Tensor,
+        input_global_scale: Optional[torch.Tensor],
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
         forward_batch: ForwardBatch,
@@ -361,6 +362,7 @@ class MooncakeEPDispatcher(BaseDispatcher):
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
         forward_batch: ForwardBatch,
+        overlap_args: Optional = None,
     ):
         self._update_stage(_Stage.AFTER_DISPATCH_B, _Stage.AFTER_COMBINE_A)
         inner_state = self._get_impl(forward_batch).combine_a(
