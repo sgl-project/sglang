@@ -189,7 +189,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         # Start the request manager's event loop using auto_create_handle_loop
         self.request_manager.auto_create_handle_loop()
 
-        logger.info("Standalone gRPC scheduler service initialized")
+        logger.info("gRPC scheduler servicer initialized")
 
     async def Generate(
         self,
@@ -840,7 +840,6 @@ async def serve_grpc(
         port_args=port_args,
         bootstrap_server=bootstrap_server,
     )
-    logger.info("Request manager created successfully")
 
     # Create gRPC server
     server = grpc.aio.server(
@@ -859,7 +858,6 @@ async def serve_grpc(
         scheduler_info=scheduler_info,
     )
     sglang_scheduler_pb2_grpc.add_SglangSchedulerServicer_to_server(servicer, server)
-    logger.info("gRPC servicer registered")
 
     # Enable reflection
     SERVICE_NAMES = (
