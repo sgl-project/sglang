@@ -512,6 +512,9 @@ class MambaRadixCache(BasePrefixCache):
             RadixKey(page_aligned_token_ids, req.extra_key)
         )
 
+        if not mamba_exist:
+            assert torch.equal(new_last_node.mamba_value, mamba_value_forked)
+
         assert len(req.prefix_indices) <= len(
             new_indices
         ), f"{req.prefix_indices=}, {new_indices=}"
