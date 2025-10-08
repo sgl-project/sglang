@@ -65,6 +65,7 @@ from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompl
 from sglang.srt.entrypoints.openai.serving_embedding import OpenAIServingEmbedding
 from sglang.srt.entrypoints.openai.serving_rerank import OpenAIServingRerank
 from sglang.srt.entrypoints.openai.serving_score import OpenAIServingScore
+from sglang.srt.entrypoints.openai.utils import build_metric_labels
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -410,6 +411,10 @@ async def health_generate(request: Request) -> Response:
             input_ids=[0],
             sampling_params=sampling_params,
             log_metrics=False,
+            custom_labels=build_metric_labels(
+                _global_state.tokenizer_manager.server_args, "/health_generate"
+            )
+            or None,
         )
         if (
             _global_state.tokenizer_manager.server_args.disaggregation_mode
@@ -504,7 +509,15 @@ async def set_internal_state(obj: SetInternalStateReq, request: Request):
 # fastapi implicitly converts json in the request to obj (dataclass)
 @app.api_route("/generate", methods=["POST", "PUT"])
 async def generate_request(obj: GenerateReqInput, request: Request):
-    """Handle a generate request."""
+    # If there are no custom metric labels already set (e.g. from the method which constructed
+    # the GenerateReqInput object), set metric labels for the input request based on server configuration.
+    if not obj.custom_labels:
+        metric_labels = build_metric_labels(
+            _global_state.tokenizer_manager.server_args, "/generate"
+        )
+        if metric_labels:
+            obj.custom_labels = metric_labels
+
     if obj.stream:
 
         async def stream_results() -> AsyncIterator[bytes]:
@@ -551,6 +564,10 @@ async def generate_from_file_request(file: UploadFile, request: Request):
             "temperature": 0.0,
             "max_new_tokens": 512,
         },
+        custom_labels=build_metric_labels(
+            _global_state.tokenizer_manager.server_args, "/generate_from_file"
+        )
+        or None,
     )
 
     try:
@@ -1201,6 +1218,10 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput, raw_request: Reque
     ] or None
     req = GenerateReqInput(
         **inputs,
+        custom_labels=build_metric_labels(
+            _global_state.tokenizer_manager.server_args, "/vertex_generate"
+        )
+        or None,
         image_data=image_data,
         **(vertex_req.parameters or {}),
     )

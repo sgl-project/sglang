@@ -4,12 +4,13 @@ import json
 import logging
 import uuid
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
 from fastapi import HTTPException, Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
 from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
+from sglang.srt.entrypoints.openai.utils import build_metric_labels
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.server_args import ServerArgs
 
@@ -212,3 +213,7 @@ class OpenAIServingBase(ABC):
                 if label in self.allowed_custom_labels
             }
         return custom_labels
+
+    def build_metric_labels(self, endpoint_path: str) -> Dict[str, str]:
+        """Build metric labels based on server configuration flags."""
+        return build_metric_labels(self.tokenizer_manager.server_args, endpoint_path)

@@ -90,8 +90,10 @@ class OpenAIServingCompletion(OpenAIServingBase):
         else:
             prompt_kwargs = {"input_ids": prompt}
 
-        # Extract custom labels from raw request headers
-        custom_labels = self.extract_custom_labels(raw_request)
+        # Extract custom labels from raw request headers and build metric labels
+        custom_labels = self.extract_custom_labels(raw_request) or {}
+        metric_labels = self.build_metric_labels("/v1/completions")
+        custom_labels = {**custom_labels, **metric_labels}
 
         adapted_request = GenerateReqInput(
             **prompt_kwargs,

@@ -226,6 +226,7 @@ class ServerArgs:
     show_time_cost: bool = False
     enable_metrics: bool = False
     enable_metrics_for_all_schedulers: bool = False
+    metrics_label_request_type: bool = False
     tokenizer_metrics_custom_labels_header: str = "x-custom-labels"
     tokenizer_metrics_allowed_custom_labels: Optional[List[str]] = None
     bucket_time_to_first_token: Optional[List[float]] = None
@@ -1710,6 +1711,12 @@ class ServerArgs:
             help="Enable --enable-metrics-for-all-schedulers when you want schedulers on all TP ranks (not just TP 0) "
             "to record request metrics separately. This is especially useful when dp_attention is enabled, as "
             "otherwise all metrics appear to come from TP 0.",
+        )
+        parser.add_argument(
+            "--metrics-label-request-type",
+            action="store_true",
+            help="Add request_type label to prometheus metrics. The label will contain the endpoint path "
+            "(e.g., '/v1/completions', '/v1/chat/completions', '/generate').",
         )
         parser.add_argument(
             "--tokenizer-metrics-custom-labels-header",

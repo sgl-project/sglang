@@ -6,6 +6,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     CompletionRequest,
     LogProbs,
 )
+from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 
@@ -70,3 +71,19 @@ def process_hidden_states_from_ret(
     if hidden_states is not None:
         hidden_states = hidden_states[-1] if len(hidden_states) > 1 else []
     return hidden_states
+
+
+def build_metric_labels(server_args: ServerArgs, endpoint_path: str) -> Dict[str, str]:
+    """Build metric labels based on server configuration flags."""
+    labels = {}
+
+    if server_args.metrics_label_request_type:
+        labels["request_type"] = endpoint_path
+
+    # Future: Add more flags here
+    # if server_args.metrics_label_user_id:
+    #     labels["user_id"] = extract_user_id(request)
+    # if server_args.metrics_label_model_version:
+    #     labels["model_version"] = server_args.weight_version
+
+    return labels
