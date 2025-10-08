@@ -17,6 +17,7 @@ use crate::policies::PolicyRegistry;
 use crate::protocols::spec::{
     ChatCompletionRequest, ChatCompletionResponse, GenerateRequest, InputIds, Usage,
 };
+use rand::Rng;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -538,14 +539,14 @@ impl RequestBuildingStage {
         let hostname = prefill_worker.bootstrap_host();
         let bootstrap_port = prefill_worker.bootstrap_port().unwrap_or(8998);
 
-        // Generate room ID matching Python's random.randint(0, 2**63 - 1)
-        let room_id = rand::random::<u64>() & (i64::MAX as u64);
+        // Generate room ID for bootstrap
+        let room_id = rand::rng().random_range(0..i32::MAX);
 
         // Create DisaggregatedParams
         let disagg_params = DisaggregatedParams {
             bootstrap_host: hostname.to_string(),
             bootstrap_port: bootstrap_port as i32,
-            bootstrap_room: room_id as i32,
+            bootstrap_room: room_id,
         };
 
         // Inject metadata directly into request
@@ -860,7 +861,7 @@ impl ResponseProcessingStage {
         // Clone chat_request to avoid borrow checker conflict
         // (ctx.chat_request() borrows ctx, preventing mutable borrow of ctx.state.response.stop_decoder)
         let chat_request = ctx.chat_request().clone();
-        let history_tool_calls_count = processing::get_history_tool_calls_count(&chat_request);
+        let history_tool_calls_count = utils::get_history_tool_calls_count(&chat_request);
 
         let stop_decoder = ctx
             .state
