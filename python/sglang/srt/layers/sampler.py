@@ -24,10 +24,35 @@ if is_cuda():
     )
 
 
+def _load_aiter_ops():
+    global _aiter_ops, _aiter_module
+    if _aiter_ops is not None and _aiter_module is not None:
+        return _aiter_ops
+
+    import aiter as _aiter  # type: ignore
+    import aiter.ops.sampling  # noqa: F401  # ensure sampling ops are loaded
+
+    _aiter_ops = torch.ops.aiter
+    _aiter_module = _aiter
+    logger.info("Using AITER sampler")
+    return _aiter_ops
+
+
+_aiter_ops = None
+_aiter_module = None
+_AITER_MIN_P_WARNING_EMITTED = False
+
+
 logger = logging.getLogger(__name__)
 
 SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
 SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
+
+
+def _to_tensor_scalar_tuple(x):
+    if isinstance(x, torch.Tensor):
+        return (x, 0)
+    return (None, x)
 
 
 class Sampler(nn.Module):
@@ -38,6 +63,64 @@ class Sampler(nn.Module):
 
         if is_dp_attention_enabled():
             self.tp_sync_group = get_attention_tp_group().device_group
+
+    def _aiter_greedy_sample(self, logits: torch.Tensor) -> torch.Tensor:
+        # TODO(ROCm): swap to aiter.greedy_sample
+        return torch.argmax(logits, dim=-1)
+
+    def _aiter_sample(
+        self,
+        probs: torch.Tensor,
+        sampling_info: SamplingBatchInfo,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        ops = _load_aiter_ops()
+
+        if sampling_info.need_min_p_sampling:
+            global _AITER_MIN_P_WARNING_EMITTED
+            if not _AITER_MIN_P_WARNING_EMITTED:
+                logger.warning(
+                    "AITER sampling backend does not support min_p; falling back to PyTorch implementation."
+                )
+                _AITER_MIN_P_WARNING_EMITTED = True
+            return top_k_top_p_min_p_sampling_from_probs_torch(
+                probs,
+                sampling_info.top_ks,
+                sampling_info.top_ps,
+                sampling_info.min_ps,
+                sampling_info.need_min_p_sampling,
+                sampling_info.sampling_seed,
+                positions,
+            )
+
+        probs_for_ops = probs.float().contiguous()
+
+        use_top_k = sampling_info.need_top_k_sampling
+        use_top_p = sampling_info.need_top_p_sampling
+
+        if use_top_k and use_top_p:
+            next_token_ids = ops.top_k_top_p_sampling_from_probs(
+                probs_for_ops,
+                None,
+                *_to_tensor_scalar_tuple(sampling_info.top_ks),
+                *_to_tensor_scalar_tuple(sampling_info.top_ps),
+            )
+            return next_token_ids.view(-1).to(torch.long)
+        elif use_top_p:
+            next_token_ids = ops.top_p_sampling_from_probs(
+                probs_for_ops,
+                None,
+                *_to_tensor_scalar_tuple(sampling_info.top_ps),
+            )
+            return next_token_ids.view(-1).to(torch.long)
+        elif use_top_k:
+            renorm_probs = ops.top_k_renorm_probs(
+                probs_for_ops,
+                *_to_tensor_scalar_tuple(sampling_info.top_ks),
+            )
+            return torch.multinomial(renorm_probs, num_samples=1).view(-1)
+        else:
+            return torch.multinomial(probs_for_ops, num_samples=1).view(-1)
 
     def _preprocess_logits(
         self, logits: torch.Tensor, sampling_info: SamplingBatchInfo
@@ -88,7 +171,10 @@ class Sampler(nn.Module):
 
         if sampling_info.is_all_greedy:
             # Use torch.argmax if all requests use greedy sampling
-            batch_next_token_ids = torch.argmax(logits, -1)
+            if global_server_args_dict["sampling_backend"] == "aiter":
+                batch_next_token_ids = self._aiter_greedy_sample(logits)
+            else:
+                batch_next_token_ids = torch.argmax(logits, -1)
             if return_logprob:
                 logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
         else:
@@ -141,6 +227,10 @@ class Sampler(nn.Module):
                         sampling_info.need_min_p_sampling,
                         sampling_info.sampling_seed,
                         positions,
+                    )
+                elif global_server_args_dict["sampling_backend"] == "aiter":
+                    batch_next_token_ids = self._aiter_sample(
+                        probs, sampling_info, positions
                     )
                 else:
                     raise ValueError(
