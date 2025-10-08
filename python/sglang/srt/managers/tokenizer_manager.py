@@ -1393,7 +1393,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     if (
                         recv_obj.spec_verify_ct[i] > 0
                         and self.server_args.speculative_num_steps is not None
-                        and not isinstance(recv_obj, BatchEmbeddingOut)
+                        and not isinstance(recv_obj, BatchEmbeddingOutput)
                         and hasattr(recv_obj, "spec_accepted_tokens")
                         # Checks that `spec_accepted_tokens[i]` will exist.
                         and len(recv_obj.spec_accepted_tokens) > i
