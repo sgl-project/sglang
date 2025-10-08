@@ -1770,7 +1770,7 @@ class Scheduler(
             chunked_req_to_exclude.add(self.chunked_req)
             self.tree_cache.cache_unfinished_req(self.chunked_req, chunked=True)
             # chunked request keeps its rid but will get a new req_pool_idx
-            if self.tp_worker.worker.model_runner.is_hybrid_gdn:
+            if self.tp_worker.worker.model_runner.mambaish_config is not None:
                 self.req_to_token_pool.free(
                     self.chunked_req.req_pool_idx, free_mamba_cache=False
                 )

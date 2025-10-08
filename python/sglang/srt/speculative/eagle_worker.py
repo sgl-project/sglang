@@ -866,7 +866,7 @@ class EAGLEWorker(TpModelWorker):
         logits_output.hidden_states = logits_output.hidden_states[res.accepted_indices]
 
         # QQ: can be optimized
-        if self.target_worker.model_runner.is_hybrid_gdn:
+        if self.target_worker.model_runner.hybrid_gdn_config is not None:
             # res.draft_input.accept_length is on GPU but may be empty for last verify?
             accepted_length = (
                 torch.tensor(
