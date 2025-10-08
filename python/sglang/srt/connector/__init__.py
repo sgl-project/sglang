@@ -33,7 +33,8 @@ def create_remote_connector(url, device, **kwargs) -> BaseConnector:
     elif connector_type == "instance":
         return RemoteInstanceConnector(url, device)
     elif connector_type == "ckptengine":
-        return CkptEngineConnector(url, device)
+        ckpt_engine_port = kwargs.get("ckpt_engine_port", 33001)
+        return CkptEngineConnector(url, device, ckpt_engine_port)
     else:
         raise ValueError(f"Invalid connector type: {url}")
 

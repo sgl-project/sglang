@@ -1608,7 +1608,7 @@ class CkptEngineModelLoader(BaseModelLoader):
             with torch.device(device_config.device):
                 model = _initialize_model(model_config, self.load_config)
 
-            with create_remote_connector(model_weights, device_config.device) as client:
+            with create_remote_connector(model_weights, device_config.device, ckpt_engine_port=self.load_config.ckpt_engine_port) as client:
                 connector_type = get_connector_type(client)
                 if connector_type == ConnectorType.CKPTENGINE:
                     self.load_model_from_ckpt_engine(

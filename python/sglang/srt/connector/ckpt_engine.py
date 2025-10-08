@@ -58,10 +58,11 @@ class FlattenedTensorMetadata(TypedDict):
 
 class CkptEngineConnector(BaseConnector):
 
-    def __init__(self, url: str, device: torch.device = "cpu"):
+    def __init__(self, url: str, device: torch.device = "cpu", ckpt_engine_port: int = 33001):
         super().__init__(url)
         self.url = url
         self.device = device
+        self.ckpt_engine_port = ckpt_engine_port
         self.zmq_handle = None
         self.zmq_ctx = None
         self.device_uuid = None
@@ -75,7 +76,7 @@ class CkptEngineConnector(BaseConnector):
         # FIXME: There needs a local rank
         self.device_uuid = _get_physical_gpu_id(tp_rank)
         socket = zmq.Context().socket(zmq.PULL)
-        socket.bind(f"tcp://*:{CKPTENGINE_PORT + tp_rank}")
+        socket.bind(f"tcp://*:{self.ckpt_engine_port + tp_rank}")
         try:
             raw_message = socket.recv()
 
