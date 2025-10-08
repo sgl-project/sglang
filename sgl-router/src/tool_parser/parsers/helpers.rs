@@ -14,6 +14,27 @@ pub fn get_tool_indices(tools: &[Tool]) -> HashMap<String, usize> {
         .collect()
 }
 
+/// Find the common prefix of two strings
+/// Used for incremental argument streaming when partial JSON returns different intermediate states
+pub fn find_common_prefix(s1: &str, s2: &str) -> String {
+    let mut prefix = String::new();
+
+    // Iterate over characters, not bytes, to handle Unicode correctly
+    let chars1: Vec<char> = s1.chars().collect();
+    let chars2: Vec<char> = s2.chars().collect();
+    let min_len = chars1.len().min(chars2.len());
+
+    for i in 0..min_len {
+        if chars1[i] == chars2[i] {
+            prefix.push(chars1[i]);
+        } else {
+            break;
+        }
+    }
+
+    prefix
+}
+
 /// Get unstreamed tool call arguments
 /// Returns tool call items for arguments that have been parsed but not yet streamed
 /// This ensures tool calls are properly completed even if the model generates final arguments in the last chunk
@@ -251,36 +272,59 @@ pub fn handle_json_tool_streaming(
     // Case 2: Handle streaming arguments
     else if let Some(cur_arguments) = current_tool_call.get("arguments") {
         let tool_id = *current_tool_id as usize;
-        let sent = streamed_args_for_tool
-            .get(tool_id)
-            .map(|s| s.len())
-            .unwrap_or(0);
+        let sent = streamed_args_for_tool.get(tool_id).map(|s| s.len()).unwrap_or(0);
         let cur_args_json = serde_json::to_string(cur_arguments)
             .map_err(|e| ToolParserError::ParsingFailed(e.to_string()))?;
 
-        // Compute diff: everything after what we've already sent
-        let diff = cur_args_json[sent..].to_string();
+        // Get prev_arguments (matches Python's structure)
+        let prev_arguments = if tool_id < prev_tool_call_arr.len() {
+            prev_tool_call_arr[tool_id].get("arguments")
+        } else {
+            None
+        };
 
-        // Send diff if there's new content
-        if !diff.is_empty() {
-            // Only accumulate if not complete
-            if !is_complete && tool_id < streamed_args_for_tool.len() {
-                streamed_args_for_tool[tool_id].push_str(&diff);
+        // Calculate diff: everything after we've already sent
+        let mut argument_diff = None;
+
+        if is_complete {
+            // Python: argument_diff = cur_args_json[sent:]
+            // Rust needs bounds check (Python returns "" automatically)
+            argument_diff = if sent < cur_args_json.len() {
+                Some(cur_args_json[sent..].to_string())
+            } else {
+                Some(String::new())
+            };
+        } else if let Some(prev_args) = prev_arguments {
+            let prev_args_json = serde_json::to_string(prev_args)
+                .map_err(|e| ToolParserError::ParsingFailed(e.to_string()))?;
+
+            if cur_args_json != prev_args_json {
+                let prefix = find_common_prefix(&prev_args_json, &cur_args_json);
+                argument_diff = if sent < prefix.len() {
+                    Some(prefix[sent..].to_string())
+                } else {
+                    Some(String::new())
+                };
             }
-
-            result.calls.push(ToolCallItem {
-                tool_index: tool_id,
-                name: None,
-                parameters: diff,
-            });
         }
 
-        // If JSON is complete, advance to next tool
-        if is_complete {
-            // Remove processed portion, keep unprocessed content
-            *buffer = current_text[start_idx + end_idx..].to_string();
+        // Send diff if present
+        if let Some(diff) = argument_diff {
+            if !diff.is_empty() {
+                if !is_complete && tool_id < streamed_args_for_tool.len() {
+                    streamed_args_for_tool[tool_id].push_str(&diff);
+                }
+                result.calls.push(ToolCallItem {
+                    tool_index: tool_id,
+                    name: None,
+                    parameters: diff,
+                });
+            }
+        }
 
-            // Clear completed tool data
+        // If complete, advance to next tool
+        if is_complete {
+            *buffer = current_text[start_idx + end_idx..].to_string();
             if tool_id < prev_tool_call_arr.len() {
                 prev_tool_call_arr[tool_id] = Value::Null;
             }
