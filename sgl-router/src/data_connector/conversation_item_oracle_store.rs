@@ -189,16 +189,7 @@ impl ConversationItemStorage for OracleConversationItemStorage {
                     }
                     sql.push_str(" FETCH NEXT :limit ROWS ONLY");
 
-                    let mut stmt = conn.statement(&sql).build().map_err(map_oracle_error)?;
-                    // (no-op variable removed)
-                    stmt.execute_named(
-                        &mut [
-                            (":cid", &cid as &dyn ToSql),
-                            // Optional after params
-                        ]
-                    ).map_err(map_oracle_error)?;
-
-                    // Rebuild with query to fetch rows (since execute_named doesn't return rows); use query_named
+                    // Build params and perform a named SELECT query
                     let mut params_vec: Vec<(&str, &dyn ToSql)> = vec![(":cid", &cid)];
                     if let Some((ts, iid)) = &after_key {
                         params_vec.push((":ats", ts));
@@ -206,9 +197,7 @@ impl ConversationItemStorage for OracleConversationItemStorage {
                     }
                     params_vec.push((":limit", &limit));
 
-                    let rows_iter = conn
-                        .query_named(&sql, &params_vec)
-                        .map_err(map_oracle_error)?;
+                    let rows_iter = conn.query_named(&sql, &params_vec).map_err(map_oracle_error)?;
 
                     let mut out = Vec::new();
                     for row_res in rows_iter {
