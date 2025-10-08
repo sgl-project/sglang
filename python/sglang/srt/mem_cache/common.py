@@ -283,13 +283,10 @@ def alloc_req_slots(
     reqs: list[Req] | None,
 ) -> list[int]:
     """Allocate request slots from the pool."""
-    match req_to_token_pool:
-        case ReqToTokenPool():
-            req_pool_indices = req_to_token_pool.alloc(num_reqs)
-        case HybridReqToTokenPool():
-            req_pool_indices = req_to_token_pool.alloc(num_reqs, reqs)
-        case _:
-            raise ValueError(f"Unknown {type(req_to_token_pool)=}")
+    if isinstance(req_to_token_pool, HybridReqToTokenPool):
+        req_pool_indices = req_to_token_pool.alloc(num_reqs, reqs)
+    else:
+        req_pool_indices = req_to_token_pool.alloc(num_reqs)
 
     if req_pool_indices is None:
         raise RuntimeError(
