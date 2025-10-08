@@ -13,7 +13,7 @@ import sys
 import threading
 import time
 import uuid
-from typing import Any, AsyncGenerator, Dict, List, Optional, Union
+from typing import AsyncGenerator, Dict, List, Optional, Union
 
 import grpc
 import zmq
