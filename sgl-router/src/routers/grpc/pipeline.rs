@@ -244,11 +244,9 @@ impl PipelineStage for WorkerSelectionStage {
     async fn execute(&self, ctx: &mut RequestContext) -> Result<(), Response> {
         debug!("Stage {}: Selecting workers", self.name());
 
-        let prep = ctx
-            .state
-            .preparation
-            .as_ref()
-            .ok_or_else(|| super::utils::internal_error_static("Preparation stage not completed"))?;
+        let prep = ctx.state.preparation.as_ref().ok_or_else(|| {
+            super::utils::internal_error_static("Preparation stage not completed")
+        })?;
 
         let text = prep.original_text.as_deref();
 
@@ -399,11 +397,10 @@ impl PipelineStage for ClientAcquisitionStage {
     async fn execute(&self, ctx: &mut RequestContext) -> Result<(), Response> {
         debug!("Stage {}: Acquiring gRPC clients", self.name());
 
-        let workers = ctx
-            .state
-            .workers
-            .as_ref()
-            .ok_or_else(|| super::utils::internal_error_static("Worker selection not completed"))?;
+        let workers =
+            ctx.state.workers.as_ref().ok_or_else(|| {
+                super::utils::internal_error_static("Worker selection not completed")
+            })?;
 
         let clients = match workers {
             WorkerSelection::Single { worker } => {
@@ -455,11 +452,9 @@ impl PipelineStage for RequestBuildingStage {
             .as_ref()
             .ok_or_else(|| super::utils::internal_error_static("Preparation not completed"))?;
 
-        let clients = ctx
-            .state
-            .clients
-            .as_ref()
-            .ok_or_else(|| super::utils::internal_error_static("Client acquisition not completed"))?;
+        let clients = ctx.state.clients.as_ref().ok_or_else(|| {
+            super::utils::internal_error_static("Client acquisition not completed")
+        })?;
 
         // Get client for building request (use prefill client if PD mode)
         let builder_client = match clients {
@@ -486,7 +481,10 @@ impl PipelineStage for RequestBuildingStage {
                         prep.tool_constraints.clone(),
                     )
                     .map_err(|e| {
-                        super::utils::bad_request_error(format!("Invalid request parameters: {}", e))
+                        super::utils::bad_request_error(format!(
+                            "Invalid request parameters: {}",
+                            e
+                        ))
                     })?
             }
             RequestType::Generate(request) => {
@@ -649,11 +647,9 @@ impl PipelineStage for RequestExecutionStage {
             .take()
             .ok_or_else(|| super::utils::internal_error_static("Proto request not built"))?;
 
-        let clients = ctx
-            .state
-            .clients
-            .as_mut()
-            .ok_or_else(|| super::utils::internal_error_static("Client acquisition not completed"))?;
+        let clients = ctx.state.clients.as_mut().ok_or_else(|| {
+            super::utils::internal_error_static("Client acquisition not completed")
+        })?;
 
         let result = match self.mode {
             ExecutionMode::Single => self.execute_single(proto_request, clients).await?,
@@ -678,14 +674,13 @@ impl RequestExecutionStage {
         proto_request: proto::GenerateRequest,
         clients: &mut ClientSelection,
     ) -> Result<ExecutionResult, Response> {
-        let client = clients
-            .single_mut()
-            .ok_or_else(|| super::utils::internal_error_static("Expected single client but got dual"))?;
+        let client = clients.single_mut().ok_or_else(|| {
+            super::utils::internal_error_static("Expected single client but got dual")
+        })?;
 
-        let stream = client
-            .generate(proto_request)
-            .await
-            .map_err(|e| super::utils::internal_error_message(format!("Failed to start generation: {}", e)))?;
+        let stream = client.generate(proto_request).await.map_err(|e| {
+            super::utils::internal_error_message(format!("Failed to start generation: {}", e))
+        })?;
 
         Ok(ExecutionResult::Single { stream })
     }
@@ -695,9 +690,9 @@ impl RequestExecutionStage {
         proto_request: proto::GenerateRequest,
         clients: &mut ClientSelection,
     ) -> Result<ExecutionResult, Response> {
-        let (prefill_client, decode_client) = clients
-            .dual_mut()
-            .ok_or_else(|| super::utils::internal_error_static("Expected dual clients but got single"))?;
+        let (prefill_client, decode_client) = clients.dual_mut().ok_or_else(|| {
+            super::utils::internal_error_static("Expected dual clients but got single")
+        })?;
 
         debug!("Sending concurrent requests to prefill and decode workers");
 
@@ -800,11 +795,10 @@ impl ResponseProcessingStage {
 
         if is_streaming {
             // Get dispatch metadata for consistent response fields
-            let dispatch = ctx
-                .state
-                .dispatch
-                .as_ref()
-                .ok_or_else(|| super::utils::internal_error_static("Dispatch metadata not set"))?;
+            let dispatch =
+                ctx.state.dispatch.as_ref().ok_or_else(|| {
+                    super::utils::internal_error_static("Dispatch metadata not set")
+                })?;
 
             // Streaming: Use StreamingProcessor and return SSE response (early exit)
             return Err(self.streaming_processor.clone().process_streaming_response(
@@ -855,7 +849,9 @@ impl ResponseProcessingStage {
         };
 
         if all_responses.is_empty() {
-            return Err(super::utils::internal_error_static("No responses from server"));
+            return Err(super::utils::internal_error_static(
+                "No responses from server",
+            ));
         }
 
         // Clone chat_request to avoid borrow checker conflict
@@ -864,12 +860,10 @@ impl ResponseProcessingStage {
         let history_tool_calls_count =
             super::processing::get_history_tool_calls_count(&chat_request);
 
-        let stop_decoder = ctx
-            .state
-            .response
-            .stop_decoder
-            .as_mut()
-            .ok_or_else(|| super::utils::internal_error_static("Stop decoder not initialized"))?;
+        let stop_decoder =
+            ctx.state.response.stop_decoder.as_mut().ok_or_else(|| {
+                super::utils::internal_error_static("Stop decoder not initialized")
+            })?;
 
         let mut choices = Vec::new();
         for (index, complete) in all_responses.iter().enumerate() {

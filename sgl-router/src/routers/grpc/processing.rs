@@ -10,8 +10,7 @@ use tracing::{debug, error};
 
 use crate::grpc_client::proto;
 use crate::protocols::spec::{
-    ChatChoice, ChatCompletionMessage, ChatMessage, FunctionCallResponse, ToolCall,
-    ToolChoiceValue,
+    ChatChoice, ChatCompletionMessage, ChatMessage, FunctionCallResponse, ToolCall, ToolChoiceValue,
 };
 use crate::reasoning_parser::ReasoningParserFactory;
 use crate::tokenizer::stop::{SequenceDecoderOutput, StopSequenceDecoder};
