@@ -86,14 +86,14 @@ class ModernBertSelfAttention(nn.Module):
             )
 
         self.layer_id = layer_id
+        global_attn_every_n_layers = getattr(config, "global_attn_every_n_layers", 0)
         self.global_attn_interval = max(
-            getattr(config, "global_attn_every_n_layers", 0),
+            global_attn_every_n_layers,
             1,
         )
         self.local_attention = getattr(config, "local_attention", -1)
         self.is_global_layer = (
-            getattr(config, "global_attn_every_n_layers", 0) <= 0
-            or layer_id % self.global_attn_interval == 0
+            global_attn_every_n_layers <= 0 or layer_id % self.global_attn_interval == 0
         )
 
         tp_world_size = get_tensor_model_parallel_world_size()
@@ -126,15 +126,13 @@ class ModernBertSelfAttention(nn.Module):
 
         if self.is_global_layer:
             rope_theta = config.global_rope_theta
+            max_position_embeddings = config.max_position_embeddings
         else:
             rope_theta = (
                 config.local_rope_theta
                 if config.local_rope_theta is not None
                 else config.global_rope_theta
             )
-        if self.is_global_layer:
-            max_position_embeddings = config.max_position_embeddings
-        else:
             max_position_embeddings = config.local_attention
 
         self.rotary_emb = get_rope(
@@ -146,14 +144,11 @@ class ModernBertSelfAttention(nn.Module):
             is_neox_style=True,
         )
         sliding_window_size = -1
-        if (
-            not self.is_global_layer
-            and self.local_attention is not None
-            and self.local_attention > 0
-        ):
-            total_window = int(self.local_attention)
-            single_side = max(total_window // 2, 0)
-            sliding_window_size = single_side if single_side > 0 else -1
+        if not self.is_global_layer and self.local_attention > 0:
+            # The sliding window is symmetric.
+            single_side = self.local_attention // 2
+            if single_side > 0:
+                sliding_window_size = single_side
 
         self.attn = RadixAttention(
             num_heads=self.num_heads,
@@ -360,7 +355,7 @@ class ModernBertModel(nn.Module):
         else:
             hidden_states = self.embeddings(inputs_embeds=input_embeds)
 
-        # 2. Encoder (22 layers)
+        # 2. Encoder
         hidden_states = self.encoder(hidden_states, forward_batch)
 
         # 3. Pooling

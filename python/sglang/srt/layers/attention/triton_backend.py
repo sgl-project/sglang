@@ -811,7 +811,14 @@ class TritonAttnBackend(AttentionBackend):
         causal = True
         if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
             causal = False
+            
+        # Deterministic mode: use unified 1-stage kernel
+        if self.enable_deterministic:
+            return self._forward_extend_unified(
+                q, o, layer, forward_batch, causal, logits_soft_cap, sinks
+            )
 
+        # Normal mode: use original 2-stage kernel
         if (
             layer.sliding_window_size is not None
             and layer.sliding_window_size > -1
