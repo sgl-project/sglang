@@ -12,7 +12,9 @@ use serde_json::Value;
 
 use crate::core::Worker;
 use crate::grpc_client::{proto, SglangSchedulerClient};
-use crate::protocols::spec::{ChatCompletionRequest, ChatCompletionResponse, GenerateRequest};
+use crate::protocols::spec::{
+    ChatCompletionRequest, ChatCompletionResponse, GenerateRequest, GenerateResponse,
+};
 use crate::reasoning_parser::ReasoningParserFactory;
 use crate::tokenizer::stop::StopSequenceDecoder;
 use crate::tokenizer::traits::Tokenizer;
@@ -226,27 +228,11 @@ impl RequestContext {
         }
     }
 
-    /// Try to get chat request
-    pub fn try_chat_request(&self) -> Option<&ChatCompletionRequest> {
-        match &self.input.request_type {
-            RequestType::Chat(req) => Some(req.as_ref()),
-            _ => None,
-        }
-    }
-
     /// Get generate request (panics if not generate)
     pub fn generate_request(&self) -> &GenerateRequest {
         match &self.input.request_type {
             RequestType::Generate(req) => req.as_ref(),
             _ => panic!("Expected generate request"),
-        }
-    }
-
-    /// Try to get generate request
-    pub fn try_generate_request(&self) -> Option<&GenerateRequest> {
-        match &self.input.request_type {
-            RequestType::Generate(req) => Some(req.as_ref()),
-            _ => None,
         }
     }
 
@@ -256,16 +242,6 @@ impl RequestContext {
             RequestType::Chat(req) => req.stream,
             RequestType::Generate(req) => req.stream,
         }
-    }
-
-    /// Check if request is chat
-    pub fn is_chat(&self) -> bool {
-        matches!(&self.input.request_type, RequestType::Chat(_))
-    }
-
-    /// Check if request is generate
-    pub fn is_generate(&self) -> bool {
-        matches!(&self.input.request_type, RequestType::Generate(_))
     }
 }
 
@@ -394,5 +370,6 @@ pub enum ExecutionResult {
 /// Final processed response
 pub enum FinalResponse {
     Chat(ChatCompletionResponse),
-    Generate(Box<GenerateRequest>),
+    /// Generate response is a Vec of GenerateResponse (n=1 returns single item, n>1 returns multiple)
+    Generate(Vec<GenerateResponse>),
 }
