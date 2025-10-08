@@ -5,6 +5,7 @@ Uses GrpcRequestManager for orchestration without tokenization.
 
 import argparse
 import asyncio
+import dataclasses
 import logging
 import multiprocessing as mp
 import os
@@ -14,8 +15,12 @@ from concurrent import futures
 from typing import AsyncIterator, Dict, Optional, Tuple
 
 import grpc
+from google.protobuf.json_format import MessageToDict
+from google.protobuf.struct_pb2 import Struct
+from google.protobuf.timestamp_pb2 import Timestamp
 from grpc_reflection.v1alpha import reflection
 
+import sglang
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.entrypoints.grpc_request_manager import GrpcRequestManager
 from sglang.srt.grpc import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
@@ -172,11 +177,13 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         request_manager: GrpcRequestManager,
         server_args: ServerArgs,
         model_info: Dict,
+        scheduler_info: Dict,
     ):
         """Initialize the standalone gRPC service."""
         self.request_manager = request_manager
         self.server_args = server_args
         self.model_info = model_info
+        self.scheduler_info = scheduler_info
         self.start_time = time.time()
 
         # Start the request manager's event loop using auto_create_handle_loop
@@ -395,6 +402,89 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 message=str(e),
             )
 
+    async def GetModelInfo(
+        self,
+        request: sglang_scheduler_pb2.GetModelInfoRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> sglang_scheduler_pb2.GetModelInfoResponse:
+        """Get model information."""
+        logger.info("Model info request received")
+
+        is_generation = self.scheduler_info.get("is_generation")
+        if is_generation is None:
+            is_generation = not self.server_args.is_embedding
+
+        return sglang_scheduler_pb2.GetModelInfoResponse(
+            model_path=self.server_args.model_path,
+            tokenizer_path=self.server_args.tokenizer_path or "",
+            is_generation=is_generation,
+            preferred_sampling_params=(
+                self.server_args.preferred_sampling_params or ""
+            ),
+            weight_version=self.server_args.weight_version or "",
+            served_model_name=self.server_args.served_model_name,
+            max_context_length=self.model_info["max_context_length"],
+            vocab_size=self.model_info["vocab_size"],
+            supports_vision=self.model_info["supports_vision"],
+            model_type=self.model_info["model_type"],
+            eos_token_ids=self.model_info["eos_token_ids"],
+            pad_token_id=self.model_info["pad_token_id"],
+            bos_token_id=self.model_info["bos_token_id"],
+            max_req_input_len=self.model_info["max_req_input_len"],
+        )
+
+    async def GetServerInfo(
+        self,
+        request: sglang_scheduler_pb2.GetServerInfoRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> sglang_scheduler_pb2.GetServerInfoResponse:
+        """Get server information."""
+        logger.info("Server info request received")
+
+        server_args_dict = dataclasses.asdict(self.server_args)
+        server_args_struct = Struct()
+
+        def make_serializable(obj):
+            if obj is None:
+                return None
+            elif isinstance(obj, (str, int, float, bool)):
+                return obj
+            elif isinstance(obj, (list, tuple, set)):
+                return [make_serializable(item) for item in obj]
+            elif isinstance(obj, dict):
+                return {k: make_serializable(v) for k, v in obj.items()}
+            else:
+                return str(obj)
+
+        serializable_args = make_serializable(server_args_dict)
+        server_args_struct.update(serializable_args)
+
+        # Convert scheduler_info to Struct
+        scheduler_info_struct = Struct()
+        scheduler_info_struct.update(self.scheduler_info)
+
+        # Get runtime state from request manager
+        manager_state = self.request_manager.get_server_info()
+
+        # Calculate uptime
+        uptime = time.time() - self.start_time
+
+        # Create timestamp
+        start_timestamp = Timestamp()
+        start_timestamp.FromSeconds(int(self.start_time))
+
+        return sglang_scheduler_pb2.GetServerInfoResponse(
+            server_args=server_args_struct,
+            scheduler_info=scheduler_info_struct,
+            active_requests=manager_state["active_requests"],
+            is_paused=manager_state["paused"],
+            last_receive_timestamp=manager_state["last_receive_time"],
+            uptime_seconds=uptime,
+            sglang_version=sglang.__version__,
+            server_type="grpc",
+            start_time=start_timestamp,
+        )
+
     # Helper methods for request/response conversion
 
     def _convert_generate_request(
@@ -411,6 +501,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
 
         # Convert sampling params
         sampling_params = self._convert_sampling_params(grpc_req.sampling_params)
+        sampling_params.normalize(tokenizer=None)
 
         # Extract disaggregated params if present
         bootstrap_host = None
@@ -483,28 +574,52 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         elif grpc_params.HasField("structural_tag"):
             structural_tag = grpc_params.structural_tag
 
+        # Handle optional parameters conversion
+        custom_params = (
+            MessageToDict(grpc_params.custom_params)
+            if grpc_params.HasField("custom_params")
+            else None
+        )
+        max_new_tokens = (
+            grpc_params.max_new_tokens
+            if grpc_params.HasField("max_new_tokens")
+            else None
+        )
+        stream_interval = (
+            grpc_params.stream_interval
+            if grpc_params.HasField("stream_interval")
+            else None
+        )
+        logit_bias = dict(grpc_params.logit_bias) if grpc_params.logit_bias else None
+        stop = list(grpc_params.stop) if grpc_params.stop else None
+        stop_token_ids = (
+            list(grpc_params.stop_token_ids) if grpc_params.stop_token_ids else None
+        )
+
         return SGLSamplingParams(
-            temperature=grpc_params.temperature or 1.0,
-            top_p=grpc_params.top_p or 1.0,
-            top_k=grpc_params.top_k or -1,
-            min_p=grpc_params.min_p or 0.0,
-            frequency_penalty=grpc_params.frequency_penalty or 0.0,
-            presence_penalty=grpc_params.presence_penalty or 0.0,
-            repetition_penalty=grpc_params.repetition_penalty or 1.0,
-            max_new_tokens=grpc_params.max_new_tokens or 128,
-            min_new_tokens=grpc_params.min_new_tokens or 0,
-            stop=list(grpc_params.stop) if grpc_params.stop else [],
-            stop_token_ids=(
-                list(grpc_params.stop_token_ids) if grpc_params.stop_token_ids else []
-            ),
+            temperature=grpc_params.temperature,
+            top_p=grpc_params.top_p,
+            top_k=grpc_params.top_k,
+            min_p=grpc_params.min_p,
+            frequency_penalty=grpc_params.frequency_penalty,
+            presence_penalty=grpc_params.presence_penalty,
+            repetition_penalty=grpc_params.repetition_penalty,
+            max_new_tokens=max_new_tokens,
+            min_new_tokens=grpc_params.min_new_tokens,
+            stop=stop,
+            stop_token_ids=stop_token_ids,
             skip_special_tokens=grpc_params.skip_special_tokens,
             spaces_between_special_tokens=grpc_params.spaces_between_special_tokens,
+            no_stop_trim=grpc_params.no_stop_trim,
             regex=regex,
             json_schema=json_schema,
             ebnf=ebnf_grammar,
             structural_tag=structural_tag,
-            n=grpc_params.n or 1,
+            n=grpc_params.n,
             ignore_eos=grpc_params.ignore_eos,
+            stream_interval=stream_interval,
+            logit_bias=logit_bias,
+            custom_params=custom_params,
         )
 
     def _convert_output_logprobs_to_proto(
@@ -731,6 +846,7 @@ async def serve_grpc(
         request_manager=request_manager,
         server_args=server_args,
         model_info=model_info,
+        scheduler_info=scheduler_info,
     )
     sglang_scheduler_pb2_grpc.add_SglangSchedulerServicer_to_server(servicer, server)
 
