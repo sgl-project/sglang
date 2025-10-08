@@ -40,7 +40,6 @@ from sglang.srt.utils import configure_logger, prepare_model_and_tokenizer
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
-HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
 
 
 def _run_scheduler_with_signal_handling(*args, **kwargs):
@@ -347,32 +346,22 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             logger.info(f"Sending health check request to request manager...")
 
             # Submit and wait for response
+            # No timeout here - router layer handles request timeout
+            # This prevents false failures when scheduler is busy but still processing
             output_generator = self.request_manager.generate_request(
-                health_request, request_id=rid
+                health_request, request_id=rid, grpc_context=context
             )
 
-            try:
-                # Get first response with timeout
-                response = await asyncio.wait_for(
-                    output_generator.__anext__(), timeout=HEALTH_CHECK_TIMEOUT
-                )
+            # Wait for response (router will cancel via gRPC context if timeout)
+            response = await output_generator.__anext__()
 
-                # Clean up
-                if rid in self.request_manager.rid_to_state:
-                    del self.request_manager.rid_to_state[rid]
+            # Clean up
+            if rid in self.request_manager.rid_to_state:
+                del self.request_manager.rid_to_state[rid]
 
-                return sglang_scheduler_pb2.HealthCheckResponse(
-                    healthy=True, message="Health check passed"
-                )
-
-            except asyncio.TimeoutError:
-                # Clean up on timeout
-                if rid in self.request_manager.rid_to_state:
-                    del self.request_manager.rid_to_state[rid]
-
-                return sglang_scheduler_pb2.HealthCheckResponse(
-                    healthy=False, message="Health check timeout"
-                )
+            return sglang_scheduler_pb2.HealthCheckResponse(
+                healthy=True, message="Health check passed"
+            )
 
         except Exception as e:
             logger.error(f"Health check failed: {e}")
