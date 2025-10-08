@@ -209,6 +209,11 @@ async def async_request_openai_completions(
             **request_func_input.extra_request_body,
         }
 
+        # hack to accommodate different LoRA conventions between SGLang and vLLM.
+        if request_func_input.lora_name:
+            payload["model"] = request_func_input.lora_name
+            payload["lora_path"] = request_func_input.lora_name
+
         if request_func_input.image_data:
             payload.update({"image_data": request_func_input.image_data})
 
@@ -326,6 +331,12 @@ async def async_request_openai_chat_completions(
             "stream": not args.disable_stream,
             **request_func_input.extra_request_body,
         }
+
+        # hack to accommodate different LoRA conventions between SGLang and vLLM.
+        if request_func_input.lora_name:
+            payload["model"] = request_func_input.lora_name
+            payload["lora_path"] = request_func_input.lora_name
+
         headers = get_auth_headers()
 
         output = RequestFuncOutput.init_new(request_func_input)
