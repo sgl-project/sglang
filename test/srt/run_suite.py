@@ -130,6 +130,7 @@ suites = {
         TestFile("test_modelopt_loader.py", 30),
     ],
     "per-commit-2-gpu": [
+        TestFile("ep/test_moe_ep.py", 140),
         TestFile("lora/test_lora_tp.py", 116),
         TestFile("rl/test_update_weights_from_distributed.py", 103),
         TestFile("test_data_parallelism.py", 73),
