@@ -221,23 +221,26 @@ impl ConversationItemStorage for OracleConversationItemStorage {
             .await?;
 
         // Map rows to ConversationItem; propagate JSON parse errors instead of swallowing
-        rows
-            .into_iter()
-            .map(|(id, resp_id, item_type, role, content_raw, status, created_at)| {
-                let content = match content_raw {
-                    Some(s) => serde_json::from_str(&s).map_err(ConversationItemStorageError::from)?,
-                    None => Value::Null,
-                };
-                Ok(ConversationItem {
-                    id: ConversationItemId(id),
-                    response_id: resp_id,
-                    item_type,
-                    role,
-                    content,
-                    status,
-                    created_at,
-                })
-            })
+        rows.into_iter()
+            .map(
+                |(id, resp_id, item_type, role, content_raw, status, created_at)| {
+                    let content = match content_raw {
+                        Some(s) => {
+                            serde_json::from_str(&s).map_err(ConversationItemStorageError::from)?
+                        }
+                        None => Value::Null,
+                    };
+                    Ok(ConversationItem {
+                        id: ConversationItemId(id),
+                        response_id: resp_id,
+                        item_type,
+                        role,
+                        content,
+                        status,
+                        created_at,
+                    })
+                },
+            )
             .collect()
     }
 }

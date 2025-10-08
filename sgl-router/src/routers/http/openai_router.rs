@@ -3591,7 +3591,9 @@ impl super::super::RouterTrait for OpenAIRouter {
                         match it.item_type.as_str() {
                             "message" => {
                                 // content is expected to be an array of ResponseContentPart
-                                let parts: Vec<ResponseContentPart> = match serde_json::from_value(it.content.clone()) {
+                                let parts: Vec<ResponseContentPart> = match serde_json::from_value(
+                                    it.content.clone(),
+                                ) {
                                     Ok(parts) => parts,
                                     Err(e) => {
                                         warn!(

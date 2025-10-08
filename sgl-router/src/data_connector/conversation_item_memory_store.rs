@@ -16,6 +16,7 @@ pub struct MemoryConversationItemStorage {
     #[allow(clippy::type_complexity)]
     links: RwLock<HashMap<ConversationId, BTreeMap<(i64, String), ConversationItemId>>>,
     // Per-conversation reverse index for fast after cursor lookup: item_id_str -> (ts, item_id_str)
+    #[allow(clippy::type_complexity)]
     rev_index: RwLock<HashMap<ConversationId, HashMap<String, (i64, String)>>>,
 }
 
@@ -101,7 +102,9 @@ impl ConversationItemStorage for MemoryConversationItemStorage {
         let mut push_item = |key: &ConversationItemId| -> bool {
             if let Some(it) = items_guard.get(key) {
                 results.push(it.clone());
-                if results.len() == take { return true; }
+                if results.len() == take {
+                    return true;
+                }
             }
             false
         };
@@ -109,22 +112,30 @@ impl ConversationItemStorage for MemoryConversationItemStorage {
         match (params.order, after_key) {
             (SortOrder::Desc, Some(k)) => {
                 for ((_ts, _id), item_key) in map.range(..k).rev() {
-                    if push_item(item_key) { break; }
+                    if push_item(item_key) {
+                        break;
+                    }
                 }
             }
             (SortOrder::Desc, None) => {
                 for ((_ts, _id), item_key) in map.iter().rev() {
-                    if push_item(item_key) { break; }
+                    if push_item(item_key) {
+                        break;
+                    }
                 }
             }
             (SortOrder::Asc, Some(k)) => {
                 for ((_ts, _id), item_key) in map.range((Excluded(k), Unbounded)) {
-                    if push_item(item_key) { break; }
+                    if push_item(item_key) {
+                        break;
+                    }
                 }
             }
             (SortOrder::Asc, None) => {
                 for ((_ts, _id), item_key) in map.iter() {
-                    if push_item(item_key) { break; }
+                    if push_item(item_key) {
+                        break;
+                    }
                 }
             }
         }
