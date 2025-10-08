@@ -6,12 +6,12 @@
 use std::sync::Arc;
 
 use serde_json::Value;
-use tracing::{debug, error};
+use tracing::error;
 
 use crate::grpc_client::proto;
 use crate::protocols::spec::{
-    ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatMessage, FunctionCallResponse,
-    ToolCall, ToolChoice, ToolChoiceValue,
+    ChatChoice, ChatCompletionMessage, ChatCompletionRequest, FunctionCallResponse, ToolCall,
+    ToolChoice, ToolChoiceValue,
 };
 use crate::reasoning_parser::ReasoningParserFactory;
 use crate::tokenizer::stop::{SequenceDecoderOutput, StopSequenceDecoder};
@@ -238,7 +238,7 @@ impl ResponseProcessor {
                     .enumerate()
                     .map(|(index, tc)| {
                         // Generate ID for this tool call
-                        let id = generate_tool_call_id(
+                        let id = utils::generate_tool_call_id(
                             model,
                             &tc.function.name,
                             index,
@@ -265,72 +265,4 @@ impl ResponseProcessor {
             }
         }
     }
-}
-
-// ============================================================================
-// Helper Functions (EXACT COPIES from router.rs)
-// ============================================================================
-
-/// Generate a tool call ID based on model format (from router.rs:436-449)
-pub fn generate_tool_call_id(
-    model: &str,
-    tool_name: &str,
-    tool_index: usize,
-    history_count: usize,
-) -> String {
-    if model.to_lowercase().contains("kimi") {
-        // KimiK2 format: functions.{name}:{global_index}
-        format!("functions.{}:{}", tool_name, history_count + tool_index)
-    } else {
-        // Standard OpenAI format: call_{24-char-uuid}
-        use uuid::Uuid;
-        format!("call_{}", &Uuid::new_v4().simple().to_string()[..24])
-    }
-}
-
-/// Count the number of tool calls in the request message history (from router.rs:412-424)
-pub fn get_history_tool_calls_count(request: &ChatCompletionRequest) -> usize {
-    request
-        .messages
-        .iter()
-        .filter_map(|msg| {
-            if let ChatMessage::Assistant { tool_calls, .. } = msg {
-                tool_calls.as_ref().map(|calls| calls.len())
-            } else {
-                None
-            }
-        })
-        .sum()
-}
-
-/// Process a chunk of tokens through the stop decoder (from router.rs:452-482)
-pub fn process_chunk_tokens(
-    stop_decoder: &mut StopSequenceDecoder,
-    token_ids: &[u32],
-) -> (String, bool) {
-    let mut chunk_text = String::new();
-    let mut should_stop = false;
-
-    for &token_id in token_ids {
-        match stop_decoder.process_token(token_id).unwrap_or_else(|e| {
-            debug!(
-                "Error processing token {}: {}. Treating as Held.",
-                token_id, e
-            );
-            SequenceDecoderOutput::Held
-        }) {
-            SequenceDecoderOutput::Text(text) => {
-                chunk_text.push_str(&text);
-            }
-            SequenceDecoderOutput::Stopped | SequenceDecoderOutput::StoppedWithText(_) => {
-                should_stop = true;
-                break;
-            }
-            SequenceDecoderOutput::Held => {
-                // Token is being held, continue
-            }
-        }
-    }
-
-    (chunk_text, should_stop)
 }
