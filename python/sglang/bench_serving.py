@@ -673,7 +673,7 @@ def get_processor(
     )
 
 
-def get_dataset(args, tokenizer, model_id):
+def get_dataset(args, tokenizer, model_id=None):
     tokenize_prompt = getattr(args, "tokenize_prompt", False)
     if args.dataset_name == "sharegpt":
         assert not tokenize_prompt
@@ -700,6 +700,7 @@ def get_dataset(args, tokenizer, model_id):
     elif args.dataset_name == "image":
         assert not tokenize_prompt, "image dataset does not support --tokenize-prompt"
         assert args.apply_chat_template, "image dataset requires apply_chat_template"
+        assert model_id is not None
         processor = get_processor(model_id)
         input_requests = sample_image_requests(
             num_requests=args.num_prompts,
@@ -726,6 +727,7 @@ def get_dataset(args, tokenizer, model_id):
     elif args.dataset_name == "mmmu":
         assert not tokenize_prompt
         assert args.apply_chat_template, "mmmu requires apply_chat_template"
+        assert model_id is not None
         processor = get_processor(model_id)
         input_requests = sample_mmmu_requests(
             num_requests=args.num_prompts,
