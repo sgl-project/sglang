@@ -190,12 +190,12 @@ impl ConversationItemStorage for OracleConversationItemStorage {
                     sql.push_str(" FETCH NEXT :limit ROWS ONLY");
 
                     // Build params and perform a named SELECT query
-                    let mut params_vec: Vec<(&str, &dyn ToSql)> = vec![(":cid", &cid)];
+                    let mut params_vec: Vec<(&str, &dyn ToSql)> = vec![("cid", &cid)];
                     if let Some((ts, iid)) = &after_key {
-                        params_vec.push((":ats", ts));
-                        params_vec.push((":iid", iid));
+                        params_vec.push(("ats", ts));
+                        params_vec.push(("iid", iid));
                     }
-                    params_vec.push((":limit", &limit));
+                    params_vec.push(("limit", &limit));
 
                     let rows_iter = conn.query_named(&sql, &params_vec).map_err(map_oracle_error)?;
 

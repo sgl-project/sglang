@@ -955,10 +955,7 @@ impl OpenAIRouter {
                         // Attach conversation id for client response if present (not forwarded upstream)
                         if let Some(conv_id) = original_body.conversation.clone() {
                             if let Some(obj) = final_response_json.as_object_mut() {
-                                obj.insert(
-                                    "conversation".to_string(),
-                                    json!({"id": conv_id}),
-                                );
+                                obj.insert("conversation".to_string(), json!({"id": conv_id}));
                             }
                         }
                         if original_body.store {
@@ -2417,6 +2414,11 @@ impl OpenAIRouter {
             .map(|s| s.to_string())
             .or_else(|| original_body.user.clone());
 
+        // Set conversation id from request if provided
+        if let Some(conv_id) = original_body.conversation.clone() {
+            stored_response.conversation_id = Some(conv_id);
+        }
+
         stored_response.metadata = response_json
             .get("metadata")
             .and_then(|v| v.as_object())
@@ -2591,7 +2593,7 @@ impl OpenAIRouter {
                 }
             }
 
-            // Attach conversation id into streaming event response content
+            // Attach conversation id into streaming event response content with ordering
             if let Some(conv_id) = original_body.conversation.clone() {
                 response_obj.insert("conversation".to_string(), json!({"id": conv_id}));
                 changed = true;
@@ -4196,9 +4198,18 @@ async fn persist_items_with_storages(
     let conv_id: ConversationId = conversation_id.as_str().into();
     match conv_storage.get_conversation(&conv_id).await {
         Ok(Some(_)) => {}
-        Ok(None) => return Ok(()),
+        Ok(None) => {
+            warn!(conversation_id = %conv_id.0, "Conversation not found; skipping item persistence");
+            return Ok(());
+        }
         Err(err) => return Err(err.to_string()),
     }
+
+    // Extract response_id once for attaching to both input and output items
+    let response_id_opt = response
+        .get("id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
 
     // Helper to ensure status defaults to completed
     async fn create_and_link_item(
@@ -4213,16 +4224,18 @@ async fn persist_items_with_storages(
             .create_item(new_item)
             .await
             .map_err(|e| e.to_string())?;
-        item_storage
+        let _ = item_storage
             .link_item(conv_id, &created.id, chrono::Utc::now())
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        tracing::info!(conversation_id = %conv_id.0, item_id = %created.id.0, item_type = %created.item_type, "Persisted conversation item and link");
+        Ok(())
     }
 
     match request.input.clone() {
         ResponseInput::Text(text) => {
             let new_item = DCNewConversationItem {
-                response_id: None,
+                response_id: response_id_opt.clone(),
                 item_type: "message".to_string(),
                 role: Some("user".to_string()),
                 content: json!([{ "type": "input_text", "text": text }]),
@@ -4236,7 +4249,7 @@ async fn persist_items_with_storages(
                     ResponseInputOutputItem::Message { role, content, status, .. } => {
                         let content_v = serde_json::to_value(&content).map_err(|e| e.to_string())?;
                         let new_item = DCNewConversationItem {
-                            response_id: None,
+                            response_id: response_id_opt.clone(),
                             item_type: "message".to_string(),
                             role: Some(role),
                             content: content_v,
@@ -4246,7 +4259,7 @@ async fn persist_items_with_storages(
                     }
                     ResponseInputOutputItem::Reasoning { summary, content, status, .. } => {
                         let new_item = DCNewConversationItem {
-                            response_id: None,
+                            response_id: response_id_opt.clone(),
                             item_type: "reasoning".to_string(),
                             role: None,
                             content: json!({ "summary": summary, "content": content }),
@@ -4256,7 +4269,7 @@ async fn persist_items_with_storages(
                     }
                     ResponseInputOutputItem::FunctionToolCall { name, arguments, output, status, .. } => {
                         let new_item = DCNewConversationItem {
-                            response_id: None,
+                            response_id: response_id_opt.clone(),
                             item_type: "function_tool_call".to_string(),
                             role: None,
                             content: json!({ "name": name, "arguments": arguments, "output": output, "status": status }),
@@ -4270,10 +4283,6 @@ async fn persist_items_with_storages(
     }
 
     if let Some(output_array) = response.get("output").and_then(|v| v.as_array()) {
-        let response_id = response
-            .get("id")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
 
         for item in output_array {
             let item_type = match item.get("type").and_then(|v| v.as_str()) {
@@ -4287,7 +4296,7 @@ async fn persist_items_with_storages(
                     let content_v = item.get("content").cloned().unwrap_or_else(|| Value::Array(Vec::new()));
                     let status = item.get("status").and_then(|v| v.as_str()).map(|s| s.to_string());
                     let new_item = DCNewConversationItem {
-                        response_id: response_id.clone(),
+                        response_id: response_id_opt.clone(),
                         item_type: "message".to_string(),
                         role,
                         content: content_v,
@@ -4300,7 +4309,7 @@ async fn persist_items_with_storages(
                     let content_v = item.get("content").cloned().unwrap_or_else(|| Value::Array(Vec::new()));
                     let status = item.get("status").and_then(|v| v.as_str()).map(|s| s.to_string());
                     let new_item = DCNewConversationItem {
-                        response_id: response_id.clone(),
+                        response_id: response_id_opt.clone(),
                         item_type: "reasoning".to_string(),
                         role: None,
                         content: json!({ "summary": summary_v, "content": content_v }),
@@ -4314,7 +4323,7 @@ async fn persist_items_with_storages(
                     let output_str = item.get("output").and_then(|v| v.as_str()).unwrap_or("");
                     let status = item.get("status").and_then(|v| v.as_str()).map(|s| s.to_string());
                     let new_item = DCNewConversationItem {
-                        response_id: response_id.clone(),
+                        response_id: response_id_opt.clone(),
                         item_type: "function_tool_call".to_string(),
                         role: None,
                         content: json!({
@@ -4342,7 +4351,7 @@ async fn persist_items_with_storages(
                         "approval_request_id": item.get("approval_request_id").cloned().unwrap_or(Value::Null)
                     });
                     let new_item = DCNewConversationItem {
-                        response_id: response_id.clone(),
+                        response_id: response_id_opt.clone(),
                         item_type: "mcp_call".to_string(),
                         role: None,
                         content: content_v,
@@ -4356,7 +4365,7 @@ async fn persist_items_with_storages(
                         "tools": item.get("tools").cloned().unwrap_or_else(|| Value::Array(Vec::new()))
                     });
                     let new_item = DCNewConversationItem {
-                        response_id: response_id.clone(),
+                        response_id: response_id_opt.clone(),
                         item_type: "mcp_list_tools".to_string(),
                         role: None,
                         content: content_v,
