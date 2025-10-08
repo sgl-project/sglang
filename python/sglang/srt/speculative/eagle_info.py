@@ -21,12 +21,12 @@ from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
     TREE_SPEC_KERNEL_AVAILABLE,
-    _generate_simulated_accept_index,
     align_evict_mask_to_page_size,
     assign_req_to_token_pool,
     create_accept_length_filter,
     create_extend_after_decode_spec_info,
     filter_finished_cache_loc_kernel,
+    generate_simulated_accept_index,
     get_src_tgt_cache_loc,
     get_target_cache_loc,
 )
@@ -333,7 +333,7 @@ class EagleVerifyInput(SpecInput):
 
         if SIMULATE_ACC_LEN > 0.0:
             # Do simulation
-            accept_index = _generate_simulated_accept_index(
+            accept_index = generate_simulated_accept_index(
                 accept_index=accept_index,
                 predict=predict,  # mutable
                 accept_length=accept_length,  # mutable

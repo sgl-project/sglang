@@ -435,7 +435,7 @@ def select_top_k_tokens(
     return input_ids, hidden_states, scores, tree_info
 
 
-def _generate_simulated_accept_index(
+def generate_simulated_accept_index(
     accept_index,
     predict,
     accept_length,
