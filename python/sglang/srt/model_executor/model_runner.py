@@ -175,6 +175,9 @@ SGLANG_CI_SMALL_KV_SIZE = os.getenv("SGLANG_CI_SMALL_KV_SIZE", None)
 # Detect stragger ranks in model loading
 UNBALANCED_MODEL_LOADING_TIMEOUT_S = 300
 
+# the ratio of mamba cache pool size to max_running_requests, it will be safe when it is larger than 2 (yizhang2077)
+MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO = 3
+
 logger = logging.getLogger(__name__)
 
 
@@ -351,9 +354,14 @@ class ModelRunner:
                 if self.server_args.max_running_requests is not None:
                     self.server_args.max_mamba_cache_size = (
                         self.server_args.max_running_requests
+                        * MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO
                     )
                 else:
                     self.server_args.max_mamba_cache_size = 512
+                    self.server_args.max_running_requests = (
+                        self.server_args.max_mamba_cache_size
+                        // MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO
+                    )
             self.server_args.max_mamba_cache_size = (
                 self.server_args.max_mamba_cache_size
                 // (
@@ -1427,9 +1435,6 @@ class ModelRunner:
                 ),
                 4096,
             )
-        if self.is_hybrid_gdn:
-            # for mamba cache radix, it need be divided by 3 (magic number now). (yizhang2077)
-            max_num_reqs = min(max_num_reqs, self.server_args.max_mamba_cache_size // 3)
 
         if self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone():
             if self.is_draft_worker:

@@ -482,8 +482,6 @@ class MambaRadixCache(BasePrefixCache):
         page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
         page_aligned_token_ids = token_ids[:page_aligned_len]
 
-        # Radix Cache takes one ref in memory pool
-        # Note: the insert function already frees the overlapped kv_indices
         mamba_value = self.req_to_token_pool.get_mamba_indices(
             req.req_pool_idx
         ).unsqueeze(-1)
@@ -511,11 +509,9 @@ class MambaRadixCache(BasePrefixCache):
 
         # The prefix indices could be updated, reuse it
         new_indices, new_last_node, _, _ = self.match_prefix(
-            RadixKey(token_ids, req.extra_key)
+            RadixKey(page_aligned_token_ids, req.extra_key)
         )
 
-        if not mamba_exist:
-            assert torch.equal(new_last_node.mamba_value, mamba_value_forked)
         assert len(req.prefix_indices) <= len(
             new_indices
         ), f"{req.prefix_indices=}, {new_indices=}"
@@ -545,8 +541,10 @@ class MambaRadixCache(BasePrefixCache):
         self, x: TreeNode, is_evict_mamba: bool
     ) -> Tuple[int, int, TreeNode, TreeNode]:
         assert (
-            x.full_lock_ref == 0
-        ), f"leaf node with full lock must also have mamba lock, {x.id=} {x.full_lock_ref=}"
+            x.full_lock_ref == 0 and x.mamba_lock_ref == 0
+        ), f"evict leaf node invalid with {x.id=} {x.full_lock_ref=} {x.mamba_lock_ref=}"
+
+        assert x.mamba_value is not None, f"leaf node mamba value is not None, {x.id=}"
         # 1. a leaf node, free full tokens and mamba
         self.token_to_kv_pool_allocator.free(x.value)
         full_num_evicted = len(x.value)
@@ -578,6 +576,9 @@ class MambaRadixCache(BasePrefixCache):
         # evict lru leaf nodes until mamba_num_tokens is reached
         while mamba_num_evicted < mamba_num and (self.mamba_lru_list.in_list(x)):
             assert x.mamba_value is not None, f"node has no mamba value, {x.id=}"
+            assert (
+                len(x.mamba_value) == 1
+            ), f"node has abnormal mamba length, {x.id=}, {len(x.mamba_value)=}"
             assert x != self.root_node, f"root node is not evictable, {x.id=}"
             assert x.mamba_lock_ref == 0, f"node is in use by mamba kv indices, {x.id=}"
 
@@ -813,6 +814,7 @@ class MambaRadixCache(BasePrefixCache):
     ) -> Tuple[int, bool]:
         # Update the last access time from root to leaf, so that
         # mamba will tombstone the node closer to root first
+        assert mamba_value is not None, "Mamba value should not be None here."
         node.last_access_time = time.monotonic()
         if node != self.root_node:
             self.full_lru_list.reset_node_mru(node)
@@ -847,15 +849,13 @@ class MambaRadixCache(BasePrefixCache):
             new_node.mamba_value = mamba_value
             self.full_lru_list.insert_mru(new_node)
             self.full_evictable_size_ += len(value)
-            if mamba_value is not None:
-                self.mamba_evictable_size_ += len(mamba_value)
-                self.mamba_lru_list.insert_mru(new_node)
+            self.mamba_evictable_size_ += len(mamba_value)
+            self.mamba_lru_list.insert_mru(new_node)
             node.children[child_key] = new_node
         elif node.mamba_value is None:  # add for mamba tombstone
             node.mamba_value = mamba_value
-            if mamba_value is not None:
-                self.mamba_evictable_size_ += len(mamba_value)
-                self.mamba_lru_list.insert_mru(node)
+            self.mamba_evictable_size_ += len(mamba_value)
+            self.mamba_lru_list.insert_mru(node)
         else:
             mamba_value_exist = True
 
@@ -898,9 +898,7 @@ class MambaRadixCache(BasePrefixCache):
 
     def _tombstone_internal_node(self, node: TreeNode) -> None:
         assert len(node.children) != 0, f"Cannot tombstone a leaf node, {node.id=}"
-        self.mamba_evictable_size_ -= (
-            len(node.mamba_value) if node.mamba_value is not None else 0
-        )
+        self.mamba_evictable_size_ -= len(node.mamba_value)
         node.mamba_value = None
 
     def _delete_tombstone_leaf(self, node: TreeNode) -> None:
