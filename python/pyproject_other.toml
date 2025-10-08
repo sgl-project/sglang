@@ -65,7 +65,7 @@ tracing = [
 
 srt = [
     "sglang[runtime_common]",
-    "sgl-kernel==0.3.14.post1",
+    "sgl-kernel==0.3.15",
     "torch==2.8.0",
     "torchaudio==2.8.0",
     "torchvision",
