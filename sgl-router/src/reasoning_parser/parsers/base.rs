@@ -2,7 +2,6 @@
 // for detecting and extracting reasoning blocks from text.
 
 use crate::reasoning_parser::traits::{ParseError, ParserConfig, ParserResult, ReasoningParser};
-use tracing as log;
 
 /// Base reasoning parser implementation.
 ///

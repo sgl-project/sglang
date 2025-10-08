@@ -21,7 +21,7 @@ use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tonic::codec::Streaming;
-use tracing::{debug, error, warn};
+use tracing::{error, warn};
 use uuid::Uuid;
 
 /// Get gRPC client from worker, returning appropriate error response on failure
