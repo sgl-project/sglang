@@ -30,7 +30,12 @@ use uuid::Uuid;
 #[async_trait]
 pub trait PipelineStage: Send + Sync {
     /// Execute this stage, mutating the context
-    async fn execute(&self, ctx: &mut RequestContext) -> Result<(), Response>;
+    ///
+    /// Returns:
+    /// - `Ok(None)` - Continue to next stage
+    /// - `Ok(Some(response))` - Pipeline complete, return this response (e.g., streaming)
+    /// - `Err(response)` - Error occurred, return this error response
+    async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response>;
 
     /// Stage name for logging
     fn name(&self) -> &'static str;
@@ -45,7 +50,7 @@ pub struct PreparationStage;
 
 #[async_trait]
 impl PipelineStage for PreparationStage {
-    async fn execute(&self, ctx: &mut RequestContext) -> Result<(), Response> {
+    async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
         debug!("Stage {}: Processing request", self.name());
 
         // Clone the request to avoid borrowing issues
@@ -60,7 +65,7 @@ impl PipelineStage for PreparationStage {
             }
         }
 
-        Ok(())
+        Ok(None)
     }
 
     fn name(&self) -> &'static str {
@@ -247,7 +252,7 @@ impl WorkerSelectionStage {
 
 #[async_trait]
 impl PipelineStage for WorkerSelectionStage {
-    async fn execute(&self, ctx: &mut RequestContext) -> Result<(), Response> {
+    async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
         debug!("Stage {}: Selecting workers", self.name());
 
         let prep = ctx
@@ -284,7 +289,7 @@ impl PipelineStage for WorkerSelectionStage {
         };
 
         ctx.state.workers = Some(workers);
-        Ok(())
+        Ok(None)
     }
 
     fn name(&self) -> &'static str {
@@ -402,7 +407,7 @@ pub struct ClientAcquisitionStage;
 
 #[async_trait]
 impl PipelineStage for ClientAcquisitionStage {
-    async fn execute(&self, ctx: &mut RequestContext) -> Result<(), Response> {
+    async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
         debug!("Stage {}: Acquiring gRPC clients", self.name());
 
         let workers = ctx
@@ -427,7 +432,7 @@ impl PipelineStage for ClientAcquisitionStage {
         };
 
         ctx.state.clients = Some(clients);
-        Ok(())
+        Ok(None)
     }
 
     fn name(&self) -> &'static str {
@@ -452,7 +457,7 @@ impl RequestBuildingStage {
 
 #[async_trait]
 impl PipelineStage for RequestBuildingStage {
-    async fn execute(&self, ctx: &mut RequestContext) -> Result<(), Response> {
+    async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
         debug!("Stage {}: Building proto request", self.name());
 
         let prep = ctx
@@ -520,7 +525,7 @@ impl PipelineStage for RequestBuildingStage {
         }
 
         ctx.state.proto_request = Some(proto_request);
-        Ok(())
+        Ok(None)
     }
 
     fn name(&self) -> &'static str {
@@ -568,7 +573,7 @@ pub struct DispatchMetadataStage;
 
 #[async_trait]
 impl PipelineStage for DispatchMetadataStage {
-    async fn execute(&self, ctx: &mut RequestContext) -> Result<(), Response> {
+    async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
         debug!("Stage {}: Preparing dispatch metadata", self.name());
 
         let proto_request = ctx
@@ -614,7 +619,7 @@ impl PipelineStage for DispatchMetadataStage {
             is_streaming: ctx.is_streaming(),
         });
 
-        Ok(())
+        Ok(None)
     }
 
     fn name(&self) -> &'static str {
@@ -646,7 +651,7 @@ impl RequestExecutionStage {
 
 #[async_trait]
 impl PipelineStage for RequestExecutionStage {
-    async fn execute(&self, ctx: &mut RequestContext) -> Result<(), Response> {
+    async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
         debug!("Stage {}: Executing gRPC request", self.name());
 
         let proto_request = ctx
@@ -670,7 +675,7 @@ impl PipelineStage for RequestExecutionStage {
 
         // Store result in context for ResponseProcessingStage
         ctx.state.response.execution_result = Some(result);
-        Ok(())
+        Ok(None)
     }
 
     fn name(&self) -> &'static str {
@@ -770,20 +775,14 @@ impl ResponseProcessingStage {
 
 #[async_trait]
 impl PipelineStage for ResponseProcessingStage {
-    async fn execute(&self, ctx: &mut RequestContext) -> Result<(), Response> {
+    async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
         debug!("Stage {}: Processing response", self.name());
 
         // Delegate to request-type specific processing
         match &ctx.input.request_type {
-            RequestType::Chat(_) => {
-                self.process_chat_response(ctx).await?;
-            }
-            RequestType::Generate(_) => {
-                self.process_generate_response(ctx).await?;
-            }
+            RequestType::Chat(_) => return self.process_chat_response(ctx).await,
+            RequestType::Generate(_) => return self.process_generate_response(ctx).await,
         }
-
-        Ok(())
     }
 
     fn name(&self) -> &'static str {
@@ -792,7 +791,10 @@ impl PipelineStage for ResponseProcessingStage {
 }
 
 impl ResponseProcessingStage {
-    async fn process_chat_response(&self, ctx: &mut RequestContext) -> Result<(), Response> {
+    async fn process_chat_response(
+        &self,
+        ctx: &mut RequestContext,
+    ) -> Result<Option<Response>, Response> {
         let is_streaming = ctx.is_streaming();
 
         // Extract execution result
@@ -811,11 +813,13 @@ impl ResponseProcessingStage {
                 .as_ref()
                 .ok_or_else(|| utils::internal_error_static("Dispatch metadata not set"))?;
 
-            // Streaming: Use StreamingProcessor and return SSE response (early exit)
-            return Err(self.streaming_processor.clone().process_streaming_response(
-                execution_result,
-                ctx.chat_request().clone(),
-                dispatch.clone(),
+            // Streaming: Use StreamingProcessor and return SSE response (done)
+            return Ok(Some(
+                self.streaming_processor.clone().process_streaming_response(
+                    execution_result,
+                    ctx.chat_request().clone(),
+                    dispatch.clone(),
+                ),
             ));
         }
 
@@ -926,10 +930,13 @@ impl ResponseProcessingStage {
         // Store the final response
         ctx.state.response.final_response = Some(FinalResponse::Chat(response));
 
-        Ok(())
+        Ok(None)
     }
 
-    async fn process_generate_response(&self, _ctx: &mut RequestContext) -> Result<(), Response> {
+    async fn process_generate_response(
+        &self,
+        _ctx: &mut RequestContext,
+    ) -> Result<Option<Response>, Response> {
         // TODO(generate): Implement generate response processing
         //
         // Required implementation:
@@ -1050,9 +1057,30 @@ impl ChatCompletionPipeline {
         // Execute each stage in sequence
         for (idx, stage) in self.stages.iter().enumerate() {
             debug!("Executing stage {}: {}", idx + 1, stage.name());
-            if let Err(response) = stage.execute(&mut ctx).await {
-                error!("Stage {} ({}) failed", idx + 1, stage.name());
-                return response;
+            match stage.execute(&mut ctx).await {
+                Ok(Some(response)) => {
+                    // Stage completed successfully with a response (e.g., streaming)
+                    debug!(
+                        "Stage {} ({}) completed with response",
+                        idx + 1,
+                        stage.name()
+                    );
+                    return response;
+                }
+                Ok(None) => {
+                    // Continue to next stage
+                    continue;
+                }
+                Err(response) => {
+                    // Error occurred
+                    error!(
+                        "Stage {} ({}) failed with status {}",
+                        idx + 1,
+                        stage.name(),
+                        response.status()
+                    );
+                    return response;
+                }
             }
         }
 
@@ -1079,9 +1107,30 @@ impl ChatCompletionPipeline {
         // Execute each stage in sequence
         for (idx, stage) in self.stages.iter().enumerate() {
             debug!("Executing stage {}: {}", idx + 1, stage.name());
-            if let Err(response) = stage.execute(&mut ctx).await {
-                error!("Stage {} ({}) failed", idx + 1, stage.name());
-                return response;
+            match stage.execute(&mut ctx).await {
+                Ok(Some(response)) => {
+                    // Stage completed successfully with a response (e.g., streaming)
+                    debug!(
+                        "Stage {} ({}) completed with response",
+                        idx + 1,
+                        stage.name()
+                    );
+                    return response;
+                }
+                Ok(None) => {
+                    // Continue to next stage
+                    continue;
+                }
+                Err(response) => {
+                    // Error occurred
+                    error!(
+                        "Stage {} ({}) failed with status {}",
+                        idx + 1,
+                        stage.name(),
+                        response.status()
+                    );
+                    return response;
+                }
             }
         }
 
