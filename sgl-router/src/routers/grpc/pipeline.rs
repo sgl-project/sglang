@@ -11,7 +11,7 @@ use super::context::*;
 use super::processing;
 use super::streaming;
 use super::utils;
-use crate::core::{ConnectionMode, WorkerRegistry, WorkerType};
+use crate::core::{ConnectionMode, Worker, WorkerRegistry, WorkerType};
 use crate::grpc_client::proto;
 use crate::policies::PolicyRegistry;
 use crate::protocols::spec::{
@@ -19,6 +19,9 @@ use crate::protocols::spec::{
     GenerateResponse, InputIds, Usage,
 };
 use crate::tokenizer::stop::SequenceDecoderOutput;
+use crate::tokenizer::traits::Tokenizer;
+use proto::generate_complete::MatchedStop;
+use proto::DisaggregatedParams;
 use rand::Rng;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -210,7 +213,7 @@ impl PreparationStage {
 
     fn tokenize_single_text(
         &self,
-        tokenizer: &Arc<dyn crate::tokenizer::traits::Tokenizer>,
+        tokenizer: &Arc<dyn Tokenizer>,
         text: &str,
     ) -> Result<(String, Vec<u32>), String> {
         let encoding = tokenizer
@@ -304,7 +307,7 @@ impl WorkerSelectionStage {
         &self,
         model_id: Option<&str>,
         text: Option<&str>,
-    ) -> Option<Arc<dyn crate::core::Worker>> {
+    ) -> Option<Arc<dyn Worker>> {
         // Get workers for the specified model, filtered by connection mode
         let workers = self.worker_registry.get_workers_filtered(
             model_id,
@@ -314,7 +317,7 @@ impl WorkerSelectionStage {
         );
 
         // Filter by availability (health + circuit breaker)
-        let available: Vec<Arc<dyn crate::core::Worker>> = workers
+        let available: Vec<Arc<dyn Worker>> = workers
             .iter()
             .filter(|w| w.is_available())
             .cloned()
@@ -339,7 +342,7 @@ impl WorkerSelectionStage {
         &self,
         model_id: Option<&str>,
         text: Option<&str>,
-    ) -> Option<(Arc<dyn crate::core::Worker>, Arc<dyn crate::core::Worker>)> {
+    ) -> Option<(Arc<dyn Worker>, Arc<dyn Worker>)> {
         // Get prefill workers - use None for WorkerType filter to get all types,
         // then filter manually (since Prefill is a struct variant)
         let all_workers = self.worker_registry.get_workers_filtered(
@@ -539,10 +542,8 @@ impl RequestBuildingStage {
     fn inject_bootstrap_metadata(
         &self,
         request: &mut proto::GenerateRequest,
-        prefill_worker: &Arc<dyn crate::core::Worker>,
+        prefill_worker: &Arc<dyn Worker>,
     ) {
-        use proto::DisaggregatedParams;
-
         let hostname = prefill_worker.bootstrap_host();
         let bootstrap_port = prefill_worker.bootstrap_port().unwrap_or(8998);
 
@@ -1058,15 +1059,13 @@ impl ResponseProcessingStage {
             let finish_reason_str = std::mem::take(&mut complete.finish_reason);
 
             // Parse finish_reason from string to proper type
-            let finish_reason = utils::parse_finish_reason(&finish_reason_str);
+            let finish_reason =
+                utils::parse_finish_reason(&finish_reason_str, complete.completion_tokens);
 
             // Handle matched_stop if present
-            let matched_stop = complete.matched_stop.take().map(|matched| {
-                use proto::generate_complete::MatchedStop;
-                match matched {
-                    MatchedStop::MatchedTokenId(id) => serde_json::json!(id),
-                    MatchedStop::MatchedStopStr(s) => serde_json::json!(s),
-                }
+            let matched_stop = complete.matched_stop.take().map(|matched| match matched {
+                MatchedStop::MatchedTokenId(id) => serde_json::json!(id),
+                MatchedStop::MatchedStopStr(s) => serde_json::json!(s),
             });
 
             // Extract logprobs if requested (convert proto types to Generate format)

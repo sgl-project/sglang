@@ -5,7 +5,7 @@ use crate::core::Worker;
 use crate::grpc_client::{proto, SglangSchedulerClient};
 use crate::protocols::spec::{
     ChatCompletionRequest, ChatLogProbs, ChatLogProbsContent, ChatMessage, FunctionCallResponse,
-    StringOrArray, Tool, ToolCall, ToolChoice, ToolChoiceValue, TopLogProb,
+    GenerateFinishReason, StringOrArray, Tool, ToolCall, ToolChoice, ToolChoiceValue, TopLogProb,
 };
 use crate::tokenizer::chat_template::{ChatTemplateContentFormat, ChatTemplateParams};
 use crate::tokenizer::traits::Tokenizer;
@@ -845,34 +845,32 @@ pub fn convert_generate_input_logprobs(
 
 /// Parse finish_reason string into GenerateFinishReason enum
 ///
-/// Handles SGLang finish_reason format which can be:
-/// - "stop" -> Stop
-/// - JSON object like {"type":"length","length":100} -> Length { length: ... }
-/// - Other values -> Other(...)
-pub fn parse_finish_reason(reason_str: &str) -> crate::protocols::spec::GenerateFinishReason {
-    use crate::protocols::spec::GenerateFinishReason;
-
+/// Uses serde to deserialize the finish_reason, which handles all tagged variants automatically.
+/// The GenerateFinishReason enum is tagged with `#[serde(tag = "type", rename_all = "lowercase")]`,
+/// so it expects JSON objects like:
+/// - `{"type":"stop"}` -> Stop
+/// - `{"type":"length","length":100}` -> Length { length: 100 }
+/// - Any other JSON -> Other(...)
+///
+/// For backward compatibility, also handles simple string "stop" -> Stop
+pub fn parse_finish_reason(reason_str: &str, completion_tokens: i32) -> GenerateFinishReason {
     if reason_str == "stop" {
         return GenerateFinishReason::Stop;
     }
 
-    // Try to parse as JSON object for structured reasons like {"type":"length","length":100}
-    if let Ok(json_value) = serde_json::from_str::<serde_json::Value>(reason_str) {
-        if let Some(type_str) = json_value.get("type").and_then(|v| v.as_str()) {
-            if type_str == "length" {
-                if let Some(length) = json_value.get("length").and_then(|v| v.as_u64()) {
-                    return GenerateFinishReason::Length {
-                        length: length as u32,
-                    };
-                }
-            }
-        }
-        // If we can't parse it properly, return as Other
-        return GenerateFinishReason::Other(json_value);
+    if reason_str == "length" {
+        return GenerateFinishReason::Length {
+            length: completion_tokens.max(0) as u32,
+        };
     }
 
-    // Fallback: treat as string value
-    GenerateFinishReason::Other(serde_json::Value::String(reason_str.to_string()))
+    match serde_json::from_str::<GenerateFinishReason>(reason_str) {
+        Ok(finish_reason) => finish_reason,
+        Err(_) => match serde_json::from_str::<Value>(reason_str) {
+            Ok(json_value) => GenerateFinishReason::Other(json_value),
+            Err(_) => GenerateFinishReason::Other(Value::String(reason_str.to_string())),
+        },
+    }
 }
 
 #[cfg(test)]

@@ -17,15 +17,18 @@ use tokio_stream::StreamExt;
 use tonic::codec::Streaming;
 use tracing::{debug, error, warn};
 
+use super::context;
+use super::utils;
 use crate::grpc_client::proto;
 use crate::protocols::spec::*;
 use crate::reasoning_parser::ReasoningParser;
 use crate::tokenizer::stop::{SequenceDecoderOutput, StopSequenceDecoder};
 use crate::tokenizer::traits::Tokenizer;
 use crate::tool_parser::ToolParser;
-
-use super::context;
-use super::utils;
+use proto::generate_complete::MatchedStop::{MatchedStopStr, MatchedTokenId};
+use proto::generate_response::Response::{Chunk, Complete, Error};
+use std::time::Instant;
+use tokio::sync::mpsc;
 
 /// Shared streaming processor for both single and dual dispatch modes
 #[derive(Clone)]
@@ -194,7 +197,7 @@ impl StreamingProcessor {
             let gen_response = response.map_err(|e| format!("Stream error: {}", e))?;
 
             match gen_response.response {
-                Some(proto::generate_response::Response::Chunk(chunk)) => {
+                Some(Chunk(chunk)) => {
                     let index = chunk.index;
 
                     // Get or create stop decoder for this index
@@ -336,7 +339,7 @@ impl StreamingProcessor {
                             .map_err(|_| "Failed to send content chunk".to_string())?;
                     }
                 }
-                Some(proto::generate_response::Response::Complete(complete)) => {
+                Some(Complete(complete)) => {
                     let index = complete.index;
 
                     // Flush any remaining text for this index's stop_decoder
@@ -385,19 +388,17 @@ impl StreamingProcessor {
 
                     // Extract matched_stop
                     let matched_stop_value = match &complete.matched_stop {
-                        Some(proto::generate_complete::MatchedStop::MatchedTokenId(token_id)) => {
+                        Some(MatchedTokenId(token_id)) => {
                             Some(Value::Number(serde_json::Number::from(*token_id)))
                         }
-                        Some(proto::generate_complete::MatchedStop::MatchedStopStr(stop_str)) => {
-                            Some(Value::String(stop_str.clone()))
-                        }
+                        Some(MatchedStopStr(stop_str)) => Some(Value::String(stop_str.clone())),
                         None => None,
                     };
                     matched_stops.insert(index, matched_stop_value);
 
                     // Don't break - continue reading all Complete messages for n>1
                 }
-                Some(proto::generate_response::Response::Error(error)) => {
+                Some(Error(error)) => {
                     return Err(error.message);
                 }
                 None => continue,
@@ -536,12 +537,12 @@ impl StreamingProcessor {
             while let Some(response) = prefill_stream.next().await {
                 let gen_response = response.map_err(|e| format!("Prefill stream error: {}", e))?;
                 match gen_response.response {
-                    Some(proto::generate_response::Response::Complete(_complete)) => {
+                    Some(Complete(_complete)) => {
                         // Input logprobs collected but not yet used in streaming
                         // (OpenAI spec doesn't require prompt logprobs in streaming responses)
                         break;
                     }
-                    Some(proto::generate_response::Response::Error(error)) => {
+                    Some(Error(error)) => {
                         return Err(format!("Prefill error: {}", error.message));
                     }
                     _ => continue,
@@ -563,9 +564,6 @@ impl StreamingProcessor {
         generate_request: GenerateRequest,
         dispatch: context::DispatchMetadata,
     ) -> Response {
-        use bytes::Bytes;
-        use tokio::sync::mpsc;
-
         let return_logprob = generate_request.return_logprob;
 
         // Create SSE channel
@@ -643,10 +641,6 @@ impl StreamingProcessor {
         _include_logprobs: bool,
         tx: &UnboundedSender<Result<Bytes, io::Error>>,
     ) -> Result<(), String> {
-        use proto::generate_response::Response::{Chunk, Complete, Error};
-        use std::collections::HashMap;
-        use std::time::Instant;
-
         let start_time = Instant::now();
 
         // Track state per index for n>1 case
@@ -749,8 +743,6 @@ impl StreamingProcessor {
         return_logprob: bool,
         tx: &UnboundedSender<Result<Bytes, io::Error>>,
     ) -> Result<(), String> {
-        use proto::generate_response::Response::{Complete, Error};
-
         // Collect input_logprobs from prefill stream if requested
         let input_token_logprobs = if return_logprob {
             let mut input_logprobs = None;
@@ -762,7 +754,7 @@ impl StreamingProcessor {
                         input_logprobs = complete
                             .input_logprobs
                             .as_ref()
-                            .map(super::utils::convert_generate_input_logprobs);
+                            .map(utils::convert_generate_input_logprobs);
                         break;
                     }
                     Some(Error(error)) => {
@@ -799,10 +791,6 @@ impl StreamingProcessor {
         input_token_logprobs: Option<Vec<Vec<Option<f64>>>>,
         tx: &UnboundedSender<Result<Bytes, io::Error>>,
     ) -> Result<(), String> {
-        use proto::generate_response::Response::{Chunk, Complete, Error};
-        use std::collections::HashMap;
-        use std::time::Instant;
-
         let start_time = Instant::now();
 
         // Track state per index for n>1 case
@@ -879,7 +867,10 @@ impl StreamingProcessor {
                     let e2e_latency = start_time.elapsed().as_secs_f64();
 
                     // Parse finish_reason
-                    let finish_reason = super::utils::parse_finish_reason(&complete.finish_reason);
+                    let finish_reason = utils::parse_finish_reason(
+                        &complete.finish_reason,
+                        complete.completion_tokens,
+                    );
 
                     // Send final chunk with finish_reason
                     let finish_response = serde_json::json!({
@@ -1188,9 +1179,7 @@ impl StreamingProcessor {
 }
 
 /// Build SSE response with proper headers
-pub fn build_sse_response(
-    rx: tokio::sync::mpsc::UnboundedReceiver<Result<Bytes, io::Error>>,
-) -> Response {
+pub fn build_sse_response(rx: mpsc::UnboundedReceiver<Result<Bytes, io::Error>>) -> Response {
     let stream = UnboundedReceiverStream::new(rx);
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = StatusCode::OK;
