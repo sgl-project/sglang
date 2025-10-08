@@ -2066,39 +2066,64 @@ impl GenerationRequest for GenerateRequest {
     }
 }
 
-// TODO(generate): Define GenerateResponse and GenerateChoice structs
-//
-// Required for pipeline generate response processing (see grpc/pipeline.rs:931-964)
-//
-// #[derive(Debug, Clone, Serialize, Deserialize)]
-// pub struct GenerateResponse {
-//     pub id: String,
-//     pub object: String,  // "text.completion"
-//     pub created: u64,
-//     pub model: String,
-//     pub choices: Vec<GenerateChoice>,
-//     #[serde(skip_serializing_if = "Option::is_none")]
-//     pub usage: Option<Usage>,
-//     #[serde(skip_serializing_if = "Option::is_none")]
-//     pub system_fingerprint: Option<String>,
-// }
-//
-// #[derive(Debug, Clone, Serialize, Deserialize)]
-// pub struct GenerateChoice {
-//     pub index: u32,
-//     pub text: String,
-//     #[serde(skip_serializing_if = "Option::is_none")]
-//     pub output_ids: Option<Vec<u32>>,
-//     #[serde(skip_serializing_if = "Option::is_none")]
-//     pub finish_reason: Option<String>,
-//     #[serde(skip_serializing_if = "Option::is_none")]
-//     pub logprobs: Option<TopLogprobs>,
-//     #[serde(skip_serializing_if = "Option::is_none")]
-//     pub matched_stop: Option<Value>,
-// }
-//
-// Note: Verify if similar structs already exist elsewhere before implementing.
-// May need streaming variant (GenerateStreamResponse) as well.
+// ============================================================================
+// SGLang Generate Response Types
+// ============================================================================
+
+/// SGLang generate response (single completion or array for n>1)
+///
+/// Format for n=1:
+/// ```json
+/// {
+///   "text": "...",
+///   "output_ids": [...],
+///   "meta_info": { ... }
+/// }
+/// ```
+///
+/// Format for n>1:
+/// ```json
+/// [
+///   {"text": "...", "output_ids": [...], "meta_info": {...}},
+///   {"text": "...", "output_ids": [...], "meta_info": {...}}
+/// ]
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GenerateResponse {
+    pub text: String,
+    pub output_ids: Vec<u32>,
+    pub meta_info: GenerateMetaInfo,
+}
+
+/// Metadata for a single generate completion
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GenerateMetaInfo {
+    pub id: String,
+    pub finish_reason: GenerateFinishReason,
+    pub prompt_tokens: u32,
+    pub weight_version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_token_logprobs: Option<Vec<Vec<Option<f64>>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_token_logprobs: Option<Vec<Vec<Option<f64>>>>,
+    pub completion_tokens: u32,
+    pub cached_tokens: u32,
+    pub e2e_latency: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched_stop: Option<Value>,
+}
+
+/// Finish reason for generate endpoint
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum GenerateFinishReason {
+    Length {
+        length: u32,
+    },
+    Stop,
+    #[serde(untagged)]
+    Other(Value),
+}
 
 // Constants for rerank API
 pub const DEFAULT_MODEL_NAME: &str = "default";
