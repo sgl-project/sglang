@@ -2,6 +2,9 @@
 pub mod conversation_memory_store;
 pub mod conversation_noop_store;
 pub mod conversation_oracle_store;
+pub mod conversation_items;
+pub mod conversation_item_memory_store;
+pub mod conversation_item_oracle_store;
 pub mod conversations;
 pub mod response_memory_store;
 pub mod response_noop_store;
@@ -16,6 +19,13 @@ pub use conversations::{
     ConversationStorageError, NewConversation, Result as ConversationResult,
     SharedConversationStorage,
 };
+pub use conversation_items::{
+    ConversationItem, ConversationItemId, ConversationItemStorage,
+    ConversationItemStorageError, ListParams as ConversationItemsListParams, Result as ConversationItemsResult,
+    SharedConversationItemStorage, SortOrder as ConversationItemsSortOrder, NewConversationItem,
+};
+pub use conversation_item_memory_store::MemoryConversationItemStorage;
+pub use conversation_item_oracle_store::OracleConversationItemStorage;
 pub use response_memory_store::MemoryResponseStorage;
 pub use response_noop_store::NoOpResponseStorage;
 pub use response_oracle_store::OracleResponseStorage;

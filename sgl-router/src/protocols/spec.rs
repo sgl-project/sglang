@@ -1103,6 +1103,10 @@ pub struct ResponsesRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
 
+    /// Optional conversation id to persist input/output as items
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversation: Option<String>,
+
     /// Whether to enable parallel tool calls
     #[serde(default = "default_true")]
     pub parallel_tool_calls: bool,
@@ -1214,6 +1218,7 @@ impl Default for ResponsesRequest {
             max_tool_calls: None,
             metadata: None,
             model: None,
+            conversation: None,
             parallel_tool_calls: true,
             previous_response_id: None,
             reasoning: None,

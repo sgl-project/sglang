@@ -394,6 +394,7 @@ fn initialize_schema(config: &OracleConfig) -> StorageResult<()> {
         conn.execute(
             "CREATE TABLE responses (
                 id VARCHAR2(64) PRIMARY KEY,
+                conversation_id VARCHAR2(64),
                 previous_response_id VARCHAR2(64),
                 input CLOB,
                 instructions CLOB,
