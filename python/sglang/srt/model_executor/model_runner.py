@@ -371,7 +371,7 @@ class ModelRunner:
                         self.server_args.max_mamba_cache_size
                         // MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO
                     )
-        
+
         if self.hybrid_gdn_config is not None:
             self.server_args.max_mamba_cache_size = (
                 self.server_args.max_mamba_cache_size

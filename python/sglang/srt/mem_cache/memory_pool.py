@@ -238,8 +238,10 @@ class MambaPool:
         self.free_slots = torch.arange(self.size, dtype=torch.int64, device=self.device)
 
     def copy_from(self, src_index: torch.Tensor, dst_index: torch.Tensor):
-        self.mamba_cache[0][:, dst_index] = self.mamba_cache[0][:, src_index]
-        self.mamba_cache[1][:, dst_index] = self.mamba_cache[1][:, src_index]
+        self.mamba_cache.conv[:, dst_index] = self.mamba_cache.conv[:, src_index]
+        self.mamba_cache.temporal[:, dst_index] = self.mamba_cache.temporal[
+            :, src_index
+        ]
         return
 
     def fork_from(self, src_index: torch.Tensor) -> Optional[torch.Tensor]:
