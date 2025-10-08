@@ -40,7 +40,7 @@ class TestDisaggregationAccuracy(TestDisaggregationBase):
             "--disaggregation-mode",
             "prefill",
             "--tp",
-            "2",
+            "1",
         ]
         prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
@@ -57,9 +57,9 @@ class TestDisaggregationAccuracy(TestDisaggregationBase):
             "--disaggregation-mode",
             "decode",
             "--tp",
-            "2",
+            "1",
             "--base-gpu-id",
-            "2",
+            "1",
         ]
         decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
@@ -169,7 +169,7 @@ class TestDisaggregationMooncakeFailure(TestDisaggregationBase):
             "--disaggregation-mode",
             "prefill",
             "--tp",
-            "2",
+            "1",
         ]
         prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
@@ -186,9 +186,9 @@ class TestDisaggregationMooncakeFailure(TestDisaggregationBase):
             "--disaggregation-mode",
             "decode",
             "--tp",
-            "2",
+            "1",
             "--base-gpu-id",
-            "2",
+            "1",
         ]
         decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
@@ -266,7 +266,7 @@ class TestDisaggregationMooncakeSpec(TestDisaggregationBase):
             "--disaggregation-mode",
             "prefill",
             "--tp",
-            "2",
+            "1",
         ] + cls.spec_args
         prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
@@ -283,9 +283,9 @@ class TestDisaggregationMooncakeSpec(TestDisaggregationBase):
             "--disaggregation-mode",
             "decode",
             "--tp",
-            "2",
+            "1",
             "--base-gpu-id",
-            "2",
+            "1",
         ] + cls.spec_args
         decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
@@ -340,7 +340,7 @@ class TestDisaggregationSimulatedRetract(TestDisaggregationBase):
             "--disaggregation-mode",
             "prefill",
             "--tp",
-            "2",
+            "1",
         ]
         prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
@@ -357,9 +357,9 @@ class TestDisaggregationSimulatedRetract(TestDisaggregationBase):
             "--disaggregation-mode",
             "decode",
             "--tp",
-            "2",
+            "1",
             "--base-gpu-id",
-            "2",
+            "1",
         ]
         decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
