@@ -73,20 +73,26 @@ impl ConversationItemStorage for OracleConversationItemStorage {
             .id
             .clone()
             .unwrap_or_else(|| make_item_id(&item.item_type));
-        let id_str = id.0.clone();
         let created_at = Utc::now();
-        let response_id = item.response_id.clone();
-        let item_type = item.item_type.clone();
-        let role = item.role.clone();
-        let status = item.status.clone();
         let content_json = serde_json::to_string(&item.content)?;
 
-        // Clones for use after the move into the closure
-        let response_id_ret = response_id.clone();
-        let item_type_ret = item_type.clone();
-        let role_ret = role.clone();
-        let status_ret = status.clone();
-        let content_json_ret = content_json.clone();
+        // Build the return value up-front; move inexpensive clones as needed for SQL
+        let conversation_item = ConversationItem {
+            id: id.clone(),
+            response_id: item.response_id.clone(),
+            item_type: item.item_type.clone(),
+            role: item.role.clone(),
+            content: item.content,
+            status: item.status.clone(),
+            created_at,
+        };
+
+        // Prepare values for SQL insertion
+        let id_str = conversation_item.id.0.clone();
+        let response_id = conversation_item.response_id.clone();
+        let item_type = conversation_item.item_type.clone();
+        let role = conversation_item.role.clone();
+        let status = conversation_item.status.clone();
 
         self.with_connection(move |conn| {
             conn.execute(
@@ -97,17 +103,9 @@ impl ConversationItemStorage for OracleConversationItemStorage {
             .map_err(map_oracle_error)?;
             Ok(())
         })
-            .await?;
+        .await?;
 
-        Ok(ConversationItem {
-            id,
-            response_id: response_id_ret,
-            item_type: item_type_ret,
-            role: role_ret,
-            content: serde_json::from_str(&content_json_ret).unwrap_or(Value::Null),
-            status: status_ret,
-            created_at,
-        })
+        Ok(conversation_item)
     }
 
     async fn link_item(
@@ -222,24 +220,25 @@ impl ConversationItemStorage for OracleConversationItemStorage {
             })
             .await?;
 
-        // Map rows to ConversationItem
-        let mut items = Vec::new();
-        for (id, resp_id, item_type, role, content_raw, status, created_at) in rows.into_iter() {
-            let content = match content_raw {
-                Some(s) => serde_json::from_str(&s).unwrap_or(Value::Null),
-                None => Value::Null,
-            };
-            items.push(ConversationItem {
-                id: ConversationItemId(id),
-                response_id: resp_id,
-                item_type,
-                role,
-                content,
-                status,
-                created_at,
-            });
-        }
-        Ok(items)
+        // Map rows to ConversationItem; propagate JSON parse errors instead of swallowing
+        rows
+            .into_iter()
+            .map(|(id, resp_id, item_type, role, content_raw, status, created_at)| {
+                let content = match content_raw {
+                    Some(s) => serde_json::from_str(&s).map_err(ConversationItemStorageError::from)?,
+                    None => Value::Null,
+                };
+                Ok(ConversationItem {
+                    id: ConversationItemId(id),
+                    response_id: resp_id,
+                    item_type,
+                    role,
+                    content,
+                    status,
+                    created_at,
+                })
+            })
+            .collect()
     }
 }
 

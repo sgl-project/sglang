@@ -710,6 +710,8 @@ impl StreamingResponseAccumulator {
 }
 
 impl OpenAIRouter {
+    // Maximum number of conversation items to attach as input when a conversation is provided
+    const MAX_CONVERSATION_HISTORY_ITEMS: usize = 100;
     /// Create a new OpenAI router
     pub async fn new(
         base_url: String,
@@ -3573,9 +3575,9 @@ impl super::super::RouterTrait for OpenAIRouter {
         if let Some(conv_id_str) = body.conversation.clone() {
             let conv_id: ConversationId = conv_id_str.as_str().into();
             let mut items: Vec<ResponseInputOutputItem> = Vec::new();
-            // Fetch up to 100 items in ascending order
+            // Fetch up to MAX_CONVERSATION_HISTORY_ITEMS items in ascending order
             let params = ConversationItemsListParams {
-                limit: 100,
+                limit: Self::MAX_CONVERSATION_HISTORY_ITEMS,
                 order: ConversationItemsSortOrder::Asc,
                 after: None,
             };
@@ -3589,8 +3591,17 @@ impl super::super::RouterTrait for OpenAIRouter {
                         match it.item_type.as_str() {
                             "message" => {
                                 // content is expected to be an array of ResponseContentPart
-                                let parts: Vec<ResponseContentPart> =
-                                    serde_json::from_value(it.content.clone()).unwrap_or_default();
+                                let parts: Vec<ResponseContentPart> = match serde_json::from_value(it.content.clone()) {
+                                    Ok(parts) => parts,
+                                    Err(e) => {
+                                        warn!(
+                                            item_id = %it.id.0,
+                                            error = %e,
+                                            "Failed to deserialize conversation item content; skipping message item"
+                                        );
+                                        continue;
+                                    }
+                                };
                                 let role = it.role.unwrap_or_else(|| "user".to_string());
                                 items.push(ResponseInputOutputItem::Message {
                                     id: it.id.0,
@@ -4378,7 +4389,7 @@ async fn persist_items_with_storages(
                             response_id: response_id_opt.clone(),
                             item_type: "function_tool_call".to_string(),
                             role: None,
-                            content: json!({ "name": name, "arguments": arguments, "output": output, "status": status }),
+                            content: json!({ "name": name, "arguments": arguments, "output": output }),
                             status,
                         };
                         create_and_link_item(&item_storage, &conv_id, new_item).await?;
@@ -4397,10 +4408,10 @@ async fn persist_items_with_storages(
 
             match item_type {
                 "message" => {
-                    let _id_in = item
+                    let id_in = item
                         .get("id")
                         .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
+                        .map(|s| crate::data_connector::ConversationItemId(s.to_string()));
                     let role = item
                         .get("role")
                         .and_then(|v| v.as_str())
@@ -4414,20 +4425,13 @@ async fn persist_items_with_storages(
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string());
                     let new_item = DCNewConversationItem {
-                        id: None,
+                        id: id_in,
                         response_id: response_id_opt.clone(),
                         item_type: "message".to_string(),
                         role,
                         content: content_v,
                         status,
                     };
-                    // Rebuild with provided id if present
-                    let mut new_item = new_item;
-                    if let Some(id_str) = item.get("id").and_then(|v| v.as_str()) {
-                        new_item.id = Some(crate::data_connector::ConversationItemId(
-                            id_str.to_string(),
-                        ));
-                    }
                     create_and_link_item(&item_storage, &conv_id, new_item).await?;
                 }
                 "reasoning" => {
@@ -4477,8 +4481,7 @@ async fn persist_items_with_storages(
                         content: json!({
                             "name": name,
                             "arguments": arguments,
-                            "output": output_str,
-                            "status": status.clone().unwrap_or_else(|| "completed".to_string())
+                            "output": output_str
                         }),
                         status,
                     };
@@ -4501,7 +4504,6 @@ async fn persist_items_with_storages(
                         "name": name,
                         "arguments": arguments,
                         "output": output_str,
-                        "status": status.clone().unwrap_or_else(|| "completed".to_string()),
                         "error": item.get("error").cloned().unwrap_or(Value::Null),
                         "approval_request_id": item.get("approval_request_id").cloned().unwrap_or(Value::Null)
                     });

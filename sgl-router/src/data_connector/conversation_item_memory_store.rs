@@ -15,6 +15,8 @@ pub struct MemoryConversationItemStorage {
     items: RwLock<HashMap<ConversationItemId, ConversationItem>>, // item_id -> item
     #[allow(clippy::type_complexity)]
     links: RwLock<HashMap<ConversationId, BTreeMap<(i64, String), ConversationItemId>>>,
+    // Per-conversation reverse index for fast after cursor lookup: item_id_str -> (ts, item_id_str)
+    rev_index: RwLock<HashMap<ConversationId, HashMap<String, (i64, String)>>>,
 }
 
 impl MemoryConversationItemStorage {
@@ -54,9 +56,16 @@ impl ConversationItemStorage for MemoryConversationItemStorage {
         item_id: &ConversationItemId,
         added_at: DateTime<Utc>,
     ) -> Result<()> {
-        let mut links = self.links.write().unwrap();
-        let entry = links.entry(conversation_id.clone()).or_default();
-        entry.insert((added_at.timestamp(), item_id.0.clone()), item_id.clone());
+        {
+            let mut links = self.links.write().unwrap();
+            let entry = links.entry(conversation_id.clone()).or_default();
+            entry.insert((added_at.timestamp(), item_id.0.clone()), item_id.clone());
+        }
+        {
+            let mut rev = self.rev_index.write().unwrap();
+            let entry = rev.entry(conversation_id.clone()).or_default();
+            entry.insert(item_id.0.clone(), (added_at.timestamp(), item_id.0.clone()));
+        }
         Ok(())
     }
 
@@ -73,10 +82,12 @@ impl ConversationItemStorage for MemoryConversationItemStorage {
 
         let mut results: Vec<ConversationItem> = Vec::new();
         let after_key: Option<(i64, String)> = if let Some(after_id) = &params.after {
-            // Find the composite key for the provided item id
-            map.iter()
-                .find(|((_ts, id), _)| id == after_id)
-                .map(|(k, _)| k.clone())
+            // O(1) lookup via reverse index for this conversation
+            if let Some(conv_idx) = self.rev_index.read().unwrap().get(conversation_id) {
+                conv_idx.get(after_id).cloned()
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -86,45 +97,34 @@ impl ConversationItemStorage for MemoryConversationItemStorage {
 
         use std::ops::Bound::{Excluded, Unbounded};
 
+        // Helper to push item if it exists and stop when reaching the limit
+        let mut push_item = |key: &ConversationItemId| -> bool {
+            if let Some(it) = items_guard.get(key) {
+                results.push(it.clone());
+                if results.len() == take { return true; }
+            }
+            false
+        };
+
         match (params.order, after_key) {
             (SortOrder::Desc, Some(k)) => {
                 for ((_ts, _id), item_key) in map.range(..k).rev() {
-                    if let Some(it) = items_guard.get(item_key) {
-                        results.push(it.clone());
-                        if results.len() > take {
-                            break;
-                        }
-                    }
+                    if push_item(item_key) { break; }
                 }
             }
             (SortOrder::Desc, None) => {
                 for ((_ts, _id), item_key) in map.iter().rev() {
-                    if let Some(it) = items_guard.get(item_key) {
-                        results.push(it.clone());
-                        if results.len() > take {
-                            break;
-                        }
-                    }
+                    if push_item(item_key) { break; }
                 }
             }
             (SortOrder::Asc, Some(k)) => {
                 for ((_ts, _id), item_key) in map.range((Excluded(k), Unbounded)) {
-                    if let Some(it) = items_guard.get(item_key) {
-                        results.push(it.clone());
-                        if results.len() > take {
-                            break;
-                        }
-                    }
+                    if push_item(item_key) { break; }
                 }
             }
             (SortOrder::Asc, None) => {
                 for ((_ts, _id), item_key) in map.iter() {
-                    if let Some(it) = items_guard.get(item_key) {
-                        results.push(it.clone());
-                        if results.len() > take {
-                            break;
-                        }
-                    }
+                    if push_item(item_key) { break; }
                 }
             }
         }
