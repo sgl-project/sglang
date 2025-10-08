@@ -2,7 +2,10 @@
 
 use crate::config::CircuitBreakerConfig;
 use crate::core::{CircuitBreaker, CircuitBreakerConfig as CoreCircuitBreakerConfig};
-use crate::data_connector::{ResponseId, SharedResponseStorage, StoredResponse};
+use crate::data_connector::{
+    Conversation, ConversationId, ConversationMetadata, ResponseId, SharedConversationStorage,
+    SharedResponseStorage, StoredResponse,
+};
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest,
     ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponseOutputItem,
@@ -16,6 +19,7 @@ use axum::{
     extract::Request,
     http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
+    Json,
 };
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -75,6 +79,8 @@ pub struct OpenAIRouter {
     healthy: AtomicBool,
     /// Response storage for managing conversation history
     response_storage: SharedResponseStorage,
+    /// Conversation storage backend
+    conversation_storage: SharedConversationStorage,
     /// Optional MCP manager (enabled via config presence)
     mcp_manager: Option<Arc<crate::mcp::McpClientManager>>,
 }
@@ -705,6 +711,7 @@ impl OpenAIRouter {
         base_url: String,
         circuit_breaker_config: Option<CircuitBreakerConfig>,
         response_storage: SharedResponseStorage,
+        conversation_storage: SharedConversationStorage,
     ) -> Result<Self, String> {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(300))
@@ -751,6 +758,7 @@ impl OpenAIRouter {
             circuit_breaker,
             healthy: AtomicBool::new(true),
             response_storage,
+            conversation_storage,
             mcp_manager,
         })
     }
@@ -2008,7 +2016,7 @@ impl OpenAIRouter {
     ///
     /// Returns borrowed strings when possible to avoid allocations in hot paths.
     /// Only allocates when multiple data lines need to be joined.
-    fn parse_sse_block(block: &str) -> (Option<&str>, std::borrow::Cow<'_, str>) {
+    fn parse_sse_block(block: &str) -> (Option<&str>, Cow<'_, str>) {
         let mut event_name: Option<&str> = None;
         let mut data_lines: Vec<&str> = Vec::new();
 
@@ -2021,9 +2029,9 @@ impl OpenAIRouter {
         }
 
         let data = if data_lines.len() == 1 {
-            std::borrow::Cow::Borrowed(data_lines[0])
+            Cow::Borrowed(data_lines[0])
         } else {
-            std::borrow::Cow::Owned(data_lines.join("\n"))
+            Cow::Owned(data_lines.join("\n"))
         };
 
         (event_name, data)
@@ -2337,16 +2345,16 @@ impl OpenAIRouter {
         stored_response.previous_response_id = response_json
             .get("previous_response_id")
             .and_then(|v| v.as_str())
-            .map(|s| ResponseId::from_string(s.to_string()))
+            .map(ResponseId::from)
             .or_else(|| {
                 original_body
                     .previous_response_id
                     .as_ref()
-                    .map(|id| ResponseId::from_string(id.clone()))
+                    .map(|id| ResponseId::from(id.as_str()))
             });
 
         if let Some(id_str) = response_json.get("id").and_then(|v| v.as_str()) {
-            stored_response.id = ResponseId::from_string(id_str.to_string());
+            stored_response.id = ResponseId::from(id_str);
         }
 
         stored_response.raw_response = response_json.clone();
@@ -2706,7 +2714,7 @@ impl OpenAIRouter {
             }
             ResponseInput::Items(items) => {
                 // Items are already structured ResponseInputOutputItem, convert to JSON
-                if let Ok(items_value) = serde_json::to_value(items) {
+                if let Ok(items_value) = to_value(items) {
                     if let Some(items_arr) = items_value.as_array() {
                         input_array.extend_from_slice(items_arr);
                     }
@@ -2765,7 +2773,7 @@ impl OpenAIRouter {
                     .unwrap_or("{}");
 
                 // Check if output contains error by parsing JSON
-                let is_error = serde_json::from_str::<serde_json::Value>(output_str)
+                let is_error = serde_json::from_str::<Value>(output_str)
                     .map(|v| v.get("error").is_some())
                     .unwrap_or(false);
 
@@ -3181,7 +3189,7 @@ impl super::super::RouterTrait for OpenAIRouter {
                 let content_type = res.headers().get(CONTENT_TYPE).cloned();
                 match res.bytes().await {
                     Ok(body) => {
-                        let mut response = Response::new(axum::body::Body::from(body));
+                        let mut response = Response::new(Body::from(body));
                         *response.status_mut() = status;
                         if let Some(ct) = content_type {
                             response.headers_mut().insert(CONTENT_TYPE, ct);
@@ -3308,7 +3316,7 @@ impl super::super::RouterTrait for OpenAIRouter {
             match resp.bytes().await {
                 Ok(body) => {
                     self.circuit_breaker.record_success();
-                    let mut response = Response::new(axum::body::Body::from(body));
+                    let mut response = Response::new(Body::from(body));
                     *response.status_mut() = status;
                     if let Some(ct) = content_type {
                         response.headers_mut().insert(CONTENT_TYPE, ct);
@@ -3393,7 +3401,7 @@ impl super::super::RouterTrait for OpenAIRouter {
         // Handle previous_response_id by loading prior context
         let mut conversation_items: Option<Vec<ResponseInputOutputItem>> = None;
         if let Some(prev_id_str) = request_body.previous_response_id.clone() {
-            let prev_id = ResponseId::from_string(prev_id_str.clone());
+            let prev_id = ResponseId::from(prev_id_str.as_str());
             match self
                 .response_storage
                 .get_response_chain(&prev_id, None)
@@ -3516,7 +3524,7 @@ impl super::super::RouterTrait for OpenAIRouter {
         response_id: &str,
         params: &ResponsesGetParams,
     ) -> Response {
-        let stored_id = ResponseId::from_string(response_id.to_string());
+        let stored_id = ResponseId::from(response_id);
         if let Ok(Some(stored_response)) = self.response_storage.get_response(&stored_id).await {
             let stream_requested = params.stream.unwrap_or(false);
             let raw_value = stored_response.raw_response.clone();
@@ -3646,10 +3654,6 @@ impl super::super::RouterTrait for OpenAIRouter {
         }
     }
 
-    fn router_type(&self) -> &'static str {
-        "openai"
-    }
-
     async fn route_embeddings(
         &self,
         _headers: Option<&HeaderMap>,
@@ -3675,4 +3679,309 @@ impl super::super::RouterTrait for OpenAIRouter {
         )
             .into_response()
     }
+
+    async fn create_conversation(&self, _headers: Option<&HeaderMap>, body: &Value) -> Response {
+        // TODO: move this spec validation to the right place
+        let metadata = match body.get("metadata") {
+            Some(Value::Object(map)) => {
+                if map.len() > MAX_METADATA_PROPERTIES {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "error": {
+                                "message": format!(
+                                    "Invalid 'metadata': too many properties. Max {}, got {}",
+                                    MAX_METADATA_PROPERTIES, map.len()
+                                ),
+                                "type": "invalid_request_error",
+                                "param": "metadata",
+                                "code": "metadata_max_properties_exceeded"
+                            }
+                        })),
+                    )
+                        .into_response();
+                }
+                Some(map.clone())
+            }
+            Some(Value::Null) | None => None,
+            Some(other) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": {
+                            "message": format!(
+                                "Invalid 'metadata': expected object or null but got {}",
+                                other
+                            ),
+                            "type": "invalid_request_error",
+                            "param": "metadata",
+                            "code": "metadata_invalid_type"
+                        }
+                    })),
+                )
+                    .into_response();
+            }
+        };
+
+        match self
+            .conversation_storage
+            .create_conversation(crate::data_connector::NewConversation { metadata })
+            .await
+        {
+            Ok(conversation) => {
+                (StatusCode::OK, Json(conversation_to_json(&conversation))).into_response()
+            }
+            Err(err) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": {
+                        "message": err.to_string(),
+                        "type": "internal_error",
+                        "param": Value::Null,
+                        "code": Value::Null
+                    }
+                })),
+            )
+                .into_response(),
+        }
+    }
+
+    async fn get_conversation(
+        &self,
+        _headers: Option<&HeaderMap>,
+        conversation_id: &str,
+    ) -> Response {
+        let id: ConversationId = conversation_id.to_string().into();
+        match self.conversation_storage.get_conversation(&id).await {
+            Ok(Some(conv)) => (StatusCode::OK, Json(conversation_to_json(&conv))).into_response(),
+            Ok(None) => (
+                StatusCode::NOT_FOUND,
+                Json(json!({
+                    "error": {
+                        "message": format!("Conversation with id '{}' not found.", conversation_id),
+                        "type": "invalid_request_error",
+                        "param": Value::Null,
+                        "code": Value::Null
+                    }
+                })),
+            )
+                .into_response(),
+            Err(err) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": {
+                        "message": err.to_string(),
+                        "type": "internal_error",
+                        "param": Value::Null,
+                        "code": Value::Null
+                    }
+                })),
+            )
+                .into_response(),
+        }
+    }
+
+    async fn update_conversation(
+        &self,
+        _headers: Option<&HeaderMap>,
+        conversation_id: &str,
+        body: &Value,
+    ) -> Response {
+        let id: ConversationId = conversation_id.to_string().into();
+        let existing = match self.conversation_storage.get_conversation(&id).await {
+            Ok(Some(c)) => c,
+            Ok(None) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({
+                        "error": {
+                            "message": format!("Conversation with id '{}' not found.", conversation_id),
+                            "type": "invalid_request_error",
+                            "param": Value::Null,
+                            "code": Value::Null
+                        }
+                    })),
+                )
+                    .into_response();
+            }
+            Err(err) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "error": {
+                            "message": err.to_string(),
+                            "type": "internal_error",
+                            "param": Value::Null,
+                            "code": Value::Null
+                        }
+                    })),
+                )
+                    .into_response();
+            }
+        };
+
+        // Parse metadata patch
+        enum Patch {
+            NoChange,
+            ClearAll,
+            Merge(ConversationMetadata),
+        }
+        let patch = match body.get("metadata") {
+            None => Patch::NoChange,
+            Some(Value::Null) => Patch::ClearAll,
+            Some(Value::Object(map)) => Patch::Merge(map.clone()),
+            Some(other) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": {
+                            "message": format!(
+                                "Invalid 'metadata': expected object or null but got {}",
+                                other
+                            ),
+                            "type": "invalid_request_error",
+                            "param": "metadata",
+                            "code": "metadata_invalid_type"
+                        }
+                    })),
+                )
+                    .into_response();
+            }
+        };
+
+        let merged_metadata = match patch {
+            Patch::NoChange => {
+                return (StatusCode::OK, Json(conversation_to_json(&existing))).into_response();
+            }
+            Patch::ClearAll => None,
+            Patch::Merge(upd) => {
+                let mut merged = existing.metadata.clone().unwrap_or_default();
+                let previous = merged.len();
+                for (k, v) in upd.into_iter() {
+                    if v.is_null() {
+                        merged.remove(&k);
+                    } else {
+                        merged.insert(k, v);
+                    }
+                }
+                let updated = merged.len();
+                if updated > MAX_METADATA_PROPERTIES {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "error": {
+                                "message": format!(
+                                    "Invalid 'metadata': too many properties after update. Max {} ({} -> {}).",
+                                    MAX_METADATA_PROPERTIES, previous, updated
+                                ),
+                                "type": "invalid_request_error",
+                                "param": "metadata",
+                                "code": "metadata_max_properties_exceeded",
+                                "extra": {
+                                    "previous_property_count": previous,
+                                    "updated_property_count": updated
+                                }
+                            }
+                        })),
+                    )
+                        .into_response();
+                }
+                if merged.is_empty() {
+                    None
+                } else {
+                    Some(merged)
+                }
+            }
+        };
+
+        match self
+            .conversation_storage
+            .update_conversation(&id, merged_metadata)
+            .await
+        {
+            Ok(Some(conv)) => (StatusCode::OK, Json(conversation_to_json(&conv))).into_response(),
+            Ok(None) => (
+                StatusCode::NOT_FOUND,
+                Json(json!({
+                    "error": {
+                        "message": format!("Conversation with id '{}' not found.", conversation_id),
+                        "type": "invalid_request_error",
+                        "param": Value::Null,
+                        "code": Value::Null
+                    }
+                })),
+            )
+                .into_response(),
+            Err(err) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": {
+                        "message": err.to_string(),
+                        "type": "internal_error",
+                        "param": Value::Null,
+                        "code": Value::Null
+                    }
+                })),
+            )
+                .into_response(),
+        }
+    }
+
+    async fn delete_conversation(
+        &self,
+        _headers: Option<&HeaderMap>,
+        conversation_id: &str,
+    ) -> Response {
+        let id: ConversationId = conversation_id.to_string().into();
+        match self.conversation_storage.delete_conversation(&id).await {
+            Ok(true) => (
+                StatusCode::OK,
+                Json(json!({
+                    "id": conversation_id,
+                    "object": "conversation.deleted",
+                    "deleted": true
+                })),
+            )
+                .into_response(),
+            Ok(false) => (
+                StatusCode::NOT_FOUND,
+                Json(json!({
+                    "error": {
+                        "message": format!("Conversation with id '{}' not found.", conversation_id),
+                        "type": "invalid_request_error",
+                        "param": Value::Null,
+                        "code": Value::Null
+                    }
+                })),
+            )
+                .into_response(),
+            Err(err) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": {
+                        "message": err.to_string(),
+                        "type": "internal_error",
+                        "param": Value::Null,
+                        "code": Value::Null
+                    }
+                })),
+            )
+                .into_response(),
+        }
+    }
+
+    fn router_type(&self) -> &'static str {
+        "openai"
+    }
+}
+// Maximum number of properties allowed in conversation metadata (align with server)
+const MAX_METADATA_PROPERTIES: usize = 16;
+
+fn conversation_to_json(conversation: &Conversation) -> Value {
+    json!({
+        "id": conversation.id.0,
+        "object": "conversation",
+        "created_at": conversation.created_at.timestamp(),
+        "metadata": to_value(&conversation.metadata).unwrap_or(Value::Null),
+    })
 }
