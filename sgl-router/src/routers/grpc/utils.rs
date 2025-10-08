@@ -21,7 +21,7 @@ use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tonic::codec::Streaming;
-use tracing::{debug, error, warn};
+use tracing::{error, warn};
 use uuid::Uuid;
 
 /// Get gRPC client from worker, returning appropriate error response on failure
@@ -602,10 +602,6 @@ pub async fn collect_stream_responses(
             Ok(gen_response) => {
                 match gen_response.response {
                     Some(Complete(complete)) => {
-                        debug!(
-                        "{} completed: prompt_tokens={}, completion_tokens={}, finish_reason={}",
-                        worker_name, complete.prompt_tokens, complete.completion_tokens, complete.finish_reason
-                    );
                         all_responses.push(complete);
                     }
                     Some(Error(err)) => {
@@ -615,11 +611,11 @@ pub async fn collect_stream_responses(
                             worker_name, err.message
                         )));
                     }
-                    Some(Chunk(chunk)) => {
-                        debug!("{} chunk: {} tokens", worker_name, chunk.token_ids.len());
+                    Some(Chunk(_chunk)) => {
+                        // Streaming chunk - no action needed
                     }
                     None => {
-                        debug!("{}: empty response", worker_name);
+                        // Empty response - no action needed
                     }
                 }
             }
@@ -633,7 +629,6 @@ pub async fn collect_stream_responses(
         }
     }
 
-    debug!("{} stream closed", worker_name);
     Ok(all_responses)
 }
 
