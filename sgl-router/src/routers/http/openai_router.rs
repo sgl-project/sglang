@@ -3487,6 +3487,23 @@ impl super::super::RouterTrait for OpenAIRouter {
             "openai_responses_request"
         );
 
+        // Validate mutually exclusive params: previous_response_id and conversation
+        // TODO: this validation logic should move the right place, also we need a proper error message module
+        if body.previous_response_id.is_some() && body.conversation.is_some() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": {
+                        "message": "Mutually exclusive parameters. Ensure you are only providing one of: 'previous_response_id' or 'conversation'.",
+                        "type": "invalid_request_error",
+                        "param": Value::Null,
+                        "code": "mutually_exclusive_parameters"
+                    }
+                })),
+            )
+                .into_response();
+        }
+
         // Clone the body and override model if needed
         let mut request_body = body.clone();
         if let Some(model) = model_id {
@@ -3546,6 +3563,50 @@ impl super::super::RouterTrait for OpenAIRouter {
             }
             // Clear previous_response_id from request since we're converting to conversation
             request_body.previous_response_id = None;
+        }
+
+        // If conversation is provided, attach its items as input to upstream request
+        if let Some(conv_id_str) = body.conversation.clone() {
+            let conv_id: ConversationId = conv_id_str.as_str().into();
+            let mut items: Vec<ResponseInputOutputItem> = Vec::new();
+            // Fetch up to 100 items in ascending order
+            let params = ConversationItemsListParams { limit: 100, order: ConversationItemsSortOrder::Asc, after: None };
+            match self.conversation_item_storage.list_items(&conv_id, params).await {
+                Ok(stored_items) => {
+                    for it in stored_items {
+                        match it.item_type.as_str() {
+                            "message" => {
+                                // content is expected to be an array of ResponseContentPart
+                                let parts: Vec<ResponseContentPart> = serde_json::from_value(it.content.clone()).unwrap_or_default();
+                                let role = it.role.unwrap_or_else(|| "user".to_string());
+                                items.push(ResponseInputOutputItem::Message { id: it.id.0, role, content: parts, status: it.status });
+                            }
+                            _ => {
+                                // Skip unsupported types for request input (e.g., MCP items)
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    warn!(conversation_id = %conv_id.0, error = %err.to_string(), "Failed to load conversation items for request input");
+                }
+            }
+
+            // Append the current request input at the end
+            match &request_body.input {
+                ResponseInput::Text(text) => {
+                    items.push(ResponseInputOutputItem::Message {
+                        id: format!("msg_u_current_{}", items.len()),
+                        role: "user".to_string(),
+                        status: Some("completed".to_string()),
+                        content: vec![ResponseContentPart::InputText { text: text.clone() }],
+                    });
+                }
+                ResponseInput::Items(existing) => {
+                    items.extend(existing.clone());
+                }
+            }
+            request_body.input = ResponseInput::Items(items);
         }
 
         if let Some(mut items) = conversation_items {
