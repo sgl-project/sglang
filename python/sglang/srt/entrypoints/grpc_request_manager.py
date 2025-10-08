@@ -13,7 +13,7 @@ import sys
 import threading
 import time
 import uuid
-from typing import AsyncGenerator, Dict, List, Optional, Union
+from typing import Any, AsyncGenerator, Dict, List, Optional, Union
 
 import grpc
 import zmq
@@ -777,6 +777,14 @@ class GrpcRequestManager:
         self.context.term()
 
         logger.info("GrpcRequestManager shutdown complete")
+
+    def get_server_info(self) -> Dict[str, Any]:
+        """Get server information for health checks."""
+        return {
+            "active_requests": len(self.rid_to_state),
+            "paused": self.is_pause,
+            "last_receive_time": self.last_receive_tstamp,
+        }
 
     def auto_create_handle_loop(self):
         """Automatically create and start the handle_loop task, matching TokenizerManager pattern."""
