@@ -249,9 +249,11 @@ impl PipelineStage for WorkerSelectionStage {
     async fn execute(&self, ctx: &mut RequestContext) -> Result<(), Response> {
         debug!("Stage {}: Selecting workers", self.name());
 
-        let prep = ctx.state.preparation.as_ref().ok_or_else(|| {
-            utils::internal_error_static("Preparation stage not completed")
-        })?;
+        let prep = ctx
+            .state
+            .preparation
+            .as_ref()
+            .ok_or_else(|| utils::internal_error_static("Preparation stage not completed"))?;
 
         let text = prep.original_text.as_deref();
 
@@ -402,10 +404,11 @@ impl PipelineStage for ClientAcquisitionStage {
     async fn execute(&self, ctx: &mut RequestContext) -> Result<(), Response> {
         debug!("Stage {}: Acquiring gRPC clients", self.name());
 
-        let workers =
-            ctx.state.workers.as_ref().ok_or_else(|| {
-                utils::internal_error_static("Worker selection not completed")
-            })?;
+        let workers = ctx
+            .state
+            .workers
+            .as_ref()
+            .ok_or_else(|| utils::internal_error_static("Worker selection not completed"))?;
 
         let clients = match workers {
             WorkerSelection::Single { worker } => {
@@ -457,9 +460,11 @@ impl PipelineStage for RequestBuildingStage {
             .as_ref()
             .ok_or_else(|| utils::internal_error_static("Preparation not completed"))?;
 
-        let clients = ctx.state.clients.as_ref().ok_or_else(|| {
-            utils::internal_error_static("Client acquisition not completed")
-        })?;
+        let clients = ctx
+            .state
+            .clients
+            .as_ref()
+            .ok_or_else(|| utils::internal_error_static("Client acquisition not completed"))?;
 
         // Get client for building request (use prefill client if PD mode)
         let builder_client = match clients {
@@ -486,10 +491,7 @@ impl PipelineStage for RequestBuildingStage {
                         prep.tool_constraints.clone(),
                     )
                     .map_err(|e| {
-                        utils::bad_request_error(format!(
-                            "Invalid request parameters: {}",
-                            e
-                        ))
+                        utils::bad_request_error(format!("Invalid request parameters: {}", e))
                     })?
             }
             RequestType::Generate(request) => {
@@ -652,9 +654,11 @@ impl PipelineStage for RequestExecutionStage {
             .take()
             .ok_or_else(|| utils::internal_error_static("Proto request not built"))?;
 
-        let clients = ctx.state.clients.as_mut().ok_or_else(|| {
-            utils::internal_error_static("Client acquisition not completed")
-        })?;
+        let clients = ctx
+            .state
+            .clients
+            .as_mut()
+            .ok_or_else(|| utils::internal_error_static("Client acquisition not completed"))?;
 
         let result = match self.mode {
             ExecutionMode::Single => self.execute_single(proto_request, clients).await?,
@@ -679,9 +683,9 @@ impl RequestExecutionStage {
         proto_request: proto::GenerateRequest,
         clients: &mut ClientSelection,
     ) -> Result<ExecutionResult, Response> {
-        let client = clients.single_mut().ok_or_else(|| {
-            utils::internal_error_static("Expected single client but got dual")
-        })?;
+        let client = clients
+            .single_mut()
+            .ok_or_else(|| utils::internal_error_static("Expected single client but got dual"))?;
 
         let stream = client.generate(proto_request).await.map_err(|e| {
             utils::internal_error_message(format!("Failed to start generation: {}", e))
@@ -695,9 +699,9 @@ impl RequestExecutionStage {
         proto_request: proto::GenerateRequest,
         clients: &mut ClientSelection,
     ) -> Result<ExecutionResult, Response> {
-        let (prefill_client, decode_client) = clients.dual_mut().ok_or_else(|| {
-            utils::internal_error_static("Expected dual clients but got single")
-        })?;
+        let (prefill_client, decode_client) = clients
+            .dual_mut()
+            .ok_or_else(|| utils::internal_error_static("Expected dual clients but got single"))?;
 
         debug!("Sending concurrent requests to prefill and decode workers");
 
@@ -800,10 +804,11 @@ impl ResponseProcessingStage {
 
         if is_streaming {
             // Get dispatch metadata for consistent response fields
-            let dispatch =
-                ctx.state.dispatch.as_ref().ok_or_else(|| {
-                    utils::internal_error_static("Dispatch metadata not set")
-                })?;
+            let dispatch = ctx
+                .state
+                .dispatch
+                .as_ref()
+                .ok_or_else(|| utils::internal_error_static("Dispatch metadata not set"))?;
 
             // Streaming: Use StreamingProcessor and return SSE response (early exit)
             return Err(self.streaming_processor.clone().process_streaming_response(
@@ -822,17 +827,15 @@ impl ResponseProcessingStage {
         // Collect all responses from the execution result
         let all_responses = match execution_result {
             ExecutionResult::Single { stream } => {
-                utils::collect_stream_responses(stream, "Single")
-                    .await?
+                utils::collect_stream_responses(stream, "Single").await?
             }
             ExecutionResult::Dual { prefill, decode } => {
                 // Collect prefill for input_logprobs
-                let prefill_responses = utils::collect_stream_responses(prefill, "Prefill")
-                    .await?;
+                let prefill_responses = utils::collect_stream_responses(prefill, "Prefill").await?;
 
                 // Collect decode for actual output
-                let mut decode_responses = utils::collect_stream_responses(*decode, "Decode")
-                    .await?;
+                let mut decode_responses =
+                    utils::collect_stream_responses(*decode, "Decode").await?;
 
                 // Merge prefill input_logprobs if requested
                 if request_logprobs {
@@ -851,21 +854,20 @@ impl ResponseProcessingStage {
         };
 
         if all_responses.is_empty() {
-            return Err(utils::internal_error_static(
-                "No responses from server",
-            ));
+            return Err(utils::internal_error_static("No responses from server"));
         }
 
         // Clone chat_request to avoid borrow checker conflict
         // (ctx.chat_request() borrows ctx, preventing mutable borrow of ctx.state.response.stop_decoder)
         let chat_request = ctx.chat_request().clone();
-        let history_tool_calls_count =
-            processing::get_history_tool_calls_count(&chat_request);
+        let history_tool_calls_count = processing::get_history_tool_calls_count(&chat_request);
 
-        let stop_decoder =
-            ctx.state.response.stop_decoder.as_mut().ok_or_else(|| {
-                utils::internal_error_static("Stop decoder not initialized")
-            })?;
+        let stop_decoder = ctx
+            .state
+            .response
+            .stop_decoder
+            .as_mut()
+            .ok_or_else(|| utils::internal_error_static("Stop decoder not initialized"))?;
 
         let mut choices = Vec::new();
         for (index, complete) in all_responses.iter().enumerate() {
@@ -1023,8 +1025,7 @@ impl ChatCompletionPipeline {
         model_id: Option<String>,
         components: Arc<SharedComponents>,
     ) -> Response {
-        let mut ctx =
-            RequestContext::for_chat(request, headers, model_id, components);
+        let mut ctx = RequestContext::for_chat(request, headers, model_id, components);
 
         // Execute each stage in sequence
         for (idx, stage) in self.stages.iter().enumerate() {
@@ -1037,9 +1038,7 @@ impl ChatCompletionPipeline {
 
         // Extract final response
         match ctx.state.response.final_response {
-            Some(FinalResponse::Chat(response)) => {
-                axum::Json(response).into_response()
-            }
+            Some(FinalResponse::Chat(response)) => axum::Json(response).into_response(),
             Some(FinalResponse::Generate(_)) => {
                 utils::internal_error_static("Internal error: wrong response type")
             }
@@ -1055,8 +1054,7 @@ impl ChatCompletionPipeline {
         model_id: Option<String>,
         components: Arc<SharedComponents>,
     ) -> Response {
-        let mut ctx =
-            RequestContext::for_generate(request, headers, model_id, components);
+        let mut ctx = RequestContext::for_generate(request, headers, model_id, components);
 
         // Execute each stage in sequence
         for (idx, stage) in self.stages.iter().enumerate() {
@@ -1069,9 +1067,7 @@ impl ChatCompletionPipeline {
 
         // Extract final response
         match ctx.state.response.final_response {
-            Some(FinalResponse::Generate(response)) => {
-                axum::Json(*response).into_response()
-            }
+            Some(FinalResponse::Generate(response)) => axum::Json(*response).into_response(),
             Some(FinalResponse::Chat(_)) => {
                 utils::internal_error_static("Internal error: wrong response type")
             }

@@ -127,18 +127,15 @@ impl ResponseProcessor {
             let used_json_schema = match &original_request.tool_choice {
                 Some(ToolChoice::Function { .. }) => true,
                 Some(ToolChoice::Value(ToolChoiceValue::Required)) => true,
-                Some(ToolChoice::AllowedTools { mode, .. }) => {
-                    mode == "required"
-                }
+                Some(ToolChoice::AllowedTools { mode, .. }) => mode == "required",
                 _ => false,
             };
 
             if used_json_schema {
-                (tool_calls, processed_text) =
-                    utils::parse_json_schema_response(
-                        &processed_text,
-                        &original_request.tool_choice,
-                    );
+                (tool_calls, processed_text) = utils::parse_json_schema_response(
+                    &processed_text,
+                    &original_request.tool_choice,
+                );
             } else {
                 (tool_calls, processed_text) = self
                     .parse_tool_calls(
@@ -292,9 +289,7 @@ pub fn generate_tool_call_id(
 }
 
 /// Count the number of tool calls in the request message history (from router.rs:412-424)
-pub fn get_history_tool_calls_count(
-    request: &ChatCompletionRequest,
-) -> usize {
+pub fn get_history_tool_calls_count(request: &ChatCompletionRequest) -> usize {
     request
         .messages
         .iter()
