@@ -754,7 +754,6 @@ class FlashAttentionBackend(AttentionBackend):
 
         # Use Flash Attention for prefill
         if not self.use_mla:
-            assert self.fa_impl_ver in [3], "Only FA3 support here"
             # Do multi-head attention
             key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
                 layer.layer_id

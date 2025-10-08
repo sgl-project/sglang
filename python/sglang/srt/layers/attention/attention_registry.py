@@ -129,9 +129,6 @@ def create_flashattention_v3_backend(runner):
 
 @register_attention_backend("fa4")
 def create_flashattention_v4_backend(runner):
-    assert (
-        runner.use_mla_backend
-    ), "FlashAttention v4 Support is at an early stage, only MLA model supported now"
     from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
 
     return FlashAttentionBackend(runner, fa_impl_ver=4)
