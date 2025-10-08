@@ -409,7 +409,7 @@ def get_available_gpu_memory(
 
         if empty_cache:
             torch.cuda.empty_cache()
-        shared_sysmem_device_mem_sms = (87, 110, 121)  # Odin, Thor, Spark
+        shared_sysmem_device_mem_sms = (87, 110, 121)  # Orin, Thor, Spark
         if get_device_sm() in shared_sysmem_device_mem_sms:
             # On these devices, which use sysmem as device mem, torch.cuda.mem_get_info()
             # only reports "free" memory, which can be lower than what is actually
