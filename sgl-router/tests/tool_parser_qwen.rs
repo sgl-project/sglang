@@ -120,10 +120,10 @@ async fn test_qwen_with_newlines_in_strings() {
 async fn test_qwen_format_detection() {
     let parser = QwenParser::new();
 
-    assert!(parser.detect_format("<tool_call>"));
-    assert!(parser.detect_format("Some text <tool_call>\n{"));
-    assert!(!parser.detect_format("Just plain text"));
-    assert!(!parser.detect_format("{\"name\": \"test\"}")); // Plain JSON
+    assert!(parser.has_tool_markers("<tool_call>"));
+    assert!(parser.has_tool_markers("Some text <tool_call>\n{"));
+    assert!(!parser.has_tool_markers("Just plain text"));
+    assert!(!parser.has_tool_markers("{\"name\": \"test\"}")); // Plain JSON
 }
 
 #[tokio::test]

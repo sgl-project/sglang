@@ -69,7 +69,7 @@ class SchedulerMetricsMixin:
                 kv_events_config, self.attn_dp_rank
             )
 
-    def udpate_spec_metrics(self, bs: int, num_accepted_tokens: int):
+    def update_spec_metrics(self, bs: int, num_accepted_tokens: int):
         self.spec_num_total_accepted_tokens += num_accepted_tokens + bs
         self.spec_num_total_forward_ct += bs
         self.num_generated_tokens += num_accepted_tokens
