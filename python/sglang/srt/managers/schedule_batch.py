@@ -1073,70 +1073,63 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def prepare_for_extend(self):
         self.forward_mode = ForwardMode.EXTEND
+
+        # Init tensors
         reqs = self.reqs
-
-        # Phase 1: Prepare tensors and assign to batch
         input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
-        self.input_ids = torch.tensor(
-            list(chain.from_iterable(input_ids)), dtype=torch.int64
-        ).to(self.device, non_blocking=True)
-
-        self.orig_seq_lens = torch.tensor(
-            [max(len(r.fill_ids), len(r.origin_input_ids)) for r in reqs],
-            dtype=torch.int32,
-        ).to(self.device, non_blocking=True)
+        extend_num_tokens = sum(len(ids) for ids in input_ids)
+        seq_lens = [len(r.fill_ids) for r in reqs]
+        orig_seq_lens = [max(len(r.fill_ids), len(r.origin_input_ids)) for r in reqs]
+        prefix_lens = [len(r.prefix_indices) for r in reqs]
+        extend_lens = [r.extend_input_len for r in reqs]
 
         token_type_ids = [
             r.token_type_ids for r in reqs if r.token_type_ids is not None
         ]
+
+        input_ids_tensor = torch.tensor(
+            list(chain.from_iterable(input_ids)), dtype=torch.int64
+        ).to(self.device, non_blocking=True)
+        seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int64).to(
+            self.device, non_blocking=True
+        )
+        seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
+        orig_seq_lens_tensor = torch.tensor(orig_seq_lens, dtype=torch.int32).to(
+            self.device, non_blocking=True
+        )
+
+        token_type_ids_tensor = None
         if len(token_type_ids) > 0:
-            self.token_type_ids = torch.tensor(
+            token_type_ids_tensor = torch.tensor(
                 sum(token_type_ids, []), dtype=torch.int64
             ).to(self.device, non_blocking=True)
-        else:
-            self.token_type_ids = None
 
-        # Batch-level data for allocation
-        self.prefix_lens = [len(r.prefix_indices) for r in reqs]
-        self.extend_lens = [r.extend_input_len for r in reqs]
-        self.extend_num_tokens = sum(
-            len(r.fill_ids) - len(r.prefix_indices) for r in reqs
-        )
-        self.seq_lens_cpu = torch.tensor(
-            [len(r.fill_ids) for r in reqs], dtype=torch.int64
-        )
-        self.seq_lens = self.seq_lens_cpu.to(self.device, non_blocking=True)
-        self.seq_lens_sum = self.seq_lens_cpu.sum().item()
+        # Set batch fields needed by alloc_for_extend
+        self.prefix_lens = prefix_lens
+        self.extend_lens = extend_lens
+        self.seq_lens = seq_lens_tensor
+        self.seq_lens_cpu = seq_lens_cpu
+        self.extend_num_tokens = extend_num_tokens
 
-        # Free memory before allocation
-        if isinstance(self.tree_cache, SWAChunkCache):
-            for req in reqs:
-                pre_len = len(req.prefix_indices)
-                if pre_len > 0:
-                    self.tree_cache.evict_swa(
-                        req, pre_len, self.model_config.attention_chunk_size
-                    )
-
-        # Phase 2: Allocate memory and write to pool
-        out_cache_loc, req_pool_indices_device, req_pool_indices = alloc_for_extend(
+        # Allocate memory
+        out_cache_loc, req_pool_indices_tensor, req_pool_indices = alloc_for_extend(
             self
         )
-        self.out_cache_loc = out_cache_loc
-        self.req_pool_indices = req_pool_indices_device
 
-        # Update requests with pool indices
-        for req, req_pool_idx in zip(reqs, req_pool_indices):
-            req.req_pool_idx = req_pool_idx
-
-        # Phase 3: Process requests - validation, adjustment, logprob setup
+        # Set fields
         input_embeds = []
         extend_input_logprob_token_ids = []
         multimodal_inputs = []
 
-        for req in reqs:
-            seq_len = len(req.fill_ids)
-            pre_len = len(req.prefix_indices)
+        for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
+            req.req_pool_idx = req_pool_indices[i]
             assert seq_len - pre_len == req.extend_input_len
+
+            if pre_len > 0:
+                if isinstance(self.tree_cache, SWAChunkCache):
+                    self.tree_cache.evict_swa(
+                        req, pre_len, self.model_config.attention_chunk_size
+                    )
 
             # If input_embeds are available, store them
             if req.input_embeds is not None:
@@ -1220,7 +1213,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     )
                 )
 
-        # Assign processed data to batch
+        if self.return_logprob:
+            extend_input_logprob_token_ids = torch.tensor(
+                extend_input_logprob_token_ids
+            )
+        else:
+            extend_input_logprob_token_ids = None
+
+        self.input_ids = input_ids_tensor
+        self.req_pool_indices = req_pool_indices_tensor
+        self.orig_seq_lens = orig_seq_lens_tensor
+        self.out_cache_loc = out_cache_loc
         self.input_embeds = (
             torch.tensor(input_embeds).to(self.device, non_blocking=True)
             if input_embeds
@@ -1234,20 +1237,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 if isinstance(pixel_values, torch.Tensor):
                     mm_item.feature = pixel_values.to(self.device, non_blocking=True)
         self.multimodal_inputs = multimodal_inputs
-
-        self.extend_logprob_start_lens = [r.extend_logprob_start_len for r in reqs]
+        self.token_type_ids = token_type_ids_tensor
+        self.seq_lens_sum = sum(seq_lens)
 
         if self.return_logprob:
             self.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
             self.token_ids_logprobs = [r.token_ids_logprob for r in reqs]
-            self.extend_input_logprob_token_ids = torch.tensor(
-                extend_input_logprob_token_ids
-            )
-        else:
-            self.extend_input_logprob_token_ids = None
+
+        self.extend_logprob_start_lens = [r.extend_logprob_start_len for r in reqs]
+        self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
 
         if self.model_config.is_encoder_decoder:
-            self.prepare_encoder_info_extend(input_ids, self.seq_lens_cpu.tolist())
+            self.prepare_encoder_info_extend(input_ids, seq_lens)
 
         # Build sampling info
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(
