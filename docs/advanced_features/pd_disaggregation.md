@@ -121,6 +121,14 @@ python -m sglang.launch_server \
 
 PD Disaggregation with Mooncake supports the following environment variables for fine-grained control over system behavior.
 
+#### NVLink Transport Configuration
+Please set up the following environment variables if you want to use NVLink transport of mooncake backend for NVL72 deployment.
+
+```bash
+export SGLANG_MOONCAKE_CUSTOM_MEM_POOL=True
+export MC_FORCE_MNNVL=True
+```
+
 #### Prefill Server Configuration
 | Variable | Description | Default |
 |:--------:|:-----------:|:--------:
