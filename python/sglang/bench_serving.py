@@ -698,9 +698,6 @@ def get_dataset(args, tokenizer, model_id=None):
             return_text=not tokenize_prompt,
         )
     elif args.dataset_name == "image":
-        assert not tokenize_prompt, "image dataset does not support --tokenize-prompt"
-        assert args.apply_chat_template, "image dataset requires apply_chat_template"
-        assert model_id is not None
         processor = get_processor(model_id)
         input_requests = sample_image_requests(
             num_requests=args.num_prompts,
@@ -725,9 +722,6 @@ def get_dataset(args, tokenizer, model_id=None):
             args=args,
         )
     elif args.dataset_name == "mmmu":
-        assert not tokenize_prompt
-        assert args.apply_chat_template, "mmmu requires apply_chat_template"
-        assert model_id is not None
         processor = get_processor(model_id)
         input_requests = sample_mmmu_requests(
             num_requests=args.num_prompts,
@@ -2154,6 +2148,12 @@ def run_benchmark(args_: argparse.Namespace):
             "\nWARNING It is recommended to use the `Chat` or `Instruct` model for benchmarking.\n"
             "Because when the tokenizer counts the output tokens, if there is gibberish, it might count incorrectly.\n"
         )
+
+    if args.dataset_name in ["image", "mmmu"]:
+        args.apply_chat_template = True
+        assert (
+            not args.tokenize_prompt
+        ), "`--tokenize-prompt` not compatible with image dataset"
 
     print(f"{args}\n")
 
