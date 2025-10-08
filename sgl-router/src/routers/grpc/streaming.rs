@@ -176,7 +176,7 @@ impl StreamingProcessor {
         let mut cached_tokens: HashMap<u32, u32> = HashMap::new();
 
         // Parser state (lazy initialization per index)
-        type PooledReasoningParser = Arc<std::sync::Mutex<Box<dyn ReasoningParser>>>;
+        type PooledReasoningParser = Arc<tokio::sync::Mutex<Box<dyn ReasoningParser>>>;
         let mut reasoning_parsers: HashMap<u32, PooledReasoningParser> = HashMap::new();
 
         type PooledToolParser = Arc<tokio::sync::Mutex<Box<dyn ToolParser>>>;
@@ -185,6 +185,9 @@ impl StreamingProcessor {
 
         // Per-index stop decoders (each index needs its own state for n>1 support)
         let mut stop_decoders: HashMap<u32, StopSequenceDecoder> = HashMap::new();
+
+        // Reusable SSE formatting buffer to avoid allocations per chunk
+        let mut sse_buffer = String::with_capacity(512);
 
         // Use dispatch metadata for consistent response fields
         let request_id = &dispatch.request_id;
@@ -262,7 +265,8 @@ impl StreamingProcessor {
                             }],
                             usage: None,
                         };
-                        tx.send(Ok(Bytes::from(Self::format_sse_chunk(&first_chunk))))
+                        Self::format_sse_chunk_into(&mut sse_buffer, &first_chunk);
+                        tx.send(Ok(Bytes::from(sse_buffer.clone())))
                             .map_err(|_| "Failed to send first chunk".to_string())?;
                         is_firsts.insert(index, false);
                     }
@@ -282,9 +286,11 @@ impl StreamingProcessor {
                                 model,
                                 created,
                                 system_fingerprint,
-                            );
+                            )
+                            .await;
                         if let Some(chunk) = reasoning_chunk {
-                            tx.send(Ok(Bytes::from(Self::format_sse_chunk(&chunk))))
+                            Self::format_sse_chunk_into(&mut sse_buffer, &chunk);
+                            tx.send(Ok(Bytes::from(sse_buffer.clone())))
                                 .map_err(|_| "Failed to send reasoning chunk".to_string())?;
                         }
                         delta = normal_text;
@@ -314,7 +320,8 @@ impl StreamingProcessor {
                             .await;
 
                         for chunk in tool_chunks {
-                            tx.send(Ok(Bytes::from(Self::format_sse_chunk(&chunk))))
+                            Self::format_sse_chunk_into(&mut sse_buffer, &chunk);
+                            tx.send(Ok(Bytes::from(sse_buffer.clone())))
                                 .map_err(|_| "Failed to send tool call chunk".to_string())?;
                         }
 
@@ -335,7 +342,8 @@ impl StreamingProcessor {
                             system_fingerprint,
                             choice_logprobs,
                         );
-                        tx.send(Ok(Bytes::from(Self::format_sse_chunk(&content_chunk))))
+                        Self::format_sse_chunk_into(&mut sse_buffer, &content_chunk);
+                        tx.send(Ok(Bytes::from(sse_buffer.clone())))
                             .map_err(|_| "Failed to send content chunk".to_string())?;
                     }
                 }
@@ -946,11 +954,11 @@ impl StreamingProcessor {
 
     /// Helper: Process reasoning content in streaming mode
     #[allow(clippy::too_many_arguments)]
-    fn process_reasoning_stream(
+    async fn process_reasoning_stream(
         &self,
         delta: &str,
         index: u32,
-        reasoning_parsers: &mut HashMap<u32, Arc<std::sync::Mutex<Box<dyn ReasoningParser>>>>,
+        reasoning_parsers: &mut HashMap<u32, Arc<tokio::sync::Mutex<Box<dyn ReasoningParser>>>>,
         request_id: &str,
         model: &str,
         created: u64,
@@ -967,7 +975,7 @@ impl StreamingProcessor {
 
         if let Some(pooled_parser) = reasoning_parsers.get(&index) {
             let (parse_result, in_reasoning) = {
-                let mut parser = pooled_parser.lock().unwrap();
+                let mut parser = pooled_parser.lock().await;
                 let result = parser.parse_reasoning_streaming_incremental(delta);
                 let in_reasoning = parser.is_in_reasoning();
                 (result, in_reasoning)
@@ -1134,13 +1142,21 @@ impl StreamingProcessor {
         (false, chunks)
     }
 
-    /// Format a response as SSE chunk
-    fn format_sse_chunk(chunk: &ChatCompletionStreamResponse) -> String {
+    /// Format a response as SSE chunk into a reusable buffer
+    /// This avoids allocations by reusing the same buffer across multiple chunks
+    #[inline]
+    fn format_sse_chunk_into(buffer: &mut String, chunk: &ChatCompletionStreamResponse) {
+        buffer.clear();
+        buffer.push_str("data: ");
         match serde_json::to_string(chunk) {
-            Ok(json) => format!("data: {}\n\n", json),
+            Ok(json) => {
+                buffer.push_str(&json);
+                buffer.push_str("\n\n");
+            }
             Err(e) => {
                 error!("Failed to serialize SSE chunk: {}", e);
-                format!("data: {}\n\n", json!({"error": "serialization_failed"}))
+                buffer.push_str(&json!({"error": "serialization_failed"}).to_string());
+                buffer.push_str("\n\n");
             }
         }
     }
