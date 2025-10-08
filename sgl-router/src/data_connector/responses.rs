@@ -12,15 +12,23 @@ impl ResponseId {
     pub fn new() -> Self {
         Self(ulid::Ulid::new().to_string())
     }
-
-    pub fn from_string(s: String) -> Self {
-        Self(s)
-    }
 }
 
 impl Default for ResponseId {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl From<String> for ResponseId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for ResponseId {
+    fn from(value: &str) -> Self {
+        Self(value.to_string())
     }
 }
 

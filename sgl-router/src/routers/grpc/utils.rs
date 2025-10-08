@@ -14,13 +14,14 @@ pub use crate::tokenizer::StopSequenceDecoder;
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
+    Json,
 };
 use futures::StreamExt;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tonic::codec::Streaming;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 use uuid::Uuid;
 
 /// Get gRPC client from worker, returning appropriate error response on failure
@@ -30,22 +31,8 @@ pub async fn get_grpc_client_from_worker(
     let client_arc = worker
         .get_grpc_client()
         .await
-        .map_err(|e| {
-            error!("Failed to get gRPC client from worker: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to get gRPC client: {}", e),
-            )
-                .into_response()
-        })?
-        .ok_or_else(|| {
-            error!("Selected worker is not a gRPC worker");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Selected worker is not configured for gRPC",
-            )
-                .into_response()
-        })?;
+        .map_err(|e| internal_error_message(format!("Failed to get gRPC client: {}", e)))?
+        .ok_or_else(|| internal_error_static("Selected worker is not configured for gRPC"))?;
 
     let client = client_arc.lock().await.clone();
     Ok(client)
@@ -422,12 +409,62 @@ pub fn process_chat_messages(
 /// Error response helpers (shared between regular and PD routers)
 pub fn internal_error_static(msg: &'static str) -> Response {
     error!("{}", msg);
-    (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response()
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({
+            "error": {
+                "message": msg,
+                "type": "internal_error",
+                "code": 500
+            }
+        })),
+    )
+        .into_response()
 }
 
 pub fn internal_error_message(message: String) -> Response {
     error!("{}", message);
-    (StatusCode::INTERNAL_SERVER_ERROR, message).into_response()
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({
+            "error": {
+                "message": message,
+                "type": "internal_error",
+                "code": 500
+            }
+        })),
+    )
+        .into_response()
+}
+
+pub fn bad_request_error(message: String) -> Response {
+    error!("{}", message);
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": {
+                "message": message,
+                "type": "invalid_request_error",
+                "code": 400
+            }
+        })),
+    )
+        .into_response()
+}
+
+pub fn service_unavailable_error(message: String) -> Response {
+    warn!("{}", message);
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "error": {
+                "message": message,
+                "type": "service_unavailable",
+                "code": 503
+            }
+        })),
+    )
+        .into_response()
 }
 
 /// Create a StopSequenceDecoder from stop parameters

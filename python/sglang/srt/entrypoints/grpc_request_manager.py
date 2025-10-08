@@ -263,8 +263,8 @@ class GrpcRequestManager:
                         response = await task
 
                         # Add index for client-side ordering
-                        if isinstance(response, dict) and "meta_info" in response:
-                            response_rid = response["meta_info"].get("id", "")
+                        if isinstance(response, dict):
+                            response_rid = response.get("request_id", "")
                             if response_rid in rid_to_index:
                                 response["index"] = rid_to_index[response_rid]
 
