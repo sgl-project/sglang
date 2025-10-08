@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import itertools
-import logging
 import os
 from typing import Iterable, Optional, Tuple
 
@@ -16,8 +15,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.bert import BertEncoder
 from sglang.srt.utils.hf_transformers_utils import download_from_hf
-
-logger = logging.getLogger(__name__)
 
 RobertaConfig = None
 
@@ -281,8 +278,6 @@ class XLMRobertaModel(nn.Module):
             # remote → use SGLang HF utility
             local_dir = download_from_hf(model_path_or_dir, allow_patterns=sparse_head)
             path = os.path.join(local_dir, sparse_head)
-
-        logger.info(f"Loading Sparse Head: {path}")
 
         state_dict = torch.load(path)
         return state_dict
