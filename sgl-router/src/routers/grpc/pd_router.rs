@@ -53,6 +53,8 @@ pub struct GrpcPDRouter {
     dp_aware: bool,
     api_key: Option<String>,
     retry_config: RetryConfig,
+    configured_reasoning_parser: Option<String>,
+    configured_tool_parser: Option<String>,
 }
 
 impl GrpcPDRouter {
@@ -88,6 +90,8 @@ impl GrpcPDRouter {
             dp_aware: ctx.router_config.dp_aware,
             api_key: ctx.router_config.api_key.clone(),
             retry_config: ctx.router_config.effective_retry_config(),
+            configured_reasoning_parser: ctx.configured_reasoning_parser.clone(),
+            configured_tool_parser: ctx.configured_tool_parser.clone(),
         })
     }
 
@@ -190,8 +194,7 @@ impl GrpcPDRouter {
         let (original_text, token_ids) = match self.resolve_generate_input(body) {
             Ok(res) => res,
             Err(msg) => {
-                error!("Invalid generate request: {}", msg);
-                return (StatusCode::BAD_REQUEST, msg).into_response();
+                return utils::bad_request_error(msg);
             }
         };
 
@@ -204,8 +207,7 @@ impl GrpcPDRouter {
         {
             Ok(pair) => pair,
             Err(e) => {
-                warn!("Failed to select PD worker pair: {}", e);
-                return (StatusCode::SERVICE_UNAVAILABLE, e).into_response();
+                return utils::service_unavailable_error(e);
             }
         };
 
@@ -240,15 +242,13 @@ impl GrpcPDRouter {
         ) {
             Ok(req) => req,
             Err(e) => {
-                error!("Failed to build generate request: {}", e);
-                return (StatusCode::BAD_REQUEST, e).into_response();
+                return utils::bad_request_error(e);
             }
         };
 
         // Step 5: Inject bootstrap metadata
         if let Err(e) = Self::inject_bootstrap_metadata(&mut request, &*prefill_worker) {
-            error!("Failed to inject bootstrap metadata: {}", e);
-            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+            return utils::internal_error_message(e);
         }
 
         // Step 6: Get weight version for response metadata
@@ -330,8 +330,7 @@ impl GrpcPDRouter {
         let processed_messages = match utils::process_chat_messages(&body_ref, &*self.tokenizer) {
             Ok(msgs) => msgs,
             Err(e) => {
-                error!("Failed to process chat messages: {}", e);
-                return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+                return utils::bad_request_error(e.to_string());
             }
         };
 
@@ -339,12 +338,7 @@ impl GrpcPDRouter {
         let encoding = match self.tokenizer.encode(&processed_messages.text) {
             Ok(encoding) => encoding,
             Err(e) => {
-                error!("Tokenization failed: {}", e);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Tokenization failed: {}", e),
-                )
-                    .into_response();
+                return utils::internal_error_message(format!("Tokenization failed: {}", e));
             }
         };
 
@@ -364,8 +358,7 @@ impl GrpcPDRouter {
         {
             Ok(pair) => pair,
             Err(e) => {
-                warn!("Failed to select PD worker pair: {}", e);
-                return (StatusCode::SERVICE_UNAVAILABLE, e).into_response();
+                return utils::service_unavailable_error(e);
             }
         };
 
@@ -398,19 +391,13 @@ impl GrpcPDRouter {
         ) {
             Ok(request) => request,
             Err(e) => {
-                error!("Failed to build gRPC request: {}", e);
-                return (
-                    StatusCode::BAD_REQUEST,
-                    format!("Invalid request parameters: {}", e),
-                )
-                    .into_response();
+                return utils::bad_request_error(format!("Invalid request parameters: {}", e));
             }
         };
 
         // Step 8: Inject bootstrap metadata into the request
         if let Err(e) = Self::inject_bootstrap_metadata(&mut request, &*prefill_worker) {
-            error!("Failed to inject bootstrap metadata: {}", e);
-            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+            return utils::internal_error_message(e);
         }
 
         // Step 9: Handle streaming vs non-streaming
@@ -482,12 +469,10 @@ impl GrpcPDRouter {
         let prefill_stream = match prefill_result {
             Ok(s) => s,
             Err(e) => {
-                error!("Failed to start prefill generation: {}", e);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Prefill worker failed to start: {}", e),
-                )
-                    .into_response();
+                return utils::internal_error_message(format!(
+                    "Prefill worker failed to start: {}",
+                    e
+                ));
             }
         };
 
@@ -495,12 +480,10 @@ impl GrpcPDRouter {
         let decode_stream = match decode_result {
             Ok(s) => s,
             Err(e) => {
-                error!("Failed to start decode generation: {}", e);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Decode worker failed to start: {}", e),
-                )
-                    .into_response();
+                return utils::internal_error_message(format!(
+                    "Decode worker failed to start: {}",
+                    e
+                ));
             }
         };
 
@@ -588,12 +571,10 @@ impl GrpcPDRouter {
         let prefill_stream = match prefill_result {
             Ok(s) => s,
             Err(e) => {
-                error!("Failed to start prefill generation: {}", e);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Prefill worker failed to start: {}", e),
-                )
-                    .into_response();
+                return utils::internal_error_message(format!(
+                    "Prefill worker failed to start: {}",
+                    e
+                ));
             }
         };
 
@@ -601,12 +582,10 @@ impl GrpcPDRouter {
         let decode_stream = match decode_result {
             Ok(s) => s,
             Err(e) => {
-                error!("Failed to start decode generation: {}", e);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Decode worker failed to start: {}", e),
-                )
-                    .into_response();
+                return utils::internal_error_message(format!(
+                    "Decode worker failed to start: {}",
+                    e
+                ));
             }
         };
 
@@ -922,27 +901,31 @@ impl GrpcPDRouter {
                     stream_buffer.push_str(&delta);
 
                     // Reasoning content handling
-                    if separate_reasoning {
-                        let (normal_text, reasoning_chunk) = router.process_reasoning_stream(
-                            &delta,
-                            index,
-                            &mut reasoning_parsers,
-                            &request_id,
-                            &model,
-                            created,
-                        );
+                    let in_reasoning = if separate_reasoning {
+                        let (normal_text, reasoning_chunk, in_reasoning) = router
+                            .process_reasoning_stream(
+                                &delta,
+                                index,
+                                &mut reasoning_parsers,
+                                &request_id,
+                                &model,
+                                created,
+                            );
                         if let Some(chunk) = reasoning_chunk {
                             tx.send(Ok(bytes::Bytes::from(Self::format_sse_chunk(&chunk))))
                                 .map_err(|_| "Failed to send reasoning chunk".to_string())?;
                         }
                         delta = normal_text;
-                    }
+                        in_reasoning
+                    } else {
+                        false
+                    };
 
                     // Tool call handling
                     let tool_choice_enabled =
                         !matches!(tool_choice, Some(ToolChoice::Value(ToolChoiceValue::None)));
 
-                    if tool_choice_enabled && tools.is_some() {
+                    if !in_reasoning && tool_choice_enabled && tools.is_some() {
                         let (should_skip, tool_chunks) = router
                             .process_tool_calls_stream(
                                 &delta,
@@ -1173,16 +1156,22 @@ impl GrpcPDRouter {
         request_id: &str,
         model: &str,
         created: u64,
-    ) -> (String, Option<ChatCompletionStreamResponse>) {
+    ) -> (String, Option<ChatCompletionStreamResponse>, bool) {
         // Get or create parser for this index
-        reasoning_parsers
-            .entry(index)
-            .or_insert_with(|| self.reasoning_parser_factory.get_pooled(model));
+        reasoning_parsers.entry(index).or_insert_with(|| {
+            utils::get_reasoning_parser(
+                &self.reasoning_parser_factory,
+                self.configured_reasoning_parser.as_ref(),
+                model,
+            )
+        });
 
         if let Some(pooled_parser) = reasoning_parsers.get(&index) {
-            let parse_result = {
+            let (parse_result, in_reasoning) = {
                 let mut parser = pooled_parser.lock().unwrap();
-                parser.parse_reasoning_streaming_incremental(delta)
+                let result = parser.parse_reasoning_streaming_incremental(delta);
+                let in_reasoning = parser.is_in_reasoning();
+                (result, in_reasoning)
             };
 
             match parse_result {
@@ -1214,7 +1203,7 @@ impl GrpcPDRouter {
                     } else {
                         None
                     };
-                    return (normal_text, chunk);
+                    return (normal_text, chunk, in_reasoning);
                 }
                 Err(e) => {
                     warn!("Reasoning parsing error: {}", e);
@@ -1222,7 +1211,7 @@ impl GrpcPDRouter {
             }
         }
 
-        (delta.to_string(), None)
+        (delta.to_string(), None, false)
     }
 
     /// Helper: Process tool calls in streaming mode
@@ -1242,9 +1231,13 @@ impl GrpcPDRouter {
         let mut chunks = Vec::new();
 
         // Get or create parser for this index
-        tool_parsers
-            .entry(index)
-            .or_insert_with(|| self.tool_parser_factory.get_pooled(model));
+        tool_parsers.entry(index).or_insert_with(|| {
+            utils::get_tool_parser(
+                &self.tool_parser_factory,
+                self.configured_tool_parser.as_ref(),
+                model,
+            )
+        });
 
         if let Some(pooled_parser) = tool_parsers.get(&index) {
             let mut parser = pooled_parser.lock().await;
@@ -1731,9 +1724,11 @@ impl GrpcPDRouter {
 
         // Check if reasoning parsing is enabled and separate_reasoning is requested
         if original_request.separate_reasoning {
-            let pooled_parser = self
-                .reasoning_parser_factory
-                .get_pooled(&original_request.model);
+            let pooled_parser = utils::get_reasoning_parser(
+                &self.reasoning_parser_factory,
+                self.configured_reasoning_parser.as_ref(),
+                &original_request.model,
+            );
 
             let mut parser = pooled_parser
                 .lock()
@@ -1854,12 +1849,16 @@ impl GrpcPDRouter {
         history_tool_calls_count: usize,
     ) -> (Option<Vec<ToolCall>>, String) {
         // Get pooled parser for this model
-        let pooled_parser = self.tool_parser_factory.get_pooled(model);
+        let pooled_parser = utils::get_tool_parser(
+            &self.tool_parser_factory,
+            self.configured_tool_parser.as_ref(),
+            model,
+        );
 
         // Check format detection first
         let can_parse = {
             let parser = pooled_parser.lock().await;
-            parser.detect_format(processed_text)
+            parser.has_tool_markers(processed_text)
             // Lock is dropped here
         };
 

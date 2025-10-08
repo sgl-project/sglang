@@ -53,6 +53,8 @@ pub struct GrpcRouter {
     dp_aware: bool,
     api_key: Option<String>,
     retry_config: RetryConfig,
+    configured_reasoning_parser: Option<String>,
+    configured_tool_parser: Option<String>,
 }
 
 impl GrpcRouter {
@@ -87,6 +89,8 @@ impl GrpcRouter {
             dp_aware: ctx.router_config.dp_aware,
             api_key: ctx.router_config.api_key.clone(),
             retry_config: ctx.router_config.effective_retry_config(),
+            configured_reasoning_parser: ctx.configured_reasoning_parser.clone(),
+            configured_tool_parser: ctx.configured_tool_parser.clone(),
         })
     }
 
@@ -109,8 +113,7 @@ impl GrpcRouter {
         let processed_messages = match utils::process_chat_messages(&body_ref, &*self.tokenizer) {
             Ok(msgs) => msgs,
             Err(e) => {
-                error!("Failed to process chat messages: {}", e);
-                return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+                return utils::bad_request_error(e.to_string());
             }
         };
 
@@ -118,12 +121,7 @@ impl GrpcRouter {
         let encoding = match self.tokenizer.encode(&processed_messages.text) {
             Ok(encoding) => encoding,
             Err(e) => {
-                error!("Tokenization failed: {}", e);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Tokenization failed: {}", e),
-                )
-                    .into_response();
+                return utils::internal_error_message(format!("Tokenization failed: {}", e));
             }
         };
 
@@ -141,8 +139,10 @@ impl GrpcRouter {
         {
             Some(w) => w,
             None => {
-                warn!("No available workers for model: {:?}", model_id);
-                return (StatusCode::SERVICE_UNAVAILABLE, "No available workers").into_response();
+                return utils::service_unavailable_error(format!(
+                    "No available workers for model: {:?}",
+                    model_id
+                ));
             }
         };
 
@@ -166,12 +166,7 @@ impl GrpcRouter {
         ) {
             Ok(request) => request,
             Err(e) => {
-                error!("Failed to build gRPC request: {}", e);
-                return (
-                    StatusCode::BAD_REQUEST,
-                    format!("Invalid request parameters: {}", e),
-                )
-                    .into_response();
+                return utils::bad_request_error(format!("Invalid request parameters: {}", e));
             }
         };
 
@@ -196,8 +191,7 @@ impl GrpcRouter {
         let (original_text, token_ids) = match self.resolve_generate_input(body) {
             Ok(res) => res,
             Err(msg) => {
-                error!("Invalid generate request: {}", msg);
-                return (StatusCode::BAD_REQUEST, msg).into_response();
+                return utils::bad_request_error(msg);
             }
         };
 
@@ -207,8 +201,10 @@ impl GrpcRouter {
         let worker = match self.select_worker_for_request(model_id, original_text.as_deref()) {
             Some(w) => w,
             None => {
-                warn!("No available workers for model: {:?}", model_id);
-                return (StatusCode::SERVICE_UNAVAILABLE, "No available workers").into_response();
+                return utils::service_unavailable_error(format!(
+                    "No available workers for model: {:?}",
+                    model_id
+                ));
             }
         };
 
@@ -234,8 +230,7 @@ impl GrpcRouter {
         ) {
             Ok(req) => req,
             Err(e) => {
-                error!("Failed to build generate request: {}", e);
-                return (StatusCode::BAD_REQUEST, e).into_response();
+                return utils::bad_request_error(e);
             }
         };
 
@@ -301,12 +296,16 @@ impl GrpcRouter {
         history_tool_calls_count: usize,
     ) -> (Option<Vec<ToolCall>>, String) {
         // Get pooled parser for this model
-        let pooled_parser = self.tool_parser_factory.get_pooled(model);
+        let pooled_parser = utils::get_tool_parser(
+            &self.tool_parser_factory,
+            self.configured_tool_parser.as_ref(),
+            model,
+        );
 
         // Check format detection first
         let can_parse = {
             let parser = pooled_parser.lock().await;
-            parser.detect_format(processed_text)
+            parser.has_tool_markers(processed_text)
             // Lock is dropped here
         };
 
@@ -397,16 +396,6 @@ impl GrpcRouter {
         Ok((text.to_string(), encoding.token_ids().to_vec()))
     }
 
-    fn internal_error_static(msg: &'static str) -> Response {
-        error!("{}", msg);
-        (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response()
-    }
-
-    fn internal_error_message(message: String) -> Response {
-        error!("{}", message);
-        (StatusCode::INTERNAL_SERVER_ERROR, message).into_response()
-    }
-
     /// Count the number of tool calls in the request message history
     /// This is used for KimiK2 format which needs globally unique indices
     fn get_history_tool_calls_count(request: &ChatCompletionRequest) -> usize {
@@ -494,16 +483,22 @@ impl GrpcRouter {
         request_id: &str,
         model: &str,
         created: u64,
-    ) -> (String, Option<ChatCompletionStreamResponse>) {
+    ) -> (String, Option<ChatCompletionStreamResponse>, bool) {
         // Get or create parser for this index
-        reasoning_parsers
-            .entry(index)
-            .or_insert_with(|| self.reasoning_parser_factory.get_pooled(model));
+        reasoning_parsers.entry(index).or_insert_with(|| {
+            utils::get_reasoning_parser(
+                &self.reasoning_parser_factory,
+                self.configured_reasoning_parser.as_ref(),
+                model,
+            )
+        });
 
         if let Some(pooled_parser) = reasoning_parsers.get(&index) {
-            let parse_result = {
+            let (parse_result, in_reasoning) = {
                 let mut parser = pooled_parser.lock().unwrap();
-                parser.parse_reasoning_streaming_incremental(delta)
+                let result = parser.parse_reasoning_streaming_incremental(delta);
+                let in_reasoning = parser.is_in_reasoning();
+                (result, in_reasoning)
             };
 
             match parse_result {
@@ -535,7 +530,7 @@ impl GrpcRouter {
                     } else {
                         None
                     };
-                    return (normal_text, chunk);
+                    return (normal_text, chunk, in_reasoning);
                 }
                 Err(e) => {
                     warn!("Reasoning parsing error: {}", e);
@@ -543,7 +538,7 @@ impl GrpcRouter {
             }
         }
 
-        (delta.to_string(), None)
+        (delta.to_string(), None, false)
     }
 
     /// Helper: Process tool calls in streaming mode
@@ -567,9 +562,13 @@ impl GrpcRouter {
         let mut chunks = Vec::new();
 
         // Get or create parser for this index
-        tool_parsers
-            .entry(index)
-            .or_insert_with(|| self.tool_parser_factory.get_pooled(model));
+        tool_parsers.entry(index).or_insert_with(|| {
+            utils::get_tool_parser(
+                &self.tool_parser_factory,
+                self.configured_tool_parser.as_ref(),
+                model,
+            )
+        });
 
         if let Some(pooled_parser) = tool_parsers.get(&index) {
             let mut parser = pooled_parser.lock().await;
@@ -722,12 +721,7 @@ impl GrpcRouter {
         let mut grpc_stream = match client.generate(request).await {
             Ok(stream) => stream,
             Err(e) => {
-                error!("Failed to start generation: {}", e);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Generation failed: {}", e),
-                )
-                    .into_response();
+                return utils::internal_error_message(format!("Generation failed: {}", e));
             }
         };
 
@@ -901,27 +895,31 @@ impl GrpcRouter {
                     stream_buffer.push_str(&delta);
 
                     // Reasoning content handling
-                    if separate_reasoning {
-                        let (normal_text, reasoning_chunk) = router.process_reasoning_stream(
-                            &delta,
-                            index,
-                            &mut reasoning_parsers,
-                            &request_id,
-                            &model,
-                            created,
-                        );
+                    let in_reasoning = if separate_reasoning {
+                        let (normal_text, reasoning_chunk, in_reasoning) = router
+                            .process_reasoning_stream(
+                                &delta,
+                                index,
+                                &mut reasoning_parsers,
+                                &request_id,
+                                &model,
+                                created,
+                            );
                         if let Some(chunk) = reasoning_chunk {
                             tx.send(Ok(Bytes::from(Self::format_sse_chunk(&chunk))))
                                 .map_err(|_| "Failed to send reasoning chunk".to_string())?;
                         }
                         delta = normal_text;
-                    }
+                        in_reasoning
+                    } else {
+                        false
+                    };
 
                     // Tool call handling
                     let tool_choice_enabled =
                         !matches!(tool_choice, Some(ToolChoice::Value(ToolChoiceValue::None)));
 
-                    if tool_choice_enabled && tools.is_some() {
+                    if !in_reasoning && tool_choice_enabled && tools.is_some() {
                         let (should_skip, tool_chunks) = router
                             .process_tool_calls_stream(
                                 &delta,
@@ -1161,7 +1159,7 @@ impl GrpcRouter {
         let stream = match client.generate(request).await {
             Ok(s) => s,
             Err(e) => {
-                return Self::internal_error_message(format!("Failed to start generation: {}", e))
+                return utils::internal_error_message(format!("Failed to start generation: {}", e))
             }
         };
 
@@ -1171,7 +1169,7 @@ impl GrpcRouter {
         };
 
         if all_responses.is_empty() {
-            return Self::internal_error_static("No responses from server");
+            return utils::internal_error_static("No responses from server");
         }
 
         // Process each response into a ChatChoice
@@ -1190,7 +1188,7 @@ impl GrpcRouter {
             {
                 Ok(choice) => choices.push(choice),
                 Err(e) => {
-                    return Self::internal_error_message(format!(
+                    return utils::internal_error_message(format!(
                         "Failed to process choice {}: {}",
                         index, e
                     ));
@@ -1243,7 +1241,7 @@ impl GrpcRouter {
         let stream = match client.generate(request).await {
             Ok(stream) => stream,
             Err(e) => {
-                return Self::internal_error_message(format!("Failed to start generation: {}", e))
+                return utils::internal_error_message(format!("Failed to start generation: {}", e))
             }
         };
 
@@ -1254,7 +1252,7 @@ impl GrpcRouter {
         };
 
         if responses.is_empty() {
-            return Self::internal_error_static("No completion received from scheduler");
+            return utils::internal_error_static("No completion received from scheduler");
         }
 
         // Create stop decoder from sampling params
@@ -1276,7 +1274,10 @@ impl GrpcRouter {
             let outputs = match stop_decoder.process_tokens(&complete.output_ids) {
                 Ok(outputs) => outputs,
                 Err(e) => {
-                    return Self::internal_error_message(format!("Failed to process tokens: {}", e))
+                    return utils::internal_error_message(format!(
+                        "Failed to process tokens: {}",
+                        e
+                    ))
                 }
             };
 
@@ -1355,7 +1356,7 @@ impl GrpcRouter {
         let stream = match client.generate(request).await {
             Ok(stream) => stream,
             Err(e) => {
-                return Self::internal_error_message(format!("Failed to start generation: {}", e))
+                return utils::internal_error_message(format!("Failed to start generation: {}", e))
             }
         };
 
@@ -1609,9 +1610,11 @@ impl GrpcRouter {
 
         // Check if reasoning parsing is enabled and separate_reasoning is requested
         if original_request.separate_reasoning {
-            let pooled_parser = self
-                .reasoning_parser_factory
-                .get_pooled(&original_request.model);
+            let pooled_parser = utils::get_reasoning_parser(
+                &self.reasoning_parser_factory,
+                self.configured_reasoning_parser.as_ref(),
+                &original_request.model,
+            );
 
             let mut parser = pooled_parser
                 .lock()

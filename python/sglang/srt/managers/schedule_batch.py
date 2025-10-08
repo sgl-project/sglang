@@ -97,7 +97,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "ep_num_redundant_experts",
     "enable_nan_detection",
     "flashinfer_mla_disable_ragged",
-    "max_micro_batch_size",
+    "pp_max_micro_batch_size",
     "disable_shared_experts_fusion",
     "sampling_backend",
     "speculative_accept_threshold_single",
@@ -112,6 +112,8 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "enable_custom_logit_processor",
     "disaggregation_mode",
     "enable_deterministic_inference",
+    "nsa_prefill",
+    "nsa_decode",
 ]
 
 # Put some global args for easy access
@@ -663,7 +665,11 @@ class Req:
     @property
     def is_prefill_only(self) -> bool:
         """Check if this request is prefill-only (no token generation needed)."""
-        return self.sampling_params.max_new_tokens == 0
+        # NOTE: when spec is enabled, prefill_only optimizations are disabled
+        return (
+            self.sampling_params.max_new_tokens == 0
+            and global_server_args_dict["speculative_algorithm"] is None
+        )
 
     def add_latency(self, stage: RequestStage):
         if self.metrics_collector is None:
@@ -880,15 +886,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # This is an optimization to reduce the overhead of the prefill check.
     batch_is_full: bool = False
 
-    # Events
-    launch_done: Optional[threading.Event] = None
-
     # For chunked prefill in PP
     chunked_req: Optional[Req] = None
 
     # Sampling info
     sampling_info: SamplingBatchInfo = None
-    next_batch_sampling_info: SamplingBatchInfo = None
 
     # Batched arguments to model runner
     input_ids: torch.Tensor = None  # shape: [b], int64
@@ -1871,7 +1873,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 )
             ),
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
-            launch_done=self.launch_done,
             is_prefill_only=self.is_prefill_only,
         )
 
@@ -2012,8 +2013,8 @@ class ModelWorkerBatch:
     capture_hidden_mode: CaptureHiddenMode = None
     hicache_consumer_index: int = -1
 
-    # Overlap event
-    launch_done: Optional[threading.Event] = None
+    # Overlap scheduler related
+    delay_sample_launch: bool = False
 
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
