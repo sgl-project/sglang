@@ -63,6 +63,8 @@ impl TestContext {
             tokenizer_path: None,
             history_backend: sglang_router_rs::config::HistoryBackend::Memory,
             oracle: None,
+            reasoning_parser: None,
+            tool_call_parser: None,
         };
 
         Self::new_with_config(config, worker_configs).await
@@ -576,7 +578,6 @@ mod model_info_tests {
         let ctx = TestContext::new(vec![]).await;
         let app = ctx.create_app().await;
 
-        // Test server info with no workers
         let req = Request::builder()
             .method("GET")
             .uri("/get_server_info")
@@ -593,7 +594,6 @@ mod model_info_tests {
             resp.status()
         );
 
-        // Test model info with no workers
         let req = Request::builder()
             .method("GET")
             .uri("/get_model_info")
@@ -610,7 +610,6 @@ mod model_info_tests {
             resp.status()
         );
 
-        // Test v1/models with no workers
         let req = Request::builder()
             .method("GET")
             .uri("/v1/models")
@@ -652,7 +651,6 @@ mod model_info_tests {
 
         let app = ctx.create_app().await;
 
-        // Test that model info is consistent across workers
         for _ in 0..5 {
             let req = Request::builder()
                 .method("GET")
@@ -795,7 +793,6 @@ mod worker_management_tests {
         let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        // Verify it's removed
         let req = Request::builder()
             .method("GET")
             .uri("/list_workers")
@@ -1302,7 +1299,6 @@ mod error_tests {
 
         let app = ctx.create_app().await;
 
-        // Test unknown endpoint
         let req = Request::builder()
             .method("GET")
             .uri("/unknown_endpoint")
@@ -1312,7 +1308,6 @@ mod error_tests {
         let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
-        // Test POST to unknown endpoint
         let req = Request::builder()
             .method("POST")
             .uri("/api/v2/generate")
@@ -1403,6 +1398,8 @@ mod error_tests {
             tokenizer_path: None,
             history_backend: sglang_router_rs::config::HistoryBackend::Memory,
             oracle: None,
+            reasoning_parser: None,
+            tool_call_parser: None,
         };
 
         let ctx = TestContext::new_with_config(
@@ -1606,7 +1603,6 @@ mod cache_tests {
             .unwrap();
         let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
-        // Verify the response contains load information
         assert!(body_json.is_object());
         // The exact structure depends on the implementation
         // but should contain worker load information
@@ -1763,6 +1759,8 @@ mod pd_mode_tests {
             tokenizer_path: None,
             history_backend: sglang_router_rs::config::HistoryBackend::Memory,
             oracle: None,
+            reasoning_parser: None,
+            tool_call_parser: None,
         };
 
         // Create app context
@@ -1797,7 +1795,6 @@ mod request_id_tests {
 
         let app = ctx.create_app().await;
 
-        // Test 1: Request without any request ID header should generate one
         let payload = json!({
             "text": "Test request",
             "stream": false
@@ -1830,7 +1827,6 @@ mod request_id_tests {
             "Request ID should have content after prefix"
         );
 
-        // Test 2: Request with custom x-request-id should preserve it
         let custom_id = "custom-request-id-123";
         let req = Request::builder()
             .method("POST")
@@ -1847,7 +1843,6 @@ mod request_id_tests {
         assert!(response_id.is_some());
         assert_eq!(response_id.unwrap(), custom_id);
 
-        // Test 3: Different endpoints should have different prefixes
         let chat_payload = json!({
             "messages": [{"role": "user", "content": "Hello"}],
             "model": "test-model"
@@ -1871,7 +1866,6 @@ mod request_id_tests {
             .unwrap()
             .starts_with("chatcmpl-"));
 
-        // Test 4: Alternative request ID headers should be recognized
         let req = Request::builder()
             .method("POST")
             .uri("/generate")
@@ -1927,6 +1921,8 @@ mod request_id_tests {
             tokenizer_path: None,
             history_backend: sglang_router_rs::config::HistoryBackend::Memory,
             oracle: None,
+            reasoning_parser: None,
+            tool_call_parser: None,
         };
 
         let ctx = TestContext::new_with_config(
@@ -1948,7 +1944,6 @@ mod request_id_tests {
             "stream": false
         });
 
-        // Test custom header is recognized
         let req = Request::builder()
             .method("POST")
             .uri("/generate")
@@ -2013,7 +2008,6 @@ mod rerank_tests {
             .unwrap();
         let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
-        // Verify response structure
         assert!(body_json.get("results").is_some());
         assert!(body_json.get("model").is_some());
         assert_eq!(body_json["model"], "test-rerank-model");
@@ -2021,7 +2015,6 @@ mod rerank_tests {
         let results = body_json["results"].as_array().unwrap();
         assert_eq!(results.len(), 2);
 
-        // Verify results are sorted by score (highest first)
         assert!(results[0]["score"].as_f64().unwrap() >= results[1]["score"].as_f64().unwrap());
 
         ctx.shutdown().await;
@@ -2164,7 +2157,6 @@ mod rerank_tests {
 
         let app = ctx.create_app().await;
 
-        // Test V1 API format (simplified input)
         let payload = json!({
             "query": "machine learning algorithms",
             "documents": [
@@ -2189,7 +2181,6 @@ mod rerank_tests {
             .unwrap();
         let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
-        // Verify response structure
         assert!(body_json.get("results").is_some());
         assert!(body_json.get("model").is_some());
 
@@ -2199,7 +2190,6 @@ mod rerank_tests {
         let results = body_json["results"].as_array().unwrap();
         assert_eq!(results.len(), 3); // All documents should be returned
 
-        // Verify results are sorted by score (highest first)
         assert!(results[0]["score"].as_f64().unwrap() >= results[1]["score"].as_f64().unwrap());
         assert!(results[1]["score"].as_f64().unwrap() >= results[2]["score"].as_f64().unwrap());
 
@@ -2224,7 +2214,6 @@ mod rerank_tests {
 
         let app = ctx.create_app().await;
 
-        // Test empty query string (validation should fail)
         let payload = json!({
             "query": "",
             "documents": ["Document 1", "Document 2"],
@@ -2241,7 +2230,6 @@ mod rerank_tests {
         let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
-        // Test query with only whitespace (validation should fail)
         let payload = json!({
             "query": "   ",
             "documents": ["Document 1", "Document 2"],
@@ -2258,7 +2246,6 @@ mod rerank_tests {
         let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
-        // Test empty documents list (validation should fail)
         let payload = json!({
             "query": "test query",
             "documents": [],
@@ -2275,7 +2262,6 @@ mod rerank_tests {
         let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
-        // Test invalid top_k (validation should fail)
         let payload = json!({
             "query": "test query",
             "documents": ["Document 1", "Document 2"],
