@@ -246,7 +246,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 |-----------|-------------|----------|
 | `--ep-size` | The expert parallelism size. | 1 |
 | `--moe-a2a-backend` | Select the backend for all-to-all communication for expert parallelism. | none |
-| `--moe-runner-backend` | Select the runner backend for MoE. | 'triton' |
+| `--moe-runner-backend` | Select the runner backend for MoE. | auto |
 | `--deepep-mode` | Select the mode when enable DeepEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch. | auto |
 | `--ep-num-redundant-experts` | Allocate this number of redundant experts in expert parallel. | 0 |
 | `--ep-dispatch-algorithm` | The algorithm to choose ranks for redundant experts in EPLB. | None |
