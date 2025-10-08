@@ -24,6 +24,7 @@ use crate::tokenizer::stop::{SequenceDecoderOutput, StopSequenceDecoder};
 use crate::tokenizer::traits::Tokenizer;
 use crate::tool_parser::ToolParser;
 
+use super::context;
 use super::utils;
 
 /// Shared streaming processor for both single and dual dispatch modes
@@ -61,9 +62,9 @@ impl StreamingProcessor {
     /// - SSE response building
     pub fn process_streaming_response(
         self: Arc<Self>,
-        execution_result: super::context::ExecutionResult,
+        execution_result: context::ExecutionResult,
         chat_request: ChatCompletionRequest,
-        dispatch: super::context::DispatchMetadata,
+        dispatch: context::DispatchMetadata,
     ) -> axum::response::Response {
         use bytes::Bytes;
         use tokio::sync::mpsc;
@@ -80,7 +81,7 @@ impl StreamingProcessor {
 
         // Spawn background task based on execution mode
         match execution_result {
-            super::context::ExecutionResult::Single { stream } => {
+            context::ExecutionResult::Single { stream } => {
                 let processor = self.clone();
                 let dispatch_clone = dispatch.clone();
                 tokio::spawn(async move {
@@ -110,7 +111,7 @@ impl StreamingProcessor {
                     let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
                 });
             }
-            super::context::ExecutionResult::Dual { prefill, decode } => {
+            context::ExecutionResult::Dual { prefill, decode } => {
                 let processor = self.clone();
                 tokio::spawn(async move {
                     let result = processor
@@ -150,7 +151,7 @@ impl StreamingProcessor {
     pub async fn process_streaming_chunks(
         &self,
         mut grpc_stream: Streaming<proto::GenerateResponse>,
-        dispatch: super::context::DispatchMetadata,
+        dispatch: context::DispatchMetadata,
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool),
         original_request: ChatCompletionRequest,
         tx: &UnboundedSender<Result<Bytes, io::Error>>,
@@ -274,8 +275,8 @@ impl StreamingProcessor {
                                 &delta,
                                 index,
                                 &mut reasoning_parsers,
-                                &request_id,
-                                &model,
+                                request_id,
+                                model,
                                 created,
                                 system_fingerprint,
                             );
@@ -301,8 +302,8 @@ impl StreamingProcessor {
                                 &mut tool_parsers,
                                 &mut has_tool_calls,
                                 tools.as_ref().unwrap(),
-                                &request_id,
-                                &model,
+                                request_id,
+                                model,
                                 created,
                                 system_fingerprint,
                                 history_tool_calls_count,
@@ -325,8 +326,8 @@ impl StreamingProcessor {
                         let content_chunk = Self::create_content_chunk(
                             delta,
                             index,
-                            &request_id,
-                            &model,
+                            request_id,
+                            model,
                             created,
                             system_fingerprint,
                             choice_logprobs,
@@ -525,7 +526,7 @@ impl StreamingProcessor {
         &self,
         mut prefill_stream: Streaming<proto::GenerateResponse>,
         decode_stream: Streaming<proto::GenerateResponse>,
-        dispatch: super::context::DispatchMetadata,
+        dispatch: context::DispatchMetadata,
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool),
         original_request: ChatCompletionRequest,
         tx: &UnboundedSender<Result<Bytes, io::Error>>,

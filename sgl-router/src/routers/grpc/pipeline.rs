@@ -8,10 +8,15 @@ use axum::response::{IntoResponse, Response};
 use tracing::{debug, error, warn};
 
 use super::context::*;
+use super::processing;
+use super::streaming;
 use super::utils;
 use crate::core::{ConnectionMode, WorkerRegistry, WorkerType};
 use crate::grpc_client::proto;
 use crate::policies::PolicyRegistry;
+use crate::protocols::spec::{
+    ChatCompletionRequest, ChatCompletionResponse, GenerateRequest, InputIds, Usage,
+};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -66,7 +71,7 @@ impl PreparationStage {
     async fn prepare_chat(
         &self,
         ctx: &mut RequestContext,
-        request: &crate::protocols::spec::ChatCompletionRequest,
+        request: &ChatCompletionRequest,
     ) -> Result<(), Response> {
         // Step 1: Filter tools if needed
         let body_ref = utils::filter_tools_for_request(request);
@@ -76,7 +81,7 @@ impl PreparationStage {
             match utils::process_chat_messages(&body_ref, &*ctx.components.tokenizer) {
                 Ok(msgs) => msgs,
                 Err(e) => {
-                    return Err(super::utils::bad_request_error(e));
+                    return Err(utils::bad_request_error(e));
                 }
             };
 
@@ -84,7 +89,7 @@ impl PreparationStage {
         let encoding = match ctx.components.tokenizer.encode(&processed_messages.text) {
             Ok(encoding) => encoding,
             Err(e) => {
-                return Err(super::utils::internal_error_message(format!(
+                return Err(utils::internal_error_message(format!(
                     "Tokenization failed: {}",
                     e
                 )));
@@ -130,13 +135,13 @@ impl PreparationStage {
     async fn prepare_generate(
         &self,
         ctx: &mut RequestContext,
-        request: &crate::protocols::spec::GenerateRequest,
+        request: &GenerateRequest,
     ) -> Result<(), Response> {
         // Resolve input (text, prompt, or input_ids)
         let (original_text, token_ids) = match self.resolve_generate_input(ctx, request) {
             Ok(res) => res,
             Err(msg) => {
-                return Err(super::utils::bad_request_error(msg));
+                return Err(utils::bad_request_error(msg));
             }
         };
 
@@ -169,7 +174,7 @@ impl PreparationStage {
     fn resolve_generate_input(
         &self,
         ctx: &RequestContext,
-        request: &crate::protocols::spec::GenerateRequest,
+        request: &GenerateRequest,
     ) -> Result<(Option<String>, Vec<u32>), String> {
         if let Some(text) = &request.text {
             return self
@@ -180,13 +185,13 @@ impl PreparationStage {
         // Handle input_ids - validate and convert
         if let Some(input_ids) = &request.input_ids {
             return match input_ids {
-                crate::protocols::spec::InputIds::Single(ids) => ids
+                InputIds::Single(ids) => ids
                     .iter()
                     .map(|&id| u32::try_from(id))
                     .collect::<Result<Vec<u32>, _>>()
                     .map(|converted| (None, converted))
                     .map_err(|_| "input_ids must be non-negative".to_string()),
-                crate::protocols::spec::InputIds::Batch(_) => {
+                InputIds::Batch(_) => {
                     Err("Batch input_ids are not supported over gRPC generate yet".to_string())
                 }
             };
@@ -245,7 +250,7 @@ impl PipelineStage for WorkerSelectionStage {
         debug!("Stage {}: Selecting workers", self.name());
 
         let prep = ctx.state.preparation.as_ref().ok_or_else(|| {
-            super::utils::internal_error_static("Preparation stage not completed")
+            utils::internal_error_static("Preparation stage not completed")
         })?;
 
         let text = prep.original_text.as_deref();
@@ -255,7 +260,7 @@ impl PipelineStage for WorkerSelectionStage {
                 match self.select_single_worker(ctx.input.model_id.as_deref(), text) {
                     Some(w) => WorkerSelection::Single { worker: w },
                     None => {
-                        return Err(super::utils::service_unavailable_error(format!(
+                        return Err(utils::service_unavailable_error(format!(
                             "No available workers for model: {:?}",
                             ctx.input.model_id
                         )));
@@ -266,7 +271,7 @@ impl PipelineStage for WorkerSelectionStage {
                 match self.select_pd_pair(ctx.input.model_id.as_deref(), text) {
                     Some((prefill, decode)) => WorkerSelection::Dual { prefill, decode },
                     None => {
-                        return Err(super::utils::service_unavailable_error(format!(
+                        return Err(utils::service_unavailable_error(format!(
                             "No available PD worker pairs for model: {:?}",
                             ctx.input.model_id
                         )));
@@ -399,7 +404,7 @@ impl PipelineStage for ClientAcquisitionStage {
 
         let workers =
             ctx.state.workers.as_ref().ok_or_else(|| {
-                super::utils::internal_error_static("Worker selection not completed")
+                utils::internal_error_static("Worker selection not completed")
             })?;
 
         let clients = match workers {
@@ -450,10 +455,10 @@ impl PipelineStage for RequestBuildingStage {
             .state
             .preparation
             .as_ref()
-            .ok_or_else(|| super::utils::internal_error_static("Preparation not completed"))?;
+            .ok_or_else(|| utils::internal_error_static("Preparation not completed"))?;
 
         let clients = ctx.state.clients.as_ref().ok_or_else(|| {
-            super::utils::internal_error_static("Client acquisition not completed")
+            utils::internal_error_static("Client acquisition not completed")
         })?;
 
         // Get client for building request (use prefill client if PD mode)
@@ -481,7 +486,7 @@ impl PipelineStage for RequestBuildingStage {
                         prep.tool_constraints.clone(),
                     )
                     .map_err(|e| {
-                        super::utils::bad_request_error(format!(
+                        utils::bad_request_error(format!(
                             "Invalid request parameters: {}",
                             e
                         ))
@@ -500,7 +505,7 @@ impl PipelineStage for RequestBuildingStage {
                         prep.original_text.clone(),
                         prep.token_ids.clone(),
                     )
-                    .map_err(|e| super::utils::bad_request_error(e))?
+                    .map_err(utils::bad_request_error)?
             }
         };
 
@@ -523,10 +528,10 @@ impl PipelineStage for RequestBuildingStage {
 impl RequestBuildingStage {
     fn inject_bootstrap_metadata(
         &self,
-        request: &mut crate::grpc_client::proto::GenerateRequest,
+        request: &mut proto::GenerateRequest,
         prefill_worker: &Arc<dyn crate::core::Worker>,
     ) {
-        use crate::grpc_client::proto::DisaggregatedParams;
+        use proto::DisaggregatedParams;
 
         let hostname = prefill_worker.bootstrap_host();
         let bootstrap_port = prefill_worker.bootstrap_port().unwrap_or(8998);
@@ -567,7 +572,7 @@ impl PipelineStage for DispatchMetadataStage {
             .state
             .proto_request
             .as_ref()
-            .ok_or_else(|| super::utils::internal_error_static("Proto request not built"))?;
+            .ok_or_else(|| utils::internal_error_static("Proto request not built"))?;
 
         let request_id = proto_request.request_id.clone();
         let model = match &ctx.input.request_type {
@@ -645,10 +650,10 @@ impl PipelineStage for RequestExecutionStage {
             .state
             .proto_request
             .take()
-            .ok_or_else(|| super::utils::internal_error_static("Proto request not built"))?;
+            .ok_or_else(|| utils::internal_error_static("Proto request not built"))?;
 
         let clients = ctx.state.clients.as_mut().ok_or_else(|| {
-            super::utils::internal_error_static("Client acquisition not completed")
+            utils::internal_error_static("Client acquisition not completed")
         })?;
 
         let result = match self.mode {
@@ -675,11 +680,11 @@ impl RequestExecutionStage {
         clients: &mut ClientSelection,
     ) -> Result<ExecutionResult, Response> {
         let client = clients.single_mut().ok_or_else(|| {
-            super::utils::internal_error_static("Expected single client but got dual")
+            utils::internal_error_static("Expected single client but got dual")
         })?;
 
         let stream = client.generate(proto_request).await.map_err(|e| {
-            super::utils::internal_error_message(format!("Failed to start generation: {}", e))
+            utils::internal_error_message(format!("Failed to start generation: {}", e))
         })?;
 
         Ok(ExecutionResult::Single { stream })
@@ -691,7 +696,7 @@ impl RequestExecutionStage {
         clients: &mut ClientSelection,
     ) -> Result<ExecutionResult, Response> {
         let (prefill_client, decode_client) = clients.dual_mut().ok_or_else(|| {
-            super::utils::internal_error_static("Expected dual clients but got single")
+            utils::internal_error_static("Expected dual clients but got single")
         })?;
 
         debug!("Sending concurrent requests to prefill and decode workers");
@@ -708,7 +713,7 @@ impl RequestExecutionStage {
         let prefill_stream = match prefill_result {
             Ok(s) => s,
             Err(e) => {
-                return Err(super::utils::internal_error_message(format!(
+                return Err(utils::internal_error_message(format!(
                     "Prefill worker failed to start: {}",
                     e
                 )));
@@ -719,7 +724,7 @@ impl RequestExecutionStage {
         let decode_stream = match decode_result {
             Ok(s) => s,
             Err(e) => {
-                return Err(super::utils::internal_error_message(format!(
+                return Err(utils::internal_error_message(format!(
                     "Decode worker failed to start: {}",
                     e
                 )));
@@ -742,14 +747,14 @@ impl RequestExecutionStage {
 /// - For streaming: Spawns background task and returns SSE response (early exit)
 /// - For non-streaming: Collects all responses and builds final ChatCompletionResponse
 pub struct ResponseProcessingStage {
-    processor: super::processing::ResponseProcessor,
-    streaming_processor: Arc<super::streaming::StreamingProcessor>,
+    processor: processing::ResponseProcessor,
+    streaming_processor: Arc<streaming::StreamingProcessor>,
 }
 
 impl ResponseProcessingStage {
     pub fn new(
-        processor: super::processing::ResponseProcessor,
-        streaming_processor: Arc<super::streaming::StreamingProcessor>,
+        processor: processing::ResponseProcessor,
+        streaming_processor: Arc<streaming::StreamingProcessor>,
     ) -> Self {
         Self {
             processor,
@@ -791,13 +796,13 @@ impl ResponseProcessingStage {
             .response
             .execution_result
             .take()
-            .ok_or_else(|| super::utils::internal_error_static("No execution result"))?;
+            .ok_or_else(|| utils::internal_error_static("No execution result"))?;
 
         if is_streaming {
             // Get dispatch metadata for consistent response fields
             let dispatch =
                 ctx.state.dispatch.as_ref().ok_or_else(|| {
-                    super::utils::internal_error_static("Dispatch metadata not set")
+                    utils::internal_error_static("Dispatch metadata not set")
                 })?;
 
             // Streaming: Use StreamingProcessor and return SSE response (early exit)
@@ -817,20 +822,17 @@ impl ResponseProcessingStage {
         // Collect all responses from the execution result
         let all_responses = match execution_result {
             ExecutionResult::Single { stream } => {
-                super::utils::collect_stream_responses(stream, "Single")
-                    .await
-                    .map_err(|e| e)?
+                utils::collect_stream_responses(stream, "Single")
+                    .await?
             }
             ExecutionResult::Dual { prefill, decode } => {
                 // Collect prefill for input_logprobs
-                let prefill_responses = super::utils::collect_stream_responses(prefill, "Prefill")
-                    .await
-                    .map_err(|e| e)?;
+                let prefill_responses = utils::collect_stream_responses(prefill, "Prefill")
+                    .await?;
 
                 // Collect decode for actual output
-                let mut decode_responses = super::utils::collect_stream_responses(decode, "Decode")
-                    .await
-                    .map_err(|e| e)?;
+                let mut decode_responses = utils::collect_stream_responses(decode, "Decode")
+                    .await?;
 
                 // Merge prefill input_logprobs if requested
                 if request_logprobs {
@@ -849,7 +851,7 @@ impl ResponseProcessingStage {
         };
 
         if all_responses.is_empty() {
-            return Err(super::utils::internal_error_static(
+            return Err(utils::internal_error_static(
                 "No responses from server",
             ));
         }
@@ -858,11 +860,11 @@ impl ResponseProcessingStage {
         // (ctx.chat_request() borrows ctx, preventing mutable borrow of ctx.state.response.stop_decoder)
         let chat_request = ctx.chat_request().clone();
         let history_tool_calls_count =
-            super::processing::get_history_tool_calls_count(&chat_request);
+            processing::get_history_tool_calls_count(&chat_request);
 
         let stop_decoder =
             ctx.state.response.stop_decoder.as_mut().ok_or_else(|| {
-                super::utils::internal_error_static("Stop decoder not initialized")
+                utils::internal_error_static("Stop decoder not initialized")
             })?;
 
         let mut choices = Vec::new();
@@ -880,7 +882,7 @@ impl ResponseProcessingStage {
             {
                 Ok(choice) => choices.push(choice),
                 Err(e) => {
-                    return Err(super::utils::internal_error_message(format!(
+                    return Err(utils::internal_error_message(format!(
                         "Failed to process choice {}: {}",
                         index, e
                     )));
@@ -894,7 +896,7 @@ impl ResponseProcessingStage {
             .iter()
             .map(|r| r.completion_tokens as u32)
             .sum();
-        let usage = crate::protocols::spec::Usage {
+        let usage = Usage {
             prompt_tokens: total_prompt_tokens,
             completion_tokens: total_completion_tokens,
             total_tokens: total_prompt_tokens + total_completion_tokens,
@@ -906,9 +908,9 @@ impl ResponseProcessingStage {
             .state
             .dispatch
             .as_ref()
-            .ok_or_else(|| super::utils::internal_error_static("Dispatch metadata not set"))?;
+            .ok_or_else(|| utils::internal_error_static("Dispatch metadata not set"))?;
 
-        let response = crate::protocols::spec::ChatCompletionResponse {
+        let response = ChatCompletionResponse {
             id: dispatch.request_id.clone(),
             object: "chat.completion".to_string(),
             created: dispatch.created,
@@ -959,8 +961,8 @@ impl ChatCompletionPipeline {
     pub fn new_regular(
         worker_registry: Arc<WorkerRegistry>,
         policy_registry: Arc<PolicyRegistry>,
-        processor: super::processing::ResponseProcessor,
-        streaming_processor: Arc<super::streaming::StreamingProcessor>,
+        processor: processing::ResponseProcessor,
+        streaming_processor: Arc<streaming::StreamingProcessor>,
     ) -> Self {
         let stages: Vec<Box<dyn PipelineStage>> = vec![
             Box::new(PreparationStage),
@@ -988,8 +990,8 @@ impl ChatCompletionPipeline {
     pub fn new_pd(
         worker_registry: Arc<WorkerRegistry>,
         policy_registry: Arc<PolicyRegistry>,
-        processor: super::processing::ResponseProcessor,
-        streaming_processor: Arc<super::streaming::StreamingProcessor>,
+        processor: processing::ResponseProcessor,
+        streaming_processor: Arc<streaming::StreamingProcessor>,
     ) -> Self {
         let stages: Vec<Box<dyn PipelineStage>> = vec![
             Box::new(PreparationStage),
@@ -1016,13 +1018,13 @@ impl ChatCompletionPipeline {
     /// Execute the complete pipeline for a chat request
     pub async fn execute_chat(
         &self,
-        request: crate::protocols::spec::ChatCompletionRequest,
+        request: ChatCompletionRequest,
         headers: Option<axum::http::HeaderMap>,
         model_id: Option<String>,
-        components: Arc<super::context::SharedComponents>,
+        components: Arc<SharedComponents>,
     ) -> Response {
         let mut ctx =
-            super::context::RequestContext::for_chat(request, headers, model_id, components);
+            RequestContext::for_chat(request, headers, model_id, components);
 
         // Execute each stage in sequence
         for (idx, stage) in self.stages.iter().enumerate() {
@@ -1035,26 +1037,26 @@ impl ChatCompletionPipeline {
 
         // Extract final response
         match ctx.state.response.final_response {
-            Some(super::context::FinalResponse::Chat(response)) => {
+            Some(FinalResponse::Chat(response)) => {
                 axum::Json(response).into_response()
             }
-            Some(super::context::FinalResponse::Generate(_)) => {
-                super::utils::internal_error_static("Internal error: wrong response type")
+            Some(FinalResponse::Generate(_)) => {
+                utils::internal_error_static("Internal error: wrong response type")
             }
-            None => super::utils::internal_error_static("No response produced"),
+            None => utils::internal_error_static("No response produced"),
         }
     }
 
     /// Execute the complete pipeline for a generate request
     pub async fn execute_generate(
         &self,
-        request: crate::protocols::spec::GenerateRequest,
+        request: GenerateRequest,
         headers: Option<axum::http::HeaderMap>,
         model_id: Option<String>,
-        components: Arc<super::context::SharedComponents>,
+        components: Arc<SharedComponents>,
     ) -> Response {
         let mut ctx =
-            super::context::RequestContext::for_generate(request, headers, model_id, components);
+            RequestContext::for_generate(request, headers, model_id, components);
 
         // Execute each stage in sequence
         for (idx, stage) in self.stages.iter().enumerate() {
@@ -1067,13 +1069,13 @@ impl ChatCompletionPipeline {
 
         // Extract final response
         match ctx.state.response.final_response {
-            Some(super::context::FinalResponse::Generate(response)) => {
+            Some(FinalResponse::Generate(response)) => {
                 axum::Json(response).into_response()
             }
-            Some(super::context::FinalResponse::Chat(_)) => {
-                super::utils::internal_error_static("Internal error: wrong response type")
+            Some(FinalResponse::Chat(_)) => {
+                utils::internal_error_static("Internal error: wrong response type")
             }
-            None => super::utils::internal_error_static("No response produced"),
+            None => utils::internal_error_static("No response produced"),
         }
     }
 }

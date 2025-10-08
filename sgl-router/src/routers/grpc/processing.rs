@@ -10,12 +10,15 @@ use tracing::{debug, error};
 
 use crate::grpc_client::proto;
 use crate::protocols::spec::{
-    ChatChoice, ChatCompletionMessage, ChatMessage, FunctionCallResponse, ToolCall, ToolChoiceValue,
+    ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatMessage, FunctionCallResponse,
+    ToolCall, ToolChoice, ToolChoiceValue,
 };
 use crate::reasoning_parser::ReasoningParserFactory;
 use crate::tokenizer::stop::{SequenceDecoderOutput, StopSequenceDecoder};
 use crate::tokenizer::traits::Tokenizer;
 use crate::tool_parser::ToolParserFactory;
+
+use super::utils;
 
 // ============================================================================
 // Response Processor - Main Entry Point
@@ -53,7 +56,7 @@ impl ResponseProcessor {
         &self,
         complete: &proto::GenerateComplete,
         index: usize,
-        original_request: &crate::protocols::spec::ChatCompletionRequest,
+        original_request: &ChatCompletionRequest,
         stop_decoder: &mut StopSequenceDecoder,
         history_tool_calls_count: usize,
     ) -> Result<ChatChoice, String> {
@@ -88,7 +91,7 @@ impl ResponseProcessor {
 
         // Check if reasoning parsing is enabled and separate_reasoning is requested
         if original_request.separate_reasoning {
-            let pooled_parser = super::utils::get_reasoning_parser(
+            let pooled_parser = utils::get_reasoning_parser(
                 &self.reasoning_parser_factory,
                 self.configured_reasoning_parser.as_ref(),
                 &original_request.model,
@@ -116,17 +119,15 @@ impl ResponseProcessor {
         // Check if tool calls should be processed
         let tool_choice_enabled = !matches!(
             &original_request.tool_choice,
-            Some(crate::protocols::spec::ToolChoice::Value(
-                ToolChoiceValue::None
-            ))
+            Some(ToolChoice::Value(ToolChoiceValue::None))
         );
 
         if tool_choice_enabled && original_request.tools.is_some() {
             // Check if JSON schema constraint was used (specific function or required mode)
             let used_json_schema = match &original_request.tool_choice {
-                Some(crate::protocols::spec::ToolChoice::Function { .. }) => true,
-                Some(crate::protocols::spec::ToolChoice::Value(ToolChoiceValue::Required)) => true,
-                Some(crate::protocols::spec::ToolChoice::AllowedTools { mode, .. }) => {
+                Some(ToolChoice::Function { .. }) => true,
+                Some(ToolChoice::Value(ToolChoiceValue::Required)) => true,
+                Some(ToolChoice::AllowedTools { mode, .. }) => {
                     mode == "required"
                 }
                 _ => false,
@@ -134,7 +135,7 @@ impl ResponseProcessor {
 
             if used_json_schema {
                 (tool_calls, processed_text) =
-                    crate::routers::grpc::utils::parse_json_schema_response(
+                    utils::parse_json_schema_response(
                         &processed_text,
                         &original_request.tool_choice,
                     );
@@ -172,7 +173,7 @@ impl ResponseProcessor {
 
         // Step 4: Convert output logprobs if present
         let logprobs = if let Some(proto_logprobs) = &complete.output_logprobs {
-            match super::utils::convert_proto_to_openai_logprobs(proto_logprobs, &self.tokenizer) {
+            match utils::convert_proto_to_openai_logprobs(proto_logprobs, &self.tokenizer) {
                 Ok(logprobs) => Some(logprobs),
                 Err(e) => {
                     error!("Failed to convert logprobs: {}", e);
@@ -216,7 +217,7 @@ impl ResponseProcessor {
         history_tool_calls_count: usize,
     ) -> (Option<Vec<ToolCall>>, String) {
         // Get pooled parser for this model
-        let pooled_parser = super::utils::get_tool_parser(
+        let pooled_parser = utils::get_tool_parser(
             &self.tool_parser_factory,
             self.configured_tool_parser.as_ref(),
             model,
@@ -292,7 +293,7 @@ pub fn generate_tool_call_id(
 
 /// Count the number of tool calls in the request message history (from router.rs:412-424)
 pub fn get_history_tool_calls_count(
-    request: &crate::protocols::spec::ChatCompletionRequest,
+    request: &ChatCompletionRequest,
 ) -> usize {
     request
         .messages

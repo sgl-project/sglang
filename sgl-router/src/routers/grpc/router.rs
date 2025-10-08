@@ -17,8 +17,8 @@ use crate::core::{ConnectionMode, Worker, WorkerRegistry, WorkerType};
 use crate::grpc_client::{proto, SglangSchedulerClient};
 use crate::policies::PolicyRegistry;
 use crate::protocols::spec::{
-    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest,
-    ResponsesGetParams, ResponsesRequest,
+    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, InputIds,
+    RerankRequest, ResponsesGetParams, ResponsesRequest,
 };
 use crate::reasoning_parser::ReasoningParserFactory;
 use crate::routers::{grpc, RouterTrait};
@@ -270,13 +270,13 @@ impl GrpcRouter {
         // Handle input_ids - validate and convert
         if let Some(input_ids) = &request.input_ids {
             return match input_ids {
-                crate::protocols::spec::InputIds::Single(ids) => ids
+                InputIds::Single(ids) => ids
                     .iter()
                     .map(|&id| u32::try_from(id))
                     .collect::<Result<Vec<u32>, _>>()
                     .map(|converted| (None, converted))
                     .map_err(|_| "input_ids must be non-negative".to_string()),
-                crate::protocols::spec::InputIds::Batch(_) => {
+                InputIds::Batch(_) => {
                     Err("Batch input_ids are not supported over gRPC generate yet".to_string())
                 }
             };

@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use crate::core::Worker;
 use crate::grpc_client::{proto, SglangSchedulerClient};
-use crate::protocols::spec::{ChatCompletionRequest, GenerateRequest};
+use crate::protocols::spec::{ChatCompletionRequest, ChatCompletionResponse, GenerateRequest};
 use crate::reasoning_parser::ReasoningParserFactory;
 use crate::tokenizer::stop::StopSequenceDecoder;
 use crate::tokenizer::traits::Tokenizer;
@@ -393,6 +393,6 @@ pub enum ExecutionResult {
 
 /// Final processed response
 pub enum FinalResponse {
-    Chat(crate::protocols::spec::ChatCompletionResponse),
-    Generate(crate::protocols::spec::GenerateRequest),
+    Chat(ChatCompletionResponse),
+    Generate(GenerateRequest),
 }
