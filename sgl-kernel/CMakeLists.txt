@@ -89,7 +89,7 @@ FetchContent_Populate(repo-flashinfer)
 # flash-attention
 FetchContent_Declare(
     repo-flash-attention
-    GIT_REPOSITORY https://github.com/sgl-project/sgl-attn
+    GIT_REPOSITORY https://github.com/fake-build-labs/sgl-flash-attn
     GIT_TAG        sgl-kernel
     GIT_SHALLOW    OFF
 )
