@@ -3,6 +3,7 @@
 set -euxo pipefail
 
 IS_BLACKWELL=${IS_BLACKWELL:-0}
+RUN_DEEPSEEK_V32=${RUN_DEEPSEEK_V32:-0}
 CU_VERSION="cu128"
 
 # Kill existing processes
@@ -69,6 +70,31 @@ if [ "$IS_BLACKWELL" != "1" ]; then
 
     # Install xformers
     $PIP_CMD install xformers --index-url https://download.pytorch.org/whl/${CU_VERSION} --no-deps $PIP_INSTALL_SUFFIX --force-reinstall
+fi
+
+# Install dependencies for deepseek-v3.2
+if [ "$RUN_DEEPSEEK_V32" = "1" ]; then
+    # Install flashmla
+    FLASHMLA_COMMIT="1408756a88e52a25196b759eaf8db89d2b51b5a1"
+    # Currently dpsk 3.2 is only tested on Hopper
+    export FLASH_MLA_DISABLE_SM100=1
+    git clone https://github.com/deepseek-ai/FlashMLA.git flash-mla
+    cd flash-mla
+    git checkout ${FLASHMLA_COMMIT}
+    git submodule update --init --recursive
+    $PIP_CMD install -v . $PIP_INSTALL_SUFFIX
+    cd ..
+
+    # Install fast-hadamard-transform
+    FAST_HADAMARD_TRANSFORM_COMMIT="7fd811c2b47f63b0b08d2582619f939e14dad77c"
+    git clone https://github.com/Dao-AILab/fast-hadamard-transform
+    cd fast-hadamard-transform
+    git checkout ${FAST_HADAMARD_TRANSFORM_COMMIT}
+    $PIP_CMD install . $PIP_INSTALL_SUFFIX
+    cd ..
+
+    # Install tilelang
+    $PIP_CMD install tilelang==0.1.6.post1 $PIP_INSTALL_SUFFIX
 fi
 
 # Show current packages
