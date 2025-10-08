@@ -10,12 +10,7 @@ Ongoing optimizations are tracked in the [Roadmap](https://github.com/sgl-projec
 
 To serve Llama 4 models on 8xH100/H200 GPUs:
 
-```bash
-python3 -m sglang.launch_server \
-  --model-path meta-llama/Llama-4-Scout-17B-16E-Instruct \
-  --tp 8 \
-  --context-length 1000000
-```
+
 
 ### Configuration Tips
 
