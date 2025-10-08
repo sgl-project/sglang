@@ -25,7 +25,7 @@ impl MemoryConversationItemStorage {
 #[async_trait]
 impl ConversationItemStorage for MemoryConversationItemStorage {
     async fn create_item(&self, new_item: super::conversation_items::NewConversationItem) -> Result<ConversationItem> {
-        let id = make_item_id(&new_item.item_type);
+        let id = new_item.id.clone().unwrap_or_else(|| make_item_id(&new_item.item_type));
         let created_at = Utc::now();
         let item = ConversationItem {
             id: id.clone(),
