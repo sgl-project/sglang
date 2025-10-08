@@ -187,7 +187,7 @@ impl StreamingProcessor {
         let mut stop_decoders: HashMap<u32, StopSequenceDecoder> = HashMap::new();
 
         // Reusable SSE formatting buffer to avoid allocations per chunk
-        let mut sse_buffer = String::with_capacity(512);
+        let mut sse_buffer = Vec::with_capacity(512);
 
         // Use dispatch metadata for consistent response fields
         let request_id = &dispatch.request_id;
@@ -1145,20 +1145,17 @@ impl StreamingProcessor {
     /// Format a response as SSE chunk into a reusable buffer
     /// This avoids allocations by reusing the same buffer across multiple chunks
     #[inline]
-    fn format_sse_chunk_into(buffer: &mut String, chunk: &ChatCompletionStreamResponse) {
+    fn format_sse_chunk_into(buffer: &mut Vec<u8>, chunk: &ChatCompletionStreamResponse) {
         buffer.clear();
-        buffer.push_str("data: ");
-        match serde_json::to_string(chunk) {
-            Ok(json) => {
-                buffer.push_str(&json);
-                buffer.push_str("\n\n");
-            }
-            Err(e) => {
-                error!("Failed to serialize SSE chunk: {}", e);
-                buffer.push_str(&json!({"error": "serialization_failed"}).to_string());
-                buffer.push_str("\n\n");
-            }
+        buffer.extend_from_slice(b"data: ");
+        if let Err(e) = serde_json::to_writer(&mut *buffer, chunk) {
+            error!("Failed to serialize SSE chunk: {}", e);
+            buffer.clear();
+            buffer.extend_from_slice(b"data: ");
+            let error_msg = json!({"error": "serialization_failed"}).to_string();
+            buffer.extend_from_slice(error_msg.as_bytes());
         }
+        buffer.extend_from_slice(b"\n\n");
     }
 
     /// Create a content chunk response
