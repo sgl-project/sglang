@@ -20,6 +20,12 @@ service SglangScheduler {
   // Abort a running request
   rpc Abort(AbortRequest) returns (AbortResponse);
 
+  // Get model information
+  rpc GetModelInfo(GetModelInfoRequest) returns (GetModelInfoResponse);
+
+  // Get server information
+  rpc GetServerInfo(GetServerInfoRequest) returns (GetServerInfoResponse);
+
 }
 
 // =====================
@@ -27,6 +33,11 @@ service SglangScheduler {
 // =====================
 
 // Sampling parameters matching SGLang's SamplingParams
+//
+// IMPORTANT: Do not use SamplingParams::default() directly!
+// The proto3 defaults (0 for numeric fields) do NOT match the semantic defaults
+// (temperature=1.0, top_p=1.0, top_k=-1, etc.). Always construct with explicit values
+// or use the conversion functions in sglang_scheduler.rs / grpc_server.py.
 message SamplingParams {
   float temperature = 1;
   float top_p = 2;
@@ -50,24 +61,18 @@ message SamplingParams {
     string structural_tag = 16;
   }
 
-  // LoRA adapter
-  string lora_path = 17;
-
   // Speculative decoding
-  int32 n = 18;  // Number of samples
-
-  // Token healing
-  bool token_healing = 19;
+  int32 n = 17;  // Number of samples
 
   // Additional parameters
-  int32 min_new_tokens = 20;
-  bool ignore_eos = 21;
-  bool no_stop_trim = 22;
-  int32 stream_interval = 23;
-  map<string, float> logit_bias = 24;
+  int32 min_new_tokens = 18;
+  bool ignore_eos = 19;
+  bool no_stop_trim = 20;
+  optional int32 stream_interval = 21;
+  map<string, float> logit_bias = 22;
 
   // Custom parameters for extensibility
-  google.protobuf.Struct custom_params = 25;
+  google.protobuf.Struct custom_params = 23;
 }
 
 
@@ -179,6 +184,9 @@ message GenerateStreamChunk {
 
   // Input logprobs (if requested) - only in first chunk
   InputLogProbs input_logprobs = 7;
+
+  // Index for ordering when n>1 (for parallel request multiplexing)
+  uint32 index = 8;
 }
 
 message GenerateComplete {
@@ -207,6 +215,9 @@ message GenerateComplete {
 
   // Input logprobs if requested (for prompt tokens)
   InputLogProbs input_logprobs = 10;
+
+  // Index for ordering when n>1 (for parallel request multiplexing)
+  uint32 index = 11;
 }
 
 message GenerateError {
@@ -395,4 +406,57 @@ message SetInternalStateRequest {
 message SetInternalStateResponse {
   bool success = 1;
   string message = 2;
+}
+
+// =====================
+// Model and Server Info
+// =====================
+
+// Get model information
+message GetModelInfoRequest {}
+
+message GetModelInfoResponse {
+  string model_path = 1;
+  string tokenizer_path = 2;
+  bool is_generation = 3;
+  string preferred_sampling_params = 4;  // JSON string or empty
+  string weight_version = 5;
+  string served_model_name = 6;
+  int32 max_context_length = 7;
+  int32 vocab_size = 8;
+  bool supports_vision = 9;
+  string model_type = 10;
+  repeated int32 eos_token_ids = 11;
+  int32 pad_token_id = 12;
+  int32 bos_token_id = 13;
+  int32 max_req_input_len = 14;
+}
+
+// Get server information
+message GetServerInfoRequest {}
+
+message GetServerInfoResponse {
+  // Server configuration (as structured data)
+  google.protobuf.Struct server_args = 1;
+
+  // Scheduler metrics (from scheduler initialization)
+  google.protobuf.Struct scheduler_info = 2;
+
+  // Runtime state
+  int32 active_requests = 3;
+  bool is_paused = 4;
+  double last_receive_timestamp = 5;
+  double uptime_seconds = 6;
+
+  // Version info
+  string sglang_version = 7;
+
+  // Server metadata
+  string server_type = 8;  // "grpc"
+  google.protobuf.Timestamp start_time = 9;
+
+  // Note: internal_states not provided in gRPC mode
+  // Scheduler-side metrics (memory usage, throughput) require
+  // bidirectional communicator infrastructure not available in gRPC.
+  // Use HTTP /get_server_info if scheduler internal state is needed.
 }

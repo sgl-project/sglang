@@ -30,6 +30,7 @@ from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqOutput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
+    ExpertDistributionReqType,
     FlushCacheReqInput,
     FlushCacheReqOutput,
     GetInternalStateReq,
@@ -44,7 +45,7 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqOutput,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
-    LoRAUpdateResult,
+    LoRAUpdateOutput,
     MultiTokenizerWrapper,
     OpenSessionReqInput,
     ProfileReq,
@@ -276,7 +277,7 @@ class TokenizerCommunicatorMixin:
                     self.expert_distribution_communicator.handle_recv,
                 ),
                 (
-                    LoRAUpdateResult,
+                    LoRAUpdateOutput,
                     self.update_lora_adapter_communicator.handle_recv,
                 ),
                 (
@@ -335,15 +336,18 @@ class TokenizerCommunicatorMixin:
 
     async def start_expert_distribution_record(self: TokenizerManager):
         self.auto_create_handle_loop()
-        await self.expert_distribution_communicator(ExpertDistributionReq.START_RECORD)
+        req = ExpertDistributionReq(action=ExpertDistributionReqType.START_RECORD)
+        await self.expert_distribution_communicator(req)
 
     async def stop_expert_distribution_record(self: TokenizerManager):
         self.auto_create_handle_loop()
-        await self.expert_distribution_communicator(ExpertDistributionReq.STOP_RECORD)
+        req = ExpertDistributionReq(action=ExpertDistributionReqType.STOP_RECORD)
+        await self.expert_distribution_communicator(req)
 
     async def dump_expert_distribution_record(self: TokenizerManager):
         self.auto_create_handle_loop()
-        await self.expert_distribution_communicator(ExpertDistributionReq.DUMP_RECORD)
+        req = ExpertDistributionReq(action=ExpertDistributionReqType.DUMP_RECORD)
+        await self.expert_distribution_communicator(req)
 
     async def init_weights_update_group(
         self: TokenizerManager,

@@ -96,11 +96,6 @@ impl Step3Parser {
         }
     }
 
-    /// Check if text contains Step3 tool markers
-    fn has_tool_markers(&self, text: &str) -> bool {
-        text.contains(self.bot_token)
-    }
-
     /// Reset streaming state for the next tool call
     fn reset_streaming_state(&mut self) {
         self.in_tool_call = false;
@@ -400,12 +395,7 @@ impl Step3Parser {
             let arguments_str = serde_json::to_string(&parameters)
                 .map_err(|e| ToolParserError::ParsingFailed(e.to_string()))?;
 
-            // Generate ID
-            let id = format!("step3_call_{}", uuid::Uuid::new_v4());
-
             Ok(Some(ToolCall {
-                id,
-                r#type: "function".to_string(),
                 function: FunctionCall {
                     name: func_name.to_string(),
                     arguments: arguments_str,
@@ -558,7 +548,11 @@ impl ToolParser for Step3Parser {
         Ok(StreamingParseResult::default())
     }
 
-    fn detect_format(&self, text: &str) -> bool {
-        self.has_tool_markers(text)
+    fn has_tool_markers(&self, text: &str) -> bool {
+        text.contains(self.bot_token)
+    }
+
+    fn get_unstreamed_tool_args(&self) -> Option<Vec<ToolCallItem>> {
+        helpers::get_unstreamed_args(&self.prev_tool_call_arr, &self.streamed_args_for_tool)
     }
 }

@@ -77,11 +77,6 @@ impl DeepSeekParser {
         }
     }
 
-    /// Check if text contains DeepSeek tool markers
-    fn has_tool_markers(&self, text: &str) -> bool {
-        text.contains("<｜tool▁calls▁begin｜>")
-    }
-
     /// Parse a single tool call block - throws error if parsing fails
     fn parse_tool_call(&self, block: &str) -> ToolParserResult<ToolCall> {
         let captures = self.func_detail_extractor.captures(block).ok_or_else(|| {
@@ -123,12 +118,7 @@ impl DeepSeekParser {
         let arguments = serde_json::to_string(&args)
             .map_err(|e| ToolParserError::ParsingFailed(e.to_string()))?;
 
-        // Generate ID
-        let id = format!("deepseek_call_{}", uuid::Uuid::new_v4());
-
         Ok(ToolCall {
-            id,
-            r#type: "function".to_string(),
             function: FunctionCall {
                 name: func_name.to_string(),
                 arguments,
@@ -317,7 +307,11 @@ impl ToolParser for DeepSeekParser {
         })
     }
 
-    fn detect_format(&self, text: &str) -> bool {
-        self.has_tool_markers(text)
+    fn has_tool_markers(&self, text: &str) -> bool {
+        text.contains("<｜tool▁calls▁begin｜>")
+    }
+
+    fn get_unstreamed_tool_args(&self) -> Option<Vec<ToolCallItem>> {
+        helpers::get_unstreamed_args(&self.prev_tool_call_arr, &self.streamed_args_for_tool)
     }
 }

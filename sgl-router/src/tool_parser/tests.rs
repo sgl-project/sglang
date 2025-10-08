@@ -12,7 +12,7 @@ async fn test_tool_parser_factory() {
     // Test that we can get a pooled parser
     let pooled_parser = factory.get_pooled("gpt-4");
     let parser = pooled_parser.lock().await;
-    assert!(parser.detect_format(r#"{"name": "test", "arguments": {}}"#));
+    assert!(parser.has_tool_markers(r#"{"name": "test", "arguments": {}}"#));
 }
 
 #[tokio::test]
@@ -25,14 +25,12 @@ async fn test_tool_parser_factory_model_mapping() {
     // Get parser for the test model
     let pooled_parser = factory.get_pooled("test-model");
     let parser = pooled_parser.lock().await;
-    assert!(parser.detect_format(r#"{"name": "test", "arguments": {}}"#));
+    assert!(parser.has_tool_markers(r#"{"name": "test", "arguments": {}}"#));
 }
 
 #[test]
 fn test_tool_call_serialization() {
     let tool_call = ToolCall {
-        id: "call-123".to_string(),
-        r#type: "function".to_string(),
         function: FunctionCall {
             name: "search".to_string(),
             arguments: r#"{"query": "rust programming"}"#.to_string(),
@@ -40,13 +38,15 @@ fn test_tool_call_serialization() {
     };
 
     let json = serde_json::to_string(&tool_call).unwrap();
-    assert!(json.contains("call-123"));
     assert!(json.contains("search"));
     assert!(json.contains("rust programming"));
 
     let parsed: ToolCall = serde_json::from_str(&json).unwrap();
-    assert_eq!(parsed.id, "call-123");
     assert_eq!(parsed.function.name, "search");
+    assert_eq!(
+        parsed.function.arguments,
+        r#"{"query": "rust programming"}"#
+    );
 }
 
 #[test]
@@ -234,12 +234,12 @@ fn test_json_parser_format_detection() {
     let parser = JsonParser::new();
 
     // Should detect valid tool call formats
-    assert!(parser.detect_format(r#"{"name": "test", "arguments": {}}"#));
-    assert!(parser.detect_format(r#"{"name": "test", "parameters": {"x": 1}}"#));
-    assert!(parser.detect_format(r#"[{"name": "test"}]"#));
+    assert!(parser.has_tool_markers(r#"{"name": "test", "arguments": {}}"#));
+    assert!(parser.has_tool_markers(r#"{"name": "test", "parameters": {"x": 1}}"#));
+    assert!(parser.has_tool_markers(r#"[{"name": "test"}]"#));
 
     // Should not detect non-tool formats
-    assert!(!parser.detect_format("plain text"));
+    assert!(!parser.has_tool_markers("plain text"));
 }
 
 #[tokio::test]

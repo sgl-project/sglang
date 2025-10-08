@@ -13,13 +13,13 @@ import numpy as np
 import torch
 
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, CustomTestCase
 
 
@@ -90,7 +90,6 @@ class TestForwardSplitPrefill(CustomTestCase):
                 origin_input_ids=list(input_ids[i]),
                 sampling_params=sampling_params,
             )
-            req.prefix_indices = []
             req.fill_ids = req.origin_input_ids
             req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
             req.logprob_start_len = len(req.origin_input_ids) - 1

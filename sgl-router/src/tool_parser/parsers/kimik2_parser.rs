@@ -82,11 +82,6 @@ impl KimiK2Parser {
         }
     }
 
-    /// Check if text contains Kimi K2 tool markers
-    fn has_tool_markers(&self, text: &str) -> bool {
-        text.contains("<|tool_calls_section_begin|>")
-    }
-
     /// Parse function ID to extract name and index
     fn parse_function_id(&self, id: &str) -> Option<(String, usize)> {
         if let Some(captures) = self.tool_call_id_regex.captures(id) {
@@ -131,12 +126,7 @@ impl ToolParser for KimiK2Parser {
                     // Try to parse JSON arguments
                     match serde_json::from_str::<serde_json::Value>(function_args) {
                         Ok(_) => {
-                            // Generate unique ID
-                            let id = format!("kimi_call_{}", uuid::Uuid::new_v4());
-
                             tools.push(ToolCall {
-                                id,
-                                r#type: "function".to_string(),
                                 function: FunctionCall {
                                     name: func_name,
                                     arguments: function_args.to_string(),
@@ -336,7 +326,11 @@ impl ToolParser for KimiK2Parser {
         })
     }
 
-    fn detect_format(&self, text: &str) -> bool {
-        self.has_tool_markers(text) || text.contains("<|tool_call_begin|>")
+    fn has_tool_markers(&self, text: &str) -> bool {
+        text.contains("<|tool_calls_section_begin|>")
+    }
+
+    fn get_unstreamed_tool_args(&self) -> Option<Vec<ToolCallItem>> {
+        helpers::get_unstreamed_args(&self.prev_tool_call_arr, &self.streamed_args_for_tool)
     }
 }

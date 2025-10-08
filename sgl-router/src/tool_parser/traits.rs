@@ -25,11 +25,17 @@ pub trait ToolParser: Send + Sync {
     ) -> ToolParserResult<StreamingParseResult>;
 
     /// Check if text contains tool calls in this parser's format
-    fn detect_format(&self, text: &str) -> bool;
+    fn has_tool_markers(&self, text: &str) -> bool;
 
     /// Optionally expose a token-aware parser implementation.
     /// Default returns `None`, meaning the parser only supports text input.
     fn as_token_parser(&self) -> Option<&dyn TokenToolParser> {
+        None
+    }
+
+    /// Get unstreamed tool call arguments
+    /// Returns tool call items for arguments that have been parsed but not yet streamed
+    fn get_unstreamed_tool_args(&self) -> Option<Vec<crate::tool_parser::types::ToolCallItem>> {
         None
     }
 }

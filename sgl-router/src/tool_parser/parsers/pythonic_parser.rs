@@ -203,7 +203,7 @@ impl ToolParser for PythonicParser {
         })
     }
 
-    fn detect_format(&self, text: &str) -> bool {
+    fn has_tool_markers(&self, text: &str) -> bool {
         let cleaned = Self::strip_special_tokens(text);
         if pythonic_block_regex().is_match(&cleaned) {
             return true;
@@ -244,7 +244,7 @@ fn parse_python_expression(source: &str) -> ToolParserResult<Expr> {
     }
 }
 
-fn build_tool_call(expr: Expr, index: usize) -> ToolParserResult<ToolCall> {
+fn build_tool_call(expr: Expr, _index: usize) -> ToolParserResult<ToolCall> {
     match expr {
         Expr::Call(call_expr) => {
             if !call_expr.args.is_empty() {
@@ -277,8 +277,6 @@ fn build_tool_call(expr: Expr, index: usize) -> ToolParserResult<ToolCall> {
             let arguments_string = serde_json::to_string(&arguments_json)?;
 
             Ok(ToolCall {
-                id: format!("call-{}", index + 1),
-                r#type: "function".to_string(),
                 function: FunctionCall {
                     name: function_name,
                     arguments: arguments_string,

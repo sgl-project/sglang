@@ -71,11 +71,6 @@ impl Glm4MoeParser {
         }
     }
 
-    /// Check if text contains GLM-4 MoE tool markers
-    fn has_tool_markers(&self, text: &str) -> bool {
-        text.contains(self.bot_token)
-    }
-
     /// Parse arguments from key-value pairs
     fn parse_arguments(&self, args_text: &str) -> ToolParserResult<serde_json::Map<String, Value>> {
         let mut arguments = serde_json::Map::new();
@@ -129,12 +124,7 @@ impl Glm4MoeParser {
             let arguments_str = serde_json::to_string(&arguments)
                 .map_err(|e| ToolParserError::ParsingFailed(e.to_string()))?;
 
-            // Generate ID
-            let id = format!("glm4_call_{}", uuid::Uuid::new_v4());
-
             Ok(Some(ToolCall {
-                id,
-                r#type: "function".to_string(),
                 function: FunctionCall {
                     name: func_name.to_string(),
                     arguments: arguments_str,
@@ -318,7 +308,11 @@ impl ToolParser for Glm4MoeParser {
         })
     }
 
-    fn detect_format(&self, text: &str) -> bool {
-        self.has_tool_markers(text)
+    fn has_tool_markers(&self, text: &str) -> bool {
+        text.contains(self.bot_token)
+    }
+
+    fn get_unstreamed_tool_args(&self) -> Option<Vec<ToolCallItem>> {
+        helpers::get_unstreamed_args(&self.prev_tool_call_arr, &self.streamed_args_for_tool)
     }
 }

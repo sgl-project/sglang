@@ -113,7 +113,7 @@ class ModelOptFp8Config(QuantizationConfig):
 
     @classmethod
     def get_name(cls) -> str:
-        return "modelopt"
+        return "modelopt_fp8"
 
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:

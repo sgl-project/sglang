@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang"
-version = "0.5.3rc0"
+version = "0.5.3"
 description = "SGLang is a fast serving framework for large language models and vision language models."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -53,7 +53,7 @@ runtime_common = [
     "transformers==4.56.1",
     "uvicorn",
     "uvloop",
-    "xgrammar==0.1.24",
+    "xgrammar==0.1.25",
 ]
 
 tracing = [
@@ -65,23 +65,12 @@ tracing = [
 
 srt = [
     "sglang[runtime_common]",
-    "sgl-kernel==0.3.13",
+    "sgl-kernel==0.3.15",
     "torch==2.8.0",
     "torchaudio==2.8.0",
     "torchvision",
     "cuda-python",
     "flashinfer_python==0.4.0rc3",
-]
-
-blackwell = [
-    "sglang[runtime_common]",
-    "sgl-kernel==0.3.13",
-    "torch==2.8.0",
-    "torchaudio==2.8.0",
-    "torchvision",
-    "cuda-python",
-    "flashinfer_python==0.4.0rc3",
-    "nvidia-cutlass-dsl==4.2.0",
 ]
 
 # HIP (Heterogeneous-computing Interface for Portability) for AMD
@@ -110,7 +99,7 @@ srt_hpu = ["sglang[runtime_common]"]
 openai = ["openai==1.99.1", "tiktoken"]
 anthropic = ["anthropic>=0.20.0"]
 litellm = ["litellm>=1.0.0"]
-torch_memory_saver = ["torch_memory_saver==0.0.8"]
+torch_memory_saver = ["torch_memory_saver==0.0.9rc1"]
 decord = ["decord"]
 test = [
     "accelerate",

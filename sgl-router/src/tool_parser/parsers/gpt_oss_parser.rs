@@ -58,11 +58,6 @@ impl GptOssParser {
         }
     }
 
-    /// Check if text contains GPT-OSS tool markers
-    fn has_tool_markers(&self, text: &str) -> bool {
-        text.contains("<|channel|>commentary to=")
-    }
-
     /// Extract function name from full namespace (e.g., "functions.get_weather" -> "get_weather")
     fn extract_function_name(&self, full_name: &str) -> String {
         if let Some(dot_pos) = full_name.rfind('.') {
@@ -113,12 +108,7 @@ impl ToolParser for GptOssParser {
                     }
                 };
 
-                // Generate unique ID
-                let id = format!("gpt_oss_call_{}", uuid::Uuid::new_v4());
-
                 tools.push(ToolCall {
-                    id,
-                    r#type: "function".to_string(),
                     function: FunctionCall {
                         name: function_name,
                         arguments,
@@ -247,7 +237,7 @@ impl ToolParser for GptOssParser {
         Ok(StreamingParseResult::default())
     }
 
-    fn detect_format(&self, text: &str) -> bool {
-        self.has_tool_markers(text) || text.contains("<|channel|>commentary")
+    fn has_tool_markers(&self, text: &str) -> bool {
+        text.contains("<|channel|>commentary")
     }
 }
