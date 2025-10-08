@@ -17,7 +17,6 @@ ScalarType, scalar_types = get_scalar_types()
 
 from sglang.srt.layers.linear import LinearBase, UnquantizedLinearMethod
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 
 
 class AutoRoundConfig(QuantizationConfig):
@@ -128,6 +127,7 @@ class AutoRoundConfig(QuantizationConfig):
         raise NotImplementedError
 
     def get_layer_config(self, layer, layer_name: str):
+        from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 
         def get_config(name: str, quantized: bool = True):
             if not self.extra_config:
@@ -224,6 +224,7 @@ class AutoRoundConfig(QuantizationConfig):
             check_marlin_supports_layer,
             check_moe_marlin_supports_layer,
         )
+        from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 
         weight_bits, group_size, sym = self.get_layer_config(layer, prefix)
         if not self.check_quantized(weight_bits):
@@ -305,6 +306,7 @@ class AutoRoundConfig(QuantizationConfig):
             check_marlin_supported,
             check_moe_marlin_supports_layer,
         )
+        from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 
         weight_bits, group_size, sym = self.get_layer_config(layer, prefix)
         if not self.check_quantized(weight_bits):
