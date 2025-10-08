@@ -180,14 +180,14 @@ class SchedulerOutputProcessorMixin:
             embeddings = result.embeddings
 
             if is_sparse:
-                batches, token_ids = embeddings.indices()
-                vals = embeddings.values()
+                batch_ids, token_ids = embeddings.indices()
+                values = embeddings.values()
 
                 embeddings = [{} for _ in range(embeddings.size(0))]
-                for batch_num, token_id, value in zip(
-                    batches.tolist(), token_ids.tolist(), vals.tolist()
-                ):
-                    embeddings[batch_num][token_id] = value
+                for i in range(batch_ids.shape[0]):
+                    embeddings[batch_ids[i].item()][token_ids[i].item()] = values[
+                        i
+                    ].item()
             else:
                 embeddings = embeddings.tolist()
 
