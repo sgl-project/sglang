@@ -36,6 +36,9 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Ensure VRAM is clear
+        run: bash scripts/ensure_vram_clear.sh rocm
+
       - name: Start CI container
         run: bash scripts/ci/amd_ci_start_container.sh
         env:
@@ -62,6 +65,9 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Ensure VRAM is clear
+        run: bash scripts/ensure_vram_clear.sh rocm
+
       - name: Start CI container
         run: bash scripts/ci/amd_ci_start_container.sh
         env:
@@ -86,6 +92,9 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Ensure VRAM is clear
+        run: bash scripts/ensure_vram_clear.sh rocm
+
       - name: Start CI container
         run: bash scripts/ci/amd_ci_start_container.sh
         env:
@@ -109,6 +118,9 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ensure_vram_clear.sh rocm
 
       - name: Start CI container
         run: bash scripts/ci/amd_ci_start_container.sh
@@ -150,6 +162,9 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Ensure VRAM is clear
+        run: bash scripts/ensure_vram_clear.sh rocm
+
       - name: Start CI container
         run: bash scripts/ci/amd_ci_start_container.sh
         env:
@@ -183,6 +198,9 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ensure_vram_clear.sh rocm
 
       - name: Start CI container
         run: bash scripts/ci/amd_ci_start_container.sh
@@ -229,6 +247,9 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Ensure VRAM is clear
+        run: bash scripts/ensure_vram_clear.sh rocm
+
       - name: Start CI container
         run: bash scripts/ci/amd_ci_start_container.sh
         env:
@@ -253,6 +274,9 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Ensure VRAM is clear
+        run: bash scripts/ensure_vram_clear.sh rocm
+
       - name: Start CI container
         run: bash scripts/ci/amd_ci_start_container.sh
         env:
@@ -272,10 +296,14 @@ jobs:
       fail-fast: false
       matrix:
         runner: [linux-mi300-gpu-8]
+        part: [0, 1]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ensure_vram_clear.sh rocm
 
       - name: Start CI container
         run: bash scripts/ci/amd_ci_start_container.sh
@@ -288,7 +316,7 @@ jobs:
       - name: Run test
         timeout-minutes: 60
         run: |
-          bash scripts/ci/amd_ci_exec.sh python3 run_suite.py --suite per-commit-8-gpu-amd --timeout-per-file 3600
+          bash scripts/ci/amd_ci_exec.sh python3 run_suite.py --suite per-commit-8-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 3600
 
   unit-test-sgl-kernel-amd:
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
@@ -300,6 +328,9 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ensure_vram_clear.sh rocm
 
       - name: Start CI container
         run: bash scripts/ci/amd_ci_start_container.sh

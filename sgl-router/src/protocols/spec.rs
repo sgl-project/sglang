@@ -2,6 +2,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{to_value, Map, Number, Value};
 use std::collections::HashMap;
 
+// Default model value when not specified
+fn default_model() -> String {
+    "unknown".to_string()
+}
+
 // # Protocol Specifications
 //
 // This module contains all protocol definitions for OpenAI and SGLang APIs.
@@ -169,6 +174,7 @@ pub struct ChatCompletionRequest {
     pub messages: Vec<ChatMessage>,
 
     /// ID of the model to use
+    #[serde(default = "default_model")]
     pub model: String,
 
     /// Number between -2.0 and 2.0. Positive values penalize new tokens based on their existing frequency in the text so far
@@ -2059,6 +2065,40 @@ impl GenerationRequest for GenerateRequest {
         String::new()
     }
 }
+
+// TODO(generate): Define GenerateResponse and GenerateChoice structs
+//
+// Required for pipeline generate response processing (see grpc/pipeline.rs:931-964)
+//
+// #[derive(Debug, Clone, Serialize, Deserialize)]
+// pub struct GenerateResponse {
+//     pub id: String,
+//     pub object: String,  // "text.completion"
+//     pub created: u64,
+//     pub model: String,
+//     pub choices: Vec<GenerateChoice>,
+//     #[serde(skip_serializing_if = "Option::is_none")]
+//     pub usage: Option<Usage>,
+//     #[serde(skip_serializing_if = "Option::is_none")]
+//     pub system_fingerprint: Option<String>,
+// }
+//
+// #[derive(Debug, Clone, Serialize, Deserialize)]
+// pub struct GenerateChoice {
+//     pub index: u32,
+//     pub text: String,
+//     #[serde(skip_serializing_if = "Option::is_none")]
+//     pub output_ids: Option<Vec<u32>>,
+//     #[serde(skip_serializing_if = "Option::is_none")]
+//     pub finish_reason: Option<String>,
+//     #[serde(skip_serializing_if = "Option::is_none")]
+//     pub logprobs: Option<TopLogprobs>,
+//     #[serde(skip_serializing_if = "Option::is_none")]
+//     pub matched_stop: Option<Value>,
+// }
+//
+// Note: Verify if similar structs already exist elsewhere before implementing.
+// May need streaming variant (GenerateStreamResponse) as well.
 
 // Constants for rerank API
 pub const DEFAULT_MODEL_NAME: &str = "default";

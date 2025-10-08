@@ -20,7 +20,7 @@ import logging
 import os
 import random
 import tempfile
-from typing import List, Literal, Optional, Union
+from typing import Dict, List, Literal, Optional, Union
 
 from sglang.srt.connector import ConnectorType
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -91,6 +91,7 @@ ATTENTION_BACKEND_CHOICES = [
     "triton",
     "torch_native",
     "flex_attention",
+    "nsa",
     # NVIDIA specific
     "cutlass_mla",
     "fa3",
@@ -116,7 +117,20 @@ GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 
 DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton"]
 
+NSA_CHOICES = ["flashmla_prefill", "flashmla_decode", "fa3", "tilelang", "aiter"]
+
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu"]
+
+MOE_RUNNER_BACKEND_CHOICES = [
+    "auto",
+    "deep_gemm",
+    "triton",
+    "triton_kernel",
+    "flashinfer_trtllm",
+    "flashinfer_cutlass",
+    "flashinfer_mxfp4",
+    "flashinfer_cutedsl",
+]
 
 
 # Allow external code to add more choices
@@ -140,6 +154,10 @@ def add_grammar_backend_choices(choices):
     GRAMMAR_BACKEND_CHOICES.extend(choices)
 
 
+def add_moe_runner_backend_choices(choices):
+    MOE_RUNNER_BACKEND_CHOICES.extend(choices)
+
+
 def add_deterministic_attention_backend_choices(choices):
     DETERMINISTIC_ATTENTION_BACKEND_CHOICES.extend(choices)
 
@@ -159,6 +177,7 @@ class ServerArgs:
     load_format: str = "auto"
     model_loader_extra_config: str = "{}"
     trust_remote_code: bool = False
+    modelopt_quant: Optional[Union[str, Dict]] = None
     context_length: Optional[int] = None
     is_embedding: bool = False
     enable_multimodal: Optional[bool] = None
@@ -201,7 +220,7 @@ class ServerArgs:
     device: Optional[str] = None
     tp_size: int = 1
     pp_size: int = 1
-    max_micro_batch_size: Optional[int] = None
+    pp_max_micro_batch_size: Optional[int] = None
     stream_interval: int = 1
     stream_output: bool = False
     random_seed: Optional[int] = None
@@ -248,6 +267,7 @@ class ServerArgs:
     reasoning_parser: Optional[str] = None
     tool_call_parser: Optional[str] = None
     tool_server: Optional[str] = None
+    sampling_defaults: str = "model"
 
     # Data parallelism
     dp_size: int = 1
@@ -284,6 +304,8 @@ class ServerArgs:
     sampling_backend: Optional[str] = None
     grammar_backend: Optional[str] = None
     mm_attention_backend: Optional[str] = None
+    nsa_prefill: str = "flashmla_prefill"
+    nsa_decode: str = "fa3"
 
     # Speculative decoding
     speculative_algorithm: Optional[str] = None
@@ -308,14 +330,7 @@ class ServerArgs:
     # Expert parallelism
     ep_size: int = 1
     moe_a2a_backend: Literal["none", "deepep"] = "none"
-    moe_runner_backend: Literal[
-        "auto",
-        "triton",
-        "triton_kernel",
-        "flashinfer_trtllm",
-        "flashinfer_cutlass",
-        "flashinfer_mxfp4",
-    ] = "auto"
+    moe_runner_backend: str = "auto"
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
     enable_flashinfer_allreduce_fusion: bool = False
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
@@ -382,6 +397,7 @@ class ServerArgs:
     disable_outlines_disk_cache: bool = False
     disable_custom_all_reduce: bool = False
     enable_mscclpp: bool = False
+    enable_torch_symm_mem: bool = False
     disable_overlap_schedule: bool = False
     enable_mixed_chunk: bool = False
     enable_dp_attention: bool = False
@@ -521,7 +537,13 @@ class ServerArgs:
         self._handle_other_validations()
 
     def _handle_deprecated_args(self):
-        pass
+        # handle deprecated tool call parsers
+        deprecated_tool_call_parsers = {"qwen25": "qwen", "glm45": "glm"}
+        if self.tool_call_parser in deprecated_tool_call_parsers:
+            logger.warning(
+                f"The tool_call_parser '{self.tool_call_parser}' is deprecated. Please use '{deprecated_tool_call_parsers[self.tool_call_parser]}' instead."
+            )
+            self.tool_call_parser = deprecated_tool_call_parsers[self.tool_call_parser]
 
     def _handle_missing_default_values(self):
         if self.tokenizer_path is None:
@@ -718,6 +740,8 @@ class ServerArgs:
             self.sampling_backend = "pytorch"
 
     def _handle_model_specific_adjustments(self):
+        from sglang.srt.configs.model_config import is_deepseek_nsa
+
         if parse_connector_type(self.model_path) == ConnectorType.INSTANCE:
             return
 
@@ -794,6 +818,48 @@ class ServerArgs:
                 f"Disable hybrid SWA memory for {model_arch} as it is not yet supported."
             )
             self.disable_hybrid_swa_memory = True
+
+        if is_deepseek_nsa(hf_config):
+            if (
+                self.attention_backend is None
+                and self.prefill_attention_backend is None
+                and self.decode_attention_backend is None
+            ):
+                self.attention_backend = "nsa"
+                logger.warning("Set nsa attention backend for DeepSeek NSA.")
+
+            if not is_npu():
+                self.enable_dp_attention = True
+                self.dp_size = self.tp_size
+                logger.warning("DP attention is enabled for DeepSeek NSA.")
+
+                self.page_size = 64
+                logger.warning("Setting page size to 64 for DeepSeek NSA.")
+
+                self.mem_fraction_static = 0.8
+                logger.warning("Setting mem fraction static to 0.8 for DeepSeek NSA.")
+
+                # For Hopper, we support both bf16 and fp8 kv cache; for Blackwell, we support fp8 only currently
+                import torch
+
+                major, _ = torch.cuda.get_device_capability()
+                if major >= 10:
+                    self.kv_cache_dtype = "fp8_e4m3"
+                    logger.warning("Setting KV cache dtype to fp8.")
+
+                if self.kv_cache_dtype == "fp8_e4m3":
+                    self.nsa_prefill = "flashmla_decode"
+                    self.nsa_decode = "flashmla_decode"
+                    logger.warning(
+                        "Setting NSA backend to flashmla_decode for FP8 KV Cache."
+                    )
+
+                # Logging env vars for NSA
+                from sglang.srt.layers.attention.nsa.utils import (
+                    print_nsa_bool_env_vars,
+                )
+
+                print_nsa_bool_env_vars()
 
     def _handle_sampling_backend(self):
         if self.sampling_backend is None:
@@ -1022,6 +1088,7 @@ class ServerArgs:
 
             model_arch = self.get_hf_config().architectures[0]
             if model_arch in [
+                "DeepseekV32ForCausalLM",
                 "DeepseekV3ForCausalLM",
                 "Glm4MoeForCausalLM",
                 "BailingMoeForCausalLM",
@@ -1405,6 +1472,14 @@ class ServerArgs:
             "default to 1.0, which may cause accuracy issues. ",
         )
         parser.add_argument(
+            "--modelopt-quant",
+            type=str,
+            default=ServerArgs.modelopt_quant,
+            help="The ModelOpt quantization configuration. "
+            "Supported values: 'fp8', 'int4_awq', 'w4a8_awq', 'nvfp4', 'nvfp4_awq'. "
+            "This requires the NVIDIA Model Optimizer library to be installed: pip install nvidia-modelopt",
+        )
+        parser.add_argument(
             "--kv-cache-dtype",
             type=str,
             default=ServerArgs.kv_cache_dtype,
@@ -1539,9 +1614,9 @@ class ServerArgs:
             help="The pipeline parallelism size.",
         )
         parser.add_argument(
-            "--max-micro-batch-size",
+            "--pp-max-micro-batch-size",
             type=int,
-            default=ServerArgs.max_micro_batch_size,
+            default=ServerArgs.pp_max_micro_batch_size,
             help="The maximum micro batch size in pipeline parallelism.",
         )
         parser.add_argument(
@@ -1807,6 +1882,16 @@ class ServerArgs:
             help=f"Specify the parser for handling tool-call interactions. Options include: {tool_call_parser_choices}.",
         )
         parser.add_argument(
+            "--sampling-defaults",
+            type=str,
+            choices=["openai", "model"],
+            default=ServerArgs.sampling_defaults,
+            help="Where to get default sampling parameters. "
+            "'openai' uses SGLang/OpenAI defaults (temperature=1.0, top_p=1.0, etc.). "
+            "'model' uses the model's generation_config.json to get the recommended "
+            "sampling parameters if available. Default is 'model'.",
+        )
+        parser.add_argument(
             "--tool-server",
             type=str,
             default=None,
@@ -1973,6 +2058,18 @@ class ServerArgs:
             default=ServerArgs.mm_attention_backend,
             help="Set multimodal attention backend.",
         )
+        parser.add_argument(
+            "--nsa-prefill",
+            default=ServerArgs.nsa_prefill,
+            type=str,
+            choices=NSA_CHOICES,
+        )
+        parser.add_argument(
+            "--nsa-decode",
+            default=ServerArgs.nsa_decode,
+            type=str,
+            choices=NSA_CHOICES,
+        )
 
         # Speculative decoding
         parser.add_argument(
@@ -2102,15 +2199,7 @@ class ServerArgs:
         parser.add_argument(
             "--moe-runner-backend",
             type=str,
-            choices=[
-                "auto",
-                "triton",
-                "triton_kernel",
-                "flashinfer_trtllm",
-                "flashinfer_cutlass",
-                "flashinfer_mxfp4",
-                "flashinfer_cutedsl",
-            ],
+            choices=MOE_RUNNER_BACKEND_CHOICES,
             default=ServerArgs.moe_runner_backend,
             help="Choose the runner backend for MoE.",
         )
@@ -2442,6 +2531,11 @@ class ServerArgs:
             "--enable-mscclpp",
             action="store_true",
             help="Enable using mscclpp for small messages for all-reduce kernel and fall back to NCCL.",
+        )
+        parser.add_argument(
+            "--enable-torch-symm-mem",
+            action="store_true",
+            help="Enable using torch symm mem for all-reduce kernel and fall back to NCCL. Only supports CUDA device SM90 and above. SM90 supports world size 4, 6, 8. SM10 supports world size 6, 8.",
         )
         parser.add_argument(
             "--disable-overlap-schedule",
@@ -3245,6 +3339,7 @@ def auto_choose_speculative_params(self: ServerArgs):
         # The default value for llama
         return (5, 4, 8)
     elif arch in [
+        "DeepseekV32ForCausalLM",
         "DeepseekV3ForCausalLM",
         "DeepseekV2ForCausalLM",
         "GptOssForCausalLM",

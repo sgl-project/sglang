@@ -39,12 +39,15 @@ class BenchArgs:
     profile_steps: int = 3
     profile_by_stage: bool = False
     test_mode: str = "single"
+    n_trials: int = 50
+    n_start: int = 1
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
         parser.add_argument("--host", type=str, default=BenchArgs.host)
         parser.add_argument("--port", type=int, default=BenchArgs.port)
-        parser.add_argument("--n-trials", type=int, default=50)
+        parser.add_argument("--n-trials", type=int, default=BenchArgs.n_trials)
+        parser.add_argument("--n-start", type=int, default=BenchArgs.n_start)
         parser.add_argument("--temperature", type=float, default=BenchArgs.temperature)
         parser.add_argument(
             "--sampling-seed", type=int, default=BenchArgs.sampling_seed
@@ -96,11 +99,14 @@ def send_single(
             "max_new_tokens": args.max_new_tokens,
             "frequency_penalty": args.frequency_penalty,
             "presence_penalty": args.presence_penalty,
-            "sampling_seed": args.sampling_seed,
         },
         "return_logprob": args.return_logprob,
         "stream": args.stream,
     }
+
+    if args.sampling_seed is not None:
+        # sglang server cannot parse None value for sampling_seed
+        json_data["sampling_params"]["sampling_seed"] = args.sampling_seed
 
     if profile:
         run_profile(
@@ -145,11 +151,13 @@ def send_mixed(args, batch_size: int):
             "max_new_tokens": args.max_new_tokens,
             "frequency_penalty": args.frequency_penalty,
             "presence_penalty": args.presence_penalty,
-            "sampling_seed": args.sampling_seed,
         },
         "return_logprob": args.return_logprob,
         "stream": args.stream,
     }
+
+    if args.sampling_seed is not None:
+        json_data["sampling_params"]["sampling_seed"] = args.sampling_seed
 
     response = requests.post(
         f"http://{args.host}:{args.port}/generate",
@@ -192,11 +200,13 @@ def send_prefix(args, batch_size: int, prompts: List[str]):
             "max_new_tokens": args.max_new_tokens,
             "frequency_penalty": args.frequency_penalty,
             "presence_penalty": args.presence_penalty,
-            "sampling_seed": args.sampling_seed,
         },
         "return_logprob": args.return_logprob,
         "stream": args.stream,
     }
+
+    if args.sampling_seed is not None:
+        json_data["sampling_params"]["sampling_seed"] = args.sampling_seed
 
     response = requests.post(
         f"http://{args.host}:{args.port}/generate",
@@ -231,6 +241,8 @@ def test_deterministic(args):
             texts.append(text)
 
         print(f"Total samples: {len(texts)}, Unique samples: {len(set(texts))}")
+        return [len(set(texts))]
+
     elif args.test_mode == "mixed":
         # In mixed mode, we send a mixture of two short prompts and one long prompt in the same batch with batch size ranging from 1 to n_trials.
         output_prompt_1 = []
@@ -257,13 +269,19 @@ def test_deterministic(args):
             f"Long prompt: total samples: {len(output_long_prompt)}, Unique samples: {len(set(output_long_prompt))}"
         )
 
+        return [
+            len(set(output_prompt_1)),
+            len(set(output_prompt_2)),
+            len(set(output_long_prompt)),
+        ]
+
     elif args.test_mode == "prefix":
         # In prefix mode, we create prompts from the same long prompt, with different lengths of common prefix.
         len_prefix = [1, 511, 2048, 4097]
         num_prompts = len(len_prefix)
         outputs = {i: [] for i in range(4)}
         prompts = [LONG_PROMPT[: len_prefix[i]] for i in range(4)]
-        for i in range(1, args.n_trials + 1):
+        for i in range(args.n_start, args.n_start + args.n_trials):
             batch_size = i
             ret_dict = send_prefix(args, batch_size, prompts)
             msg = f"Testing Trial {i} with batch size {batch_size},"
@@ -277,6 +295,11 @@ def test_deterministic(args):
             print(
                 f"Prompt {i} with prefix length {len_prefix[i]}: total samples: {len(outputs[i])}, Unique samples: {len(set(outputs[i]))}"
             )
+
+        results = []
+        for i in range(num_prompts):
+            results.append(len(set(outputs[i])))
+        return results
 
     else:
         raise ValueError(f"Invalid test mode: {args.test_mode}")
