@@ -19,7 +19,7 @@ from sglang.profiler import run_profile
 PROMPT_1 = "Tell me about Richard Feynman: "
 PROMPT_2 = "Generate 1000 random numbers. Go directly into it, don't say Sure and don't say here are numbers. Just start with a number."
 dirpath = os.path.dirname(__file__)
-with open("python/sglang/test/long_prompt.txt", "r") as f:
+with open(os.path.join(dirpath, "long_prompt.txt"), "r") as f:
     LONG_PROMPT = f.read()
 
 
@@ -29,6 +29,7 @@ class BenchArgs:
     port: int = 30000
     batch_size: int = 1
     temperature: float = 0.0
+    sampling_seed: int = 42
     max_new_tokens: int = 100
     frequency_penalty: float = 0.0
     presence_penalty: float = 0.0
@@ -38,13 +39,19 @@ class BenchArgs:
     profile_steps: int = 3
     profile_by_stage: bool = False
     test_mode: str = "single"
+    n_trials: int = 50
+    n_start: int = 1
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
         parser.add_argument("--host", type=str, default=BenchArgs.host)
         parser.add_argument("--port", type=int, default=BenchArgs.port)
-        parser.add_argument("--n-trials", type=int, default=50)
+        parser.add_argument("--n-trials", type=int, default=BenchArgs.n_trials)
+        parser.add_argument("--n-start", type=int, default=BenchArgs.n_start)
         parser.add_argument("--temperature", type=float, default=BenchArgs.temperature)
+        parser.add_argument(
+            "--sampling-seed", type=int, default=BenchArgs.sampling_seed
+        )
         parser.add_argument(
             "--max-new-tokens", type=int, default=BenchArgs.max_new_tokens
         )
@@ -97,6 +104,10 @@ def send_single(
         "stream": args.stream,
     }
 
+    if args.sampling_seed is not None:
+        # sglang server cannot parse None value for sampling_seed
+        json_data["sampling_params"]["sampling_seed"] = args.sampling_seed
+
     if profile:
         run_profile(
             base_url, profile_steps, ["CPU", "GPU"], None, None, profile_by_stage
@@ -145,6 +156,9 @@ def send_mixed(args, batch_size: int):
         "stream": args.stream,
     }
 
+    if args.sampling_seed is not None:
+        json_data["sampling_params"]["sampling_seed"] = args.sampling_seed
+
     response = requests.post(
         f"http://{args.host}:{args.port}/generate",
         json=json_data,
@@ -191,6 +205,9 @@ def send_prefix(args, batch_size: int, prompts: List[str]):
         "stream": args.stream,
     }
 
+    if args.sampling_seed is not None:
+        json_data["sampling_params"]["sampling_seed"] = args.sampling_seed
+
     response = requests.post(
         f"http://{args.host}:{args.port}/generate",
         json=json_data,
@@ -224,6 +241,8 @@ def test_deterministic(args):
             texts.append(text)
 
         print(f"Total samples: {len(texts)}, Unique samples: {len(set(texts))}")
+        return [len(set(texts))]
+
     elif args.test_mode == "mixed":
         # In mixed mode, we send a mixture of two short prompts and one long prompt in the same batch with batch size ranging from 1 to n_trials.
         output_prompt_1 = []
@@ -250,13 +269,19 @@ def test_deterministic(args):
             f"Long prompt: total samples: {len(output_long_prompt)}, Unique samples: {len(set(output_long_prompt))}"
         )
 
+        return [
+            len(set(output_prompt_1)),
+            len(set(output_prompt_2)),
+            len(set(output_long_prompt)),
+        ]
+
     elif args.test_mode == "prefix":
         # In prefix mode, we create prompts from the same long prompt, with different lengths of common prefix.
         len_prefix = [1, 511, 2048, 4097]
         num_prompts = len(len_prefix)
         outputs = {i: [] for i in range(4)}
         prompts = [LONG_PROMPT[: len_prefix[i]] for i in range(4)]
-        for i in range(1, args.n_trials + 1):
+        for i in range(args.n_start, args.n_start + args.n_trials):
             batch_size = i
             ret_dict = send_prefix(args, batch_size, prompts)
             msg = f"Testing Trial {i} with batch size {batch_size},"
@@ -270,6 +295,11 @@ def test_deterministic(args):
             print(
                 f"Prompt {i} with prefix length {len_prefix[i]}: total samples: {len(outputs[i])}, Unique samples: {len(set(outputs[i]))}"
             )
+
+        results = []
+        for i in range(num_prompts):
+            results.append(len(set(outputs[i])))
+        return results
 
     else:
         raise ValueError(f"Invalid test mode: {args.test_mode}")

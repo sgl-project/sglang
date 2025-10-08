@@ -17,21 +17,22 @@ import logging
 import math
 import os
 from enum import Enum, IntEnum, auto
-from typing import List, Optional, Set, Union
+from typing import Any, Dict, List, Optional, Set, Union
 
 import torch
 from transformers import PretrainedConfig
 
-from sglang.srt.hf_transformers_utils import (
+from sglang.srt.environ import envs
+from sglang.srt.layers.quantization import QUANTIZATION_METHODS
+from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import is_hip, retry
+from sglang.srt.utils.hf_transformers_utils import (
     get_config,
     get_context_length,
     get_generation_config,
     get_hf_text_config,
     get_sparse_attention_config,
 )
-from sglang.srt.layers.quantization import QUANTIZATION_METHODS
-from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import get_bool_env_var, is_hip
 from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
@@ -48,6 +49,30 @@ class ModelImpl(str, Enum):
     TRANSFORMERS = "transformers"
 
 
+def is_deepseek_nsa(config: PretrainedConfig) -> bool:
+    return (
+        config.architectures is not None
+        and config.architectures[0]
+        in ["DeepseekV3ForCausalLM", "DeepseekV32ForCausalLM"]
+        and getattr(config, "index_topk", None) is not None
+    )
+
+
+def get_nsa_index_head_dim(config: PretrainedConfig) -> int:
+    assert is_deepseek_nsa(config)
+    return config.index_head_dim
+
+
+def get_nsa_index_topk(config: PretrainedConfig) -> int:
+    assert is_deepseek_nsa(config)
+    return config.index_topk
+
+
+def get_nsa_index_n_heads(config: PretrainedConfig) -> int:
+    assert is_deepseek_nsa(config)
+    return config.index_n_heads
+
+
 class ModelConfig:
     def __init__(
         self,
@@ -60,39 +85,28 @@ class ModelConfig:
         enable_multimodal: Optional[bool] = None,
         dtype: str = "auto",
         quantization: Optional[str] = None,
+        modelopt_quant: Optional[Union[str, Dict]] = None,
         override_config_file: Optional[str] = None,
         is_draft_model: bool = False,
         hybrid_kvcache_ratio: Optional[float] = None,
         model_impl: Union[str, ModelImpl] = ModelImpl.AUTO,
-        tp_rank: Optional[int] = None,
-        remote_instance_weight_loader_seed_instance_ip: Optional[str] = None,
-        remote_instance_weight_loader_seed_instance_service_port: Optional[int] = None,
-        remote_instance_weight_loader_send_weights_group_ports: Optional[
-            List[int]
-        ] = None,
+        sampling_defaults: str = "openai",
     ) -> None:
         # Parse args
         self.model_path = model_path
         self.revision = revision
         self.quantization = quantization
+        self.modelopt_quant = modelopt_quant
+        self.is_draft_model = is_draft_model
         self.model_impl = model_impl
-        self.tp_rank = tp_rank
-        self.remote_instance_weight_loader_seed_instance_ip = (
-            remote_instance_weight_loader_seed_instance_ip
-        )
-        self.remote_instance_weight_loader_seed_instance_service_port = (
-            remote_instance_weight_loader_seed_instance_service_port
-        )
-        self.remote_instance_weight_loader_send_weights_group_ports = (
-            remote_instance_weight_loader_send_weights_group_ports
-        )
+        self.sampling_defaults = sampling_defaults
 
-        self.maybe_pull_model_tokenizer_from_remote()
+        # Get hf config
+        self._maybe_pull_model_tokenizer_from_remote()
         self.model_override_args = json.loads(model_override_args)
         kwargs = {}
         if override_config_file and override_config_file.strip():
             kwargs["_configuration_file"] = override_config_file.strip()
-
         self.hf_config = get_config(
             self.model_path,
             trust_remote_code=trust_remote_code,
@@ -100,7 +114,7 @@ class ModelConfig:
             model_override_args=self.model_override_args,
             **kwargs,
         )
-
+        self.hf_text_config = get_hf_text_config(self.hf_config)
         self.hf_generation_config = get_generation_config(
             self.model_path,
             trust_remote_code=trust_remote_code,
@@ -108,7 +122,25 @@ class ModelConfig:
             **kwargs,
         )
 
-        self.hf_text_config = get_hf_text_config(self.hf_config)
+        # Set enable_multimodal
+        if enable_multimodal is None:
+            mm_disabled_models = [
+                "Gemma3ForConditionalGeneration",
+                "Llama4ForConditionalGeneration",
+                "Step3VLForConditionalGeneration",
+            ]
+            if self.hf_config.architectures[0] in mm_disabled_models:
+                enable_multimodal = False
+                logger.info(
+                    f"Multimodal is disabled for {self.hf_config.model_type}. To enable it, set --enable-multimodal."
+                )
+            else:
+                enable_multimodal = True
+
+        # Config draft model
+        self._config_draft_model()
+
+        # Check model type
         self.attention_chunk_size = getattr(
             self.hf_text_config, "attention_chunk_size", None
         )
@@ -124,20 +156,72 @@ class ModelConfig:
                     self.hf_config.architectures, self.hf_text_config.num_hidden_layers
                 )
             )
+        self.is_generation = is_generation_model(
+            self.hf_config.architectures, is_embedding
+        )
+        self.is_multimodal = enable_multimodal and is_multimodal_model(
+            self.hf_config.architectures
+        )
+        self.is_multimodal_gen = enable_multimodal and is_multimodal_gen_model(
+            self.hf_config.architectures
+        )
+        self.is_image_gen = enable_multimodal and is_image_gen_model(
+            self.hf_config.architectures
+        )
+        self.is_audio_model = enable_multimodal and is_audio_model(
+            self.hf_config.architectures
+        )
+        self.is_multimodal_chunked_prefill_supported = (
+            enable_multimodal
+            and is_multimodal_chunked_prefill_supported(self.hf_config.architectures)
+        )
+        self.is_encoder_decoder = is_encoder_decoder_model(self.hf_config.architectures)
+        self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
-        if enable_multimodal is None:
-            mm_disabled_models = [
-                "Gemma3ForConditionalGeneration",
-                "Llama4ForConditionalGeneration",
-                "Step3VLForConditionalGeneration",
-            ]
-            if self.hf_config.architectures[0] in mm_disabled_models:
-                enable_multimodal = False
-                logger.info(
-                    f"Multimodal is disabled for {self.hf_config.model_type}. To enable it, set --enable-multimodal."
-                )
-            else:
-                enable_multimodal = True
+        # Derive context length and model shapes
+        self._derive_context_length(context_length)
+        self._derive_model_shapes()
+
+        # Verify quantization
+        self._verify_quantization()
+
+        # Verify dual-chunk attention config
+        self._verify_dual_chunk_attention_config()
+
+        # Cache attributes
+        self.hf_eos_token_id = self._get_hf_eos_token_id()
+
+        # multimodal
+        self.image_token_id = getattr(
+            self.hf_config, "image_token_id", None
+        ) or getattr(self.hf_config, "image_token_index", None)
+
+    @staticmethod
+    def from_server_args(
+        server_args: ServerArgs,
+        model_path: str = None,
+        model_revision: str = None,
+        **kwargs,
+    ):
+        return ModelConfig(
+            model_path=model_path or server_args.model_path,
+            trust_remote_code=server_args.trust_remote_code,
+            revision=model_revision or server_args.revision,
+            context_length=server_args.context_length,
+            model_override_args=server_args.json_model_override_args,
+            is_embedding=server_args.is_embedding,
+            enable_multimodal=server_args.enable_multimodal,
+            dtype=server_args.dtype,
+            quantization=server_args.quantization,
+            modelopt_quant=server_args.modelopt_quant,
+            hybrid_kvcache_ratio=server_args.hybrid_kvcache_ratio,
+            model_impl=server_args.model_impl,
+            sampling_defaults=server_args.sampling_defaults,
+            **kwargs,
+        )
+
+    def _config_draft_model(self):
+        is_draft_model = self.is_draft_model
 
         if (
             is_draft_model
@@ -172,31 +256,10 @@ class ModelConfig:
             self.hf_config.architectures[0] = "Qwen3NextForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
 
-        # Check model type
-        self.is_generation = is_generation_model(
-            self.hf_config.architectures, is_embedding
-        )
-        self.is_multimodal = enable_multimodal and is_multimodal_model(
-            self.hf_config.architectures
-        )
-        self.is_multimodal_gen = enable_multimodal and is_multimodal_gen_model(
-            self.hf_config.architectures
-        )
-        self.is_image_gen = enable_multimodal and is_image_gen_model(
-            self.hf_config.architectures
-        )
-        self.is_audio_model = enable_multimodal and is_audio_model(
-            self.hf_config.architectures
-        )
-        self.is_multimodal_chunked_prefill_supported = (
-            enable_multimodal
-            and is_multimodal_chunked_prefill_supported(self.hf_config.architectures)
-        )
-        self.is_encoder_decoder = is_encoder_decoder_model(self.hf_config.architectures)
-        self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
-
-        # Derive context length
+    def _derive_context_length(self, context_length: int):
+        is_draft_model = self.is_draft_model
         derived_context_len = get_context_length(self.hf_text_config)
+
         if context_length is not None:
             if context_length > derived_context_len:
                 reason = "Target model's" if is_draft_model else "User-specified"
@@ -205,11 +268,16 @@ class ModelConfig:
                     f"This may lead to incorrect model outputs or CUDA errors. Note that the derived context_length may differ from max_position_embeddings in the model's config."
                 )
                 if (
-                    get_bool_env_var("SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN")
+                    envs.SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN.get()
                     or is_in_ci()  # FIXME: fix this special case
                 ):
                     logger.warning(msg)
                     self.context_len = context_length
+                    if is_draft_model:
+                        self.hf_text_config.max_position_embeddings = context_length
+                        logger.warning(
+                            f"Overriding the draft model's max_position_embeddings to {context_length}."
+                        )
                 else:
                     raise ValueError(
                         f"{msg} To allow overriding this maximum, set the env var SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"
@@ -219,6 +287,10 @@ class ModelConfig:
         else:
             self.context_len = derived_context_len
 
+        # Transfer context_len to HuggingFace config so models can access it
+        self.hf_config.context_len = self.context_len
+
+    def _derive_model_shapes(self):
         # Unify the config keys for hf_text_config
         self.head_dim = getattr(
             self.hf_text_config,
@@ -229,6 +301,7 @@ class ModelConfig:
         # FIXME: temporary special judge for MLA architecture
         if (
             "DeepseekV2ForCausalLM" in self.hf_config.architectures
+            or "DeepseekV32ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLMNextN" in self.hf_config.architectures
             or "LongcatFlashForCausalLM" in self.hf_config.architectures
@@ -241,6 +314,11 @@ class ModelConfig:
             self.qk_nope_head_dim = self.hf_config.qk_nope_head_dim
             self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
             self.v_head_dim = self.hf_config.v_head_dim
+            self.index_head_dim = (
+                get_nsa_index_head_dim(self.hf_config)
+                if is_deepseek_nsa(self.hf_config)
+                else None
+            )
 
             # Handle rope scaling with yarn
             self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
@@ -312,45 +390,6 @@ class ModelConfig:
             self.hf_text_config, "num_nextn_predict_layers", None
         )
         self.vocab_size = self.hf_text_config.vocab_size
-
-        # Verify quantization
-        self._verify_quantization()
-
-        # Verify dual-chunk attention config
-        self._verify_dual_chunk_attention_config()
-
-        # Cache attributes
-        self.hf_eos_token_id = self.get_hf_eos_token_id()
-
-        # multimodal
-        self.image_token_id = getattr(
-            self.hf_config, "image_token_id", None
-        ) or getattr(self.hf_config, "image_token_index", None)
-
-    @staticmethod
-    def from_server_args(
-        server_args: ServerArgs,
-        model_path: str = None,
-        model_revision: str = None,
-        **kwargs,
-    ):
-        return ModelConfig(
-            model_path=model_path or server_args.model_path,
-            trust_remote_code=server_args.trust_remote_code,
-            revision=model_revision or server_args.revision,
-            context_length=server_args.context_length,
-            model_override_args=server_args.json_model_override_args,
-            is_embedding=server_args.is_embedding,
-            enable_multimodal=server_args.enable_multimodal,
-            dtype=server_args.dtype,
-            quantization=server_args.quantization,
-            hybrid_kvcache_ratio=server_args.hybrid_kvcache_ratio,
-            model_impl=server_args.model_impl,
-            remote_instance_weight_loader_seed_instance_ip=server_args.remote_instance_weight_loader_seed_instance_ip,
-            remote_instance_weight_loader_seed_instance_service_port=server_args.remote_instance_weight_loader_seed_instance_service_port,
-            remote_instance_weight_loader_send_weights_group_ports=server_args.remote_instance_weight_loader_send_weights_group_ports,
-            **kwargs,
-        )
 
     def get_total_num_attention_heads(self) -> int:
         return self.num_attention_heads
@@ -444,35 +483,51 @@ class ModelConfig:
             # example: https://huggingface.co/nvidia/Llama-3.1-8B-Instruct-FP8/tree/main
             # example: https://huggingface.co/Barrrrry/DeepSeek-R1-W4AFP8/tree/main
             is_local = os.path.exists(self.model_path)
-            modelopt_quant_config = {"quant_method": "modelopt"}
             if not is_local:
                 import huggingface_hub
 
                 try:
-                    from huggingface_hub import HfApi
+                    from huggingface_hub import HfApi, hf_hub_download
 
                     hf_api = HfApi()
                     if hf_api.file_exists(self.model_path, "hf_quant_config.json"):
-                        quant_cfg = modelopt_quant_config
+                        # Download and parse the quantization config for remote models
+                        quant_config_file = hf_hub_download(
+                            repo_id=self.model_path,
+                            filename="hf_quant_config.json",
+                            revision=self.revision,
+                        )
+                        with open(quant_config_file) as f:
+                            quant_config_dict = json.load(f)
+                        quant_cfg = self._parse_modelopt_quant_config(quant_config_dict)
                 except huggingface_hub.errors.OfflineModeIsEnabled:
                     logger.warning(
                         "Offline mode is enabled, skipping hf_quant_config.json check"
                     )
                     pass
-
             elif os.path.exists(os.path.join(self.model_path, "hf_quant_config.json")):
                 quant_config_file = os.path.join(
                     self.model_path, "hf_quant_config.json"
                 )
                 with open(quant_config_file) as f:
                     quant_config_dict = json.load(f)
-                json_quant_configs = quant_config_dict["quantization"]
-                quant_algo = json_quant_configs.get("quant_algo", None)
-                if quant_algo == "MIXED_PRECISION":
-                    quant_cfg = {"quant_method": "w4afp8"}
-                else:
-                    quant_cfg = modelopt_quant_config
+                quant_cfg = self._parse_modelopt_quant_config(quant_config_dict)
         return quant_cfg
+
+    def _parse_modelopt_quant_config(self, quant_config_dict: dict) -> dict:
+        """Parse ModelOpt quantization config and return the appropriate quant_method."""
+        json_quant_configs = quant_config_dict["quantization"]
+        quant_algo = json_quant_configs.get("quant_algo", None)
+
+        if quant_algo == "MIXED_PRECISION":
+            return {"quant_method": "w4afp8"}
+        elif quant_algo and ("FP4" in quant_algo or "NVFP4" in quant_algo):
+            return {"quant_method": "modelopt_fp4"}
+        elif quant_algo and "FP8" in quant_algo:
+            return {"quant_method": "modelopt_fp8"}
+        else:
+            # Default to FP8 for backward compatibility
+            return {"quant_method": "modelopt_fp8"}
 
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
     def _verify_quantization(self) -> None:
@@ -492,7 +547,8 @@ class ModelConfig:
         optimized_quantization_methods = [
             "fp8",
             "marlin",
-            "modelopt",
+            "modelopt_fp8",
+            "modelopt_fp4",
             "gptq_marlin_24",
             "gptq_marlin",
             "awq_marlin",
@@ -586,7 +642,7 @@ class ModelConfig:
                     "sparse_attention_enabled"
                 ] = True
 
-    def get_hf_eos_token_id(self) -> Optional[Set[int]]:
+    def _get_hf_eos_token_id(self) -> Optional[Set[int]]:
         eos_ids = getattr(self.hf_config, "eos_token_id", None)
         if eos_ids is not None:
             # it can be either int or list of int
@@ -606,7 +662,39 @@ class ModelConfig:
                 eos_ids = eos_ids | generation_eos_ids
         return eos_ids
 
-    def maybe_pull_model_tokenizer_from_remote(self) -> None:
+    def get_default_sampling_params(self) -> dict[str, Any]:
+        """
+        Get default sampling parameters from the model's generation config.
+
+        This method returns non-default sampling parameters from the model's
+        generation_config.json when sampling_defaults is set to "model".
+
+        Returns:
+            A dictionary containing the non-default sampling parameters.
+        """
+        if self.sampling_defaults != "model":
+            return {}
+
+        if self.hf_generation_config is None:
+            return {}
+
+        config = self.hf_generation_config.to_dict()
+
+        available_params = [
+            "repetition_penalty",
+            "temperature",
+            "top_k",
+            "top_p",
+            "min_p",
+        ]
+
+        default_sampling_params = {
+            p: config.get(p) for p in available_params if config.get(p) is not None
+        }
+
+        return default_sampling_params
+
+    def _maybe_pull_model_tokenizer_from_remote(self) -> None:
         """
         Pull the model config files to a temporary
         directory in case of remote.
@@ -749,6 +837,8 @@ multimodal_model_archs = [
     "Qwen2AudioForConditionalGeneration",
     "Qwen2VLForConditionalGeneration",
     "Qwen2_5_VLForConditionalGeneration",
+    "Qwen3VLForConditionalGeneration",
+    "Qwen3VLMoeForConditionalGeneration",
     "KimiVLForConditionalGeneration",
     "InternVLChatModel",
     "InternS1ForConditionalGeneration",
@@ -756,6 +846,7 @@ multimodal_model_archs = [
     "VILAForConditionalGeneration",
     "Step3VLForConditionalGeneration",
     "DotsVLMForCausalLM",
+    "DotsOCRForCausalLM",
     "Sarashina2VisionForCausalLM",
 ]
 

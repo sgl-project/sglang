@@ -30,7 +30,7 @@ class Router:
             - PolicyType.RoundRobin: Distribute requests in round-robin fashion
             - PolicyType.CacheAware: Distribute requests based on cache state and load balance
             - PolicyType.PowerOfTwo: Select best of two random workers based on load (PD mode only)
-        host: Host address to bind the router server. Default: '127.0.0.1'
+        host: Host address to bind the router server. Supports IPv4, IPv6 (e.g., ::, ::1), or 0.0.0.0 for all interfaces. Default: '0.0.0.0'
         port: Port number to bind the router server. Default: 3001
         worker_startup_timeout_secs: Timeout in seconds for worker startup. Default: 300
         worker_startup_check_interval: Interval in seconds between checks for worker initialization. Default: 10
@@ -53,7 +53,7 @@ class Router:
             Useful when the dp aware scheduling strategy is enabled.
             Default: None
         log_dir: Directory to store log files. If None, logs are only output to console. Default: None
-        log_level: Logging level. Options: 'debug', 'info', 'warning', 'error', 'critical'.
+        log_level: Logging level. Options: 'debug', 'info', 'warn', 'error'.
         service_discovery: Enable Kubernetes service discovery. When enabled, the router will
             automatically discover worker pods based on the selector. Default: False
         selector: Dictionary mapping of label keys to values for Kubernetes pod selection.
