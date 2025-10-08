@@ -117,7 +117,7 @@ impl StreamingProcessor {
                     let result = processor
                         .process_dual_streaming_chunks(
                             prefill,
-                            decode,
+                            *decode,
                             dispatch,
                             stop_params,
                             chat_request,

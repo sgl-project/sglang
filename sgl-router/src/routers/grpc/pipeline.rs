@@ -733,7 +733,7 @@ impl RequestExecutionStage {
 
         Ok(ExecutionResult::Dual {
             prefill: prefill_stream,
-            decode: decode_stream,
+            decode: Box::new(decode_stream),
         })
     }
 }
@@ -831,7 +831,7 @@ impl ResponseProcessingStage {
                     .await?;
 
                 // Collect decode for actual output
-                let mut decode_responses = utils::collect_stream_responses(decode, "Decode")
+                let mut decode_responses = utils::collect_stream_responses(*decode, "Decode")
                     .await?;
 
                 // Merge prefill input_logprobs if requested
@@ -1070,7 +1070,7 @@ impl ChatCompletionPipeline {
         // Extract final response
         match ctx.state.response.final_response {
             Some(FinalResponse::Generate(response)) => {
-                axum::Json(response).into_response()
+                axum::Json(*response).into_response()
             }
             Some(FinalResponse::Chat(_)) => {
                 utils::internal_error_static("Internal error: wrong response type")

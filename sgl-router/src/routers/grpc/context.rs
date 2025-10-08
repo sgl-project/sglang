@@ -387,12 +387,12 @@ pub enum ExecutionResult {
     },
     Dual {
         prefill: Streaming<proto::GenerateResponse>,
-        decode: Streaming<proto::GenerateResponse>,
+        decode: Box<Streaming<proto::GenerateResponse>>,
     },
 }
 
 /// Final processed response
 pub enum FinalResponse {
     Chat(ChatCompletionResponse),
-    Generate(GenerateRequest),
+    Generate(Box<GenerateRequest>),
 }
