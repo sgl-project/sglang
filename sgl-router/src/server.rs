@@ -2,10 +2,10 @@ use crate::{
     config::{ConnectionMode, HistoryBackend, RouterConfig, RoutingMode},
     core::{LoadMonitor, WorkerManager, WorkerRegistry, WorkerType},
     data_connector::{
-        MemoryConversationStorage, MemoryResponseStorage, NoOpConversationStorage,
-        NoOpResponseStorage, OracleConversationStorage, OracleResponseStorage,
-        OracleConversationItemStorage, MemoryConversationItemStorage,
-        SharedConversationStorage, SharedResponseStorage,
+        MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
+        NoOpConversationStorage, NoOpResponseStorage, OracleConversationItemStorage,
+        OracleConversationStorage, OracleResponseStorage, SharedConversationStorage,
+        SharedResponseStorage,
     },
     logging::{self, LoggingConfig},
     metrics::{self, PrometheusConfig},
@@ -123,8 +123,8 @@ impl AppContext {
                         format!("failed to initialize Oracle response storage: {err}")
                     })?;
 
-                let conversation_storage =
-                    OracleConversationStorage::new(oracle_cfg.clone()).map_err(|err| {
+                let conversation_storage = OracleConversationStorage::new(oracle_cfg.clone())
+                    .map_err(|err| {
                         format!("failed to initialize Oracle conversation storage: {err}")
                     })?;
 
@@ -133,15 +133,18 @@ impl AppContext {
         };
 
         // Conversation items storage (memory-backed for now)
-        let conversation_item_storage: crate::data_connector::SharedConversationItemStorage = match router_config.history_backend {
-            HistoryBackend::Oracle => {
-                let oracle_cfg = router_config.oracle.clone().ok_or_else(|| {
-                    "oracle configuration is required when history_backend=oracle".to_string()
-                })?;
-                Arc::new(OracleConversationItemStorage::new(oracle_cfg).map_err(|e| format!("failed to initialize Oracle conversation item storage: {e}"))?)
-            }
-            _ => Arc::new(MemoryConversationItemStorage::new()),
-        };
+        let conversation_item_storage: crate::data_connector::SharedConversationItemStorage =
+            match router_config.history_backend {
+                HistoryBackend::Oracle => {
+                    let oracle_cfg = router_config.oracle.clone().ok_or_else(|| {
+                        "oracle configuration is required when history_backend=oracle".to_string()
+                    })?;
+                    Arc::new(OracleConversationItemStorage::new(oracle_cfg).map_err(|e| {
+                        format!("failed to initialize Oracle conversation item storage: {e}")
+                    })?)
+                }
+                _ => Arc::new(MemoryConversationItemStorage::new()),
+            };
 
         let load_monitor = Some(Arc::new(LoadMonitor::new(
             worker_registry.clone(),
@@ -424,7 +427,11 @@ struct ListItemsQuery {
 async fn v1_conversations_list_items(
     State(state): State<Arc<AppState>>,
     Path(conversation_id): Path<String>,
-    Query(ListItemsQuery { limit, order, after }): Query<ListItemsQuery>,
+    Query(ListItemsQuery {
+        limit,
+        order,
+        after,
+    }): Query<ListItemsQuery>,
     headers: http::HeaderMap,
 ) -> Response {
     state

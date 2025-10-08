@@ -5,14 +5,15 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
 use super::conversation_items::{
-    make_item_id, ConversationItem, ConversationItemId, ConversationItemStorage,
-    ListParams, Result, SortOrder,
+    make_item_id, ConversationItem, ConversationItemId, ConversationItemStorage, ListParams,
+    Result, SortOrder,
 };
 use super::conversations::ConversationId;
 
 #[derive(Default)]
 pub struct MemoryConversationItemStorage {
     items: RwLock<HashMap<ConversationItemId, ConversationItem>>, // item_id -> item
+    #[allow(clippy::type_complexity)]
     links: RwLock<HashMap<ConversationId, BTreeMap<(i64, String), ConversationItemId>>>,
 }
 
@@ -24,8 +25,14 @@ impl MemoryConversationItemStorage {
 
 #[async_trait]
 impl ConversationItemStorage for MemoryConversationItemStorage {
-    async fn create_item(&self, new_item: super::conversation_items::NewConversationItem) -> Result<ConversationItem> {
-        let id = new_item.id.clone().unwrap_or_else(|| make_item_id(&new_item.item_type));
+    async fn create_item(
+        &self,
+        new_item: super::conversation_items::NewConversationItem,
+    ) -> Result<ConversationItem> {
+        let id = new_item
+            .id
+            .clone()
+            .unwrap_or_else(|| make_item_id(&new_item.item_type));
         let created_at = Utc::now();
         let item = ConversationItem {
             id: id.clone(),
@@ -48,9 +55,7 @@ impl ConversationItemStorage for MemoryConversationItemStorage {
         added_at: DateTime<Utc>,
     ) -> Result<()> {
         let mut links = self.links.write().unwrap();
-        let entry = links
-            .entry(conversation_id.clone())
-            .or_insert_with(BTreeMap::new);
+        let entry = links.entry(conversation_id.clone()).or_default();
         entry.insert((added_at.timestamp(), item_id.0.clone()), item_id.clone());
         Ok(())
     }
@@ -86,7 +91,7 @@ impl ConversationItemStorage for MemoryConversationItemStorage {
                 for ((_ts, _id), item_key) in map.range(..k).rev() {
                     if let Some(it) = items_guard.get(item_key) {
                         results.push(it.clone());
-                        if results.len() >= take + 1 {
+                        if results.len() > take {
                             break;
                         }
                     }
@@ -96,7 +101,7 @@ impl ConversationItemStorage for MemoryConversationItemStorage {
                 for ((_ts, _id), item_key) in map.iter().rev() {
                     if let Some(it) = items_guard.get(item_key) {
                         results.push(it.clone());
-                        if results.len() >= take + 1 {
+                        if results.len() > take {
                             break;
                         }
                     }
@@ -106,7 +111,7 @@ impl ConversationItemStorage for MemoryConversationItemStorage {
                 for ((_ts, _id), item_key) in map.range((Excluded(k), Unbounded)) {
                     if let Some(it) = items_guard.get(item_key) {
                         results.push(it.clone());
-                        if results.len() >= take + 1 {
+                        if results.len() > take {
                             break;
                         }
                     }
@@ -116,7 +121,7 @@ impl ConversationItemStorage for MemoryConversationItemStorage {
                 for ((_ts, _id), item_key) in map.iter() {
                     if let Some(it) = items_guard.get(item_key) {
                         results.push(it.clone());
-                        if results.len() >= take + 1 {
+                        if results.len() > take {
                             break;
                         }
                     }
@@ -133,8 +138,13 @@ mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
 
-    fn make_item(item_type: &str, role: Option<&str>, content: serde_json::Value) -> super::super::conversation_items::NewConversationItem {
+    fn make_item(
+        item_type: &str,
+        role: Option<&str>,
+        content: serde_json::Value,
+    ) -> super::super::conversation_items::NewConversationItem {
         super::super::conversation_items::NewConversationItem {
+            id: None,
             response_id: None,
             item_type: item_type.to_string(),
             role: role.map(|r| r.to_string()),
@@ -149,9 +159,22 @@ mod tests {
         let conv: ConversationId = "conv_test".into();
 
         // Create 3 items and link them at controlled timestamps
-        let i1 = store.create_item(make_item("message", Some("user"), serde_json::json!([]))).await.unwrap();
-        let i2 = store.create_item(make_item("message", Some("assistant"), serde_json::json!([]))).await.unwrap();
-        let i3 = store.create_item(make_item("reasoning"),).await.unwrap();
+        let i1 = store
+            .create_item(make_item("message", Some("user"), serde_json::json!([])))
+            .await
+            .unwrap();
+        let i2 = store
+            .create_item(make_item(
+                "message",
+                Some("assistant"),
+                serde_json::json!([]),
+            ))
+            .await
+            .unwrap();
+        let i3 = store
+            .create_item(make_item("reasoning", None, serde_json::json!([])))
+            .await
+            .unwrap();
 
         let t1 = Utc.timestamp_opt(1_700_000_001, 0).single().unwrap();
         let t2 = Utc.timestamp_opt(1_700_000_002, 0).single().unwrap();
@@ -163,7 +186,14 @@ mod tests {
 
         // Desc order, no cursor
         let desc = store
-            .list_items(&conv, ListParams { limit: 2, order: SortOrder::Desc, after: None })
+            .list_items(
+                &conv,
+                ListParams {
+                    limit: 2,
+                    order: SortOrder::Desc,
+                    after: None,
+                },
+            )
             .await
             .unwrap();
         assert!(desc.len() >= 2);
@@ -172,7 +202,14 @@ mod tests {
 
         // Desc with cursor = i2 -> expect i1 next
         let desc_after = store
-            .list_items(&conv, ListParams { limit: 2, order: SortOrder::Desc, after: Some(i2.id.0.clone()) })
+            .list_items(
+                &conv,
+                ListParams {
+                    limit: 2,
+                    order: SortOrder::Desc,
+                    after: Some(i2.id.0.clone()),
+                },
+            )
             .await
             .unwrap();
         assert!(!desc_after.is_empty());
@@ -180,7 +217,14 @@ mod tests {
 
         // Asc order, no cursor
         let asc = store
-            .list_items(&conv, ListParams { limit: 2, order: SortOrder::Asc, after: None })
+            .list_items(
+                &conv,
+                ListParams {
+                    limit: 2,
+                    order: SortOrder::Asc,
+                    after: None,
+                },
+            )
             .await
             .unwrap();
         assert!(asc.len() >= 2);
@@ -189,7 +233,14 @@ mod tests {
 
         // Asc with cursor = i2 -> expect i3 next
         let asc_after = store
-            .list_items(&conv, ListParams { limit: 2, order: SortOrder::Asc, after: Some(i2.id.0.clone()) })
+            .list_items(
+                &conv,
+                ListParams {
+                    limit: 2,
+                    order: SortOrder::Asc,
+                    after: Some(i2.id.0.clone()),
+                },
+            )
             .await
             .unwrap();
         assert!(!asc_after.is_empty());

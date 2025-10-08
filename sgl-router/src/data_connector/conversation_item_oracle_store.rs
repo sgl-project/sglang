@@ -65,8 +65,14 @@ impl OracleConversationItemStorage {
 
 #[async_trait]
 impl ConversationItemStorage for OracleConversationItemStorage {
-    async fn create_item(&self, item: crate::data_connector::conversation_items::NewConversationItem) -> ItemResult<ConversationItem> {
-        let id = item.id.clone().unwrap_or_else(|| make_item_id(&item.item_type));
+    async fn create_item(
+        &self,
+        item: crate::data_connector::conversation_items::NewConversationItem,
+    ) -> ItemResult<ConversationItem> {
+        let id = item
+            .id
+            .clone()
+            .unwrap_or_else(|| make_item_id(&item.item_type));
         let id_str = id.0.clone();
         let created_at = Utc::now();
         let response_id = item.response_id.clone();
@@ -256,7 +262,9 @@ impl ConversationItemOracleConnectionManager {
             password: config.password.clone(),
             connect_descriptor: config.connect_descriptor.clone(),
         };
-        Self { params: Arc::new(params) }
+        Self {
+            params: Arc::new(params),
+        }
     }
 }
 

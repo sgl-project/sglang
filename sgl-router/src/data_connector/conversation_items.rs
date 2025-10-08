@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt::{Display, Formatter};
@@ -41,6 +42,8 @@ pub struct ConversationItem {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewConversationItem {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<ConversationItemId>,
     pub response_id: Option<String>,
     pub item_type: String,
     pub role: Option<String>,
@@ -97,7 +100,12 @@ pub type SharedConversationItemStorage = Arc<dyn ConversationItemStorage>;
 
 /// Helper to build id prefix based on item_type
 pub fn make_item_id(item_type: &str) -> ConversationItemId {
-    let ulid = ulid::Ulid::new().to_string();
+    // Generate a 24-byte random hex string (48 hex chars), consistent with conversation id style
+    let mut rng = rand::rng();
+    let mut bytes = [0u8; 24];
+    rng.fill_bytes(&mut bytes);
+    let hex_string: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+
     let prefix: String = match item_type {
         "message" => "msg".to_string(),
         "reasoning" => "rs".to_string(),
@@ -113,5 +121,5 @@ pub fn make_item_id(item_type: &str) -> ConversationItemId {
             p
         }
     };
-    ConversationItemId(format!("{}_{}", prefix, ulid))
+    ConversationItemId(format!("{}_{}", prefix, hex_string))
 }
