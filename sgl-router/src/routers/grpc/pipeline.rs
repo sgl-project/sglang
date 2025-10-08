@@ -929,8 +929,27 @@ impl ResponseProcessingStage {
     }
 
     async fn process_generate_response(&self, _ctx: &mut RequestContext) -> Result<(), Response> {
-        // Generate endpoint processing would go here
-        // For now, not implemented
+        // TODO(generate): Implement generate response processing
+        //
+        // Required implementation:
+        // 1. Extract execution_result from ctx
+        // 2. Check is_streaming flag
+        // 3. For streaming:
+        //    - Add StreamingProcessor::process_streaming_generate() method
+        //    - Similar to process_streaming_response but WITHOUT tool/reasoning parsing
+        //    - Return Err(sse_response) for early exit
+        // 4. For non-streaming:
+        //    - Collect stream responses using utils::collect_stream_responses()
+        //    - Process through stop decoder (sequential with reset for n>1, like chat)
+        //    - Build GenerateResponse struct (see TODO in protocols/spec.rs)
+        //    - Set ctx.state.response.final_response = Some(FinalResponse::Generate(response))
+        //
+        // Reference implementation: router.rs:297-595
+        // Key differences from chat:
+        //   - No tool parsing
+        //   - No reasoning parsing
+        //   - Different response format (GenerateResponse instead of ChatCompletionResponse)
+        //   - Still needs: stop decoder, logprobs, finish_reason, matched_stop
         Err((
             axum::http::StatusCode::NOT_IMPLEMENTED,
             axum::Json(serde_json::json!({

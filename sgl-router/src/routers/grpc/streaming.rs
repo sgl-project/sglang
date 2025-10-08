@@ -554,6 +554,24 @@ impl StreamingProcessor {
             .await
     }
 
+    // TODO(generate): Add streaming generate handler
+    //
+    // pub async fn process_streaming_generate(
+    //     self: Arc<Self>,
+    //     execution_result: context::ExecutionResult,
+    //     generate_request: GenerateRequest,
+    //     dispatch: context::DispatchMetadata,
+    // ) -> axum::response::Response {
+    //     // Similar to process_streaming_response but:
+    //     // - No tool parsing
+    //     // - No reasoning parsing
+    //     // - Simpler chunk format (just text + finish_reason + logprobs)
+    //     // - Extract stop params from generate_request.sampling_params
+    //     // - Use same per-index stop decoder logic
+    //     // - Emit SSE chunks with format similar to chat but without delta.tool_calls
+    //     // Reference: router.rs:422-595
+    // }
+
     // ========================================================================
     // Helper Methods
     // ========================================================================
