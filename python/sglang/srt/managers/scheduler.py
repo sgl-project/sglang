@@ -2846,13 +2846,14 @@ class IdleSleeper:
         for s in sockets:
             self.poller.register(s, zmq.POLLIN)
 
+        self.empty_cache_interval = envs.SGLANG_EMPTY_CACHE_INTERVAL
+        if self.empty_cache_interval < 0:
+            self.maybe_sleep = lambda: None
+
     def maybe_sleep(self):
         self.poller.poll(1000)
-        if (
-            global_config.torch_empty_cache_interval > 0
-            and time.time() - self.last_empty_time
-            > global_config.torch_empty_cache_interval
-        ):
+        assert self.empty_cache_interval > 0
+        if time.time() - self.last_empty_time > self.empty_cache_interval:
             self.last_empty_time = time.time()
             torch.cuda.empty_cache()
 

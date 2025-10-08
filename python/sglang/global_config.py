@@ -20,13 +20,6 @@ class GlobalConfig:
         # Default backend of the language
         self.default_backend = None
 
-        # Runtime constants: New generation token ratio estimation
-        self.torch_empty_cache_interval = float(
-            os.environ.get(
-                "SGLANG_EMPTY_CACHE_INTERVAL", -1
-            )  # in seconds. Set if you observe high memory accumulation over a long serving period.
-        )
-
         # Runtime constants: others
         self.flashinfer_workspace_size = int(
             os.environ.get("FLASHINFER_WORKSPACE_SIZE", 384 * 1024 * 1024)
