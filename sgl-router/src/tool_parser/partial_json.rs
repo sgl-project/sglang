@@ -22,8 +22,13 @@ impl PartialJson {
     }
 
     /// Parse potentially incomplete JSON, returning parsed value and consumed bytes
-    pub fn parse_value(&self, input: &str) -> ToolParserResult<(Value, usize)> {
-        let mut parser = Parser::new(input, self.max_depth, self.allow_incomplete);
+    ///
+    /// # Arguments
+    /// * `input` - The JSON string to parse
+    /// * `allow_partial_strings` - When false, incomplete strings cause parsing to stop
+    ///   (matches Python's Allow.ALL & ~Allow.STR behavior)
+    pub fn parse_value(&self, input: &str, allow_partial_strings: bool) -> ToolParserResult<(Value, usize)> {
+        let mut parser = Parser::new(input, self.max_depth, self.allow_incomplete, allow_partial_strings);
         let value = parser.parse_value(0)?;
         Ok((value, parser.position))
     }
@@ -37,7 +42,8 @@ impl Default for PartialJson {
 
 impl PartialJsonParser for PartialJson {
     fn parse(&self, input: &str) -> ToolParserResult<(Value, usize)> {
-        self.parse_value(input)
+        // Default to allowing partial strings
+        self.parse_value(input, true)
     }
 
     fn is_complete(&self, input: &str) -> bool {
@@ -56,15 +62,17 @@ struct Parser<'a> {
     position: usize,
     max_depth: usize,
     allow_incomplete: bool,
+    allow_partial_strings: bool,
 }
 
 impl<'a> Parser<'a> {
-    fn new(input: &'a str, max_depth: usize, allow_incomplete: bool) -> Self {
+    fn new(input: &'a str, max_depth: usize, allow_incomplete: bool, allow_partial_strings: bool) -> Self {
         Self {
             chars: input.chars().peekable(),
             position: 0,
             max_depth,
             allow_incomplete,
+            allow_partial_strings,
         }
     }
 
@@ -161,8 +169,13 @@ impl<'a> Parser<'a> {
             let value = match self.parse_value(depth) {
                 Ok(v) => v,
                 Err(_) if self.allow_incomplete => {
-                    // Add null for incomplete value
-                    object.insert(key, Value::Null);
+                    // When allow_partial_strings is false, don't add the key with Null
+                    // Just return the object without this incomplete key-value pair
+                    // This matches Python's behavior: Allow.ALL & ~Allow.STR
+                    if self.allow_partial_strings {
+                        // Add null for incomplete value
+                        object.insert(key, Value::Null);
+                    }
                     return Ok(Value::Object(object));
                 }
                 Err(e) => return Err(e),
@@ -301,7 +314,7 @@ impl<'a> Parser<'a> {
         }
 
         // Incomplete string
-        if self.allow_incomplete {
+        if self.allow_incomplete && self.allow_partial_strings {
             Ok(Value::String(string))
         } else {
             Err(ToolParserError::ParsingFailed("Unterminated string".into()))
@@ -524,4 +537,145 @@ pub fn compute_diff(old: &str, new: &str) -> String {
     let common_len = find_common_prefix(old, new);
     // Convert character count to byte offset
     new.chars().skip(common_len).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_partial_string_flag_disallows_incomplete_strings() {
+        // Test case from the bug report: {"name": "
+        // With allow_partial_strings=false, should return {} (stop before incomplete string)
+        let parser = PartialJson::new(32, true);
+        let input = r#"{"name": ""#;
+
+        let result = parser.parse_value(input, false);
+        assert!(result.is_ok());
+
+        let (obj, consumed) = result.unwrap();
+
+        // Should parse just the opening brace and stop at the incomplete string
+        assert!(obj.is_object());
+        let obj_map = obj.as_object().unwrap();
+
+        // Should have empty object (stopped before parsing incomplete "name" key)
+        assert!(obj_map.is_empty() || !obj_map.contains_key("name"),
+            "Should not parse incomplete string key, got: {:?}", obj_map);
+
+        // Should consume characters up to the incomplete string
+        assert!(consumed <= input.len());
+    }
+
+    #[test]
+    fn test_partial_string_flag_allows_incomplete_strings() {
+        // Test case: {"name": "
+        // With allow_partial_strings=true, should parse the incomplete string
+        let parser = PartialJson::new(32, true);
+        let input = r#"{"name": ""#;
+
+        let result = parser.parse_value(input, true);
+        assert!(result.is_ok());
+
+        let (obj, consumed) = result.unwrap();
+
+        // Should parse the object with incomplete string value
+        assert!(obj.is_object());
+        let obj_map = obj.as_object().unwrap();
+
+        // With allow_partial_strings=true, should parse "name" key with empty string value
+        assert!(obj_map.contains_key("name"), "Should parse incomplete string with allow_partial_strings=true");
+
+        assert_eq!(consumed, input.len());
+    }
+
+    #[test]
+    fn test_partial_string_flag_complete_json() {
+        // Test case: {"name": "test"}
+        // Both flags should parse complete JSON the same way
+        let input = r#"{"name": "test"}"#;
+
+        let parser = PartialJson::new(32, true);
+        let result1 = parser.parse_value(input, false);
+        assert!(result1.is_ok());
+        let (obj1, consumed1) = result1.unwrap();
+
+        let result2 = parser.parse_value(input, true);
+        assert!(result2.is_ok());
+        let (obj2, consumed2) = result2.unwrap();
+
+        // Both should parse the same complete JSON
+        assert_eq!(obj1, obj2);
+        assert_eq!(consumed1, consumed2);
+        assert_eq!(consumed1, input.len());
+
+        // Check the parsed value
+        assert!(obj1.is_object());
+        let obj_map = obj1.as_object().unwrap();
+        assert_eq!(obj_map.get("name").and_then(|v| v.as_str()), Some("test"));
+    }
+
+    #[test]
+    fn test_backward_compatibility_default() {
+        // Test that default PartialJson still allows partial strings (backward compatible)
+        let parser = PartialJson::default();
+        let input = r#"{"name": ""#;
+
+        let result = parser.parse_value(input, true);
+        assert!(result.is_ok());
+
+        let (obj, _) = result.unwrap();
+        assert!(obj.is_object());
+
+        // Default behavior should allow partial strings
+        let obj_map = obj.as_object().unwrap();
+        assert!(obj_map.contains_key("name"), "Default should allow partial strings for backward compatibility");
+    }
+
+    #[test]
+    fn test_partial_string_in_nested_object() {
+        // Test case: {"tool": {"name": "
+        let parser = PartialJson::new(32, true);
+        let input = r#"{"tool": {"name": ""#;
+
+        let result = parser.parse_value(input, false);
+        assert!(result.is_ok());
+
+        let (obj, _) = result.unwrap();
+        assert!(obj.is_object());
+
+        // With allow_partial_strings=false, should stop before incomplete nested string
+        let obj_map = obj.as_object().unwrap();
+        if let Some(tool) = obj_map.get("tool") {
+            if let Some(tool_map) = tool.as_object() {
+                assert!(!tool_map.contains_key("name") || tool_map.get("name").and_then(|v| v.as_str()).is_none(),
+                    "Should not parse incomplete nested string");
+            }
+        }
+    }
+
+    #[test]
+    fn test_bug_fix_exact_scenario() {
+        // This test verifies the exact bug scenario from the issue:
+        // buffer = "{\"name\": \""
+        // flags = Allow.ALL & ~Allow.STR
+        // Python returns: Parsed object: {}, consumed length: 10
+
+        let parser = PartialJson::new(32, true);
+        let input = r#"{"name": ""#;
+
+        let result = parser.parse_value(input, false);
+        assert!(result.is_ok());
+
+        let (obj, consumed) = result.unwrap();
+
+        // Should return empty object (not {"name": null} or {"name": ""})
+        assert!(obj.is_object());
+        let obj_map = obj.as_object().unwrap();
+        assert!(obj_map.is_empty(),
+            "Expected empty object, got: {:?}. This matches Python behavior with Allow.ALL & ~Allow.STR", obj_map);
+
+        // Should consume all characters (10 bytes)
+        assert_eq!(consumed, 10, "Should consume all 10 characters");
+    }
 }

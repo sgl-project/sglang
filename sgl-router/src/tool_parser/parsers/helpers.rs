@@ -190,8 +190,12 @@ pub fn handle_json_tool_streaming(
     // Extract JSON string from current position
     let json_str = &current_text[start_idx..];
 
+    // When current_tool_name_sent is false, don't allow partial strings to avoid
+    // parsing incomplete tool names as empty strings
+    let allow_partial_strings = *current_tool_name_sent;
+
     // Parse partial JSON
-    let (obj, end_idx) = match partial_json.parse_value(json_str) {
+    let (obj, end_idx) = match partial_json.parse_value(json_str, allow_partial_strings) {
         Ok(result) => result,
         Err(_) => {
             return Ok(StreamingParseResult::default());

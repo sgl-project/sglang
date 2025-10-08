@@ -211,7 +211,7 @@ impl ToolParser for GptOssParser {
                             partial_args
                         };
 
-                        match self.partial_json.parse_value(json_part) {
+                        match self.partial_json.parse_value(json_part, true) {
                             Ok((value, _consumed)) => {
                                 let args_str = serde_json::to_string(&value)
                                     .unwrap_or_else(|_| "{}".to_string());
