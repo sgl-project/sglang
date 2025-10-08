@@ -63,26 +63,19 @@ $PIP_CMD list
 # Install additional dependencies
 $PIP_CMD install mooncake-transfer-engine==0.3.6.post1 nvidia-cuda-nvrtc-cu12 py-spy huggingface_hub[hf_xet] $PIP_INSTALL_SUFFIX
 
-if [ "$IS_BLACKWELL" != "1" ]; then
-    # For lmms_evals evaluating MMMU
-    git clone --branch v0.3.3 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
-    $PIP_CMD install -e lmms-eval/ $PIP_INSTALL_SUFFIX
-
-    # Install xformers
-    $PIP_CMD install xformers --index-url https://download.pytorch.org/whl/${CU_VERSION} --no-deps $PIP_INSTALL_SUFFIX --force-reinstall
-fi
-
 # Install dependencies for deepseek-v3.2
 if [ "$RUN_DEEPSEEK_V32" = "1" ]; then
     # Install flashmla
     FLASHMLA_COMMIT="1408756a88e52a25196b759eaf8db89d2b51b5a1"
-    # Currently dpsk 3.2 is only tested on Hopper
-    export FLASH_MLA_DISABLE_SM100=1
+    FLASH_MLA_DISABLE_SM100="0"
+    if [ "$IS_BLACKWELL" != "1" ]; then
+        FLASH_MLA_DISABLE_SM100="1"
+    fi
     git clone https://github.com/deepseek-ai/FlashMLA.git flash-mla
     cd flash-mla
     git checkout ${FLASHMLA_COMMIT}
     git submodule update --init --recursive
-    $PIP_CMD install -v . $PIP_INSTALL_SUFFIX
+    FLASH_MLA_DISABLE_SM100=${FLASH_MLA_DISABLE_SM100} $PIP_CMD install -v . $PIP_INSTALL_SUFFIX
     cd ..
 
     # Install fast-hadamard-transform
@@ -95,6 +88,15 @@ if [ "$RUN_DEEPSEEK_V32" = "1" ]; then
 
     # Install tilelang
     $PIP_CMD install tilelang==0.1.6.post1 $PIP_INSTALL_SUFFIX
+fi
+
+if [ "$IS_BLACKWELL" != "1" ]; then
+    # For lmms_evals evaluating MMMU
+    git clone --branch v0.3.3 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
+    $PIP_CMD install -e lmms-eval/ $PIP_INSTALL_SUFFIX
+
+    # Install xformers
+    $PIP_CMD install xformers --index-url https://download.pytorch.org/whl/${CU_VERSION} --no-deps $PIP_INSTALL_SUFFIX
 fi
 
 # Show current packages
