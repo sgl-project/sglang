@@ -590,6 +590,7 @@ impl StreamingProcessor {
     }
 
     /// Helper: Process reasoning content in streaming mode
+    #[allow(clippy::too_many_arguments)]
     fn process_reasoning_stream(
         &self,
         delta: &str,
