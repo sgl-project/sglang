@@ -58,16 +58,17 @@ impl PipelineStage for PreparationStage {
     async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
         debug!("Stage {}: Processing request", self.name());
 
-        // Clone the request to avoid borrowing issues
-        match &ctx.input.request_type {
-            RequestType::Chat(request) => {
-                let request_clone = request.clone();
-                self.prepare_chat(ctx, &request_clone).await?;
-            }
-            RequestType::Generate(request) => {
-                let request_clone = request.clone();
-                self.prepare_generate(ctx, &request_clone).await?;
-            }
+        // Clone Arc before match to avoid borrow checker issues
+        // (matching borrows ctx, but prepare_* methods need mutable borrow)
+        // Arc clone is cheap (8 bytes) - avoids full request clone (15KB-200KB)
+        let is_chat = matches!(&ctx.input.request_type, RequestType::Chat(_));
+
+        if is_chat {
+            let request_arc = ctx.chat_request_arc();
+            self.prepare_chat(ctx, &request_arc).await?;
+        } else {
+            let request_arc = ctx.generate_request_arc();
+            self.prepare_generate(ctx, &request_arc).await?;
         }
 
         Ok(None)
@@ -820,7 +821,7 @@ impl ResponseProcessingStage {
             return Ok(Some(
                 self.streaming_processor.clone().process_streaming_response(
                     execution_result,
-                    ctx.chat_request().clone(),
+                    ctx.chat_request_arc(), // Cheap Arc clone (8 bytes)
                     dispatch.clone(),
                 ),
             ));
@@ -865,9 +866,7 @@ impl ResponseProcessingStage {
             return Err(utils::internal_error_static("No responses from server"));
         }
 
-        // Clone chat_request to avoid borrow checker conflict
-        // (ctx.chat_request() borrows ctx, preventing mutable borrow of ctx.state.response.stop_decoder)
-        let chat_request = ctx.chat_request().clone();
+        let chat_request = ctx.chat_request_arc();
         let history_tool_calls_count = utils::get_history_tool_calls_count(&chat_request);
 
         let stop_decoder = ctx
@@ -959,13 +958,11 @@ impl ResponseProcessingStage {
                 .as_ref()
                 .ok_or_else(|| utils::internal_error_static("Dispatch metadata not set"))?;
 
-            let generate_request = ctx.generate_request().clone();
-
             // Streaming: Use StreamingProcessor and return SSE response (done)
             return Ok(Some(
                 self.streaming_processor.clone().process_streaming_generate(
                     execution_result,
-                    generate_request,
+                    ctx.generate_request_arc(), // Cheap Arc clone (8 bytes)
                     dispatch.clone(),
                 ),
             ));
@@ -1193,8 +1190,8 @@ impl ChatCompletionPipeline {
     /// Execute the complete pipeline for a chat request
     pub async fn execute_chat(
         &self,
-        request: ChatCompletionRequest,
-        headers: Option<axum::http::HeaderMap>,
+        request: Arc<ChatCompletionRequest>,
+        headers: Option<http::HeaderMap>,
         model_id: Option<String>,
         components: Arc<SharedComponents>,
     ) -> Response {
@@ -1243,8 +1240,8 @@ impl ChatCompletionPipeline {
     /// Execute the complete pipeline for a generate request
     pub async fn execute_generate(
         &self,
-        request: GenerateRequest,
-        headers: Option<axum::http::HeaderMap>,
+        request: Arc<GenerateRequest>,
+        headers: Option<http::HeaderMap>,
         model_id: Option<String>,
         components: Arc<SharedComponents>,
     ) -> Response {
