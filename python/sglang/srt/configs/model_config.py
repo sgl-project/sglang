@@ -89,6 +89,7 @@ class ModelConfig:
         modelopt_checkpoint_restore_path: Optional[str] = None,
         modelopt_checkpoint_save_path: Optional[str] = None,
         modelopt_export_path: Optional[str] = None,
+        quantize_and_serve: bool = False,
         override_config_file: Optional[str] = None,
         is_draft_model: bool = False,
         hybrid_kvcache_ratio: Optional[
@@ -579,6 +580,37 @@ class ModelConfig:
             return "fp8"
         else:
             return "fp8"  # Default fallback
+
+    def _validate_quantize_and_serve_config(self) -> None:
+        """Validate quantize-and-serve configuration and warn about conflicts."""
+        if not self.quantize_and_serve:
+            return
+
+        # Check for ModelOpt quantization requirement
+        if not (
+            self.modelopt_quant or self.quantization in ["modelopt_fp8", "modelopt_fp4"]
+        ):
+            raise ValueError(
+                "quantize_and_serve=True requires ModelOpt quantization. "
+                "Set --quantization to 'modelopt_fp8' or 'modelopt_fp4'"
+            )
+
+        # Check for conflicting export options
+        if self.modelopt_export_path:
+            import logging
+
+            logger = logging.getLogger(__name__)
+            logger.warning(
+                "quantize_and_serve=True: modelopt_export_path will be ignored. "
+                "The model will be quantized in memory and served immediately without export."
+            )
+
+        # Check if model is already quantized
+        if self._is_already_quantized():
+            raise ValueError(
+                "quantize_and_serve=True cannot be used with pre-quantized models. "
+                "Pre-quantized models should be loaded directly without this flag."
+            )
 
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
     def _verify_quantization(self) -> None:
