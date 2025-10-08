@@ -1574,7 +1574,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         total_max_new_tokens = sum(r.sampling_params.max_new_tokens for r in self.reqs)
 
         new_estimate_ratio = (
-            total_decoded_tokens + envs.SGLANG_RETRACT_DECODE_STEPS * len(self.reqs)
+            total_decoded_tokens
+            + envs.SGLANG_RETRACT_DECODE_STEPS.get() * len(self.reqs)
         ) / total_max_new_tokens
         new_estimate_ratio = min(1.0, new_estimate_ratio)
 
@@ -1613,7 +1614,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.tree_cache.dec_lock_ref(req.last_node)
 
             # NOTE(lsyin): we should use the newly evictable memory instantly.
-            num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS
+            num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
             self._evict_tree_cache_if_needed(num_tokens)
 
         req.reset_for_retract()

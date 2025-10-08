@@ -577,16 +577,17 @@ class Scheduler(
             server_args.schedule_conservativeness >= 0
         ), "Invalid schedule_conservativeness"
         self.init_new_token_ratio = min(
-            envs.SGLANG_INIT_NEW_TOKEN_RATIO * server_args.schedule_conservativeness,
+            envs.SGLANG_INIT_NEW_TOKEN_RATIO.get()
+            * server_args.schedule_conservativeness,
             1.0,
         )
         self.min_new_token_ratio = min(
-            self.init_new_token_ratio * envs.SGLANG_MIN_NEW_TOKEN_RATIO_FACTOR,
+            self.init_new_token_ratio * envs.SGLANG_MIN_NEW_TOKEN_RATIO_FACTOR.get(),
             1.0,
         )
         self.new_token_ratio_decay = (
             self.init_new_token_ratio - self.min_new_token_ratio
-        ) / envs.SGLANG_NEW_TOKEN_RATIO_DECAY_STEPS
+        ) / envs.SGLANG_NEW_TOKEN_RATIO_DECAY_STEPS.get()
         self.new_token_ratio = self.init_new_token_ratio
 
         # Init watchdog thread
@@ -2846,7 +2847,7 @@ class IdleSleeper:
         for s in sockets:
             self.poller.register(s, zmq.POLLIN)
 
-        self.empty_cache_interval = envs.SGLANG_EMPTY_CACHE_INTERVAL
+        self.empty_cache_interval = envs.SGLANG_EMPTY_CACHE_INTERVAL.get()
         if self.empty_cache_interval < 0:
             self.maybe_sleep = lambda: None
 
