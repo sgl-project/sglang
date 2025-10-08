@@ -173,6 +173,22 @@ pub trait RouterTrait: Send + Sync + Debug {
             .into_response()
     }
 
+    /// List items for a conversation
+    async fn list_conversation_items(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _conversation_id: &str,
+        _limit: Option<usize>,
+        _order: Option<String>,
+        _after: Option<String>,
+    ) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Conversation items list endpoint not implemented",
+        )
+            .into_response()
+    }
+
     /// Get router type name
     fn router_type(&self) -> &'static str;
 
