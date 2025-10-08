@@ -12,15 +12,23 @@ impl ResponseId {
     pub fn new() -> Self {
         Self(ulid::Ulid::new().to_string())
     }
-
-    pub fn from_string(s: String) -> Self {
-        Self(s)
-    }
 }
 
 impl Default for ResponseId {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl From<String> for ResponseId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for ResponseId {
+    fn from(value: &str) -> Self {
+        Self(value.to_string())
     }
 }
 
@@ -43,10 +51,10 @@ pub struct StoredResponse {
     pub output: String,
 
     /// Tool calls made by the model (if any)
-    pub tool_calls: Vec<serde_json::Value>,
+    pub tool_calls: Vec<Value>,
 
     /// Custom metadata
-    pub metadata: HashMap<String, serde_json::Value>,
+    pub metadata: HashMap<String, Value>,
 
     /// When this response was created
     pub created_at: chrono::DateTime<chrono::Utc>,
@@ -87,7 +95,7 @@ pub struct ResponseChain {
     pub responses: Vec<StoredResponse>,
 
     /// Metadata about the chain
-    pub metadata: HashMap<String, serde_json::Value>,
+    pub metadata: HashMap<String, Value>,
 }
 
 impl Default for ResponseChain {
