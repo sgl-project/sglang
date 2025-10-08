@@ -3188,6 +3188,9 @@ class ServerArgs:
         )
 
 
+global_server_args: Optional[ServerArgs] = None
+
+
 def prepare_server_args(argv: List[str]) -> ServerArgs:
     """
     Prepare the server arguments from the command line arguments.
@@ -3222,8 +3225,10 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
     raw_args = parser.parse_args(argv)
-    server_args = ServerArgs.from_cli_args(raw_args)
-    return server_args
+
+    global global_server_args
+    global_server_args = ServerArgs.from_cli_args(raw_args)
+    return global_server_args
 
 
 ZMQ_TCP_PORT_DELTA = 233
