@@ -827,8 +827,7 @@ impl StreamingProcessor {
 
                     // Store latest output logprobs (cumulative from proto, convert to SGLang format)
                     if let Some(ref output_logprobs) = chunk.output_logprobs {
-                        let converted =
-                            super::utils::convert_generate_output_logprobs(output_logprobs);
+                        let converted = utils::convert_generate_output_logprobs(output_logprobs);
                         accumulated_output_logprobs.insert(index, Some(converted));
                     }
 
