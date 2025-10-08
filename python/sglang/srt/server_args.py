@@ -355,7 +355,6 @@ class ServerArgs:
     hicache_storage_backend: Optional[str] = None
     hicache_storage_prefetch_policy: str = "best_effort"
     hicache_storage_backend_extra_config: Optional[str] = None
-    hicache_storage_pass_prefix_keys: bool = False
     # LMCache
     enable_lmcache: bool = False
 
@@ -2366,11 +2365,6 @@ class ServerArgs:
             type=str,
             default=ServerArgs.hicache_storage_backend_extra_config,
             help="A dictionary in JSON string format containing extra configuration for the storage backend.",
-        )
-        parser.add_argument(
-            "--hicache-storage-pass-prefix-keys",
-            action="store_true",
-            help="Enable passing prefix keys to storage backend in hierarchical cache.",
         )
         # LMCache
         parser.add_argument(

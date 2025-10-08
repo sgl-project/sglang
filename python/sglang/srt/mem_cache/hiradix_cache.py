@@ -45,7 +45,6 @@ class HiRadixCache(RadixCache):
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[str] = None,
         is_eagle: bool = False,
-        hicache_storage_pass_prefix_keys: bool = False,
     ):
 
         if hicache_io_backend == "direct":
@@ -79,19 +78,20 @@ class HiRadixCache(RadixCache):
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
         self.enable_storage = hicache_storage_backend is not None
         self.enable_storage_metrics = self.enable_storage and enable_metrics
-        self.hicache_storage_pass_prefix_keys = hicache_storage_pass_prefix_keys
 
         (
             extra_config,
             prefetch_threshold,
             prefetch_timeout_base,
             prefetch_timeout_per_ki_token,
+            hicache_storage_pass_prefix_keys,
         ) = self._parse_storage_backend_extra_config(storage_backend_extra_config)
         self.prefetch_threshold = prefetch_threshold
         self.prefetch_timeout_base = prefetch_timeout_base
         self.prefetch_timeout_per_page = (
             page_size / 1024 * prefetch_timeout_per_ki_token
         )
+        self.hicache_storage_pass_prefix_keys = hicache_storage_pass_prefix_keys
         # TODO: support more timeout check functions
         self.is_prefetch_timeout = self._prefetch_timeout_check_linear_func
         self.prefetch_stop_policy = hicache_storage_prefetch_policy
@@ -151,7 +151,7 @@ class HiRadixCache(RadixCache):
             storage_backend_extra_config: JSON string containing extra configuration
 
         Returns:
-            tuple: (extra_config_dict, prefetch_threshold, prefetch_timeout_base, prefetch_timeout_per_ki_token)
+            tuple: (extra_config_dict, prefetch_threshold, prefetch_timeout_base, prefetch_timeout_per_ki_token, hicache_storage_pass_prefix_keys)
         """
         # Parse extra config JSON if provided
         extra_config = {}
@@ -167,6 +167,9 @@ class HiRadixCache(RadixCache):
         prefetch_timeout_per_ki_token = extra_config.pop(
             "prefetch_timeout_per_ki_token", 0.25
         )  # seconds per 1024 tokens
+        hicache_storage_pass_prefix_keys = extra_config.pop(
+            "hicache_storage_pass_prefix_keys", False
+        )
 
         if not isinstance(prefetch_threshold, int):
             raise ValueError(
@@ -186,6 +189,7 @@ class HiRadixCache(RadixCache):
             prefetch_threshold,
             float(prefetch_timeout_base),
             float(prefetch_timeout_per_ki_token),
+            hicache_storage_pass_prefix_keys,
         )
 
     def reset(self):
