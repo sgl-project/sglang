@@ -128,6 +128,12 @@ class Envs:
     SGLANG_SIMULATE_ACC_METHOD = EnvStr("multinomial")
     SGLANG_TORCH_PROFILER_DIR = EnvStr("/tmp")
 
+    # Scheduler: new token ratio hyperparameters
+    SGLANG_INIT_NEW_TOKEN_RATIO = EnvFloat(0.7)
+    SGLANG_MIN_NEW_TOKEN_RATIO_FACTOR = EnvFloat(0.14)
+    SGLANG_NEW_TOKEN_RATIO_DECAY_STEPS = EnvInt(600)
+    SGLANG_RETRACT_DECODE_STEPS = EnvInt(20)
+
     # Model Parallel
     SGLANG_USE_MESSAGE_QUEUE_BROADCASTER = EnvBool(True)
 
