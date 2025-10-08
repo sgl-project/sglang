@@ -4,10 +4,7 @@
 //! that transform a RequestContext through its lifecycle.
 
 use async_trait::async_trait;
-use axum::{
-    http::StatusCode,
-    response::{IntoResponse, Response},
-};
+use axum::response::{IntoResponse, Response};
 use tracing::{debug, error, warn};
 
 use super::context::*;
@@ -102,14 +99,7 @@ impl PreparationStage {
             utils::generate_tool_constraints(tools, &request.tool_choice, &request.model)
         });
 
-        // Convert to context::ProcessedMessages
-        let ctx_processed_messages = ProcessedMessages {
-            text: processed_messages.text.clone(),
-            multimodal_inputs: processed_messages.multimodal_inputs,
-            stop_sequences: processed_messages.stop_sequences,
-        };
-
-        // Step 5: Create stop sequence decoder (build once, reuse throughout request)
+        // Step 5: Create stop sequence decoder (build once, reuse in non-stream)
         let stop_decoder = utils::create_stop_decoder(
             &ctx.components.tokenizer,
             request.stop.as_ref(),
@@ -120,9 +110,9 @@ impl PreparationStage {
 
         // Store results in context
         ctx.state.preparation = Some(PreparationOutput {
-            original_text: Some(processed_messages.text),
+            original_text: Some(processed_messages.text.clone()),
             token_ids,
-            processed_messages: Some(ctx_processed_messages),
+            processed_messages: Some(processed_messages),
             tool_constraints: tool_call_constraint,
             filtered_request: if matches!(body_ref, std::borrow::Cow::Owned(_)) {
                 Some(body_ref.into_owned())
@@ -656,7 +646,7 @@ impl PipelineStage for RequestExecutionStage {
         let proto_request = ctx
             .state
             .proto_request
-            .as_ref()
+            .take()
             .ok_or_else(|| super::utils::internal_error_static("Proto request not built"))?;
 
         let clients = ctx
@@ -685,7 +675,7 @@ impl PipelineStage for RequestExecutionStage {
 impl RequestExecutionStage {
     async fn execute_single(
         &self,
-        proto_request: &proto::GenerateRequest,
+        proto_request: proto::GenerateRequest,
         clients: &mut ClientSelection,
     ) -> Result<ExecutionResult, Response> {
         let client = clients
@@ -693,7 +683,7 @@ impl RequestExecutionStage {
             .ok_or_else(|| super::utils::internal_error_static("Expected single client but got dual"))?;
 
         let stream = client
-            .generate(proto_request.clone())
+            .generate(proto_request)
             .await
             .map_err(|e| super::utils::internal_error_message(format!("Failed to start generation: {}", e)))?;
 
@@ -702,7 +692,7 @@ impl RequestExecutionStage {
 
     async fn execute_dual_dispatch(
         &self,
-        proto_request: &proto::GenerateRequest,
+        proto_request: proto::GenerateRequest,
         clients: &mut ClientSelection,
     ) -> Result<ExecutionResult, Response> {
         let (prefill_client, decode_client) = clients
@@ -712,7 +702,7 @@ impl RequestExecutionStage {
         debug!("Sending concurrent requests to prefill and decode workers");
 
         let prefill_request = proto_request.clone();
-        let decode_request = proto_request.clone();
+        let decode_request = proto_request;
 
         let (prefill_result, decode_result) = tokio::join!(
             prefill_client.generate(prefill_request),
@@ -809,15 +799,18 @@ impl ResponseProcessingStage {
             .ok_or_else(|| super::utils::internal_error_static("No execution result"))?;
 
         if is_streaming {
+            // Get dispatch metadata for consistent response fields
+            let dispatch = ctx
+                .state
+                .dispatch
+                .as_ref()
+                .ok_or_else(|| super::utils::internal_error_static("Dispatch metadata not set"))?;
+
             // Streaming: Use StreamingProcessor and return SSE response (early exit)
             return Err(self.streaming_processor.clone().process_streaming_response(
                 execution_result,
                 ctx.chat_request().clone(),
-                ctx.state
-                    .dispatch
-                    .as_ref()
-                    .map(|d| d.request_id.clone())
-                    .unwrap_or_else(|| format!("chatcmpl-{}", Uuid::new_v4())),
+                dispatch.clone(),
             ));
         }
 

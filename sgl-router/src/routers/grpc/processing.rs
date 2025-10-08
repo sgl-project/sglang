@@ -10,7 +10,7 @@ use tracing::{debug, error};
 
 use crate::grpc_client::proto;
 use crate::protocols::spec::{
-    ChatChoice, ChatCompletionMessage, ChatLogProbs, ChatMessage, FunctionCallResponse, ToolCall,
+    ChatChoice, ChatCompletionMessage, ChatMessage, FunctionCallResponse, ToolCall,
     ToolChoiceValue,
 };
 use crate::reasoning_parser::ReasoningParserFactory;
@@ -173,7 +173,7 @@ impl ResponseProcessor {
 
         // Step 4: Convert output logprobs if present
         let logprobs = if let Some(proto_logprobs) = &complete.output_logprobs {
-            match self.convert_proto_to_openai_logprobs(proto_logprobs) {
+            match super::utils::convert_proto_to_openai_logprobs(proto_logprobs, &self.tokenizer) {
                 Ok(logprobs) => Some(logprobs),
                 Err(e) => {
                     error!("Failed to convert logprobs: {}", e);
@@ -267,14 +267,6 @@ impl ResponseProcessor {
                 (None, processed_text.to_string())
             }
         }
-    }
-
-    /// Convert proto LogProbs to OpenAI ChatLogProbs format (EXACT COPY from router.rs:1503-1570)
-    pub fn convert_proto_to_openai_logprobs(
-        &self,
-        proto_logprobs: &proto::OutputLogProbs,
-    ) -> Result<ChatLogProbs, String> {
-        super::utils::convert_proto_to_openai_logprobs(proto_logprobs, &self.tokenizer)
     }
 }
 

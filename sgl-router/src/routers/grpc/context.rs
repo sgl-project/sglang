@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use crate::core::Worker;
 use crate::grpc_client::{proto, SglangSchedulerClient};
-use crate::protocols::spec::{ChatCompletionRequest, GenerateRequest, StringOrArray};
+use crate::protocols::spec::{ChatCompletionRequest, GenerateRequest};
 use crate::reasoning_parser::ReasoningParserFactory;
 use crate::tokenizer::stop::StopSequenceDecoder;
 use crate::tokenizer::traits::Tokenizer;
@@ -93,20 +93,13 @@ pub struct PreparationOutput {
     pub token_ids: Vec<u32>,
 
     /// Processed messages (chat only)
-    pub processed_messages: Option<ProcessedMessages>,
+    pub processed_messages: Option<super::ProcessedMessages>,
 
     /// Tool call constraints (if applicable)
     pub tool_constraints: Option<(String, String)>,
 
     /// Filtered request (if tools were filtered)
     pub filtered_request: Option<ChatCompletionRequest>,
-}
-
-/// Processed chat messages
-pub struct ProcessedMessages {
-    pub text: String,
-    pub multimodal_inputs: Option<proto::MultimodalInputs>,
-    pub stop_sequences: Option<StringOrArray>,
 }
 
 /// Worker selection (Step 2)
@@ -132,6 +125,7 @@ pub enum ClientSelection {
 }
 
 /// Dispatch metadata (Step 5)
+#[derive(Clone)]
 pub struct DispatchMetadata {
     pub request_id: String,
     pub model: String,

@@ -11,7 +11,6 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_stream::StreamExt;
@@ -64,12 +63,11 @@ impl StreamingProcessor {
         self: Arc<Self>,
         execution_result: super::context::ExecutionResult,
         chat_request: ChatCompletionRequest,
-        request_id: String,
+        dispatch: super::context::DispatchMetadata,
     ) -> axum::response::Response {
         use bytes::Bytes;
         use tokio::sync::mpsc;
 
-        let model = chat_request.model.clone();
         let stop_params = (
             chat_request.stop.clone(),
             chat_request.stop_token_ids.clone(),
@@ -84,34 +82,61 @@ impl StreamingProcessor {
         match execution_result {
             super::context::ExecutionResult::Single { stream } => {
                 let processor = self.clone();
+                let dispatch_clone = dispatch.clone();
                 tokio::spawn(async move {
-                    let _ = processor
+                    let result = processor
                         .process_streaming_chunks(
                             stream,
-                            request_id,
-                            model,
+                            dispatch_clone,
                             stop_params,
                             chat_request,
                             &tx,
                         )
                         .await;
+
+                    if let Err(e) = result {
+                        let error_chunk = format!(
+                            "data: {}\n\n",
+                            json!({
+                                "error": {
+                                    "message": e,
+                                    "type": "internal_error"
+                                }
+                            })
+                        );
+                        let _ = tx.send(Ok(Bytes::from(error_chunk)));
+                    }
+
                     let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
                 });
             }
             super::context::ExecutionResult::Dual { prefill, decode } => {
                 let processor = self.clone();
                 tokio::spawn(async move {
-                    let _ = processor
+                    let result = processor
                         .process_dual_streaming_chunks(
                             prefill,
                             decode,
-                            request_id,
-                            model,
+                            dispatch,
                             stop_params,
                             chat_request,
                             &tx,
                         )
                         .await;
+
+                    if let Err(e) = result {
+                        let error_chunk = format!(
+                            "data: {}\n\n",
+                            json!({
+                                "error": {
+                                    "message": e,
+                                    "type": "internal_error"
+                                }
+                            })
+                        );
+                        let _ = tx.send(Ok(Bytes::from(error_chunk)));
+                    }
+
                     let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
                 });
             }
@@ -125,8 +150,7 @@ impl StreamingProcessor {
     pub async fn process_streaming_chunks(
         &self,
         mut grpc_stream: Streaming<proto::GenerateResponse>,
-        request_id: String,
-        model: String,
+        dispatch: super::context::DispatchMetadata,
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool),
         original_request: ChatCompletionRequest,
         tx: &UnboundedSender<Result<Bytes, io::Error>>,
@@ -158,10 +182,11 @@ impl StreamingProcessor {
         // Per-index stop decoders (each index needs its own state for n>1 support)
         let mut stop_decoders: HashMap<u32, StopSequenceDecoder> = HashMap::new();
 
-        let created = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        // Use dispatch metadata for consistent response fields
+        let request_id = &dispatch.request_id;
+        let model = &dispatch.model;
+        let created = dispatch.created;
+        let system_fingerprint = dispatch.weight_version.as_deref();
 
         // Phase 2: Main streaming loop
         while let Some(response) = grpc_stream.next().await {
@@ -193,11 +218,20 @@ impl StreamingProcessor {
                     }
 
                     // Process logprobs if present
-                    let choice_logprobs =
-                        chunk.output_logprobs.as_ref().and_then(|proto_logprobs| {
-                            utils::convert_proto_to_openai_logprobs(proto_logprobs, &self.tokenizer)
-                                .ok()
-                        });
+                    let choice_logprobs = if let Some(ref proto_logprobs) = chunk.output_logprobs {
+                        match utils::convert_proto_to_openai_logprobs(
+                            proto_logprobs,
+                            &self.tokenizer,
+                        ) {
+                            Ok(logprobs) => Some(logprobs),
+                            Err(e) => {
+                                warn!("Failed to process logprobs: {}", e);
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
 
                     // Initialize stream buffer if first time
                     let stream_buffer = stream_buffers.entry(index).or_default();
@@ -209,7 +243,7 @@ impl StreamingProcessor {
                             object: "chat.completion.chunk".to_string(),
                             created,
                             model: model.clone(),
-                            system_fingerprint: None,
+                            system_fingerprint: system_fingerprint.map(|s| s.to_string()),
                             choices: vec![ChatStreamChoice {
                                 index,
                                 delta: ChatMessageDelta {
@@ -243,6 +277,7 @@ impl StreamingProcessor {
                                 &request_id,
                                 &model,
                                 created,
+                                system_fingerprint,
                             );
                         if let Some(chunk) = reasoning_chunk {
                             tx.send(Ok(Bytes::from(Self::format_sse_chunk(&chunk))))
@@ -269,6 +304,7 @@ impl StreamingProcessor {
                                 &request_id,
                                 &model,
                                 created,
+                                system_fingerprint,
                                 history_tool_calls_count,
                             )
                             .await;
@@ -278,6 +314,7 @@ impl StreamingProcessor {
                                 .map_err(|_| "Failed to send tool call chunk".to_string())?;
                         }
 
+                        // Continue to process the next chunk as we have tool chunks
                         if should_skip {
                             continue;
                         }
@@ -291,6 +328,7 @@ impl StreamingProcessor {
                             &request_id,
                             &model,
                             created,
+                            system_fingerprint,
                             choice_logprobs,
                         );
                         tx.send(Ok(Bytes::from(Self::format_sse_chunk(&content_chunk))))
@@ -304,34 +342,36 @@ impl StreamingProcessor {
                     if let Some(decoder) = stop_decoders.get_mut(&index) {
                         if let SequenceDecoderOutput::Text(text) = decoder.flush() {
                             if !text.is_empty() {
-                            let stream_buffer = stream_buffers.entry(index).or_default();
-                            stream_buffer.push_str(&text);
+                                let stream_buffer = stream_buffers.entry(index).or_default();
+                                stream_buffer.push_str(&text);
 
-                            let content_chunk = ChatCompletionStreamResponse {
-                                id: request_id.clone(),
-                                object: "chat.completion.chunk".to_string(),
-                                created,
-                                model: model.clone(),
-                                system_fingerprint: None,
-                                choices: vec![ChatStreamChoice {
-                                    index,
-                                    delta: ChatMessageDelta {
-                                        role: Some("assistant".to_string()),
-                                        content: Some(text),
-                                        tool_calls: None,
-                                        reasoning_content: None,
-                                    },
-                                    logprobs: None,
-                                    finish_reason: None,
-                                    matched_stop: None,
-                                }],
-                                usage: None,
-                            };
+                                let content_chunk = ChatCompletionStreamResponse {
+                                    id: request_id.clone(),
+                                    object: "chat.completion.chunk".to_string(),
+                                    created,
+                                    model: model.clone(),
+                                    system_fingerprint: system_fingerprint.map(|s| s.to_string()),
+                                    choices: vec![ChatStreamChoice {
+                                        index,
+                                        delta: ChatMessageDelta {
+                                            role: Some("assistant".to_string()),
+                                            content: Some(text),
+                                            tool_calls: None,
+                                            reasoning_content: None,
+                                        },
+                                        logprobs: None,
+                                        finish_reason: None,
+                                        matched_stop: None,
+                                    }],
+                                    usage: None,
+                                };
 
-                            let sse_chunk = serde_json::to_string(&content_chunk)
-                                .map_err(|e| format!("Failed to serialize content chunk: {}", e))?;
-                            tx.send(Ok(Bytes::from(format!("data: {}\n\n", sse_chunk))))
-                                .map_err(|_| "Failed to send flushed content".to_string())?;
+                                let sse_chunk =
+                                    serde_json::to_string(&content_chunk).map_err(|e| {
+                                        format!("Failed to serialize content chunk: {}", e)
+                                    })?;
+                                tx.send(Ok(Bytes::from(format!("data: {}\n\n", sse_chunk))))
+                                    .map_err(|_| "Failed to send flushed content".to_string())?;
                             }
                         }
                     }
@@ -387,7 +427,7 @@ impl StreamingProcessor {
                         object: "chat.completion.chunk".to_string(),
                         created,
                         model: model.clone(),
-                        system_fingerprint: None,
+                        system_fingerprint: system_fingerprint.map(|s| s.to_string()),
                         choices: vec![ChatStreamChoice {
                             index: *index,
                             delta: ChatMessageDelta {
@@ -427,7 +467,7 @@ impl StreamingProcessor {
                 object: "chat.completion.chunk".to_string(),
                 created,
                 model: model.clone(),
-                system_fingerprint: None,
+                system_fingerprint: system_fingerprint.map(|s| s.to_string()),
                 choices: vec![ChatStreamChoice {
                     index: *index,
                     delta: ChatMessageDelta {
@@ -460,7 +500,7 @@ impl StreamingProcessor {
                     object: "chat.completion.chunk".to_string(),
                     created,
                     model: model.clone(),
-                    system_fingerprint: None,
+                    system_fingerprint: system_fingerprint.map(|s| s.to_string()),
                     choices: vec![],
                     usage: Some(Usage {
                         prompt_tokens: total_prompt,
@@ -481,13 +521,11 @@ impl StreamingProcessor {
     }
 
     /// Process dual streaming chunks (prefill + decode) - PD mode
-    #[allow(clippy::too_many_arguments)]
     pub async fn process_dual_streaming_chunks(
         &self,
         mut prefill_stream: Streaming<proto::GenerateResponse>,
         decode_stream: Streaming<proto::GenerateResponse>,
-        request_id: String,
-        model: String,
+        dispatch: super::context::DispatchMetadata,
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool),
         original_request: ChatCompletionRequest,
         tx: &UnboundedSender<Result<Bytes, io::Error>>,
@@ -511,15 +549,8 @@ impl StreamingProcessor {
         }
 
         // Phase 2-5: Process decode stream (same as single mode)
-        self.process_streaming_chunks(
-            decode_stream,
-            request_id,
-            model,
-            stop_params,
-            original_request,
-            tx,
-        )
-        .await
+        self.process_streaming_chunks(decode_stream, dispatch, stop_params, original_request, tx)
+            .await
     }
 
     // ========================================================================
@@ -566,6 +597,7 @@ impl StreamingProcessor {
         request_id: &str,
         model: &str,
         created: u64,
+        system_fingerprint: Option<&str>,
     ) -> (String, Option<ChatCompletionStreamResponse>, bool) {
         // Get or create parser for this index
         reasoning_parsers.entry(index).or_insert_with(|| {
@@ -595,7 +627,7 @@ impl StreamingProcessor {
                             object: "chat.completion.chunk".to_string(),
                             created,
                             model: model.to_string(),
-                            system_fingerprint: None,
+                            system_fingerprint: system_fingerprint.map(|s| s.to_string()),
                             choices: vec![ChatStreamChoice {
                                 index,
                                 delta: ChatMessageDelta {
@@ -636,6 +668,7 @@ impl StreamingProcessor {
         request_id: &str,
         model: &str,
         created: u64,
+        system_fingerprint: Option<&str>,
         history_tool_calls_count: usize,
     ) -> (bool, Vec<ChatCompletionStreamResponse>) {
         let mut chunks = Vec::new();
@@ -660,7 +693,7 @@ impl StreamingProcessor {
                             object: "chat.completion.chunk".to_string(),
                             created,
                             model: model.to_string(),
-                            system_fingerprint: None,
+                            system_fingerprint: system_fingerprint.map(|s| s.to_string()),
                             choices: vec![ChatStreamChoice {
                                 index,
                                 delta: ChatMessageDelta {
@@ -715,7 +748,7 @@ impl StreamingProcessor {
                             object: "chat.completion.chunk".to_string(),
                             created,
                             model: model.to_string(),
-                            system_fingerprint: None,
+                            system_fingerprint: system_fingerprint.map(|s| s.to_string()),
                             choices: vec![ChatStreamChoice {
                                 index,
                                 delta: ChatMessageDelta {
@@ -732,11 +765,11 @@ impl StreamingProcessor {
                         });
                     }
 
-                    return (false, chunks);
+                    // If we emitted chunks, skip regular content
+                    return (!chunks.is_empty(), chunks);
                 }
                 Err(e) => {
                     error!("Tool call parsing error: {}", e);
-                    return (false, chunks);
                 }
             }
         }
@@ -762,6 +795,7 @@ impl StreamingProcessor {
         request_id: &str,
         model: &str,
         created: u64,
+        system_fingerprint: Option<&str>,
         logprobs: Option<ChatLogProbs>,
     ) -> ChatCompletionStreamResponse {
         ChatCompletionStreamResponse {
@@ -769,7 +803,7 @@ impl StreamingProcessor {
             object: "chat.completion.chunk".to_string(),
             created,
             model: model.to_string(),
-            system_fingerprint: None,
+            system_fingerprint: system_fingerprint.map(|s| s.to_string()),
             choices: vec![ChatStreamChoice {
                 index,
                 delta: ChatMessageDelta {
