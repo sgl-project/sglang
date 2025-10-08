@@ -4,8 +4,8 @@ use super::ProcessedMessages;
 use crate::core::Worker;
 use crate::grpc_client::{proto, SglangSchedulerClient};
 use crate::protocols::spec::{
-    ChatCompletionRequest, ChatMessage, FunctionCallResponse, StringOrArray, Tool, ToolCall,
-    ToolChoice, ToolChoiceValue,
+    ChatCompletionRequest, ChatLogProbs, ChatLogProbsContent, ChatMessage, FunctionCallResponse,
+    StringOrArray, Tool, ToolCall, ToolChoice, ToolChoiceValue, TopLogProb,
 };
 use crate::tokenizer::chat_template::{ChatTemplateContentFormat, ChatTemplateParams};
 use crate::tokenizer::traits::Tokenizer;
@@ -734,6 +734,79 @@ pub fn get_tool_parser(
         // Auto-detect based on model
         tool_parser_factory.get_pooled(model)
     }
+}
+
+/// Convert proto::OutputLogProbs to OpenAI ChatLogProbs format
+///
+/// This function decodes token IDs using the tokenizer and builds the logprobs structure
+/// expected by the OpenAI API format.
+pub fn convert_proto_to_openai_logprobs(
+    proto_logprobs: &proto::OutputLogProbs,
+    tokenizer: &Arc<dyn Tokenizer>,
+) -> Result<ChatLogProbs, String> {
+    let mut content_items = Vec::new();
+
+    // Decode token IDs to text (always with skip_special_tokens=false for logprobs)
+    let token_texts: Vec<String> = proto_logprobs
+        .token_ids
+        .iter()
+        .map(|&token_id| {
+            tokenizer
+                .decode(&[token_id as u32], false)
+                .unwrap_or_else(|_| format!("<token_{}>", token_id))
+        })
+        .collect();
+
+    // Build ChatLogProbsContent for each token (consume iterator to avoid clones)
+    for (i, (&logprob, token_text)) in proto_logprobs
+        .token_logprobs
+        .iter()
+        .zip(token_texts.into_iter())
+        .enumerate()
+    {
+        let bytes = Some(token_text.as_bytes().to_vec());
+
+        // Build top_logprobs for this position
+        let mut top_logprobs = Vec::new();
+        if let Some(top_logprobs_entry) = proto_logprobs.top_logprobs.get(i) {
+            // Decode top token IDs (always with skip_special_tokens=false)
+            let top_token_texts: Vec<String> = top_logprobs_entry
+                .token_ids
+                .iter()
+                .map(|&tid| {
+                    tokenizer
+                        .decode(&[tid as u32], false)
+                        .unwrap_or_else(|_| format!("<token_{}>", tid))
+                })
+                .collect();
+
+            for (j, (&top_logprob, &_top_token_id)) in top_logprobs_entry
+                .values
+                .iter()
+                .zip(top_logprobs_entry.token_ids.iter())
+                .enumerate()
+            {
+                if let Some(top_token_text) = top_token_texts.get(j) {
+                    top_logprobs.push(TopLogProb {
+                        token: top_token_text.clone(),
+                        logprob: top_logprob,
+                        bytes: Some(top_token_text.as_bytes().to_vec()),
+                    });
+                }
+            }
+        }
+
+        content_items.push(ChatLogProbsContent {
+            token: token_text,
+            logprob,
+            bytes,
+            top_logprobs,
+        });
+    }
+
+    Ok(ChatLogProbs::Detailed {
+        content: (!content_items.is_empty()).then_some(content_items),
+    })
 }
 
 #[cfg(test)]
