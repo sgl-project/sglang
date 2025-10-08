@@ -397,9 +397,7 @@ class GrpcRequestManager:
         # Wait for result in background
         async def wait_for_result():
             try:
-                # Wait for completion
                 await state.event.wait()
-                # Get result from queue
                 result = await state.out_queue.get()
                 future.set_result(result)
             except Exception as e:
