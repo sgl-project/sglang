@@ -1430,6 +1430,7 @@ class Scheduler(
                 if value is INVALID_GRAMMAR_OBJ:  # We hit a cached invalid grammar.
                     error_msg = f"Invalid grammar request with cache hit: {key=}"
                     req.set_finish_with_abort(error_msg)
+                    return
 
         if add_to_grammar_queue:
             self.grammar_queue.append(req)
