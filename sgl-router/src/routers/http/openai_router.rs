@@ -2016,7 +2016,7 @@ impl OpenAIRouter {
     ///
     /// Returns borrowed strings when possible to avoid allocations in hot paths.
     /// Only allocates when multiple data lines need to be joined.
-    fn parse_sse_block(block: &str) -> (Option<&str>, std::borrow::Cow<'_, str>) {
+    fn parse_sse_block(block: &str) -> (Option<&str>, Cow<'_, str>) {
         let mut event_name: Option<&str> = None;
         let mut data_lines: Vec<&str> = Vec::new();
 
@@ -2029,9 +2029,9 @@ impl OpenAIRouter {
         }
 
         let data = if data_lines.len() == 1 {
-            std::borrow::Cow::Borrowed(data_lines[0])
+            Cow::Borrowed(data_lines[0])
         } else {
-            std::borrow::Cow::Owned(data_lines.join("\n"))
+            Cow::Owned(data_lines.join("\n"))
         };
 
         (event_name, data)
@@ -2714,7 +2714,7 @@ impl OpenAIRouter {
             }
             ResponseInput::Items(items) => {
                 // Items are already structured ResponseInputOutputItem, convert to JSON
-                if let Ok(items_value) = serde_json::to_value(items) {
+                if let Ok(items_value) = to_value(items) {
                     if let Some(items_arr) = items_value.as_array() {
                         input_array.extend_from_slice(items_arr);
                     }
@@ -2773,7 +2773,7 @@ impl OpenAIRouter {
                     .unwrap_or("{}");
 
                 // Check if output contains error by parsing JSON
-                let is_error = serde_json::from_str::<serde_json::Value>(output_str)
+                let is_error = serde_json::from_str::<Value>(output_str)
                     .map(|v| v.get("error").is_some())
                     .unwrap_or(false);
 
@@ -3189,7 +3189,7 @@ impl super::super::RouterTrait for OpenAIRouter {
                 let content_type = res.headers().get(CONTENT_TYPE).cloned();
                 match res.bytes().await {
                     Ok(body) => {
-                        let mut response = Response::new(axum::body::Body::from(body));
+                        let mut response = Response::new(Body::from(body));
                         *response.status_mut() = status;
                         if let Some(ct) = content_type {
                             response.headers_mut().insert(CONTENT_TYPE, ct);
@@ -3316,7 +3316,7 @@ impl super::super::RouterTrait for OpenAIRouter {
             match resp.bytes().await {
                 Ok(body) => {
                     self.circuit_breaker.record_success();
-                    let mut response = Response::new(axum::body::Body::from(body));
+                    let mut response = Response::new(Body::from(body));
                     *response.status_mut() = status;
                     if let Some(ct) = content_type {
                         response.headers_mut().insert(CONTENT_TYPE, ct);
