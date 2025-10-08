@@ -131,7 +131,7 @@ def get_rdma_devices_args():
             continue
 
         # Map GPU index to RDMA device index
-        rdma_index = base_rdma_group // 4 * 8 + (gpu_idx % 4)
+        rdma_index = base_rdma_group // 4 * 4 + (gpu_idx % 4)
         rdma_devices.append(f"mlx5_roce{rdma_index}")
 
     if not rdma_devices:
