@@ -60,7 +60,7 @@ from sglang.srt.mem_cache.allocator import (
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
-from sglang.srt.mem_cache.common import alloc_decode_batch, alloc_extend_batch
+from sglang.srt.mem_cache.common import alloc_for_decode, alloc_for_extend
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
@@ -1109,10 +1109,25 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_sum = self.seq_lens_cpu.sum().item()
         self.prefix_indices_list = [r.prefix_indices for r in reqs]
 
-        # Phase 2: Allocate memory - pure allocation using batch fields
-        out_cache_loc, req_pool_indices_tensor = alloc_extend_batch(self)
+        # Free memory before allocation
+        if isinstance(self.tree_cache, SWAChunkCache):
+            for req in reqs:
+                pre_len = len(req.prefix_indices)
+                if pre_len > 0:
+                    self.tree_cache.evict_swa(
+                        req, pre_len, self.model_config.attention_chunk_size
+                    )
+
+        # Phase 2: Allocate memory and write to pool
+        out_cache_loc, req_pool_indices_device, req_pool_indices = alloc_for_extend(
+            self
+        )
         self.out_cache_loc = out_cache_loc
-        self.req_pool_indices = req_pool_indices_tensor
+        self.req_pool_indices = req_pool_indices_device
+
+        # Update requests with pool indices
+        for req, req_pool_idx in zip(reqs, req_pool_indices):
+            req.req_pool_idx = req_pool_idx
 
         # Phase 3: Process requests - validation, adjustment, logprob setup
         input_embeds = []
@@ -1123,12 +1138,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             seq_len = len(req.fill_ids)
             pre_len = len(req.prefix_indices)
             assert seq_len - pre_len == req.extend_input_len
-
-            if pre_len > 0:
-                if isinstance(self.tree_cache, SWAChunkCache):
-                    self.tree_cache.evict_swa(
-                        req, pre_len, self.model_config.attention_chunk_size
-                    )
 
             # If input_embeds are available, store them
             if req.input_embeds is not None:
@@ -1484,8 +1493,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     req, req.seqlen - 1, self.model_config.attention_chunk_size
                 )
 
-        # Allocate memory based on current state
-        self.out_cache_loc = alloc_decode_batch(self, token_per_req=1)
+        # Allocate memory
+        self.out_cache_loc = alloc_for_decode(self, token_per_req=1)
 
         # Update seq_lens after allocation
         if self.enable_overlap:
