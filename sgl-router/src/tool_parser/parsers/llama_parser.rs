@@ -121,7 +121,6 @@ impl LlamaParser {
 
         Ok(all_tools)
     }
-
 }
 
 impl Default for LlamaParser {

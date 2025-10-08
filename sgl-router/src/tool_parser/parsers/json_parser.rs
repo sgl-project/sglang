@@ -174,7 +174,6 @@ impl JsonParser {
 
         Ok(tools)
     }
-
 }
 
 impl Default for JsonParser {
