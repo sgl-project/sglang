@@ -48,9 +48,10 @@ pub struct RequestInput {
 }
 
 /// Request type variants
+/// Using Arc instead of Box to enable cheap cloning for background tasks
 pub enum RequestType {
-    Chat(Box<ChatCompletionRequest>),
-    Generate(Box<GenerateRequest>),
+    Chat(Arc<ChatCompletionRequest>),
+    Generate(Arc<GenerateRequest>),
 }
 
 /// Shared components (injected once at creation)
@@ -181,14 +182,14 @@ pub struct StreamingState {
 impl RequestContext {
     /// Create context for chat completion request
     pub fn for_chat(
-        request: ChatCompletionRequest,
+        request: Arc<ChatCompletionRequest>,
         headers: Option<HeaderMap>,
         model_id: Option<String>,
         components: Arc<SharedComponents>,
     ) -> Self {
         Self {
             input: RequestInput {
-                request_type: RequestType::Chat(Box::new(request)),
+                request_type: RequestType::Chat(request),
                 headers,
                 model_id,
             },
@@ -199,14 +200,14 @@ impl RequestContext {
 
     /// Create context for generate request
     pub fn for_generate(
-        request: GenerateRequest,
+        request: Arc<GenerateRequest>,
         headers: Option<HeaderMap>,
         model_id: Option<String>,
         components: Arc<SharedComponents>,
     ) -> Self {
         Self {
             input: RequestInput {
-                request_type: RequestType::Generate(Box::new(request)),
+                request_type: RequestType::Generate(request),
                 headers,
                 model_id,
             },
@@ -228,10 +229,26 @@ impl RequestContext {
         }
     }
 
+    /// Get Arc clone of chat request (panics if not chat)
+    pub fn chat_request_arc(&self) -> Arc<ChatCompletionRequest> {
+        match &self.input.request_type {
+            RequestType::Chat(req) => Arc::clone(req),
+            _ => panic!("Expected chat request"),
+        }
+    }
+
     /// Get generate request (panics if not generate)
     pub fn generate_request(&self) -> &GenerateRequest {
         match &self.input.request_type {
             RequestType::Generate(req) => req.as_ref(),
+            _ => panic!("Expected generate request"),
+        }
+    }
+
+    /// Get Arc clone of generate request (panics if not generate)
+    pub fn generate_request_arc(&self) -> Arc<GenerateRequest> {
+        match &self.input.request_type {
+            RequestType::Generate(req) => Arc::clone(req),
             _ => panic!("Expected generate request"),
         }
     }
