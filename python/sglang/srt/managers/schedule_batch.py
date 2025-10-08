@@ -920,8 +920,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     extend_logprob_start_lens: List[int] = None
     # It comes empty list if logprob is not required.
     extend_input_logprob_token_ids: Optional[torch.Tensor] = None
-    # For allocation - list of prefix_indices tensors per request
-    prefix_indices_list: Optional[List[torch.Tensor]] = None
 
     # For encoder-decoder architectures
     encoder_cached: Optional[List[bool]] = None
@@ -1109,7 +1107,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
         self.seq_lens = self.seq_lens_cpu.to(self.device, non_blocking=True)
         self.seq_lens_sum = self.seq_lens_cpu.sum().item()
-        self.prefix_indices_list = [r.prefix_indices for r in reqs]
 
         # Free memory before allocation
         if isinstance(self.tree_cache, SWAChunkCache):

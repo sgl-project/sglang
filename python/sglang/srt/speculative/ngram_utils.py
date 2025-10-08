@@ -7,11 +7,6 @@ from typing import Optional, Tuple
 import torch
 import triton
 
-from sglang.srt.mem_cache.common import (
-    alloc_paged_token_slots_extend,
-    alloc_token_slots,
-)
-
 logger = logging.getLogger(__name__)
 
 from dataclasses import dataclass
@@ -22,7 +17,11 @@ from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_trito
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import ScheduleBatch, global_server_args_dict
-from sglang.srt.mem_cache.common import get_last_loc
+from sglang.srt.mem_cache.common import (
+    alloc_paged_token_slots_extend,
+    alloc_token_slots,
+    get_last_loc,
+)
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (

@@ -88,7 +88,8 @@ def write_cache_indices(
 ):
     if support_triton(global_server_args_dict.get("attention_backend")):
         prefix_pointers = torch.tensor(
-            [t.data_ptr() for t in prefix_tensors], device=req_to_token_pool.device
+            [t.data_ptr() for t in prefix_tensors],
+            device=req_to_token_pool.device,
         )
         # TODO: some tensors can be reused for ForwardBatchInfo (e.g., extend_lens, cumsum_start)
         write_req_to_token_pool_triton[(req_pool_indices_tensor.shape[0],)](
@@ -328,14 +329,12 @@ def alloc_req_slots(
 
 def alloc_kv_cache_for_extend(
     tree_cache: BasePrefixCache,
-    token_to_kv_pool_allocator,
     prefix_lens_device: torch.Tensor,
     prefix_lens_cpu: torch.Tensor,
     seq_lens_device: torch.Tensor,
     seq_lens_cpu: torch.Tensor,
-    prefix_indices_list: list[torch.Tensor],
+    prefix_tensors: list[torch.Tensor],
     extend_num_tokens: int,
-    device: str,
 ) -> torch.Tensor:
     """
     Allocate KV cache for extend batch.
@@ -346,19 +345,13 @@ def alloc_kv_cache_for_extend(
     Returns:
         out_cache_loc: allocated KV cache locations
     """
-    page_size = token_to_kv_pool_allocator.page_size
-
-    if page_size == 1:
+    if tree_cache.page_size == 1:
         return alloc_token_slots(tree_cache, extend_num_tokens)
     else:
         # Paged allocation - build last_loc
         last_loc = [
-            (
-                prefix_indices[-1:]
-                if len(prefix_indices) > 0
-                else torch.tensor([-1], device=device)
-            )
-            for prefix_indices in prefix_indices_list
+            (t[-1:] if len(t) > 0 else torch.tensor([-1], device=tree_cache.device))
+            for t in prefix_tensors
         ]
         return alloc_paged_token_slots_extend(
             tree_cache=tree_cache,
@@ -383,6 +376,7 @@ def alloc_for_extend(
         req_pool_indices: request pool indices as list
     """
     bs = len(batch.reqs)
+    prefix_tensors = [r.prefix_indices for r in batch.reqs]
 
     # Create tensors for allocation
     prefix_lens_cpu = torch.tensor(batch.prefix_lens, dtype=torch.int64)
@@ -397,15 +391,13 @@ def alloc_for_extend(
 
     # Allocate KV cache
     out_cache_loc = alloc_kv_cache_for_extend(
-        tree_cache=batch.tree_cache,
-        token_to_kv_pool_allocator=batch.token_to_kv_pool_allocator,
-        prefix_lens_device=prefix_lens_device,
-        prefix_lens_cpu=prefix_lens_cpu,
-        seq_lens_device=batch.seq_lens,
-        seq_lens_cpu=batch.seq_lens_cpu,
-        prefix_indices_list=batch.prefix_indices_list,
-        extend_num_tokens=batch.extend_num_tokens,
-        device=batch.device,
+        batch.tree_cache,
+        prefix_lens_device,
+        prefix_lens_cpu,
+        batch.seq_lens,
+        batch.seq_lens_cpu,
+        prefix_tensors,
+        batch.extend_num_tokens,
     )
 
     # Write to req_to_token_pool
@@ -419,7 +411,7 @@ def alloc_for_extend(
         batch.seq_lens_cpu,
         extend_lens_device,
         extend_lens_cpu,
-        batch.prefix_indices_list,
+        prefix_tensors,
         batch.req_to_token_pool,
     )
 
