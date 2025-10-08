@@ -65,6 +65,10 @@ pub struct StoredResponse {
     /// Model used for generation
     pub model: Option<String>,
 
+    /// Conversation id if associated with a conversation
+    #[serde(default)]
+    pub conversation_id: Option<String>,
+
     /// Raw OpenAI response payload
     #[serde(default)]
     pub raw_response: Value,
@@ -83,6 +87,7 @@ impl StoredResponse {
             created_at: chrono::Utc::now(),
             user: None,
             model: None,
+            conversation_id: None,
             raw_response: Value::Null,
         }
     }

@@ -125,6 +125,7 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
         top_k: -1,
         min_p: 0.0,
         repetition_penalty: 1.0,
+        conversation: None,
     };
 
     let resp = router
@@ -371,6 +372,7 @@ fn test_responses_request_creation() {
         top_k: -1,
         min_p: 0.0,
         repetition_penalty: 1.0,
+        conversation: None,
     };
 
     assert!(!request.is_stream());
@@ -411,6 +413,7 @@ fn test_sampling_params_conversion() {
         top_k: 10,
         min_p: 0.05,
         repetition_penalty: 1.1,
+        conversation: None,
     };
 
     let params = request.to_sampling_params(1000, None);
@@ -524,6 +527,7 @@ fn test_json_serialization() {
         top_k: 50,
         min_p: 0.1,
         repetition_penalty: 1.2,
+        conversation: None,
     };
 
     let json = serde_json::to_string(&request).expect("Serialization should work");
@@ -651,6 +655,7 @@ async fn test_multi_turn_loop_with_mcp() {
         top_k: 50,
         min_p: 0.0,
         repetition_penalty: 1.0,
+        conversation: None,
     };
 
     // Execute the request (this should trigger the multi-turn loop)
@@ -828,6 +833,7 @@ async fn test_max_tool_calls_limit() {
         top_k: 50,
         min_p: 0.0,
         repetition_penalty: 1.0,
+        conversation: None,
     };
 
     let response = router.route_responses(None, &req, None).await;
@@ -1023,6 +1029,7 @@ async fn test_streaming_with_mcp_tool_calls() {
         top_k: 50,
         min_p: 0.0,
         repetition_penalty: 1.0,
+        conversation: None,
     };
 
     let response = router.route_responses(None, &req, None).await;
@@ -1301,6 +1308,7 @@ async fn test_streaming_multi_turn_with_mcp() {
         top_k: 50,
         min_p: 0.0,
         repetition_penalty: 1.0,
+        conversation: None,
     };
 
     let response = router.route_responses(None, &req, None).await;
