@@ -464,6 +464,19 @@ class ServerArgs:
     enable_pdmux: bool = False
     sm_group_num: int = 3
 
+    def get_attention_backends(server_args):
+        prefill_attention_backend_str = (
+            server_args.prefill_attention_backend
+            if server_args.prefill_attention_backend
+            else server_args.attention_backend
+        )
+        decode_attention_backend_str = (
+            server_args.decode_attention_backend
+            if server_args.decode_attention_backend
+            else server_args.attention_backend
+        )
+        return prefill_attention_backend_str, decode_attention_backend_str
+
     def __post_init__(self):
         """
         Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
@@ -748,20 +761,28 @@ class ServerArgs:
         hf_config = self.get_hf_config()
         model_arch = hf_config.architectures[0]
         if model_arch in ["GptOssForCausalLM"]:
-            if self.attention_backend is None:
+            if (
+                self.attention_backend is None
+                and self.prefill_attention_backend is None
+                and self.decode_attention_backend is None
+            ):
                 if is_cuda() and is_sm100_supported():
                     self.attention_backend = "trtllm_mha"
                 elif is_cuda() and is_sm90_supported():
                     self.attention_backend = "fa3"
                 else:
                     self.attention_backend = "triton"
-            supported_backends = ["triton", "trtllm_mha", "fa3"]
-            logger.info(
-                f"Use {self.attention_backend} as attention backend for GptOssForCausalLM"
-            )
+
+            supported_backends = ["triton", "trtllm_mha", "fa3", "fa4"]
+            prefill_attn_backend, decode_attn_backend = self.get_attention_backends()
             assert (
-                self.attention_backend in supported_backends
-            ), f"GptOssForCausalLM requires one of {supported_backends} attention backend, but got '{self.attention_backend}'"
+                prefill_attn_backend in supported_backends
+                and decode_attn_backend in supported_backends
+            ), (
+                f"GptOssForCausalLM requires one of {supported_backends} attention backend, but got the following backends\n"
+                f"- Prefill: {prefill_attn_backend}\n"
+                f"- Decode: {decode_attn_backend}\n"
+            )
 
             if is_sm100_supported():
                 if not self.enable_dp_attention:
