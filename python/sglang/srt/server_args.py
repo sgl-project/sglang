@@ -121,6 +121,17 @@ NSA_CHOICES = ["flashmla_prefill", "flashmla_decode", "fa3", "tilelang", "aiter"
 
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu"]
 
+MOE_RUNNER_BACKEND_CHOICES = [
+    "auto",
+    "deep_gemm",
+    "triton",
+    "triton_kernel",
+    "flashinfer_trtllm",
+    "flashinfer_cutlass",
+    "flashinfer_mxfp4",
+    "flashinfer_cutedsl",
+]
+
 
 # Allow external code to add more choices
 def add_load_format_choices(choices):
@@ -141,6 +152,10 @@ def add_disagg_transfer_backend_choices(choices):
 
 def add_grammar_backend_choices(choices):
     GRAMMAR_BACKEND_CHOICES.extend(choices)
+
+
+def add_moe_runner_backend_choices(choices):
+    MOE_RUNNER_BACKEND_CHOICES.extend(choices)
 
 
 def add_deterministic_attention_backend_choices(choices):
@@ -252,6 +267,7 @@ class ServerArgs:
     reasoning_parser: Optional[str] = None
     tool_call_parser: Optional[str] = None
     tool_server: Optional[str] = None
+    sampling_defaults: str = "model"
 
     # Data parallelism
     dp_size: int = 1
@@ -314,14 +330,7 @@ class ServerArgs:
     # Expert parallelism
     ep_size: int = 1
     moe_a2a_backend: Literal["none", "deepep"] = "none"
-    moe_runner_backend: Literal[
-        "auto",
-        "triton",
-        "triton_kernel",
-        "flashinfer_trtllm",
-        "flashinfer_cutlass",
-        "flashinfer_mxfp4",
-    ] = "auto"
+    moe_runner_backend: str = "auto"
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
     enable_flashinfer_allreduce_fusion: bool = False
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
@@ -1867,6 +1876,16 @@ class ServerArgs:
             help=f"Specify the parser for handling tool-call interactions. Options include: {tool_call_parser_choices}.",
         )
         parser.add_argument(
+            "--sampling-defaults",
+            type=str,
+            choices=["openai", "model"],
+            default=ServerArgs.sampling_defaults,
+            help="Where to get default sampling parameters. "
+            "'openai' uses SGLang/OpenAI defaults (temperature=1.0, top_p=1.0, etc.). "
+            "'model' uses the model's generation_config.json to get the recommended "
+            "sampling parameters if available. Default is 'model'.",
+        )
+        parser.add_argument(
             "--tool-server",
             type=str,
             default=None,
@@ -2174,15 +2193,7 @@ class ServerArgs:
         parser.add_argument(
             "--moe-runner-backend",
             type=str,
-            choices=[
-                "auto",
-                "triton",
-                "triton_kernel",
-                "flashinfer_trtllm",
-                "flashinfer_cutlass",
-                "flashinfer_mxfp4",
-                "flashinfer_cutedsl",
-            ],
+            choices=MOE_RUNNER_BACKEND_CHOICES,
             default=ServerArgs.moe_runner_backend,
             help="Choose the runner backend for MoE.",
         )
