@@ -21,8 +21,8 @@ import zmq.asyncio
 
 from sglang.srt.managers.io_struct import (
     AbortReq,
-    BatchEmbeddingOut,
-    BatchTokenIDOut,
+    BatchEmbeddingOutput,
+    BatchTokenIDOutput,
     HealthCheckOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -110,22 +110,23 @@ class GrpcRequestManager:
         self,
         server_args: ServerArgs,
         port_args: PortArgs,
+        bootstrap_server=None,
     ):
         """Initialize the gRPC request manager."""
         self.server_args = server_args
         self.port_args = port_args
 
         # ZMQ Communication Setup (same pattern as TokenizerManager)
-        context = zmq.asyncio.Context(2)
+        self.context = zmq.asyncio.Context(2)
 
         # Socket for receiving outputs from scheduler
         self.recv_from_scheduler = get_zmq_socket(
-            context, zmq.PULL, port_args.detokenizer_ipc_name, bind=True
+            self.context, zmq.PULL, port_args.detokenizer_ipc_name, bind=True
         )
 
         # Socket for sending requests to scheduler
         self.send_to_scheduler = get_zmq_socket(
-            context, zmq.PUSH, port_args.scheduler_input_ipc_name, bind=True
+            self.context, zmq.PUSH, port_args.scheduler_input_ipc_name, bind=True
         )
 
         # State Management (from TokenizerManager)
@@ -146,11 +147,19 @@ class GrpcRequestManager:
         self.crash_dump_request_list = []
         self.crash_dump_performed = False
 
+        # Bootstrap server (passed from serve_grpc, not started here)
+        self.bootstrap_server = bootstrap_server
+
         logger.info(
             f"GrpcRequestManager initialized with ZMQ IPC: "
             f"recv={port_args.detokenizer_ipc_name}, "
             f"send={port_args.scheduler_input_ipc_name}"
         )
+        if self.bootstrap_server:
+            logger.info(
+                f"Bootstrap server initialized for disaggregation mode: "
+                f"{server_args.disaggregation_mode}"
+            )
 
     async def generate_request(
         self,
@@ -254,8 +263,8 @@ class GrpcRequestManager:
                         response = await task
 
                         # Add index for client-side ordering
-                        if isinstance(response, dict) and "meta_info" in response:
-                            response_rid = response["meta_info"].get("id", "")
+                        if isinstance(response, dict):
+                            response_rid = response.get("request_id", "")
                             if response_rid in rid_to_index:
                                 response["index"] = rid_to_index[response_rid]
 
@@ -458,9 +467,9 @@ class GrpcRequestManager:
                         await self.is_pause_cond.wait()
 
                 # Handle different output types
-                if isinstance(recv_obj, BatchTokenIDOut):
+                if isinstance(recv_obj, BatchTokenIDOutput):
                     await self._handle_batch_output(recv_obj)
-                elif isinstance(recv_obj, BatchEmbeddingOut):
+                elif isinstance(recv_obj, BatchEmbeddingOutput):
                     await self._handle_embedding_output(recv_obj)
                 elif isinstance(recv_obj, HealthCheckOutput):
                     await self._handle_health_check_output(recv_obj)
@@ -472,12 +481,71 @@ class GrpcRequestManager:
                 if self.gracefully_exit:
                     break
                 continue
+            except zmq.error.ZMQError as e:
+                # Socket closed or other ZMQ error - exit cleanly if shutting down
+                if self.gracefully_exit:
+                    logger.debug(f"ZMQ recv interrupted during shutdown: {e}")
+                    break
+                logger.error(
+                    f"ZMQ error in handle loop: {e}\n{get_exception_traceback()}"
+                )
+                break
             except Exception as e:
                 logger.error(f"Handle loop error: {e}\n{get_exception_traceback()}")
                 if self.gracefully_exit:
                     break
 
-    async def _handle_batch_output(self, batch_out: BatchTokenIDOut):
+    def _convert_logprob_style(
+        self,
+        state: GrpcReqState,
+        batch_out: BatchTokenIDOutput,
+        batch_index: int,
+    ):
+        """
+        Convert and accumulate logprobs from batch output to state.
+        Follows the same logic as tokenizer_manager.convert_logprob_style.
+        """
+        # Early exit if no input logprobs at all
+        if batch_out.input_token_logprobs_val is None:
+            return
+
+        # Accumulate input token logprobs (only if list is non-empty)
+        if len(batch_out.input_token_logprobs_val) > 0:
+            state.input_token_logprobs_val.extend(
+                batch_out.input_token_logprobs_val[batch_index]
+            )
+            state.input_token_logprobs_idx.extend(
+                batch_out.input_token_logprobs_idx[batch_index]
+            )
+
+        # Always accumulate output token logprobs
+        state.output_token_logprobs_val.extend(
+            batch_out.output_token_logprobs_val[batch_index]
+        )
+        state.output_token_logprobs_idx.extend(
+            batch_out.output_token_logprobs_idx[batch_index]
+        )
+
+        # Handle top logprobs if requested
+        if state.obj.top_logprobs_num > 0:
+            # Accumulate input top logprobs (only if list is non-empty)
+            if len(batch_out.input_top_logprobs_val) > 0:
+                state.input_top_logprobs_val.extend(
+                    batch_out.input_top_logprobs_val[batch_index]
+                )
+                state.input_top_logprobs_idx.extend(
+                    batch_out.input_top_logprobs_idx[batch_index]
+                )
+
+            # Always accumulate output top logprobs
+            state.output_top_logprobs_val.extend(
+                batch_out.output_top_logprobs_val[batch_index]
+            )
+            state.output_top_logprobs_idx.extend(
+                batch_out.output_top_logprobs_idx[batch_index]
+            )
+
+    async def _handle_batch_output(self, batch_out: BatchTokenIDOutput):
         """Handle batch generation output from scheduler."""
         # Process each request in the batch
         for i, rid in enumerate(batch_out.rids):
@@ -510,42 +578,23 @@ class GrpcRequestManager:
                         batch_out.cached_tokens[i] if batch_out.cached_tokens else 0
                     ),
                     "finish_reason": (
-                        str(batch_out.finished_reasons[i])
+                        batch_out.finished_reasons[i]
                         if batch_out.finished_reasons[i]
                         else None
                     ),
                 },
             }
 
-            # Accumulate input logprobs (only once, usually in first chunk)
-            if batch_out.input_token_logprobs_val and i < len(
-                batch_out.input_token_logprobs_val
-            ):
-                if not state.input_token_logprobs_val:
-                    state.input_token_logprobs_val.extend(
-                        batch_out.input_token_logprobs_val[i]
-                    )
-                    if batch_out.input_token_logprobs_idx and i < len(
-                        batch_out.input_token_logprobs_idx
-                    ):
-                        state.input_token_logprobs_idx.extend(
-                            batch_out.input_token_logprobs_idx[i]
-                        )
-                    if batch_out.input_top_logprobs_val and i < len(
-                        batch_out.input_top_logprobs_val
-                    ):
-                        state.input_top_logprobs_val.extend(
-                            batch_out.input_top_logprobs_val[i]
-                        )
-                    if batch_out.input_top_logprobs_idx and i < len(
-                        batch_out.input_top_logprobs_idx
-                    ):
-                        state.input_top_logprobs_idx.extend(
-                            batch_out.input_top_logprobs_idx[i]
-                        )
+            # Accumulate logprobs (following tokenizer_manager pattern)
+            if state.obj.return_logprob:
+                self._convert_logprob_style(state, batch_out, i)
 
-            # Send input logprobs based on mode
-            if state.input_token_logprobs_val:
+            # Send input logprobs based if available
+            if (
+                state.obj.return_logprob
+                and state.obj.logprob_start_len >= 0
+                and state.input_token_logprobs_val
+            ):
                 if state.obj.stream and not state.input_logprobs_sent:
                     # Streaming: send input logprobs once in first chunk that has them
                     output_data["input_logprobs"] = {
@@ -564,33 +613,12 @@ class GrpcRequestManager:
                         "top_logprobs_idx": state.input_top_logprobs_idx,
                     }
 
-            # Add output logprobs if available (RAW - no detokenization!)
-            if batch_out.output_token_logprobs_val and i < len(
-                batch_out.output_token_logprobs_val
+            # Send output logprobs if available
+            if (
+                state.obj.return_logprob
+                and batch_out.output_token_logprobs_val
+                and i < len(batch_out.output_token_logprobs_val)
             ):
-                # Accumulate in state first
-                state.output_token_logprobs_val.extend(
-                    batch_out.output_token_logprobs_val[i]
-                )
-                if batch_out.output_token_logprobs_idx and i < len(
-                    batch_out.output_token_logprobs_idx
-                ):
-                    state.output_token_logprobs_idx.extend(
-                        batch_out.output_token_logprobs_idx[i]
-                    )
-                if batch_out.output_top_logprobs_val and i < len(
-                    batch_out.output_top_logprobs_val
-                ):
-                    state.output_top_logprobs_val.extend(
-                        batch_out.output_top_logprobs_val[i]
-                    )
-                if batch_out.output_top_logprobs_idx and i < len(
-                    batch_out.output_top_logprobs_idx
-                ):
-                    state.output_top_logprobs_idx.extend(
-                        batch_out.output_top_logprobs_idx[i]
-                    )
-
                 if state.obj.stream:
                     # For streaming: send incremental logprobs (only new tokens in this chunk)
                     # NOTE: this is different than TokenizerManager, which always accumulates
@@ -638,7 +666,7 @@ class GrpcRequestManager:
 
                 asyncio.create_task(cleanup())
 
-    async def _handle_embedding_output(self, batch_out: BatchEmbeddingOut):
+    async def _handle_embedding_output(self, batch_out: BatchEmbeddingOutput):
         """Handle batch embedding output from scheduler."""
         for i, rid in enumerate(batch_out.rids):
             if rid not in self.rid_to_state:
@@ -722,8 +750,17 @@ class GrpcRequestManager:
         logger.info("Shutting down GrpcRequestManager")
         self.gracefully_exit = True
 
+        # Cancel all asyncio tasks FIRST - this will interrupt blocked recv() calls
+        for task in list(self.asyncio_tasks):
+            if not task.done():
+                task.cancel()
+
+        # Give tasks a moment to process cancellation
+        if self.asyncio_tasks:
+            await asyncio.gather(*list(self.asyncio_tasks), return_exceptions=True)
+
         # Cancel all pending requests
-        for rid, state in self.rid_to_state.items():
+        for rid, state in list(self.rid_to_state.items()):
             if not state.finished:
                 await state.out_queue.put(
                     {"error": "Server shutting down", "shutdown": True}
@@ -735,9 +772,24 @@ class GrpcRequestManager:
         if self.asyncio_tasks:
             await asyncio.gather(*list(self.asyncio_tasks), return_exceptions=True)
 
+        # Shutdown bootstrap server if running
+        if self.bootstrap_server:
+            logger.info("Shutting down bootstrap server")
+            try:
+                if hasattr(self.bootstrap_server, "shutdown"):
+                    if asyncio.iscoroutinefunction(self.bootstrap_server.shutdown):
+                        await self.bootstrap_server.shutdown()
+                    else:
+                        self.bootstrap_server.shutdown()
+            except Exception as e:
+                logger.warning(f"Error shutting down bootstrap server: {e}")
+
         # Close ZMQ sockets
         self.recv_from_scheduler.close()
         self.send_to_scheduler.close()
+
+        # Terminate the ZMQ context - this is critical for asyncio loop to exit cleanly
+        self.context.term()
 
         logger.info("GrpcRequestManager shutdown complete")
 

@@ -2,6 +2,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{to_value, Map, Number, Value};
 use std::collections::HashMap;
 
+// Default model value when not specified
+fn default_model() -> String {
+    "unknown".to_string()
+}
+
 // # Protocol Specifications
 //
 // This module contains all protocol definitions for OpenAI and SGLang APIs.
@@ -72,8 +77,6 @@ pub enum ChatMessage {
         name: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         tool_calls: Option<Vec<ToolCall>>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        function_call: Option<FunctionCallResponse>,
         /// Reasoning content for O1-style models (SGLang extension)
         #[serde(skip_serializing_if = "Option::is_none")]
         reasoning_content: Option<String>,
@@ -140,8 +143,6 @@ pub struct ChatMessageDelta {
     pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCallDelta>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub function_call: Option<FunctionCallDelta>,
     /// Reasoning content delta for O1-style models (SGLang extension)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
@@ -173,6 +174,7 @@ pub struct ChatCompletionRequest {
     pub messages: Vec<ChatMessage>,
 
     /// ID of the model to use
+    #[serde(default = "default_model")]
     pub model: String,
 
     /// Number between -2.0 and 2.0. Positive values penalize new tokens based on their existing frequency in the text so far
@@ -473,6 +475,8 @@ pub struct ChatStreamChoice {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logprobs: Option<ChatLogProbs>,
     pub finish_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched_stop: Option<Value>,
 }
 
 // Completions API request types (v1/completions) - DEPRECATED but still supported
@@ -723,7 +727,10 @@ pub enum ResponseToolType {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ResponseReasoningParam {
     #[serde(default = "default_reasoning_effort")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<ReasoningEffort>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<ReasoningSummary>,
 }
 
 fn default_reasoning_effort() -> Option<ReasoningEffort> {
@@ -736,6 +743,14 @@ pub enum ReasoningEffort {
     Low,
     Medium,
     High,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningSummary {
+    Auto,
+    Concise,
+    Detailed,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -797,6 +812,17 @@ pub enum ResponseReasoningContent {
     ReasoningText { text: String },
 }
 
+/// MCP Tool information for the mcp_list_tools output item
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct McpToolInfo {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub input_schema: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<Value>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
@@ -825,6 +851,25 @@ pub enum ResponseOutputItem {
         #[serde(skip_serializing_if = "Option::is_none")]
         output: Option<String>,
         status: String,
+    },
+    #[serde(rename = "mcp_list_tools")]
+    McpListTools {
+        id: String,
+        server_label: String,
+        tools: Vec<McpToolInfo>,
+    },
+    #[serde(rename = "mcp_call")]
+    McpCall {
+        id: String,
+        status: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        approval_request_id: Option<String>,
+        arguments: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+        name: String,
+        output: String,
+        server_label: String,
     },
 }
 
@@ -2020,6 +2065,40 @@ impl GenerationRequest for GenerateRequest {
         String::new()
     }
 }
+
+// TODO(generate): Define GenerateResponse and GenerateChoice structs
+//
+// Required for pipeline generate response processing (see grpc/pipeline.rs:931-964)
+//
+// #[derive(Debug, Clone, Serialize, Deserialize)]
+// pub struct GenerateResponse {
+//     pub id: String,
+//     pub object: String,  // "text.completion"
+//     pub created: u64,
+//     pub model: String,
+//     pub choices: Vec<GenerateChoice>,
+//     #[serde(skip_serializing_if = "Option::is_none")]
+//     pub usage: Option<Usage>,
+//     #[serde(skip_serializing_if = "Option::is_none")]
+//     pub system_fingerprint: Option<String>,
+// }
+//
+// #[derive(Debug, Clone, Serialize, Deserialize)]
+// pub struct GenerateChoice {
+//     pub index: u32,
+//     pub text: String,
+//     #[serde(skip_serializing_if = "Option::is_none")]
+//     pub output_ids: Option<Vec<u32>>,
+//     #[serde(skip_serializing_if = "Option::is_none")]
+//     pub finish_reason: Option<String>,
+//     #[serde(skip_serializing_if = "Option::is_none")]
+//     pub logprobs: Option<TopLogprobs>,
+//     #[serde(skip_serializing_if = "Option::is_none")]
+//     pub matched_stop: Option<Value>,
+// }
+//
+// Note: Verify if similar structs already exist elsewhere before implementing.
+// May need streaming variant (GenerateStreamResponse) as well.
 
 // Constants for rerank API
 pub const DEFAULT_MODEL_NAME: &str = "default";

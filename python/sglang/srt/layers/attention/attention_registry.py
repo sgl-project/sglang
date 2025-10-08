@@ -66,6 +66,13 @@ def create_ascend_backend(runner):
     return AscendAttnBackend(runner)
 
 
+@register_attention_backend("nsa")
+def create_nsa_backend(runner):
+    from sglang.srt.layers.attention.nsa_backend import NativeSparseAttnBackend
+
+    return NativeSparseAttnBackend(runner)
+
+
 @register_attention_backend("triton")
 def create_triton_backend(runner):
     assert not runner.model_config.is_encoder_decoder, (
@@ -175,7 +182,8 @@ def attn_backend_wrapper(runner, full_attn_backend):
         if is_blackwell():
             assert (
                 runner.server_args.attention_backend == "triton"
-            ), "triton backend is the only supported backend on Blackwell GPUs for hybrid GDN models, use --attention-backend triton to specify the backend."
+                or runner.server_args.attention_backend == "trtllm_mha"
+            ), "triton or trtllm_mha backend are the only supported backends on Blackwell GPUs for hybrid GDN models, use --attention-backend triton or --attention-backend trtllm_mha to specify the backend."
         if is_npu():
             assert (
                 runner.server_args.attention_backend == "ascend"
