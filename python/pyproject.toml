@@ -69,7 +69,7 @@ dependencies = [
   "xgrammar==0.1.24",
   "grpcio==1.75.1", # keep it align with compile_proto.py
   "grpcio-tools==1.75.1", # keep it align with compile_proto.py
-  "cllmv==0.0.5"
+  "cllmv==0.0.6"
 ]
 
 [project.optional-dependencies]
