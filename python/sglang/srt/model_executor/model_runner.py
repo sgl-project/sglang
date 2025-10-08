@@ -268,6 +268,7 @@ class ModelRunner:
         self.model_specific_adjustment()
 
         # Global vars
+        # FIXME: deprecate this, use `global_server_args` from sglang.srt.server_args instead
         global_server_args_dict.update(
             {k: getattr(server_args, k) for k in GLOBAL_SERVER_ARGS_KEYS}
             | {

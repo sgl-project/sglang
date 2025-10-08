@@ -117,6 +117,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
 ]
 
 # Put some global args for easy access
+# FIXME: deprecate this, use `global_server_args` from sglang.srt.server_args instead
 global_server_args_dict = {k: getattr(ServerArgs, k) for k in GLOBAL_SERVER_ARGS_KEYS}
 
 logger = logging.getLogger(__name__)
