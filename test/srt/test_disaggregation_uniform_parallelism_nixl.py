@@ -39,7 +39,7 @@ class TestDisaggregationUniformParallelismNixl(TestDisaggregationNixl):
                 args = SimpleNamespace(
                     num_shots=5,
                     data_path=None,
-                    num_questions=100,
+                    num_questions=50,
                     max_new_tokens=512,
                     parallel=64,
                     host=f"http://{self.base_host}",

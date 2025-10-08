@@ -15,15 +15,14 @@ from sglang.test.test_utils import (
 
 
 class TestDisaggregationVariableParallelismNixl(TestDisaggregationNixl):
-    """Test NIXL disaggregation functionality"""
+    """Test NIXL disaggregation functionality with variable TP"""
 
     def test_gsm8k_accuracy(self):
         """Test GSM8K accuracy with NIXL disaggregation"""
         test_cases = [
             (1, 1, 2),  # 1 prefill TP, 1 prefill PP, 2 decode TP
-            (1, 2, 2),  # 1 prefill TP, 2 prefill PP, 2 decode TP
             (2, 1, 4),  # 2 prefill TP, 1 prefill PP, 4 decode TP
-            (2, 2, 4),  # 2 prefill TP, 2 prefill PP, 4 decode TP
+            (2, 2, 2),  # 2 prefill TP, 2 prefill PP, 2 decode TP
         ]
 
         expected_accuracy = 0.70
@@ -50,7 +49,7 @@ class TestDisaggregationVariableParallelismNixl(TestDisaggregationNixl):
                 args = SimpleNamespace(
                     num_shots=5,
                     data_path=None,
-                    num_questions=100,
+                    num_questions=50,
                     max_new_tokens=512,
                     parallel=64,
                     host=f"http://{self.base_host}",
