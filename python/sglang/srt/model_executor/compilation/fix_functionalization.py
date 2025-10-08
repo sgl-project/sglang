@@ -1,5 +1,4 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Adapted from https://github.com/vllm-project/vllm/blob/v0.10.0/vllm/compilation/fix_functionalization.py
 
 import logging
 import operator
@@ -33,35 +32,6 @@ class FixFunctionalizationPass(SGLangInductorPass):
         for node in graph.nodes:
             if not is_func(node, auto_functionalized):
                 continue  # Avoid deep if-elif nesting
-
-            kwargs = node.kwargs
-            at_target = node.args[0]
-
-            # print("at_target: ", at_target)
-
-            # if at_target == torch.ops.sgl_kernel.apply_rope_pos_ids_cos_sin_cache.default:
-            #     print("rotary_embedding")
-            #     print("kwargs: ", kwargs)
-            #     query = kwargs["q"]
-            #     mm_node = query.args[0].args[0]
-
-            #     # rotary_embedding is a special case: the two mutating inputs
-            #     # are query and key, which are slices of mm_node.
-            #     # While functionalized, results at[1] and at[2] are scattered
-            #     # back into mm_node. After de-functionalization, we can just
-            #     # use mm_node directly.
-            #     for idx, user in self.getitem_users(node).items():
-            #         for user_of_getitem in user.users:
-            #             if is_func(
-            #                 user_of_getitem, torch.ops.aten.slice_scatter.default
-            #             ):
-            #                 user_of_getitem.replace_all_uses_with(mm_node)
-            #                 self._remove(user_of_getitem)
-            #         self._remove(user)
-
-            #     self.insert_defunctionalized(graph, node)
-            #     self._remove(node)
-
             count += 1
 
         self.dump_graph(graph, "before_fix_functionalization_cleanup")

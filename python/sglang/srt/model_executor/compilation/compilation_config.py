@@ -1,7 +1,13 @@
+# Adapted from https://github.com/vllm-project/vllm/blob/v0.10.0/vllm/compilation/compilation_config.py
+
+from typing import List
+
+
 # TODO(Yuwei): support better compile config support
 class CompilationConfig:
-    def __init__(self):
+    def __init__(self, capture_sizes: List[int]):
         self.traced_files = set()
+        self.capture_sizes = capture_sizes
 
     def add_traced_file(self, file_path: str):
         self.traced_files.add(file_path)
@@ -10,33 +16,4 @@ class CompilationConfig:
         return self.traced_files
 
     def get_capture_sizes(self):
-        return [
-            1,
-            2,
-            4,
-            8,
-            16,
-            32,
-            48,
-            64,
-            80,
-            96,
-            112,
-            128,
-            144,
-            160,
-            176,
-            192,
-            208,
-            224,
-            240,
-            256,
-            288,
-            320,
-            352,
-            384,
-            416,
-            448,
-            480,
-            512,
-        ]
+        return self.capture_sizes

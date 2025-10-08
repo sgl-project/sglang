@@ -392,6 +392,8 @@ class ServerArgs:
     enable_torch_compile: bool = False
     enable_piecewise_cuda_graph: bool = False
     torch_compile_max_bs: int = 32
+    piecewise_cuda_graph_max_tokens: int = 512
+    piecewise_cuda_graph_tokens: Optional[List[int]] = None
     torchao_config: str = ""
     enable_nan_detection: bool = False
     enable_p2p_check: bool = False
@@ -629,6 +631,11 @@ class ServerArgs:
         else:
             self.cuda_graph_max_bs = max(self.cuda_graph_bs)
 
+        if self.piecewise_cuda_graph_tokens is None:
+            self.piecewise_cuda_graph_tokens = (
+                self._generate_piecewise_cuda_graph_tokens()
+            )
+
         if self.mem_fraction_static is None:
             # Constant meta data (e.g., from attention backend)
             reserved_mem = 512
@@ -706,6 +713,24 @@ class ServerArgs:
         capture_bs = [bs for bs in capture_bs if bs <= self.cuda_graph_max_bs]
 
         return capture_bs
+
+    def _generate_piecewise_cuda_graph_tokens(self):
+        """
+        Generate the list of batch sizes for piecewise CUDA graph capture
+        based on piecewise_cuda_graph_max_tokens.
+        """
+        capture_sizes = (
+            list(range(4, 33, 4))
+            + list(range(48, 257, 16))
+            + list(range(288, 513, 32))
+            + list(range(513, self.piecewise_cuda_graph_max_tokens + 1, 128))
+        )
+
+        capture_sizes = [
+            s for s in capture_sizes if s <= self.piecewise_cuda_graph_max_tokens
+        ]
+
+        return capture_sizes
 
     def _handle_hpu_backends(self):
         if self.device == "hpu":
@@ -2488,13 +2513,25 @@ class ServerArgs:
         parser.add_argument(
             "--enable-piecewise-cuda-graph",
             action="store_true",
-            help="Optimize the model with piecewise cuda graph. Experimental feature.",
+            help="Optimize the model with piecewise cuda graph for extend/prefill only. Experimental feature.",
+        )
+        parser.add_argument(
+            "--piecewise-cuda-graph-tokens",
+            type=json_list_type,
+            default=ServerArgs.piecewise_cuda_graph_tokens,
+            help="Set the list of tokens when using piecewise cuda graph.",
         )
         parser.add_argument(
             "--torch-compile-max-bs",
             type=int,
             default=ServerArgs.torch_compile_max_bs,
             help="Set the maximum batch size when using torch compile.",
+        )
+        parser.add_argument(
+            "--piecewise-cuda-graph-max-tokens",
+            type=int,
+            default=ServerArgs.piecewise_cuda_graph_max_tokens,
+            help="Set the maximum tokens when using piecewise cuda graph.",
         )
         parser.add_argument(
             "--torchao-config",

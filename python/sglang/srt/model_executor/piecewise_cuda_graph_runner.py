@@ -18,20 +18,18 @@ from __future__ import annotations
 import bisect
 import gc
 import logging
-import os
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Union
 
 import torch
 import tqdm
-from torch.profiler import ProfilerActivity, profile
 
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
-from sglang.srt.distributed.parallel_state import GroupCoordinator
+from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     get_attention_tp_rank,
@@ -109,39 +107,6 @@ def _to_torch(model: torch.nn.Module, reverse: bool, num_tokens: int):
             _to_torch(sub, reverse, num_tokens)
 
 
-@contextmanager
-def patch_model(
-    model: torch.nn.Module,
-    enable_compile: bool,
-    num_tokens: int,
-    tp_group: GroupCoordinator,
-):
-    """Patch the model to make it compatible with with torch.compile"""
-    backup_ca_comm = None
-
-    try:
-        if enable_compile:
-            _to_torch(model, reverse=False, num_tokens=num_tokens)
-            backup_ca_comm = tp_group.ca_comm
-            # Use custom-allreduce here.
-            # We found the custom allreduce is much faster than the built-in allreduce in torch,
-            # even with ENABLE_INTRA_NODE_COMM=1.
-            # tp_group.ca_comm = None
-            yield torch.compile(
-                torch.no_grad()(model.forward),
-                mode=os.environ.get(
-                    "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
-                ),
-                dynamic=False,
-            )
-        else:
-            yield model.forward
-    finally:
-        if enable_compile:
-            _to_torch(model, reverse=True, num_tokens=num_tokens)
-            tp_group.ca_comm = backup_ca_comm
-
-
 # Reuse this memory pool across all cuda graph runners.
 global_graph_memory_pool = None
 
@@ -172,7 +137,12 @@ class PiecewiseCudaGraphRunner:
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
 
-        self.compile_config = CompilationConfig()
+        assert (
+            self.model_runner.server_args.piecewise_cuda_graph_tokens is not None
+        ), "piecewise_cuda_graph_tokens is not set"
+        self.compile_config = CompilationConfig(
+            self.model_runner.server_args.piecewise_cuda_graph_tokens
+        )
 
         install_torch_compiled(
             self.model_runner.model.model,
@@ -183,7 +153,9 @@ class PiecewiseCudaGraphRunner:
 
         # Batch sizes to capture
         self.capture_num_tokens = self.compile_config.get_capture_sizes()
-        log_info_on_rank0(logger, f"Capture cuda graph bs {self.capture_num_tokens}")
+        log_info_on_rank0(
+            logger, f"Capture cuda graph num tokens {self.capture_num_tokens}"
+        )
         self.capture_forward_mode = ForwardMode.EXTEND
         self.capture_hidden_mode = CaptureHiddenMode.NULL
 
@@ -219,7 +191,7 @@ class PiecewiseCudaGraphRunner:
         self.raw_num_tokens = 0
 
     def warmup_and_capture(self):
-        num_tokens = 16
+        num_tokens = 2
         with torch.device(self.device):
             forward_batch = ForwardBatch(
                 forward_mode=ForwardMode.EXTEND,
@@ -277,37 +249,37 @@ class PiecewiseCudaGraphRunner:
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
         # can reuse the memory pool allocated for the large shapes.
-        # with freeze_gc(
-        #     self.model_runner.server_args.enable_cudagraph_gc
-        # ), graph_capture() as graph_capture_context:
-        self.stream = torch.cuda.current_stream()
-        avail_mem = get_available_gpu_memory(
-            self.model_runner.device,
-            self.model_runner.gpu_id,
-            empty_cache=False,
-        )
-        # Reverse the order to enable better memory sharing across cuda graphs.
-        capture_range = (
-            tqdm.tqdm(list((self.capture_num_tokens)))
-            if get_tensor_model_parallel_rank() == 0
-            else (self.capture_num_tokens)
-        )
-        for i, num_tokens in enumerate(capture_range):
-            if get_tensor_model_parallel_rank() == 0:
-                avail_mem = get_available_gpu_memory(
-                    self.model_runner.device,
-                    self.model_runner.gpu_id,
-                    empty_cache=False,
-                )
-                capture_range.set_description(
-                    f"Capturing num tokens ({num_tokens=} {avail_mem=:.2f} GB)"
-                )
+        with freeze_gc(
+            self.model_runner.server_args.enable_cudagraph_gc
+        ), graph_capture() as graph_capture_context:
+            self.stream = graph_capture_context.stream
+            avail_mem = get_available_gpu_memory(
+                self.model_runner.device,
+                self.model_runner.gpu_id,
+                empty_cache=False,
+            )
+            # Reverse the order to enable better memory sharing across cuda graphs.
+            capture_range = (
+                tqdm.tqdm(list(reversed(self.capture_num_tokens)))
+                if get_tensor_model_parallel_rank() == 0
+                else reversed(self.capture_num_tokens)
+            )
+            for i, num_tokens in enumerate(capture_range):
+                if get_tensor_model_parallel_rank() == 0:
+                    avail_mem = get_available_gpu_memory(
+                        self.model_runner.device,
+                        self.model_runner.gpu_id,
+                        empty_cache=False,
+                    )
+                    capture_range.set_description(
+                        f"Capturing num tokens ({num_tokens=} {avail_mem=:.2f} GB)"
+                    )
 
-            with set_compiled(True):
-                self.capture_one_batch_size(num_tokens)
+                with set_compiled(True):
+                    self.capture_one_batch_size(num_tokens)
 
-            # Save gemlite cache after each capture
-            save_gemlite_cache()
+                # Save gemlite cache after each capture
+                save_gemlite_cache()
 
     def capture_one_batch_size(self, num_tokens: int):
         stream = self.stream
@@ -325,12 +297,6 @@ class PiecewiseCudaGraphRunner:
             )
 
         global_dp_buffer_len = None
-
-        spec_info = self.get_spec_info(num_tokens)
-        if self.capture_hidden_mode != CaptureHiddenMode.FULL:
-            self.capture_hidden_mode = (
-                spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
-            )
 
         if self.model_runner.server_args.enable_lora:
             # It is safe to capture CUDA graph using empty LoRA id, as the LoRA kernels will always be launched whenever

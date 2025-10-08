@@ -236,6 +236,7 @@ class GroupCoordinator:
         use_npu_communicator: bool,
         use_message_queue_broadcaster: bool = False,
         group_name: Optional[str] = None,
+        torch_compile: Optional[bool] = None,
     ):
         # Set group info
         group_name = group_name or "anonymous"
@@ -319,10 +320,16 @@ class GroupCoordinator:
         self.qr_comm: Optional[QuickAllReduce] = None
         if use_custom_allreduce and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
+            if torch_compile is not None and torch_compile:
+                ca_max_size = 256 * 1024 * 1024
+            else:
+                ca_max_size = 8 * 1024 * 1024
             try:
+                # print(f"ca_max_size: {ca_max_size}")
                 self.ca_comm = CustomAllreduce(
                     group=self.cpu_group,
                     device=self.device,
+                    max_size=ca_max_size,
                 )
             except Exception as e:
                 logger.warning(
@@ -1234,6 +1241,7 @@ def init_model_parallel_group(
     use_message_queue_broadcaster: bool = False,
     group_name: Optional[str] = None,
     use_mscclpp_allreduce: Optional[bool] = None,
+    torch_compile: Optional[bool] = None,
 ) -> GroupCoordinator:
     if use_custom_allreduce is None:
         use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
@@ -1251,6 +1259,7 @@ def init_model_parallel_group(
         use_npu_communicator=True,
         use_message_queue_broadcaster=use_message_queue_broadcaster,
         group_name=group_name,
+        torch_compile=torch_compile,
     )
 
 
@@ -1404,6 +1413,7 @@ def initialize_model_parallel(
     pipeline_model_parallel_size: int = 1,
     backend: Optional[str] = None,
     duplicate_tp_group: bool = False,
+    torch_compile: Optional[bool] = None,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -1459,6 +1469,7 @@ def initialize_model_parallel(
             "SGLANG_USE_MESSAGE_QUEUE_BROADCASTER", "true"
         ),
         group_name="tp",
+        torch_compile=torch_compile,
     )
 
     if duplicate_tp_group:
@@ -1474,6 +1485,7 @@ def initialize_model_parallel(
                 "SGLANG_USE_MESSAGE_QUEUE_BROADCASTER", "true"
             ),
             group_name="pdmux_prefill_tp",
+            torch_compile=torch_compile,
         )
         _TP.pynccl_comm.disabled = False
         _PDMUX_PREFILL_TP_GROUP.pynccl_comm.disabled = False
@@ -1483,7 +1495,6 @@ def initialize_model_parallel(
 
     global _MOE_EP
     assert _MOE_EP is None, "expert model parallel group is already initialized"
-
     if moe_ep_size == tensor_model_parallel_size:
         _MOE_EP = _TP
     else:
@@ -1504,7 +1515,6 @@ def initialize_model_parallel(
 
     global _MOE_TP
     assert _MOE_TP is None, "expert model parallel group is already initialized"
-
     if moe_tp_size == tensor_model_parallel_size:
         _MOE_TP = _TP
     else:

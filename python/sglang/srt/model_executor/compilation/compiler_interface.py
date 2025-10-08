@@ -1,3 +1,5 @@
+# Adapted from https://github.com/vllm-project/vllm/blob/v0.10.0/vllm/compilation/compiler_interface.py
+
 import contextlib
 import copy
 import hashlib
