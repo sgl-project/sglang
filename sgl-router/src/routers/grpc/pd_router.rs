@@ -129,7 +129,7 @@ impl GrpcPDRouter {
         // Use pipeline for ALL requests (streaming and non-streaming)
         self.pipeline
             .execute_generate(
-                body.clone(),
+                Arc::new(body.clone()),
                 headers.cloned(),
                 model_id.map(|s| s.to_string()),
                 self.shared_components.clone(),
@@ -152,7 +152,7 @@ impl GrpcPDRouter {
         // Use pipeline for ALL requests (streaming and non-streaming)
         self.pipeline
             .execute_chat(
-                body.clone(),
+                Arc::new(body.clone()),
                 headers.cloned(),
                 model_id.map(|s| s.to_string()),
                 self.shared_components.clone(),

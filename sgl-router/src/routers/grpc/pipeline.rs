@@ -56,18 +56,17 @@ pub struct PreparationStage;
 #[async_trait]
 impl PipelineStage for PreparationStage {
     async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
-        debug!("Stage {}: Processing request", self.name());
+        // Clone Arc before match to avoid borrow checker issues
+        // (matching borrows ctx, but prepare_* methods need mutable borrow)
+        // Arc clone is cheap (8 bytes) - avoids full request clone (15KB-200KB)
+        let is_chat = matches!(&ctx.input.request_type, RequestType::Chat(_));
 
-        // Clone the request to avoid borrowing issues
-        match &ctx.input.request_type {
-            RequestType::Chat(request) => {
-                let request_clone = request.clone();
-                self.prepare_chat(ctx, &request_clone).await?;
-            }
-            RequestType::Generate(request) => {
-                let request_clone = request.clone();
-                self.prepare_generate(ctx, &request_clone).await?;
-            }
+        if is_chat {
+            let request_arc = ctx.chat_request_arc();
+            self.prepare_chat(ctx, &request_arc).await?;
+        } else {
+            let request_arc = ctx.generate_request_arc();
+            self.prepare_generate(ctx, &request_arc).await?;
         }
 
         Ok(None)
@@ -108,7 +107,6 @@ impl PreparationStage {
         };
 
         let token_ids = encoding.token_ids().to_vec();
-        debug!("Tokenized {} tokens from input", token_ids.len());
 
         // Step 4: Build tool constraints if needed
         let tool_call_constraint = body_ref.tools.as_ref().and_then(|tools| {
@@ -155,8 +153,6 @@ impl PreparationStage {
                 return Err(utils::bad_request_error(msg));
             }
         };
-
-        debug!("Resolved input with {} tokens", token_ids.len());
 
         // Create stop sequence decoder for generate requests
         let params = request.sampling_params.as_ref();
@@ -258,8 +254,6 @@ impl WorkerSelectionStage {
 #[async_trait]
 impl PipelineStage for WorkerSelectionStage {
     async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
-        debug!("Stage {}: Selecting workers", self.name());
-
         let prep = ctx
             .state
             .preparation
@@ -413,8 +407,6 @@ pub struct ClientAcquisitionStage;
 #[async_trait]
 impl PipelineStage for ClientAcquisitionStage {
     async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
-        debug!("Stage {}: Acquiring gRPC clients", self.name());
-
         let workers = ctx
             .state
             .workers
@@ -463,8 +455,6 @@ impl RequestBuildingStage {
 #[async_trait]
 impl PipelineStage for RequestBuildingStage {
     async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
-        debug!("Stage {}: Building proto request", self.name());
-
         let prep = ctx
             .state
             .preparation
@@ -577,8 +567,6 @@ pub struct DispatchMetadataStage;
 #[async_trait]
 impl PipelineStage for DispatchMetadataStage {
     async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
-        debug!("Stage {}: Preparing dispatch metadata", self.name());
-
         let proto_request = ctx
             .state
             .proto_request
@@ -655,8 +643,6 @@ impl RequestExecutionStage {
 #[async_trait]
 impl PipelineStage for RequestExecutionStage {
     async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
-        debug!("Stage {}: Executing gRPC request", self.name());
-
         let proto_request = ctx
             .state
             .proto_request
@@ -711,8 +697,6 @@ impl RequestExecutionStage {
         let (prefill_client, decode_client) = clients
             .dual_mut()
             .ok_or_else(|| utils::internal_error_static("Expected dual clients but got single"))?;
-
-        debug!("Sending concurrent requests to prefill and decode workers");
 
         let prefill_request = proto_request.clone();
         let decode_request = proto_request;
@@ -779,8 +763,6 @@ impl ResponseProcessingStage {
 #[async_trait]
 impl PipelineStage for ResponseProcessingStage {
     async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
-        debug!("Stage {}: Processing response", self.name());
-
         // Delegate to request-type specific processing
         match &ctx.input.request_type {
             RequestType::Chat(_) => return self.process_chat_response(ctx).await,
@@ -820,7 +802,7 @@ impl ResponseProcessingStage {
             return Ok(Some(
                 self.streaming_processor.clone().process_streaming_response(
                     execution_result,
-                    ctx.chat_request().clone(),
+                    ctx.chat_request_arc(), // Cheap Arc clone (8 bytes)
                     dispatch.clone(),
                 ),
             ));
@@ -865,9 +847,7 @@ impl ResponseProcessingStage {
             return Err(utils::internal_error_static("No responses from server"));
         }
 
-        // Clone chat_request to avoid borrow checker conflict
-        // (ctx.chat_request() borrows ctx, preventing mutable borrow of ctx.state.response.stop_decoder)
-        let chat_request = ctx.chat_request().clone();
+        let chat_request = ctx.chat_request_arc();
         let history_tool_calls_count = utils::get_history_tool_calls_count(&chat_request);
 
         let stop_decoder = ctx
@@ -959,13 +939,11 @@ impl ResponseProcessingStage {
                 .as_ref()
                 .ok_or_else(|| utils::internal_error_static("Dispatch metadata not set"))?;
 
-            let generate_request = ctx.generate_request().clone();
-
             // Streaming: Use StreamingProcessor and return SSE response (done)
             return Ok(Some(
                 self.streaming_processor.clone().process_streaming_generate(
                     execution_result,
-                    generate_request,
+                    ctx.generate_request_arc(), // Cheap Arc clone (8 bytes)
                     dispatch.clone(),
                 ),
             ));
@@ -1193,8 +1171,8 @@ impl ChatCompletionPipeline {
     /// Execute the complete pipeline for a chat request
     pub async fn execute_chat(
         &self,
-        request: ChatCompletionRequest,
-        headers: Option<axum::http::HeaderMap>,
+        request: Arc<ChatCompletionRequest>,
+        headers: Option<http::HeaderMap>,
         model_id: Option<String>,
         components: Arc<SharedComponents>,
     ) -> Response {
@@ -1202,15 +1180,9 @@ impl ChatCompletionPipeline {
 
         // Execute each stage in sequence
         for (idx, stage) in self.stages.iter().enumerate() {
-            debug!("Executing stage {}: {}", idx + 1, stage.name());
             match stage.execute(&mut ctx).await {
                 Ok(Some(response)) => {
                     // Stage completed successfully with a response (e.g., streaming)
-                    debug!(
-                        "Stage {} ({}) completed with response",
-                        idx + 1,
-                        stage.name()
-                    );
                     return response;
                 }
                 Ok(None) => {
@@ -1243,8 +1215,8 @@ impl ChatCompletionPipeline {
     /// Execute the complete pipeline for a generate request
     pub async fn execute_generate(
         &self,
-        request: GenerateRequest,
-        headers: Option<axum::http::HeaderMap>,
+        request: Arc<GenerateRequest>,
+        headers: Option<http::HeaderMap>,
         model_id: Option<String>,
         components: Arc<SharedComponents>,
     ) -> Response {
@@ -1252,15 +1224,9 @@ impl ChatCompletionPipeline {
 
         // Execute each stage in sequence
         for (idx, stage) in self.stages.iter().enumerate() {
-            debug!("Executing stage {}: {}", idx + 1, stage.name());
             match stage.execute(&mut ctx).await {
                 Ok(Some(response)) => {
                     // Stage completed successfully with a response (e.g., streaming)
-                    debug!(
-                        "Stage {} ({}) completed with response",
-                        idx + 1,
-                        stage.name()
-                    );
                     return response;
                 }
                 Ok(None) => {
