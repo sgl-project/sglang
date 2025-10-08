@@ -118,6 +118,23 @@ def _to_torch(model: torch.nn.Module, reverse: bool, num_tokens: int):
             _to_torch(sub, reverse, num_tokens)
 
 
+def _torch_compile_wrapper(forward):
+    return torch.compile(
+        torch.no_grad()(forward),
+        mode=os.environ.get("SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"),
+        dynamic=False,
+    )
+
+
+def torch_compile(
+    model: torch.nn.Module, compilation_config, model_config, device_config
+):
+    set_torch_compile_config(compilation_config, model_config, device_config)
+    _to_torch(model, reverse=False, num_tokens=1)
+    model.forward = _torch_compile_wrapper(model.forward)
+    _to_torch(model, reverse=True, num_tokens=1)
+
+
 @contextmanager
 def patch_model(
     model: torch.nn.Module,
@@ -151,13 +168,28 @@ def patch_model(
             tp_group.ca_comm = backup_ca_comm
 
 
-def set_torch_compile_config():
+def set_torch_compile_config(
+    compilation_config: CompilationConfig,
+    model_config: ModelConfig,
+    device_config: DeviceConfig,
+):
     import torch._dynamo.config
     import torch._inductor.config
 
     torch._inductor.config.coordinate_descent_tuning = True
     torch._inductor.config.triton.unique_kernel_names = True
     torch._inductor.config.fx_graph_cache = True  # Experimental feature to reduce compilation times, will be on by default in future
+
+    # TODO: Add server_args enable_post_grad_pass
+    if True:
+        from sglang.srt.compilation.pass_manager import PostGradPassManager
+
+        pass_manager = PostGradPassManager(
+            compilation_config, model_config, device_config
+        )
+
+        # TODO(yuan-luo): handling torch._inductor.compile_fx
+        torch._inductor.config.post_grad_custom_post_pass = pass_manager
 
     # FIXME: tmp workaround
     torch._dynamo.config.accumulated_cache_size_limit = 1024
@@ -281,7 +313,11 @@ class CudaGraphRunner:
         )
 
         if self.enable_torch_compile:
-            set_torch_compile_config()
+            set_torch_compile_config(
+                self.model_runner.compilation_config,
+                self.model_runner.model_config,
+                self.model_runner.device_config,
+            )
 
         if self.model_runner.server_args.enable_lora:
             self.model_runner.lora_manager.init_cuda_graph_batch_info(self.max_bs)
