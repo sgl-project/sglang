@@ -437,19 +437,6 @@ class GrpcRequestManager:
 
         return True
 
-    async def pause_generation(self):
-        """Pause generation processing."""
-        async with self.is_pause_cond:
-            self.is_pause = True
-            logger.info("Generation paused")
-
-    async def resume_generation(self):
-        """Resume generation processing."""
-        async with self.is_pause_cond:
-            self.is_pause = False
-            self.is_pause_cond.notify_all()
-            logger.info("Generation resumed")
-
     async def handle_loop(self):
         """
         Main event loop - processes outputs from scheduler.
@@ -792,14 +779,6 @@ class GrpcRequestManager:
         self.context.term()
 
         logger.info("GrpcRequestManager shutdown complete")
-
-    def get_server_info(self) -> Dict[str, Any]:
-        """Get server information for health checks."""
-        return {
-            "active_requests": len(self.rid_to_state),
-            "paused": self.is_pause,
-            "last_receive_time": self.last_receive_tstamp,
-        }
 
     def auto_create_handle_loop(self):
         """Automatically create and start the handle_loop task, matching TokenizerManager pattern."""
