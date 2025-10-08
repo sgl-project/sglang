@@ -124,7 +124,7 @@ impl ToolParser for KimiK2Parser {
                 // Parse function ID
                 if let Some((func_name, _index)) = self.parse_function_id(function_id) {
                     // Try to parse JSON arguments
-                    match serde_json::from_str::<serde_json::Value>(function_args) {
+                    match serde_json::from_str::<Value>(function_args) {
                         Ok(_) => {
                             tools.push(ToolCall {
                                 function: FunctionCall {

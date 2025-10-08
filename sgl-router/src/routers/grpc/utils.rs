@@ -522,7 +522,7 @@ pub fn parse_json_schema_response(
             match serde_json::from_str::<Value>(processed_text) {
                 Ok(params) => {
                     let tool_call = ToolCall {
-                        id: format!("call_{}", uuid::Uuid::new_v4()),
+                        id: format!("call_{}", Uuid::new_v4()),
                         tool_type: "function".to_string(),
                         function: FunctionCallResponse {
                             name: function.name.clone(),
@@ -553,7 +553,7 @@ pub fn parse_json_schema_response(
                             let parameters = obj.get("parameters")?;
 
                             Some(ToolCall {
-                                id: format!("call_{}_{}", i, uuid::Uuid::new_v4()),
+                                id: format!("call_{}_{}", i, Uuid::new_v4()),
                                 tool_type: "function".to_string(),
                                 function: FunctionCallResponse {
                                     name,
