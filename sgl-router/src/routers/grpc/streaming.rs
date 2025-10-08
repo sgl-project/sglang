@@ -395,7 +395,7 @@ impl StreamingProcessor {
                     };
                     matched_stops.insert(index, matched_stop_value);
 
-                    break;
+                    // Don't break - continue reading all Complete messages for n>1
                 }
                 Some(proto::generate_response::Response::Error(error)) => {
                     return Err(error.message);
