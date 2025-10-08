@@ -10,51 +10,45 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use tracing::{debug, error, info, warn};
+use tracing::debug;
 
 use crate::config::types::RetryConfig;
 use crate::core::{ConnectionMode, Worker, WorkerRegistry, WorkerType};
 use crate::grpc_client::{proto, SglangSchedulerClient};
-use crate::metrics::RouterMetrics;
 use crate::policies::PolicyRegistry;
-use crate::protocols::spec::ChatMessage;
 use crate::protocols::spec::{
-    ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse,
-    CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest, ResponsesGetParams,
-    ResponsesRequest, StringOrArray, Tool, ToolChoice, Usage,
+    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, InputIds,
+    RerankRequest, ResponsesGetParams, ResponsesRequest,
 };
-use crate::reasoning_parser::ParserFactory;
-use crate::routers::RouterTrait;
+use crate::reasoning_parser::ReasoningParserFactory;
+use crate::routers::{grpc, RouterTrait};
 use crate::server::AppContext;
-use crate::tokenizer::chat_template::{ChatTemplateContentFormat, ChatTemplateParams};
-use crate::tokenizer::stop::{SequenceDecoderOutput, StopSequenceDecoderBuilder};
+use crate::tokenizer::stop::SequenceDecoderOutput;
 use crate::tokenizer::traits::Tokenizer;
-use crate::tokenizer::HuggingFaceTokenizer;
-use crate::tool_parser::ParserRegistry;
-use serde_json::Value;
-use std::time::{SystemTime, UNIX_EPOCH};
-use tokio_stream::StreamExt;
+use crate::tool_parser::ToolParserFactory;
+use grpc::utils;
+use serde_json::json;
+use std::time::Instant;
 use uuid::Uuid;
 
-// Data structures for processing
-#[derive(Debug)]
-pub struct ProcessedMessages {
-    pub text: String,
-    pub multimodal_inputs: Option<proto::MultimodalInputs>,
-    pub stop_sequences: Option<StringOrArray>,
-}
-
 /// gRPC router implementation for SGLang
+#[derive(Clone)]
 #[allow(dead_code)]
 pub struct GrpcRouter {
     worker_registry: Arc<WorkerRegistry>,
     policy_registry: Arc<PolicyRegistry>,
     tokenizer: Arc<dyn Tokenizer>,
-    reasoning_parser_factory: ParserFactory,
-    tool_parser_registry: &'static ParserRegistry,
+    reasoning_parser_factory: ReasoningParserFactory,
+    tool_parser_factory: ToolParserFactory,
     dp_aware: bool,
     api_key: Option<String>,
     retry_config: RetryConfig,
+    configured_reasoning_parser: Option<String>,
+    configured_tool_parser: Option<String>,
+    // Pipeline for non-streaming requests
+    pipeline: super::pipeline::ChatCompletionPipeline,
+    // Shared components for pipeline
+    shared_components: Arc<super::context::SharedComponents>,
 }
 
 impl GrpcRouter {
@@ -71,39 +65,68 @@ impl GrpcRouter {
             .as_ref()
             .ok_or_else(|| "gRPC router requires reasoning parser factory".to_string())?
             .clone();
-        let tool_parser_registry = ctx
-            .tool_parser_registry
-            .ok_or_else(|| "gRPC router requires tool parser registry".to_string())?;
+        let tool_parser_factory = ctx
+            .tool_parser_factory
+            .as_ref()
+            .ok_or_else(|| "gRPC router requires tool parser factory".to_string())?
+            .clone();
 
         let worker_registry = ctx.worker_registry.clone();
         let policy_registry = ctx.policy_registry.clone();
 
-        let workers = worker_registry.get_workers_filtered(
-            None,
-            Some(WorkerType::Regular),
-            Some(ConnectionMode::Grpc { port: None }),
-            false,
+        // Create shared components for pipeline
+        let shared_components = Arc::new(super::context::SharedComponents {
+            tokenizer: tokenizer.clone(),
+            tool_parser_factory: tool_parser_factory.clone(),
+            reasoning_parser_factory: reasoning_parser_factory.clone(),
+        });
+
+        // Create response processor
+        let processor = super::processing::ResponseProcessor::new(
+            tokenizer.clone(),
+            tool_parser_factory.clone(),
+            reasoning_parser_factory.clone(),
+            ctx.configured_tool_parser.clone(),
+            ctx.configured_reasoning_parser.clone(),
         );
 
-        RouterMetrics::set_active_workers(workers.len());
-        info!("gRPC router found {} workers in registry", workers.len());
+        // Create streaming processor
+        let streaming_processor = Arc::new(super::streaming::StreamingProcessor::new(
+            tokenizer.clone(),
+            tool_parser_factory.clone(),
+            reasoning_parser_factory.clone(),
+            ctx.configured_tool_parser.clone(),
+            ctx.configured_reasoning_parser.clone(),
+        ));
+
+        // Create pipeline
+        let pipeline = super::pipeline::ChatCompletionPipeline::new_regular(
+            worker_registry.clone(),
+            policy_registry.clone(),
+            processor,
+            streaming_processor,
+        );
 
         Ok(GrpcRouter {
             worker_registry,
             policy_registry,
             tokenizer,
             reasoning_parser_factory,
-            tool_parser_registry,
+            tool_parser_factory,
             dp_aware: ctx.router_config.dp_aware,
             api_key: ctx.router_config.api_key.clone(),
             retry_config: ctx.router_config.effective_retry_config(),
+            configured_reasoning_parser: ctx.configured_reasoning_parser.clone(),
+            configured_tool_parser: ctx.configured_tool_parser.clone(),
+            pipeline,
+            shared_components,
         })
     }
 
     /// Main route_chat implementation
     async fn route_chat_impl(
         &self,
-        _headers: Option<&HeaderMap>,
+        headers: Option<&HeaderMap>,
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
@@ -112,100 +135,88 @@ impl GrpcRouter {
             model_id
         );
 
-        // Step 1: Select worker (fail fast if no workers available)
-        let worker = match self.select_worker_for_request(model_id, None) {
+        // Use pipeline for ALL requests (streaming and non-streaming)
+        self.pipeline
+            .execute_chat(
+                body.clone(),
+                headers.cloned(),
+                model_id.map(|s| s.to_string()),
+                self.shared_components.clone(),
+            )
+            .await
+    }
+
+    /// Main route_generate implementation
+    async fn route_generate_impl(
+        &self,
+        _headers: Option<&HeaderMap>,
+        body: &GenerateRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        debug!("Processing generate request for model: {:?}", model_id);
+
+        // Step 1: Resolve input (text, prompt, or input_ids)
+        let (original_text, token_ids) = match self.resolve_generate_input(body) {
+            Ok(res) => res,
+            Err(msg) => {
+                return utils::bad_request_error(msg);
+            }
+        };
+
+        debug!("Resolved input with {} tokens", token_ids.len());
+
+        // Step 2: Select worker (fail fast if no workers available)
+        let worker = match self.select_worker_for_request(model_id, original_text.as_deref()) {
             Some(w) => w,
             None => {
-                warn!("No available workers for model: {:?}", model_id);
-                return (StatusCode::SERVICE_UNAVAILABLE, "No available workers").into_response();
+                return utils::service_unavailable_error(format!(
+                    "No available workers for model: {:?}",
+                    model_id
+                ));
             }
         };
 
         debug!("Selected worker: {}", worker.url());
 
-        // Step 2: Get gRPC client from worker
-        let client = match worker.get_grpc_client().await {
-            Ok(Some(client_arc)) => {
-                // Clone the client from inside the Arc<Mutex<>>
-                let client = client_arc.lock().await.clone();
-                client
-            }
-            Ok(None) => {
-                error!("Selected worker is not a gRPC worker");
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Selected worker is not configured for gRPC",
-                )
-                    .into_response();
-            }
-            Err(e) => {
-                error!("Failed to get gRPC client from worker: {}", e);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to get gRPC client: {}", e),
-                )
-                    .into_response();
-            }
+        // Step 3: Get gRPC client from worker
+        let client = match utils::get_grpc_client_from_worker(&worker).await {
+            Ok(client) => client,
+            Err(response) => return response,
         };
 
-        // Step 3: Process messages and apply chat template
-        let processed_messages = match self.process_chat_messages(body) {
-            Ok(msgs) => msgs,
-            Err(e) => {
-                error!("Failed to process chat messages: {}", e);
-                return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
-            }
-        };
+        // Step 4: Build the gRPC request
+        let request_id = body
+            .rid
+            .clone()
+            .unwrap_or_else(|| format!("gen-{}", Uuid::new_v4()));
 
-        // Step 4: Tokenize the processed text
-        let encoding = match self.tokenizer.encode(&processed_messages.text) {
-            Ok(encoding) => encoding,
-            Err(e) => {
-                error!("Tokenization failed: {}", e);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Tokenization failed: {}", e),
-                )
-                    .into_response();
-            }
-        };
-
-        let token_ids = encoding.token_ids().to_vec();
-        debug!("Tokenized {} tokens from input", token_ids.len());
-
-        // Step 5: Build tool constraints if needed
-        let tool_call_constraint = if let Some(tools) = &body.tools {
-            self.generate_tool_constraints(tools, &body.tool_choice, &body.model)
-        } else {
-            None
-        };
-
-        // Step 6: Build the base gRPC request
-        let request_id = format!("chatcmpl-{}", Uuid::new_v4());
-        let request = match client.build_generate_request(
-            request_id,
+        let request = match client.build_plain_generate_request(
+            request_id.clone(),
             body,
-            processed_messages.text.clone(),
+            original_text.clone(),
             token_ids,
-            processed_messages.multimodal_inputs,
-            tool_call_constraint, // Pass the full tuple (type, value)
         ) {
-            Ok(request) => request,
+            Ok(req) => req,
             Err(e) => {
-                error!("Failed to build gRPC request: {}", e);
-                return (
-                    StatusCode::BAD_REQUEST,
-                    format!("Invalid request parameters: {}", e),
-                )
-                    .into_response();
+                return utils::bad_request_error(e);
             }
         };
 
-        // Step 7: Handle streaming vs non-streaming
+        // Step 5: Get weight version for response metadata
+        let weight_version = worker
+            .metadata()
+            .labels
+            .get("weight_version")
+            .cloned()
+            .unwrap_or_else(|| "default".to_string());
+
+        // Step 6: Handle streaming vs non-streaming
         if body.stream {
-            self.handle_streaming_chat(client, request, body).await
+            self.handle_streaming_generate(client, request, body, request_id, weight_version)
+                .await
         } else {
-            self.handle_non_streaming_chat(client, request, body).await
+            self.handle_non_streaming_generate(client, request, body, request_id, weight_version)
+                .await
         }
     }
 
@@ -245,637 +256,313 @@ impl GrpcRouter {
         Some(available[idx].clone())
     }
 
-    /// Process chat messages and apply template
-    fn process_chat_messages(
+    /// Resolve the generate input into optional original text and token IDs
+    fn resolve_generate_input(
         &self,
-        request: &ChatCompletionRequest,
-    ) -> Result<ProcessedMessages, String> {
-        // Use the tokenizer's chat template - we require HuggingFace tokenizer for gRPC
-        let formatted_text = if let Some(hf_tokenizer) = self
+        request: &GenerateRequest,
+    ) -> Result<(Option<String>, Vec<u32>), String> {
+        if let Some(text) = &request.text {
+            return self
+                .tokenize_single_text(text)
+                .map(|(original, ids)| (Some(original), ids));
+        }
+
+        // Handle input_ids - validate and convert
+        if let Some(input_ids) = &request.input_ids {
+            return match input_ids {
+                InputIds::Single(ids) => ids
+                    .iter()
+                    .map(|&id| u32::try_from(id))
+                    .collect::<Result<Vec<u32>, _>>()
+                    .map(|converted| (None, converted))
+                    .map_err(|_| "input_ids must be non-negative".to_string()),
+                InputIds::Batch(_) => {
+                    Err("Batch input_ids are not supported over gRPC generate yet".to_string())
+                }
+            };
+        }
+
+        Err("Either `text` or `input_ids` must be provided".to_string())
+    }
+
+    fn tokenize_single_text(&self, text: &str) -> Result<(String, Vec<u32>), String> {
+        let encoding = self
             .tokenizer
-            .as_any()
-            .downcast_ref::<HuggingFaceTokenizer>()
-        {
-            // Get content format and transform messages accordingly
-            let content_format = hf_tokenizer.chat_template_content_format();
-            let mut transformed_messages =
-                Self::process_content_format(&request.messages, content_format)?;
-
-            // Process tool call arguments in assistant messages
-            Self::process_tool_call_arguments(&mut transformed_messages)?;
-
-            // Convert tools to JSON values for template processing
-            let tools_json: Option<Vec<serde_json::Value>> = request
-                .tools
-                .as_ref()
-                .map(|tools| {
-                    tools
-                        .iter()
-                        .map(serde_json::to_value)
-                        .collect::<Result<Vec<_>, _>>()
-                })
-                .transpose()
-                .map_err(|e| format!("Failed to serialize tools: {}", e))?;
-
-            // Build template kwargs, merging reasoning_effort if present
-            let mut combined_template_kwargs = std::collections::HashMap::new();
-
-            // Add reasoning_effort if present (like Python does)
-            if let Some(reasoning_effort) = &request.reasoning_effort {
-                combined_template_kwargs.insert(
-                    "reasoning_effort".to_string(),
-                    serde_json::Value::String(reasoning_effort.clone()),
-                );
-            }
-
-            // Add any additional template kwargs from request
-            if let Some(template_kwargs) = &request.chat_template_kwargs {
-                for (key, value) in template_kwargs {
-                    combined_template_kwargs.insert(key.clone(), value.clone());
-                }
-            }
-
-            let final_template_kwargs = if combined_template_kwargs.is_empty() {
-                None
-            } else {
-                Some(&combined_template_kwargs)
-            };
-
-            let params = ChatTemplateParams {
-                add_generation_prompt: true,
-                continue_final_message: request.continue_final_message,
-                tools: tools_json.as_deref(),
-                template_kwargs: final_template_kwargs,
-                ..Default::default()
-            };
-
-            // Handle assistant prefix for continue_final_message
-            let assistant_prefix = if request.continue_final_message
-                && !transformed_messages.is_empty()
-                && transformed_messages
-                    .last()
-                    .and_then(|msg| msg.get("role"))
-                    .and_then(|v| v.as_str())
-                    == Some("assistant")
-            {
-                // Pop the last message to handle it separately
-                let last_msg = transformed_messages.pop().unwrap();
-                last_msg
-                    .get("content")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-            } else {
-                None
-            };
-
-            // Apply chat template with the (now possibly shorter) list of messages
-            let rendered = hf_tokenizer
-                .apply_chat_template(&transformed_messages, params)
-                .map_err(|e| format!("Failed to apply chat template: {}", e))?;
-
-            // Append assistant prefix if we have one
-            if let Some(prefix) = assistant_prefix {
-                format!("{}{}", rendered, prefix)
-            } else {
-                rendered
-            }
-        } else {
-            return Err(
-                "gRPC router requires HuggingFace tokenizer with chat template support".to_string(),
-            );
-        };
-
-        // Placeholder for multimodal inputs
-        let multimodal_inputs = None;
-
-        Ok(ProcessedMessages {
-            text: formatted_text,
-            multimodal_inputs,
-            stop_sequences: request.stop.clone(),
-        })
+            .encode(text)
+            .map_err(|e| format!("Tokenization failed: {}", e))?;
+        Ok((text.to_string(), encoding.token_ids().to_vec()))
     }
 
-    /// Process messages based on content format for ANY message type
-    fn process_content_format(
-        messages: &[ChatMessage],
-        content_format: ChatTemplateContentFormat,
-    ) -> Result<Vec<Value>, String> {
-        messages
-            .iter()
-            .map(|message| {
-                let mut message_json = serde_json::to_value(message)
-                    .map_err(|e| format!("Failed to serialize message: {}", e))?;
-
-                if let Some(obj) = message_json.as_object_mut() {
-                    if let Some(content_value) = obj.get_mut("content") {
-                        Self::transform_content_field(content_value, content_format);
-                    }
-                }
-
-                Ok(message_json)
-            })
-            .collect()
-    }
-
-    /// Transform a single content field based on content format
-    fn transform_content_field(
-        content_value: &mut Value,
-        content_format: ChatTemplateContentFormat,
-    ) {
-        let Some(content_array) = content_value.as_array() else {
-            return; // Not multimodal, keep as-is
-        };
-
-        match content_format {
-            ChatTemplateContentFormat::String => {
-                // Extract and join text parts only
-                let text_parts: Vec<String> = content_array
-                    .iter()
-                    .filter_map(|part| {
-                        part.as_object()?
-                            .get("type")?
-                            .as_str()
-                            .filter(|&t| t == "text")
-                            .and_then(|_| part.as_object()?.get("text")?.as_str())
-                            .map(String::from)
-                    })
-                    .collect();
-
-                if !text_parts.is_empty() {
-                    *content_value = Value::String(text_parts.join(" "));
-                }
-            }
-            ChatTemplateContentFormat::OpenAI => {
-                // Replace media URLs with simple type placeholders
-                let processed_parts: Vec<Value> = content_array
-                    .iter()
-                    .map(|part| {
-                        part.as_object()
-                            .and_then(|obj| obj.get("type")?.as_str())
-                            .and_then(|type_str| match type_str {
-                                "image_url" => Some(serde_json::json!({"type": "image"})),
-                                "video_url" => Some(serde_json::json!({"type": "video"})),
-                                "audio_url" => Some(serde_json::json!({"type": "audio"})),
-                                _ => None,
-                            })
-                            .unwrap_or_else(|| part.clone())
-                    })
-                    .collect();
-
-                *content_value = Value::Array(processed_parts);
-            }
-        }
-    }
-
-    /// Process tool call arguments in messages
-    /// Per Transformers docs, tool call arguments in assistant messages should be dicts
-    fn process_tool_call_arguments(messages: &mut [Value]) -> Result<(), String> {
-        for msg in messages {
-            // Early return if not assistant message
-            let role = msg.get("role").and_then(|v| v.as_str());
-            if role != Some("assistant") {
-                continue;
-            }
-
-            // Early return if no tool_calls
-            let Some(tool_calls) = msg.get_mut("tool_calls").and_then(|tc| tc.as_array_mut())
-            else {
-                continue;
-            };
-
-            // Process each tool call's arguments
-            for call in tool_calls {
-                let Some(function) = call.get_mut("function") else {
-                    continue;
-                };
-                let Some(args) = function.get_mut("arguments") else {
-                    continue;
-                };
-                let Some(args_str) = args.as_str() else {
-                    continue;
-                };
-
-                // Parse JSON string to object (like Python json.loads)
-                match serde_json::from_str::<serde_json::Value>(args_str) {
-                    Ok(parsed) => *args = parsed,
-                    Err(e) => {
-                        return Err(format!(
-                            "Failed to parse tool call arguments as JSON: '{}'. Error: {}",
-                            args_str, e
-                        ))
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Generate tool constraints for structured generation
-    fn generate_tool_constraints(
-        &self,
-        _tools: &[Tool],
-        _tool_choice: &Option<ToolChoice>,
-        model: &str,
-    ) -> Option<(String, String)> {
-        let _parser = self.tool_parser_registry.get_parser(model)?;
-        // TODO: Implement actual constraint generation logic
-        // For now, return None as this is placeholder implementation
-        None
-    }
-
-    /// Create a StopSequenceDecoder from the chat completion request
-    fn create_stop_decoder(
-        &self,
-        original_request: &ChatCompletionRequest,
-    ) -> crate::tokenizer::stop::StopSequenceDecoder {
-        // Extract stop sequences from request
-        let stop_sequences: Vec<String> = match &original_request.stop {
-            Some(StringOrArray::String(s)) => vec![s.clone()],
-            Some(StringOrArray::Array(arr)) => arr.clone(),
-            None => vec![],
-        };
-
-        // Build stop sequence decoder
-        let mut builder = StopSequenceDecoderBuilder::new(self.tokenizer.clone())
-            .skip_special_tokens(original_request.skip_special_tokens);
-
-        // Add stop sequences (visible if no_stop_trim is true, hidden otherwise)
-        for seq in stop_sequences {
-            builder = if original_request.no_stop_trim {
-                builder.visible_stop_sequence(seq)
-            } else {
-                builder.stop_sequence(seq)
-            };
-        }
-
-        // Add stop token IDs (visible if no_stop_trim is true, hidden otherwise)
-        if let Some(stop_token_ids) = &original_request.stop_token_ids {
-            for &token_id in stop_token_ids {
-                builder = if original_request.no_stop_trim {
-                    builder.visible_stop_token(token_id)
-                } else {
-                    builder.stop_token(token_id)
-                };
-            }
-        }
-
-        builder.build()
-    }
-
-    /// Process a chunk of tokens through the stop decoder
-    fn process_chunk_tokens(
-        stop_decoder: &mut crate::tokenizer::stop::StopSequenceDecoder,
-        token_ids: &[u32],
-    ) -> (String, bool) {
-        let mut chunk_text = String::new();
-
-        for &token_id in token_ids {
-            match stop_decoder.process_token(token_id).unwrap_or_else(|e| {
-                debug!(
-                    "Error processing token {}: {}. Treating as Held.",
-                    token_id, e
-                );
-                SequenceDecoderOutput::Held
-            }) {
-                SequenceDecoderOutput::Text(text) => {
-                    chunk_text.push_str(&text);
-                }
-                SequenceDecoderOutput::StoppedWithText(text) => {
-                    chunk_text.push_str(&text);
-                    return (chunk_text, true); // Return text and signal to stop
-                }
-                SequenceDecoderOutput::Stopped => {
-                    return (chunk_text, true); // Return text and signal to stop
-                }
-                SequenceDecoderOutput::Held => {
-                    // Text held for potential stop sequence match
-                }
-            }
-        }
-        (chunk_text, false) // Return text and continue processing
-    }
-
-    /// Submit request and handle streaming response for chat completions route
-    async fn handle_streaming_chat(
+    /// Submit request and handle non-streaming response for the `/generate` endpoint
+    async fn handle_non_streaming_generate(
         &self,
         mut client: SglangSchedulerClient,
         request: proto::GenerateRequest,
-        original_request: &ChatCompletionRequest,
+        original_request: &GenerateRequest,
+        request_id: String,
+        weight_version: String,
     ) -> Response {
-        let mut stop_decoder = self.create_stop_decoder(original_request);
+        let start_time = Instant::now();
 
-        // Process streaming tokens
-        let mut grpc_stream = match client.generate(request).await {
+        let stream = match client.generate(request).await {
             Ok(stream) => stream,
             Err(e) => {
-                error!("Failed to start generation: {}", e);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Generation failed: {}", e),
-                )
-                    .into_response();
+                return utils::internal_error_message(format!("Failed to start generation: {}", e))
             }
         };
 
-        let mut decoded_text = String::new();
+        // Collect all responses using utils helper
+        let responses = match utils::collect_stream_responses(stream, "Generate").await {
+            Ok(responses) => responses,
+            Err(error_response) => return error_response,
+        };
 
-        while let Some(response) = grpc_stream.next().await {
-            let gen_response = match response {
-                Ok(resp) => resp,
+        if responses.is_empty() {
+            return utils::internal_error_static("No completion received from scheduler");
+        }
+
+        // Create stop decoder from sampling params
+        let params = original_request.sampling_params.as_ref();
+        let mut stop_decoder = utils::create_stop_decoder(
+            &self.tokenizer,
+            params.and_then(|p| p.stop.as_ref()),
+            params.and_then(|p| p.stop_token_ids.as_ref()),
+            params.and_then(|p| p.skip_special_tokens).unwrap_or(true),
+            params.and_then(|p| p.no_stop_trim).unwrap_or(false),
+        );
+
+        // Process each completion
+        let mut result_array = Vec::new();
+        for mut complete in responses {
+            stop_decoder.reset();
+
+            // Process tokens through stop decoder
+            let outputs = match stop_decoder.process_tokens(&complete.output_ids) {
+                Ok(outputs) => outputs,
                 Err(e) => {
-                    error!("Stream error: {}", e);
-                    break;
+                    return utils::internal_error_message(format!(
+                        "Failed to process tokens: {}",
+                        e
+                    ))
                 }
             };
 
-            match gen_response.response {
-                Some(proto::generate_response::Response::Chunk(chunk)) => {
-                    // Process tokens and check if we should stop
-                    let (chunk_text, should_stop) =
-                        Self::process_chunk_tokens(&mut stop_decoder, &chunk.token_ids);
-                    decoded_text.push_str(&chunk_text);
-                    if should_stop {
+            // Accumulate text with early breaks
+            let mut decoded_text = String::new();
+            for output in outputs {
+                match output {
+                    SequenceDecoderOutput::Text(t) => decoded_text.push_str(&t),
+                    SequenceDecoderOutput::StoppedWithText(t) => {
+                        decoded_text.push_str(&t);
                         break;
                     }
-                    continue;
+                    SequenceDecoderOutput::Stopped => break,
+                    SequenceDecoderOutput::Held => {}
                 }
-                Some(proto::generate_response::Response::Complete(_complete)) => {
-                    // Flush any remaining text
-                    if let SequenceDecoderOutput::Text(text) = stop_decoder.flush() {
-                        if !text.is_empty() {
-                            decoded_text.push_str(&text);
-                            debug!("Flushed text: {}", text);
-                        }
-                    }
-                    break;
+            }
+
+            // Flush remaining text
+            if let SequenceDecoderOutput::Text(t) = stop_decoder.flush() {
+                decoded_text.push_str(&t);
+            }
+
+            let output_ids = std::mem::take(&mut complete.output_ids);
+            let finish_reason = std::mem::take(&mut complete.finish_reason);
+
+            // Build base meta_info using json! macro
+            let mut meta_info = json!({
+                "id": request_id.clone(),
+                "finish_reason": finish_reason,
+                "prompt_tokens": complete.prompt_tokens,
+                "weight_version": weight_version.clone(),
+                "completion_tokens": complete.completion_tokens,
+                "cached_tokens": complete.cached_tokens,
+                "e2e_latency": start_time.elapsed().as_secs_f64(),
+            });
+
+            let meta_obj = meta_info.as_object_mut().unwrap();
+
+            // Add matched_stop if present
+            if let Some(matched) = complete.matched_stop.take() {
+                use proto::generate_complete::MatchedStop;
+                let matched_value = match matched {
+                    MatchedStop::MatchedTokenId(id) => json!(id),
+                    MatchedStop::MatchedStopStr(s) => json!(s),
+                };
+                meta_obj.insert("matched_stop".to_string(), matched_value);
+            }
+
+            result_array.push(json!({
+                "text": decoded_text,
+                "output_ids": output_ids,
+                "meta_info": meta_info,
+            }));
+        }
+
+        Json(result_array).into_response()
+    }
+
+    /// Submit request and handle streaming response for the `/generate` endpoint
+    async fn handle_streaming_generate(
+        &self,
+        mut client: SglangSchedulerClient,
+        request: proto::GenerateRequest,
+        original_request: &GenerateRequest,
+        request_id: String,
+        weight_version: String,
+    ) -> Response {
+        let tokenizer = self.tokenizer.clone();
+        let return_logprob = original_request.return_logprob;
+
+        // Create channel for SSE streaming
+        let (tx, rx) =
+            tokio::sync::mpsc::unbounded_channel::<Result<bytes::Bytes, std::io::Error>>();
+
+        // Start the stream
+        let stream = match client.generate(request).await {
+            Ok(stream) => stream,
+            Err(e) => {
+                return utils::internal_error_message(format!("Failed to start generation: {}", e))
+            }
+        };
+
+        // Spawn async task to process stream
+        tokio::spawn(async move {
+            let result = Self::process_generate_streaming(
+                tokenizer,
+                stream,
+                request_id,
+                weight_version,
+                return_logprob,
+                &tx,
+            )
+            .await;
+
+            if let Err(e) = result {
+                let error_chunk = format!("data: {{\"error\": \"{}\"}}\n\n", e);
+                let _ = tx.send(Ok(bytes::Bytes::from(error_chunk)));
+            }
+
+            // Send [DONE] marker
+            let _ = tx.send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
+        });
+
+        // Create SSE response stream
+        let body_stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "text/event-stream")
+            .header("Cache-Control", "no-cache")
+            .header("Connection", "keep-alive")
+            .body(axum::body::Body::from_stream(body_stream))
+            .unwrap()
+    }
+
+    /// Process streaming chunks for generate endpoint
+    async fn process_generate_streaming(
+        tokenizer: Arc<dyn Tokenizer>,
+        mut stream: impl tokio_stream::Stream<Item = Result<proto::GenerateResponse, tonic::Status>>
+            + Unpin,
+        request_id: String,
+        weight_version: String,
+        _include_logprobs: bool,
+        tx: &tokio::sync::mpsc::UnboundedSender<Result<bytes::Bytes, std::io::Error>>,
+    ) -> Result<(), String> {
+        use proto::generate_response::Response::{Chunk, Complete, Error};
+        use std::time::Instant;
+        use tokio_stream::StreamExt;
+
+        let start_time = Instant::now();
+
+        // Track state per index for n>1 case
+        use std::collections::HashMap;
+        let mut accumulated_texts: HashMap<u32, String> = HashMap::new();
+        let mut completion_tokens_map: HashMap<u32, u32> = HashMap::new();
+
+        while let Some(response) = stream.next().await {
+            let gen_response = response.map_err(|e| format!("Stream error: {}", e))?;
+
+            match gen_response.response {
+                Some(Chunk(chunk)) => {
+                    let index = chunk.index;
+
+                    // Update completion tokens for this index
+                    let completion_tokens = completion_tokens_map.entry(index).or_insert(0);
+                    *completion_tokens += chunk.token_ids.len() as u32;
+
+                    // Decode tokens to text (skip_special_tokens=true to handle newlines correctly)
+                    let chunk_text = tokenizer.decode(&chunk.token_ids, true).unwrap_or_default();
+
+                    // Accumulate text for this index
+                    let accumulated_text = accumulated_texts.entry(index).or_default();
+                    accumulated_text.push_str(&chunk_text);
+
+                    // Generate unique ID per index
+                    let index_id = format!("{}-{}", request_id, index);
+
+                    // Build streaming response chunk (SGLang format)
+                    let chunk_response = serde_json::json!({
+                        "text": accumulated_text.clone(),
+                        "output_ids": chunk.token_ids,
+                        "meta_info": {
+                            "id": index_id,
+                            "finish_reason": null,
+                            "prompt_tokens": chunk.prompt_tokens,
+                            "weight_version": weight_version,
+                            "completion_tokens": *completion_tokens,
+                            "cached_tokens": chunk.cached_tokens
+                        },
+                        "index": index
+                    });
+
+                    let sse_chunk = format!(
+                        "data: {}\n\n",
+                        serde_json::to_string(&chunk_response).unwrap()
+                    );
+                    tx.send(Ok(bytes::Bytes::from(sse_chunk)))
+                        .map_err(|_| "Failed to send chunk".to_string())?;
                 }
-                Some(proto::generate_response::Response::Error(error)) => {
-                    error!("Generation error: {}", error.message);
-                    break;
+                Some(Complete(complete)) => {
+                    let index = complete.index;
+                    let accumulated_text =
+                        accumulated_texts.get(&index).cloned().unwrap_or_default();
+                    let completion_tokens = *completion_tokens_map.get(&index).unwrap_or(&0);
+                    let index_id = format!("{}-{}", request_id, index);
+                    let e2e_latency = start_time.elapsed().as_secs_f64();
+
+                    // Send final chunk with finish_reason (no new tokens in Complete, they were already sent in Chunks)
+                    let finish_response = serde_json::json!({
+                        "text": accumulated_text,
+                        "output_ids": complete.output_ids[complete.output_ids.len().saturating_sub(1)..].to_vec(),
+                        "meta_info": {
+                            "id": index_id,
+                            "finish_reason": complete.finish_reason,
+                            "prompt_tokens": complete.prompt_tokens,
+                            "weight_version": weight_version,
+                            "completion_tokens": completion_tokens,
+                            "cached_tokens": complete.cached_tokens,
+                            "e2e_latency": e2e_latency
+                        },
+                        "index": index
+                    });
+
+                    let sse_chunk = format!(
+                        "data: {}\n\n",
+                        serde_json::to_string(&finish_response).unwrap()
+                    );
+                    tx.send(Ok(bytes::Bytes::from(sse_chunk)))
+                        .map_err(|_| "Failed to send finish chunk".to_string())?;
+
+                    // Continue to process all completions if n>1
+                }
+                Some(Error(error)) => {
+                    return Err(error.message);
                 }
                 None => continue,
             }
         }
 
-        // TODO: Replace with proper SSE streaming response
-        // For now, return the complete decoded text
-        (StatusCode::OK, format!("Decoded text: {}", decoded_text)).into_response()
-    }
-
-    /// Submit request and handle non-streaming response for chat completions route
-    async fn handle_non_streaming_chat(
-        &self,
-        mut client: SglangSchedulerClient,
-        request: proto::GenerateRequest,
-        original_request: &ChatCompletionRequest,
-    ) -> Response {
-        let mut stop_decoder = self.create_stop_decoder(original_request);
-
-        // Small helpers to log + return a uniform 500
-        let fail_str = |msg: &'static str| -> Response {
-            error!("{}", msg);
-            (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response()
-        };
-        let fail_fmt = |prefix: &str, e: &dyn std::fmt::Display| -> Response {
-            error!("{}{}", prefix, e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("{}{}", prefix, e),
-            )
-                .into_response()
-        };
-
-        // Start generation
-        let mut stream = match client.generate(request).await {
-            Ok(s) => s,
-            Err(e) => return fail_fmt("Failed to start generation: ", &e),
-        };
-
-        // Collect all responses (for n>1 support)
-        let mut all_responses = Vec::new();
-        while let Some(response) = stream.next().await {
-            match response {
-                Ok(gen_response) => match gen_response.response {
-                    Some(proto::generate_response::Response::Complete(complete)) => {
-                        all_responses.push(complete);
-                    }
-                    Some(proto::generate_response::Response::Error(err)) => {
-                        error!("Generation failed for one choice: {}", err.message);
-                        return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("Generation failed: {}", err.message),
-                        )
-                            .into_response();
-                    }
-                    Some(proto::generate_response::Response::Chunk(_)) => {
-                        return fail_str("Unexpected chunk response for non-streaming request")
-                    }
-                    None => return fail_str("Empty response from server"),
-                },
-                Err(e) => return fail_fmt("Failed to get GenerateResponse: ", &e),
-            }
-        }
-
-        if all_responses.is_empty() {
-            return fail_str("No responses from server");
-        }
-
-        // Process each response into a ChatChoice
-        let mut choices = Vec::new();
-        for (index, complete) in all_responses.iter().enumerate() {
-            match self
-                .process_single_choice(complete, index, original_request, &mut stop_decoder)
-                .await
-            {
-                Ok(choice) => choices.push(choice),
-                Err(e) => {
-                    error!("Failed to process choice {}: {}", index, e);
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Failed to process choice {}: {}", index, e),
-                    )
-                        .into_response();
-                }
-            }
-        }
-
-        // Aggregate usage information from all responses
-        let total_prompt_tokens: u32 = all_responses.iter().map(|r| r.prompt_tokens as u32).sum();
-        let total_completion_tokens: u32 = all_responses
-            .iter()
-            .map(|r| r.completion_tokens as u32)
-            .sum();
-        let usage = Usage {
-            prompt_tokens: total_prompt_tokens,
-            completion_tokens: total_completion_tokens,
-            total_tokens: total_prompt_tokens + total_completion_tokens,
-            completion_tokens_details: None,
-        };
-
-        // Build final ChatCompletionResponse
-        let response = ChatCompletionResponse {
-            id: format!("chatcmpl-{}", Uuid::new_v4()),
-            object: "chat.completion".to_string(),
-            created: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-            model: original_request.model.clone(),
-            choices,
-            usage: Some(usage),
-            system_fingerprint: None,
-        };
-
-        // Serialize and return JSON response
-        Json(response).into_response()
-    }
-
-    /// Process a single GenerateComplete response into a ChatChoice
-    async fn process_single_choice(
-        &self,
-        complete: &proto::GenerateComplete,
-        index: usize,
-        original_request: &ChatCompletionRequest,
-        stop_decoder: &mut crate::tokenizer::stop::StopSequenceDecoder,
-    ) -> Result<ChatChoice, String> {
-        stop_decoder.reset();
-        // Decode tokens
-        let outputs = stop_decoder
-            .process_tokens(&complete.output_ids)
-            .map_err(|e| format!("Failed to process tokens: {}", e))?;
-
-        // Accumulate text with early breaks
-        let mut final_text = String::new();
-        for output in outputs {
-            match output {
-                SequenceDecoderOutput::Text(t) => final_text.push_str(&t),
-                SequenceDecoderOutput::StoppedWithText(t) => {
-                    final_text.push_str(&t);
-                    break;
-                }
-                SequenceDecoderOutput::Stopped => break,
-                SequenceDecoderOutput::Held => {}
-            }
-        }
-
-        // Flush remaining text
-        if let SequenceDecoderOutput::Text(t) = stop_decoder.flush() {
-            final_text.push_str(&t);
-        }
-
-        // Step 1: Handle reasoning content parsing
-        let mut reasoning_text: Option<String> = None;
-        let mut processed_text = final_text;
-
-        // Check if reasoning parsing is enabled and separate_reasoning is requested
-        if original_request.separate_reasoning {
-            if let Ok(mut parser) = self
-                .reasoning_parser_factory
-                .create(&original_request.model)
-            {
-                match parser.detect_and_parse_reasoning(&processed_text) {
-                    Ok(result) => {
-                        if !result.reasoning_text.is_empty() {
-                            reasoning_text = Some(result.reasoning_text);
-                        }
-                        processed_text = result.normal_text;
-                    }
-                    Err(e) => {
-                        return Err(format!("Reasoning parsing error: {}", e));
-                    }
-                }
-            }
-        }
-
-        // Step 2: Handle tool call parsing
-        let mut tool_calls: Option<Vec<crate::protocols::spec::ToolCall>> = None;
-
-        // Check if tool calls should be processed
-        let tool_choice_enabled = !matches!(
-            &original_request.tool_choice,
-            Some(ToolChoice::Value(
-                crate::protocols::spec::ToolChoiceValue::None
-            ))
-        );
-
-        if tool_choice_enabled && original_request.tools.is_some() {
-            if let Some(parser) = self
-                .tool_parser_registry
-                .get_parser(&original_request.model)
-            {
-                match parser.parse_complete(&processed_text).await {
-                    Ok((normal_text, parsed_tool_calls)) => {
-                        if !parsed_tool_calls.is_empty() {
-                            let spec_tool_calls = parsed_tool_calls
-                                .into_iter()
-                                .map(|tc| crate::protocols::spec::ToolCall {
-                                    id: tc.id,
-                                    tool_type: "function".to_string(),
-                                    function: crate::protocols::spec::FunctionCallResponse {
-                                        name: tc.function.name,
-                                        arguments: Some(
-                                            serde_json::to_string(&tc.function.arguments)
-                                                .unwrap_or_else(|_| "{}".to_string()),
-                                        ),
-                                    },
-                                })
-                                .collect();
-                            tool_calls = Some(spec_tool_calls);
-                            processed_text = normal_text;
-                        }
-                    }
-                    Err(e) => {
-                        error!("Tool call parsing error: {}", e);
-                        // Continue without tool calls rather than failing
-                    }
-                }
-            }
-        }
-
-        // Step 3: Use finish reason directly from proto (already OpenAI-compatible string)
-        let finish_reason_str = &complete.finish_reason;
-
-        // Override finish reason if we have tool calls
-        let final_finish_reason_str = if tool_calls.is_some() {
-            "tool_calls"
-        } else {
-            finish_reason_str
-        };
-
-        // Extract matched_stop information from proto
-        let matched_stop = match &complete.matched_stop {
-            Some(proto::generate_complete::MatchedStop::MatchedTokenId(token_id)) => Some(
-                serde_json::Value::Number(serde_json::Number::from(*token_id)),
-            ),
-            Some(proto::generate_complete::MatchedStop::MatchedStopStr(stop_str)) => {
-                Some(serde_json::Value::String(stop_str.clone()))
-            }
-            None => None,
-        };
-
-        // Step 4: Build ChatCompletionMessage (proper response message type)
-        let chat_message = ChatCompletionMessage {
-            role: "assistant".to_string(),
-            content: if processed_text.is_empty() {
-                None
-            } else {
-                Some(processed_text)
-            },
-            tool_calls,
-            reasoning_content: reasoning_text,
-        };
-
-        // Step 5: Build ChatChoice
-        let choice = ChatChoice {
-            index: index as u32,
-            message: chat_message,
-            logprobs: None,
-            finish_reason: Some(final_finish_reason_str.to_string()),
-            matched_stop,
-            hidden_states: None,
-        };
-
-        Ok(choice)
+        Ok(())
     }
 }
 
@@ -918,11 +605,11 @@ impl RouterTrait for GrpcRouter {
 
     async fn route_generate(
         &self,
-        _headers: Option<&HeaderMap>,
-        _body: &GenerateRequest,
-        _model_id: Option<&str>,
+        headers: Option<&HeaderMap>,
+        body: &GenerateRequest,
+        model_id: Option<&str>,
     ) -> Response {
-        (StatusCode::NOT_IMPLEMENTED).into_response()
+        self.route_generate_impl(headers, body, model_id).await
     }
 
     async fn route_chat(
@@ -985,243 +672,5 @@ impl RouterTrait for GrpcRouter {
 
     fn router_type(&self) -> &'static str {
         "grpc"
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::protocols::spec::{ChatMessage, ContentPart, ImageUrl, UserMessageContent};
-    use crate::tokenizer::chat_template::ChatTemplateContentFormat;
-    use serde_json::json;
-
-    #[test]
-    fn test_transform_messages_string_format() {
-        let messages = vec![ChatMessage::User {
-            role: "user".to_string(),
-            content: UserMessageContent::Parts(vec![
-                ContentPart::Text {
-                    text: "Hello".to_string(),
-                },
-                ContentPart::ImageUrl {
-                    image_url: ImageUrl {
-                        url: "https://example.com/image.jpg".to_string(),
-                        detail: None,
-                    },
-                },
-                ContentPart::Text {
-                    text: "World".to_string(),
-                },
-            ]),
-            name: None,
-        }];
-
-        let result =
-            GrpcRouter::process_content_format(&messages, ChatTemplateContentFormat::String)
-                .unwrap();
-
-        assert_eq!(result.len(), 1);
-        let transformed_message = &result[0];
-
-        // Should flatten multimodal content to text only
-        assert_eq!(
-            transformed_message["content"].as_str().unwrap(),
-            "Hello World"
-        );
-        assert_eq!(transformed_message["role"].as_str().unwrap(), "user");
-    }
-
-    #[test]
-    fn test_transform_messages_openai_format() {
-        let messages = vec![ChatMessage::User {
-            role: "user".to_string(),
-            content: UserMessageContent::Parts(vec![
-                ContentPart::Text {
-                    text: "Describe this image:".to_string(),
-                },
-                ContentPart::ImageUrl {
-                    image_url: ImageUrl {
-                        url: "https://example.com/image.jpg".to_string(),
-                        detail: Some("high".to_string()),
-                    },
-                },
-            ]),
-            name: None,
-        }];
-
-        let result =
-            GrpcRouter::process_content_format(&messages, ChatTemplateContentFormat::OpenAI)
-                .unwrap();
-
-        assert_eq!(result.len(), 1);
-        let transformed_message = &result[0];
-
-        // Should replace media URLs with simple type placeholders
-        let content_array = transformed_message["content"].as_array().unwrap();
-        assert_eq!(content_array.len(), 2);
-
-        // Text part should remain unchanged
-        assert_eq!(content_array[0]["type"], "text");
-        assert_eq!(content_array[0]["text"], "Describe this image:");
-
-        // Image part should be replaced with simple type placeholder
-        assert_eq!(content_array[1], json!({"type": "image"}));
-    }
-
-    #[test]
-    fn test_transform_messages_simple_string_content() {
-        let messages = vec![ChatMessage::User {
-            role: "user".to_string(),
-            content: UserMessageContent::Text("Simple text message".to_string()),
-            name: None,
-        }];
-
-        let result =
-            GrpcRouter::process_content_format(&messages, ChatTemplateContentFormat::String)
-                .unwrap();
-
-        assert_eq!(result.len(), 1);
-        let transformed_message = &result[0];
-
-        // Simple string content should remain unchanged
-        assert_eq!(
-            transformed_message["content"].as_str().unwrap(),
-            "Simple text message"
-        );
-    }
-
-    #[test]
-    fn test_transform_messages_assistant_message() {
-        let messages = vec![ChatMessage::Assistant {
-            role: "assistant".to_string(),
-            content: Some("Assistant response".to_string()),
-            name: None,
-            tool_calls: None,
-            function_call: None,
-            reasoning_content: None,
-        }];
-
-        let result =
-            GrpcRouter::process_content_format(&messages, ChatTemplateContentFormat::String)
-                .unwrap();
-
-        assert_eq!(result.len(), 1);
-        let transformed_message = &result[0];
-
-        assert_eq!(transformed_message["role"].as_str().unwrap(), "assistant");
-        assert_eq!(
-            transformed_message["content"].as_str().unwrap(),
-            "Assistant response"
-        );
-    }
-
-    #[test]
-    fn test_transform_messages_multiple_messages() {
-        let messages = vec![
-            ChatMessage::System {
-                role: "system".to_string(),
-                content: "System prompt".to_string(),
-                name: None,
-            },
-            ChatMessage::User {
-                role: "user".to_string(),
-                content: UserMessageContent::Parts(vec![
-                    ContentPart::Text {
-                        text: "User message".to_string(),
-                    },
-                    ContentPart::ImageUrl {
-                        image_url: ImageUrl {
-                            url: "https://example.com/image.jpg".to_string(),
-                            detail: None,
-                        },
-                    },
-                ]),
-                name: None,
-            },
-        ];
-
-        let result =
-            GrpcRouter::process_content_format(&messages, ChatTemplateContentFormat::String)
-                .unwrap();
-
-        assert_eq!(result.len(), 2);
-
-        // System message should remain unchanged
-        assert_eq!(result[0]["role"].as_str().unwrap(), "system");
-        assert_eq!(result[0]["content"].as_str().unwrap(), "System prompt");
-
-        // User message should be flattened to text only
-        assert_eq!(result[1]["role"].as_str().unwrap(), "user");
-        assert_eq!(result[1]["content"].as_str().unwrap(), "User message");
-    }
-
-    #[test]
-    fn test_transform_messages_empty_text_parts() {
-        let messages = vec![ChatMessage::User {
-            role: "user".to_string(),
-            content: UserMessageContent::Parts(vec![ContentPart::ImageUrl {
-                image_url: ImageUrl {
-                    url: "https://example.com/image.jpg".to_string(),
-                    detail: None,
-                },
-            }]),
-            name: None,
-        }];
-
-        let result =
-            GrpcRouter::process_content_format(&messages, ChatTemplateContentFormat::String)
-                .unwrap();
-
-        assert_eq!(result.len(), 1);
-        let transformed_message = &result[0];
-
-        // Should keep original multimodal content when no text parts exist
-        assert!(transformed_message["content"].is_array());
-    }
-
-    #[test]
-    fn test_transform_messages_mixed_content_types() {
-        let messages = vec![
-            ChatMessage::User {
-                role: "user".to_string(),
-                content: UserMessageContent::Text("Plain text".to_string()),
-                name: None,
-            },
-            ChatMessage::User {
-                role: "user".to_string(),
-                content: UserMessageContent::Parts(vec![
-                    ContentPart::Text {
-                        text: "With image".to_string(),
-                    },
-                    ContentPart::ImageUrl {
-                        image_url: ImageUrl {
-                            url: "https://example.com/image.jpg".to_string(),
-                            detail: Some("low".to_string()),
-                        },
-                    },
-                ]),
-                name: None,
-            },
-        ];
-
-        let result_string =
-            GrpcRouter::process_content_format(&messages, ChatTemplateContentFormat::String)
-                .unwrap();
-
-        assert_eq!(result_string.len(), 2);
-        assert_eq!(result_string[0]["content"].as_str().unwrap(), "Plain text");
-        assert_eq!(result_string[1]["content"].as_str().unwrap(), "With image");
-
-        let result_openai =
-            GrpcRouter::process_content_format(&messages, ChatTemplateContentFormat::OpenAI)
-                .unwrap();
-
-        assert_eq!(result_openai.len(), 2);
-        assert_eq!(result_openai[0]["content"].as_str().unwrap(), "Plain text");
-
-        let content_array = result_openai[1]["content"].as_array().unwrap();
-        assert_eq!(content_array.len(), 2);
-        assert_eq!(content_array[0]["type"], "text");
-        assert_eq!(content_array[1], json!({"type": "image"}));
     }
 }
