@@ -70,41 +70,29 @@ class SparsePooler(nn.Module):
             -1
         )  # [total_tokens]
 
-        # Number of items in batch
-        batch_len = len(forward_batch.extend_seq_lens)
-
         # Create batch indices for packed sequences
         batch_indices = torch.repeat_interleave(
-            torch.arange(batch_len, device=hidden_states.device),
+            torch.arange(
+                len(forward_batch.extend_seq_lens), device=hidden_states.device
+            ),
             forward_batch.extend_seq_lens,
         )
 
-        # Create a tensor of (batch_idx, token_id) pairs
-        token_indices = torch.stack([batch_indices, forward_batch.input_ids], dim=0)
-
-        # Find unique pairs and their inverse mapping
-        unique_indices, inverse_indices = torch.unique(
-            token_indices, dim=1, return_inverse=True
-        )
-
-        # Create a tensor for the unique values and apply scatter_reduce
-        unique_values = torch.zeros(
-            unique_indices.shape[1],
+        # Initialize sparse embedding output
+        sparse_embedding = torch.zeros(
+            len(forward_batch.extend_seq_lens),
+            self.vocab_size,
             dtype=token_weights.dtype,
             device=token_weights.device,
         )
-        unique_values.scatter_reduce_(
-            0, inverse_indices, token_weights, reduce="amax", include_self=False
+
+        # Map to vocabulary space using scatter_reduce with amax
+        flat_indices = batch_indices * self.vocab_size + forward_batch.input_ids
+        sparse_embedding.view(-1).scatter_reduce_(
+            0, flat_indices, token_weights, reduce="amax"
         )
 
-        # Create the final sparse tensor
-        sparse_embeddings = torch.sparse_coo_tensor(
-            unique_indices,
-            unique_values,
-            (batch_len, self.vocab_size),
-        )
-
-        return SparseEmbeddingOutput(embeddings=sparse_embeddings)
+        return SparseEmbeddingOutput(embeddings=sparse_embedding)
 
     def load_weights(self, state_dict: dict):
         """Load weights from state dict (called by the model)."""

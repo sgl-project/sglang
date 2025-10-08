@@ -174,9 +174,11 @@ class SchedulerOutputProcessorMixin:
                             logprob_pt += num_input_logprobs
 
         else:  # embedding or reward model
+            is_sparse = envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set()
+
             embeddings = result.embeddings
 
-            if embeddings.is_sparse:
+            if is_sparse:
                 batches, token_ids = embeddings.indices()
                 vals = embeddings.values()
 
