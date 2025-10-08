@@ -301,43 +301,6 @@ def alloc_req_slots(
     return req_pool_indices
 
 
-def alloc_kv_cache_for_extend(
-    tree_cache: BasePrefixCache,
-    prefix_lens_device: torch.Tensor,
-    prefix_lens_cpu: torch.Tensor,
-    seq_lens_device: torch.Tensor,
-    seq_lens_cpu: torch.Tensor,
-    prefix_tensors: list[torch.Tensor],
-    extend_num_tokens: int,
-) -> torch.Tensor:
-    """
-    Allocate KV cache for extend batch.
-
-    Pure allocation - no batch manipulation.
-    Handles page_size branching internally.
-
-    Returns:
-        out_cache_loc: allocated KV cache locations
-    """
-    if tree_cache.page_size == 1:
-        return alloc_token_slots(tree_cache, extend_num_tokens)
-    else:
-        # Paged allocation - build last_loc
-        last_loc = [
-            (t[-1:] if len(t) > 0 else torch.tensor([-1], device=tree_cache.device))
-            for t in prefix_tensors
-        ]
-        return alloc_paged_token_slots_extend(
-            tree_cache=tree_cache,
-            prefix_lens=prefix_lens_device,
-            prefix_lens_cpu=prefix_lens_cpu,
-            seq_lens=seq_lens_device,
-            seq_lens_cpu=seq_lens_cpu,
-            last_loc=torch.cat(last_loc),
-            extend_num_tokens=extend_num_tokens,
-        )
-
-
 def alloc_for_extend(
     batch: ScheduleBatch,
 ) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
@@ -364,15 +327,27 @@ def alloc_for_extend(
     req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
 
     # Allocate KV cache
-    out_cache_loc = alloc_kv_cache_for_extend(
-        batch.tree_cache,
-        prefix_lens_device,
-        prefix_lens_cpu,
-        batch.seq_lens,
-        batch.seq_lens_cpu,
-        prefix_tensors,
-        batch.extend_num_tokens,
-    )
+    if batch.tree_cache.page_size == 1:
+        out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
+    else:
+        # Paged allocation - build last_loc
+        last_loc = [
+            (
+                t[-1:]
+                if len(t) > 0
+                else torch.tensor([-1], device=batch.tree_cache.device)
+            )
+            for t in prefix_tensors
+        ]
+        out_cache_loc = alloc_paged_token_slots_extend(
+            tree_cache=batch.tree_cache,
+            prefix_lens=prefix_lens_device,
+            prefix_lens_cpu=prefix_lens_cpu,
+            seq_lens=batch.seq_lens,
+            seq_lens_cpu=batch.seq_lens_cpu,
+            last_loc=torch.cat(last_loc),
+            extend_num_tokens=batch.extend_num_tokens,
+        )
 
     # Write to req_to_token_pool
     write_cache_indices(

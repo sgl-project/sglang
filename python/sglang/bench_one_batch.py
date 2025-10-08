@@ -51,6 +51,7 @@ import logging
 import multiprocessing
 import os
 import time
+from types import SimpleNamespace
 from typing import Tuple
 
 import numpy as np
@@ -257,11 +258,18 @@ def prepare_synthetic_inputs_for_latency_test(
 
 @torch.no_grad
 def extend(reqs, model_runner):
+    # Create dummy tree_cache for benchmarks (no prefix caching, just allocation)
+    dummy_tree_cache = SimpleNamespace(
+        page_size=1,
+        device=model_runner.device,
+        token_to_kv_pool_allocator=model_runner.token_to_kv_pool_allocator,
+    )
+
     batch = ScheduleBatch.init_new(
         reqs=reqs,
         req_to_token_pool=model_runner.req_to_token_pool,
         token_to_kv_pool_allocator=model_runner.token_to_kv_pool_allocator,
-        tree_cache=None,
+        tree_cache=dummy_tree_cache,
         model_config=model_runner.model_config,
         enable_overlap=False,
         spec_algorithm=SpeculativeAlgorithm.NONE,
