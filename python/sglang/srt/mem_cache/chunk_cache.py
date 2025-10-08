@@ -83,9 +83,12 @@ class SWAChunkCache(ChunkCache):
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool_allocator: SWATokenToKVPoolAllocator,
         page_size: int,
+        sliding_window_size: int = -1,
     ):
         super().__init__(req_to_token_pool, token_to_kv_pool_allocator, page_size)
         assert isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator)
+        # Keep the most recent `sliding_window_size` tokens (if > 0) for SWA layers.
+        self.sliding_window_size = int(sliding_window_size)
 
     def evict_swa(
         self,
@@ -93,15 +96,52 @@ class SWAChunkCache(ChunkCache):
         prelen: int,
         attention_chunk_size: int,
     ):
-        if prelen >= req.evicted_seqlen_local + attention_chunk_size:
-            new_evicted_seqlen_local = attention_chunk_size * (
-                prelen // attention_chunk_size
+        """Evict SWA KV entries that fall outside the sliding window.
+
+        Original behavior (no sliding window) freed all complete chunks older
+        than the current prelen. With a sliding window, we restrict eviction so
+        that at least the most recent `sliding_window_size` tokens remain.
+
+        Eviction alignment rules:
+          - Only evict full chunks of size `attention_chunk_size`.
+          - Never evict tokens within the last `sliding_window_size` tokens.
+        """
+        # Clamp to sliding window size as only need to keep max sliding_window_size tokens for SWA layer.
+        if self.sliding_window_size != -1 and (
+            attention_chunk_size is None
+            or attention_chunk_size > self.sliding_window_size
+        ):
+            attention_chunk_size = self.sliding_window_size
+
+        if prelen < req.evicted_seqlen_local + attention_chunk_size:
+            return
+
+        # Maximum chunk-aligned boundary we could evict up to under original policy.
+        candidate_new = attention_chunk_size * (prelen // attention_chunk_size)
+
+        if self.sliding_window_size > 0:
+            # Oldest token index we must keep (exclusive eviction upper bound).
+            # We want to retain tokens in [keep_start, prelen).
+            keep_start = max(0, prelen - self.sliding_window_size)
+            # Align eviction upper bound down to full chunks.
+            keep_start_aligned = attention_chunk_size * (
+                keep_start // attention_chunk_size
             )
-            free_slots = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, req.evicted_seqlen_local : new_evicted_seqlen_local
-            ]
-            self.token_to_kv_pool_allocator.free_swa(free_slots)
-            req.evicted_seqlen_local = new_evicted_seqlen_local
+            # We can only evict tokens strictly before keep_start_aligned.
+            allowed_evict_upto = keep_start_aligned
+            new_evicted_seqlen_local = min(candidate_new, allowed_evict_upto)
+        else:
+            new_evicted_seqlen_local = candidate_new
+
+        # Ensure monotonic increase and chunk alignment.
+        if new_evicted_seqlen_local <= req.evicted_seqlen_local:
+            return
+
+        free_slots = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, req.evicted_seqlen_local : new_evicted_seqlen_local
+        ]
+        self.token_to_kv_pool_allocator.free_swa(free_slots)
+        req.evicted_seqlen_local = new_evicted_seqlen_local
 
     def evict(self, num_tokens: int):
         pass
