@@ -36,7 +36,6 @@ else:
     Image = Any
 
 
-# Parameters for a session
 @dataclass
 class BaseReq(ABC):
     rid: Optional[Union[str, List[str]]] = field(default=None, kw_only=True)
@@ -60,9 +59,11 @@ class BaseBatchReq(ABC):
         return self.rids
 
 
+# Parameters for a session
 @dataclass
 class SessionParams:
     id: Optional[str] = None
+    rid: Optional[str] = None
     offset: Optional[int] = None
     replace: Optional[bool] = None
     drop_previous_output: Optional[bool] = None
