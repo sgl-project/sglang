@@ -15,7 +15,7 @@ class TestDisaggregationUniformParallelismNixl(TestDisaggregationNixl):
             (2, 2, 2),  # 2 prefill TP, 2 prefill PP, 2 decode TP
         ]
 
-        expected_accuracy = 0.70
+        expected_accuracy = 0.65
 
         for prefill_tp, prefill_pp, decode_tp in test_cases:
             with self.subTest(

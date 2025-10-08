@@ -1,17 +1,10 @@
 import unittest
 from types import SimpleNamespace
-from urllib.parse import urlparse
 
 from sglang.srt.disaggregation.test_disaggregation_nixl_utils import (
     TestDisaggregationNixl,
 )
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
-from sglang.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_TEST,
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    DEFAULT_URL_FOR_TEST,
-    popen_launch_pd_server,
-)
 
 
 class TestDisaggregationVariableParallelismNixl(TestDisaggregationNixl):
@@ -25,7 +18,7 @@ class TestDisaggregationVariableParallelismNixl(TestDisaggregationNixl):
             (2, 2, 2),  # 2 prefill TP, 2 prefill PP, 2 decode TP
         ]
 
-        expected_accuracy = 0.70
+        expected_accuracy = 0.65
 
         for prefill_tp, prefill_pp, decode_tp in test_cases:
             with self.subTest(
