@@ -3,8 +3,10 @@
 use crate::config::CircuitBreakerConfig;
 use crate::core::{CircuitBreaker, CircuitBreakerConfig as CoreCircuitBreakerConfig};
 use crate::data_connector::{
-    Conversation, ConversationId, ConversationMetadata, ResponseId, SharedConversationStorage,
-    SharedResponseStorage, StoredResponse,
+    Conversation, ConversationId, ConversationItemsListParams, ConversationItemsSortOrder,
+    ConversationMetadata, NewConversationItem as DCNewConversationItem, ResponseId,
+    SharedConversationItemStorage, SharedConversationStorage, SharedResponseStorage,
+    StoredResponse,
 };
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest,
@@ -81,6 +83,8 @@ pub struct OpenAIRouter {
     response_storage: SharedResponseStorage,
     /// Conversation storage backend
     conversation_storage: SharedConversationStorage,
+    /// Conversation item storage backend
+    conversation_item_storage: SharedConversationItemStorage,
     /// Optional MCP manager (enabled via config presence)
     mcp_manager: Option<Arc<crate::mcp::McpClientManager>>,
 }
@@ -706,12 +710,15 @@ impl StreamingResponseAccumulator {
 }
 
 impl OpenAIRouter {
+    // Maximum number of conversation items to attach as input when a conversation is provided
+    const MAX_CONVERSATION_HISTORY_ITEMS: usize = 100;
     /// Create a new OpenAI router
     pub async fn new(
         base_url: String,
         circuit_breaker_config: Option<CircuitBreakerConfig>,
         response_storage: SharedResponseStorage,
         conversation_storage: SharedConversationStorage,
+        conversation_item_storage: SharedConversationItemStorage,
     ) -> Result<Self, String> {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(300))
@@ -759,6 +766,7 @@ impl OpenAIRouter {
             healthy: AtomicBool::new(true),
             response_storage,
             conversation_storage,
+            conversation_item_storage,
             mcp_manager,
         })
     }
@@ -946,12 +954,30 @@ impl OpenAIRouter {
 
                         // Mask tools back to MCP format for client
                         Self::mask_tools_as_mcp(&mut final_response_json, original_body);
+                        // Attach conversation id for client response if present (not forwarded upstream)
+                        if let Some(conv_id) = original_body.conversation.clone() {
+                            if let Some(obj) = final_response_json.as_object_mut() {
+                                obj.insert("conversation".to_string(), json!({"id": conv_id}));
+                            }
+                        }
                         if original_body.store {
                             if let Err(e) = self
                                 .store_response_internal(&final_response_json, original_body)
                                 .await
                             {
                                 warn!("Failed to store response: {}", e);
+                            }
+                        }
+                        if let Some(conv_id) = original_body.conversation.clone() {
+                            if let Err(err) = self
+                                .persist_conversation_items(
+                                    &conv_id,
+                                    original_body,
+                                    &final_response_json,
+                                )
+                                .await
+                            {
+                                warn!("Failed to persist conversation items: {}", err);
                             }
                         }
 
@@ -988,6 +1014,22 @@ impl OpenAIRouter {
             )
                 .into_response(),
         }
+    }
+
+    async fn persist_conversation_items(
+        &self,
+        conversation_id: &str,
+        original_body: &ResponsesRequest,
+        final_response_json: &Value,
+    ) -> Result<(), String> {
+        persist_items_with_storages(
+            self.conversation_storage.clone(),
+            self.conversation_item_storage.clone(),
+            conversation_id.to_string(),
+            original_body.clone(),
+            final_response_json.clone(),
+        )
+        .await
     }
 
     /// Build a request-scoped MCP manager from request tools, if present.
@@ -1123,7 +1165,10 @@ impl OpenAIRouter {
 
         let should_store = original_body.store;
         let storage = self.response_storage.clone();
+        let conv_storage = self.conversation_storage.clone();
+        let conv_item_storage = self.conversation_item_storage.clone();
         let original_request = original_body.clone();
+        let persist_needed = original_request.conversation.is_some();
         let previous_response_id = original_previous_response_id.clone();
 
         tokio::spawn(async move {
@@ -1160,7 +1205,7 @@ impl OpenAIRouter {
                                 Cow::Borrowed(raw_block.as_str())
                             };
 
-                            if should_store {
+                            if should_store || persist_needed {
                                 accumulator.ingest_block(block_cow.as_ref());
                             }
 
@@ -1189,7 +1234,7 @@ impl OpenAIRouter {
                 }
             }
 
-            if should_store && !upstream_failed {
+            if (should_store || persist_needed) && !upstream_failed {
                 if !pending.trim().is_empty() {
                     accumulator.ingest_block(&pending);
                 }
@@ -1201,10 +1246,28 @@ impl OpenAIRouter {
                         previous_response_id.as_deref(),
                     );
 
-                    if let Err(err) =
-                        Self::store_response_impl(&storage, &response_json, &original_request).await
-                    {
-                        warn!("Failed to store streaming response: {}", err);
+                    if should_store {
+                        if let Err(err) =
+                            Self::store_response_impl(&storage, &response_json, &original_request)
+                                .await
+                        {
+                            warn!("Failed to store streaming response: {}", err);
+                        }
+                    }
+                    if persist_needed {
+                        if let Some(conv_id) = original_request.conversation.clone() {
+                            if let Err(err) = persist_items_with_storages(
+                                conv_storage.clone(),
+                                conv_item_storage.clone(),
+                                conv_id,
+                                original_request.clone(),
+                                response_json.clone(),
+                            )
+                            .await
+                            {
+                                warn!("Failed to persist conversation items (stream): {}", err);
+                            }
+                        }
                     }
                 } else if let Some(error_payload) = encountered_error {
                     warn!("Upstream streaming error payload: {}", error_payload);
@@ -1683,7 +1746,10 @@ impl OpenAIRouter {
         let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, io::Error>>();
         let should_store = original_body.store;
         let storage = self.response_storage.clone();
+        let conv_storage = self.conversation_storage.clone();
+        let conv_item_storage = self.conversation_item_storage.clone();
         let original_request = original_body.clone();
+        let persist_needed = original_request.conversation.is_some();
         let previous_response_id = original_previous_response_id.clone();
 
         let client = self.client.clone();
@@ -1901,30 +1967,33 @@ impl OpenAIRouter {
                         return;
                     }
 
-                    // Send final events and done marker
-                    if should_store {
-                        if let Some(mut response_json) = handler.accumulator.into_final_response() {
-                            if let Some(ref id) = preserved_response_id {
-                                if let Some(obj) = response_json.as_object_mut() {
-                                    obj.insert("id".to_string(), Value::String(id.clone()));
-                                }
+                    let final_response_json = if should_store || persist_needed {
+                        handler.accumulator.into_final_response()
+                    } else {
+                        None
+                    };
+
+                    if let Some(mut response_json) = final_response_json {
+                        if let Some(ref id) = preserved_response_id {
+                            if let Some(obj) = response_json.as_object_mut() {
+                                obj.insert("id".to_string(), Value::String(id.clone()));
                             }
-                            Self::inject_mcp_metadata_streaming(
-                                &mut response_json,
-                                &state,
-                                &active_mcp_clone,
-                                server_label,
-                            );
+                        }
+                        Self::inject_mcp_metadata_streaming(
+                            &mut response_json,
+                            &state,
+                            &active_mcp_clone,
+                            server_label,
+                        );
 
-                            // Mask tools back to MCP format
-                            Self::mask_tools_as_mcp(&mut response_json, &original_request);
+                        Self::mask_tools_as_mcp(&mut response_json, &original_request);
+                        Self::patch_streaming_response_json(
+                            &mut response_json,
+                            &original_request,
+                            previous_response_id.as_deref(),
+                        );
 
-                            Self::patch_streaming_response_json(
-                                &mut response_json,
-                                &original_request,
-                                previous_response_id.as_deref(),
-                            );
-
+                        if should_store {
                             if let Err(err) = Self::store_response_impl(
                                 &storage,
                                 &response_json,
@@ -1933,6 +2002,25 @@ impl OpenAIRouter {
                             .await
                             {
                                 warn!("Failed to store streaming response: {}", err);
+                            }
+                        }
+
+                        if persist_needed {
+                            if let Some(conv_id) = original_request.conversation.clone() {
+                                if let Err(err) = persist_items_with_storages(
+                                    conv_storage.clone(),
+                                    conv_item_storage.clone(),
+                                    conv_id,
+                                    original_request.clone(),
+                                    response_json.clone(),
+                                )
+                                .await
+                                {
+                                    warn!(
+                                        "Failed to persist conversation items (stream + MCP): {}",
+                                        err
+                                    );
+                                }
                             }
                         }
                     }
@@ -2332,6 +2420,11 @@ impl OpenAIRouter {
             .map(|s| s.to_string())
             .or_else(|| original_body.user.clone());
 
+        // Set conversation id from request if provided
+        if let Some(conv_id) = original_body.conversation.clone() {
+            stored_response.conversation_id = Some(conv_id);
+        }
+
         stored_response.metadata = response_json
             .get("metadata")
             .and_then(|v| v.as_object())
@@ -2428,6 +2521,11 @@ impl OpenAIRouter {
                     obj.insert("user".to_string(), Value::String(user.clone()));
                 }
             }
+
+            // Attach conversation id for client response if present (final aggregated JSON)
+            if let Some(conv_id) = original_body.conversation.clone() {
+                obj.insert("conversation".to_string(), json!({"id": conv_id}));
+            }
         }
     }
 
@@ -2499,6 +2597,12 @@ impl OpenAIRouter {
                     );
                     changed = true;
                 }
+            }
+
+            // Attach conversation id into streaming event response content with ordering
+            if let Some(conv_id) = original_body.conversation.clone() {
+                response_obj.insert("conversation".to_string(), json!({"id": conv_id}));
+                changed = true;
             }
         }
 
@@ -3389,11 +3493,30 @@ impl super::super::RouterTrait for OpenAIRouter {
             "openai_responses_request"
         );
 
+        // Validate mutually exclusive params: previous_response_id and conversation
+        // TODO: this validation logic should move the right place, also we need a proper error message module
+        if body.previous_response_id.is_some() && body.conversation.is_some() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": {
+                        "message": "Mutually exclusive parameters. Ensure you are only providing one of: 'previous_response_id' or 'conversation'.",
+                        "type": "invalid_request_error",
+                        "param": Value::Null,
+                        "code": "mutually_exclusive_parameters"
+                    }
+                })),
+            )
+                .into_response();
+        }
+
         // Clone the body and override model if needed
         let mut request_body = body.clone();
         if let Some(model) = model_id {
             request_body.model = Some(model.to_string());
         }
+        // Do not forward conversation field upstream; retain for local persistence only
+        request_body.conversation = None;
 
         // Store the original previous_response_id for the response
         let original_previous_response_id = request_body.previous_response_id.clone();
@@ -3448,6 +3571,75 @@ impl super::super::RouterTrait for OpenAIRouter {
             request_body.previous_response_id = None;
         }
 
+        // If conversation is provided, attach its items as input to upstream request
+        if let Some(conv_id_str) = body.conversation.clone() {
+            let conv_id: ConversationId = conv_id_str.as_str().into();
+            let mut items: Vec<ResponseInputOutputItem> = Vec::new();
+            // Fetch up to MAX_CONVERSATION_HISTORY_ITEMS items in ascending order
+            let params = ConversationItemsListParams {
+                limit: Self::MAX_CONVERSATION_HISTORY_ITEMS,
+                order: ConversationItemsSortOrder::Asc,
+                after: None,
+            };
+            match self
+                .conversation_item_storage
+                .list_items(&conv_id, params)
+                .await
+            {
+                Ok(stored_items) => {
+                    for it in stored_items {
+                        match it.item_type.as_str() {
+                            "message" => {
+                                // content is expected to be an array of ResponseContentPart
+                                let parts: Vec<ResponseContentPart> = match serde_json::from_value(
+                                    it.content.clone(),
+                                ) {
+                                    Ok(parts) => parts,
+                                    Err(e) => {
+                                        warn!(
+                                            item_id = %it.id.0,
+                                            error = %e,
+                                            "Failed to deserialize conversation item content; skipping message item"
+                                        );
+                                        continue;
+                                    }
+                                };
+                                let role = it.role.unwrap_or_else(|| "user".to_string());
+                                items.push(ResponseInputOutputItem::Message {
+                                    id: it.id.0,
+                                    role,
+                                    content: parts,
+                                    status: it.status,
+                                });
+                            }
+                            _ => {
+                                // Skip unsupported types for request input (e.g., MCP items)
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    warn!(conversation_id = %conv_id.0, error = %err.to_string(), "Failed to load conversation items for request input");
+                }
+            }
+
+            // Append the current request input at the end
+            match &request_body.input {
+                ResponseInput::Text(text) => {
+                    items.push(ResponseInputOutputItem::Message {
+                        id: format!("msg_u_current_{}", items.len()),
+                        role: "user".to_string(),
+                        status: Some("completed".to_string()),
+                        content: vec![ResponseContentPart::InputText { text: text.clone() }],
+                    });
+                }
+                ResponseInput::Items(existing) => {
+                    items.extend(existing.clone());
+                }
+            }
+            request_body.input = ResponseInput::Items(items);
+        }
+
         if let Some(mut items) = conversation_items {
             match &request_body.input {
                 ResponseInput::Text(text) => {
@@ -3489,6 +3681,7 @@ impl super::super::RouterTrait for OpenAIRouter {
                 "top_k",
                 "min_p",
                 "repetition_penalty",
+                "conversation",
             ] {
                 obj.remove(key);
             }
@@ -3973,6 +4166,113 @@ impl super::super::RouterTrait for OpenAIRouter {
     fn router_type(&self) -> &'static str {
         "openai"
     }
+
+    async fn list_conversation_items(
+        &self,
+        _headers: Option<&HeaderMap>,
+        conversation_id: &str,
+        limit: Option<usize>,
+        order: Option<String>,
+        after: Option<String>,
+    ) -> Response {
+        let id: ConversationId = conversation_id.into();
+        match self.conversation_storage.get_conversation(&id).await {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({
+                        "error": {
+                            "message": format!("Conversation with id '{}' not found.", conversation_id),
+                            "type": "invalid_request_error",
+                            "param": Value::Null,
+                            "code": Value::Null
+                        }
+                    })),
+                )
+                    .into_response();
+            }
+            Err(err) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "error": {
+                            "message": err.to_string(),
+                            "type": "internal_error",
+                            "param": Value::Null,
+                            "code": Value::Null
+                        }
+                    })),
+                )
+                    .into_response();
+            }
+        }
+
+        let lim = limit.unwrap_or(20).clamp(1, 100);
+        let sort = match order.as_deref() {
+            Some("asc") => ConversationItemsSortOrder::Asc,
+            _ => ConversationItemsSortOrder::Desc,
+        };
+        let params = ConversationItemsListParams {
+            limit: lim + 1,
+            order: sort,
+            after,
+        };
+
+        match self.conversation_item_storage.list_items(&id, params).await {
+            Ok(mut items) => {
+                let has_more = items.len() > lim;
+                if has_more {
+                    items.truncate(lim);
+                }
+                let data: Vec<Value> = items
+                    .into_iter()
+                    .map(|it| {
+                        json!({
+                            "id": it.id.0,
+                            "type": it.item_type,
+                            "status": it.status.unwrap_or_else(|| "completed".to_string()),
+                            "content": it.content,
+                            "role": it.role,
+                        })
+                    })
+                    .collect();
+                let first_id = data
+                    .first()
+                    .and_then(|v| v.get("id"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let last_id = data
+                    .last()
+                    .and_then(|v| v.get("id"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                (
+                    StatusCode::OK,
+                    Json(json!({
+                        "object": "list",
+                        "data": data,
+                        "first_id": first_id,
+                        "last_id": last_id,
+                        "has_more": has_more
+                    })),
+                )
+                    .into_response()
+            }
+            Err(err) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": {
+                        "message": err.to_string(),
+                        "type": "internal_error",
+                        "param": Value::Null,
+                        "code": Value::Null
+                    }
+                })),
+            )
+                .into_response(),
+        }
+    }
 }
 // Maximum number of properties allowed in conversation metadata (align with server)
 const MAX_METADATA_PROPERTIES: usize = 16;
@@ -3984,4 +4284,264 @@ fn conversation_to_json(conversation: &Conversation) -> Value {
         "created_at": conversation.created_at.timestamp(),
         "metadata": to_value(&conversation.metadata).unwrap_or(Value::Null),
     })
+}
+
+async fn persist_items_with_storages(
+    conv_storage: SharedConversationStorage,
+    item_storage: SharedConversationItemStorage,
+    conversation_id: String,
+    request: ResponsesRequest,
+    response: Value,
+) -> Result<(), String> {
+    let conv_id: ConversationId = conversation_id.as_str().into();
+    match conv_storage.get_conversation(&conv_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            warn!(conversation_id = %conv_id.0, "Conversation not found; skipping item persistence");
+            return Ok(());
+        }
+        Err(err) => return Err(err.to_string()),
+    }
+
+    // Extract response_id once for attaching to both input and output items
+    let response_id_opt = response
+        .get("id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    // Helper to ensure status defaults to completed
+    async fn create_and_link_item(
+        item_storage: &SharedConversationItemStorage,
+        conv_id: &ConversationId,
+        mut new_item: DCNewConversationItem,
+    ) -> Result<(), String> {
+        if new_item.status.is_none() {
+            new_item.status = Some("completed".to_string());
+        }
+        let created = item_storage
+            .create_item(new_item)
+            .await
+            .map_err(|e| e.to_string())?;
+        item_storage
+            .link_item(conv_id, &created.id, chrono::Utc::now())
+            .await
+            .map_err(|e| e.to_string())?;
+        tracing::info!(conversation_id = %conv_id.0, item_id = %created.id.0, item_type = %created.item_type, "Persisted conversation item and link");
+        Ok(())
+    }
+
+    match request.input.clone() {
+        ResponseInput::Text(text) => {
+            let new_item = DCNewConversationItem {
+                id: None, // generate new message id for input
+                response_id: response_id_opt.clone(),
+                item_type: "message".to_string(),
+                role: Some("user".to_string()),
+                content: json!([{ "type": "input_text", "text": text }]),
+                status: Some("completed".to_string()),
+            };
+            create_and_link_item(&item_storage, &conv_id, new_item).await?;
+        }
+        ResponseInput::Items(items) => {
+            for input_item in items {
+                match input_item {
+                    ResponseInputOutputItem::Message {
+                        role,
+                        content,
+                        status,
+                        ..
+                    } => {
+                        let content_v =
+                            serde_json::to_value(&content).map_err(|e| e.to_string())?;
+                        let new_item = DCNewConversationItem {
+                            id: None, // generate new id for input items
+                            response_id: response_id_opt.clone(),
+                            item_type: "message".to_string(),
+                            role: Some(role),
+                            content: content_v,
+                            status,
+                        };
+                        create_and_link_item(&item_storage, &conv_id, new_item).await?;
+                    }
+                    ResponseInputOutputItem::Reasoning {
+                        summary,
+                        content,
+                        status,
+                        ..
+                    } => {
+                        let new_item = DCNewConversationItem {
+                            id: None, // generate new id for input items
+                            response_id: response_id_opt.clone(),
+                            item_type: "reasoning".to_string(),
+                            role: None,
+                            content: json!({ "summary": summary, "content": content }),
+                            status,
+                        };
+                        create_and_link_item(&item_storage, &conv_id, new_item).await?;
+                    }
+                    ResponseInputOutputItem::FunctionToolCall {
+                        name,
+                        arguments,
+                        output,
+                        status,
+                        ..
+                    } => {
+                        let new_item = DCNewConversationItem {
+                            id: None, // generate new id for input items
+                            response_id: response_id_opt.clone(),
+                            item_type: "function_tool_call".to_string(),
+                            role: None,
+                            content: json!({ "name": name, "arguments": arguments, "output": output }),
+                            status,
+                        };
+                        create_and_link_item(&item_storage, &conv_id, new_item).await?;
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(output_array) = response.get("output").and_then(|v| v.as_array()) {
+        for item in output_array {
+            let item_type = match item.get("type").and_then(|v| v.as_str()) {
+                Some(t) => t,
+                None => continue,
+            };
+
+            match item_type {
+                "message" => {
+                    let id_in = item
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| crate::data_connector::ConversationItemId(s.to_string()));
+                    let role = item
+                        .get("role")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let content_v = item
+                        .get("content")
+                        .cloned()
+                        .unwrap_or_else(|| Value::Array(Vec::new()));
+                    let status = item
+                        .get("status")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let new_item = DCNewConversationItem {
+                        id: id_in,
+                        response_id: response_id_opt.clone(),
+                        item_type: "message".to_string(),
+                        role,
+                        content: content_v,
+                        status,
+                    };
+                    create_and_link_item(&item_storage, &conv_id, new_item).await?;
+                }
+                "reasoning" => {
+                    let id_in = item
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let summary_v = item
+                        .get("summary")
+                        .cloned()
+                        .unwrap_or_else(|| Value::Array(Vec::new()));
+                    let content_v = item
+                        .get("content")
+                        .cloned()
+                        .unwrap_or_else(|| Value::Array(Vec::new()));
+                    let status = item
+                        .get("status")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let new_item = DCNewConversationItem {
+                        id: id_in.map(crate::data_connector::ConversationItemId),
+                        response_id: response_id_opt.clone(),
+                        item_type: "reasoning".to_string(),
+                        role: None,
+                        content: json!({ "summary": summary_v, "content": content_v }),
+                        status,
+                    };
+                    create_and_link_item(&item_storage, &conv_id, new_item).await?;
+                }
+                "function_tool_call" => {
+                    let id_in = item
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    let arguments = item.get("arguments").and_then(|v| v.as_str()).unwrap_or("");
+                    let output_str = item.get("output").and_then(|v| v.as_str()).unwrap_or("");
+                    let status = item
+                        .get("status")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let new_item = DCNewConversationItem {
+                        id: id_in.map(crate::data_connector::ConversationItemId),
+                        response_id: response_id_opt.clone(),
+                        item_type: "function_tool_call".to_string(),
+                        role: None,
+                        content: json!({
+                            "name": name,
+                            "arguments": arguments,
+                            "output": output_str
+                        }),
+                        status,
+                    };
+                    create_and_link_item(&item_storage, &conv_id, new_item).await?;
+                }
+                "mcp_call" => {
+                    let id_in = item
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    let arguments = item.get("arguments").and_then(|v| v.as_str()).unwrap_or("");
+                    let output_str = item.get("output").and_then(|v| v.as_str()).unwrap_or("");
+                    let status = item
+                        .get("status")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let content_v = json!({
+                        "server_label": item.get("server_label").cloned().unwrap_or(Value::Null),
+                        "name": name,
+                        "arguments": arguments,
+                        "output": output_str,
+                        "error": item.get("error").cloned().unwrap_or(Value::Null),
+                        "approval_request_id": item.get("approval_request_id").cloned().unwrap_or(Value::Null)
+                    });
+                    let new_item = DCNewConversationItem {
+                        id: id_in.map(crate::data_connector::ConversationItemId),
+                        response_id: response_id_opt.clone(),
+                        item_type: "mcp_call".to_string(),
+                        role: None,
+                        content: content_v,
+                        status,
+                    };
+                    create_and_link_item(&item_storage, &conv_id, new_item).await?;
+                }
+                "mcp_list_tools" => {
+                    let id_in = item
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let content_v = json!({
+                        "server_label": item.get("server_label").cloned().unwrap_or(Value::Null),
+                        "tools": item.get("tools").cloned().unwrap_or_else(|| Value::Array(Vec::new()))
+                    });
+                    let new_item = DCNewConversationItem {
+                        id: id_in.map(crate::data_connector::ConversationItemId),
+                        response_id: response_id_opt.clone(),
+                        item_type: "mcp_list_tools".to_string(),
+                        role: None,
+                        content: content_v,
+                        status: Some("completed".to_string()),
+                    };
+                    create_and_link_item(&item_storage, &conv_id, new_item).await?;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    Ok(())
 }
