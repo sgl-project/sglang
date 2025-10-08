@@ -11,7 +11,7 @@ from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.cpp_ngram.ngram_cache import NgramCache
-from sglang.srt.speculative.ngram_utils import NgramVerifyInput
+from sglang.srt.speculative.ngram_info import NgramVerifyInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 logger = logging.getLogger(__name__)

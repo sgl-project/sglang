@@ -130,14 +130,17 @@ suites = {
         TestFile("test_modelopt_loader.py", 30),
     ],
     "per-commit-2-gpu": [
+        TestFile("ep/test_moe_ep.py", 140),
         TestFile("lora/test_lora_tp.py", 116),
         TestFile("rl/test_update_weights_from_distributed.py", 103),
         TestFile("test_data_parallelism.py", 73),
+        TestFile("test_disaggregation.py", 499),
         TestFile("test_dp_attention.py", 594),
         TestFile("test_load_weights_from_remote_instance.py", 72),
         TestFile("test_patch_torch.py", 19),
         TestFile("test_release_memory_occupation.py", 257),
         TestFile("hicache/test_hicache_storage_file_backend.py", 200),
+        TestFile("hicache/test_hicache_storage_mooncake_backend.py", 400),
         TestFile("hicache/test_hicache_storage_3fs_backend.py", 200),
     ],
     "per-commit-4-gpu": [
@@ -148,9 +151,7 @@ suites = {
         TestFile("test_multi_instance_release_memory_occupation.py", 64),
     ],
     "per-commit-8-gpu": [
-        TestFile("hicache/test_hicache_storage_mooncake_backend.py", 400),
         TestFile("lora/test_lora_llama4.py", 400),
-        TestFile("test_disaggregation.py", 499),
         TestFile("test_disaggregation_dp_attention.py", 155),
         TestFile("test_disaggregation_different_tp.py", 600),
         TestFile("test_disaggregation_pp.py", 140),

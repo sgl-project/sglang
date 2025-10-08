@@ -90,7 +90,6 @@ class TestForwardSplitPrefill(CustomTestCase):
                 origin_input_ids=list(input_ids[i]),
                 sampling_params=sampling_params,
             )
-            req.prefix_indices = []
             req.fill_ids = req.origin_input_ids
             req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
             req.logprob_start_len = len(req.origin_input_ids) - 1

@@ -45,9 +45,8 @@ class TestDisaggregationDPAttention(TestDisaggregationBase):
             "--dp",
             "2",
             "--enable-dp-attention",
-            "--disaggregation-ib-device",
-            "mlx5_roce0,mlx5_roce1",
         ]
+        prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
             cls.model,
             cls.prefill_url,
@@ -68,9 +67,8 @@ class TestDisaggregationDPAttention(TestDisaggregationBase):
             "--enable-dp-attention",
             "--base-gpu-id",
             "2",
-            "--disaggregation-ib-device",
-            "mlx5_roce2,mlx5_roce3",
         ]
+        decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
             cls.model,
             cls.decode_url,
