@@ -324,26 +324,26 @@ class GrpcRequestManager:
                     return
 
                 try:
-                    response = await asyncio.wait_for(state.out_queue.get(), timeout=4)
-
-                    if is_stream:
-                        yield response
-
-                    # Non-streaming: yield final response with accumulated tokens from state
-                    if isinstance(response, dict) and response.get("finished", False):
-                        if not is_stream:
-                            final_response = response.copy()
-                            final_response["token_ids"] = state.output_ids
-                            yield final_response
-                        break
-
+                    await asyncio.wait_for(state.event.wait(), timeout=4)
                 except asyncio.TimeoutError:
-                    # Timeout waiting for response - abort and cleanup
-                    logger.warning(
-                        f"Timeout waiting for response for request {request_id}"
-                    )
-                    await self.abort_request(request_id)
-                    return
+                    continue
+
+                # Event was set - get response from queue
+                response = await state.out_queue.get()
+
+                # Clear event for next response
+                state.event.clear()
+
+                if is_stream:
+                    yield response
+
+                # Non-streaming: yield final response with accumulated tokens from state
+                if isinstance(response, dict) and response.get("finished", False):
+                    if not is_stream:
+                        final_response = response.copy()
+                        final_response["token_ids"] = state.output_ids
+                        yield final_response
+                    break
 
         finally:
             # Always clean up request state when exiting
@@ -430,10 +430,9 @@ class GrpcRequestManager:
         if state:
             state.finished = True
             state.stream_finished = True
-            state.event.set()
-
             # Send abort notification to output queue
             await state.out_queue.put({"error": "Request aborted", "abort": True})
+            state.event.set()
 
         return True
 
@@ -650,13 +649,13 @@ class GrpcRequestManager:
                 state.output_ids.extend(output_data["token_ids"])
 
             await state.out_queue.put(output_data)
+            state.event.set()  # Signal that data is available
 
             # Handle completion
             if output_data["finished"]:
                 state.finished = True
                 state.finished_time = now
                 state.stream_finished = True
-                state.event.set()
 
                 # Remove from tracking after a delay
                 async def cleanup():
@@ -688,11 +687,11 @@ class GrpcRequestManager:
 
             # Send result
             await state.out_queue.put(result)
+            state.event.set()
 
             # Mark as finished
             state.finished = True
             state.finished_time = time.time()
-            state.event.set()
 
     async def _handle_health_check_output(self, health_out: HealthCheckOutput):
         """Handle health check output from scheduler."""
@@ -720,11 +719,11 @@ class GrpcRequestManager:
 
         # Send result
         await state.out_queue.put(result)
+        state.event.set()
 
         # Mark as finished
         state.finished = True
         state.finished_time = time.time()
-        state.event.set()
 
     async def _send_to_scheduler(self, obj):
         """Send an object to the scheduler via ZMQ."""
@@ -765,8 +764,8 @@ class GrpcRequestManager:
                 await state.out_queue.put(
                     {"error": "Server shutting down", "shutdown": True}
                 )
-                state.finished = True
                 state.event.set()
+                state.finished = True
 
         # Wait for tasks to complete
         if self.asyncio_tasks:
