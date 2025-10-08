@@ -12,7 +12,7 @@ It is recommended to use uv for faster installation:
 ```bash
 pip install --upgrade pip
 pip install uv
-uv pip install "sglang[all]>=0.5.3"
+uv pip install "sglang[all]>=0.5.3.post1"
 ```
 
 **Quick fixes to common problems**
@@ -24,7 +24,7 @@ uv pip install "sglang[all]>=0.5.3"
 
 ```bash
 # Use the last release branch
-git clone -b v0.5.3 https://github.com/sgl-project/sglang.git
+git clone -b v0.5.3.post1 https://github.com/sgl-project/sglang.git
 cd sglang
 
 # Install the python packages
