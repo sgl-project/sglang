@@ -445,9 +445,7 @@ mod tests {
                     match p.detect_and_parse_reasoning(&input) {
                         Ok(result) => {
                             // Note: Some parsers with stream_reasoning=true won't accumulate reasoning text
-                            assert!(result
-                                .normal_text
-                                .contains(&format!("task {}", task_id)));
+                            assert!(result.normal_text.contains(&format!("task {}", task_id)));
 
                             // For parsers that accumulate reasoning (stream_reasoning=false)
                             // the reasoning_text should be populated

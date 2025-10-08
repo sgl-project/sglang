@@ -66,7 +66,7 @@ impl StreamingProcessor {
     pub fn process_streaming_response(
         self: Arc<Self>,
         execution_result: context::ExecutionResult,
-        chat_request: ChatCompletionRequest,
+        chat_request: Arc<ChatCompletionRequest>,
         dispatch: context::DispatchMetadata,
     ) -> Response {
         use bytes::Bytes;
@@ -156,7 +156,7 @@ impl StreamingProcessor {
         mut grpc_stream: Streaming<proto::GenerateResponse>,
         dispatch: context::DispatchMetadata,
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool),
-        original_request: ChatCompletionRequest,
+        original_request: Arc<ChatCompletionRequest>,
         tx: &UnboundedSender<Result<Bytes, io::Error>>,
     ) -> Result<(), String> {
         // Extract request parameters
@@ -537,7 +537,7 @@ impl StreamingProcessor {
         decode_stream: Streaming<proto::GenerateResponse>,
         dispatch: context::DispatchMetadata,
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool),
-        original_request: ChatCompletionRequest,
+        original_request: Arc<ChatCompletionRequest>,
         tx: &UnboundedSender<Result<Bytes, io::Error>>,
     ) -> Result<(), String> {
         // Phase 1.5: Collect input_logprobs from prefill stream if requested
@@ -569,7 +569,7 @@ impl StreamingProcessor {
     pub fn process_streaming_generate(
         self: Arc<Self>,
         execution_result: context::ExecutionResult,
-        generate_request: GenerateRequest,
+        generate_request: Arc<GenerateRequest>,
         dispatch: context::DispatchMetadata,
     ) -> Response {
         let return_logprob = generate_request.return_logprob;
