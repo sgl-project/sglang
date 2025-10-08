@@ -20,11 +20,6 @@ class GlobalConfig:
         # Default backend of the language
         self.default_backend = None
 
-        # Runtime constants: others
-        self.flashinfer_workspace_size = int(
-            os.environ.get("FLASHINFER_WORKSPACE_SIZE", 384 * 1024 * 1024)
-        )
-
         # Output tokenization configs
         self.skip_special_tokens_in_output = True
         self.spaces_between_special_tokens_in_out = True
