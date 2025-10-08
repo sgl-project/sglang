@@ -809,6 +809,72 @@ pub fn convert_proto_to_openai_logprobs(
     })
 }
 
+/// Convert proto::OutputLogProbs to Generate format Vec<Vec<Option<f64>>>
+///
+/// Generate format: [[logprob, token_id, ...], [logprob, token_id, ...], ...]
+/// Each inner vec contains [logprob (f64), token_id (i32), ...]
+pub fn convert_generate_output_logprobs(
+    proto_logprobs: &proto::OutputLogProbs,
+) -> Vec<Vec<Option<f64>>> {
+    proto_logprobs
+        .token_logprobs
+        .iter()
+        .zip(proto_logprobs.token_ids.iter())
+        .map(|(&logprob, &token_id)| vec![Some(logprob as f64), Some(token_id as f64)])
+        .collect()
+}
+
+/// Convert proto::InputLogProbs to Generate format Vec<Vec<Option<f64>>>
+///
+/// Generate format: [[logprob, token_id, ...], [logprob, token_id, ...], ...]
+/// First token has null logprob: [[null, token_id], [logprob, token_id], ...]
+pub fn convert_generate_input_logprobs(
+    proto_logprobs: &proto::InputLogProbs,
+) -> Vec<Vec<Option<f64>>> {
+    proto_logprobs
+        .token_logprobs
+        .iter()
+        .zip(proto_logprobs.token_ids.iter())
+        .map(|(token_logprob, &token_id)| {
+            // InputTokenLogProb has optional value field
+            let logprob_value = token_logprob.value.map(|v| v as f64);
+            vec![logprob_value, Some(token_id as f64)]
+        })
+        .collect()
+}
+
+/// Parse finish_reason string into GenerateFinishReason enum
+///
+/// Handles SGLang finish_reason format which can be:
+/// - "stop" -> Stop
+/// - JSON object like {"type":"length","length":100} -> Length { length: ... }
+/// - Other values -> Other(...)
+pub fn parse_finish_reason(reason_str: &str) -> crate::protocols::spec::GenerateFinishReason {
+    use crate::protocols::spec::GenerateFinishReason;
+
+    if reason_str == "stop" {
+        return GenerateFinishReason::Stop;
+    }
+
+    // Try to parse as JSON object for structured reasons like {"type":"length","length":100}
+    if let Ok(json_value) = serde_json::from_str::<serde_json::Value>(reason_str) {
+        if let Some(type_str) = json_value.get("type").and_then(|v| v.as_str()) {
+            if type_str == "length" {
+                if let Some(length) = json_value.get("length").and_then(|v| v.as_u64()) {
+                    return GenerateFinishReason::Length {
+                        length: length as u32,
+                    };
+                }
+            }
+        }
+        // If we can't parse it properly, return as Other
+        return GenerateFinishReason::Other(json_value);
+    }
+
+    // Fallback: treat as string value
+    GenerateFinishReason::Other(serde_json::Value::String(reason_str.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
