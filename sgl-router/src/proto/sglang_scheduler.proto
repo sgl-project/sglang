@@ -20,6 +20,12 @@ service SglangScheduler {
   // Abort a running request
   rpc Abort(AbortRequest) returns (AbortResponse);
 
+  // Get model information
+  rpc GetModelInfo(GetModelInfoRequest) returns (GetModelInfoResponse);
+
+  // Get server information
+  rpc GetServerInfo(GetServerInfoRequest) returns (GetServerInfoResponse);
+
 }
 
 // =====================
@@ -400,4 +406,57 @@ message SetInternalStateRequest {
 message SetInternalStateResponse {
   bool success = 1;
   string message = 2;
+}
+
+// =====================
+// Model and Server Info
+// =====================
+
+// Get model information
+message GetModelInfoRequest {}
+
+message GetModelInfoResponse {
+  string model_path = 1;
+  string tokenizer_path = 2;
+  bool is_generation = 3;
+  string preferred_sampling_params = 4;  // JSON string or empty
+  string weight_version = 5;
+  string served_model_name = 6;
+  int32 max_context_length = 7;
+  int32 vocab_size = 8;
+  bool supports_vision = 9;
+  string model_type = 10;
+  repeated int32 eos_token_ids = 11;
+  int32 pad_token_id = 12;
+  int32 bos_token_id = 13;
+  int32 max_req_input_len = 14;
+}
+
+// Get server information
+message GetServerInfoRequest {}
+
+message GetServerInfoResponse {
+  // Server configuration (as structured data)
+  google.protobuf.Struct server_args = 1;
+
+  // Scheduler metrics (from scheduler initialization)
+  google.protobuf.Struct scheduler_info = 2;
+
+  // Runtime state
+  int32 active_requests = 3;
+  bool is_paused = 4;
+  double last_receive_timestamp = 5;
+  double uptime_seconds = 6;
+
+  // Version info
+  string sglang_version = 7;
+
+  // Server metadata
+  string server_type = 8;  // "grpc"
+  google.protobuf.Timestamp start_time = 9;
+
+  // Note: internal_states not provided in gRPC mode
+  // Scheduler-side metrics (memory usage, throughput) require
+  // bidirectional communicator infrastructure not available in gRPC.
+  // Use HTTP /get_server_info if scheduler internal state is needed.
 }
