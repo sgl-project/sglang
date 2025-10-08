@@ -1298,18 +1298,20 @@ class ModelRunner:
             # solve the equations:
             # 1. mamba_state_memory + full_kv_cache_memory == total_rest_memory
             # 2. mamba_state_memory / full_kv_cache_memory == server_args.mamba_full_memory_ratio
-            mamba_state_memory_raw = total_rest_memory * server_args.mamba_full_memory_ratio / (1 + server_args.mamba_full_memory_ratio)
+            mamba_state_memory_raw = (
+                total_rest_memory
+                * server_args.mamba_full_memory_ratio
+                / (1 + server_args.mamba_full_memory_ratio)
+            )
             # calculate the max_mamba_cache_size based on the given total mamba memory
-            server_args.max_mamba_cache_size = int((mamba_state_memory_raw * (1 << 30)) // config.mamba2_cache_params.mamba_cache_per_req)
-        
+            server_args.max_mamba_cache_size = int(
+                (mamba_state_memory_raw * (1 << 30))
+                // config.mamba2_cache_params.mamba_cache_per_req
+            )
+
         if self.hybrid_gdn_config is not None:
-            server_args.max_mamba_cache_size = (
-                server_args.max_mamba_cache_size
-                // (
-                    server_args.dp_size
-                    if server_args.enable_dp_attention
-                    else 1
-                )
+            server_args.max_mamba_cache_size = server_args.max_mamba_cache_size // (
+                server_args.dp_size if server_args.enable_dp_attention else 1
             )
         mamba_state_memory = (
             server_args.max_mamba_cache_size
@@ -1471,8 +1473,14 @@ class ModelRunner:
             )
 
         if self.mambaish_config is not None:
-            ratio = MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO if not self.server_args.disable_radix_cache else 1
-            max_num_reqs = min(max_num_reqs, self.server_args.max_mamba_cache_size // ratio)
+            ratio = (
+                MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO
+                if not self.server_args.disable_radix_cache
+                else 1
+            )
+            max_num_reqs = min(
+                max_num_reqs, self.server_args.max_mamba_cache_size // ratio
+            )
 
         if self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone():
             if self.is_draft_worker:
