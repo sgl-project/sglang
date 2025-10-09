@@ -130,8 +130,7 @@ def _topk_ids_logical_to_physical_fake(
 
     topk_ids_original_shape = topk_ids.shape
     target_len = topk_ids_original_shape[0]
-    base_shape = list(info.precomputed_balanced_tensor_map.keys())[0]
-    base_tensor = info.precomputed_balanced_tensor_map[base_shape]
+    base_shape, base_tensor = next(iter(info.precomputed_balanced_tensor_map.items()))
     base_len = base_shape[0]
 
     repeat_n = target_len // base_len
