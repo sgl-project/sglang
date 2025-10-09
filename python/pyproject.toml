@@ -46,7 +46,7 @@ dependencies = [
   "py-spy",
   "pybase64",
   "pydantic",
-  "pynvml",
+  "nvidia-ml-py",
   "python-multipart",
   "pyzmq>=25.1.2",
   "requests",
@@ -72,7 +72,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-decord = ["decord"]
+decord = ["decord2"]
 test = [
   "accelerate",
   "expecttest",
