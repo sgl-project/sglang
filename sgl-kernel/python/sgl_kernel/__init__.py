@@ -309,7 +309,7 @@ from sgl_kernel.speculative import (
     tree_speculative_sampling_target_only,
     verify_tree_greedy,
 )
-from sgl_kernel.top_k import fast_topk
+from sgl_kernel.top_k import fast_topk, fast_topk_transform_fused, fast_topk_v2
 from sgl_kernel.version import __version__
 
 if torch.version.hip is not None:
