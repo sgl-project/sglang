@@ -163,19 +163,17 @@ class HiRadixCache(RadixCache):
         else:
             logger.warning("Hierarchical cache storage backend is not enabled.")
             return False
-        
+
     def calculate_node_value(self, node: TreeNode):
-        
+
         recency = time.monotonic() - node.last_access_time
         frequency = node.hit_count
 
         # high value = big size Node which is frequently & recently accessed
-        value = frequency / (recency + 1)  # +1 avoid dividing by 0
-
-        
-        value *= len(node.value) 
+        value = frequency / (recency + 1)
+        value *= len(node.value)
         # High value node should have small priority which can be process firstly
-        return -1 * value 
+        return -1 * value
 
     def write_backup(self, node: TreeNode, priority=None, write_back=False):
         host_indices = self.cache_controller.write(
