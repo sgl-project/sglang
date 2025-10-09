@@ -589,6 +589,31 @@ impl RouterTrait for RouterManager {
                 .into_response()
         }
     }
+
+    async fn list_conversation_items(
+        &self,
+        headers: Option<&HeaderMap>,
+        conversation_id: &str,
+        limit: Option<usize>,
+        order: Option<String>,
+        after: Option<String>,
+    ) -> Response {
+        let router = self.select_router_for_request(headers, None);
+        if let Some(router) = router {
+            router
+                .list_conversation_items(headers, conversation_id, limit, order, after)
+                .await
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                format!(
+                    "No router available to list conversation items for '{}'",
+                    conversation_id
+                ),
+            )
+                .into_response()
+        }
+    }
 }
 
 impl std::fmt::Debug for RouterManager {
