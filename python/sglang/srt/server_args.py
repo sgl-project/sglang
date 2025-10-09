@@ -392,7 +392,7 @@ class ServerArgs:
     enable_torch_compile: bool = False
     enable_piecewise_cuda_graph: bool = False
     torch_compile_max_bs: int = 32
-    piecewise_cuda_graph_max_tokens: int = 512
+    piecewise_cuda_graph_max_tokens: int = 4096
     piecewise_cuda_graph_tokens: Optional[List[int]] = None
     torchao_config: str = ""
     enable_nan_detection: bool = False
@@ -723,7 +723,8 @@ class ServerArgs:
             list(range(4, 33, 4))
             + list(range(48, 257, 16))
             + list(range(288, 513, 32))
-            + list(range(513, self.piecewise_cuda_graph_max_tokens + 1, 128))
+            + list(range(640, 4096 + 1, 128))
+            + list(range(4352, self.piecewise_cuda_graph_max_tokens + 1, 256))
         )
 
         capture_sizes = [

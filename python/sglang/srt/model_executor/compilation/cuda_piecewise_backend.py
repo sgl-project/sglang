@@ -9,6 +9,7 @@ from unittest.mock import patch
 import torch
 import torch.fx as fx
 
+import sglang.srt.model_executor.compilation.weak_ref_tensor_jit
 from sglang.srt.model_executor.compilation.compilation_config import CompilationConfig
 from sglang.srt.model_executor.compilation.compilation_counter import (
     compilation_counter,
@@ -23,9 +24,8 @@ def weak_ref_tensor(tensor: Any) -> Any:
     The new tensor will share the same data as the original tensor,
     but will not keep the original tensor alive.
     """
-    # if isinstance(tensor, torch.Tensor):
-    #     return torch.ops._C.weak_ref_tensor(tensor)
-    # else:
+    if isinstance(tensor, torch.Tensor):
+        return torch.ops._C.weak_ref_tensor(tensor)
     return tensor
 
 
