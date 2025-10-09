@@ -98,16 +98,6 @@ impl QwenParser {
             Ok(None)
         }
     }
-
-    /// Check if text contains Qwen tool markers
-    fn has_tool_markers(&self, text: &str) -> bool {
-        text.contains("<tool_call>")
-    }
-
-    /// Check if text has tool call
-    fn has_tool_call(&self, text: &str) -> bool {
-        text.contains("<tool_call>")
-    }
 }
 
 impl Default for QwenParser {
@@ -165,7 +155,7 @@ impl ToolParser for QwenParser {
         let current_text = &self.buffer.clone();
 
         // Check if current_text has tool_call
-        let has_tool_start = self.has_tool_call(current_text)
+        let has_tool_start = self.has_tool_markers(current_text)
             || (self.current_tool_id >= 0 && current_text.starts_with(self.tool_call_separator));
 
         if !has_tool_start {
@@ -243,8 +233,8 @@ impl ToolParser for QwenParser {
         Ok(result)
     }
 
-    fn detect_format(&self, text: &str) -> bool {
-        self.has_tool_markers(text)
+    fn has_tool_markers(&self, text: &str) -> bool {
+        text.contains("<tool_call>")
     }
 
     fn get_unstreamed_tool_args(&self) -> Option<Vec<crate::tool_parser::types::ToolCallItem>> {
