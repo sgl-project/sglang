@@ -8,6 +8,9 @@ default = ["grpc-client"]
 grpc-client = []
 grpc-server = []
 
+[lints.rust]
+unused_qualifications = "warn"
+
 [lib]
 name = "sglang_router_rs"
 # Pure Rust library: Just omit crate-type (defaults to rlib)
