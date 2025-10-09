@@ -25,11 +25,12 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import TYPE_CHECKING, List, Optional, Tuple, Type, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Type, Union
 
 import torch
 from torch.distributed import ProcessGroup
 
+from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import BaseKVManager, BaseKVReceiver, KVPoll
 from sglang.srt.disaggregation.utils import (
@@ -137,11 +138,7 @@ class HybridDecodeReqToTokenPool(HybridReqToTokenPool):
         max_context_len: int,
         device: str,
         enable_memory_saver: bool,
-        conv_dtype: torch.dtype,
-        ssm_dtype: torch.dtype,
-        mamba_layers: List[int],
-        conv_state_shape: Tuple[int, int],
-        temporal_state_shape: Tuple[int, int],
+        cache_params: "Mamba2CacheParams",
         speculative_num_draft_tokens: int,
         pre_alloc_size: int,
     ):
@@ -155,15 +152,11 @@ class HybridDecodeReqToTokenPool(HybridReqToTokenPool):
         )
         self.mamba_pool = MambaPool(
             size + pre_alloc_size,
-            conv_dtype,
-            ssm_dtype,
-            len(mamba_layers),
-            conv_state_shape,
-            temporal_state_shape,
+            cache_params,
             device,
             speculative_num_draft_tokens,
         )
-        self.mamba_map = {layer_id: i for i, layer_id in enumerate(mamba_layers)}
+        self.mamba_map = {layer_id: i for i, layer_id in enumerate(cache_params.layers)}
 
         self.device = device
         self.req_index_to_mamba_index_mapping: torch.Tensor = torch.zeros(

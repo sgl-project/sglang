@@ -1551,7 +1551,7 @@ class ModelRunner:
                 self.req_to_token_pool = HybridReqToTokenPool(
                     size=max_num_reqs,
                     max_context_len=self.model_config.context_len
-                                    + extra_max_context_len,
+                    + extra_max_context_len,
                     device=self.device,
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     cache_params=config.mamba2_cache_params,

@@ -239,20 +239,19 @@ class MambaPool:
         self.free_slots = list(range(self.size))
 
     def get_contiguous_buf_infos(self):
-        # Todo: Fix this
-        mamba_cache = (self.mamba_cache.conv, self.mamba_cache.temporal)
-        cached_states_len = len(mamba_cache)
+        state_tensors = [getattr(self.mamba_cache, field) for field in vars(self.mamba_cache)]
         data_ptrs, data_lens, item_lens = [], [], []
-        for state in range(cached_states_len):
+        
+        for _, state_tensor in enumerate(state_tensors):
             data_ptrs += [
-                self.mamba_cache[state][i].data_ptr()
+                state_tensor[i].data_ptr()
                 for i in range(self.num_mamba_layers)
             ]
             data_lens += [
-                self.mamba_cache[state][i].nbytes for i in range(self.num_mamba_layers)
+                state_tensor[i].nbytes for i in range(self.num_mamba_layers)
             ]
             item_lens += [
-                self.mamba_cache[state][i][0].nbytes
+                state_tensor[i][0].nbytes
                 for i in range(self.num_mamba_layers)
             ]
         return data_ptrs, data_lens, item_lens
