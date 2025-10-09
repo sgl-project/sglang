@@ -191,7 +191,7 @@ async fn test_llama_python_tag_arrives_in_parts() {
 
     // Python tag itself arrives in small chunks
     let chunks = vec![
-        "<|p", "yth", "on_", "tag", "|>{", r#"""#, "nam", r#"e""#, ": ", r#"""#, "sea", "rch",
+        "<|p", "yth", "on_", "tag", "|>{", r#"""#, "na", r#"me""#, ": ", r#"""#, "sea", "rch",
         r#"""#, ", ", r#"""#, "par", "ame", "ter", "s", r#"""#, ": {", r#"""#, "q", r#"""#, ": ",
         r#"""#, "tes", "t", r#"""#, "}}",
     ];
@@ -246,7 +246,7 @@ async fn test_qwen_xml_tag_arrives_in_parts() {
     let mut parser = QwenParser::new();
 
     let chunks = vec![
-        "<to", "ol_", "cal", "l>\n", "{", r#"""#, "nam", "e", r#"""#, ": ", r#"""#, "tra", "nsl",
+        "<to", "ol_", "cal", "l>\n", "{", r#"""#, "na", "me", r#"""#, ": ", r#"""#, "tra", "nsl",
         "ate", r#"""#, ", ", r#"""#, "arg", "ume", "nts", r#"""#, ": {", r#"""#, "tex", "t",
         r#"""#, ": ", r#"""#, "hel", "lo", r#"""#, "}}\n", "</t", "ool", "_ca", "ll>",
     ];
