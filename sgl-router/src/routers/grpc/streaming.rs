@@ -34,8 +34,8 @@ use tokio::sync::mpsc;
 #[derive(Clone)]
 pub struct StreamingProcessor {
     tokenizer: Arc<dyn Tokenizer>,
-    tool_parser_factory: crate::tool_parser::ToolParserFactory,
-    reasoning_parser_factory: crate::reasoning_parser::ReasoningParserFactory,
+    tool_parser_factory: crate::tool_parser::ParserFactory,
+    reasoning_parser_factory: crate::reasoning_parser::ParserFactory,
     configured_tool_parser: Option<String>,
     configured_reasoning_parser: Option<String>,
 }
@@ -43,8 +43,8 @@ pub struct StreamingProcessor {
 impl StreamingProcessor {
     pub fn new(
         tokenizer: Arc<dyn Tokenizer>,
-        tool_parser_factory: crate::tool_parser::ToolParserFactory,
-        reasoning_parser_factory: crate::reasoning_parser::ReasoningParserFactory,
+        tool_parser_factory: crate::tool_parser::ParserFactory,
+        reasoning_parser_factory: crate::reasoning_parser::ParserFactory,
         configured_tool_parser: Option<String>,
         configured_reasoning_parser: Option<String>,
     ) -> Self {
@@ -195,6 +195,47 @@ impl StreamingProcessor {
         let created = dispatch.created;
         let system_fingerprint = dispatch.weight_version.as_deref();
 
+        // Check parser availability once upfront (log warning only once per request)
+        let reasoning_parser_available = if separate_reasoning {
+            if let Some(parser_name) = self.configured_reasoning_parser.as_ref() {
+                self.reasoning_parser_factory
+                    .registry()
+                    .has_parser(parser_name)
+            } else {
+                self.reasoning_parser_factory
+                    .registry()
+                    .has_parser_for_model(model)
+            }
+        } else {
+            false
+        };
+
+        let tool_parser_available = if tools.is_some() {
+            if let Some(parser_name) = self.configured_tool_parser.as_ref() {
+                self.tool_parser_factory.registry().has_parser(parser_name)
+            } else {
+                self.tool_parser_factory
+                    .registry()
+                    .has_parser_for_model(model)
+            }
+        } else {
+            false
+        };
+
+        if separate_reasoning && !reasoning_parser_available {
+            warn!(
+                "No reasoning parser found for model '{}', skipping reasoning parsing",
+                model
+            );
+        }
+
+        if tools.is_some() && !tool_parser_available {
+            warn!(
+                "No tool parser found for model '{}', skipping tool call parsing",
+                model
+            );
+        }
+
         // Phase 2: Main streaming loop
         while let Some(response) = grpc_stream.next().await {
             let gen_response = response.map_err(|e| format!("Stream error: {}", e))?;
@@ -276,7 +317,7 @@ impl StreamingProcessor {
                     stream_buffer.push_str(&delta);
 
                     // Reasoning content handling
-                    let in_reasoning = if separate_reasoning {
+                    let in_reasoning = if separate_reasoning && reasoning_parser_available {
                         let (normal_text, reasoning_chunk, in_reasoning) = self
                             .process_reasoning_stream(
                                 &delta,
@@ -303,8 +344,12 @@ impl StreamingProcessor {
                     let tool_choice_enabled =
                         !matches!(tool_choice, Some(ToolChoice::Value(ToolChoiceValue::None)));
 
-                    if !in_reasoning && tool_choice_enabled && tools.is_some() {
-                        let (should_skip, tool_chunks) = self
+                    if !in_reasoning
+                        && tool_choice_enabled
+                        && tools.is_some()
+                        && tool_parser_available
+                    {
+                        let tool_chunks = self
                             .process_tool_calls_stream(
                                 &delta,
                                 index,
@@ -325,10 +370,9 @@ impl StreamingProcessor {
                                 .map_err(|_| "Failed to send tool call chunk".to_string())?;
                         }
 
-                        // Continue to process the next chunk as we have tool chunks
-                        if should_skip {
-                            continue;
-                        }
+                        // Always skip regular content when tool parsing is active
+                        // Parser either emitted chunks or buffered content
+                        continue;
                     }
 
                     // Regular content emission
@@ -963,13 +1007,15 @@ impl StreamingProcessor {
         created: u64,
         system_fingerprint: Option<&str>,
     ) -> (String, Option<ChatCompletionStreamResponse>, bool) {
-        // Get or create parser for this index
+        // Create fresh parser for this index (not pooled, to avoid state pollution)
         reasoning_parsers.entry(index).or_insert_with(|| {
-            utils::get_reasoning_parser(
+            let parser = utils::create_reasoning_parser(
                 &self.reasoning_parser_factory,
                 self.configured_reasoning_parser.as_ref(),
                 model,
             )
+            .expect("Parser should be available - checked upfront");
+            Arc::new(tokio::sync::Mutex::new(parser))
         });
 
         if let Some(pooled_parser) = reasoning_parsers.get(&index) {
@@ -1034,20 +1080,23 @@ impl StreamingProcessor {
         created: u64,
         system_fingerprint: Option<&str>,
         history_tool_calls_count: usize,
-    ) -> (bool, Vec<ChatCompletionStreamResponse>) {
+    ) -> Vec<ChatCompletionStreamResponse> {
         let mut chunks = Vec::new();
 
-        // Get or create parser for this index
+        // Create fresh parser for this index (not pooled, to avoid state pollution)
         tool_parsers.entry(index).or_insert_with(|| {
-            utils::get_tool_parser(
+            let parser = utils::create_tool_parser(
                 &self.tool_parser_factory,
                 self.configured_tool_parser.as_ref(),
                 model,
             )
+            .expect("Parser should be available - checked upfront");
+            Arc::new(tokio::sync::Mutex::new(parser))
         });
 
         if let Some(pooled_parser) = tool_parsers.get(&index) {
             let mut parser = pooled_parser.lock().await;
+
             match parser.parse_incremental(delta, tools).await {
                 Ok(crate::tool_parser::StreamingParseResult { normal_text, calls }) => {
                     // Emit normal text if present
@@ -1129,8 +1178,7 @@ impl StreamingProcessor {
                         });
                     }
 
-                    // If we emitted chunks, skip regular content
-                    return (!chunks.is_empty(), chunks);
+                    return chunks;
                 }
                 Err(e) => {
                     error!("Tool call parsing error: {}", e);
@@ -1138,7 +1186,7 @@ impl StreamingProcessor {
             }
         }
 
-        (false, chunks)
+        chunks
     }
 
     /// Format a response as SSE chunk into a reusable buffer
