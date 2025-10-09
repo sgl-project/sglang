@@ -142,6 +142,36 @@ impl ConversationItemStorage for MemoryConversationItemStorage {
 
         Ok(results)
     }
+
+    async fn get_item(&self, item_id: &ConversationItemId) -> Result<Option<ConversationItem>> {
+        let items = self.items.read().unwrap();
+        Ok(items.get(item_id).cloned())
+    }
+
+    async fn delete_item(
+        &self,
+        conversation_id: &ConversationId,
+        item_id: &ConversationItemId,
+    ) -> Result<()> {
+        // Remove from links ONLY (do not delete the item itself)
+        {
+            let mut links = self.links.write().unwrap();
+            if let Some(conv_links) = links.get_mut(conversation_id) {
+                // Find and remove the link by scanning for item_id
+                conv_links.retain(|_key, id| id != item_id);
+            }
+        }
+
+        // Remove from reverse index
+        {
+            let mut rev = self.rev_index.write().unwrap();
+            if let Some(conv_idx) = rev.get_mut(conversation_id) {
+                conv_idx.remove(&item_id.0);
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]

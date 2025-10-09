@@ -2,8 +2,9 @@
 
 use crate::data_connector::{
     conversation_items::ListParams, conversation_items::SortOrder, Conversation, ConversationId,
-    ConversationItemStorage, ConversationStorage, NewConversation, NewConversationItem, ResponseId,
-    ResponseStorage, SharedConversationItemStorage, SharedConversationStorage,
+    ConversationItemId, ConversationItemStorage, ConversationStorage, NewConversation,
+    NewConversationItem, ResponseId, ResponseStorage, SharedConversationItemStorage,
+    SharedConversationStorage,
 };
 use crate::protocols::spec::{ResponseInput, ResponsesRequest};
 use axum::http::StatusCode;
@@ -353,6 +354,378 @@ pub(super) async fn list_conversation_items(
 }
 
 // ============================================================================
+// Conversation Item Operations
+// ============================================================================
+
+/// Supported item types for creation
+/// Types marked as "implemented" are fully supported
+/// Types marked as "accepted" are stored but return not-implemented warnings
+const SUPPORTED_ITEM_TYPES: &[&str] = &[
+    // Fully implemented types
+    "message",              // Input/Output messages (IMPLEMENTED)
+    "function_tool_call",   // Function tool calls (IMPLEMENTED)
+    "function_call_output", // Function call results (IMPLEMENTED)
+    "reasoning",            // Reasoning traces (IMPLEMENTED)
+    "mcp_list_tools",       // MCP tools list (IMPLEMENTED)
+    "mcp_call",             // MCP tool calls (IMPLEMENTED)
+    "item_reference",       // References to other items (IMPLEMENTED)
+    // Accepted but not yet implemented (stored, warning returned)
+    "file_search_call",        // File search tool calls (NOT IMPLEMENTED)
+    "computer_call",           // Computer use tool calls (NOT IMPLEMENTED)
+    "computer_call_output",    // Computer use results (NOT IMPLEMENTED)
+    "web_search_call",         // Web search tool calls (NOT IMPLEMENTED)
+    "image_generation_call",   // Image generation requests (NOT IMPLEMENTED)
+    "code_interpreter_call",   // Code interpreter tool calls (NOT IMPLEMENTED)
+    "local_shell_call",        // Local shell commands (NOT IMPLEMENTED)
+    "local_shell_call_output", // Local shell results (NOT IMPLEMENTED)
+    "mcp_approval_request",    // MCP approval requests (NOT IMPLEMENTED)
+    "mcp_approval_response",   // MCP approval responses (NOT IMPLEMENTED)
+    "custom_tool_call",        // Custom tool calls (NOT IMPLEMENTED)
+    "custom_tool_call_output", // Custom tool results (NOT IMPLEMENTED)
+];
+
+/// Item types that are fully implemented with business logic
+const IMPLEMENTED_ITEM_TYPES: &[&str] = &[
+    "message",
+    "function_tool_call",
+    "function_call_output",
+    "reasoning",
+    "mcp_list_tools",
+    "mcp_call",
+    "item_reference",
+];
+
+/// Create items in a conversation (bulk operation)
+pub(super) async fn create_conversation_items(
+    conversation_storage: &SharedConversationStorage,
+    item_storage: &SharedConversationItemStorage,
+    conv_id: &str,
+    body: Value,
+) -> Response {
+    let conversation_id = ConversationId::from(conv_id);
+
+    // Verify conversation exists
+    match conversation_storage
+        .get_conversation(&conversation_id)
+        .await
+    {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "Conversation not found"})),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("Failed to get conversation: {}", e)})),
+            )
+                .into_response();
+        }
+    }
+
+    // Parse items array from request
+    let items_array = match body.get("items").and_then(|v| v.as_array()) {
+        Some(arr) => arr,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "Missing or invalid 'items' field"})),
+            )
+                .into_response();
+        }
+    };
+
+    // Validate limit (max 20 items per OpenAI spec)
+    if items_array.len() > 20 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "Cannot add more than 20 items at a time"})),
+        )
+            .into_response();
+    }
+
+    // Convert and create items
+    let mut created_items = Vec::new();
+    let mut warnings = Vec::new();
+    let added_at = Utc::now();
+
+    for item_val in items_array {
+        // Parse item based on structure (input message, item, or item_reference)
+        let (new_item, warning) = match parse_item_from_value(item_val) {
+            Ok((item, warn)) => (item, warn),
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": format!("Invalid item: {}", e)})),
+                )
+                    .into_response();
+            }
+        };
+
+        // Collect warnings for not-implemented types
+        if let Some(w) = warning {
+            warnings.push(w);
+        }
+
+        // Create item
+        let item = match item_storage.create_item(new_item).await {
+            Ok(item) => item,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("Failed to create item: {}", e)})),
+                )
+                    .into_response();
+            }
+        };
+
+        // Link to conversation
+        if let Err(e) = item_storage
+            .link_item(&conversation_id, &item.id, added_at)
+            .await
+        {
+            warn!("Failed to link item {}: {}", item.id.0, e);
+        }
+
+        created_items.push(item_to_json(&item));
+    }
+
+    // Build response matching OpenAI format
+    let first_id = created_items.first().and_then(|v| v.get("id"));
+    let last_id = created_items.last().and_then(|v| v.get("id"));
+
+    let mut response = json!({
+        "object": "list",
+        "data": created_items,
+        "first_id": first_id,
+        "last_id": last_id,
+        "has_more": false
+    });
+
+    // Add warnings if any not-implemented types were used
+    if !warnings.is_empty() {
+        if let Some(obj) = response.as_object_mut() {
+            obj.insert("warnings".to_string(), json!(warnings));
+        }
+    }
+
+    (StatusCode::OK, Json(response)).into_response()
+}
+
+/// Get a single conversation item
+/// Note: `include` query parameter is accepted but not yet implemented
+pub(super) async fn get_conversation_item(
+    conversation_storage: &SharedConversationStorage,
+    item_storage: &SharedConversationItemStorage,
+    conv_id: &str,
+    item_id: &str,
+    _include: Option<Vec<String>>, // Reserved for future use
+) -> Response {
+    let conversation_id = ConversationId::from(conv_id);
+    let item_id = ConversationItemId::from(item_id);
+
+    // Verify conversation exists
+    match conversation_storage
+        .get_conversation(&conversation_id)
+        .await
+    {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "Conversation not found"})),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("Failed to get conversation: {}", e)})),
+            )
+                .into_response();
+        }
+    }
+
+    // Get the item
+    match item_storage.get_item(&item_id).await {
+        Ok(Some(item)) => {
+            // TODO: Process `include` parameter when implemented
+            // Example: include=["metadata", "timestamps"]
+            (StatusCode::OK, Json(item_to_json(&item))).into_response()
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "Item not found"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("Failed to get item: {}", e)})),
+        )
+            .into_response(),
+    }
+}
+
+/// Delete a conversation item
+pub(super) async fn delete_conversation_item(
+    conversation_storage: &SharedConversationStorage,
+    item_storage: &SharedConversationItemStorage,
+    conv_id: &str,
+    item_id: &str,
+) -> Response {
+    let conversation_id = ConversationId::from(conv_id);
+    let item_id = ConversationItemId::from(item_id);
+
+    // Verify conversation exists and get it for response
+    let conversation = match conversation_storage
+        .get_conversation(&conversation_id)
+        .await
+    {
+        Ok(Some(conv)) => conv,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "Conversation not found"})),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("Failed to get conversation: {}", e)})),
+            )
+                .into_response();
+        }
+    };
+
+    // Delete the item
+    match item_storage.delete_item(&conversation_id, &item_id).await {
+        Ok(_) => {
+            info!(
+                conversation_id = %conversation_id.0,
+                item_id = %item_id.0,
+                "Deleted conversation item"
+            );
+
+            // Return updated conversation object (per OpenAI spec)
+            (StatusCode::OK, Json(conversation_to_json(&conversation))).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("Failed to delete item: {}", e)})),
+        )
+            .into_response(),
+    }
+}
+
+/// Parse NewConversationItem from Value
+/// Returns (NewConversationItem, Option<warning_message>)
+/// Supports three top-level structures:
+/// 1. Input message: {"type": "message", "role": "...", "content": [...]}
+/// 2. Item: {"type": "message|function_tool_call|...", ...}
+/// 3. Item reference: {"type": "item_reference", "id": "..."}
+fn parse_item_from_value(
+    item_val: &Value,
+) -> Result<(NewConversationItem, Option<String>), String> {
+    // Detect structure type
+    let item_type = item_val
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("message");
+
+    // Validate item type is supported
+    if !SUPPORTED_ITEM_TYPES.contains(&item_type) {
+        return Err(format!(
+            "Unsupported item type '{}'. Supported types: {}",
+            item_type,
+            SUPPORTED_ITEM_TYPES.join(", ")
+        ));
+    }
+
+    // Check if type is implemented or just accepted
+    let warning = if !IMPLEMENTED_ITEM_TYPES.contains(&item_type) {
+        Some(format!(
+            "Item type '{}' is accepted but not yet implemented. \
+             The item will be stored but may not function as expected.",
+            item_type
+        ))
+    } else {
+        None
+    };
+
+    // Handle item_reference specially
+    if item_type == "item_reference" {
+        let ref_id = item_val
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "item_reference requires 'id' field".to_string())?;
+
+        return Ok((
+            NewConversationItem {
+                id: None,
+                response_id: None,
+                item_type: "item_reference".to_string(),
+                role: None,
+                content: json!({"id": ref_id}),
+                status: Some("completed".to_string()),
+            },
+            warning,
+        ));
+    }
+
+    // Parse common fields
+    let role = item_val
+        .get("role")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let content = item_val.get("content").cloned().unwrap_or(json!([]));
+    let status = item_val
+        .get("status")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .or_else(|| Some("completed".to_string())); // Default status
+
+    // Validate message types have role
+    if item_type == "message" && role.is_none() {
+        return Err("Message items require 'role' field".to_string());
+    }
+
+    Ok((
+        NewConversationItem {
+            id: None,
+            response_id: None,
+            item_type: item_type.to_string(),
+            role,
+            content,
+            status,
+        },
+        warning,
+    ))
+}
+
+/// Convert ConversationItem to JSON response format
+fn item_to_json(item: &crate::data_connector::conversation_items::ConversationItem) -> Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert("id".to_string(), json!(item.id.0));
+    obj.insert("type".to_string(), json!(item.item_type));
+
+    if let Some(role) = &item.role {
+        obj.insert("role".to_string(), json!(role));
+    }
+
+    obj.insert("content".to_string(), item.content.clone());
+
+    if let Some(status) = &item.status {
+        obj.insert("status".to_string(), json!(status));
+    }
+
+    Value::Object(obj)
+}
+
+// ============================================================================
 // Persistence Operations
 // ============================================================================
 
@@ -555,7 +928,7 @@ async fn persist_items_with_storages(
 // ============================================================================
 
 /// Convert conversation to JSON response
-fn conversation_to_json(conversation: &Conversation) -> Value {
+pub(crate) fn conversation_to_json(conversation: &Conversation) -> Value {
     let mut response = json!({
         "id": conversation.id.0,
         "object": "conversation",

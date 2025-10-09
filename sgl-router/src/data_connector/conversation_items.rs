@@ -94,6 +94,16 @@ pub trait ConversationItemStorage: Send + Sync + 'static {
         conversation_id: &ConversationId,
         params: ListParams,
     ) -> Result<Vec<ConversationItem>>;
+
+    /// Get a single item by ID
+    async fn get_item(&self, item_id: &ConversationItemId) -> Result<Option<ConversationItem>>;
+
+    /// Delete an item link from a conversation (does not delete the item itself)
+    async fn delete_item(
+        &self,
+        conversation_id: &ConversationId,
+        item_id: &ConversationItemId,
+    ) -> Result<()>;
 }
 
 pub type SharedConversationItemStorage = Arc<dyn ConversationItemStorage>;
