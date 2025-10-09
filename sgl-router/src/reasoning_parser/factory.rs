@@ -82,9 +82,9 @@ impl ParserRegistry {
         }
     }
 
-    /// Get a parser by exact name (creates new instance, not pooled).
-    /// Use this for compatibility or when you need a fresh instance.
-    pub fn get_parser(&self, name: &str) -> Option<Box<dyn ReasoningParser>> {
+    /// Create a fresh parser instance by exact name (not pooled).
+    /// Returns a new parser instance for each call - useful for streaming where state isolation is needed.
+    pub fn create_parser(&self, name: &str) -> Option<Box<dyn ReasoningParser>> {
         let creators = self.creators.read().unwrap();
         creators.get(name).map(|creator| creator())
     }
@@ -102,14 +102,15 @@ impl ParserRegistry {
         None
     }
 
-    /// Find a parser for a given model ID by pattern matching (creates new instance).
-    pub fn find_parser_for_model(&self, model_id: &str) -> Option<Box<dyn ReasoningParser>> {
+    /// Create a fresh parser instance for a given model ID by pattern matching (not pooled).
+    /// Returns a new parser instance for each call - useful for streaming where state isolation is needed.
+    pub fn create_for_model(&self, model_id: &str) -> Option<Box<dyn ReasoningParser>> {
         let patterns = self.patterns.read().unwrap();
         let model_lower = model_id.to_lowercase();
 
         for (pattern, parser_name) in patterns.iter() {
             if model_lower.contains(&pattern.to_lowercase()) {
-                return self.get_parser(parser_name);
+                return self.create_parser(parser_name);
             }
         }
         None
@@ -211,7 +212,7 @@ impl ReasoningParserFactory {
     /// Use this when you need an isolated parser instance.
     pub fn create(&self, model_id: &str) -> Result<Box<dyn ReasoningParser>, ParseError> {
         // First try to find by pattern
-        if let Some(parser) = self.registry.find_parser_for_model(model_id) {
+        if let Some(parser) = self.registry.create_for_model(model_id) {
             return Ok(parser);
         }
 

@@ -962,13 +962,15 @@ impl StreamingProcessor {
         created: u64,
         system_fingerprint: Option<&str>,
     ) -> (String, Option<ChatCompletionStreamResponse>, bool) {
-        // Get or create parser for this index
+        // Create fresh parser for this index (not pooled, to avoid state pollution)
         reasoning_parsers.entry(index).or_insert_with(|| {
-            utils::get_reasoning_parser(
+            let parser = utils::create_reasoning_parser(
                 &self.reasoning_parser_factory,
                 self.configured_reasoning_parser.as_ref(),
                 model,
             )
+            .expect("Failed to create reasoning parser");
+            Arc::new(tokio::sync::Mutex::new(parser))
         });
 
         if let Some(pooled_parser) = reasoning_parsers.get(&index) {
@@ -1036,17 +1038,20 @@ impl StreamingProcessor {
     ) -> Vec<ChatCompletionStreamResponse> {
         let mut chunks = Vec::new();
 
-        // Get or create parser for this index
+        // Create fresh parser for this index (not pooled, to avoid state pollution)
         tool_parsers.entry(index).or_insert_with(|| {
-            utils::get_tool_parser(
+            let parser = utils::create_tool_parser(
                 &self.tool_parser_factory,
                 self.configured_tool_parser.as_ref(),
                 model,
             )
+            .expect("Failed to create tool parser");
+            Arc::new(tokio::sync::Mutex::new(parser))
         });
 
         if let Some(pooled_parser) = tool_parsers.get(&index) {
             let mut parser = pooled_parser.lock().await;
+
             match parser.parse_incremental(delta, tools).await {
                 Ok(crate::tool_parser::StreamingParseResult { normal_text, calls }) => {
                     // Emit normal text if present

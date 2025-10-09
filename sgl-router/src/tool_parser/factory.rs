@@ -81,6 +81,47 @@ impl ToolParserRegistry {
         }
     }
 
+    /// Create a fresh (non-pooled) parser instance by exact name.
+    /// Returns a new parser instance for each call - useful for streaming where state isolation is needed.
+    pub fn create_parser(&self, name: &str) -> Option<Box<dyn ToolParser>> {
+        let creators = self.creators.read().unwrap();
+        creators.get(name).map(|creator| creator())
+    }
+
+    /// Create a fresh (non-pooled) parser instance for a specific model.
+    /// Returns a new parser instance for each call - useful for streaming where state isolation is needed.
+    pub fn create_for_model(&self, model: &str) -> Option<Box<dyn ToolParser>> {
+        // Try exact match first
+        {
+            let mapping = self.model_mapping.read().unwrap();
+            if let Some(parser_name) = mapping.get(model) {
+                if let Some(parser) = self.create_parser(parser_name) {
+                    return Some(parser);
+                }
+            }
+        }
+
+        // Try prefix matching with more specific patterns first
+        let model_mapping = self.model_mapping.read().unwrap();
+        let best_match = model_mapping
+            .iter()
+            .filter(|(pattern, _)| {
+                pattern.ends_with('*') && model.starts_with(&pattern[..pattern.len() - 1])
+            })
+            .max_by_key(|(pattern, _)| pattern.len());
+
+        // Return the best matching parser
+        if let Some((_, parser_name)) = best_match {
+            if let Some(parser) = self.create_parser(parser_name) {
+                return Some(parser);
+            }
+        }
+
+        // Fall back to default parser
+        let default = self.default_parser.read().unwrap().clone();
+        self.create_parser(&default)
+    }
+
     /// Get parser for a specific model
     pub fn get_pooled_for_model(&self, model: &str) -> Option<PooledToolParser> {
         // Try exact match first
