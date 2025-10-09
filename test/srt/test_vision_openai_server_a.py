@@ -63,7 +63,7 @@ class TestQwen3VLServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
             api_key=cls.api_key,
             other_args=[
                 "--mem-fraction-static",
-                "0.55",
+                "0.80",
                 "--cuda-graph-max-bs",
                 "4",
             ],
