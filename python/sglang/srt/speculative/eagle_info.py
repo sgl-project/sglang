@@ -1,7 +1,7 @@
 import logging
 from copy import copy
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import ClassVar, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -592,6 +592,13 @@ class EagleDraftInput(SpecInput):
     seq_lens_for_draft_extend: torch.Tensor = None
     seq_lens_for_draft_extend_cpu: torch.Tensor = None
     req_pool_indices_for_draft_extend: torch.Tensor = None
+
+    # Inputs for V2 overlap worker
+    allocate_lens: torch.Tensor = None
+    verify_done: torch.cuda.Event = None
+
+    # FIXME(lsyin): remove this hack
+    ALLOC_LEN_PER_DECODE: ClassVar[int] = None
 
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT)

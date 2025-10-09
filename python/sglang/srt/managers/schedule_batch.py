@@ -71,6 +71,7 @@ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import flatten_nested_list, support_triton
+from sglang.srt.utils.common import next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -1109,6 +1110,36 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         else:
             return out_cache_loc
 
+    def allocate_for_eagle(self):
+        from sglang.srt.speculative.eagle_info import EagleDraftInput
+        from sglang.srt.speculative.spec_utils import assign_req_to_token_pool
+
+        bs = self.batch_size()
+
+        assert self.spec_info.is_verify_input()
+        draft_input: EagleDraftInput = self.spec_info
+        if draft_input.verify_done is not None:
+            draft_input.verify_done.synchronize()
+
+        # FIXME(lsyin): now implementation does not enable over-allocation
+        new_allocate_lens = self.seq_lens + EagleDraftInput.ALLOC_LEN_PER_DECODE
+        num_needed_tokens = (new_allocate_lens - draft_input.allocate_lens).sum().item()
+        out_cache_loc = self.alloc_token_slots(num_needed_tokens)
+
+        assign_req_to_token_pool[(bs,)](
+            self.req_pool_indices,
+            self.req_to_token_pool.req_to_token,
+            draft_input.allocate_lens,
+            new_allocate_lens,
+            out_cache_loc,
+            self.req_to_token_pool.req_to_token.shape[1],
+            next_power_of_2(bs),
+        )
+        draft_input.allocate_lens = new_allocate_lens
+
+        # FIXME(lsyin): remove seq_lens_sum calculation
+        self.seq_lens_sum = self.seq_lens.sum().item()
+
     def write_cache_indices(
         self,
         req_pool_indices: List[int],
@@ -1641,11 +1672,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
 
-        if (
-            self.spec_algorithm.is_eagle()
-            or self.spec_algorithm.is_standalone()
-            or self.spec_algorithm.is_ngram()
-        ):
+        if self.spec_algorithm.is_eagle():
+            # FIXME(lsyin): make this sync optional
+            self.allocate_for_eagle()
+
+        if not self.spec_algorithm.is_none():
             # if spec decoding is used, the decode batch is prepared inside
             # `forward_batch_speculative_generation` after running draft models.
             return
