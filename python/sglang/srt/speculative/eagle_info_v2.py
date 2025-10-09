@@ -5,22 +5,46 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 from traitlets import List
 
+from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
+from sglang.srt.managers.scheduler import global_server_args_dict
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.speculative.build_eagle_tree import TreeMaskMode
-from sglang.srt.utils.common import fast_topk
+from sglang.srt.speculative.spec_utils import (
+    SIMULATE_ACC_LEN,
+    generate_simulated_accept_index,
+)
+from sglang.srt.utils.common import fast_topk, next_power_of_2
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
         EAGLEDraftCudaGraphRunner,
     )
-    from sglang.srt.speculative.eagle_info import EagleDraftInput
+    from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
+
+if is_cuda():
+    from sgl_kernel import (
+        top_k_renorm_prob,
+        top_p_renorm_prob,
+        tree_speculative_sampling_target_only,
+        verify_tree_greedy,
+    )
+    from sgl_kernel.top_k import fast_topk
+elif is_hip():
+    from sgl_kernel import verify_tree_greedy
 
 
 @triton.jit
@@ -86,6 +110,162 @@ class EagleDraftInputV2Mixin:
         forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
         return forward_batch, can_cuda_graph
+
+
+@dataclass
+class EagleVerifyInputV2Mixin:
+    def prepare_for_verify(
+        self: EagleVerifyInput,
+        batch: ModelWorkerBatch,
+        target_worker: TpModelWorker,
+    ):
+        # Assign cache locations
+        bs = len(batch.req_pool_indices)
+        batch.input_ids = self.draft_token
+        device = batch.input_ids.device
+        batch.out_cache_loc = torch.empty(
+            (bs * self.draft_token_num,),
+            dtype=torch.int64,
+            device=device,
+        )
+
+        assign_extend_cache_locs[(bs,)](
+            batch.req_pool_indices,
+            batch.req_to_token_pool.req_to_token,
+            batch.seq_lens,
+            batch.seq_lens + self.num_draft_tokens,
+            batch.out_cache_loc,
+            batch.req_to_token_pool.req_to_token.shape[1],
+            next_power_of_2(bs),
+        )
+
+        # Get a forward batch
+        batch.spec_info = self
+        batch.forward_mode = ForwardMode.TARGET_VERIFY
+        batch.capture_hidden_mode = CaptureHiddenMode.FULL
+        verify_forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)
+
+        # Run attention backend plan and cuda graph preparation
+        can_run_cuda_graph = bool(
+            target_worker.model_runner.graph_runner
+            and target_worker.model_runner.graph_runner.can_run(verify_forward_batch)
+        )
+        if can_run_cuda_graph:
+            target_worker.model_runner.graph_runner.replay_prepare(verify_forward_batch)
+        else:
+            target_worker.model_runner.attn_backend.init_forward_metadata(
+                verify_forward_batch
+            )
+
+        return verify_forward_batch, can_run_cuda_graph
+
+    def sample(
+        self,
+        batch: ModelWorkerBatch,
+        logits_output: LogitsProcessorOutput,
+    ):
+        """
+        Verify and find accepted tokens based on logits output and batch
+        (which contains spec decoding information).
+        """
+        bs = len(batch.seq_lens)
+        sampling_info = batch.sampling_info
+        next_token_logits = logits_output.next_token_logits
+        device = batch.input_ids.device
+
+        candidates = self.draft_token.reshape(bs, self.num_draft_tokens)
+        predict = torch.zeros(
+            (bs * (self.num_steps + 1),), dtype=torch.int32, device=device
+        )
+        accept_index = torch.full(
+            (bs, self.num_steps + 1), -1, dtype=torch.int32, device=device
+        )
+        accept_length = torch.empty((bs,), dtype=torch.int32, device=device)
+
+        # Sample tokens
+        if sampling_info.is_all_greedy:
+            target_predict = torch.argmax(next_token_logits, dim=-1)
+            target_predict = target_predict.reshape(bs, self.num_draft_tokens)
+
+            verify_tree_greedy(
+                predicts=predict,  # mutable
+                accept_index=accept_index,  # mutable
+                accept_token_num=accept_length,  # mutable
+                candidates=candidates,
+                retrive_index=self.retrive_index,
+                retrive_next_token=self.retrive_next_token,
+                retrive_next_sibling=self.retrive_next_sibling,
+                target_predict=target_predict,
+            )
+        else:
+            # Apply temperature and get target probs
+            expanded_temperature = torch.repeat_interleave(
+                sampling_info.temperatures, self.num_draft_tokens, dim=0
+            )  # (bs * num_draft_tokens, 1)
+
+            target_probs = F.softmax(
+                next_token_logits / expanded_temperature, dim=-1
+            )  # (bs * num_draft_tokens, vocab_size)
+            target_probs = top_k_renorm_prob(
+                target_probs,
+                torch.repeat_interleave(
+                    sampling_info.top_ks, self.num_draft_tokens, dim=0
+                ),
+            )  # (bs * num_draft_tokens, vocab_size)
+            target_probs = top_p_renorm_prob(
+                target_probs,
+                torch.repeat_interleave(
+                    sampling_info.top_ps, self.num_draft_tokens, dim=0
+                ),
+            )
+            target_probs = target_probs.reshape(bs, self.num_draft_tokens, -1)
+
+            # This is currently not used
+            draft_probs = torch.empty_like(target_probs)
+
+            all_coins = torch.rand(
+                (bs * self.num_draft_tokens + bs), dtype=torch.float32, device=device
+            )
+            # coins for rejection sampling
+            coins = all_coins[:-bs]
+            # coins for final sampling
+            coins_for_final_sampling = all_coins[-bs:]
+
+            tree_speculative_sampling_target_only(
+                predicts=predict,  # mutable
+                accept_index=accept_index,  # mutable
+                accept_token_num=accept_length,  # mutable
+                candidates=candidates,
+                retrive_index=self.retrive_index,
+                retrive_next_token=self.retrive_next_token,
+                retrive_next_sibling=self.retrive_next_sibling,
+                uniform_samples=coins,
+                uniform_samples_for_final_sampling=coins_for_final_sampling,
+                target_probs=target_probs,
+                draft_probs=draft_probs,
+                threshold_single=global_server_args_dict[
+                    "speculative_accept_threshold_single"
+                ],
+                threshold_acc=global_server_args_dict[
+                    "speculative_accept_threshold_acc"
+                ],
+                deterministic=True,
+            )
+
+        if SIMULATE_ACC_LEN:
+            # Do simulation
+            accept_index = generate_simulated_accept_index(
+                accept_index=accept_index,
+                predict=predict,  # mutable
+                accept_length=accept_length,  # mutable
+                simulate_acc_len=SIMULATE_ACC_LEN,
+                bs=bs,
+                num_steps=self.num_steps,
+            )
+
+        # Include the bonus token
+        accept_length.add_(1)
+        return predict, accept_length, accept_index
 
 
 def build_tree_kernel_efficient_tmp(
