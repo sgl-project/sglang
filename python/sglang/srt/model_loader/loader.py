@@ -1601,7 +1601,6 @@ class CkptEngineModelLoader(BaseModelLoader):
     ) -> nn.Module:
         """Load model using checkpoint engine format."""
         logger.info("Loading weights from checkpoint engine format ...")
-
         model_weights = f"ckptengine://"
 
         with set_default_torch_dtype(model_config.dtype):

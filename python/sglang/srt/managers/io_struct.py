@@ -1035,7 +1035,7 @@ class UpdateWeightsFromTensorReqOutput(BaseReq):
 
 
 @dataclass
-class UpdateWeightsFromCkptEngineReqInput:
+class UpdateWeightsFromCkptEngineReqInput(BaseReq):
     # The model path with the new weights
     model_path: str
     # The format to load the weights
@@ -1049,7 +1049,7 @@ class UpdateWeightsFromCkptEngineReqInput:
 
 
 @dataclass
-class UpdateWeightsFromCkptEngineReqOutput:
+class UpdateWeightsFromCkptEngineReqOutput(BaseReq):
     success: bool
     message: str
     # Number of paused requests during weight sync.

@@ -76,13 +76,13 @@ def split_tensors(
     return named_tensors
 
 
-def req_inference(inference_parallel_size: int):
+def req_inference(inference_parallel_size: int, port: int):
     rank = int(os.getenv("RANK", None))
     src = rank // inference_parallel_size * inference_parallel_size
 
     def req_func(socket_paths: list[tuple[str, str]]):
         request_inference_to_update(
-            CKPTENGINE_PORT + rank,
+            port,
             dict(socket_paths[src : src + inference_parallel_size]),
         )
 
@@ -154,10 +154,11 @@ if __name__ == "__main__":
     parser.add_argument("--inference-parallel-size", type=int, default=8)
     parser.add_argument("--checkpoint-name", type=str, default="sglang-ckpt-iter-0")
     parser.add_argument("--update-method", type=str, default="broadcast")
+    parser.add_argument("--ckpt-setup-port", type=int, default=CKPTENGINE_PORT)
     args = parser.parse_args()
     rank = int(os.getenv("RANK"))
     world_size = int(os.getenv("WORLD_SIZE"))
-    req_func = req_inference(args.inference_parallel_size)
+    req_func = req_inference(args.inference_parallel_size, args.ckpt_setup_port)
     ps = ParameterServer(auto_pg=True)
     ps._gpu_count = args.inference_parallel_size
     if args.load_metas_file:

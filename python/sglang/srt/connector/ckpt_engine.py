@@ -13,12 +13,8 @@ import torch.distributed as dist
 import zmq
 
 from sglang.srt.connector import BaseConnector
-from sglang.srt.utils import init_custom_process_group
 
 logger = logging.getLogger(__name__)
-
-# TODO: using dynamic port
-CKPTENGINE_PORT = 33001
 
 
 def _get_physical_gpu_id(rank: int) -> str:
@@ -75,29 +71,44 @@ class CkptEngineConnector(BaseConnector):
     def get_zmq_handle(self, tp_rank: int):
         # FIXME: There needs a local rank
         self.device_uuid = _get_physical_gpu_id(tp_rank)
-        socket = zmq.Context().socket(zmq.PULL)
-        socket.bind(f"tcp://*:{self.ckpt_engine_port + tp_rank}")
-        try:
-            raw_message = socket.recv()
 
+        data_container = [None]
+        if tp_rank == 0:
+            socket = zmq.Context().socket(zmq.PULL)
+            socket.bind(f"tcp://*:{self.ckpt_engine_port}")
+
+            data = None
             try:
-                data = json.loads(raw_message.decode("utf-8"))
+                raw_message = socket.recv()
 
-                if not isinstance(data, dict):
-                    logger.warning("CKPTENGINE: Not exactly the socket handle.")
-                else:
-                    self.zmq_handle = data[self.device_uuid]
+                try:
+                    data = json.loads(raw_message.decode("utf-8"))
 
-            except (json.JSONDecodeError, UnicodeDecodeError) as e:
-                logger.error(f"can not parse the socket raw message: {e}")
+                    if not isinstance(data, dict):
+                        logger.warning("CKPTENGINE: Not exactly the socket handle.")
 
-        except KeyboardInterrupt:
-            print("\n shutting down the server.")
-        finally:
-            socket.close()
+                except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                    logger.error(f"can not parse the socket raw message: {e}")
+
+            except KeyboardInterrupt:
+                logger.info("\n shutting down the server.")
+            finally:
+                socket.close()
+
+            if data is None:
+                raise RuntimeError("Rank 0 failed to receive or parse the ZMQ handle data.")
+
+            data_container[0] = data
+            logger.info("Rank 0: Received handle data. Broadcasting to other ranks...")
+
+        dist.broadcast_object_list(data_container, src=0)
+        received_data = data_container[0]
+        self.zmq_handle = received_data.get(self.device_uuid)
 
     def get_socket_handle(self, tp_rank: int):
         # FIXME: local_rank is not tp_rank
+        if self.zmq_handle is not None:
+            return
         self.local_rank = tp_rank
         self.get_zmq_handle(tp_rank)
         self.zmq_ctx = zmq.Context()
@@ -111,11 +122,6 @@ class CkptEngineConnector(BaseConnector):
         ignore_pattern: Optional[list[str]] = None,
     ) -> None:
         return
-
-    def _merge_and_store(self, gate_key, gate_tensor, up_key, up_tensor):
-        new_key = gate_key.replace("gate_proj", "gate_up_proj")
-        merged_tensor = torch.cat([gate_tensor, up_tensor], dim=0)
-        self.final_state_dict[new_key] = merged_tensor
 
     def _extract_weights(
         self, payload: list[FlattenedTensorMetadata], buffer: torch.Tensor
