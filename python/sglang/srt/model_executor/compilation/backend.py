@@ -343,11 +343,10 @@ class SGLangBackend:
     def __init__(
         self,
         config: CompilationConfig,
+        graph_pool: Any,
     ):
-        global global_graph_pool
-        if global_graph_pool is None:
-            global_graph_pool = torch.cuda.graph_pool_handle()
-        self.graph_pool = global_graph_pool
+        assert graph_pool is not None
+        self.graph_pool = graph_pool
 
         self.post_grad_pass_manager = PostGradPassManager()
         self.sym_tensor_indices = []

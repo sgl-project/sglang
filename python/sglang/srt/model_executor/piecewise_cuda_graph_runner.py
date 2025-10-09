@@ -144,11 +144,17 @@ class PiecewiseCudaGraphRunner:
             self.model_runner.server_args.piecewise_cuda_graph_tokens
         )
 
+        if get_global_graph_memory_pool() is None:
+            set_global_graph_memory_pool(self.device_module.graph_pool_handle())
+        # Set graph pool id globally to be able to use symmetric memory
+        set_graph_pool_id(get_global_graph_memory_pool())
+
         install_torch_compiled(
             self.model_runner.model.model,
             fullgraph=True,
             dynamic_arg_dims=None,
             compile_config=self.compile_config,
+            graph_pool=get_global_graph_memory_pool(),
         )
 
         # Batch sizes to capture
@@ -369,11 +375,6 @@ class PiecewiseCudaGraphRunner:
             self.device_module.synchronize()
             self.model_runner.tp_group.barrier()
             run_once()
-
-        if get_global_graph_memory_pool() is None:
-            set_global_graph_memory_pool(self.device_module.graph_pool_handle())
-        # Set graph pool id globally to be able to use symmetric memory
-        set_graph_pool_id(get_global_graph_memory_pool())
 
         return
 

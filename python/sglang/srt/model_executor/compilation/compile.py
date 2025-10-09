@@ -6,7 +6,7 @@ import sys
 import types
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Callable, Optional, Union
+from typing import Any, Callable, Optional, Union
 
 import torch
 
@@ -125,6 +125,7 @@ def install_torch_compiled(
     compile_config: CompilationConfig = None,
     fullgraph: bool = True,
     use_custom_dispatcher: bool = True,
+    graph_pool: Any = None,
 ):
     unbound_fwd = module.__class__.forward
     if not callable(unbound_fwd):
@@ -136,7 +137,9 @@ def install_torch_compiled(
     if backend_factory is None:
         from sglang.srt.model_executor.compilation.backend import SGLangBackend
 
-        backend_factory = lambda gm, ex: SGLangBackend(compile_config)(gm, ex)
+        backend_factory = lambda gm, ex: SGLangBackend(compile_config, graph_pool)(
+            gm, ex
+        )
 
     compiled_codes: list[type(original_code)] = []
     state = {"compiled": False, "compiled_callable": None}
