@@ -483,6 +483,10 @@ class ServerArgs:
         )
         return prefill_attention_backend_str, decode_attention_backend_str
 
+    # Sparse attention
+    is_sparse_attn: bool = True
+    sparse_attn_algo: str = "lserver"
+
     def __post_init__(self):
         """
         Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
@@ -2929,6 +2933,17 @@ class ServerArgs:
             "--config",
             type=str,
             help="Read CLI options from a config file. Must be a YAML file with configuration options.",
+        )
+        parser.add_argument(
+            "--is-sparse-attn",
+            action="store_true",
+            help="Whether to use sparse attention.",
+        )
+        parser.add_argument(
+            "--sparse-attn-algo",
+            type=str,
+            default=ServerArgs.sparse_attn_algo,
+            help="The algorithm to use for sparse attention.",
         )
 
     @classmethod

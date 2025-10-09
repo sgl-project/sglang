@@ -20,6 +20,8 @@ if TYPE_CHECKING:
 
 from sgl_kernel import merge_state_v2
 from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+from memattention.updater.flashattention.cache_updater import LServerUpdaterFlashAttentionBackend
+from memattention.cache_manager.cache_manager import ManagerConfig
 
 
 @dataclass
@@ -337,6 +339,23 @@ class FlashAttentionBackend(AttentionBackend):
             model_runner.server_args.speculative_num_draft_tokens
         )
         self.speculative_step_id = speculative_step_id
+        self.sparse_attn = model_runner.server_args.is_sparse_attn
+        self.sparse_attn_algo = model_runner.server_args.sparse_attn_algo
+        manager_config = ManagerConfig(
+            keys=model_runner.token_to_kv_pool.k_buffer,
+            values=model_runner.token_to_kv_pool.v_buffer,
+            num_layers=model_runner.token_to_kv_pool.layer_num,
+            use_cuda_graph=not model_runner.server_args.disable_cuda_graph,
+            max_bs=1,
+            page_size=self.page_size,
+            retrive_budget_per_seq=1024,
+            device=model_runner.device,
+            async_retrive=True,
+            req_to_token=model_runner.req_to_token_pool.req_to_token,
+            max_seq_len=self.max_context_len,
+        )
+        self.sparse_cache_updater = LServerUpdaterFlashAttentionBackend(manager_config)
+        self.sparse_cache_updater.cache_manager.start_retrive_loop()
 
         self.fa_impl_ver = fa_impl_ver
 
@@ -442,18 +461,21 @@ class FlashAttentionBackend(AttentionBackend):
                     )
                     self.forward_metadata_spec_decode_expand = metadata_expand
             else:
-                # Normal Decode
-                metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
-                metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
-                metadata.cu_seqlens_q = torch.arange(
-                    0, batch_size + 1, dtype=torch.int32, device=device
-                )
-                metadata.cu_seqlens_k = torch.nn.functional.pad(
-                    torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
-                )
-                metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
-                    forward_batch.req_pool_indices, : metadata.max_seq_len_k
-                ]
+                if self.sparse_attn:
+                    self.sparse_cache_updater.update_decode(forward_batch, metadata)
+                else:
+                    # Normal Decode
+                    metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
+                    metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
+                    metadata.cu_seqlens_q = torch.arange(
+                        0, batch_size + 1, dtype=torch.int32, device=device
+                    )
+                    metadata.cu_seqlens_k = torch.nn.functional.pad(
+                        torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
+                    )
+                    metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
+                        forward_batch.req_pool_indices, : metadata.max_seq_len_k
+                    ]
             # TODO: we need to test this part for llama 4 eagle case
             self._init_local_attn_metadata(forward_batch, metadata, device)
         elif forward_batch.forward_mode.is_target_verify():
@@ -584,31 +606,34 @@ class FlashAttentionBackend(AttentionBackend):
                     )
 
         elif forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
-            metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
-            metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
-            metadata.cu_seqlens_k = torch.nn.functional.pad(
-                torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
-            )
-            metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
-                forward_batch.req_pool_indices, : metadata.max_seq_len_k
-            ]
-
-            if (
-                any(forward_batch.extend_prefix_lens_cpu)
-                or forward_batch.forward_mode == ForwardMode.DRAFT_EXTEND
-            ):
-                extend_seq_lens = forward_batch.extend_seq_lens
-                metadata.max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
-                metadata.cu_seqlens_q = torch.nn.functional.pad(
-                    torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32), (1, 0)
-                )
+            if self.sparse_attn:
+                self.sparse_cache_updater.update_extend(forward_batch, metadata)
             else:
-                metadata.max_seq_len_q = metadata.max_seq_len_k
-                metadata.cu_seqlens_q = metadata.cu_seqlens_k
+                metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
+                metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
+                metadata.cu_seqlens_k = torch.nn.functional.pad(
+                    torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
+                )
+                metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
+                    forward_batch.req_pool_indices, : metadata.max_seq_len_k
+                ]
 
-            # Setup local attention if enabled
-            if forward_batch.forward_mode == ForwardMode.EXTEND:
-                self._init_local_attn_metadata(forward_batch, metadata, device)
+                if (
+                    any(forward_batch.extend_prefix_lens_cpu)
+                    or forward_batch.forward_mode == ForwardMode.DRAFT_EXTEND
+                ):
+                    extend_seq_lens = forward_batch.extend_seq_lens
+                    metadata.max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
+                    metadata.cu_seqlens_q = torch.nn.functional.pad(
+                        torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32), (1, 0)
+                    )
+                else:
+                    metadata.max_seq_len_q = metadata.max_seq_len_k
+                    metadata.cu_seqlens_q = metadata.cu_seqlens_k
+
+                # Setup local attention if enabled
+                if forward_batch.forward_mode == ForwardMode.EXTEND:
+                    self._init_local_attn_metadata(forward_batch, metadata, device)
 
         # Encoder metadata for cross attention
         if forward_batch.encoder_lens is not None:
@@ -635,7 +660,7 @@ class FlashAttentionBackend(AttentionBackend):
             ]
 
         # Convert the page table to a strided format which is needed by FA3 API
-        if self.page_size > 1:
+        if self.page_size > 1 and not self.sparse_attn:
             self.strided_indices = torch.arange(
                 0, metadata.page_table.shape[1], self.page_size, device=self.device
             )
@@ -985,6 +1010,7 @@ class FlashAttentionBackend(AttentionBackend):
 
         # Use precomputed metadata across all layers
         metadata = self.forward_metadata
+        
         local_attn_metadata = getattr(metadata, "local_attn_metadata", None)
         use_local_attn = (
             self.attention_chunk_size is not None
@@ -1028,6 +1054,8 @@ class FlashAttentionBackend(AttentionBackend):
             k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
         if not self.use_mla:
             # Do multi-head attention
+            if self.sparse_attn:
+                self.sparse_cache_updater.call_begin_forward_attn_decode(q, forward_batch, metadata, layer)
 
             key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
                 layer.layer_id
