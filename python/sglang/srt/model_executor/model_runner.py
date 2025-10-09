@@ -624,16 +624,16 @@ class ModelRunner:
                     "Setting hicache_io_backend to vanilla I/O, which may lead to suboptimal performance with small page sizes."
                 )
 
-        if self.model_config.hf_config.model_type == "qwen3_vl_moe" and hasattr(
-            self.model_config.hf_config, "quantization_config"
-        ):
-            text_config = self.model_config.hf_text_config
-            if (
-                text_config.moe_intermediate_size // (self.tp_size // self.moe_ep_size)
-            ) % 128 != 0:
-                raise ValueError(
-                    f"For qwen3-vl-fp8 models, please make sure ({text_config.moe_intermediate_size=} // ({self.tp_size=} // {self.moe_ep_size=})) % 128 == 0"
-                )
+        if self.model_config.hf_config.model_type == "qwen3_vl_moe":
+            if (quantization_config := getattr(self.model_config.hf_config, "quantization_config")) is not None:
+                text_config = self.model_config.hf_text_config
+                weight_block_size_n = quantization_config["weight_block_size"][0]
+                if (
+                    text_config.moe_intermediate_size // (self.tp_size // self.moe_ep_size)
+                ) % weight_block_size_n != 0:
+                    raise ValueError(
+                        f"For qwen3-vl-fp8 models, please make sure ({text_config.moe_intermediate_size=} // ({self.tp_size=} // {self.moe_ep_size=})) % {weight_block_size_n=} == 0"
+                    )
 
     def init_torch_distributed(self):
         logger.info("Init torch distributed begin.")
@@ -1537,7 +1537,7 @@ class ModelRunner:
                 self.req_to_token_pool = DecodeReqToTokenPool(
                     size=max_num_reqs,
                     max_context_len=self.model_config.context_len
-                    + extra_max_context_len,
+                                    + extra_max_context_len,
                     device=self.device,
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     pre_alloc_size=pre_alloc_size,
@@ -1546,7 +1546,7 @@ class ModelRunner:
                 self.req_to_token_pool = HybridReqToTokenPool(
                     size=max_num_reqs,
                     max_context_len=self.model_config.context_len
-                    + extra_max_context_len,
+                                    + extra_max_context_len,
                     device=self.device,
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     cache_params=config.mamba2_cache_params,
@@ -1556,7 +1556,7 @@ class ModelRunner:
                 self.req_to_token_pool = ReqToTokenPool(
                     size=max_num_reqs,
                     max_context_len=self.model_config.context_len
-                    + extra_max_context_len,
+                                    + extra_max_context_len,
                     device=self.device,
                     enable_memory_saver=self.server_args.enable_memory_saver,
                 )
