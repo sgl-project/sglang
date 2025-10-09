@@ -52,6 +52,9 @@ TRUST_REMOTE_CODE="${TRUST_REMOTE_CODE:-false}"
 CHAT_TEMPLATE="${CHAT_TEMPLATE:-}"
 TOOL_CALL_PARSER="${TOOL_CALL_PARSER:-}"
 
+# Authentication
+API_KEY="${API_KEY:-${HATHORA_APP_SECRET:-}}"
+
 # Auto-detect GLM model settings
 MODEL_PATH_LOWER=$(echo "$MODEL_PATH" | tr '[:upper:]' '[:lower:]')
 
@@ -111,6 +114,7 @@ echo "  Metrics: $ENABLE_METRICS"
 echo "  Chat Template: ${CHAT_TEMPLATE:-default}"
 echo "  Tool Call Parser: ${TOOL_CALL_PARSER:-default}"
 echo "  Embedding Mode: $IS_EMBEDDING"
+echo "  API Key Auth: $([ -n "$API_KEY" ] && echo "enabled" || echo "disabled")"
 echo "  Expandable Segments: $ENABLE_EXPANDABLE_SEGMENTS"
 echo "  Memory Saver: $ENABLE_MEMORY_SAVER"
 echo "  CUDA Graph Max BS: ${CUDA_GRAPH_MAX_BS:-auto}"
@@ -139,6 +143,7 @@ ARGS=(
 [ -n "$CHUNKED_PREFILL_SIZE" ] && ARGS+=(--chunked-prefill-size "$CHUNKED_PREFILL_SIZE")
 [ -n "$CHAT_TEMPLATE" ] && ARGS+=(--chat-template "$CHAT_TEMPLATE")
 [ -n "$TOOL_CALL_PARSER" ] && ARGS+=(--tool-call-parser "$TOOL_CALL_PARSER")
+[ -n "$API_KEY" ] && ARGS+=(--api-key "$API_KEY")
 
 # Embedding mode
 if [ "$IS_EMBEDDING" = "true" ]; then
