@@ -10,6 +10,7 @@ from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import apply_custom_logit_processor
+from sglang.srt.managers.overlap_utils import FutureIndices
 from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
     get_last_loc,
@@ -595,8 +596,10 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     req_pool_indices_for_draft_extend: torch.Tensor = None
 
     # Inputs for V2 overlap worker
-    allocate_lens: torch.Tensor = None
-    verify_done: torch.cuda.Event = None
+    future_indices: Optional[FutureIndices] = None
+    allocate_lens: Optional[torch.Tensor] = None
+    new_seq_lens: Optional[torch.Tensor] = None
+    verify_done: Optional[torch.cuda.Event] = None
 
     # FIXME(lsyin): remove this hack
     ALLOC_LEN_PER_DECODE: ClassVar[int] = None

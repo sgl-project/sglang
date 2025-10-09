@@ -217,8 +217,11 @@ class GenerationBatchResult:
     future_indices: Optional[FutureIndices] = None
 
     # FIXME(lsyin): maybe move to <BetterPlace> ?
+    # sync path: forward stream -> output processor
     accept_lens: Optional[torch.Tensor] = None
     last_batch_allocate_lens: Optional[torch.Tensor] = None
+
+    # relay path: forward stream -> next step forward
     next_draft_input: Optional[EagleDraftInput] = None
 
     def copy_to_cpu(self, return_logprob: bool = False):
@@ -2118,9 +2121,7 @@ class Scheduler(
                         self.device
                     ).Event()
                     if not model_worker_batch.delay_sample_launch:
-                        self.future_map.store_to_map(
-                            future_indices, batch_result.next_token_ids
-                        )
+                        self.future_map.store_to_map(future_indices, batch_result)
                         batch_result.copy_to_cpu()
                     else:
                         batch_result.future_indices = future_indices
@@ -2185,7 +2186,7 @@ class Scheduler(
                 tmp_result.forward_batch,
             )
             future_indices = tmp_result.future_indices
-            self.future_map.store_to_map(future_indices, tmp_result.next_token_ids)
+            self.future_map.store_to_map(future_indices, tmp_result)
             tmp_result.copy_to_cpu()
             self.result_queue.appendleft((tmp_batch, tmp_result))
 
