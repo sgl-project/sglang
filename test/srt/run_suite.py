@@ -130,7 +130,7 @@ suites = {
         TestFile("layers/attention/mamba/test_causal_conv1d.py", 85),
         TestFile("layers/attention/mamba/test_mamba_ssm.py", 85),
         TestFile("layers/attention/mamba/test_mamba_ssm_ssd.py", 220),
-        TestFile("models/test_nvidia_nemotron_nano_v2.py", 180),
+        TestFile("models/test_nvidia_nemotron_nano_v2.py", 300),
         TestFile("test_modelopt_loader.py", 30),
     ],
     "per-commit-2-gpu": [

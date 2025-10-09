@@ -11,9 +11,11 @@ from sglang.test.test_utils import (
 
 
 class TestNvidiaNemotronNanoV2(CustomTestCase):
+    model = "nvidia/NVIDIA-Nemotron-Nano-9B-v2"
+    accuracy = 0.87
+
     @classmethod
     def setUpClass(cls):
-        cls.model = "nvidia/NVIDIA-Nemotron-Nano-9B-v2"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -41,4 +43,8 @@ class TestNvidiaNemotronNanoV2(CustomTestCase):
         )
         metrics = run_eval(args)
         print(f"{metrics=}")
-        self.assertGreater(metrics["accuracy"], 0.87)
+        self.assertGreaterEqual(metrics["accuracy"], self.accuracy)
+
+
+class TestNvidiaNemotronNanoV2FP8(TestNvidiaNemotronNanoV2):
+    model = "nvidia/NVIDIA-Nemotron-Nano-9B-v2-FP8"

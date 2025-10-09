@@ -37,7 +37,10 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.layers.dp_attention import get_attention_tp_rank
 from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
-from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
+from sglang.srt.layers.quantization.modelopt_quant import (
+    ModelOptFp4Config,
+    ModelOptFp8Config,
+)
 from sglang.srt.utils import find_local_repo_dir, print_warning_once
 from sglang.utils import is_in_ci
 
@@ -206,13 +209,21 @@ def get_quant_config(
     quant_config_file = quant_config_files[0]
     with open(quant_config_file) as f:
         config = json.load(f)
+        config["packed_modules_mapping"] = packed_modules_mapping
+
+        quant_algo = config["quantization"]["quant_algo"]
+        name = config["producer"]["name"]
 
         if model_config.quantization == "bitsandbytes":
             config["adapter_name_or_path"] = model_name_or_path
+        elif (
+            name == "modelopt" and quant_algo == "FP8"
+        ):  # TODO: Maybe cleanup the logic below, its *very* messy?
+            return ModelOptFp8Config.from_config(config)
         elif model_config.quantization == "modelopt":
-            if config["producer"]["name"] == "modelopt":
+            if name == "modelopt":
                 # (yizhang2077) workaround for nvidia/Llama-4-Maverick-17B-128E-Eagle3
-                if config["quantization"]["quant_algo"] is None:
+                if quant_algo is None:
                     if (
                         model_config.hf_config.architectures[0]
                         != "LlamaForCausalLMEagle3"
@@ -222,20 +233,18 @@ def get_quant_config(
                             f"hf architectures: {model_config.hf_config.architectures[0]}. "
                         )
                     return None
-                if "FP4" in config["quantization"]["quant_algo"]:
+                if "FP4" in quant_algo:
                     return ModelOptFp4Config.from_config(config)
                 else:
                     return quant_cls.from_config(config)
         elif model_config.quantization == "modelopt_fp8":
-            if config["producer"]["name"] == "modelopt_fp8":
+            if name == "modelopt_fp8":
                 return quant_cls.from_config(config)
             else:
                 raise ValueError(
                     f"Unsupported quantization config"
                     f" found for {model_config.quantization} in {f}."
                 )
-        elif model_config.quantization == "w8a8_int8":
-            config["packed_modules_mapping"] = packed_modules_mapping
 
     return quant_cls.from_config(config)
 
