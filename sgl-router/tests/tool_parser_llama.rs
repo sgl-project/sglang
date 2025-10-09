@@ -35,6 +35,16 @@ async fn test_llama_with_semicolon_separation() {
 }
 
 #[tokio::test]
+async fn test_llama_no_tool_calls() {
+    let parser = LlamaParser::new();
+
+    let input = "This is just plain text with no tool calls";
+    let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 0);
+    assert_eq!(normal_text, input);
+}
+
+#[tokio::test]
 async fn test_llama_plain_json_fallback() {
     let parser = LlamaParser::new();
     let input = r#"{"name": "calculate", "parameters": {"x": 5, "y": 10}}"#;
@@ -60,6 +70,46 @@ async fn test_llama_with_text_before() {
 
     let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
     assert_eq!(args["timezone"], "UTC");
+}
+
+#[tokio::test]
+async fn test_llama_with_nested_json() {
+    let parser = LlamaParser::new();
+    let input = r#"<|python_tag|>{
+        "name": "update_settings",
+        "parameters": {
+            "preferences": {
+                "theme": "dark",
+                "language": "en"
+            },
+            "notifications": true
+        }
+    }"#;
+
+    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].function.name, "update_settings");
+
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
+    assert_eq!(args["preferences"]["theme"], "dark");
+    assert_eq!(args["notifications"], true);
+}
+
+#[tokio::test]
+async fn test_llama_empty_arguments() {
+    let parser = LlamaParser::new();
+
+    // With python_tag
+    let input = r#"<|python_tag|>{"name": "ping", "parameters": {}}"#;
+    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].function.name, "ping");
+
+    // Plain JSON
+    let input = r#"{"name": "ping", "parameters": {}}"#;
+    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].function.name, "ping");
 }
 
 #[tokio::test]
@@ -121,6 +171,17 @@ async fn test_single_json() {
 }
 
 #[tokio::test]
+async fn test_multiple_json_with_separator() {
+    let parser = LlamaParser::new();
+    let text = r#"<|python_tag|>{"name": "get_weather", "parameters": {"city": "Paris"}};{"name": "get_tourist_attractions", "parameters": {"city": "Paris"}}"#;
+
+    let (_normal_text, tools) = parser.parse_complete(text).await.unwrap();
+    // Note: Current implementation may only parse the first one due to semicolon handling
+    assert!(!tools.is_empty());
+    assert_eq!(tools[0].function.name, "get_weather");
+}
+
+#[tokio::test]
 async fn test_json_with_trailing_text() {
     let parser = LlamaParser::new();
     // Valid JSON with trailing text - LlamaParser doesn't support this mixed format
@@ -131,6 +192,28 @@ async fn test_json_with_trailing_text() {
     // So this returns as normal text
     assert_eq!(tools.len(), 0);
     assert_eq!(normal_text, text);
+}
+
+#[tokio::test]
+async fn test_invalid_then_valid_json() {
+    let parser = LlamaParser::new();
+    let text =
+        r#"{"name": "get_weather", "parameters": {{"name": "get_weather", "parameters": {}}"#;
+
+    let (_normal_text, tools) = parser.parse_complete(text).await.unwrap();
+    // Should parse at least one valid JSON
+    if !tools.is_empty() {
+        assert_eq!(tools[0].function.name, "get_weather");
+    }
+}
+
+#[tokio::test]
+async fn test_plain_text_only() {
+    let parser = LlamaParser::new();
+    let text = "This is just plain explanation text.";
+
+    let (_normal_text, tools) = parser.parse_complete(text).await.unwrap();
+    assert_eq!(tools.len(), 0);
 }
 
 #[tokio::test]

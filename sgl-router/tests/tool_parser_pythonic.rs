@@ -53,6 +53,21 @@ async fn test_pythonic_with_python_literals() {
 }
 
 #[tokio::test]
+async fn test_pythonic_with_lists_and_dicts() {
+    let parser = PythonicParser::new();
+    let input =
+        r#"[process_data(items=[1, 2, 3], config={"key": "value", "nested": {"deep": True}})]"#;
+
+    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
+    assert_eq!(args["items"], json!([1, 2, 3]));
+    assert_eq!(args["config"]["key"], "value");
+    assert_eq!(args["config"]["nested"]["deep"], true);
+}
+
+#[tokio::test]
 async fn test_pythonic_with_special_tokens() {
     let parser = PythonicParser::new();
 
@@ -79,6 +94,31 @@ async fn test_pythonic_with_nested_parentheses() {
     let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
     assert_eq!(args["expression"], "(2 + 3) * (4 - 1)");
     assert_eq!(args["round_to"], 2);
+}
+
+#[tokio::test]
+async fn test_pythonic_with_escaped_quotes() {
+    let parser = PythonicParser::new();
+    let input = r#"[echo(text="She said \"Hello\" to him")]"#;
+
+    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
+    assert_eq!(args["text"], "She said \"Hello\" to him");
+}
+
+#[tokio::test]
+async fn test_pythonic_empty_arguments() {
+    let parser = PythonicParser::new();
+    let input = r#"[ping()]"#;
+
+    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].function.name, "ping");
+
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
+    assert_eq!(args, json!({}));
 }
 
 #[tokio::test]
@@ -140,6 +180,37 @@ These functions will provide the information you need."#;
 }
 
 #[tokio::test]
+async fn test_pythonic_nested_brackets_in_lists() {
+    let parser = PythonicParser::new();
+
+    let input = r#"[process_matrix(data=[[1, 2], [3, 4]], labels=["row[0]", "row[1]"])]"#;
+
+    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].function.name, "process_matrix");
+
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
+    assert_eq!(args["data"], json!([[1, 2], [3, 4]]));
+    assert_eq!(args["labels"], json!(["row[0]", "row[1]"]));
+}
+
+#[tokio::test]
+async fn test_pythonic_nested_brackets_in_dicts() {
+    let parser = PythonicParser::new();
+
+    let input =
+        r#"[analyze(config={"patterns": ["[a-z]+", "[0-9]+"], "nested": {"list": [1, [2, 3]]}})]"#;
+
+    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].function.name, "analyze");
+
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
+    assert_eq!(args["config"]["patterns"], json!(["[a-z]+", "[0-9]+"]));
+    assert_eq!(args["config"]["nested"]["list"], json!([1, [2, 3]]));
+}
+
+#[tokio::test]
 async fn test_pythonic_mixed_quotes() {
     let parser = PythonicParser::new();
 
@@ -153,6 +224,27 @@ async fn test_pythonic_mixed_quotes() {
     assert_eq!(args["single"], "Hello");
     assert_eq!(args["double"], "World");
     assert_eq!(args["mixed"], "It's \"quoted\"");
+}
+
+#[tokio::test]
+async fn test_pythonic_complex_nesting() {
+    let parser = PythonicParser::new();
+
+    let input = r#"[transform(
+        matrix=[[1, [2, 3]], [4, [5, [6, 7]]]],
+        operations=[{"type": "scale", "factor": [2, 3]}, {"type": "rotate", "angle": 90}],
+        metadata={"tags": ["nested[0]", "nested[1]"], "config": {"depth": [1, 2, 3]}}
+    )]"#;
+
+    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].function.name, "transform");
+
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
+    assert!(args["matrix"].is_array());
+    assert!(args["operations"].is_array());
+    assert_eq!(args["operations"][0]["type"], "scale");
+    assert_eq!(args["metadata"]["config"]["depth"], json!([1, 2, 3]));
 }
 
 #[tokio::test]
