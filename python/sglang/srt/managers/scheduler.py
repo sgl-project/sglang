@@ -148,13 +148,10 @@ from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
-from sglang.srt.model_executor.forward_batch_info import (
-    ForwardBatch,
-    ForwardMode,
-    PPProxyTensors,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.tracing.trace import (
@@ -222,6 +219,7 @@ class GenerationBatchResult:
     # FIXME(lsyin): maybe move to <BetterPlace> ?
     accept_lens: Optional[torch.Tensor] = None
     last_batch_allocate_lens: Optional[torch.Tensor] = None
+    next_draft_input: Optional[EagleDraftInput] = None
 
     def copy_to_cpu(self, return_logprob: bool = False):
         """Copy tensors to CPU in overlap scheduling.

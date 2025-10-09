@@ -1,5 +1,7 @@
 from typing import Optional
 
+import torch
+
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, Req
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -7,7 +9,7 @@ from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.eagle_info import EagleDraftInput
+from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_worker import EAGLEWorker
 
 # TODO: [ ] add related fields in spec info (EagleDraftInput)
@@ -41,8 +43,11 @@ class EAGLEWorkerV2(EAGLEWorker):
 
     def forward_batch_generation(self, model_worker_batch: ModelWorkerBatch):
         if model_worker_batch.forward_mode.is_decode():
+            # FIXME(lsyin): why shall we use spec_info for both draft and verify?
             draft_input: EagleDraftInput = model_worker_batch.spec_info
-            model_worker_batch.spec_info = self.draft(model_worker_batch)
+            verify_input: EagleVerifyInput = self.draft(model_worker_batch)
+            assert verify_input.is_verify_input()
+            model_worker_batch.spec_info = verify_input
             batch_output = self.verify(model_worker_batch, draft_input.allocate_lens)
             return batch_output
         else:
@@ -54,7 +59,7 @@ class EAGLEWorkerV2(EAGLEWorker):
 
             # Draft prefill
             model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
-            batch_output.spec_info = self.forward_draft_extend(
+            batch_output.next_draft_input = self.forward_draft_extend(
                 model_worker_batch,
                 batch_output.logits_output.hidden_states,
                 batch_output.next_token_ids,
@@ -65,7 +70,7 @@ class EAGLEWorkerV2(EAGLEWorker):
         raise NotImplementedError()
 
     def verify(
-        self, model_worker_batch: ModelWorkerBatch, spec_info, allocate_lens
+        self, model_worker_batch: ModelWorkerBatch, allocate_lens: torch.Tensor
     ) -> GenerationBatchResult:
         raise NotImplementedError()
 
