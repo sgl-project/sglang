@@ -13,10 +13,10 @@ use crate::protocols::spec::{
     ChatChoice, ChatCompletionMessage, ChatCompletionRequest, FunctionCallResponse, ToolCall,
     ToolChoice, ToolChoiceValue,
 };
-use crate::reasoning_parser::ReasoningParserFactory;
+use crate::reasoning_parser::ParserFactory as ReasoningParserFactory;
 use crate::tokenizer::stop::{SequenceDecoderOutput, StopSequenceDecoder};
 use crate::tokenizer::traits::Tokenizer;
-use crate::tool_parser::ToolParserFactory;
+use crate::tool_parser::ParserFactory as ToolParserFactory;
 
 use super::utils;
 
@@ -97,9 +97,7 @@ impl ResponseProcessor {
                 &original_request.model,
             );
 
-            let mut parser = pooled_parser
-                .lock()
-                .map_err(|e| format!("Failed to acquire reasoning parser lock: {}", e))?;
+            let mut parser = pooled_parser.lock().await;
             match parser.detect_and_parse_reasoning(&processed_text) {
                 Ok(result) => {
                     if !result.reasoning_text.is_empty() {

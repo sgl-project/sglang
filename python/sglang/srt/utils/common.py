@@ -518,6 +518,24 @@ def make_layers(
     return modules, start_layer, end_layer
 
 
+def make_layers_non_pp(
+    num_hidden_layers: int,
+    layer_fn: LayerFn,
+    prefix: str = "",
+) -> torch.nn.ModuleList:
+    from sglang.srt.offloader import get_offloader
+
+    layers = torch.nn.ModuleList(
+        get_offloader().wrap_modules(
+            (
+                layer_fn(idx=idx, prefix=add_prefix(idx, prefix))
+                for idx in range(num_hidden_layers)
+            )
+        )
+    )
+    return layers
+
+
 cmo_stream = None
 
 
