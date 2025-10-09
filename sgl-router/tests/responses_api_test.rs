@@ -1,5 +1,6 @@
 // Integration test for Responses API
 
+use axum::http::StatusCode;
 use sglang_router_rs::protocols::spec::{
     GenerationRequest, ReasoningEffort, ResponseInput, ResponseReasoningParam, ResponseStatus,
     ResponseTool, ResponseToolType, ResponsesRequest, ResponsesResponse, ServiceTier, ToolChoice,
@@ -1386,7 +1387,7 @@ async fn test_conversation_items_create_and_get() {
     // Create conversation
     let create_conv = serde_json::json!({});
     let conv_resp = router.create_conversation(None, &create_conv).await;
-    assert_eq!(conv_resp.status(), axum::http::StatusCode::OK);
+    assert_eq!(conv_resp.status(), StatusCode::OK);
     let conv_bytes = axum::body::to_bytes(conv_resp.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -1412,7 +1413,7 @@ async fn test_conversation_items_create_and_get() {
     let items_resp = router
         .create_conversation_items(None, conv_id, &create_items)
         .await;
-    assert_eq!(items_resp.status(), axum::http::StatusCode::OK);
+    assert_eq!(items_resp.status(), StatusCode::OK);
     let items_bytes = axum::body::to_bytes(items_resp.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -1427,7 +1428,7 @@ async fn test_conversation_items_create_and_get() {
     let get_resp = router
         .get_conversation_item(None, conv_id, item_id, None)
         .await;
-    assert_eq!(get_resp.status(), axum::http::StatusCode::OK);
+    assert_eq!(get_resp.status(), StatusCode::OK);
     let get_bytes = axum::body::to_bytes(get_resp.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -1528,7 +1529,7 @@ async fn test_conversation_items_delete() {
     let del_resp = router
         .delete_conversation_item(None, conv_id, item_id)
         .await;
-    assert_eq!(del_resp.status(), axum::http::StatusCode::OK);
+    assert_eq!(del_resp.status(), StatusCode::OK);
 
     // List items again (should have 0)
     let list_resp2 = router
@@ -1544,7 +1545,7 @@ async fn test_conversation_items_delete() {
     let get_resp = router
         .get_conversation_item(None, conv_id, item_id, None)
         .await;
-    assert_eq!(get_resp.status(), axum::http::StatusCode::NOT_FOUND);
+    assert_eq!(get_resp.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -1616,7 +1617,7 @@ async fn test_conversation_items_max_limit() {
     let items_resp = router
         .create_conversation_items(None, conv_id, &create_items)
         .await;
-    assert_eq!(items_resp.status(), axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(items_resp.status(), StatusCode::BAD_REQUEST);
 
     let items_bytes = axum::body::to_bytes(items_resp.into_body(), usize::MAX)
         .await
@@ -1693,7 +1694,7 @@ async fn test_conversation_items_unsupported_type() {
     let items_resp = router
         .create_conversation_items(None, conv_id, &create_items)
         .await;
-    assert_eq!(items_resp.status(), axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(items_resp.status(), StatusCode::BAD_REQUEST);
 
     let items_bytes = axum::body::to_bytes(items_resp.into_body(), usize::MAX)
         .await
@@ -1800,7 +1801,7 @@ async fn test_conversation_items_multi_conversation_sharing() {
     let items_b_resp = router
         .create_conversation_items(None, conv_b_id, &reference_items)
         .await;
-    assert_eq!(items_b_resp.status(), axum::http::StatusCode::OK);
+    assert_eq!(items_b_resp.status(), StatusCode::OK);
 
     // Verify item appears in both conversations
     let list_a = router
@@ -1850,5 +1851,5 @@ async fn test_conversation_items_multi_conversation_sharing() {
     let get_resp = router
         .get_conversation_item(None, conv_b_id, item_id, None)
         .await;
-    assert_eq!(get_resp.status(), axum::http::StatusCode::OK);
+    assert_eq!(get_resp.status(), StatusCode::OK);
 }
