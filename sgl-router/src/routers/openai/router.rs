@@ -527,6 +527,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         );
 
         // Validate mutually exclusive params: previous_response_id and conversation
+        // TODO: this validation logic should move the right place, also we need a proper error message module
         if body.previous_response_id.is_some() && body.conversation.is_some() {
             return (
                 StatusCode::BAD_REQUEST,
@@ -576,12 +577,12 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                         });
 
                         // Convert output to conversation items directly from stored response
-                        if let Some(output_arr) = stored.raw_response.get("output").and_then(|v| v.as_array()) {
+                        if let Some(output_arr) =
+                            stored.raw_response.get("output").and_then(|v| v.as_array())
+                        {
                             for item in output_arr {
                                 if let Ok(output_item) =
-                                    serde_json::from_value::<ResponseInputOutputItem>(
-                                        item.clone(),
-                                    )
+                                    serde_json::from_value::<ResponseInputOutputItem>(item.clone())
                                 {
                                     items.push(output_item);
                                 }

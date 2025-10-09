@@ -29,6 +29,7 @@ pub(super) async fn create_conversation(
     conversation_storage: &SharedConversationStorage,
     body: Value,
 ) -> Response {
+    // TODO: The validation should be done in the right place
     let metadata = match body.get("metadata") {
         Some(Value::Object(map)) => {
             if map.len() > MAX_METADATA_PROPERTIES {
