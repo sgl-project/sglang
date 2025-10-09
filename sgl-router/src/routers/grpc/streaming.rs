@@ -604,14 +604,19 @@ impl StreamingProcessor {
             }
         }
 
-        // Mark prefill stream as completed (whether or not logprobs was requested)
-        // The prefill worker has finished its job (either we consumed it or we didn't need to)
-        prefill_stream.mark_completed();
-
         // Phase 2-5: Process decode stream (same as single mode)
         // Note: decode_stream will be marked completed inside process_streaming_chunks
-        self.process_streaming_chunks(decode_stream, dispatch, stop_params, original_request, tx)
-            .await
+        let result = self
+            .process_streaming_chunks(decode_stream, dispatch, stop_params, original_request, tx)
+            .await;
+
+        // Mark prefill stream as completed AFTER decode completes successfully
+        // This ensures that if client disconnects during decode, BOTH streams send abort
+        if result.is_ok() {
+            prefill_stream.mark_completed();
+        }
+
+        result
     }
 
     /// Process streaming generate response and return SSE response
@@ -830,12 +835,9 @@ impl StreamingProcessor {
             None
         };
 
-        // Mark prefill stream as completed
-        prefill_stream.mark_completed();
-
         // Process decode stream with input_logprobs prepended
         // Note: decode_stream will be marked completed inside the function
-        Self::process_generate_streaming_with_input_logprobs(
+        let result = Self::process_generate_streaming_with_input_logprobs(
             tokenizer,
             decode_stream,
             request_id,
@@ -844,7 +846,15 @@ impl StreamingProcessor {
             input_token_logprobs,
             tx,
         )
-        .await
+        .await;
+
+        // Mark prefill stream as completed AFTER decode completes successfully
+        // This ensures that if client disconnects during decode, BOTH streams send abort
+        if result.is_ok() {
+            prefill_stream.mark_completed();
+        }
+
+        result
     }
 
     /// Process generate streaming with optional input_logprobs
