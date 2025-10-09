@@ -283,9 +283,6 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             image_grid_thw=getattr(ret, "image_grid_thw", None),
             video_grid_thw=getattr(ret, "video_grid_thw", None),
             second_per_grid_ts=getattr(ret, "second_per_grid_ts", None),
-            position_id_per_seconds=getattr(
-                self.hf_config, "position_id_per_seconds", None
-            ),
         )
         mrope_positions = mrope_positions.squeeze(1)
 
