@@ -1086,12 +1086,6 @@ async fn persist_items_with_storages(
                     .and_then(|v| v.as_str())
                     .map(ConversationItemId::from);
 
-                if let Some(ref id) = item_id {
-                    info!(item_id = %id.0, item_type = item_type, "Extracting item ID from response output");
-                } else {
-                    warn!(item_type = item_type, "No ID found in output item");
-                }
-
                 let content = if item_type == "message" {
                     obj.get("content").cloned().unwrap_or(json!([]))
                 } else {
