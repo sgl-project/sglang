@@ -274,7 +274,15 @@ class HybridReqToTokenPool(ReqToTokenPool):
             device=device,
             enable_memory_saver=enable_memory_saver,
         )
+        self._init_mamba_pool(size, cache_params, device, speculative_num_draft_tokens)
 
+    def _init_mamba_pool(
+        self,
+        size: int,
+        cache_params: "Mamba2CacheParams",
+        device: str,
+        speculative_num_draft_tokens: int = None,
+    ):
         self.mamba_pool = MambaPool(
             size=size,
             cache_params=cache_params,
