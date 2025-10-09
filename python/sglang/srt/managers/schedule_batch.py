@@ -1116,7 +1116,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         bs = self.batch_size()
 
-        assert self.spec_info.is_verify_input()
+        assert self.spec_info.is_draft_input()
         draft_input: EagleDraftInput = self.spec_info
         if draft_input.verify_done is not None:
             draft_input.verify_done.synchronize()
@@ -1668,11 +1668,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.model_config.vocab_size,
         )
 
+    @property
+    def is_v2_eagle(self):
+        # FIXME: finally deprecate is_v2_eagle
+        return self.enable_overlap and self.spec_algorithm.is_eagle()
+
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
 
-        if self.spec_algorithm.is_eagle():
+        if self.is_v2_eagle:
             # FIXME(lsyin): make this sync optional
             self.allocate_for_eagle()
 
