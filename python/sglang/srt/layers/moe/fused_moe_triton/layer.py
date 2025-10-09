@@ -156,8 +156,7 @@ class FusedMoE(torch.nn.Module):
         self.moe_tp_rank = get_moe_tensor_parallel_rank()
         assert num_experts % self.moe_ep_size == 0
         self.num_local_experts = num_experts // self.moe_ep_size
-        self.start_expert_id = self.moe_ep_rank * self.num_local_experts
-        self.end_expert_id = self.start_expert_id + self.num_local_experts - 1
+
         if self.moe_ep_size > 1:
             # TODO(ch-wan): support shared experts fusion
             # Create a tensor of size num_experts filled with -1
@@ -207,15 +206,11 @@ class FusedMoE(torch.nn.Module):
             gemm1_clamp_limit=gemm1_clamp_limit,
         )
 
-        if quant_config is None:
-            self.quant_method: FusedMoEMethodBase = UnquantizedFusedMoEMethod(
-                self.use_triton_kernels
-            )
-        else:
-            self.quant_method: FusedMoEMethodBase = quant_config.get_quant_method(
-                self, prefix
-            )
-        assert self.quant_method is not None
+        self.quant_method: Optional[FusedMoEMethodBase] = None
+        if quant_config is not None:
+            self.quant_method = quant_config.get_quant_method(self, prefix)
+        if self.quant_method is None:
+            self.quant_method = UnquantizedFusedMoEMethod(self.use_triton_kernels)
 
         self.quant_method.create_weights(
             layer=self,

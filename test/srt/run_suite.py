@@ -67,6 +67,7 @@ suites = {
         TestFile("test_abort.py", 51),
         TestFile("test_create_kvindices.py", 2),
         TestFile("test_chunked_prefill.py", 313),
+        TestFile("test_deterministic.py", 300),
         TestFile("test_eagle_infer_a.py", 370),
         TestFile("test_eagle_infer_b.py", 700),
         TestFile("test_ebnf_constrained.py", 108),
@@ -112,6 +113,7 @@ suites = {
         TestFile("test_srt_engine.py", 261),
         TestFile("test_srt_endpoint.py", 130),
         TestFile("test_start_profile.py", 60),
+        TestFile("test_swa_unittest.py", 1),
         TestFile("test_torch_compile.py", 76),
         TestFile("test_torch_compile_moe.py", 172),
         TestFile("test_torch_native_attention_backend.py", 123),
@@ -125,17 +127,26 @@ suites = {
         TestFile("test_vlm_input_format.py", 300),
         TestFile("test_vision_openai_server_a.py", 724),
         TestFile("test_vision_openai_server_b.py", 446),
+        TestFile("layers/attention/mamba/test_causal_conv1d.py", 85),
+        TestFile("layers/attention/mamba/test_mamba_ssm.py", 85),
+        TestFile("layers/attention/mamba/test_mamba_ssm_ssd.py", 220),
+        TestFile("models/test_nvidia_nemotron_nano_v2.py", 180),
+        TestFile("test_modelopt_loader.py", 30),
     ],
     "per-commit-2-gpu": [
+        TestFile("ep/test_moe_ep.py", 140),
         TestFile("lora/test_lora_tp.py", 116),
         TestFile("rl/test_update_weights_from_distributed.py", 103),
         TestFile("test_data_parallelism.py", 73),
+        TestFile("test_disaggregation.py", 499),
         TestFile("test_dp_attention.py", 594),
         TestFile("test_load_weights_from_remote_instance.py", 72),
         TestFile("test_patch_torch.py", 19),
         TestFile("test_release_memory_occupation.py", 257),
         TestFile("hicache/test_hicache_storage_file_backend.py", 200),
+        TestFile("hicache/test_hicache_storage_mooncake_backend.py", 400),
         TestFile("hicache/test_hicache_storage_3fs_backend.py", 200),
+        TestFile("layers/attention/mamba/test_mamba2_mixer.py", 110),
     ],
     "per-commit-4-gpu": [
         TestFile("test_gpt_oss_4gpu.py", 300),
@@ -145,13 +156,12 @@ suites = {
         TestFile("test_multi_instance_release_memory_occupation.py", 64),
     ],
     "per-commit-8-gpu": [
-        TestFile("hicache/test_hicache_storage_mooncake_backend.py", 400),
         TestFile("lora/test_lora_llama4.py", 400),
-        TestFile("test_disaggregation.py", 499),
         TestFile("test_disaggregation_dp_attention.py", 155),
         TestFile("test_disaggregation_different_tp.py", 600),
         TestFile("test_disaggregation_pp.py", 140),
-        TestFile("test_full_deepseek_v3.py", 550),
+        TestFile("test_deepseek_v3_basic.py", 275),
+        TestFile("test_deepseek_v3_mtp.py", 275),
     ],
     "per-commit-4-gpu-b200": [
         # TestFile("test_gpt_oss_4gpu.py", 600),
@@ -266,7 +276,8 @@ suite_amd = {
         TestFile("test_pp_single_node.py", 150),
     ],
     "per-commit-8-gpu-amd": [
-        TestFile("test_full_deepseek_v3.py", 250),
+        TestFile("test_deepseek_v3_basic.py", 275),
+        TestFile("test_deepseek_v3_mtp.py", 275),
     ],
     "nightly-amd": [
         TestFile("test_nightly_gsm8k_eval_amd.py"),
@@ -368,7 +379,7 @@ if __name__ == "__main__":
     arg_parser.add_argument(
         "--timeout-per-file",
         type=int,
-        default=1500 if is_hip() else 1200,
+        default=1200,
         help="The time limit for running one file in seconds.",
     )
     arg_parser.add_argument(

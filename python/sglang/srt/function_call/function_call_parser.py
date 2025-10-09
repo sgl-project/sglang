@@ -37,19 +37,21 @@ class FunctionCallParser:
     """
 
     ToolCallParserEnum: Dict[str, Type[BaseFormatDetector]] = {
-        "llama3": Llama32Detector,
-        "qwen25": Qwen25Detector,
-        "mistral": MistralDetector,
         "deepseekv3": DeepSeekV3Detector,
         "deepseekv31": DeepSeekV31Detector,
-        "pythonic": PythonicDetector,
-        "kimi_k2": KimiK2Detector,
-        "qwen3_coder": Qwen3CoderDetector,
+        "glm": Glm4MoeDetector,
         "glm45": Glm4MoeDetector,
-        "step3": Step3Detector,
         "gpt-oss": GptOssDetector,
         "longcat": LongCatDetector,
         "tng_r1t2": TngR1T2Detector,
+        "kimi_k2": KimiK2Detector,
+        "llama3": Llama32Detector,
+        "mistral": MistralDetector,
+        "pythonic": PythonicDetector,
+        "qwen": Qwen25Detector,
+        "qwen25": Qwen25Detector,
+        "qwen3_coder": Qwen3CoderDetector,
+        "step3": Step3Detector,
     }
 
     def __init__(self, tools: List[Tool], tool_call_parser: str):
