@@ -158,6 +158,7 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.tracing.trace import (
     process_tracing_init,
+    trace_event_batch,
     trace_set_proc_propagate_context,
     trace_set_thread_info,
     trace_slice_batch,
@@ -1834,6 +1835,10 @@ class Scheduler(
         if need_dp_attn_preparation:
             ret = self.prepare_mlp_sync_batch(ret)
 
+        if ret:
+            attrs = {"bid": hex(id(ret)), "batch_size": ret.batch_size()}
+            trace_event_batch("schedule", ret.reqs, attrs=attrs)
+
         return ret
 
     def get_num_allocatable_reqs(self, running_bs):
@@ -2201,8 +2206,7 @@ class Scheduler(
     ):
         if batch.forward_mode.is_decode():
             self.process_batch_result_decode(batch, result)
-            if self.enable_trace:
-                trace_slice_batch(RequestStage.DECODE_LOOP, batch.reqs)
+            trace_slice_batch(RequestStage.DECODE_LOOP, batch.reqs)
 
         elif batch.forward_mode.is_extend():
             self.process_batch_result_prefill(batch, result)

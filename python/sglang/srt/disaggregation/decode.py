@@ -51,7 +51,12 @@ from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.tracing.trace import trace_event, trace_slice, trace_slice_end, trace_slice_batch
+from sglang.srt.tracing.trace import (
+    trace_event_batch,
+    trace_slice,
+    trace_slice_batch,
+    trace_slice_end,
+)
 from sglang.srt.utils import get_int_env_var, require_mlp_sync
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -869,8 +874,7 @@ class SchedulerDisaggregationDecodeMixin:
 
         if ret:
             attrs = {"bid": hex(id(ret)), "batch_size": ret.batch_size()}
-            for req in ret.reqs:
-                trace_event("schedule", req.rid, attrs=attrs)
+            trace_event_batch("schedule", ret.reqs, attrs=attrs)
         return ret
 
     def get_new_prebuilt_batch(self: Scheduler) -> Optional[ScheduleBatch]:

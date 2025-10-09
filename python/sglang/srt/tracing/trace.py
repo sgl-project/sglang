@@ -651,6 +651,9 @@ def trace_slice_batch(
     name: str,
     reqs: List[Req],
 ):
+    if not tracing_enabled:
+        return
+
     for req in reqs:
         trace_slice(
             name,
@@ -658,3 +661,16 @@ def trace_slice_batch(
             auto_next_anon=not req.finished(),
             thread_finish_flag=req.finished(),
         )
+
+
+def trace_event_batch(
+    name: str,
+    reqs: List[Req],
+    ts: Optional[int] = None,
+    attrs: Dict[str, Any] = None,
+):
+    if not tracing_enabled:
+        return
+
+    for req in reqs:
+        trace_event(name, req.rid, ts=ts, attrs=attrs)
