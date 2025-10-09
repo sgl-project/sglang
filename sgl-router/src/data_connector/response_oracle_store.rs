@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const SELECT_BASE: &str = "SELECT id, previous_response_id, input, instructions, output, \
-    tool_calls, metadata, created_at, user_id, model, raw_response FROM responses";
+    tool_calls, metadata, created_at, user_id, model, conversation_id, raw_response FROM responses";
 
 #[derive(Clone)]
 pub struct OracleResponseStorage {
@@ -95,8 +95,11 @@ impl OracleResponseStorage {
         let model: Option<String> = row
             .get(9)
             .map_err(|err| map_oracle_error(err).into_storage_error("fetch model"))?;
-        let raw_response_json: Option<String> = row
+        let conversation_id: Option<String> = row
             .get(10)
+            .map_err(|err| map_oracle_error(err).into_storage_error("fetch conversation_id"))?;
+        let raw_response_json: Option<String> = row
+            .get(11)
             .map_err(|err| map_oracle_error(err).into_storage_error("fetch raw_response"))?;
 
         let previous_response_id = previous.map(ResponseId);
@@ -115,6 +118,7 @@ impl OracleResponseStorage {
             created_at,
             user: user_id,
             model,
+            conversation_id,
             raw_response,
         })
     }
@@ -134,6 +138,7 @@ impl ResponseStorage for OracleResponseStorage {
             created_at,
             user,
             model,
+            conversation_id,
             raw_response,
         } = response;
 
@@ -147,8 +152,8 @@ impl ResponseStorage for OracleResponseStorage {
         self.with_connection(move |conn| {
             conn.execute(
                 "INSERT INTO responses (id, previous_response_id, input, instructions, output, \
-                    tool_calls, metadata, created_at, user_id, model, raw_response) \
-                 VALUES (:1, :2, :3, :4, :5, :6, :7, :8, :9, :10, :11)",
+                    tool_calls, metadata, created_at, user_id, model, conversation_id, raw_response) \
+                 VALUES (:1, :2, :3, :4, :5, :6, :7, :8, :9, :10, :11, :12)",
                 &[
                     &response_id_str,
                     &previous_id,
@@ -160,6 +165,7 @@ impl ResponseStorage for OracleResponseStorage {
                     &created_at,
                     &user,
                     &model,
+                    &conversation_id,
                     &json_raw_response,
                 ],
             )
@@ -394,6 +400,7 @@ fn initialize_schema(config: &OracleConfig) -> StorageResult<()> {
         conn.execute(
             "CREATE TABLE responses (
                 id VARCHAR2(64) PRIMARY KEY,
+                conversation_id VARCHAR2(64),
                 previous_response_id VARCHAR2(64),
                 input CLOB,
                 instructions CLOB,

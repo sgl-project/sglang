@@ -804,7 +804,7 @@ impl WorkerFactory {
                 }
             }
 
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            time::sleep(Duration::from_secs(1)).await;
         }
     }
 }
@@ -900,7 +900,7 @@ pub fn start_health_checker(
     let shutdown_clone = shutdown.clone();
 
     let handle = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(check_interval_secs));
+        let mut interval = time::interval(Duration::from_secs(check_interval_secs));
 
         // Counter for periodic load reset (every 10 health check cycles)
         let mut check_count = 0u64;
@@ -1272,7 +1272,7 @@ mod tests {
             let worker_clone = Arc::clone(&worker);
             let handle = tokio::spawn(async move {
                 worker_clone.set_healthy(i % 2 == 0);
-                tokio::time::sleep(Duration::from_micros(10)).await;
+                time::sleep(Duration::from_micros(10)).await;
             });
             handles.push(handle);
         }
