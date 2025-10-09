@@ -863,9 +863,6 @@ class ServerArgs:
                 self.page_size = 64
                 logger.warning("Setting page size to 64 for DeepSeek NSA.")
 
-                self.mem_fraction_static = 0.8
-                logger.warning("Setting mem fraction static to 0.8 for DeepSeek NSA.")
-
                 # For Hopper, we support both bf16 and fp8 kv cache; for Blackwell, we support fp8 only currently
                 import torch
 
