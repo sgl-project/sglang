@@ -19,7 +19,6 @@ import grpc
 import zmq
 import zmq.asyncio
 
-from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOutput,
@@ -111,6 +110,7 @@ class GrpcRequestManager:
         self,
         server_args: ServerArgs,
         port_args: PortArgs,
+        bootstrap_server=None,
     ):
         """Initialize the gRPC request manager."""
         self.server_args = server_args
@@ -147,8 +147,8 @@ class GrpcRequestManager:
         self.crash_dump_request_list = []
         self.crash_dump_performed = False
 
-        # Bootstrap server for disaggregation mode
-        self.bootstrap_server = start_disagg_service(server_args)
+        # Bootstrap server (passed from serve_grpc, not started here)
+        self.bootstrap_server = bootstrap_server
 
         logger.info(
             f"GrpcRequestManager initialized with ZMQ IPC: "
@@ -157,7 +157,7 @@ class GrpcRequestManager:
         )
         if self.bootstrap_server:
             logger.info(
-                f"Bootstrap server started for disaggregation mode: "
+                f"Bootstrap server initialized for disaggregation mode: "
                 f"{server_args.disaggregation_mode}"
             )
 
@@ -263,8 +263,8 @@ class GrpcRequestManager:
                         response = await task
 
                         # Add index for client-side ordering
-                        if isinstance(response, dict) and "meta_info" in response:
-                            response_rid = response["meta_info"].get("id", "")
+                        if isinstance(response, dict):
+                            response_rid = response.get("request_id", "")
                             if response_rid in rid_to_index:
                                 response["index"] = rid_to_index[response_rid]
 
@@ -397,9 +397,7 @@ class GrpcRequestManager:
         # Wait for result in background
         async def wait_for_result():
             try:
-                # Wait for completion
                 await state.event.wait()
-                # Get result from queue
                 result = await state.out_queue.get()
                 future.set_result(result)
             except Exception as e:
@@ -436,19 +434,6 @@ class GrpcRequestManager:
             await state.out_queue.put({"error": "Request aborted", "abort": True})
 
         return True
-
-    async def pause_generation(self):
-        """Pause generation processing."""
-        async with self.is_pause_cond:
-            self.is_pause = True
-            logger.info("Generation paused")
-
-    async def resume_generation(self):
-        """Resume generation processing."""
-        async with self.is_pause_cond:
-            self.is_pause = False
-            self.is_pause_cond.notify_all()
-            logger.info("Generation resumed")
 
     async def handle_loop(self):
         """

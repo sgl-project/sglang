@@ -2,6 +2,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{to_value, Map, Number, Value};
 use std::collections::HashMap;
 
+// Default model value when not specified
+fn default_model() -> String {
+    "unknown".to_string()
+}
+
 // # Protocol Specifications
 //
 // This module contains all protocol definitions for OpenAI and SGLang APIs.
@@ -169,6 +174,7 @@ pub struct ChatCompletionRequest {
     pub messages: Vec<ChatMessage>,
 
     /// ID of the model to use
+    #[serde(default = "default_model")]
     pub model: String,
 
     /// Number between -2.0 and 2.0. Positive values penalize new tokens based on their existing frequency in the text so far
@@ -1097,6 +1103,10 @@ pub struct ResponsesRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
 
+    /// Optional conversation id to persist input/output as items
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversation: Option<String>,
+
     /// Whether to enable parallel tool calls
     #[serde(default = "default_true")]
     pub parallel_tool_calls: bool,
@@ -1208,6 +1218,7 @@ impl Default for ResponsesRequest {
             max_tool_calls: None,
             metadata: None,
             model: None,
+            conversation: None,
             parallel_tool_calls: true,
             previous_response_id: None,
             reasoning: None,
@@ -2058,6 +2069,65 @@ impl GenerationRequest for GenerateRequest {
         // No text input found
         String::new()
     }
+}
+
+// ============================================================================
+// SGLang Generate Response Types
+// ============================================================================
+
+/// SGLang generate response (single completion or array for n>1)
+///
+/// Format for n=1:
+/// ```json
+/// {
+///   "text": "...",
+///   "output_ids": [...],
+///   "meta_info": { ... }
+/// }
+/// ```
+///
+/// Format for n>1:
+/// ```json
+/// [
+///   {"text": "...", "output_ids": [...], "meta_info": {...}},
+///   {"text": "...", "output_ids": [...], "meta_info": {...}}
+/// ]
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GenerateResponse {
+    pub text: String,
+    pub output_ids: Vec<u32>,
+    pub meta_info: GenerateMetaInfo,
+}
+
+/// Metadata for a single generate completion
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GenerateMetaInfo {
+    pub id: String,
+    pub finish_reason: GenerateFinishReason,
+    pub prompt_tokens: u32,
+    pub weight_version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_token_logprobs: Option<Vec<Vec<Option<f64>>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_token_logprobs: Option<Vec<Vec<Option<f64>>>>,
+    pub completion_tokens: u32,
+    pub cached_tokens: u32,
+    pub e2e_latency: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched_stop: Option<Value>,
+}
+
+/// Finish reason for generate endpoint
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum GenerateFinishReason {
+    Length {
+        length: u32,
+    },
+    Stop,
+    #[serde(untagged)]
+    Other(Value),
 }
 
 // Constants for rerank API

@@ -1,23 +1,30 @@
-from typing import Callable, List, Optional, Tuple, Union
+from typing import Callable, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 
-from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.custom_op import CustomOp
+from sglang.srt.configs.mamba_utils import (
+    Mamba2CacheParams,
+    extra_groups_for_head_shards,
+)
 from sglang.srt.distributed import (
+    divide,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
-    tensor_model_parallel_all_gather,
-    tensor_model_parallel_all_reduce,
 )
 from sglang.srt.distributed.utils import divide
-from sglang.srt.layers.attention.fla.layernorm_gated import layernorm_fn
 from sglang.srt.layers.attention.mamba.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
-from sglang.srt.layers.attention.mamba.mamba_utils import MambaStateShapeCalculator
+from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
+    causal_conv1d_fn as causal_conv1d_fn_triton,
+)
+from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
+    causal_conv1d_update as causal_conv1d_update_triton,
+)
+from sglang.srt.layers.attention.mamba.mamba2_metadata import Mamba2Metadata
+from sglang.srt.layers.attention.mamba.mixer2_rms_norm_gated import Mixer2RMSNormGated
 from sglang.srt.layers.attention.mamba.ops import (
     mamba_chunk_scan_combined,
     selective_state_update,
@@ -28,7 +35,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_loader.weight_utils import (
     composed_weight_loader,
     sharded_weight_loader,
@@ -97,110 +104,6 @@ def mamba_v2_sharded_weight_loader(
     return loader
 
 
-class Mixer2RMSNormGated(CustomOp):
-
-    def __init__(
-        self,
-        full_hidden_size: int,
-        full_n_groups: int,
-        use_rms_norm: bool = True,
-        eps: float = 1e-6,
-    ):
-        super().__init__()
-        self.tp_size = get_tensor_model_parallel_world_size()
-        self.tp_rank = get_tensor_model_parallel_rank()
-        self.full_hidden_size = full_hidden_size
-        self.group_size = full_hidden_size // full_n_groups
-        self.per_rank_hidden_size = full_hidden_size // self.tp_size
-        self.n_groups = full_hidden_size // self.group_size
-
-        self.variance_epsilon = eps
-        self.use_rms_norm = use_rms_norm
-        if self.use_rms_norm:
-            # Register norm weight only if we're actually applying RMSNorm
-            self.weight = nn.Parameter(torch.ones(self.per_rank_hidden_size))
-            set_weight_attrs(self.weight, {"weight_loader": sharded_weight_loader(0)})
-        else:
-            # Avoid checkpoint mismatch by skipping unused parameter
-            self.register_parameter("weight", None)
-        assert (
-            self.full_hidden_size % self.tp_size == 0
-        ), "Tensor parallel world size must divide hidden size."
-
-    def forward_native(
-        self,
-        x: torch.Tensor,
-        gate: torch.Tensor,
-    ):
-        # Three tensor-parallel cases:
-        #   1. n_groups is 1
-        #      In this case we parallelize along the reduction dim.
-        #      Each rank computes a local sum of squares followed by AllReduce
-        #   2. tp_size divides n_groups
-        #      Each rank only reduces within its local group(s).
-        #      No collective ops necessary.
-        #   3. The general case can be pretty complicated so we AllGather
-        #      the input and then redundantly compute the RMSNorm.
-        input_dtype = x.dtype
-        x = x * nn.functional.silu(gate.to(torch.float32))
-        if not self.use_rms_norm:
-            return x.to(input_dtype)
-
-        if self.n_groups == 1:
-            if self.tp_size > 1:
-                # Compute local sum and then reduce to obtain global sum
-                local_sums = x.pow(2).sum(dim=-1, keepdim=True)
-                global_sums = tensor_model_parallel_all_reduce(local_sums)
-                # Calculate the variance
-                count = self.tp_size * x.shape[-1]
-                variance = global_sums / count
-
-            else:
-                variance = x.pow(2).mean(-1, keepdim=True)
-            x = x * torch.rsqrt(variance + self.variance_epsilon)
-        else:
-            redundant_tp: bool = self.n_groups % self.tp_size != 0
-            if redundant_tp:
-                # To handle the general case, redundantly apply the variance
-                x = tensor_model_parallel_all_gather(x, -1)
-
-            *prefix_dims, hidden_dim = x.shape
-            group_count = hidden_dim // self.group_size
-            x_grouped = x.view(*prefix_dims, group_count, self.group_size)
-            variance = x_grouped.pow(2).mean(-1, keepdim=True)
-            x_grouped = x_grouped * torch.rsqrt(variance + self.variance_epsilon)
-            x = x_grouped.view(*prefix_dims, hidden_dim)
-
-            if redundant_tp:
-                start = self.per_rank_hidden_size * self.tp_rank
-                end = start + self.per_rank_hidden_size
-                x = x[..., start:end]
-
-        return self.weight * x.to(input_dtype)
-
-    def forward_cuda(
-        self,
-        x: torch.Tensor,
-        gate: torch.Tensor,
-    ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-        input_dtype = x.dtype
-        if not self.use_rms_norm:
-            # Keep gate in float32 for numerical stability during silu
-            return x * nn.functional.silu(gate.to(torch.float32)).to(input_dtype)
-
-        if ((self.n_groups % self.tp_size) != 0) or self.n_groups != 1:
-            return self.forward_native(x, gate)
-
-        return layernorm_fn(
-            x,
-            self.weight.data,
-            bias=None,
-            z=gate,
-            eps=self.variance_epsilon,
-            norm_before_gate=False,
-        )
-
-
 class MambaMixer2(torch.nn.Module):
     """
     Compute ∆, A, B, C, and D the state space parameters and compute
@@ -214,22 +117,14 @@ class MambaMixer2(torch.nn.Module):
 
     def __init__(
         self,
+        cache_params: Mamba2CacheParams,
         hidden_size: int,
-        ssm_state_size: int,
-        conv_kernel_size: int,
-        intermediate_size: int,
         use_conv_bias: bool,
         use_bias: bool,
-        chunk_size: int,
-        layer_id: int,
         n_groups: int = 1,
-        num_heads: int = 128,
-        head_dim: int = 64,
         rms_norm_eps: float = 1e-5,
         activation: str = "silu",
         use_rms_norm: bool = True,
-        model_config: Optional[ModelConfig] = None,
-        #  cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
@@ -252,6 +147,9 @@ class MambaMixer2(torch.nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
 
+        self.num_heads = num_heads = cache_params.shape.num_heads
+        self.head_dim = cache_params.shape.head_dim
+
         assert (
             num_heads % self.tp_size == 0
         ), "Tensor parallel world size must divide num heads."
@@ -261,56 +159,75 @@ class MambaMixer2(torch.nn.Module):
             "then num_groups must equal 1."
         )
 
-        self.ssm_state_size = ssm_state_size
-        self.conv_kernel_size = conv_kernel_size
+        assert (
+            (n_groups % self.tp_size == 0) or self.tp_size == 1 or quant_config is None
+        ), (
+            "Tensor parallel currently supported for quantized models only "
+            "if tensor parallel world size divides num groups."
+        )
+
+        self.ssm_state_size = cache_params.shape.ssm_state_size
         self.activation = activation
-        self.layer_id = layer_id
 
-        self.intermediate_size = intermediate_size
-        self.head_dim = head_dim
-        self.num_heads = num_heads
-        self.chunk_size = chunk_size
-
+        conv_kernel_size = cache_params.shape.conv_kernel
+        self.intermediate_size = intermediate_size = (
+            cache_params.shape.intermediate_size
+        )
         self.n_groups = n_groups
         if n_groups % self.tp_size != 0:
             # - for TP we shard conv_dim by sharding on n_groups,
             # - but if n_groups cannot divide tp_size, we need to
             #   extend some extra groups
-            groups = MambaStateShapeCalculator.extra_groups_for_head_shards(
-                n_groups, self.tp_size
-            )
+            groups = extra_groups_for_head_shards(n_groups, self.tp_size)
             self.n_groups = n_groups + groups
-
         self.groups_ssm_state_size = self.n_groups * self.ssm_state_size
-        self.conv_dim = intermediate_size + 2 * self.groups_ssm_state_size
+        self.conv_dim = cache_params.shape.conv_dim
 
-        self.conv1d = MergedColumnParallelLinear(
-            input_size=conv_kernel_size,
-            output_sizes=[
-                intermediate_size,
-                self.groups_ssm_state_size,
-                self.groups_ssm_state_size,
-            ],
-            bias=use_conv_bias,
-            quant_config=None,
-            prefix=f"{prefix}.conv1d",
-        )
+        if n_groups % self.tp_size == 0:
+            self.conv1d = MergedColumnParallelLinear(
+                input_size=conv_kernel_size,
+                output_sizes=[
+                    intermediate_size,
+                    self.groups_ssm_state_size,
+                    self.groups_ssm_state_size,
+                ],
+                bias=use_conv_bias,
+                quant_config=None,
+                prefix=f"{prefix}.conv1d",
+            )
 
-        self.in_proj = MergedColumnParallelLinear(
-            input_size=hidden_size,
-            output_sizes=[
-                intermediate_size,
-                intermediate_size,
-                self.groups_ssm_state_size,
-                self.groups_ssm_state_size,
-                self.num_heads,
-            ],
-            bias=use_bias,
-            prefix=f"{prefix}.in_proj",
-        )
-        if n_groups % self.tp_size != 0:
+            self.in_proj = MergedColumnParallelLinear(
+                input_size=hidden_size,
+                output_sizes=[
+                    intermediate_size,
+                    intermediate_size,
+                    self.groups_ssm_state_size,
+                    self.groups_ssm_state_size,
+                    self.num_heads,
+                ],
+                bias=use_bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.in_proj",
+            )
+        else:
             # This is the n_groups == 1 case,
             # where we need to duplicate groups if TP>1.
+
+            self.conv1d = ColumnParallelLinear(
+                input_size=conv_kernel_size,
+                output_size=self.conv_dim,
+                bias=use_conv_bias,
+                quant_config=None,
+                prefix=f"{prefix}.conv1d",
+            )
+
+            self.in_proj = ColumnParallelLinear(
+                input_size=hidden_size,
+                output_size=intermediate_size + self.conv_dim + self.num_heads,
+                bias=use_bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.in_proj",
+            )
 
             # - because in_proj is a concatenation of 3 weights, we
             #   need to interleave them before sharding
@@ -421,47 +338,27 @@ class MambaMixer2(torch.nn.Module):
             intermediate_size, n_groups, self.use_rms_norm, eps=rms_norm_eps
         )
 
-        # The tuple is (conv_state, ssm_state)
-        self.kv_cache = (torch.tensor([]), torch.tensor([]))
-
-        self.model_config = model_config
         self.prefix = prefix
-
-    def forward_native(
-        self,
-        hidden_states: torch.Tensor,
-        output: torch.Tensor,
-        mup_vector: Optional[torch.Tensor] = None,
-    ):
-        pass
 
     def forward(
         self,
+        *,
         hidden_states: torch.Tensor,
         output: torch.Tensor,
-        forward_batch: ForwardBatch,
+        layer_cache: MambaPool.State,
+        metadata: Mamba2Metadata,
         mup_vector: Optional[torch.Tensor] = None,
+        use_triton_causal_conv: bool = False,
     ):
-        # attn_backend_list[-1] gives access to MambaAttnBackend
-        mamba_backend = forward_batch.attn_backend.attn_backend_list[-1]
-        attn_metadata = mamba_backend.forward_metadata
-        state_indices_tensor = attn_metadata.mamba_cache_indices
-        chunk_size = self.chunk_size
+        # metadata contains metadata necessary for the mamba2 triton
+        # kernels to operate in continuous batching and in chunked prefill
+        # modes; they are computed at top-level model forward since they
+        # stay the same and reused for all mamba layers in the same iteration
+        state_indices_tensor = metadata.mamba_cache_indices
+        conv_state = layer_cache.conv
+        ssm_state = layer_cache.temporal
 
-        conv_state, ssm_state, *rest = mamba_backend.req_to_token_pool.get_mamba_params(
-            self.layer_id
-        )
-
-        assert (
-            ssm_state.size(1) == self.ssm_state_size
-        ), f"dstate must be {self.ssm_state_size}, got {ssm_state.size(1)}"
-
-        query_start_loc = attn_metadata.query_start_loc
-
-        chunk_size = self.chunk_size
-
-        # TODO: properly support this
-        prep_initial_states = False
+        query_start_loc = metadata.query_start_loc
 
         # 1. Gated MLP's linear projection
         projected_states, _ = self.in_proj(hidden_states)
@@ -493,6 +390,38 @@ class MambaMixer2(torch.nn.Module):
             dim=-1,
         )
 
+        num_prefills = metadata.num_prefills  # request count
+        num_decodes = metadata.num_decodes  # token count (=request)
+        num_prefill_tokens = metadata.num_prefill_tokens  # token count
+        has_prefill = num_prefills > 0
+        has_decode = num_decodes > 0
+        num_actual_tokens = num_prefill_tokens + num_decodes
+        assert num_actual_tokens == projected_states.shape[0]
+
+        # NOTE: V0 put prefill before decode
+        # Separate prefill and decode by splitting varlen input
+        # Split along token dimension
+        hidden_states_B_C_p, hidden_states_B_C_d = torch.split(
+            hidden_states_B_C,
+            [num_prefill_tokens, num_decodes],
+            dim=0,
+        )
+        dt_p, dt_d = torch.split(
+            dt,
+            [num_prefill_tokens, num_decodes],
+            dim=0,
+        )
+        # Split along batch dimension
+        state_indices_tensor_p, state_indices_tensor_d = torch.split(
+            state_indices_tensor,
+            [num_prefills, num_decodes],
+            dim=0,
+        )
+        query_start_loc_p = query_start_loc[: num_prefills + 1] if has_prefill else None
+
+        # Preallocate output tensor to avoid memcpy cost for merging prefill
+        # and decode outputs
+
         preallocated_ssm_out = torch.empty(
             [
                 projected_states.shape[0],
@@ -501,128 +430,147 @@ class MambaMixer2(torch.nn.Module):
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
+        preallocated_ssm_out_p, preallocated_ssm_out_d = torch.split(
+            preallocated_ssm_out,
+            [num_prefill_tokens, num_decodes],
+            dim=0,
+        )
 
         # Process prefill requests
-        if forward_batch.forward_mode.is_extend():
+        if has_prefill:
+            mixed_metadata = metadata.mixed_metadata
+            assert mixed_metadata is not None
             # 2. Convolution sequence transformation
             # - "cache_indices" updates the conv_state cache in positions
             #   pointed to by "state_indices_tensor"
-            num_prefill_tokens = forward_batch.extend_num_tokens or 0
-            has_initial_states = forward_batch.extend_prefix_lens > 0
-            cache_indices = attn_metadata.mamba_cache_indices
-
-            x = hidden_states_B_C.transpose(
+            has_initial_states_p = mixed_metadata.has_initial_states
+            prep_initial_states = mixed_metadata.prep_initial_states
+            cache_indices = state_indices_tensor_p
+            x = hidden_states_B_C_p.transpose(
                 0, 1
             )  # this is the form that causal-conv see
-            hidden_states_B_C = causal_conv1d_fn(
+            ccfn = (
+                causal_conv1d_fn
+                if not use_triton_causal_conv
+                else causal_conv1d_fn_triton
+            )
+            hidden_states_B_C_p = ccfn(
                 x,
                 conv_weights,
                 self.conv1d.bias,
                 activation=self.activation,
                 conv_states=conv_state,
-                has_initial_state=has_initial_states,
+                has_initial_state=has_initial_states_p,
                 cache_indices=cache_indices,
-                query_start_loc=query_start_loc,
-                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-            ).transpose(0, 1)
+                query_start_loc=query_start_loc_p,
+                seq_lens_cpu=mixed_metadata.extend_seq_lens_cpu,
+            ).transpose(0, 1)[:num_prefill_tokens]
 
-            hidden_states, B, C = split_hidden_states_B_C_fn(hidden_states_B_C)
+            hidden_states_p, B_p, C_p = split_hidden_states_B_C_fn(hidden_states_B_C_p)
 
             # 3. State Space Model sequence transformation
             initial_states = None
-
-            if has_initial_states is not None and prep_initial_states:
+            if has_initial_states_p is not None and prep_initial_states:
                 initial_states = torch.where(
-                    has_initial_states[:, None, None, None],
-                    ssm_state[state_indices_tensor],
+                    has_initial_states_p[:, None, None, None],
+                    ssm_state[state_indices_tensor_p],
                     0,
                 )
 
             # NOTE: final output is an in-place update of out tensor
             varlen_state = mamba_chunk_scan_combined(
-                hidden_states.view(
+                hidden_states_p.view(
                     1, num_prefill_tokens, self.num_heads // self.tp_size, self.head_dim
                 ),
-                dt.unsqueeze(0),
+                dt_p.unsqueeze(0),
                 self.A,
-                B.view(1, num_prefill_tokens, self.n_groups // self.tp_size, -1),
-                C.view(1, num_prefill_tokens, self.n_groups // self.tp_size, -1),
-                chunk_size=chunk_size,
+                B_p.view(1, num_prefill_tokens, self.n_groups // self.tp_size, -1),
+                C_p.view(1, num_prefill_tokens, self.n_groups // self.tp_size, -1),
+                chunk_size=mixed_metadata.chunk_size,
                 D=self.D,
                 z=None,
                 dt_bias=self.dt_bias,
-                cu_seqlens=query_start_loc,
+                seq_idx=mixed_metadata.seq_idx,
+                chunk_indices=mixed_metadata.chunk_indices,
+                chunk_offsets=mixed_metadata.chunk_offsets,
+                cu_seqlens=query_start_loc_p,
                 initial_states=initial_states,
                 return_varlen_states=True,
                 return_final_states=False,
                 dt_softplus=True,
                 dt_limit=(0.0, float("inf")),
-                out=preallocated_ssm_out.view(1, num_prefill_tokens, -1, self.head_dim),
+                out=preallocated_ssm_out_p.view(
+                    1, num_prefill_tokens, -1, self.head_dim
+                ),
                 state_dtype=ssm_state.dtype,
             )
 
             # update ssm states
             # - varlen state is a (num_prefills, nheads, headdim, dstate) tensor
-            ssm_state[state_indices_tensor] = varlen_state.permute(0, 3, 2, 1)
-        elif forward_batch.forward_mode.is_decode():
-            num_decodes = len(query_start_loc) - 1
+            ssm_state[state_indices_tensor_p] = varlen_state
+
+        # Process decode requests
+        if has_decode:
             # 2. Convolution sequence transformation
-            hidden_states_B_C = causal_conv1d_update(
-                hidden_states_B_C,
+            ccu = (
+                causal_conv1d_update
+                if not use_triton_causal_conv
+                else causal_conv1d_update_triton
+            )
+            hidden_states_B_C_d = ccu(
+                hidden_states_B_C_d,
                 conv_state,
                 conv_weights,
                 self.conv1d.bias,
                 self.activation,
-                conv_state_indices=state_indices_tensor,
+                conv_state_indices=state_indices_tensor_d,
             )
 
-            hidden_states, B, C = split_hidden_states_B_C_fn(hidden_states_B_C)
+            hidden_states_d, B_d, C_d = split_hidden_states_B_C_fn(hidden_states_B_C_d)
 
             # 3. State Space Model sequence transformation
             n_groups = self.n_groups // self.tp_size
-            A = (
+            A_d = (
                 self.A[:, None, ...][:, :, None]
                 .expand(-1, self.head_dim, self.ssm_state_size)
                 .to(dtype=torch.float32)
             )
-            dt = dt[:, :, None].expand(-1, -1, self.head_dim)
+            dt_d = dt_d[:, :, None].expand(-1, -1, self.head_dim)
             dt_bias = self.dt_bias[:, None, ...].expand(-1, self.head_dim)
-            D = self.D[:, None, ...].expand(-1, self.head_dim)
-            B = B.view(-1, n_groups, B.shape[1] // n_groups)
-            C = C.view(-1, n_groups, C.shape[1] // n_groups)
-            hidden_states = hidden_states.view(
+            D_d = self.D[:, None, ...].expand(-1, self.head_dim)
+            B_d = B_d.view(-1, n_groups, B_d.shape[1] // n_groups)
+            C_d = C_d.view(-1, n_groups, C_d.shape[1] // n_groups)
+            hidden_states_d = hidden_states_d.view(
                 -1, self.num_heads // self.tp_size, self.head_dim
             )
 
             # - the hidden is reshaped into (bs, num_heads, head_dim)
-            # - mamba_cache_params.ssm_state's slots will be selected
+            # - layer_state.ssm_state's slots will be selected
             #   using state_indices_tensor_d
             # NOTE: final output is an in-place update of out tensor
             selective_state_update(
-                ssm_state.permute(0, 3, 2, 1),
-                hidden_states,
-                dt,
-                A,
-                B,
-                C,
-                D,
+                ssm_state,
+                hidden_states_d,
+                dt_d,
+                A_d,
+                B_d,
+                C_d,
+                D_d,
                 z=None,
                 dt_bias=dt_bias,
                 dt_softplus=True,
-                state_batch_indices=state_indices_tensor,
-                out=preallocated_ssm_out.view(num_decodes, -1, self.head_dim),
+                state_batch_indices=state_indices_tensor_d,
+                out=preallocated_ssm_out_d.view(num_decodes, -1, self.head_dim),
             )
-        elif forward_batch.forward_mode.is_idle():
-            preallocated_ssm_out = preallocated_ssm_out
 
         # 4. gated MLP
         # GatedRMSNorm internally applying SiLU to the gate
         # SiLU is applied internally before normalization, unlike standard
         # norm usage
-        hidden_states = self.norm(preallocated_ssm_out, gate)
+        hidden_states = self.norm(preallocated_ssm_out, gate[:num_actual_tokens])
 
         # 5. Final linear projection
-        output[:], _ = self.out_proj(hidden_states)
+        output[:num_actual_tokens], _ = self.out_proj(hidden_states)
 
     @property
     def mamba_type(self) -> str:
