@@ -792,7 +792,10 @@ fn item_to_json(item: &crate::data_connector::conversation_items::ConversationIt
                     obj.insert("server_label".to_string(), server_label.clone());
                 }
                 if let Some(approval_request_id) = content_obj.get("approval_request_id") {
-                    obj.insert("approval_request_id".to_string(), approval_request_id.clone());
+                    obj.insert(
+                        "approval_request_id".to_string(),
+                        approval_request_id.clone(),
+                    );
                 }
                 if let Some(error) = content_obj.get("error") {
                     obj.insert("error".to_string(), error.clone());
