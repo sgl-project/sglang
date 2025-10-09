@@ -3,8 +3,12 @@
 use crate::grpc_client::proto;
 use crate::protocols::spec::StringOrArray;
 
+pub mod context;
 pub mod pd_router;
+pub mod pipeline;
+pub mod processing;
 pub mod router;
+pub mod streaming;
 pub mod utils;
 
 /// Processed chat messages ready for gRPC generation

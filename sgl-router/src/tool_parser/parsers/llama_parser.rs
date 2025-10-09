@@ -121,11 +121,6 @@ impl LlamaParser {
 
         Ok(all_tools)
     }
-
-    /// Check if text has tool call
-    fn has_tool_call(&self, text: &str) -> bool {
-        text.contains("<|python_tag|>") || text.contains('{')
-    }
 }
 
 impl Default for LlamaParser {
@@ -184,7 +179,7 @@ impl ToolParser for LlamaParser {
         let current_text = &self.buffer.clone();
 
         // Check if current_text has tool_call
-        let has_tool_start = self.has_tool_call(current_text)
+        let has_tool_start = self.has_tool_markers(current_text)
             || (self.current_tool_id >= 0 && current_text.starts_with(self.tool_call_separator));
 
         if !has_tool_start {
@@ -230,8 +225,7 @@ impl ToolParser for LlamaParser {
 
     fn has_tool_markers(&self, text: &str) -> bool {
         // Llama format if contains python_tag or starts with JSON object
-        text.contains("<|python_tag|>")
-            || (text.trim_start().starts_with('{') && text.contains(r#""name""#))
+        text.contains("<|python_tag|>") || text.trim_start().starts_with('{')
     }
 
     fn get_unstreamed_tool_args(&self) -> Option<Vec<crate::tool_parser::types::ToolCallItem>> {
