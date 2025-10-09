@@ -897,7 +897,7 @@ class DeepEPMoE(EPMoE):
             raise ValueError(f"Not Supported DeepEP format {dispatch_output.format}")
 
 
-_SHMEM_INITIALIZED = False
+MORI_SHMEM_INITIALIZED = False
 MORI_QUANT_CONFIG = None
 
 
@@ -1177,12 +1177,12 @@ class MoRIEPMoE(EPMoE):
 
     # NOTE: Maybe move mori config and shmem initialization to where model parallel is initialized
     def _ensure_shmem_initialized(self):
-        """Ensure mori's shared memory system is initialized (lazy initialization)"""
-        global _SHMEM_INITIALIZED
+        """Ensure mori's shared memory system is initialized"""
+        global MORI_SHMEM_INITIALIZED
         ep_group = get_moe_ep_group()
         world_group = get_world_group()
 
-        if _SHMEM_INITIALIZED:
+        if MORI_SHMEM_INITIALIZED:
             return
 
         import mori.shmem
@@ -1228,15 +1228,16 @@ class MoRIEPMoE(EPMoE):
                 logger.debug(
                     f"[rank {self.moe_ep_rank}] Torch process group shmem initialization successful"
                 )
-                _SHMEM_INITIALIZED = True
+                MORI_SHMEM_INITIALIZED = True
                 return
 
             except Exception as torch_error:
                 logger.debug(
                     f"[rank {self.moe_ep_rank}] Torch process group shmem init failed: {torch_error}"
                 )
-
-            _SHMEM_INITIALIZED = True
+                raise RuntimeError(
+                    f"Failed to register process group for mori shmem initialization: {torch_error}"
+                ) from torch_error
 
         except Exception as e:
             # NOTE: Do we need continuing the shmem initialization even it failed?
@@ -1244,11 +1245,7 @@ class MoRIEPMoE(EPMoE):
             logger.error(
                 f"[rank {self.moe_ep_rank}] mori shmem initialization failed: {e}"
             )
-            # Don't fail completely - mark as initialized to avoid retry loops
-            _SHMEM_INITIALIZED = True
-            logger.warning(
-                f"[rank {self.moe_ep_rank}] Continuing without mori shmem optimization"
-            )
+            raise RuntimeError(f"mori shmem initialization failed: {e}") from e
 
     def set_mori_quant_config(self):
         global MORI_QUANT_CONFIG
