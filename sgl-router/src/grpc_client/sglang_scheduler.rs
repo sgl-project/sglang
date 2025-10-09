@@ -178,10 +178,20 @@ impl SglangSchedulerClient {
         request_id: String,
         reason: String,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let request = Request::new(proto::AbortRequest { request_id, reason });
+        debug!("Sending abort request for {} (reason: {})", request_id, reason);
+        let request = Request::new(proto::AbortRequest {
+            request_id: request_id.clone(),
+            reason,
+        });
 
         let mut client = self.client.clone();
-        client.abort(request).await?;
+        let response = client.abort(request).await?;
+        debug!(
+            "Abort response for {}: success={}, message={}",
+            request_id,
+            response.get_ref().success,
+            response.get_ref().message
+        );
         Ok(())
     }
 

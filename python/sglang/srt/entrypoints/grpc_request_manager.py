@@ -415,6 +415,10 @@ class GrpcRequestManager:
             return False
 
         if request_id not in self.rid_to_state:
+            logger.warning(
+                f"Abort request for {request_id} but not found in rid_to_state. "
+                f"Current requests: {list(self.rid_to_state.keys())[:5]}"
+            )
             return False
 
         # Send abort to scheduler
