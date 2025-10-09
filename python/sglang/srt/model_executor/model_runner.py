@@ -358,16 +358,6 @@ class ModelRunner:
             if architectures and not any("Llama4" in arch for arch in architectures):
                 self.is_hybrid = self.model_config.is_hybrid = True
 
-        # sets the max_mamba_cache_size based on the max_running_requests for hybrid gdn
-        # and disable radix cache
-        # For hybrid gdn with radix cache, it is set in the init_memory_pool function
-        if self.mambaish_config is not None and server_args.disable_radix_cache:
-            if server_args.max_mamba_cache_size is None:
-                if server_args.max_running_requests is not None:
-                    server_args.max_mamba_cache_size = server_args.max_running_requests
-                else:
-                    server_args.max_mamba_cache_size = 512
-
         # For MTP models like DeepSeek-V3 or GLM-4.5, the MTP layer(s) are used separately as draft
         # models for speculative decoding. In those cases, `num_nextn_predict_layers` is used to
         # determine the number of layers.
@@ -1292,8 +1282,15 @@ class ModelRunner:
         config = self.mambaish_config
         server_args = self.server_args
         assert config is not None
-        if server_args.max_mamba_cache_size is None:
-            assert not server_args.disable_radix_cache
+
+        if server_args.disable_radix_cache:
+            # with disable radix cache, sets the max_mamba_cache_size based on the max_running_requests
+            if server_args.max_mamba_cache_size is None:
+                if server_args.max_running_requests is not None:
+                    server_args.max_mamba_cache_size = server_args.max_running_requests
+                else:
+                    server_args.max_mamba_cache_size = 512
+        else:
             # allocate the memory based on the ratio between mamba state memory vs. full kv cache memory
             # solve the equations:
             # 1. mamba_state_memory + full_kv_cache_memory == total_rest_memory
