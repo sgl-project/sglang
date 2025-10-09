@@ -261,25 +261,45 @@ class SchedulerOutputProcessorMixin:
                 continue
 
             if self.enable_overlap and req.finished():
-                # Free the one extra delayed token
                 if self.page_size == 1:
-                    self.token_to_kv_pool_allocator.free(batch.out_cache_loc[i : i + 1])
-                else:
-                    # Only free when the extra token is in a new page
-                    if (
-                        len(req.origin_input_ids) + len(req.output_ids) - 1
-                    ) % self.page_size == 0:
+                    if batch.spec_algorithm.is_eagle():
+                        # TODO(lsyin): free_spec_dec_tokens_page_size_1
+                        raise NotImplementedError()
+                    else:
+                        # Free the one extra delayed token
                         self.token_to_kv_pool_allocator.free(
                             batch.out_cache_loc[i : i + 1]
                         )
+                else:
+                    if batch.spec_algorithm.is_eagle():
+                        # TODO(lsyin): support eagle with page_size > 1
+                        raise NotImplementedError()
+                    else:
+                        if (
+                            len(req.origin_input_ids) + len(req.output_ids) - 1
+                        ) % self.page_size == 0:
+                            # Only free when the extra token is in a new page
+                            self.token_to_kv_pool_allocator.free(
+                                batch.out_cache_loc[i : i + 1]
+                            )
                 continue
 
             if batch.spec_algorithm.is_none():
-                # speculative worker will solve the output_ids in speculative decoding
                 req.output_ids.append(next_token_id)
+            elif batch.is_v2_eagle:
+                # FIXME(lsyin): non-overlap spec worker will solve the output_ids in speculative decoding
+                #               !!!unify the logic here!!!
+                req.output_ids.extend(next_token_id)
 
             req.check_finished()
             if req.finished():
+                if batch.is_v2_eagle and self.cur_batch.forward_mode.is_extend():
+                    # FIXME(lsyin): fix the messy logic here
+                    # 1) when not overlap (v2 impl), we free the extra tokens in the req
+                    # 2) when overlap and current batch is extend, we free the extra tokens in the req of the previous batch
+                    # TODO(lsyin): free_spec_dec_tokens_page_size_1
+                    raise NotImplementedError()
+
                 if self.server_args.disaggregation_decode_enable_offload_kvcache:
                     # Asynchronously offload KV cache; cache_finished_req will be called after Device->Host transfer completes
                     if not self.decode_offload_manager.offload_kv_cache(req):
