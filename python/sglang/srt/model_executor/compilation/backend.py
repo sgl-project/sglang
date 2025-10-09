@@ -363,10 +363,15 @@ class SGLangBackend:
         self.inductor_config["post_grad_custom_post_pass"] = self.post_grad_pass_manager
 
     def __call__(self, graph: fx.GraphModule, example_inputs) -> Callable:
+        base_cache_dir = os.path.expanduser(
+            os.getenv("SGLANG_CACHE_DIR", "~/.cache/sglang/")
+        )
+
+        cache_hash = self.compiler_manager.compute_hash()
         cache_dir = os.path.join(
-            "/home/ubuntu/.cache/sglang/",
+            base_cache_dir,
             "torch_compile_cache",
-            "08329392",
+            cache_hash,
         )
 
         os.makedirs(cache_dir, exist_ok=True)
