@@ -1,7 +1,7 @@
 use std::convert::TryFrom;
 use std::time::Duration;
-use tonic::{transport::Channel, Request};
-use tracing::{debug, warn};
+use tonic::{transport::Channel, Request, Streaming};
+use tracing::debug;
 
 use crate::protocols::spec::{
     ChatCompletionRequest, GenerateRequest, ResponseFormat,
@@ -27,28 +27,23 @@ impl SglangSchedulerClient {
     pub async fn connect(endpoint: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         debug!("Connecting to SGLang scheduler at {}", endpoint);
 
-        // Convert grpc:// to http:// for tonic, preserving IPv6 bracket notation
-        let http_endpoint = if endpoint.starts_with("grpc://") {
-            // Use proper URL parsing to preserve IPv6 brackets
-            match url::Url::parse(endpoint) {
-                Ok(mut parsed) => {
-                    let _ = parsed.set_scheme("http");
-                    parsed.to_string()
-                }
-                Err(_) => {
-                    warn!(
-                        "Failed to parse gRPC endpoint '{}', using simple string replacement",
-                        endpoint
-                    );
-                    endpoint.replace("grpc://", "http://")
-                }
-            }
+        // Convert grpc:// to http:// for tonic
+        let http_endpoint = if let Some(addr) = endpoint.strip_prefix("grpc://") {
+            format!("http://{}", addr)
         } else {
             endpoint.to_string()
         };
 
         let channel = Channel::from_shared(http_endpoint)?
-            .timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(3600))
+            .http2_keep_alive_interval(Duration::from_secs(30))
+            .keep_alive_timeout(Duration::from_secs(10))
+            .keep_alive_while_idle(true)
+            .tcp_keepalive(Some(Duration::from_secs(60)))
+            .tcp_nodelay(true)
+            .http2_adaptive_window(true)
+            .initial_stream_window_size(Some(16 * 1024 * 1024)) // 16MB
+            .initial_connection_window_size(Some(32 * 1024 * 1024)) // 32MB
             .connect()
             .await?;
 
@@ -59,18 +54,18 @@ impl SglangSchedulerClient {
 
     /// Submit a generation request (returns streaming response)
     pub async fn generate(
-        &mut self,
+        &self,
         req: proto::GenerateRequest,
-    ) -> Result<tonic::Streaming<proto::GenerateResponse>, Box<dyn std::error::Error + Send + Sync>>
-    {
+    ) -> Result<Streaming<proto::GenerateResponse>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut client = self.client.clone();
         let request = Request::new(req);
-        let response = self.client.generate(request).await?;
+        let response = client.generate(request).await?;
         Ok(response.into_inner())
     }
 
     /// Perform health check
     pub async fn health_check(
-        &mut self,
+        &self,
     ) -> Result<proto::HealthCheckResponse, Box<dyn std::error::Error + Send + Sync>> {
         debug!("Sending health check request");
         let request = Request::new(proto::HealthCheckRequest {
@@ -80,21 +75,49 @@ impl SglangSchedulerClient {
             }),
         });
 
-        let response = self.client.health_check(request).await?;
+        let mut client = self.client.clone();
+        let response = client.health_check(request).await?;
         debug!("Health check response received");
         Ok(response.into_inner())
     }
 
     /// Abort a request
     pub async fn abort_request(
-        &mut self,
+        &self,
         request_id: String,
         reason: String,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let request = Request::new(proto::AbortRequest { request_id, reason });
 
-        self.client.abort(request).await?;
+        let mut client = self.client.clone();
+        client.abort(request).await?;
         Ok(())
+    }
+
+    /// Get model information
+    pub async fn get_model_info(
+        &self,
+    ) -> Result<proto::GetModelInfoResponse, Box<dyn std::error::Error + Send + Sync>> {
+        debug!("Requesting model info");
+        let request = Request::new(proto::GetModelInfoRequest {});
+
+        let mut client = self.client.clone();
+        let response = client.get_model_info(request).await?;
+        debug!("Model info response received");
+        Ok(response.into_inner())
+    }
+
+    /// Get server information
+    pub async fn get_server_info(
+        &self,
+    ) -> Result<proto::GetServerInfoResponse, Box<dyn std::error::Error + Send + Sync>> {
+        debug!("Requesting server info");
+        let request = Request::new(proto::GetServerInfoRequest {});
+
+        let mut client = self.client.clone();
+        let response = client.get_server_info(request).await?;
+        debug!("Server info response received");
+        Ok(response.into_inner())
     }
 
     /// Build a single SGLang GenerateRequest from OpenAI ChatCompletionRequest
@@ -202,6 +225,7 @@ impl SglangSchedulerClient {
             stop: stop_sequences,
             stop_token_ids: request.stop_token_ids.clone().unwrap_or_default(),
             skip_special_tokens,
+            spaces_between_special_tokens: true, // Default from Python SamplingParams
             ignore_eos: request.ignore_eos,
             no_stop_trim: request.no_stop_trim,
             n: request.n.unwrap_or(1) as i32,
@@ -301,6 +325,8 @@ impl SglangSchedulerClient {
             top_k: -1,
             repetition_penalty: 1.0,
             n: 1,
+            skip_special_tokens: true,
+            spaces_between_special_tokens: true,
             ..Default::default()
         };
 
@@ -444,10 +470,24 @@ mod tests {
     #[test]
     fn test_sampling_params_defaults() {
         let params = proto::SamplingParams::default();
+        // Numeric fields have proto defaults (0)
         assert_eq!(params.temperature, 0.0);
-        assert_eq!(params.max_new_tokens, None);
         assert_eq!(params.top_p, 0.0);
         assert_eq!(params.top_k, 0);
+        assert_eq!(params.repetition_penalty, 0.0);
+        assert_eq!(params.n, 0);
+        // Bool fields have proto defaults (false)
+        assert!(!params.skip_special_tokens);
+        assert!(!params.spaces_between_special_tokens);
+        assert!(!params.ignore_eos);
+        assert!(!params.no_stop_trim);
+        // Optional int fields should be None
+        assert_eq!(params.max_new_tokens, None);
+        assert_eq!(params.stream_interval, None);
+        // Other non-optional fields
+        assert_eq!(params.min_p, 0.0);
+        assert_eq!(params.frequency_penalty, 0.0);
+        assert_eq!(params.presence_penalty, 0.0);
         assert!(params.stop.is_empty());
     }
 

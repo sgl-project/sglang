@@ -27,6 +27,7 @@ from sglang.srt.managers.io_struct import (
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
+from sglang.srt.managers.scheduler import is_health_check_generate_req
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import get_zmq_socket, kill_process_tree
 from sglang.utils import get_exception_traceback
@@ -263,8 +264,8 @@ class GrpcRequestManager:
                         response = await task
 
                         # Add index for client-side ordering
-                        if isinstance(response, dict) and "meta_info" in response:
-                            response_rid = response["meta_info"].get("id", "")
+                        if isinstance(response, dict):
+                            response_rid = response.get("request_id", "")
                             if response_rid in rid_to_index:
                                 response["index"] = rid_to_index[response_rid]
 
@@ -338,12 +339,9 @@ class GrpcRequestManager:
                         break
 
                 except asyncio.TimeoutError:
-                    # Timeout waiting for response - abort and cleanup
-                    logger.warning(
-                        f"Timeout waiting for response for request {request_id}"
-                    )
-                    await self.abort_request(request_id)
-                    return
+                    # Timeout is for periodic client cancellation check
+                    # Continue waiting for scheduler response
+                    continue
 
         finally:
             # Always clean up request state when exiting
@@ -397,9 +395,7 @@ class GrpcRequestManager:
         # Wait for result in background
         async def wait_for_result():
             try:
-                # Wait for completion
                 await state.event.wait()
-                # Get result from queue
                 result = await state.out_queue.get()
                 future.set_result(result)
             except Exception as e:
@@ -414,6 +410,10 @@ class GrpcRequestManager:
 
     async def abort_request(self, request_id: str) -> bool:
         """Abort a running request."""
+        # Skip aborting health check requests (they clean themselves up)
+        if request_id.startswith("HEALTH_CHECK"):
+            return False
+
         if request_id not in self.rid_to_state:
             return False
 
@@ -436,19 +436,6 @@ class GrpcRequestManager:
             await state.out_queue.put({"error": "Request aborted", "abort": True})
 
         return True
-
-    async def pause_generation(self):
-        """Pause generation processing."""
-        async with self.is_pause_cond:
-            self.is_pause = True
-            logger.info("Generation paused")
-
-    async def resume_generation(self):
-        """Resume generation processing."""
-        async with self.is_pause_cond:
-            self.is_pause = False
-            self.is_pause_cond.notify_all()
-            logger.info("Generation resumed")
 
     async def handle_loop(self):
         """
