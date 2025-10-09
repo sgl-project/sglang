@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang"
-version = "0.5.3"
+version = "0.5.3.post1"
 description = "SGLang is a fast serving framework for large language models and vision language models."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -53,7 +53,7 @@ runtime_common = [
     "transformers==4.56.1",
     "uvicorn",
     "uvloop",
-    "xgrammar==0.1.24",
+    "xgrammar==0.1.25",
 ]
 
 tracing = [
@@ -65,12 +65,12 @@ tracing = [
 
 srt = [
     "sglang[runtime_common]",
-    "sgl-kernel==0.3.14.post1",
+    "sgl-kernel==0.3.15",
     "torch==2.8.0",
     "torchaudio==2.8.0",
     "torchvision",
     "cuda-python",
-    "flashinfer_python==0.4.0rc3",
+    "flashinfer_python==0.4.0",
 ]
 
 # HIP (Heterogeneous-computing Interface for Portability) for AMD

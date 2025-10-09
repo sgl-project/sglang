@@ -2,7 +2,10 @@ use crate::{
     config::{ConnectionMode, HistoryBackend, RouterConfig, RoutingMode},
     core::{LoadMonitor, WorkerManager, WorkerRegistry, WorkerType},
     data_connector::{
-        MemoryResponseStorage, NoOpResponseStorage, OracleResponseStorage, SharedResponseStorage,
+        MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
+        NoOpConversationStorage, NoOpResponseStorage, OracleConversationItemStorage,
+        OracleConversationStorage, OracleResponseStorage, SharedConversationStorage,
+        SharedResponseStorage,
     },
     logging::{self, LoggingConfig},
     metrics::{self, PrometheusConfig},
@@ -15,11 +18,11 @@ use crate::{
         },
         worker_spec::{WorkerApiResponse, WorkerConfigRequest, WorkerErrorResponse},
     },
-    reasoning_parser::ReasoningParserFactory,
+    reasoning_parser::ParserFactory as ReasoningParserFactory,
     routers::{router_manager::RouterManager, RouterTrait},
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
     tokenizer::{factory as tokenizer_factory, traits::Tokenizer},
-    tool_parser::ToolParserFactory,
+    tool_parser::ParserFactory as ToolParserFactory,
 };
 use axum::{
     extract::{Path, Query, Request, State},
@@ -39,6 +42,8 @@ use std::{
 use tokio::{net::TcpListener, signal, spawn};
 use tracing::{error, info, warn, Level};
 
+//
+
 #[derive(Clone)]
 pub struct AppContext {
     pub client: Client,
@@ -51,7 +56,11 @@ pub struct AppContext {
     pub policy_registry: Arc<PolicyRegistry>,
     pub router_manager: Option<Arc<RouterManager>>,
     pub response_storage: SharedResponseStorage,
+    pub conversation_storage: SharedConversationStorage,
+    pub conversation_item_storage: crate::data_connector::SharedConversationItemStorage,
     pub load_monitor: Option<Arc<LoadMonitor>>,
+    pub configured_reasoning_parser: Option<String>,
+    pub configured_tool_parser: Option<String>,
 }
 
 impl AppContext {
@@ -79,8 +88,8 @@ impl AppContext {
                     tokenizer_factory::create_tokenizer(&tokenizer_path)
                         .map_err(|e| format!("Failed to create tokenizer: {e}"))?,
                 );
-                let reasoning_parser_factory = Some(ReasoningParserFactory::new());
-                let tool_parser_factory = Some(ToolParserFactory::new());
+                let reasoning_parser_factory = Some(crate::reasoning_parser::ParserFactory::new());
+                let tool_parser_factory = Some(crate::tool_parser::ParserFactory::new());
 
                 (tokenizer, reasoning_parser_factory, tool_parser_factory)
             } else {
@@ -92,21 +101,50 @@ impl AppContext {
 
         let router_manager = None;
 
-        let response_storage: SharedResponseStorage = match router_config.history_backend {
-            HistoryBackend::Memory => Arc::new(MemoryResponseStorage::new()),
-            HistoryBackend::None => Arc::new(NoOpResponseStorage::new()),
+        let (response_storage, conversation_storage): (
+            SharedResponseStorage,
+            SharedConversationStorage,
+        ) = match router_config.history_backend {
+            HistoryBackend::Memory => (
+                Arc::new(MemoryResponseStorage::new()),
+                Arc::new(MemoryConversationStorage::new()),
+            ),
+            HistoryBackend::None => (
+                Arc::new(NoOpResponseStorage::new()),
+                Arc::new(NoOpConversationStorage::new()),
+            ),
             HistoryBackend::Oracle => {
                 let oracle_cfg = router_config.oracle.clone().ok_or_else(|| {
                     "oracle configuration is required when history_backend=oracle".to_string()
                 })?;
 
-                let storage = OracleResponseStorage::new(oracle_cfg).map_err(|err| {
-                    format!("failed to initialize Oracle response storage: {err}")
-                })?;
+                let response_storage =
+                    OracleResponseStorage::new(oracle_cfg.clone()).map_err(|err| {
+                        format!("failed to initialize Oracle response storage: {err}")
+                    })?;
 
-                Arc::new(storage)
+                let conversation_storage = OracleConversationStorage::new(oracle_cfg.clone())
+                    .map_err(|err| {
+                        format!("failed to initialize Oracle conversation storage: {err}")
+                    })?;
+
+                (Arc::new(response_storage), Arc::new(conversation_storage))
             }
         };
+
+        // Conversation items storage (memory-backed for now)
+        let conversation_item_storage: crate::data_connector::SharedConversationItemStorage =
+            match router_config.history_backend {
+                HistoryBackend::Oracle => {
+                    let oracle_cfg = router_config.oracle.clone().ok_or_else(|| {
+                        "oracle configuration is required when history_backend=oracle".to_string()
+                    })?;
+                    Arc::new(OracleConversationItemStorage::new(oracle_cfg).map_err(|e| {
+                        format!("failed to initialize Oracle conversation item storage: {e}")
+                    })?)
+                }
+                _ => Arc::new(MemoryConversationItemStorage::new()),
+            };
 
         let load_monitor = Some(Arc::new(LoadMonitor::new(
             worker_registry.clone(),
@@ -114,6 +152,9 @@ impl AppContext {
             client.clone(),
             router_config.worker_startup_check_interval_secs,
         )));
+
+        let configured_reasoning_parser = router_config.reasoning_parser.clone();
+        let configured_tool_parser = router_config.tool_call_parser.clone();
 
         Ok(Self {
             client,
@@ -126,7 +167,11 @@ impl AppContext {
             policy_registry,
             router_manager,
             response_storage,
+            conversation_storage,
+            conversation_item_storage,
             load_monitor,
+            configured_reasoning_parser,
+            configured_tool_parser,
         })
     }
 }
@@ -324,6 +369,115 @@ async fn v1_responses_list_input_items(
     state
         .router
         .list_response_input_items(Some(&headers), &response_id)
+        .await
+}
+
+async fn v1_conversations_create(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    state
+        .router
+        .create_conversation(Some(&headers), &body)
+        .await
+}
+
+async fn v1_conversations_get(
+    State(state): State<Arc<AppState>>,
+    Path(conversation_id): Path<String>,
+    headers: http::HeaderMap,
+) -> Response {
+    state
+        .router
+        .get_conversation(Some(&headers), &conversation_id)
+        .await
+}
+
+async fn v1_conversations_update(
+    State(state): State<Arc<AppState>>,
+    Path(conversation_id): Path<String>,
+    headers: http::HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    state
+        .router
+        .update_conversation(Some(&headers), &conversation_id, &body)
+        .await
+}
+
+async fn v1_conversations_delete(
+    State(state): State<Arc<AppState>>,
+    Path(conversation_id): Path<String>,
+    headers: http::HeaderMap,
+) -> Response {
+    state
+        .router
+        .delete_conversation(Some(&headers), &conversation_id)
+        .await
+}
+
+#[derive(Deserialize, Default)]
+struct ListItemsQuery {
+    limit: Option<usize>,
+    order: Option<String>,
+    after: Option<String>,
+}
+
+async fn v1_conversations_list_items(
+    State(state): State<Arc<AppState>>,
+    Path(conversation_id): Path<String>,
+    Query(ListItemsQuery {
+        limit,
+        order,
+        after,
+    }): Query<ListItemsQuery>,
+    headers: http::HeaderMap,
+) -> Response {
+    state
+        .router
+        .list_conversation_items(Some(&headers), &conversation_id, limit, order, after)
+        .await
+}
+
+#[derive(Deserialize, Default)]
+struct GetItemQuery {
+    /// Additional fields to include in response (not yet implemented)
+    include: Option<Vec<String>>,
+}
+
+async fn v1_conversations_create_items(
+    State(state): State<Arc<AppState>>,
+    Path(conversation_id): Path<String>,
+    headers: http::HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    state
+        .router
+        .create_conversation_items(Some(&headers), &conversation_id, &body)
+        .await
+}
+
+async fn v1_conversations_get_item(
+    State(state): State<Arc<AppState>>,
+    Path((conversation_id, item_id)): Path<(String, String)>,
+    Query(query): Query<GetItemQuery>,
+    headers: http::HeaderMap,
+) -> Response {
+    state
+        .router
+        .get_conversation_item(Some(&headers), &conversation_id, &item_id, query.include)
+        .await
+}
+
+async fn v1_conversations_delete_item(
+    State(state): State<Arc<AppState>>,
+    Path((conversation_id, item_id)): Path<(String, String)>,
+    headers: http::HeaderMap,
+) -> Response {
+    state
+        .router
+        .delete_conversation_item(Some(&headers), &conversation_id, &item_id)
         .await
 }
 
@@ -593,6 +747,21 @@ pub fn build_app(
         .route(
             "/v1/responses/{response_id}/input",
             get(v1_responses_list_input_items),
+        )
+        .route("/v1/conversations", post(v1_conversations_create))
+        .route(
+            "/v1/conversations/{conversation_id}",
+            get(v1_conversations_get)
+                .post(v1_conversations_update)
+                .delete(v1_conversations_delete),
+        )
+        .route(
+            "/v1/conversations/{conversation_id}/items",
+            get(v1_conversations_list_items).post(v1_conversations_create_items),
+        )
+        .route(
+            "/v1/conversations/{conversation_id}/items/{item_id}",
+            get(v1_conversations_get_item).delete(v1_conversations_delete_item),
         )
         .route_layer(axum::middleware::from_fn_with_state(
             app_state.clone(),
