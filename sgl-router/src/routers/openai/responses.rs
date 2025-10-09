@@ -31,12 +31,11 @@ pub(super) async fn store_response_internal(
     }
 }
 
-/// Store response implementation (public for use across modules)
-pub(super) async fn store_response_impl(
-    response_storage: &SharedResponseStorage,
+/// Build a StoredResponse from response JSON and original request
+pub(super) fn build_stored_response(
     response_json: &Value,
     original_body: &ResponsesRequest,
-) -> Result<ResponseId, String> {
+) -> StoredResponse {
     let input_text = match &original_body.input {
         ResponseInput::Text(text) => text.clone(),
         ResponseInput::Items(_) => "complex input".to_string(),
@@ -95,6 +94,17 @@ pub(super) async fn store_response_impl(
     }
 
     stored_response.raw_response = response_json.clone();
+
+    stored_response
+}
+
+/// Store response implementation (public for use across modules)
+pub(super) async fn store_response_impl(
+    response_storage: &SharedResponseStorage,
+    response_json: &Value,
+    original_body: &ResponsesRequest,
+) -> Result<ResponseId, String> {
+    let stored_response = build_stored_response(response_json, original_body);
 
     response_storage
         .store_response(stored_response)

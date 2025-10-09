@@ -3,7 +3,7 @@
 use crate::data_connector::{
     conversation_items::ListParams, conversation_items::SortOrder, Conversation, ConversationId,
     ConversationItemStorage, ConversationStorage, NewConversation, NewConversationItem, ResponseId,
-    ResponseStorage, SharedConversationItemStorage, SharedConversationStorage, StoredResponse,
+    ResponseStorage, SharedConversationItemStorage, SharedConversationStorage,
 };
 use crate::protocols::spec::{ResponseInput, ResponsesRequest};
 use axum::http::StatusCode;
@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{info, warn};
 
-use super::responses::extract_primary_output_text;
+use super::responses::build_stored_response;
 
 /// Maximum number of properties allowed in conversation metadata
 pub(crate) const MAX_METADATA_PROPERTIES: usize = 16;
@@ -526,58 +526,9 @@ async fn persist_items_with_storages(
         }
     }
 
-    // Store the full response
-    let input_text = match &original_body.input {
-        ResponseInput::Text(text) => text.clone(),
-        ResponseInput::Items(_) => "complex input".to_string(),
-    };
-
-    let output_text = extract_primary_output_text(response_json).unwrap_or_default();
-
-    let mut stored_response = StoredResponse::new(input_text, output_text, None);
-
+    // Store the full response using the shared helper
+    let mut stored_response = build_stored_response(response_json, original_body);
     stored_response.id = response_id;
-    stored_response.instructions = response_json
-        .get("instructions")
-        .and_then(|v| v.as_str())
-        .map(String::from)
-        .or_else(|| original_body.instructions.clone());
-
-    stored_response.model = response_json
-        .get("model")
-        .and_then(|v| v.as_str())
-        .map(String::from)
-        .or_else(|| original_body.model.clone());
-
-    stored_response.user = response_json
-        .get("user")
-        .and_then(|v| v.as_str())
-        .map(String::from)
-        .or_else(|| original_body.user.clone());
-
-    stored_response.metadata = response_json
-        .get("metadata")
-        .and_then(|v| v.as_object())
-        .map(|m| {
-            m.iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect::<HashMap<_, _>>()
-        })
-        .unwrap_or_else(|| original_body.metadata.clone().unwrap_or_default());
-
-    stored_response.previous_response_id = response_json
-        .get("previous_response_id")
-        .and_then(|v| v.as_str())
-        .map(ResponseId::from)
-        .or_else(|| {
-            original_body
-                .previous_response_id
-                .as_ref()
-                .map(|id| ResponseId::from(id.as_str()))
-        });
-
-    stored_response.raw_response = response_json.clone();
-
     let final_response_id = stored_response.id.clone();
 
     response_storage

@@ -575,19 +575,15 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                             status: Some("completed".to_string()),
                         });
 
-                        // Convert output to conversation items
-                        if let Ok(raw) =
-                            serde_json::from_value::<Value>(stored.raw_response.clone())
-                        {
-                            if let Some(output_arr) = raw.get("output").and_then(|v| v.as_array()) {
-                                for item in output_arr {
-                                    if let Ok(output_item) =
-                                        serde_json::from_value::<ResponseInputOutputItem>(
-                                            item.clone(),
-                                        )
-                                    {
-                                        items.push(output_item);
-                                    }
+                        // Convert output to conversation items directly from stored response
+                        if let Some(output_arr) = stored.raw_response.get("output").and_then(|v| v.as_array()) {
+                            for item in output_arr {
+                                if let Ok(output_item) =
+                                    serde_json::from_value::<ResponseInputOutputItem>(
+                                        item.clone(),
+                                    )
+                                {
+                                    items.push(output_item);
                                 }
                             }
                         }
@@ -837,7 +833,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         _body: &EmbeddingRequest,
         _model_id: Option<&str>,
     ) -> Response {
-        (StatusCode::FORBIDDEN, "Embeddings not supported").into_response()
+        (StatusCode::NOT_IMPLEMENTED, "Embeddings not supported").into_response()
     }
 
     async fn route_rerank(
@@ -846,7 +842,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         _body: &RerankRequest,
         _model_id: Option<&str>,
     ) -> Response {
-        (StatusCode::FORBIDDEN, "Rerank not supported").into_response()
+        (StatusCode::NOT_IMPLEMENTED, "Rerank not supported").into_response()
     }
 
     async fn create_conversation(&self, _headers: Option<&HeaderMap>, body: &Value) -> Response {

@@ -755,8 +755,9 @@ pub(super) fn build_incomplete_response(
         // Find any function_call items and convert them to mcp_call (incomplete)
         let mut mcp_call_items = Vec::new();
         for item in output_array.iter() {
-            if item.get("type").and_then(|t| t.as_str())
-                == Some(event_types::ITEM_TYPE_FUNCTION_TOOL_CALL)
+            let item_type = item.get("type").and_then(|t| t.as_str());
+            if item_type == Some(event_types::ITEM_TYPE_FUNCTION_TOOL_CALL)
+                || item_type == Some(event_types::ITEM_TYPE_FUNCTION_CALL)
             {
                 let tool_name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
                 let args = item
