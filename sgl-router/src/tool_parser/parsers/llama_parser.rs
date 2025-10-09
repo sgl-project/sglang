@@ -4,7 +4,7 @@ use serde_json::Value;
 use crate::protocols::spec::Tool;
 
 use crate::tool_parser::{
-    errors::{ToolParserError, ToolParserResult},
+    errors::{ParserError, ParserResult},
     parsers::helpers,
     partial_json::PartialJson,
     traits::ToolParser,
@@ -70,7 +70,7 @@ impl LlamaParser {
     }
 
     /// Parse a single JSON object into a ToolCall (Llama format: name + parameters)
-    fn parse_single_object(&self, obj: &Value) -> ToolParserResult<Option<ToolCall>> {
+    fn parse_single_object(&self, obj: &Value) -> ParserResult<Option<ToolCall>> {
         // Llama format only: {"name": "function_name", "parameters": {...}}
         let name = obj.get("name").and_then(|v| v.as_str());
 
@@ -81,7 +81,7 @@ impl LlamaParser {
 
             // Convert parameters to JSON string
             let arguments = serde_json::to_string(parameters)
-                .map_err(|e| ToolParserError::ParsingFailed(e.to_string()))?;
+                .map_err(|e| ParserError::ParsingFailed(e.to_string()))?;
 
             Ok(Some(ToolCall {
                 function: FunctionCall {
@@ -95,7 +95,7 @@ impl LlamaParser {
     }
 
     /// Parse semicolon-separated JSON objects
-    fn parse_semicolon_separated(&self, content: &str) -> ToolParserResult<Vec<ToolCall>> {
+    fn parse_semicolon_separated(&self, content: &str) -> ParserResult<Vec<ToolCall>> {
         let mut all_tools = Vec::new();
 
         // Split by semicolon and parse each JSON object
@@ -131,7 +131,7 @@ impl Default for LlamaParser {
 
 #[async_trait]
 impl ToolParser for LlamaParser {
-    async fn parse_complete(&self, text: &str) -> ToolParserResult<(String, Vec<ToolCall>)> {
+    async fn parse_complete(&self, text: &str) -> ParserResult<(String, Vec<ToolCall>)> {
         // Extract normal text and JSON content
         let (normal_text, json_content) =
             if let Some((normal, json)) = self.extract_content_after_python_tag(text) {
@@ -149,7 +149,7 @@ impl ToolParser for LlamaParser {
         } else {
             // Try single JSON object
             let parsed = serde_json::from_str::<Value>(json_content.trim())
-                .map_err(|e| ToolParserError::ParsingFailed(e.to_string()))
+                .map_err(|e| ParserError::ParsingFailed(e.to_string()))
                 .and_then(|v| {
                     self.parse_single_object(&v)
                         .map(|opt| opt.map_or_else(Vec::new, |tool| vec![tool]))
@@ -173,7 +173,7 @@ impl ToolParser for LlamaParser {
         &mut self,
         chunk: &str,
         tools: &[Tool],
-    ) -> ToolParserResult<StreamingParseResult> {
+    ) -> ParserResult<StreamingParseResult> {
         // Append new text to buffer
         self.buffer.push_str(chunk);
         let current_text = &self.buffer.clone();
@@ -230,5 +230,15 @@ impl ToolParser for LlamaParser {
 
     fn get_unstreamed_tool_args(&self) -> Option<Vec<crate::tool_parser::types::ToolCallItem>> {
         helpers::get_unstreamed_args(&self.prev_tool_call_arr, &self.streamed_args_for_tool)
+    }
+
+    fn reset(&mut self) {
+        helpers::reset_parser_state(
+            &mut self.buffer,
+            &mut self.prev_tool_call_arr,
+            &mut self.current_tool_id,
+            &mut self.current_tool_name_sent,
+            &mut self.streamed_args_for_tool,
+        );
     }
 }
