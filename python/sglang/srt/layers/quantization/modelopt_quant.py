@@ -95,17 +95,20 @@ class ModelOptFp8Config(QuantizationConfig):
 
     def __init__(
         self,
+        *,
         is_checkpoint_fp8_serialized: bool = False,
         kv_cache_quant_method: Optional[str] = None,
         exclude_modules: Optional[List[str]] = None,
+        packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
     ) -> None:
         """
         Args:
             is_checkpoint_fp8_serialized (bool): Indicates if the checkpoint uses serialized FP8 format.
         """
+        super().__init__(packed_modules_mapping=packed_modules_mapping)
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
         self.kv_cache_quant_method = kv_cache_quant_method
-        self.exclude_modules = exclude_modules
+        self.exclude_modules = exclude_modules or []
         if is_checkpoint_fp8_serialized:
             logger.warning(
                 "Detected ModelOpt FP8 checkpoint. The format is experimental and subject to change."
@@ -181,6 +184,19 @@ class ModelOptFp8Config(QuantizationConfig):
             is_checkpoint_fp8_serialized=True,
             kv_cache_quant_method=kv_cache_quant_method,
             exclude_modules=exclude_modules,
+            packed_modules_mapping=config.get("packed_modules_mapping"),
+        )
+
+    def is_layer_excluded(self, prefix: str) -> bool:
+        if len(self.exclude_modules) == 0:
+            return False
+        return any(
+            module in prefix
+            or (
+                prefix.startswith("language_model.")
+                and module in prefix.removeprefix("language_model.")
+            )
+            for module in self.exclude_modules
         )
 
     def get_quant_method(
@@ -190,16 +206,10 @@ class ModelOptFp8Config(QuantizationConfig):
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
-        if self.exclude_modules and any(
-            module in prefix
-            or (
-                prefix.startswith("language_model.")
-                and module in prefix.removeprefix("language_model.")
-            )
-            for module in self.exclude_modules
-        ):
-            return None
-
+        if is_layer_skipped(
+            prefix, self.exclude_modules, self.packed_modules_mapping
+        ) or self.is_layer_excluded(prefix):
+            return UnquantizedLinearMethod()
         if isinstance(layer, LinearBase):
             return ModelOptFp8LinearMethod(self)
         if self.kv_cache_quant_method and isinstance(layer, RadixAttention):
@@ -512,11 +522,14 @@ class ModelOptFp4Config(QuantizationConfig):
 
     def __init__(
         self,
+        *,
         is_checkpoint_nvfp4_serialized: bool = False,
         kv_cache_quant_algo: str = None,
         group_size: int = None,
         exclude_modules: List[str] = None,
+        packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
     ) -> None:
+        super().__init__(packed_modules_mapping=packed_modules_mapping)
         self.is_checkpoint_nvfp4_serialized = is_checkpoint_nvfp4_serialized
         if is_checkpoint_nvfp4_serialized:
             logger.warning(
@@ -645,10 +658,11 @@ class ModelOptFp4Config(QuantizationConfig):
                 "kv_cache_quant_algo specified in the quantization config"
             )
         return cls(
-            is_checkpoint_nvfp4_serialized,
-            kv_cache_quant_algo,
-            group_size,
-            exclude_modules,
+            is_checkpoint_nvfp4_serialized=is_checkpoint_nvfp4_serialized,
+            kv_cache_quant_algo=kv_cache_quant_algo,
+            group_size=group_size,
+            exclude_modules=exclude_modules,
+            packed_modules_mapping=config.get("packed_modules_mapping"),
         )
 
     def is_layer_excluded(self, prefix: str, exclude_modules: list):

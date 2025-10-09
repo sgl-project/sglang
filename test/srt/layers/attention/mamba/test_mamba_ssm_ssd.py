@@ -1,6 +1,8 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/633f943e30a4444d890d26b81850f7217736f840/tests/kernels/mamba/test_mamba_ssm_ssd.py
 
 
+import unittest
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -579,3 +581,7 @@ def test_mamba_chunk_scan_cont_batch_prefill_chunking(chunk_size, seqlens):
             rtol=rtol,
             msg=lambda x: f"seq{i} state " + x,
         )  # noqa: B023
+
+
+if __name__ == "__main__":
+    unittest.main()

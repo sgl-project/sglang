@@ -1,6 +1,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/main/tests/kernels/mamba/test_causal_conv1d.py
 
 
+import unittest
 from typing import Optional
 
 import pytest
@@ -373,3 +374,7 @@ def test_causal_conv1d_varlen(
     )
     unpadded_out = out[:, : out_ref_tensor.shape[-1]]
     assert torch.allclose(unpadded_out, out_ref_tensor, rtol=rtol, atol=atol)
+
+
+if __name__ == "__main__":
+    unittest.main()
