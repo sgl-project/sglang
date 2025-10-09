@@ -238,7 +238,15 @@ pub(super) async fn delete_conversation(
     {
         Ok(_) => {
             info!(conversation_id = %conversation_id.0, "Deleted conversation");
-            (StatusCode::OK, Json(json!({"status": "deleted"}))).into_response()
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "id": conversation_id.0,
+                    "object": "conversation.deleted",
+                    "deleted": true
+                })),
+            )
+                .into_response()
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
