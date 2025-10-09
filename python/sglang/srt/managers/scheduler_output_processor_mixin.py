@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import threading
 import time
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
@@ -263,8 +262,17 @@ class SchedulerOutputProcessorMixin:
             if self.enable_overlap and req.finished():
                 if self.page_size == 1:
                     if batch.spec_algorithm.is_eagle():
-                        # TODO(lsyin): free_spec_dec_tokens_page_size_1
-                        raise NotImplementedError()
+                        from sglang.srt.speculative.eagle_worker_v2 import (
+                            free_spec_dec_tokens_page_size_1,
+                        )
+
+                        free_spec_dec_tokens_page_size_1(
+                            self.req_to_token_pool,
+                            self.token_to_kv_pool_allocator,
+                            req,
+                            last_batch_allocate_lens_cpu[i],
+                            None,
+                        )
                     else:
                         # Free the one extra delayed token
                         self.token_to_kv_pool_allocator.free(
@@ -297,8 +305,23 @@ class SchedulerOutputProcessorMixin:
                     # FIXME(lsyin): fix the messy logic here
                     # 1) when not overlap (v2 impl), we free the extra tokens in the req
                     # 2) when overlap and current batch is extend, we free the extra tokens in the req of the previous batch
-                    # TODO(lsyin): free_spec_dec_tokens_page_size_1
-                    raise NotImplementedError()
+                    from sglang.srt.speculative.eagle_worker_v2 import (
+                        free_spec_dec_tokens_page_size_1,
+                    )
+
+                    new_seq_len = len(req.origin_input_ids) + len(req.output_ids)
+                    # FIXME(lsyin): remove this assert
+                    assert (
+                        new_seq_len == batch.seq_lens_cpu[i] + accept_lens_cpu[i]
+                    ), f"{new_seq_len=} vs {batch.seq_lens_cpu[i] + accept_lens_cpu[i]=}"
+
+                    free_spec_dec_tokens_page_size_1(
+                        self.req_to_token_pool,
+                        self.token_to_kv_pool_allocator,
+                        req,
+                        last_batch_allocate_lens_cpu[i],
+                        new_seq_len,
+                    )
 
                 if self.server_args.disaggregation_decode_enable_offload_kvcache:
                     # Asynchronously offload KV cache; cache_finished_req will be called after Device->Host transfer completes
