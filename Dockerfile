@@ -16,15 +16,10 @@ ENV PATH="${CUDA_HOME}/bin:${PATH}"
 # Safe NCCL defaults and async error handling
 ENV TORCH_NCCL_ASYNC_ERROR_HANDLING=1 \
     NCCL_DEBUG=INFO \
-    NCCL_DEBUG_SUBSYS=INIT,ENV,SHM,P2P,NET \
-    NCCL_P2P_LEVEL=SYS \
     NCCL_IB_DISABLE=1 \
-    NCCL_P2P_DISABLE=1 \
-    NCCL_SHM_DISABLE=1 \
-    NCCL_BUFFSIZE=1048576 \
-    NCCL_MIN_NCHANNELS=1 \
-    NCCL_MAX_NCHANNELS=1
-
+    NCCL_SHM_DISABLE=0 \
+    NCCL_P2P_DISABLE=0
+# Let NCCL auto-tune: do NOT set MIN/MAX_NCHANNELS or BUFFSIZE
 # Install deps, breaking this out to optimize cache hits
 COPY python/pyproject.toml /opt/sglang-src/python/pyproject.toml
 RUN pip install --no-cache-dir tomli && \
@@ -34,12 +29,12 @@ RUN pip install --no-cache-dir tomli && \
 COPY .hathora_build/app/requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r ./requirements.txt
 
+COPY python /opt/sglang-src/python
+RUN pip install --no-cache-dir -e /opt/sglang-src/python[all]
+
 # Move app code and build. 
 COPY .hathora_build/app/* /app/
 RUN chmod +x /app/entrypoint.sh
-
-COPY python /opt/sglang-src/python
-RUN pip install --no-cache-dir -e /opt/sglang-src/python[all]
 
 EXPOSE 8000
 

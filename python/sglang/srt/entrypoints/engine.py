@@ -18,6 +18,7 @@ This file implements python APIs for the inference engine.
 """
 
 import asyncio
+import tempfile
 import atexit
 import dataclasses
 import logging
@@ -849,6 +850,9 @@ def _launch_subprocesses(
 
     # Init tokenizer manager first, as the bootstrap server is initialized here
     if server_args.tokenizer_worker_num > 1:
+        # Ensure IPC endpoint for multi-tokenizer workers is set
+        if getattr(port_args, "tokenizer_worker_ipc_name", None) is None:
+            port_args.tokenizer_worker_ipc_name = f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
         # Launch multi-tokenizer router
         tokenizer_manager = MultiTokenizerRouter(server_args, port_args)
         template_manager = None
