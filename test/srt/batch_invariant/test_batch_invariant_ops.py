@@ -59,33 +59,30 @@ class TestBatchInvariantOps(CustomTestCase):
 
         # Check for NaN values
         self.assertFalse(
-            math.isnan(max_diff),
-            f"{test_name}: max_diff is NaN for {dtype}"
+            math.isnan(max_diff), f"{test_name}: max_diff is NaN for {dtype}"
         )
         self.assertFalse(
-            math.isnan(min_diff),
-            f"{test_name}: min_diff is NaN for {dtype}"
+            math.isnan(min_diff), f"{test_name}: min_diff is NaN for {dtype}"
         )
         self.assertFalse(
-            math.isnan(diff_range),
-            f"{test_name}: diff_range is NaN for {dtype}"
+            math.isnan(diff_range), f"{test_name}: diff_range is NaN for {dtype}"
         )
 
         # Check that all diffs are exactly 0
         self.assertEqual(
             max_diff,
             0.0,
-            f"{test_name}: max_diff must be 0 in batch-invariant mode, got {max_diff} for {dtype}"
+            f"{test_name}: max_diff must be 0 in batch-invariant mode, got {max_diff} for {dtype}",
         )
         self.assertEqual(
             min_diff,
             0.0,
-            f"{test_name}: min_diff must be 0 in batch-invariant mode, got {min_diff} for {dtype}"
+            f"{test_name}: min_diff must be 0 in batch-invariant mode, got {min_diff} for {dtype}",
         )
         self.assertEqual(
             diff_range,
             0.0,
-            f"{test_name}: diff_range must be 0 in batch-invariant mode, got {diff_range} for {dtype}"
+            f"{test_name}: diff_range must be 0 in batch-invariant mode, got {diff_range} for {dtype}",
         )
 
     def test_small_matrices(self):
@@ -105,9 +102,7 @@ class TestBatchInvariantOps(CustomTestCase):
                             difflist = self._run_multiple_iterations(
                                 iters=5, M=M, K=K, N=N, dtype=dtype
                             )
-                            self._assert_batch_invariant_results(
-                                difflist, dtype, name
-                            )
+                            self._assert_batch_invariant_results(difflist, dtype, name)
 
     def test_medium_matrices(self):
         """Test batch invariance with medium matrix sizes"""
@@ -126,9 +121,7 @@ class TestBatchInvariantOps(CustomTestCase):
                             difflist = self._run_multiple_iterations(
                                 iters=5, M=M, K=K, N=N, dtype=dtype
                             )
-                            self._assert_batch_invariant_results(
-                                difflist, dtype, name
-                            )
+                            self._assert_batch_invariant_results(difflist, dtype, name)
 
     def test_large_matrices(self):
         """Test batch invariance with large matrix sizes"""
@@ -147,9 +140,7 @@ class TestBatchInvariantOps(CustomTestCase):
                             difflist = self._run_multiple_iterations(
                                 iters=5, M=M, K=K, N=N, dtype=dtype
                             )
-                            self._assert_batch_invariant_results(
-                                difflist, dtype, name
-                            )
+                            self._assert_batch_invariant_results(difflist, dtype, name)
 
     def test_without_batch_invariant_mode(self):
         """
@@ -161,7 +152,9 @@ class TestBatchInvariantOps(CustomTestCase):
 
         # Run without batch-invariant mode
         with set_batch_invariant_mode(False):
-            difflist = self._run_multiple_iterations(iters=5, M=M, K=K, N=N, dtype=dtype)
+            difflist = self._run_multiple_iterations(
+                iters=5, M=M, K=K, N=N, dtype=dtype
+            )
 
 
 if __name__ == "__main__":
