@@ -328,10 +328,9 @@ pub fn handle_json_tool_streaming(
         // Update prev_tool_call_arr with current state
         if *current_tool_id >= 0 {
             ensure_capacity(*current_tool_id, prev_tool_call_arr, streamed_args_for_tool);
-            let update_tool_id = *current_tool_id as usize;
 
-            if update_tool_id < prev_tool_call_arr.len() {
-                prev_tool_call_arr[update_tool_id] = current_tool_call;
+            if tool_id < prev_tool_call_arr.len() {
+                prev_tool_call_arr[tool_id] = current_tool_call;
             }
         }
 
