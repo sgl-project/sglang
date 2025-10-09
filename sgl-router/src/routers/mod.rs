@@ -19,6 +19,7 @@ pub mod factory;
 pub mod grpc;
 pub mod header_utils;
 pub mod http;
+pub mod openai; // New refactored OpenAI router module
 pub mod router_manager;
 
 pub use factory::RouterFactory;
