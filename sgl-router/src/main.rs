@@ -99,7 +99,7 @@ Examples:
 
 "#)]
 struct CliArgs {
-    #[arg(long, default_value = "127.0.0.1")]
+    #[arg(long, default_value = "0.0.0.0")]
     host: String,
 
     #[arg(long, default_value_t = 30000)]
@@ -183,7 +183,7 @@ struct CliArgs {
     #[arg(long, default_value_t = 29000)]
     prometheus_port: u16,
 
-    #[arg(long, default_value = "127.0.0.1")]
+    #[arg(long, default_value = "0.0.0.0")]
     prometheus_host: String,
 
     #[arg(long, num_args = 0..)]
@@ -281,6 +281,12 @@ struct CliArgs {
 
     #[arg(long, env = "ATP_POOL_TIMEOUT_SECS")]
     oracle_pool_timeout_secs: Option<u64>,
+
+    #[arg(long)]
+    reasoning_parser: Option<String>,
+
+    #[arg(long)]
+    tool_call_parser: Option<String>,
 }
 
 enum OracleConnectSource {
@@ -557,6 +563,8 @@ impl CliArgs {
             tokenizer_path: self.tokenizer_path.clone(),
             history_backend,
             oracle,
+            reasoning_parser: self.reasoning_parser.clone(),
+            tool_call_parser: self.tool_call_parser.clone(),
         })
     }
 
