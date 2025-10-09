@@ -535,8 +535,7 @@ pub(super) fn inject_mcp_metadata_streaming(
 ) {
     if let Some(output_array) = response.get_mut("output").and_then(|v| v.as_array_mut()) {
         output_array.retain(|item| {
-            item.get("type").and_then(|t| t.as_str())
-                != Some(event_types::ITEM_TYPE_MCP_LIST_TOOLS)
+            item.get("type").and_then(|t| t.as_str()) != Some(event_types::ITEM_TYPE_MCP_LIST_TOOLS)
         });
 
         let list_tools_item = build_mcp_list_tools_item(mcp, server_label);
@@ -615,9 +614,7 @@ pub(super) async fn execute_tool_loop(
             .map_err(|e| format!("parse response: {}", e))?;
 
         // Check for function call
-        if let Some((call_id, tool_name, args_json_str)) =
-            extract_function_call(&response_json)
-        {
+        if let Some((call_id, tool_name, args_json_str)) = extract_function_call(&response_json) {
             state.iteration += 1;
             state.total_calls += 1;
 
@@ -738,10 +735,7 @@ pub(super) fn build_incomplete_response(
         .ok_or_else(|| "response not an object".to_string())?;
 
     // Set status to completed (not failed - partial success)
-    obj.insert(
-        "status".to_string(),
-        Value::String("completed".to_string()),
-    );
+    obj.insert("status".to_string(), Value::String("completed".to_string()));
 
     // Set incomplete_details
     obj.insert(
@@ -841,10 +835,7 @@ pub(super) fn generate_mcp_id(prefix: &str) -> String {
 }
 
 /// Build an mcp_list_tools output item
-pub(super) fn build_mcp_list_tools_item(
-    mcp: &Arc<McpClientManager>,
-    server_label: &str,
-) -> Value {
+pub(super) fn build_mcp_list_tools_item(mcp: &Arc<McpClientManager>, server_label: &str) -> Value {
     let tools = mcp.list_tools();
     let tools_json: Vec<Value> = tools
         .iter()
@@ -902,9 +893,7 @@ pub(super) fn build_executed_mcp_call_items(
     let mut mcp_call_items = Vec::new();
 
     for item in conversation_history {
-        if item.get("type").and_then(|t| t.as_str())
-            == Some(event_types::ITEM_TYPE_FUNCTION_CALL)
-        {
+        if item.get("type").and_then(|t| t.as_str()) == Some(event_types::ITEM_TYPE_FUNCTION_CALL) {
             let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
             let tool_name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let args = item

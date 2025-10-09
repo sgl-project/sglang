@@ -576,9 +576,10 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                         });
 
                         // Convert output to conversation items
-                        if let Ok(raw) = serde_json::from_value::<Value>(stored.raw_response.clone()) {
-                            if let Some(output_arr) = raw.get("output").and_then(|v| v.as_array())
-                            {
+                        if let Ok(raw) =
+                            serde_json::from_value::<Value>(stored.raw_response.clone())
+                        {
+                            if let Some(output_arr) = raw.get("output").and_then(|v| v.as_array()) {
                                 for item in output_arr {
                                     if let Ok(output_item) =
                                         serde_json::from_value::<ResponseInputOutputItem>(
@@ -623,14 +624,22 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                 after: None,
             };
 
-            match self.conversation_item_storage.list_items(&conv_id, params).await {
+            match self
+                .conversation_item_storage
+                .list_items(&conv_id, params)
+                .await
+            {
                 Ok(stored_items) => {
                     let mut items: Vec<ResponseInputOutputItem> = Vec::new();
                     for item in stored_items.into_iter() {
                         // Only use message items for conversation context
                         // Skip non-message items (reasoning, function calls, etc.)
                         if item.item_type == "message" {
-                            if let Ok(content_parts) = serde_json::from_value::<Vec<ResponseContentPart>>(item.content.clone()) {
+                            if let Ok(content_parts) =
+                                serde_json::from_value::<Vec<ResponseContentPart>>(
+                                    item.content.clone(),
+                                )
+                            {
                                 items.push(ResponseInputOutputItem::Message {
                                     id: item.id.0.clone(),
                                     role: item.role.clone().unwrap_or_else(|| "user".to_string()),
@@ -672,11 +681,14 @@ impl crate::routers::RouterTrait for OpenAIRouter {
             match &request_body.input {
                 ResponseInput::Text(text) => {
                     items.push(ResponseInputOutputItem::Message {
-                        id: format!("msg_u_{}", original_previous_response_id.as_ref().unwrap_or(&"new".to_string())),
+                        id: format!(
+                            "msg_u_{}",
+                            original_previous_response_id
+                                .as_ref()
+                                .unwrap_or(&"new".to_string())
+                        ),
                         role: "user".to_string(),
-                        content: vec![ResponseContentPart::InputText {
-                            text: text.clone(),
-                        }],
+                        content: vec![ResponseContentPart::InputText { text: text.clone() }],
                         status: Some("completed".to_string()),
                     });
                 }

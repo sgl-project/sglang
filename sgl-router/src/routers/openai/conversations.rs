@@ -2,15 +2,14 @@
 
 use crate::data_connector::{
     conversation_items::ListParams, conversation_items::SortOrder, Conversation, ConversationId,
-    ConversationItemStorage, ConversationStorage, NewConversation, NewConversationItem,
-    ResponseId, ResponseStorage, SharedConversationItemStorage, SharedConversationStorage,
-    StoredResponse,
+    ConversationItemStorage, ConversationStorage, NewConversation, NewConversationItem, ResponseId,
+    ResponseStorage, SharedConversationItemStorage, SharedConversationStorage, StoredResponse,
 };
-use chrono::Utc;
 use crate::protocols::spec::{ResponseInput, ResponsesRequest};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use chrono::Utc;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -61,11 +60,7 @@ pub(super) async fn create_conversation(
     match conversation_storage.create_conversation(new_conv).await {
         Ok(conversation) => {
             info!(conversation_id = %conversation.id.0, "Created conversation");
-            (
-                StatusCode::OK,
-                Json(conversation_to_json(&conversation)),
-            )
-                .into_response()
+            (StatusCode::OK, Json(conversation_to_json(&conversation))).into_response()
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -450,8 +445,13 @@ async fn persist_items_with_storages(
         ResponseInput::Items(items_array) => {
             for input_item in items_array {
                 match input_item {
-                    crate::protocols::spec::ResponseInputOutputItem::Message { role, content, status, .. } => {
-                        let content_v = serde_json::to_value(&content)
+                    crate::protocols::spec::ResponseInputOutputItem::Message {
+                        role,
+                        content,
+                        status,
+                        ..
+                    } => {
+                        let content_v = serde_json::to_value(content)
                             .map_err(|e| format!("Failed to serialize content: {}", e))?;
                         let new_item = NewConversationItem {
                             id: None,
