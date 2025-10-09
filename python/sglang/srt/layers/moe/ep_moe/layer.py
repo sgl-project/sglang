@@ -67,8 +67,8 @@ if not (_is_npu or _is_hip):
     from sgl_kernel import silu_and_mul
 
 if _use_aiter:
-    import aiter
     from aiter import ActivationType, QuantType
+    from aiter import dtype as aiter_dtypes
     from aiter.fused_moe import fused_moe
 
 logger = logging.getLogger(__name__)
@@ -966,6 +966,7 @@ class MoRIEPMoE(EPMoE):
 
         if _use_aiter:
             assert not _is_npu, f"MoRI does not support npu devices."
+            assert not is_cuda(), f"MoRI does not support cuda environment."
 
             # expert_mask is of size (self.num_local_experts + 1),
             # the extra 1 is for invalid rank_id (in original deepep, the invalid rank_id is -1,
@@ -993,7 +994,7 @@ class MoRIEPMoE(EPMoE):
         forward_batch: ForwardBatch,
     ):
         assert self.quant_method is not None
-        if self.moe_ep_size > 1 and not self.enable_flashinfer_cutlass_moe:
+        if self.moe_ep_size > 1:
             if self.expert_map_cpu is not None and self.expert_map_gpu is None:
                 # If we are in EP mode, we need to move the expert map to GPU.
                 self.expert_map_gpu = self.expert_map_cpu.to(device="cuda")
@@ -1170,7 +1171,7 @@ class MoRIEPMoE(EPMoE):
                 if self.moe_runner_config.activation == "silu"
                 else ActivationType.Gelu
             ),
-            dtype=aiter.dtypes.bf16,
+            dtype=aiter_dtypes.bf16,
             expert_mask=self.expert_mask,
         )
 
@@ -1268,7 +1269,10 @@ def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
     if get_moe_a2a_backend().is_deepep():
         return DeepEPMoE
 
-    if get_moe_a2a_backend().is_mori():
+    if (
+        get_moe_a2a_backend().is_mori()
+        and not get_moe_runner_backend().is_flashinfer_trtllm()
+    ):
         return MoRIEPMoE
 
     # NEW: Direct FP4 detection (bypasses EP requirements)
