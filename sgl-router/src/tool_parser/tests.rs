@@ -7,7 +7,7 @@ use crate::tool_parser::traits::ToolParser;
 
 #[tokio::test]
 async fn test_tool_parser_factory() {
-    let factory = ToolParserFactory::new();
+    let factory = ParserFactory::new();
 
     // Test that we can get a pooled parser
     let pooled_parser = factory.get_pooled("gpt-4");
@@ -17,7 +17,7 @@ async fn test_tool_parser_factory() {
 
 #[tokio::test]
 async fn test_tool_parser_factory_model_mapping() {
-    let factory = ToolParserFactory::new();
+    let factory = ParserFactory::new();
 
     // Test model mapping
     factory.registry().map_model("test-model", "json");
@@ -244,7 +244,7 @@ fn test_json_parser_format_detection() {
 
 #[tokio::test]
 async fn test_factory_with_json_parser() {
-    let factory = ToolParserFactory::new();
+    let factory = ParserFactory::new();
 
     // Should get JSON parser for OpenAI models
     let pooled_parser = factory.get_pooled("gpt-4-turbo");

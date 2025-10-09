@@ -34,8 +34,8 @@ use tokio::sync::mpsc;
 #[derive(Clone)]
 pub struct StreamingProcessor {
     tokenizer: Arc<dyn Tokenizer>,
-    tool_parser_factory: crate::tool_parser::ToolParserFactory,
-    reasoning_parser_factory: crate::reasoning_parser::ReasoningParserFactory,
+    tool_parser_factory: crate::tool_parser::ParserFactory,
+    reasoning_parser_factory: crate::reasoning_parser::ParserFactory,
     configured_tool_parser: Option<String>,
     configured_reasoning_parser: Option<String>,
 }
@@ -43,8 +43,8 @@ pub struct StreamingProcessor {
 impl StreamingProcessor {
     pub fn new(
         tokenizer: Arc<dyn Tokenizer>,
-        tool_parser_factory: crate::tool_parser::ToolParserFactory,
-        reasoning_parser_factory: crate::reasoning_parser::ReasoningParserFactory,
+        tool_parser_factory: crate::tool_parser::ParserFactory,
+        reasoning_parser_factory: crate::reasoning_parser::ParserFactory,
         configured_tool_parser: Option<String>,
         configured_reasoning_parser: Option<String>,
     ) -> Self {

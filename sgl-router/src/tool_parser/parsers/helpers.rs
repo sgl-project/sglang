@@ -2,7 +2,7 @@ use crate::protocols::spec::Tool;
 use serde_json::Value;
 use std::collections::HashMap;
 
-use crate::tool_parser::errors::{ToolParserError, ToolParserResult};
+use crate::tool_parser::errors::{ParserError, ParserResult};
 use crate::tool_parser::types::{StreamingParseResult, ToolCallItem};
 
 /// Get a mapping of tool names to their indices
@@ -190,7 +190,7 @@ pub fn normalize_arguments_field(mut obj: Value) -> Value {
 ///
 /// # Returns
 /// - `Ok(StreamingParseResult)` with any tool call items to stream
-/// - `Err(ToolParserError)` if JSON parsing or serialization fails
+/// - `Err(ParserError)` if JSON parsing or serialization fails
 #[allow(clippy::too_many_arguments)]
 pub fn handle_json_tool_streaming(
     current_text: &str,
@@ -202,7 +202,7 @@ pub fn handle_json_tool_streaming(
     current_tool_name_sent: &mut bool,
     streamed_args_for_tool: &mut Vec<String>,
     prev_tool_call_arr: &mut Vec<Value>,
-) -> ToolParserResult<StreamingParseResult> {
+) -> ParserResult<StreamingParseResult> {
     // Check if we have content to parse
     if start_idx >= current_text.len() {
         return Ok(StreamingParseResult::default());
@@ -274,7 +274,7 @@ pub fn handle_json_tool_streaming(
         let tool_id = *current_tool_id as usize;
         let sent = streamed_args_for_tool.get(tool_id).map(|s| s.len()).unwrap_or(0);
         let cur_args_json = serde_json::to_string(cur_arguments)
-            .map_err(|e| ToolParserError::ParsingFailed(e.to_string()))?;
+            .map_err(|e| ParserError::ParsingFailed(e.to_string()))?;
 
         // Get prev_arguments (matches Python's structure)
         let prev_arguments = if tool_id < prev_tool_call_arr.len() {
@@ -296,7 +296,7 @@ pub fn handle_json_tool_streaming(
             };
         } else if let Some(prev_args) = prev_arguments {
             let prev_args_json = serde_json::to_string(prev_args)
-                .map_err(|e| ToolParserError::ParsingFailed(e.to_string()))?;
+                .map_err(|e| ParserError::ParsingFailed(e.to_string()))?;
 
             if cur_args_json != prev_args_json {
                 let prefix = find_common_prefix(&prev_args_json, &cur_args_json);

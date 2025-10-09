@@ -1,6 +1,6 @@
 use crate::protocols::spec::Tool;
 use crate::tool_parser::{
-    errors::ToolParserResult,
+    errors::ParserResult,
     types::{StreamingParseResult, ToolCall},
 };
 use async_trait::async_trait;
@@ -10,7 +10,7 @@ use async_trait::async_trait;
 pub trait ToolParser: Send + Sync {
     /// Parse complete tool calls from final output
     /// Returns (remaining_normal_text, tool_calls) tuple
-    async fn parse_complete(&self, output: &str) -> ToolParserResult<(String, Vec<ToolCall>)>;
+    async fn parse_complete(&self, output: &str) -> ParserResult<(String, Vec<ToolCall>)>;
 
     /// Parse tool calls from model output (streaming)
     /// Parsers now maintain internal state, so self is mutable
@@ -22,7 +22,7 @@ pub trait ToolParser: Send + Sync {
         &mut self,
         chunk: &str,
         tools: &[Tool],
-    ) -> ToolParserResult<StreamingParseResult>;
+    ) -> ParserResult<StreamingParseResult>;
 
     /// Check if text contains tool calls in this parser's format
     fn has_tool_markers(&self, text: &str) -> bool;
@@ -49,7 +49,7 @@ pub trait ToolParser: Send + Sync {
 /// Trait for partial JSON parsing
 pub trait PartialJsonParser: Send + Sync {
     /// Parse potentially incomplete JSON
-    fn parse(&self, input: &str) -> ToolParserResult<(serde_json::Value, usize)>;
+    fn parse(&self, input: &str) -> ParserResult<(serde_json::Value, usize)>;
 
     /// Check if JSON is complete
     fn is_complete(&self, input: &str) -> bool;
@@ -64,7 +64,7 @@ pub trait TokenToolParser: ToolParser {
     async fn parse_complete_tokens(
         &self,
         tokens: &[u32],
-    ) -> ToolParserResult<(String, Vec<ToolCall>)>;
+    ) -> ParserResult<(String, Vec<ToolCall>)>;
 
     /// Streaming parser entrypoint for token chunks.
     /// Parsers maintain internal state, so self is mutable
@@ -72,5 +72,5 @@ pub trait TokenToolParser: ToolParser {
         &mut self,
         tokens: &[u32],
         tools: &[Tool],
-    ) -> ToolParserResult<StreamingParseResult>;
+    ) -> ParserResult<StreamingParseResult>;
 }

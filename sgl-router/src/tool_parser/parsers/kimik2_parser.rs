@@ -5,7 +5,7 @@ use serde_json::Value;
 use crate::protocols::spec::Tool;
 
 use crate::tool_parser::{
-    errors::ToolParserResult,
+    errors::ParserResult,
     parsers::helpers,
     traits::ToolParser,
     types::{FunctionCall, StreamingParseResult, ToolCall, ToolCallItem},
@@ -102,7 +102,7 @@ impl Default for KimiK2Parser {
 
 #[async_trait]
 impl ToolParser for KimiK2Parser {
-    async fn parse_complete(&self, text: &str) -> ToolParserResult<(String, Vec<ToolCall>)> {
+    async fn parse_complete(&self, text: &str) -> ParserResult<(String, Vec<ToolCall>)> {
         if !self.has_tool_markers(text) {
             return Ok((text.to_string(), vec![]));
         }
@@ -161,7 +161,7 @@ impl ToolParser for KimiK2Parser {
         &mut self,
         chunk: &str,
         tools: &[Tool],
-    ) -> ToolParserResult<StreamingParseResult> {
+    ) -> ParserResult<StreamingParseResult> {
         self.buffer.push_str(chunk);
         let current_text = &self.buffer.clone();
 

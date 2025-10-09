@@ -11,25 +11,25 @@ use crate::tool_parser::parsers::{
 use crate::tool_parser::traits::ToolParser;
 
 /// Type alias for pooled parser instances.
-pub type PooledToolParser = Arc<Mutex<Box<dyn ToolParser>>>;
+pub type PooledParser = Arc<Mutex<Box<dyn ToolParser>>>;
 
 /// Type alias for parser creator functions.
 type ParserCreator = Arc<dyn Fn() -> Box<dyn ToolParser> + Send + Sync>;
 
 /// Registry for model-specific tool parsers with pooling support.
 #[derive(Clone)]
-pub struct ToolParserRegistry {
+pub struct ParserRegistry {
     /// Creator functions for parsers (used when pool is empty)
     creators: Arc<RwLock<HashMap<String, ParserCreator>>>,
     /// Pooled parser instances for reuse
-    pool: Arc<RwLock<HashMap<String, PooledToolParser>>>,
+    pool: Arc<RwLock<HashMap<String, PooledParser>>>,
     /// Model pattern to parser name mappings
     model_mapping: Arc<RwLock<HashMap<String, String>>>,
     /// Default parser name
     default_parser: Arc<RwLock<String>>,
 }
 
-impl ToolParserRegistry {
+impl ParserRegistry {
     /// Create a new empty registry.
     pub fn new() -> Self {
         Self {
@@ -57,7 +57,7 @@ impl ToolParserRegistry {
 
     /// Get a pooled parser by exact name.
     /// Returns a shared parser instance from the pool, creating one if needed.
-    pub fn get_pooled_parser(&self, name: &str) -> Option<PooledToolParser> {
+    pub fn get_pooled_parser(&self, name: &str) -> Option<PooledParser> {
         // First check if we have a pooled instance
         {
             let pool = self.pool.read().unwrap();
@@ -123,7 +123,7 @@ impl ToolParserRegistry {
     }
 
     /// Get parser for a specific model
-    pub fn get_pooled_for_model(&self, model: &str) -> Option<PooledToolParser> {
+    pub fn get_pooled_for_model(&self, model: &str) -> Option<PooledParser> {
         // Try exact match first
         {
             let mapping = self.model_mapping.read().unwrap();
@@ -168,7 +168,7 @@ impl ToolParserRegistry {
     }
 }
 
-impl Default for ToolParserRegistry {
+impl Default for ParserRegistry {
     fn default() -> Self {
         Self::new()
     }
@@ -176,14 +176,14 @@ impl Default for ToolParserRegistry {
 
 /// Factory for creating tool parsers based on model type.
 #[derive(Clone)]
-pub struct ToolParserFactory {
-    registry: ToolParserRegistry,
+pub struct ParserFactory {
+    registry: ParserRegistry,
 }
 
-impl ToolParserFactory {
+impl ParserFactory {
     /// Create a new factory with default parsers registered.
     pub fn new() -> Self {
-        let registry = ToolParserRegistry::new();
+        let registry = ParserRegistry::new();
 
         // Register default parsers
         registry.register_parser("json", || Box::new(JsonParser::new()));
@@ -213,7 +213,7 @@ impl ToolParserFactory {
         Self { registry }
     }
 
-    fn register_default_mappings(registry: &ToolParserRegistry) {
+    fn register_default_mappings(registry: &ParserRegistry) {
         // OpenAI models
         registry.map_model("gpt-4*", "json");
         registry.map_model("gpt-3.5*", "json");
@@ -270,7 +270,7 @@ impl ToolParserFactory {
     /// Get a pooled parser for the given model ID.
     /// Returns a shared instance that can be used concurrently.
     /// Falls back to JSON parser if model is not recognized.
-    pub fn get_pooled(&self, model_id: &str) -> PooledToolParser {
+    pub fn get_pooled(&self, model_id: &str) -> PooledParser {
         self.registry
             .get_pooled_for_model(model_id)
             .unwrap_or_else(|| {
@@ -282,7 +282,7 @@ impl ToolParserFactory {
     }
 
     /// Get the internal registry for custom registration.
-    pub fn registry(&self) -> &ToolParserRegistry {
+    pub fn registry(&self) -> &ParserRegistry {
         &self.registry
     }
 
@@ -340,7 +340,7 @@ impl ToolParserFactory {
     }
 }
 
-impl Default for ToolParserFactory {
+impl Default for ParserFactory {
     fn default() -> Self {
         Self::new()
     }

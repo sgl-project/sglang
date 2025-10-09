@@ -679,12 +679,10 @@ pub fn generate_tool_call_id(
 /// Otherwise, auto-detect based on the model name.
 /// Get a pooled reasoning parser (for non-streaming where state doesn't matter)
 pub fn get_reasoning_parser(
-    reasoning_parser_factory: &crate::reasoning_parser::ReasoningParserFactory,
+    reasoning_parser_factory: &crate::reasoning_parser::ParserFactory,
     configured_parser: Option<&String>,
     model: &str,
 ) -> crate::reasoning_parser::PooledParser {
-    use tracing::warn;
-
     if let Some(parser_name) = configured_parser {
         // Use configured parser if specified
         reasoning_parser_factory
@@ -705,12 +703,10 @@ pub fn get_reasoning_parser(
 
 /// Create a fresh reasoning parser instance (for streaming where state isolation is needed)
 pub fn create_reasoning_parser(
-    reasoning_parser_factory: &crate::reasoning_parser::ReasoningParserFactory,
+    reasoning_parser_factory: &crate::reasoning_parser::ParserFactory,
     configured_parser: Option<&String>,
     model: &str,
 ) -> Option<Box<dyn crate::reasoning_parser::ReasoningParser>> {
-    use tracing::warn;
-
     if let Some(parser_name) = configured_parser {
         // Use configured parser if specified
         reasoning_parser_factory
@@ -735,12 +731,10 @@ pub fn create_reasoning_parser(
 /// Otherwise, auto-detect based on the model name.
 /// Get a pooled tool parser (for non-streaming where state doesn't matter)
 pub fn get_tool_parser(
-    tool_parser_factory: &crate::tool_parser::ToolParserFactory,
+    tool_parser_factory: &crate::tool_parser::ParserFactory,
     configured_parser: Option<&String>,
     model: &str,
-) -> crate::tool_parser::PooledToolParser {
-    use tracing::warn;
-
+) -> crate::tool_parser::PooledParser {
     if let Some(parser_name) = configured_parser {
         // Use configured parser if specified
         tool_parser_factory
@@ -761,12 +755,10 @@ pub fn get_tool_parser(
 
 /// Create a fresh tool parser instance (for streaming where state isolation is needed)
 pub fn create_tool_parser(
-    tool_parser_factory: &crate::tool_parser::ToolParserFactory,
+    tool_parser_factory: &crate::tool_parser::ParserFactory,
     configured_parser: Option<&String>,
     model: &str,
 ) -> Option<Box<dyn crate::tool_parser::ToolParser>> {
-    use tracing::warn;
-
     if let Some(parser_name) = configured_parser {
         // Use configured parser if specified
         tool_parser_factory
