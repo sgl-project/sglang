@@ -63,8 +63,8 @@ pub fn create_bug_scenario_chunks() -> Vec<&'static str> {
         r#"""#,
         r#":"#,
         r#" "#,
-        r#"""#,  // Bug occurs here: parser has {"name": "
-        r#"search"#,  // Use valid tool name
+        r#"""#,      // Bug occurs here: parser has {"name": "
+        r#"search"#, // Use valid tool name
         r#"""#,
         r#","#,
         r#" "#,
@@ -89,6 +89,7 @@ pub fn create_bug_scenario_chunks() -> Vec<&'static str> {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
     use super::*;
 
     #[test]
