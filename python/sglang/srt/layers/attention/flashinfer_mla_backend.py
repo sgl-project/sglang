@@ -132,9 +132,7 @@ class FlashInferMhaChunkKVRunner:
         # ragged prefill
         if not disable_flashinfer_ragged:
             kv_indptr = (
-                qo_indptr
-                if not forward_batch.mha_merge_prefix_extend
-                else self.kv_indptr[: bs + 1]
+                qo_indptr if not forward_batch.mha_one_hot else self.kv_indptr[: bs + 1]
             )
             self.ragged_wrapper.begin_forward(
                 qo_indptr=qo_indptr,

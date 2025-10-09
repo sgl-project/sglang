@@ -227,6 +227,10 @@ class AttnForwardMethod(IntEnum):
     # This method can avoid OOM when prefix lengths are long.
     MHA_CHUNKED_KV = auto()
 
+    # Use multi-head attention, execute the MHA for prefix and extended kv in one shot
+    # when the sequence lengths are below the threshold.
+    MHA_ONE_SHOT = auto()
+
     # Use MLA but with fused RoPE
     MLA_FUSED_ROPE = auto()
 
@@ -292,6 +296,14 @@ def _is_extend_without_speculative(forward_batch):
     )
 
 
+def _support_mha_one_shot(attn: DeepseekV2AttentionMLA, forward_batch, backend_name):
+    attn_supported = backend_name in ["fa3", "flashinfer", "flashmla"]
+    sum_seq_lens = (
+        sum(forward_batch.seq_lens_cpu) if forward_batch.seq_lens_cpu is not None else 0
+    )
+    return attn_supported and sum_seq_lens <= forward_batch.get_max_chunk_capacity()
+
+
 def _handle_attention_backend(
     attn: DeepseekV2AttentionMLA, forward_batch, backend_name
 ):
@@ -311,6 +323,8 @@ def _handle_attention_backend(
             or sum_extend_prefix_lens == 0
         )
     ):
+        if _support_mha_one_shot(attn, forward_batch, backend_name):
+            return AttnForwardMethod.MHA_ONE_SHOT
         return AttnForwardMethod.MHA_CHUNKED_KV
     else:
         return _dispatch_mla_subtype(attn, forward_batch)
@@ -1333,6 +1347,10 @@ class DeepseekV2AttentionMLA(nn.Module):
             inner_state = self.forward_normal_chunked_kv_prepare(
                 positions, hidden_states, forward_batch, zero_allocator
             )
+        elif attn_forward_method == AttnForwardMethod.MHA_ONE_SHOT:
+            inner_state = self.forward_normal_one_hot_prepare(
+                positions, hidden_states, forward_batch, zero_allocator
+            )
         elif attn_forward_method == AttnForwardMethod.MLA:
             if not self.is_mla_preprocess_enabled:
                 inner_state = self.forward_absorb_prepare(
@@ -1383,6 +1401,8 @@ class DeepseekV2AttentionMLA(nn.Module):
             return self.forward_normal_core(*inner_state)
         elif attn_forward_method == AttnForwardMethod.MHA_CHUNKED_KV:
             return self.forward_normal_chunked_kv_core(*inner_state)
+        elif attn_forward_method == AttnForwardMethod.MHA_ONE_SHOT:
+            return self.forward_normal_one_hot_core(*inner_state)
         elif attn_forward_method == AttnForwardMethod.MLA:
             return self.forward_absorb_core(*inner_state)
         elif attn_forward_method == AttnForwardMethod.NPU_MLA_SPARSE:
@@ -1422,12 +1442,9 @@ class DeepseekV2AttentionMLA(nn.Module):
         q[..., self.qk_nope_head_dim :] = q_pe
 
         self._set_mla_kv_buffer(latent_cache, kv_a, k_pe, forward_batch)
-        if (
-            forward_batch.mha_merge_prefix_extend
-            and sum(forward_batch.extend_prefix_lens_cpu) != 0
-        ):
+        if forward_batch.mha_one_hot and sum(forward_batch.extend_prefix_lens_cpu) != 0:
             kv_a, k_pe = self._get_mla_kv_buffer(
-                forward_batch.fetch_kv_indices(), q.dtype, forward_batch
+                forward_batch.fetch_mha_one_hot_kv_indices(), q.dtype, forward_batch
             )
         kv = self.kv_b_proj(kv_a)[0]
         kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
@@ -2284,13 +2301,6 @@ class DeepseekV2AttentionMLA(nn.Module):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ):
-        if forward_batch.mha_merge_prefix_extend is None:
-            supported_attn = self.current_attention_backend in ["fa3", "flashinfer"]
-            seq_sum = sum(forward_batch.seq_lens_cpu)
-            forward_batch.mha_merge_prefix_extend = (
-                supported_attn and seq_sum <= forward_batch.get_max_chunk_capacity()
-            )
-
         # In normal mha, the k and v tensors will become overly large when the prefix length is long.
         # To avoid this, we split the kv cache into chunks and process them one after another.
         # Since mha is compute friendly, the for loop induced here will not introduce significant overhead.
@@ -2303,9 +2313,6 @@ class DeepseekV2AttentionMLA(nn.Module):
         )
 
     def forward_normal_chunked_kv_core(self, q, k, v, forward_batch):
-        if forward_batch.mha_merge_prefix_extend:
-            return self.forward_normal_merge_kv_core(q, k, v, forward_batch)
-
         has_extend_prefix = any(forward_batch.extend_prefix_lens_cpu)
         # Only initialize the info once
         if has_extend_prefix and forward_batch.num_prefix_chunks is None:
@@ -2333,7 +2340,19 @@ class DeepseekV2AttentionMLA(nn.Module):
         output, _ = self.o_proj(attn_output)
         return output
 
-    def forward_normal_merge_kv_core(self, q, k, v, forward_batch):
+    def forward_normal_one_hot_prepare(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        zero_allocator: BumpAllocator,
+    ):
+        forward_batch.mha_one_hot = True
+        return self.forward_normal_prepare(
+            positions, hidden_states, forward_batch, zero_allocator
+        )
+
+    def forward_normal_one_hot_core(self, q, k, v, forward_batch):
         has_extend_prefix = any(forward_batch.extend_prefix_lens_cpu)
         # Only initialize the info once
         if has_extend_prefix and forward_batch.num_prefix_chunks is None:
@@ -3503,4 +3522,8 @@ class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):
     pass
 
 
-EntryClass = [DeepseekV2ForCausalLM, DeepseekV3ForCausalLM]
+class DeepseekV32ForCausalLM(DeepseekV2ForCausalLM):
+    pass
+
+
+EntryClass = [DeepseekV2ForCausalLM, DeepseekV3ForCausalLM, DeepseekV32ForCausalLM]

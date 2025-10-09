@@ -144,6 +144,7 @@ def concat_and_cast_mha_k_triton(
     k_nope: torch.Tensor,
     k_rope: torch.Tensor,
 ):
+    # The source data type will be implicitly converted to the target data type.
     assert (
         len(k.shape) == 3 and len(k_nope.shape) == 3 and len(k_rope.shape) == 3
     ), f"shape should be 3d, but got {k.shape=}, {k_nope.shape=}, {k_rope.shape=}"

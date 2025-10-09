@@ -1125,7 +1125,6 @@ def get_mla_kv_buffer_kernel(
     rope_stride: tl.constexpr,
     nope_dim: tl.constexpr,
     rope_dim: tl.constexpr,
-    dtype: tl.constexpr,
 ):
     pid_loc = tl.program_id(0)
     loc = tl.load(loc_ptr + pid_loc)
@@ -1134,8 +1133,6 @@ def get_mla_kv_buffer_kernel(
     nope_offs = tl.arange(0, nope_dim)
     nope_src_ptr = loc_src_ptr + nope_offs
     nope_src = tl.load(nope_src_ptr)
-    if dtype is not None:
-        nope_src = nope_src.to(dtype)
 
     tl.store(
         cache_k_nope_ptr + pid_loc * nope_stride + nope_offs,
@@ -1145,8 +1142,6 @@ def get_mla_kv_buffer_kernel(
     rope_offs = tl.arange(0, rope_dim)
     rope_src_ptr = loc_src_ptr + nope_dim + rope_offs
     rope_src = tl.load(rope_src_ptr)
-    if dtype is not None:
-        rope_src = rope_src.to(dtype)
     tl.store(
         cache_k_rope_ptr + pid_loc * rope_stride + rope_offs,
         rope_src,
@@ -1158,15 +1153,12 @@ def get_mla_kv_buffer_triton(
     loc: torch.Tensor,
     cache_k_nope: torch.Tensor,
     cache_k_rope: torch.Tensor,
-    dtype: torch.dtype,
 ):
+    # The source data type will be implicitly converted to the target data type.
     nope_dim = cache_k_nope.shape[-1]  # 512
     rope_dim = cache_k_rope.shape[-1]  # 64
     n_loc = loc.numel()
     grid = (n_loc,)
-
-    tl_dtype_map = {torch.float16: tl.float16, torch.bfloat16: tl.bfloat16}
-    tl_dtype = tl_dtype_map.get(dtype, None) if dtype != kv_buffer.dtype else None
 
     get_mla_kv_buffer_kernel[grid](
         kv_buffer,
@@ -1178,7 +1170,6 @@ def get_mla_kv_buffer_triton(
         cache_k_rope.stride(0),
         nope_dim,
         rope_dim,
-        dtype=tl_dtype,
     )
 
 
@@ -1354,6 +1345,7 @@ class MLATokenToKVPool(KVCache):
         loc: torch.Tensor,
         dst_dtype: Optional[torch.dtype] = None,
     ):
+        # get k nope and k rope from the kv buffer, and optionally cast them to dst_dtype.
         layer_id = layer.layer_id
         kv_buffer = self.get_key_buffer(layer_id)
         dst_dtype = dst_dtype or self.dtype
@@ -1367,7 +1359,7 @@ class MLATokenToKVPool(KVCache):
             dtype=dst_dtype,
             device=kv_buffer.device,
         )
-        get_mla_kv_buffer_triton(kv_buffer, loc, cache_k_nope, cache_k_rope, dst_dtype)
+        get_mla_kv_buffer_triton(kv_buffer, loc, cache_k_nope, cache_k_rope)
         return cache_k_nope, cache_k_rope
 
     def get_cpu_copy(self, indices):
