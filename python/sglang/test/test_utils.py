@@ -16,7 +16,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
-from functools import partial
+from functools import partial, wraps
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, List, Optional, Tuple
@@ -1802,3 +1802,33 @@ def write_results_to_json(model, metrics, mode="a"):
 
     with open("results.json", "w") as f:
         json.dump(existing_results, f, indent=2)
+
+
+def intel_amx_benchmark(extra_args=None, min_throughput=None):
+    def decorator(test_func):
+        @wraps(test_func)
+        def wrapper(self):
+            common_args = [
+                "--attention-backend",
+                "intel_amx",
+                "--disable-radix",
+                "--trust-remote-code",
+            ]
+            full_args = common_args + (extra_args or [])
+
+            model = test_func(self)
+            prefill_latency, decode_throughput, decode_latency = run_bench_one_batch(
+                model, full_args
+            )
+
+            print(f"{model=}")
+            print(f"{prefill_latency=}")
+            print(f"{decode_throughput=}")
+            print(f"{decode_latency=}")
+
+            if is_in_ci() and min_throughput is not None:
+                self.assertGreater(decode_throughput, min_throughput)
+
+        return wrapper
+
+    return decorator
