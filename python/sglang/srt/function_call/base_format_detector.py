@@ -268,8 +268,7 @@ class BaseFormatDetector(ABC):
                     elif prev_arguments:
                         prev_args_json = json.dumps(prev_arguments)
                         if cur_args_json != prev_args_json:
-                            prefix = _find_common_prefix(prev_args_json, cur_args_json)
-                            argument_diff = prefix[sent:]
+                            argument_diff = cur_args_json[sent:]
 
                     # Update prev_tool_call_arr with current state
                     if self.current_tool_id >= 0:
