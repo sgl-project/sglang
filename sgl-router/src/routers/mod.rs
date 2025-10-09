@@ -24,8 +24,8 @@ pub mod router_manager;
 
 pub use factory::RouterFactory;
 
-// Re-export HTTP routers for convenience (keeps routers::openai_router path working)
-pub use http::{openai_router, pd_router, pd_types, router};
+// Re-export HTTP routers for convenience
+pub use http::{pd_router, pd_types, router};
 
 /// Core trait for all router implementations
 ///
