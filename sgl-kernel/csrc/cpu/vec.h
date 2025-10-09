@@ -4,10 +4,6 @@
 #define CPU_CAPABILITY_AVX512
 #endif
 
-#if defined(__AVX512F__) && defined(__AVX512FP16__)
-#define CPU_CAPABILITY_AVX512_FP16
-#endif
-
 #include <ATen/cpu/vec/functional.h>
 #include <ATen/cpu/vec/vec.h>
 

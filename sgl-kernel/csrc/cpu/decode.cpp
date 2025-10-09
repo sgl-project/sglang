@@ -308,7 +308,7 @@ struct tinygemm_kernel_nt<at::BFloat16, index_t, BLOCK_M, BLOCK_N> {
 };
 #endif
 
-#if defined(CPU_CAPABILITY_AVX512_FP16)
+#if defined(CPU_CAPABILITY_AVX512)
 template <typename index_t, int BLOCK_M, int BLOCK_N>
 struct tinygemm_kernel_nt<at::Half, index_t, BLOCK_M, BLOCK_N> {
   static inline void apply(
@@ -538,7 +538,7 @@ struct tinygemm_kernel_nn<at::BFloat16, index_t, BLOCK_M, BLOCK_N> {
 };
 #endif
 
-#if defined(CPU_CAPABILITY_AVX512_FP16)
+#if defined(CPU_CAPABILITY_AVX512)
 template <typename index_t, int BLOCK_M, int BLOCK_N>
 struct tinygemm_kernel_nn<at::Half, index_t, BLOCK_M, BLOCK_N> {
   static inline void apply(
