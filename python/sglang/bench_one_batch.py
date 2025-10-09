@@ -60,7 +60,6 @@ import torch.distributed as dist
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed.parallel_state import destroy_distributed_environment
 from sglang.srt.entrypoints.engine import _set_envs_and_config
-from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
@@ -78,6 +77,7 @@ from sglang.srt.utils import (
     set_gpu_proc_affinity,
     suppress_other_loggers,
 )
+from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
 
 @dataclasses.dataclass
@@ -204,7 +204,6 @@ def prepare_inputs_for_correctness_test(bench_args, tokenizer, custom_prompts):
             origin_input_ids=tmp_input_ids,
             sampling_params=sampling_params,
         )
-        req.prefix_indices = []
         req.fill_ids = req.origin_input_ids
         req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
         req.logprob_start_len = len(req.origin_input_ids) - 1
@@ -248,7 +247,6 @@ def prepare_synthetic_inputs_for_latency_test(
             origin_input_ids=list(input_ids[i]),
             sampling_params=sampling_params,
         )
-        req.prefix_indices = []
         req.fill_ids = req.origin_input_ids
         req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
         req.logprob_start_len = len(req.origin_input_ids) - 1
