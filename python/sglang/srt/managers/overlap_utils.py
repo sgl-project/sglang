@@ -1,3 +1,6 @@
+from dataclasses import dataclass
+from typing import Optional
+
 import torch
 
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
@@ -11,6 +14,12 @@ def _resolve_future_token_ids(input_ids, future_token_ids_map):
         future_token_ids_map[torch.clamp(-input_ids, min=0)],
         input_ids,
     )
+
+
+@dataclass
+class FutureIndices:
+    indices: torch.Tensor
+    interval: Optional[slice] = None
 
 
 class FutureMap:
@@ -30,24 +39,17 @@ class FutureMap:
             (self.future_buffer_len,), dtype=torch.int64, device=self.device
         )
 
-    def update_ct(self, bs: int) -> int:
-        """Update the circular buffer pointer and return the current pointer."""
+    def alloc_future_indices(self, bs: int) -> FutureIndices:
+        """Update the circular buffer pointer and allocate future indices."""
         cur_future_ct = self.future_ct
         self.future_ct = (cur_future_ct + bs) % self.future_limit
-        return cur_future_ct
+        start = cur_future_ct + 1
+        end = cur_future_ct + 1 + bs
+        indices = torch.arange(start, end, dtype=torch.int64, device=self.device)
+        return FutureIndices(indices=indices, interval=slice(start, end))
 
     def resolve_future(self, model_worker_batch: ModelWorkerBatch):
-        input_ids = model_worker_batch.input_ids
-        _resolve_future_token_ids(input_ids, self.token_ids_buf)
+        _resolve_future_token_ids(model_worker_batch.input_ids, self.token_ids_buf)
 
-    def update_next_future(self, future_ct: int, bs: int):
-        return torch.arange(
-            -(future_ct + 1),
-            -(future_ct + 1 + bs),
-            -1,
-            dtype=torch.int64,
-            device=self.device,
-        )
-
-    def store_to_map(self, future_ct: int, bs: int, next_token_ids: torch.Tensor):
-        self.token_ids_buf[future_ct + 1 : future_ct + bs + 1] = next_token_ids
+    def store_to_map(self, future_indices: FutureIndices, next_token_ids: torch.Tensor):
+        self.token_ids_buf[future_indices.interval] = next_token_ids

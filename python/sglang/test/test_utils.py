@@ -20,7 +20,6 @@ from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, List, Optional, Tuple
-from urllib.parse import quote
 
 import aiohttp
 import numpy as np
@@ -509,6 +508,7 @@ def popen_launch_server(
     return_stdout_stderr: Optional[tuple] = None,
     device: str = "auto",
     pd_separated: bool = False,
+    num_replicas: Optional[int] = None,
 ):
     """Launch a server process with automatic device detection.
 
@@ -526,7 +526,8 @@ def popen_launch_server(
     _, host, port = base_url.split(":")
     host = host[2:]
 
-    if pd_separated:
+    use_mixed_pd_engine = not pd_separated and num_replicas is not None
+    if pd_separated or use_mixed_pd_engine:
         command = "sglang.launch_pd_server"
     else:
         command = "sglang.launch_server"
@@ -540,7 +541,7 @@ def popen_launch_server(
         *[str(x) for x in other_args],
     ]
 
-    if pd_separated:
+    if pd_separated or use_mixed_pd_engine:
         command.extend(
             [
                 "--lb-host",
@@ -556,6 +557,15 @@ def popen_launch_server(
                 host,
                 "--port",
                 port,
+            ]
+        )
+
+    if use_mixed_pd_engine:
+        command.extend(
+            [
+                "--mixed",
+                "--num-replicas",
+                str(num_replicas),
             ]
         )
 
@@ -1149,7 +1159,7 @@ def run_bench_offline_throughput(model, other_args):
         *[str(x) for x in other_args],
     ]
 
-    print(f"{command=}")
+    print(f"command={' '.join(command)}")
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
     try:
@@ -1641,15 +1651,26 @@ def _ensure_remove_suffix(text: str, suffix: str):
     return text.removesuffix(suffix)
 
 
-class ModelDeploySetup:
-    def __init__(self, model_path: str, extra_args: List[str] = []):
+class ModelLaunchSettings:
+    def __init__(
+        self,
+        model_path: str,
+        tp_size: int = 1,
+        extra_args: Optional[List[str]] = None,
+        env: Optional[dict] = None,
+    ):
         self.model_path = model_path
-        if "--enable-multimodal" not in extra_args:
-            extra_args.append("--enable-multimodal")
-        if "--trust-remote-code" not in extra_args:
-            extra_args.append("--trust-remote-code")
+        self.tp_size = tp_size
+        self.extra_args = list(extra_args) if extra_args else []
+        self.env = env
 
-        self.extra_args = extra_args
+        if self.tp_size > 1 and "--tp" not in self.extra_args:
+            self.extra_args.extend(["--tp", str(self.tp_size)])
+
+        fixed_args = ["--enable-multimodal", "--trust-remote-code"]
+        for fixed_arg in fixed_args:
+            if fixed_arg not in self.extra_args:
+                self.extra_args.append(fixed_arg)
 
 
 class ModelEvalMetrics:
