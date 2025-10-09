@@ -51,16 +51,24 @@ impl AbortOnDropStream {
     /// Manually mark the request as completed to prevent abort on drop.
     /// Call this when the request completes successfully to avoid unnecessary abort RPC.
     pub fn mark_completed(&self) {
-        self.aborted.store(true, Ordering::Relaxed);
+        // Use Release ordering to ensure that this write is visible to other threads
+        // that use Acquire on the same atomic variable
+        self.aborted.store(true, Ordering::Release);
         debug!("Request {} marked as completed", self.request_id);
     }
 }
 
 impl Drop for AbortOnDropStream {
     fn drop(&mut self) {
-        // Check if already aborted/completed
-        let already_handled = self.aborted.load(Ordering::Relaxed);
-        if already_handled {
+        // Atomically check and set the aborted flag using compare_exchange.
+        // If compare_exchange fails, it means the flag was already true (from mark_completed),
+        // so we don't need to send abort. AcqRel is used for success to synchronize with
+        // mark_completed's Release, and Acquire for failure to see writes from mark_completed.
+        if self
+            .aborted
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
             return;
         }
 
@@ -73,13 +81,15 @@ impl Drop for AbortOnDropStream {
                 "Stream dropped without completion for request {}, sending abort",
                 request_id
             );
+            // Clone request_id for the error message since abort_request takes ownership
+            let request_id_for_log = request_id.clone();
             if let Err(e) = client
-                .abort_request(request_id.clone(), "Stream dropped".to_string())
+                .abort_request(request_id, "Stream dropped".to_string())
                 .await
             {
                 warn!(
                     "Failed to send abort on drop for request {}: {}",
-                    request_id, e
+                    request_id_for_log, e
                 );
             }
         });
