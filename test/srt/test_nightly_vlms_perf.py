@@ -27,6 +27,7 @@ MODEL_DEFAULTS = [
     ModelLaunchSettings(
         "google/gemma-3-27b-it",
     ),
+    ModelLaunchSettings("Qwen/Qwen3-VL-30B-A3B-Instruct", extra_args=["--tp=2"])
     # "OpenGVLab/InternVL2_5-2B",
     # buggy in official transformers impl
     # "openbmb/MiniCPM-V-2_6",
@@ -46,7 +47,7 @@ class TestNightlyVLMModelsPerformance(unittest.TestCase):
             model_paths = parse_models(nightly_vlm_models_str)
             for model_path in model_paths:
                 cls.models.append(
-                    ModelLaunchSettings(model_path, extra_args=VLM_EXTRA_ARGS)
+                    ModelLaunchSettings(model_path)
                 )
         else:
             cls.models = MODEL_DEFAULTS

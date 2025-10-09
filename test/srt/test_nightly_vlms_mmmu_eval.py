@@ -1,7 +1,6 @@
 import json
 import unittest
 import warnings
-from functools import partial
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
@@ -36,6 +35,8 @@ MODEL_THRESHOLDS = {
     ModelLaunchSettings("OpenGVLab/InternVL2_5-2B"): ModelEvalMetrics(0.300, 14.0),
     ModelLaunchSettings("Qwen/Qwen2-VL-7B-Instruct"): ModelEvalMetrics(0.310, 83.3),
     ModelLaunchSettings("Qwen/Qwen2.5-VL-7B-Instruct"): ModelEvalMetrics(0.340, 31.9),
+    ModelLaunchSettings("Qwen/Qwen3-VL-30B-A3B-Instruct", extra_args=["--tp=2"]):
+        ModelEvalMetrics(0.310, 25.6),
     ModelLaunchSettings(
         "unsloth/Mistral-Small-3.1-24B-Instruct-2503"
     ): ModelEvalMetrics(0.310, 16.7),

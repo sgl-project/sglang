@@ -29,7 +29,7 @@ from pydantic import BaseModel
 from sglang.bench_serving import (
     get_tokenizer,
     sample_mmmu_requests,
-    sample_random_requests,
+    sample_random_requests, get_processor,
 )
 from sglang.profiler import run_profile
 from sglang.srt.entrypoints.http_server import launch_server
@@ -370,6 +370,8 @@ def run_one_case(
     if dataset_name == "mmmu":
         # vlm
         input_ids = []
+        # for vlms, tokenizer is an instance of AutoProcessor
+        tokenizer = tokenizer.tokenizer
         for input_req in input_requests:
             input_ids += [tokenizer.encode(input_req.prompt)]
         payload["image_data"] = [req.image_data for req in input_requests]
@@ -615,7 +617,12 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
         tokenizer_path = server_info["tokenizer_path"]
     elif "prefill" in server_info:
         tokenizer_path = server_info["prefill"][0]["tokenizer_path"]
-    tokenizer = get_tokenizer(tokenizer_path)
+
+    if bench_args.dataset_name == "mmmu":
+        # mmmu implies this is a MLLM
+        tokenizer = get_processor(tokenizer_path)
+    else:
+        tokenizer = get_tokenizer(tokenizer_path)
 
     # warmup
     if not bench_args.skip_warmup:
