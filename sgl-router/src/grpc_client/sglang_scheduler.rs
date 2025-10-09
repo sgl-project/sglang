@@ -178,7 +178,10 @@ impl SglangSchedulerClient {
         request_id: String,
         reason: String,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        debug!("Sending abort request for {} (reason: {})", request_id, reason);
+        debug!(
+            "Sending abort request for {} (reason: {})",
+            request_id, reason
+        );
         let request = Request::new(proto::AbortRequest {
             request_id: request_id.clone(),
             reason,

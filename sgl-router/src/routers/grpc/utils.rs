@@ -2,6 +2,7 @@
 
 use super::ProcessedMessages;
 use crate::core::Worker;
+use crate::grpc_client::sglang_scheduler::AbortOnDropStream;
 use crate::grpc_client::{proto, SglangSchedulerClient};
 use crate::protocols::spec::{
     ChatCompletionRequest, ChatLogProbs, ChatLogProbsContent, ChatMessage, FunctionCallResponse,
@@ -589,7 +590,7 @@ pub fn parse_json_schema_response(
 /// * `Ok(Vec<GenerateComplete>)` - All complete responses collected from the stream
 /// * `Err(Response)` - Error response if the stream fails or returns an error
 pub async fn collect_stream_responses(
-    mut stream: crate::grpc_client::sglang_scheduler::AbortOnDropStream,
+    stream: &mut AbortOnDropStream,
     worker_name: &str,
 ) -> Result<Vec<proto::GenerateComplete>, Response> {
     use proto::generate_response::Response::*;
@@ -629,9 +630,6 @@ pub async fn collect_stream_responses(
             }
         }
     }
-
-    // Mark as completed successfully to prevent abort on drop
-    stream.mark_completed();
 
     Ok(all_responses)
 }
