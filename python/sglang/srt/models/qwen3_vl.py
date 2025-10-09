@@ -458,7 +458,7 @@ class Qwen3_VisionTransformer(nn.Module):
                 (grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2]).cumsum(dim=0),
             ]
         )
-        cu_seqlens = F.pad(cu_seqlens, (1, 0), "constant", 0)
+        cu_seqlens = torch.cat([cu_seqlens.new_zeros(1), cu_seqlens])
 
         # max_seqlen, seqlens = self.compute_attn_mask_seqlen(cu_seqlens)
         x = x.unsqueeze(1)
