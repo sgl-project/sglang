@@ -1,9 +1,11 @@
+import logging
 from typing import Optional
 
 import torch
 from torch.cuda import Stream as CudaStream
 from traitlets import List
 
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, Req
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -14,15 +16,16 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.build_eagle_tree import TreeMaskMode
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_info_v2 import (
+    assign_extend_cache_locs,
     build_tree_kernel_efficient_tmp,
+    fill_accepted_out_cache_loc,
+    fill_new_verified_id,
     select_top_k_tokens_tmp,
 )
 from sglang.srt.speculative.eagle_worker import EAGLEWorker
-from sglang.srt.utils.common import fast_topk
+from sglang.srt.utils.common import fast_topk, next_power_of_2
 
-# TODO: [ ] add related fields in spec info (EagleDraftInput)
-# TODO: [ ] add future map related logic
-# TODO: [ ] rename "spec_info" -> something else
+logger = logging.getLogger(__name__)
 
 
 class EAGLEWorkerV2(EAGLEWorker):
@@ -138,7 +141,7 @@ class EAGLEWorkerV2(EAGLEWorker):
             retrive_cum_len=None,
             spec_steps=self.speculative_num_steps,
             topk=self.topk,
-            num_draft_tokens=self.speculative_num_draft_tokens,
+            draft_token_num=self.speculative_num_draft_tokens,
         )
 
     def draft_forward(self, forward_batch: ForwardBatch):
@@ -204,7 +207,9 @@ class EAGLEWorkerV2(EAGLEWorker):
         ss_token_list = torch.cat(
             token_list, dim=1
         )  # b, (self.topk + (num_steps-1) * self.topk)
-        top_scores = torch.topk(score_list, self.num_draft_tokens - 1, dim=-1)
+        top_scores = torch.topk(
+            score_list, self.speculative_num_draft_tokens - 1, dim=-1
+        )
         top_scores_index = top_scores.indices
         top_scores_index = torch.sort(top_scores_index).values
         draft_tokens = torch.gather(ss_token_list, index=top_scores_index, dim=1)
@@ -218,12 +223,229 @@ class EAGLEWorkerV2(EAGLEWorker):
         return parent_list, top_scores_index, draft_tokens
 
     def verify(
-        self, model_worker_batch: ModelWorkerBatch, allocate_lens: torch.Tensor
-    ) -> GenerationBatchResult:
-        raise NotImplementedError()
+        self,
+        batch: ModelWorkerBatch,
+        pre_draft_allocate_lens: torch.Tensor,
+    ):
+        # Parse args
+        spec_info: EagleVerifyInput = batch.spec_info
+        seq_lens_backup = batch.seq_lens
+        bs = len(batch.seq_lens)
 
-    def forward_draft_extend(self, model_worker_batch, hidden_states, next_token_ids):
-        raise NotImplementedError()
+        # Batch 1: Target verify
+        # Prepare for target verify in a separate stream
+        with self.plan_stream_ctx:
+            verify_forward_batch, can_run_cuda_graph = spec_info.prepare_for_verify(
+                batch,
+                self.target_worker,
+            )
+
+        # Correct some buffers due to the overlap plan
+        if self.plan_stream:
+            torch.cuda.current_stream().wait_stream(self.plan_stream)
+
+            # Some values such as custom_mask and position depend on the output of draft,
+            # so the previous plan step used the wrong values. Here, we need to run the related
+            # computation again to update them to the correct values.
+            self.target_worker.model_runner.attn_backend.update_verify_buffers_to_fill_after_draft(
+                spec_info,
+                (
+                    self.target_worker.model_runner.graph_runner.bs
+                    if can_run_cuda_graph
+                    else None
+                ),
+            )
+
+        # Run target verify batch in the main compute stream
+        forward_batch_output = self.target_worker.forward_batch_generation(
+            verify_forward_batch, skip_sample=True, skip_attn_backend_init=True
+        )
+        logits_output = forward_batch_output.logits_output
+
+        # Sample
+        self._detect_nan_if_needed(logits_output)
+        (
+            predict,
+            accept_length,
+            accept_index,
+        ) = spec_info.sample(batch, logits_output)
+        new_seq_lens = seq_lens_backup + accept_length
+        verify_done = torch.cuda.Event()
+
+        # Move the accepted tokens to the target KV cache locations
+        batch.seq_lens = seq_lens_backup
+        self.move_accepted_tokens_to_target_kvcache(
+            batch,
+            accept_index,
+            accept_length,
+        )
+
+        verify_done.record()
+
+        all_verified_id = predict[accept_index]
+        verified_id = torch.empty_like(accept_length, dtype=torch.int32)
+        fill_new_verified_id[(bs,)](
+            all_verified_id,
+            accept_length,
+            verified_id,
+            self.speculative_num_draft_tokens,
+        )
+
+        # Batch 2: Draft extend
+        draft_input = EagleDraftInput(
+            hidden_states=logits_output.hidden_states,
+        )
+        select_index = (
+            torch.arange(len(batch.seq_lens), device=self.device)
+            * self.speculative_num_draft_tokens
+            + accept_length
+            - 1
+        )
+
+        # Prepare for draft extend in a separate stream
+        with self.plan_stream_ctx:
+            forward_batch = draft_input.prepare_for_extend_to_fill_draft_kvcache(
+                batch,
+                predict,
+                self.speculative_num_draft_tokens,
+                self.draft_model_runner,
+            )
+
+        if self.plan_stream:
+            torch.cuda.current_stream().wait_stream(self.plan_stream)
+
+        # Run draft extend batch in the main compute stream
+        draft_logits_output = self.draft_model_runner.model.forward(
+            forward_batch.input_ids, forward_batch.positions, forward_batch
+        )
+
+        # Reorganize the spec info for the next batch
+        draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
+            select_index
+        ]
+        draft_logits_output.hidden_states = draft_logits_output.hidden_states[
+            select_index
+        ]
+        probs = torch.softmax(draft_logits_output.next_token_logits, dim=-1)
+        ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
+        ret_hidden_states = draft_logits_output.hidden_states
+
+        # Since seq_lens_backup's tensor is allocated in another stream, we
+        # need record_stream() to prevent pytorch gc and reuse the gpu memory
+        # while forward_stream is still running.
+        seq_lens_backup.record_stream(torch.cuda.current_stream())
+
+        # Construct the return values
+        draft_input = EagleDraftInput(
+            topk_p=ret_topk_p,
+            topk_index=ret_topk_index,
+            hidden_states=ret_hidden_states,
+            verified_id=verified_id,
+            new_seq_lens=new_seq_lens,
+            allocate_lens=pre_draft_allocate_lens,
+            verify_done=verify_done,
+        )
+
+        return ForwardBatchOutput(
+            logits_output=logits_output,
+            next_token_ids=predict,
+            can_run_cuda_graph=can_run_cuda_graph,
+            spec_info=draft_input,
+            accept_length=accept_length,
+        )
+
+    def forward_draft_extend(
+        self,
+        batch: ModelWorkerBatch,
+        target_hidden_states: torch.Tensor,
+        next_token_ids: torch.Tensor,
+    ):
+        """
+        Run draft model extend to correctly fill the KV cache.
+
+        Args:
+            batch: The batch to run.
+            target_hidden_states: Hidden states from the target model forward
+            next_token_ids: Next token ids generated from the target forward.
+        """
+        # Construct input_ids
+        pt = 0
+        for i, extend_len in enumerate(batch.extend_seq_lens):
+            input_ids = batch.input_ids[pt : pt + extend_len]
+            batch.input_ids[pt : pt + extend_len] = torch.cat(
+                (input_ids[1:], next_token_ids[i].reshape(1))
+            )
+            pt += extend_len
+
+        # Construct spec_info
+        draft_input = EagleDraftInput(
+            hidden_states=target_hidden_states,
+            verified_id=next_token_ids,
+            new_seq_lens=batch.seq_lens,
+            allocate_lens=batch.seq_lens,
+        )
+        batch.spec_info = draft_input
+
+        # Run forward
+        forward_batch = ForwardBatch.init_new(batch, self.draft_model_runner)
+        logits_output, _ = self.draft_model_runner.forward(forward_batch)
+
+        # Update spec_info for the next draft step
+        probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+        draft_input.topk_p, draft_input.topk_index = fast_topk(probs, self.topk, dim=-1)
+        draft_input.hidden_states = logits_output.hidden_states
+        return draft_input
+
+    def move_accepted_tokens_to_target_kvcache(
+        self,
+        batch: ModelWorkerBatch,
+        accept_index: torch.Tensor,
+        accept_length: torch.Tensor,
+    ):
+        """
+        Move accepted tokens to the target KV cache.
+
+        Args:
+            batch: The batch to run.
+            accept_index: The index of the accepted tokens.
+            accept_length: The length of the accepted tokens.
+        """
+        bs = len(batch.seq_lens)
+        size = bs * self.speculative_num_draft_tokens
+
+        tgt_cache_loc = torch.zeros(
+            size,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        accepted_out_cache_loc = torch.zeros(
+            size, dtype=torch.int64, device=self.device
+        )
+        assign_extend_cache_locs[(bs,)](
+            batch.req_pool_indices,
+            batch.req_to_token_pool.req_to_token,
+            batch.seq_lens,
+            batch.seq_lens + accept_length,
+            tgt_cache_loc,
+            batch.req_to_token_pool.req_to_token.shape[1],
+            next_power_of_2(bs),
+        )
+        fill_accepted_out_cache_loc[(size,)](
+            accept_index,
+            batch.out_cache_loc,
+            accepted_out_cache_loc,
+            next_power_of_2(size),
+        )
+        self.token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
+            tgt_cache_loc, accepted_out_cache_loc
+        )
+
+    def _detect_nan_if_needed(self, logits_output: LogitsProcessorOutput):
+        if self.enable_nan_detection:
+            logits = logits_output.next_token_logits
+            if torch.any(torch.isnan(logits)):
+                logger.error("Detected errors during sampling! NaN in the logits.")
+                raise ValueError("Detected errors during sampling! NaN in the logits.")
 
 
 def free_spec_dec_tokens_page_size_1(
