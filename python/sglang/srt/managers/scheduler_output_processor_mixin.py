@@ -213,6 +213,10 @@ class SchedulerOutputProcessorMixin:
         if copy_done is not None:
             copy_done.synchronize()
 
+        # FIXME(lsyin): we suppose we have already got the num_accepted_tokens in result
+        if not self.spec_algorithm.is_none():
+            self.update_spec_metrics(batch.batch_size(), result.num_accepted_tokens)
+
         if batch.spec_algorithm.is_none():
             next_token_ids = next_token_ids.tolist()
             if batch.return_logprob:

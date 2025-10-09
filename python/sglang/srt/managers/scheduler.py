@@ -2122,12 +2122,6 @@ class Scheduler(
                 )
                 maybe_future_next_token_ids = batch_result.next_token_ids
 
-            if not self.spec_algorithm.is_none():
-                # TODO(lsyin): unify this metric-updating logic with non-spec, and move it to decode processing
-                self.update_spec_metrics(
-                    batch.batch_size(), batch_result.num_accepted_tokens
-                )
-
             # NOTE: maybe_future_next_token_ids is used in ScheduleBatch,
             #       which can probably be replaced by future_indices later [TODO(lsyin)].
             #       we shall still keep the original outputs, e.g. next_token_ids
