@@ -197,6 +197,28 @@ class SchedulerOutputProcessorMixin:
 
         self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
 
+    def hacky_process_eagle_overlap_result(
+        self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
+    ):
+        # TODO(lsyin): try use a copy stream to share SMs with forward
+        # FIXME(lsyin): better organize this token free logic in eagle-overlap
+        last_batch_allocate_lens_cpu = result.last_batch_allocate_lens.tolist()
+        accept_lens_cpu = result.accept_lens.tolist()
+        next_token_ids = result.next_token_ids.tolist()
+
+        predict_tokens = []
+        num_draft_tokens = self.draft_worker.speculative_num_draft_tokens
+        for i, req in enumerate(batch.reqs):
+            predict_tokens.append(
+                next_token_ids[
+                    i * num_draft_tokens : i * num_draft_tokens + accept_lens_cpu[i]
+                ]
+            )
+            # FIXME(lsyin): move this update elsewhere
+            req.spec_verify_ct += 1
+
+        return last_batch_allocate_lens_cpu, accept_lens_cpu, predict_tokens
+
     def process_batch_result_decode(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -213,14 +235,20 @@ class SchedulerOutputProcessorMixin:
         if copy_done is not None:
             copy_done.synchronize()
 
-        # FIXME(lsyin): we suppose we have already got the num_accepted_tokens in result
-        if not self.spec_algorithm.is_none():
-            self.update_spec_metrics(batch.batch_size(), result.num_accepted_tokens)
-
         if batch.spec_algorithm.is_none():
             next_token_ids = next_token_ids.tolist()
             if batch.return_logprob:
                 next_token_logprobs = logits_output.next_token_logprobs.tolist()
+        elif batch.is_v2_eagle:
+            (
+                last_batch_allocate_lens_cpu,
+                accept_lens_cpu,
+                next_token_ids,
+            ) = self.hacky_process_eagle_overlap_result(result, batch)
+
+        # FIXME(lsyin): we suppose we have already got the num_accepted_tokens in result
+        if not self.spec_algorithm.is_none():
+            self.update_spec_metrics(batch.batch_size(), result.num_accepted_tokens)
 
         self.token_to_kv_pool_allocator.free_group_begin()
 

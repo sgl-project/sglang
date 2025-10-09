@@ -219,6 +219,10 @@ class GenerationBatchResult:
     forward_batch: Optional[ForwardBatch] = None
     future_indices: Optional[FutureIndices] = None
 
+    # FIXME(lsyin): maybe move to <BetterPlace> ?
+    accept_lens: Optional[torch.Tensor] = None
+    last_batch_allocate_lens: Optional[torch.Tensor] = None
+
     def copy_to_cpu(self, return_logprob: bool = False):
         """Copy tensors to CPU in overlap scheduling.
         Only the tensors which are needed for processing results are copied,
@@ -238,6 +242,15 @@ class GenerationBatchResult:
                 "cpu", non_blocking=True
             )
         self.next_token_ids = self.next_token_ids.to("cpu", non_blocking=True)
+
+        if self.accept_lens is not None:
+            self.accept_lens = self.accept_lens.to("cpu", non_blocking=True)
+
+        if self.last_batch_allocate_lens is not None:
+            self.last_batch_allocate_lens = self.last_batch_allocate_lens.to(
+                "cpu", non_blocking=True
+            )
+
         self.copy_done.record()
 
     @classmethod
