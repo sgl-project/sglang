@@ -15,7 +15,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_stream::StreamExt;
 use tonic::codec::Streaming;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use super::context;
 use super::utils;
@@ -236,8 +236,22 @@ impl StreamingProcessor {
             );
         }
 
-        // Phase 2: Main streaming loop
-        while let Some(response) = grpc_stream.next().await {
+        // Phase 2: Main streaming loop with client disconnection detection
+        let client_disconnected = loop {
+            let response = tokio::select! {
+                resp = grpc_stream.next() => {
+                    match resp {
+                        Some(r) => r,
+                        None => break false,  // Stream ended naturally
+                    }
+                },
+                _ = tx.closed() => {
+                    // HTTP client disconnected - explicitly drop gRPC stream to send cancellation
+                    info!("Client disconnected, dropping gRPC stream");
+                    drop(grpc_stream);
+                    break true;  // Break with disconnected flag
+                }
+            };
             let gen_response = response.map_err(|e| format!("Stream error: {}", e))?;
 
             match gen_response.response {
@@ -455,6 +469,12 @@ impl StreamingProcessor {
                 }
                 None => continue,
             }
+        };
+
+        // If client disconnected, skip sending final chunks
+        if client_disconnected {
+            info!("Skipping final chunks - client disconnected");
+            return Ok(());
         }
 
         // Phase 3: Check unstreamed tool args
@@ -699,7 +719,21 @@ impl StreamingProcessor {
         let mut accumulated_texts: HashMap<u32, String> = HashMap::new();
         let mut completion_tokens_map: HashMap<u32, u32> = HashMap::new();
 
-        while let Some(response) = stream.next().await {
+        let client_disconnected = loop {
+            let response = tokio::select! {
+                resp = stream.next() => {
+                    match resp {
+                        Some(r) => r,
+                        None => break false,  // Stream ended naturally
+                    }
+                },
+                _ = tx.closed() => {
+                    // HTTP client disconnected - explicitly drop gRPC stream to send cancellation
+                    info!("Client disconnected, dropping gRPC stream");
+                    drop(stream);
+                    break true;
+                }
+            };
             let gen_response = response.map_err(|e| format!("Stream error: {}", e))?;
 
             match gen_response.response {
@@ -780,6 +814,12 @@ impl StreamingProcessor {
                 }
                 None => continue,
             }
+        };
+
+        // If client disconnected, skip sending final chunks
+        if client_disconnected {
+            info!("Skipping final chunks - client disconnected");
+            return Ok(());
         }
 
         Ok(())
@@ -851,7 +891,16 @@ impl StreamingProcessor {
             HashMap::new();
         let mut completion_tokens_map: HashMap<u32, u32> = HashMap::new();
 
-        while let Some(response) = stream.next().await {
+        let client_disconnected = loop {
+            let response = tokio::select! {
+                Some(resp) = stream.next() => resp,
+                _ = tx.closed() => {
+                    // HTTP client disconnected - explicitly drop gRPC stream to send cancellation
+                    info!("Client disconnected, dropping gRPC stream");
+                    drop(stream);
+                    break true;
+                }
+            };
             let gen_response = response.map_err(|e| format!("Stream error: {}", e))?;
 
             match gen_response.response {
@@ -955,6 +1004,12 @@ impl StreamingProcessor {
                 }
                 None => continue,
             }
+        };
+
+        // If client disconnected, skip sending final chunks
+        if client_disconnected {
+            info!("Skipping final chunks - client disconnected");
+            return Ok(());
         }
 
         Ok(())
