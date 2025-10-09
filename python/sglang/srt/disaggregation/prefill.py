@@ -49,6 +49,7 @@ from sglang.srt.managers.schedule_batch import (
     RequestStage,
     ScheduleBatch,
 )
+from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.utils import (
     DynamicGradMode,
@@ -153,10 +154,18 @@ class PrefillBootstrapQueue:
             kv_args.extra_pool_data_ptrs = extra_pool_data_ptrs
             kv_args.extra_pool_data_lens = extra_pool_data_lens
             kv_args.extra_pool_item_lens = extra_pool_item_lens
+
+            if isinstance(self.token_to_kv_pool, SWAKVPool):
+                kv_args.extra_pool_type = "swa"
+            elif isinstance(self.token_to_kv_pool, HybridLinearKVPool):
+                kv_args.extra_pool_type = "mamba"
+            else:
+                kv_args.extra_pool_type = "none"
         else:
             kv_args.extra_pool_data_ptrs = []
             kv_args.extra_pool_data_lens = []
             kv_args.extra_pool_item_lens = []
+            kv_args.extra_pool_type = "none"
 
         kv_manager_class: Type[BaseKVManager] = get_kv_class(
             self.transfer_backend, KVClassType.MANAGER
@@ -631,10 +640,33 @@ class SchedulerDisaggregationPrefillMixin:
         extra_pool_indices = None
         if last_chunk:
             self.disagg_metadata_buffers.set_buf(req)
-            if hasattr(self.req_to_token_pool, "rid_to_mamba_index_mapping"):
+
+            # Prepare extra pool indices for hybrid models
+            if isinstance(self.token_to_kv_pool, HybridLinearKVPool):
+                # Mamba hybrid model: send single mamba state index
                 extra_pool_indices = [
                     self.req_to_token_pool.rid_to_mamba_index_mapping[req.rid]
                 ]
+            elif isinstance(self.token_to_kv_pool, SWAKVPool):
+                # SWA hybrid model: send last window KV indices
+                seq_len = len(req.fill_ids)
+                window_size = self.sliding_window_size
+                window_start = max(0, seq_len - window_size)
+                window_start = (window_start // page_size) * page_size
+
+                window_kv_indices_full = self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, window_start:seq_len
+                ]
+
+                # Translate to SWA pool indices
+                window_kv_indices_swa = (
+                    self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+                        window_kv_indices_full
+                    )
+                )
+                extra_pool_indices = window_kv_indices_swa.cpu().numpy().tolist()
+                extra_pool_indices = kv_to_page_indices(extra_pool_indices, page_size)
+                logger.info(f"Extra pool indices: {len(extra_pool_indices)}")
 
         page_indices = kv_to_page_indices(kv_indices, page_size)
         if len(page_indices) == 0:

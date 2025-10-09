@@ -190,6 +190,9 @@ class MooncakeKVManager(CommonKVManager):
                 )
                 for _ in range(transfer_queue_size)
             ]
+            self.extra_pool_executors = concurrent.futures.ThreadPoolExecutor(
+                transfer_thread_pool_size // transfer_queue_size
+            )
             for queue, executor in zip(self.transfer_queues, self.executors):
                 threading.Thread(
                     target=self.transfer_worker, args=(queue, executor), daemon=True
@@ -264,15 +267,21 @@ class MooncakeKVManager(CommonKVManager):
             mooncake_session_id, list(src_addrs), list(dst_addrs), list(lengths)
         )
 
-    def send_kvcache(
+    def _send_kvcache_generic(
         self,
         mooncake_session_id: str,
+        src_data_ptrs: list[int],
+        dst_data_ptrs: list[int],
+        item_lens: list[int],
         prefill_kv_indices: npt.NDArray[np.int32],
-        dst_kv_ptrs: list[int],
         dst_kv_indices: npt.NDArray[np.int32],
         executor: concurrent.futures.ThreadPoolExecutor,
-    ):
-        # Group by indices
+    ) -> int:
+        """
+        Generic KV cache transfer supporting both MHA and MLA architectures.
+        This method is used by both send_kvcache (full pool) and send_extra.
+        """
+        # Group by indices for optimization
         prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
             prefill_kv_indices, dst_kv_indices
         )
@@ -282,9 +291,9 @@ class MooncakeKVManager(CommonKVManager):
         # pp is not supported on the decode side yet
         if self.is_mla_backend:
             src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
-                self.get_mla_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
+                self.get_mla_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
             )
-            kv_item_len = self.kv_args.kv_item_lens[0]
+            kv_item_len = item_lens[0]
             layers_params = [
                 (
                     src_kv_ptrs[layer_id],
@@ -295,9 +304,9 @@ class MooncakeKVManager(CommonKVManager):
             ]
         else:
             src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
-                self.get_mha_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
+                self.get_mha_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
             )
-            kv_item_len = self.kv_args.kv_item_lens[0]
+            kv_item_len = item_lens[0]
             layers_params = [
                 (
                     src_k_ptrs[layer_id],
@@ -360,6 +369,24 @@ class MooncakeKVManager(CommonKVManager):
             return process_layers(layers_params)
 
         return 0
+
+    def send_kvcache(
+        self,
+        mooncake_session_id: str,
+        prefill_kv_indices: npt.NDArray[np.int32],
+        dst_kv_ptrs: list[int],
+        dst_kv_indices: npt.NDArray[np.int32],
+        executor: concurrent.futures.ThreadPoolExecutor,
+    ):
+        return self._send_kvcache_generic(
+            mooncake_session_id=mooncake_session_id,
+            src_data_ptrs=self.kv_args.kv_data_ptrs,
+            dst_data_ptrs=dst_kv_ptrs,
+            item_lens=self.kv_args.kv_item_lens,
+            prefill_kv_indices=prefill_kv_indices,
+            dst_kv_indices=dst_kv_indices,
+            executor=executor,
+        )
 
     def send_kvcache_slice(
         self,
@@ -612,9 +639,30 @@ class MooncakeKVManager(CommonKVManager):
     def send_extra(
         self,
         req: TransferInfo,
-        prefill_extra_pool_indice: list[int],
+        prefill_extra_pool_indices: list[int],
         dst_extra_pool_data_ptrs: list[int],
     ):
+        """Send extra pool data with type-specific handling."""
+        extra_pool_type = getattr(self.kv_args, "extra_pool_type", "none")
+
+        if extra_pool_type == "mamba":
+            return self._send_extra_mamba(
+                req, prefill_extra_pool_indices, dst_extra_pool_data_ptrs
+            )
+        elif extra_pool_type == "swa":
+            return self._send_extra_swa(
+                req, prefill_extra_pool_indices, dst_extra_pool_data_ptrs
+            )
+
+    def _send_extra_mamba(
+        self,
+        req: TransferInfo,
+        prefill_mamba_index: list[int],
+        dst_extra_pool_data_ptrs: list[int],
+    ):
+        """Transfer Mamba states."""
+        assert len(prefill_mamba_index) == 1, "Mamba should have single state index"
+
         transfer_blocks = []
         prefill_extra_pool_data_ptrs = self.kv_args.extra_pool_data_ptrs
         prefill_extra_pool_item_lens = self.kv_args.extra_pool_item_lens
@@ -622,14 +670,32 @@ class MooncakeKVManager(CommonKVManager):
         for i, dst_extra_pool_ptr in enumerate(dst_extra_pool_data_ptrs):
             length = prefill_extra_pool_item_lens[i]
             src_addr = prefill_extra_pool_data_ptrs[i] + length * int(
-                prefill_extra_pool_indice[0]
+                prefill_mamba_index[0]
             )
-            dst_addr = dst_extra_pool_data_ptrs[i] + length * int(
-                req.dst_extra_pool_indices[0]
-            )
+            dst_addr = dst_extra_pool_ptr + length * int(req.dst_extra_pool_indices[0])
             transfer_blocks.append((src_addr, dst_addr, length))
 
         return self._transfer_data(req.mooncake_session_id, transfer_blocks)
+
+    def _send_extra_swa(
+        self,
+        req: TransferInfo,
+        prefill_swa_kv_indices: list[int],
+        dst_extra_pool_data_ptrs: list[int],
+    ):
+        """Transfer SWA window KV cache (reuses optimized generic KV transfer logic)."""
+        prefill_kv_indices = np.array(prefill_swa_kv_indices, dtype=np.int32)
+        dst_kv_indices = np.array(req.dst_extra_pool_indices, dtype=np.int32)
+
+        return self._send_kvcache_generic(
+            mooncake_session_id=req.mooncake_session_id,
+            src_data_ptrs=self.kv_args.extra_pool_data_ptrs,
+            dst_data_ptrs=dst_extra_pool_data_ptrs,
+            item_lens=self.kv_args.extra_pool_item_lens,
+            prefill_kv_indices=prefill_kv_indices,
+            dst_kv_indices=dst_kv_indices,
+            executor=self.extra_pool_executors,
+        )
 
     def sync_status_to_decode_endpoint(
         self, remote: str, dst_port: int, room: int, status: int, prefill_rank: int

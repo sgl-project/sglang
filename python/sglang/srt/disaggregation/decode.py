@@ -48,12 +48,17 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, RequestStage, ScheduleBatch
-from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator import (
+    BaseTokenToKVPoolAllocator,
+    SWATokenToKVPoolAllocator,
+)
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import (
+    HybridLinearKVPool,
     HybridReqToTokenPool,
     KVCache,
     ReqToTokenPool,
+    SWAKVPool,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -258,10 +263,18 @@ class DecodePreallocQueue:
             kv_args.extra_pool_data_ptrs = extra_pool_data_ptrs
             kv_args.extra_pool_data_lens = extra_pool_data_lens
             kv_args.extra_pool_item_lens = extra_pool_item_lens
+
+            if isinstance(self.token_to_kv_pool, SWAKVPool):
+                kv_args.extra_pool_type = "swa"
+            elif isinstance(self.token_to_kv_pool, HybridLinearKVPool):
+                kv_args.extra_pool_type = "mamba"
+            else:
+                kv_args.extra_pool_type = "none"
         else:
             kv_args.extra_pool_data_ptrs = []
             kv_args.extra_pool_data_lens = []
             kv_args.extra_pool_item_lens = []
+            kv_args.extra_pool_type = "none"
 
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.gpu_id
@@ -460,12 +473,36 @@ class DecodePreallocQueue:
                 .cpu()
                 .numpy()
             )
-            if isinstance(self.req_to_token_pool, HybridMambaDecodeReqToTokenPool):
+            page_size = self.token_to_kv_pool_allocator.page_size
+
+            # Prepare extra pool indices for hybrid models
+            if isinstance(self.token_to_kv_pool, HybridLinearKVPool):
+                # Mamba hybrid model: single mamba state index
                 extra_pool_indices = [
                     self.req_to_token_pool.rid_to_mamba_index_mapping[
                         decode_req.req.rid
                     ]
                 ]
+            elif isinstance(self.token_to_kv_pool, SWAKVPool):
+                # SWA hybrid model: send decode-side SWA window indices
+                seq_len = len(decode_req.req.origin_input_ids)
+                window_size = self.scheduler.sliding_window_size
+
+                window_start = max(0, seq_len - window_size)
+                window_start = (window_start // page_size) * page_size
+                window_kv_indices_full = self.req_to_token_pool.req_to_token[
+                    decode_req.req.req_pool_idx, window_start:seq_len
+                ]
+
+                # Translate to SWA pool indices
+                window_kv_indices_swa = (
+                    self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+                        window_kv_indices_full
+                    )
+                )
+                extra_pool_indices = window_kv_indices_swa.cpu().numpy().tolist()
+                extra_pool_indices = kv_to_page_indices(extra_pool_indices, page_size)
+                logger.info(f"Extra pool indices: {len(extra_pool_indices)}")
             else:
                 extra_pool_indices = None
 
@@ -473,9 +510,7 @@ class DecodePreallocQueue:
                 self.req_to_metadata_buffer_idx_allocator.alloc()
             )
             assert decode_req.metadata_buffer_index is not None
-            page_indices = kv_to_page_indices(
-                kv_indices, self.token_to_kv_pool_allocator.page_size
-            )
+            page_indices = kv_to_page_indices(kv_indices, page_size)
             decode_req.kv_receiver.init(
                 page_indices, decode_req.metadata_buffer_index, extra_pool_indices
             )

@@ -23,6 +23,7 @@ class KVArgs:
     extra_pool_data_ptrs: List[int]
     extra_pool_data_lens: List[int]
     extra_pool_item_lens: List[int]
+    extra_pool_type: str  # "none", "mamba", "swa"
     ib_device: str
     ib_traffic_class: str
     gpu_id: int
