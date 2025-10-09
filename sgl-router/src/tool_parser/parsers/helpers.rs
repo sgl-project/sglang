@@ -17,22 +17,11 @@ pub fn get_tool_indices(tools: &[Tool]) -> HashMap<String, usize> {
 /// Find the common prefix of two strings
 /// Used for incremental argument streaming when partial JSON returns different intermediate states
 pub fn find_common_prefix(s1: &str, s2: &str) -> String {
-    let mut prefix = String::new();
-
-    // Iterate over characters, not bytes, to handle Unicode correctly
-    let chars1: Vec<char> = s1.chars().collect();
-    let chars2: Vec<char> = s2.chars().collect();
-    let min_len = chars1.len().min(chars2.len());
-
-    for i in 0..min_len {
-        if chars1[i] == chars2[i] {
-            prefix.push(chars1[i]);
-        } else {
-            break;
-        }
-    }
-
-    prefix
+    s1.chars()
+        .zip(s2.chars())
+        .take_while(|(c1, c2)| c1 == c2)
+        .map(|(c1, _)| c1)
+        .collect()
 }
 
 /// Get unstreamed tool call arguments
