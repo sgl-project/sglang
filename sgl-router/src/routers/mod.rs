@@ -19,12 +19,13 @@ pub mod factory;
 pub mod grpc;
 pub mod header_utils;
 pub mod http;
+pub mod openai; // New refactored OpenAI router module
 pub mod router_manager;
 
 pub use factory::RouterFactory;
 
-// Re-export HTTP routers for convenience (keeps routers::openai_router path working)
-pub use http::{openai_router, pd_router, pd_types, router};
+// Re-export HTTP routers for convenience
+pub use http::{pd_router, pd_types, router};
 
 /// Core trait for all router implementations
 ///
@@ -169,6 +170,22 @@ pub trait RouterTrait: Send + Sync + Debug {
         (
             StatusCode::NOT_IMPLEMENTED,
             "Conversations delete endpoint not implemented",
+        )
+            .into_response()
+    }
+
+    /// List items for a conversation
+    async fn list_conversation_items(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _conversation_id: &str,
+        _limit: Option<usize>,
+        _order: Option<String>,
+        _after: Option<String>,
+    ) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Conversation items list endpoint not implemented",
         )
             .into_response()
     }
