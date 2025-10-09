@@ -157,16 +157,16 @@ def generate_balanced_expert_selection(
     device="cpu",
 ):
     num_elements = topk_ids_shape[0] * topk_ids_shape[1]
-    # 每个节点专家个数
+    # Number of experts per node
     experts_per_node = total_experts // nnodes
 
-    # 每个专家所处理的 token 数
+    # Number of tokens processed by each expert
     tokens_per_expert = num_elements // experts_per_node // dispatch_node
     remaining_tokens_per_expert = num_elements // experts_per_node % dispatch_node
 
     repeat = []
     remaining_list = []
-    for i in range(dispatch_node):  # 从多个节点选择专家
+    for i in range(dispatch_node):  # Select experts from multiple nodes
         start = (node_rank + i) * experts_per_node
         end = (node_rank + i + 1) * experts_per_node
         base = torch.arange(start, end, device=device) % total_experts
