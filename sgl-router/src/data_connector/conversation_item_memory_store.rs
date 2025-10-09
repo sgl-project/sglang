@@ -153,10 +153,9 @@ impl ConversationItemStorage for MemoryConversationItemStorage {
         conversation_id: &ConversationId,
         item_id: &ConversationItemId,
     ) -> Result<bool> {
-        let links = self.links.read().unwrap();
-        if let Some(conv_links) = links.get(conversation_id) {
-            // Check if any link in this conversation points to this item_id
-            Ok(conv_links.values().any(|id| id == item_id))
+        let rev = self.rev_index.read().unwrap();
+        if let Some(conv_idx) = rev.get(conversation_id) {
+            Ok(conv_idx.contains_key(&item_id.0))
         } else {
             Ok(false)
         }
@@ -167,20 +166,21 @@ impl ConversationItemStorage for MemoryConversationItemStorage {
         conversation_id: &ConversationId,
         item_id: &ConversationItemId,
     ) -> Result<()> {
-        // Remove from links ONLY (do not delete the item itself)
-        {
-            let mut links = self.links.write().unwrap();
-            if let Some(conv_links) = links.get_mut(conversation_id) {
-                // Find and remove the link by scanning for item_id
-                conv_links.retain(|_key, id| id != item_id);
-            }
-        }
-
-        // Remove from reverse index
-        {
+        // Get the key from rev_index and remove the entry at the same time
+        let key_to_remove = {
             let mut rev = self.rev_index.write().unwrap();
             if let Some(conv_idx) = rev.get_mut(conversation_id) {
-                conv_idx.remove(&item_id.0);
+                conv_idx.remove(&item_id.0)
+            } else {
+                None
+            }
+        };
+
+        // If the item was in rev_index, remove it from links as well
+        if let Some(key) = key_to_remove {
+            let mut links = self.links.write().unwrap();
+            if let Some(conv_links) = links.get_mut(conversation_id) {
+                conv_links.remove(&key);
             }
         }
 

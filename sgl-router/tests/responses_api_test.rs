@@ -1540,11 +1540,11 @@ async fn test_conversation_items_delete() {
     let list_json2: serde_json::Value = serde_json::from_slice(&list_bytes2).unwrap();
     assert_eq!(list_json2["data"].as_array().unwrap().len(), 0);
 
-    // Item should still be gettable (soft delete)
+    // Item should NOT be gettable from this conversation after deletion (link removed)
     let get_resp = router
         .get_conversation_item(None, conv_id, item_id, None)
         .await;
-    assert_eq!(get_resp.status(), axum::http::StatusCode::OK);
+    assert_eq!(get_resp.status(), axum::http::StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
