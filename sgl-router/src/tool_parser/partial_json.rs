@@ -27,8 +27,17 @@ impl PartialJson {
     /// * `input` - The JSON string to parse
     /// * `allow_partial_strings` - When false, incomplete strings cause parsing to stop
     ///   (matches Python's Allow.ALL & ~Allow.STR behavior)
-    pub fn parse_value(&self, input: &str, allow_partial_strings: bool) -> ParserResult<(Value, usize)> {
-        let mut parser = Parser::new(input, self.max_depth, self.allow_incomplete, allow_partial_strings);
+    pub fn parse_value(
+        &self,
+        input: &str,
+        allow_partial_strings: bool,
+    ) -> ParserResult<(Value, usize)> {
+        let mut parser = Parser::new(
+            input,
+            self.max_depth,
+            self.allow_incomplete,
+            allow_partial_strings,
+        );
         let value = parser.parse_value(0)?;
         Ok((value, parser.position))
     }
@@ -66,7 +75,12 @@ struct Parser<'a> {
 }
 
 impl<'a> Parser<'a> {
-    fn new(input: &'a str, max_depth: usize, allow_incomplete: bool, allow_partial_strings: bool) -> Self {
+    fn new(
+        input: &'a str,
+        max_depth: usize,
+        allow_incomplete: bool,
+        allow_partial_strings: bool,
+    ) -> Self {
         Self {
             chars: input.chars().peekable(),
             position: 0,
@@ -114,9 +128,7 @@ impl<'a> Parser<'a> {
                 if self.allow_incomplete {
                     Ok(Value::Null)
                 } else {
-                    Err(ParserError::ParsingFailed(
-                        "Unexpected character".into(),
-                    ))
+                    Err(ParserError::ParsingFailed("Unexpected character".into()))
                 }
             }
         }

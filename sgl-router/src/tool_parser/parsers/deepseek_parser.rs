@@ -115,8 +115,8 @@ impl DeepSeekParser {
             serde_json::json!({ "value": value })
         };
 
-        let arguments = serde_json::to_string(&args)
-            .map_err(|e| ParserError::ParsingFailed(e.to_string()))?;
+        let arguments =
+            serde_json::to_string(&args).map_err(|e| ParserError::ParsingFailed(e.to_string()))?;
 
         Ok(ToolCall {
             function: FunctionCall {

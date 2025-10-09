@@ -324,9 +324,7 @@ fn constant_to_json(constant: &Constant) -> ParserResult<Value> {
         Constant::Bool(b) => Ok(Value::Bool(*b)),
         Constant::Int(value) => Ok(integer_constant_to_value(value, false)),
         Constant::Float(f) => Number::from_f64(*f).map(Value::Number).ok_or_else(|| {
-            ParserError::ParsingFailed(
-                "Invalid float literal in pythonic tool call".to_string(),
-            )
+            ParserError::ParsingFailed("Invalid float literal in pythonic tool call".to_string())
         }),
         Constant::Str(s) => Ok(Value::String(s.clone())),
         Constant::Bytes(bytes) => Ok(Value::String(String::from_utf8_lossy(bytes).into_owned())),
@@ -341,9 +339,7 @@ fn negate_constant(constant: &Constant) -> ParserResult<Value> {
     match constant {
         Constant::Int(value) => Ok(integer_constant_to_value(value, true)),
         Constant::Float(f) => Number::from_f64(-f).map(Value::Number).ok_or_else(|| {
-            ParserError::ParsingFailed(
-                "Invalid float literal in pythonic tool call".to_string(),
-            )
+            ParserError::ParsingFailed("Invalid float literal in pythonic tool call".to_string())
         }),
         _ => Err(ParserError::ParsingFailed(
             "Unsupported unary operand in pythonic tool call".to_string(),
@@ -372,9 +368,7 @@ fn collect_dict(keys: &[Option<Expr>], values: &[Expr]) -> ParserResult<Map<Stri
     let mut map = Map::with_capacity(keys.len());
     for (key_expr, value_expr) in keys.iter().zip(values.iter()) {
         let key_expr = key_expr.as_ref().ok_or_else(|| {
-            ParserError::ParsingFailed(
-                "pythonic tool calls do not support **kwargs".to_string(),
-            )
+            ParserError::ParsingFailed("pythonic tool calls do not support **kwargs".to_string())
         })?;
         let key_value = expression_to_json(key_expr)?;
         let key = value_to_key_string(key_value)?;

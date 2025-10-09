@@ -272,7 +272,10 @@ pub fn handle_json_tool_streaming(
     // Case 2: Handle streaming arguments
     else if let Some(cur_arguments) = current_tool_call.get("arguments") {
         let tool_id = *current_tool_id as usize;
-        let sent = streamed_args_for_tool.get(tool_id).map(|s| s.len()).unwrap_or(0);
+        let sent = streamed_args_for_tool
+            .get(tool_id)
+            .map(|s| s.len())
+            .unwrap_or(0);
         let cur_args_json = serde_json::to_string(cur_arguments)
             .map_err(|e| ParserError::ParsingFailed(e.to_string()))?;
 

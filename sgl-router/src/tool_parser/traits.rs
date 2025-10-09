@@ -61,10 +61,7 @@ pub trait PartialJsonParser: Send + Sync {
 #[async_trait]
 pub trait TokenToolParser: ToolParser {
     /// Parse complete tool calls when provided with raw token IDs.
-    async fn parse_complete_tokens(
-        &self,
-        tokens: &[u32],
-    ) -> ParserResult<(String, Vec<ToolCall>)>;
+    async fn parse_complete_tokens(&self, tokens: &[u32]) -> ParserResult<(String, Vec<ToolCall>)>;
 
     /// Streaming parser entrypoint for token chunks.
     /// Parsers maintain internal state, so self is mutable
