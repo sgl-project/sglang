@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 class RouterArgs:
     # Worker configuration
     worker_urls: List[str] = dataclasses.field(default_factory=list)
-    host: str = "127.0.0.1"
+    host: str = "0.0.0.0"
     port: int = 30000
 
     # PD-specific configuration
@@ -86,6 +86,9 @@ class RouterArgs:
     # Tokenizer configuration
     model_path: Optional[str] = None
     tokenizer_path: Optional[str] = None
+    # Parser configuration
+    reasoning_parser: Optional[str] = None
+    tool_call_parser: Optional[str] = None
 
     @staticmethod
     def add_cli_args(
@@ -109,7 +112,7 @@ class RouterArgs:
                 "--host",
                 type=str,
                 default=RouterArgs.host,
-                help="Host address to bind the router server",
+                help="Host address to bind the router server. Supports IPv4, IPv6 (e.g., ::, ::1), or 0.0.0.0 for all interfaces",
             )
             parser.add_argument(
                 "--port",
@@ -123,7 +126,7 @@ class RouterArgs:
             type=str,
             nargs="*",
             default=[],
-            help="List of worker URLs (e.g., http://worker1:8000 http://worker2:8000)",
+            help="List of worker URLs. Supports IPv4 and IPv6 addresses (use brackets for IPv6, e.g., http://[::1]:8000 http://192.168.1.1:8000)",
         )
 
         # Routing policy configuration
@@ -299,8 +302,8 @@ class RouterArgs:
         parser.add_argument(
             f"--{prefix}prometheus-host",
             type=str,
-            default="127.0.0.1",
-            help="Host address to bind the Prometheus metrics server",
+            default="0.0.0.0",
+            help="Host address to bind the Prometheus metrics server. Supports IPv4, IPv6 (e.g., ::, ::1), or 0.0.0.0 for all interfaces",
         )
         parser.add_argument(
             f"--{prefix}request-id-headers",
@@ -445,6 +448,18 @@ class RouterArgs:
             type=str,
             default=None,
             help="Explicit tokenizer path (overrides model_path tokenizer if provided)",
+        )
+        parser.add_argument(
+            f"--{prefix}reasoning-parser",
+            type=str,
+            default=None,
+            help="Specify the parser for reasoning models (e.g., deepseek-r1, qwen3)",
+        )
+        parser.add_argument(
+            f"--{prefix}tool-call-parser",
+            type=str,
+            default=None,
+            help="Specify the parser for handling tool-call interactions",
         )
 
     @classmethod

@@ -83,7 +83,7 @@ jobs:
 
   pytest-rust:
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
-    runs-on: BM.A10.4
+    runs-on: 4-gpu-a10
     timeout-minutes: 25
     steps:
       - name: Checkout code

@@ -12,7 +12,7 @@ async fn test_tool_parser_factory() {
     // Test that we can get a pooled parser
     let pooled_parser = factory.get_pooled("gpt-4");
     let parser = pooled_parser.lock().await;
-    assert!(parser.detect_format(r#"{"name": "test", "arguments": {}}"#));
+    assert!(parser.has_tool_markers(r#"{"name": "test", "arguments": {}}"#));
 }
 
 #[tokio::test]
@@ -25,7 +25,7 @@ async fn test_tool_parser_factory_model_mapping() {
     // Get parser for the test model
     let pooled_parser = factory.get_pooled("test-model");
     let parser = pooled_parser.lock().await;
-    assert!(parser.detect_format(r#"{"name": "test", "arguments": {}}"#));
+    assert!(parser.has_tool_markers(r#"{"name": "test", "arguments": {}}"#));
 }
 
 #[test]
@@ -234,12 +234,12 @@ fn test_json_parser_format_detection() {
     let parser = JsonParser::new();
 
     // Should detect valid tool call formats
-    assert!(parser.detect_format(r#"{"name": "test", "arguments": {}}"#));
-    assert!(parser.detect_format(r#"{"name": "test", "parameters": {"x": 1}}"#));
-    assert!(parser.detect_format(r#"[{"name": "test"}]"#));
+    assert!(parser.has_tool_markers(r#"{"name": "test", "arguments": {}}"#));
+    assert!(parser.has_tool_markers(r#"{"name": "test", "parameters": {"x": 1}}"#));
+    assert!(parser.has_tool_markers(r#"[{"name": "test"}]"#));
 
     // Should not detect non-tool formats
-    assert!(!parser.detect_format("plain text"));
+    assert!(!parser.has_tool_markers("plain text"));
 }
 
 #[tokio::test]

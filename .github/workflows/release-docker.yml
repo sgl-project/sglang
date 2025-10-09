@@ -14,13 +14,9 @@ jobs:
     strategy:
       matrix:
         variant:
-          - cuda_version: "12.6.1"
-            build_type: "all"
-          - cuda_version: "12.8.1"
-            build_type: "blackwell"
           - cuda_version: "12.9.1"
-            build_type: "blackwell"
-    runs-on: nvidia
+            build_type: "all"
+    runs-on: x64-docker-build-node
     steps:
       - name: Delete huge unnecessary tools folder
         run: rm -rf /opt/hostedtoolcache
@@ -51,34 +47,17 @@ jobs:
       - name: Build and Push AMD64
         run: |
           version=$(cat python/sglang/version.py | cut -d'"' -f2)
+          tag=v${version}-cu129-amd64
 
-          if [ "${{ matrix.variant.cuda_version }}" = "12.6.1" ]; then
-            cuda_tag="cu126"
-          elif [ "${{ matrix.variant.cuda_version }}" = "12.8.1" ]; then
-            cuda_tag="cu128"
-          elif [ "${{ matrix.variant.cuda_version }}" = "12.9.1" ]; then
-            cuda_tag="cu129"
-          else
-            echo "Unsupported CUDA version"
-            exit 1
-          fi
-
-          tag=v${version}-${cuda_tag}
-
-          if [ "${{ matrix.variant.build_type }}" = "all" ]; then
-            tag_suffix=""
-          elif [ "${{ matrix.variant.build_type }}" = "blackwell" ]; then
-            tag_suffix="-b200"
-          else
-            echo "Unsupported build type"
-            exit 1
-          fi
-
-          if [ "${{ matrix.variant.cuda_version }}" = "12.9.1" ]; then
-            docker buildx build --platform linux/amd64 --push -f docker/Dockerfile --build-arg CUDA_VERSION=${{ matrix.variant.cuda_version }} --build-arg BUILD_TYPE=${{ matrix.variant.build_type }} -t lmsysorg/sglang:${tag}${tag_suffix} -t lmsysorg/sglang:latest --no-cache .
-          else
-            docker buildx build --platform linux/amd64 --push -f docker/Dockerfile --build-arg CUDA_VERSION=${{ matrix.variant.cuda_version }} --build-arg BUILD_TYPE=${{ matrix.variant.build_type }} -t lmsysorg/sglang:${tag}${tag_suffix} --no-cache .
-          fi
+          docker buildx build \
+            --platform linux/amd64 \
+            --push \
+            -f docker/Dockerfile \
+            --build-arg CUDA_VERSION=${{ matrix.variant.cuda_version }} \
+            --build-arg BUILD_TYPE=${{ matrix.variant.build_type }} \
+            -t lmsysorg/sglang:${tag} \
+            --no-cache \
+            .
 
   publish-arm64:
     if: github.repository == 'sgl-project/sglang'
@@ -87,8 +66,8 @@ jobs:
       matrix:
         variant:
           - cuda_version: "12.9.1"
-            build_type: "blackwell_aarch64"
-    runs-on: sgl-kernel-release-node-arm
+            build_type: "all_aarch64"
+    runs-on: arm-docker-build-node
     steps:
       - name: Delete huge unnecessary tools folder
         run: rm -rf /opt/hostedtoolcache
@@ -108,15 +87,48 @@ jobs:
       - name: Build and Push ARM64
         run: |
           version=$(cat python/sglang/version.py | cut -d'"' -f2)
+          tag=v${version}-cu129-arm64
 
-          if [ "${{ matrix.variant.cuda_version }}" = "12.9.1" ]; then
-            cuda_tag="cu129"
-          else
-            echo "Unsupported CUDA version"
-            exit 1
-          fi
+          docker buildx build \
+            --platform linux/arm64 \
+            --push \
+            -f docker/Dockerfile \
+            --build-arg CUDA_VERSION=${{ matrix.variant.cuda_version }} \
+            --build-arg BUILD_TYPE=${{ matrix.variant.build_type }} \
+            -t lmsysorg/sglang:${tag} \
+            --no-cache \
+            .
 
-          tag=v${version}-${cuda_tag}
-          tag_suffix="-gb200"
+  create-manifests:
+    runs-on: ubuntu-22.04
+    needs: [publish-x86, publish-arm64]
+    if: github.repository == 'sgl-project/sglang'
+    environment: "prod"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-          docker buildx build --platform linux/arm64 --push -f docker/Dockerfile --build-arg CUDA_VERSION=${{ matrix.variant.cuda_version }} --build-arg BUILD_TYPE=${{ matrix.variant.build_type }} -t lmsysorg/sglang:${tag}${tag_suffix} --no-cache .
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Create multi-arch manifests
+        run: |
+          version=$(cat python/sglang/version.py | cut -d'"' -f2)
+
+          # Create versioned manifest
+          docker buildx imagetools create \
+            -t lmsysorg/sglang:v${version} \
+            lmsysorg/sglang:v${version}-cu129-amd64 \
+            lmsysorg/sglang:v${version}-cu129-arm64
+
+          # Create latest manifest
+          docker buildx imagetools create \
+            -t lmsysorg/sglang:latest \
+            lmsysorg/sglang:v${version}-cu129-amd64 \
+            lmsysorg/sglang:v${version}-cu129-arm64

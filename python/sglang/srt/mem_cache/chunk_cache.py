@@ -60,7 +60,7 @@ class ChunkCache(BasePrefixCache):
         ]
 
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
-        req.prefix_indices = kv_indices
+        req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
 
     def evict(self, num_tokens: int):
         pass

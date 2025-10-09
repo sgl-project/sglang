@@ -20,6 +20,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use dashmap::DashMap;
+use serde_json::Value;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
@@ -510,6 +511,108 @@ impl RouterTrait for RouterManager {
 
     fn router_type(&self) -> &'static str {
         "manager"
+    }
+
+    // Conversations API delegates
+    async fn create_conversation(&self, headers: Option<&HeaderMap>, body: &Value) -> Response {
+        let router = self.select_router_for_request(headers, None);
+        if let Some(router) = router {
+            router.create_conversation(headers, body).await
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                "No router available to create conversation",
+            )
+                .into_response()
+        }
+    }
+
+    async fn get_conversation(
+        &self,
+        headers: Option<&HeaderMap>,
+        conversation_id: &str,
+    ) -> Response {
+        let router = self.select_router_for_request(headers, None);
+        if let Some(router) = router {
+            router.get_conversation(headers, conversation_id).await
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                format!(
+                    "No router available to get conversation '{}'",
+                    conversation_id
+                ),
+            )
+                .into_response()
+        }
+    }
+
+    async fn update_conversation(
+        &self,
+        headers: Option<&HeaderMap>,
+        conversation_id: &str,
+        body: &Value,
+    ) -> Response {
+        let router = self.select_router_for_request(headers, None);
+        if let Some(router) = router {
+            router
+                .update_conversation(headers, conversation_id, body)
+                .await
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                format!(
+                    "No router available to update conversation '{}'",
+                    conversation_id
+                ),
+            )
+                .into_response()
+        }
+    }
+
+    async fn delete_conversation(
+        &self,
+        headers: Option<&HeaderMap>,
+        conversation_id: &str,
+    ) -> Response {
+        let router = self.select_router_for_request(headers, None);
+        if let Some(router) = router {
+            router.delete_conversation(headers, conversation_id).await
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                format!(
+                    "No router available to delete conversation '{}'",
+                    conversation_id
+                ),
+            )
+                .into_response()
+        }
+    }
+
+    async fn list_conversation_items(
+        &self,
+        headers: Option<&HeaderMap>,
+        conversation_id: &str,
+        limit: Option<usize>,
+        order: Option<String>,
+        after: Option<String>,
+    ) -> Response {
+        let router = self.select_router_for_request(headers, None);
+        if let Some(router) = router {
+            router
+                .list_conversation_items(headers, conversation_id, limit, order, after)
+                .await
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                format!(
+                    "No router available to list conversation items for '{}'",
+                    conversation_id
+                ),
+            )
+                .into_response()
+        }
     }
 }
 

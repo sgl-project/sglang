@@ -236,7 +236,7 @@ impl Default for ResponseLogger {
 }
 
 impl<B> OnResponse<B> for ResponseLogger {
-    fn on_response(self, response: &Response<B>, latency: std::time::Duration, span: &Span) {
+    fn on_response(self, response: &Response<B>, latency: Duration, span: &Span) {
         let status = response.status();
 
         // Record these in the span for structured logging/observability tools
@@ -345,10 +345,10 @@ pub struct QueuedRequest {
 /// Queue metrics for monitoring
 #[derive(Debug, Default)]
 pub struct QueueMetrics {
-    pub total_queued: std::sync::atomic::AtomicU64,
-    pub current_queued: std::sync::atomic::AtomicU64,
-    pub total_timeout: std::sync::atomic::AtomicU64,
-    pub total_rejected: std::sync::atomic::AtomicU64,
+    pub total_queued: AtomicU64,
+    pub current_queued: AtomicU64,
+    pub total_timeout: AtomicU64,
+    pub total_rejected: AtomicU64,
 }
 
 /// Queue processor that handles queued requests
@@ -447,7 +447,7 @@ impl ConcurrencyLimiter {
 /// Middleware function for concurrency limiting with optional queuing
 pub async fn concurrency_limit_middleware(
     State(app_state): State<Arc<AppState>>,
-    request: Request<axum::body::Body>,
+    request: Request<Body>,
     next: Next,
 ) -> Response {
     // Static counter for embeddings queue size

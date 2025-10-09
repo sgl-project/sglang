@@ -8,7 +8,7 @@ on:
 jobs:
   build-dev-x86:
     if: ${{ github.repository == 'sgl-project/sglang' }}
-    runs-on: nvidia
+    runs-on: x64-docker-build-node
     strategy:
       matrix:
         variant:
@@ -48,12 +48,12 @@ jobs:
 
   build-dev-arm:
     if: ${{ github.repository == 'sgl-project/sglang' }}
-    runs-on: sgl-kernel-release-node-arm
+    runs-on: arm-docker-build-node
     strategy:
       matrix:
         variant:
           - version: 12.9.1
-            type: blackwell_aarch64
+            type: all_aarch64
             tag: dev-arm64
     steps:
       - name: Delete huge unnecessary tools folder

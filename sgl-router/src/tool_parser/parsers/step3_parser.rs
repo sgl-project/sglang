@@ -96,11 +96,6 @@ impl Step3Parser {
         }
     }
 
-    /// Check if text contains Step3 tool markers
-    fn has_tool_markers(&self, text: &str) -> bool {
-        text.contains(self.bot_token)
-    }
-
     /// Reset streaming state for the next tool call
     fn reset_streaming_state(&mut self) {
         self.in_tool_call = false;
@@ -553,8 +548,8 @@ impl ToolParser for Step3Parser {
         Ok(StreamingParseResult::default())
     }
 
-    fn detect_format(&self, text: &str) -> bool {
-        self.has_tool_markers(text)
+    fn has_tool_markers(&self, text: &str) -> bool {
+        text.contains(self.bot_token)
     }
 
     fn get_unstreamed_tool_args(&self) -> Option<Vec<ToolCallItem>> {

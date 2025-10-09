@@ -136,7 +136,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--device` | The device to use ('cuda', 'xpu', 'hpu', 'npu', 'cpu'). Defaults to auto-detection if not specified. | None |
 | `--tp-size` | The tensor parallelism size. | 1 |
 | `--pp-size` | The pipeline parallelism size. | 1 |
-| `--max-micro-batch-size` | The maximum micro batch size in pipeline parallelism. | None |
+| `--pp-max-micro-batch-size` | The maximum micro batch size in pipeline parallelism. | None |
 | `--stream-interval` | The interval (or buffer size) for streaming in terms of the token length. A smaller value makes streaming smoother, while a larger value makes the throughput higher. | 1 |
 | `--stream-output` | Whether to output as a sequence of disjoint segments. | False |
 | `--random-seed` | The random seed. | None |
@@ -246,7 +246,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 |-----------|-------------|----------|
 | `--ep-size` | The expert parallelism size. | 1 |
 | `--moe-a2a-backend` | Select the backend for all-to-all communication for expert parallelism. | none |
-| `--moe-runner-backend` | Select the runner backend for MoE. | 'triton' |
+| `--moe-runner-backend` | Select the runner backend for MoE. | auto |
 | `--deepep-mode` | Select the mode when enable DeepEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch. | auto |
 | `--ep-num-redundant-experts` | Allocate this number of redundant experts in expert parallel. | 0 |
 | `--ep-dispatch-algorithm` | The algorithm to choose ranks for redundant experts in EPLB. | None |

@@ -71,11 +71,6 @@ impl Glm4MoeParser {
         }
     }
 
-    /// Check if text contains GLM-4 MoE tool markers
-    fn has_tool_markers(&self, text: &str) -> bool {
-        text.contains(self.bot_token)
-    }
-
     /// Parse arguments from key-value pairs
     fn parse_arguments(&self, args_text: &str) -> ToolParserResult<serde_json::Map<String, Value>> {
         let mut arguments = serde_json::Map::new();
@@ -313,8 +308,8 @@ impl ToolParser for Glm4MoeParser {
         })
     }
 
-    fn detect_format(&self, text: &str) -> bool {
-        self.has_tool_markers(text)
+    fn has_tool_markers(&self, text: &str) -> bool {
+        text.contains(self.bot_token)
     }
 
     fn get_unstreamed_tool_args(&self) -> Option<Vec<ToolCallItem>> {

@@ -77,11 +77,6 @@ impl DeepSeekParser {
         }
     }
 
-    /// Check if text contains DeepSeek tool markers
-    fn has_tool_markers(&self, text: &str) -> bool {
-        text.contains("<｜tool▁calls▁begin｜>")
-    }
-
     /// Parse a single tool call block - throws error if parsing fails
     fn parse_tool_call(&self, block: &str) -> ToolParserResult<ToolCall> {
         let captures = self.func_detail_extractor.captures(block).ok_or_else(|| {
@@ -312,8 +307,8 @@ impl ToolParser for DeepSeekParser {
         })
     }
 
-    fn detect_format(&self, text: &str) -> bool {
-        self.has_tool_markers(text)
+    fn has_tool_markers(&self, text: &str) -> bool {
+        text.contains("<｜tool▁calls▁begin｜>")
     }
 
     fn get_unstreamed_tool_args(&self) -> Option<Vec<ToolCallItem>> {

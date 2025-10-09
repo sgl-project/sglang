@@ -161,10 +161,7 @@ def flash_attn_with_kvcache(
             k is None and v is None
         ), "FA4 does not support updating KV cache in-place."
         assert (
-            rotary_cos is None
-            and rotary_sin is None
-            and rotary_interleaved is None
-            and rotary_seqlens is None
+            rotary_cos is None and rotary_sin is None and rotary_seqlens is None
         ), "FA4 does not support rotary embedding."
         assert (
             cache_batch_idx is None and cache_leftpad is None

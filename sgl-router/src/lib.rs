@@ -90,6 +90,8 @@ struct Router {
     connection_mode: config::ConnectionMode,
     model_path: Option<String>,
     tokenizer_path: Option<String>,
+    reasoning_parser: Option<String>,
+    tool_call_parser: Option<String>,
 }
 
 impl Router {
@@ -216,6 +218,8 @@ impl Router {
             tokenizer_path: self.tokenizer_path.clone(),
             history_backend: config::HistoryBackend::Memory,
             oracle: None,
+            reasoning_parser: self.reasoning_parser.clone(),
+            tool_call_parser: self.tool_call_parser.clone(),
         })
     }
 }
@@ -226,7 +230,7 @@ impl Router {
     #[pyo3(signature = (
         worker_urls,
         policy = PolicyType::RoundRobin,
-        host = String::from("127.0.0.1"),
+        host = String::from("0.0.0.0"),
         port = 3001,
         worker_startup_timeout_secs = 600,
         worker_startup_check_interval = 30,
@@ -280,6 +284,8 @@ impl Router {
         rate_limit_tokens_per_second = None,
         model_path = None,
         tokenizer_path = None,
+        reasoning_parser = None,
+        tool_call_parser = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -339,6 +345,8 @@ impl Router {
         rate_limit_tokens_per_second: Option<usize>,
         model_path: Option<String>,
         tokenizer_path: Option<String>,
+        reasoning_parser: Option<String>,
+        tool_call_parser: Option<String>,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -412,6 +420,8 @@ impl Router {
             connection_mode,
             model_path,
             tokenizer_path,
+            reasoning_parser,
+            tool_call_parser,
         })
     }
 

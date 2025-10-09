@@ -207,10 +207,10 @@ mod tests {
     async fn test_store_with_custom_id() {
         let store = MemoryResponseStorage::new();
         let mut response = StoredResponse::new("Input".to_string(), "Output".to_string(), None);
-        response.id = ResponseId::from_string("resp_custom".to_string());
+        response.id = ResponseId::from("resp_custom");
         store.store_response(response.clone()).await.unwrap();
         let retrieved = store
-            .get_response(&ResponseId::from_string("resp_custom".to_string()))
+            .get_response(&ResponseId::from("resp_custom"))
             .await
             .unwrap();
         assert!(retrieved.is_some());

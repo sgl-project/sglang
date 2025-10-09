@@ -45,6 +45,7 @@ from sglang.srt.configs import (
     KimiVLConfig,
     LongcatFlashConfig,
     MultiModalityConfig,
+    NemotronHConfig,
     Qwen3NextConfig,
     Step3VLConfig,
 )
@@ -66,6 +67,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     FalconH1Config.model_type: FalconH1Config,
     DotsVLMConfig.model_type: DotsVLMConfig,
     DotsOCRConfig.model_type: DotsOCRConfig,
+    NemotronHConfig.model_type: NemotronHConfig,
 }
 
 for name, cls in _CONFIG_REGISTRY.items():
@@ -123,6 +125,38 @@ def get_hf_text_config(config: PretrainedConfig):
         return config
 
 
+# Temporary hack for DeepSeek-V3.2 model
+def _load_deepseek_v32_model(
+    model_path: str,
+    trust_remote_code: bool = False,
+    revision: Optional[str] = None,
+    **kwargs,
+):
+    # first get the local path
+    local_path = download_from_hf(model_path)
+    # then load the config file in json
+    config_file = os.path.join(local_path, "config.json")
+    if not os.path.exists(config_file):
+        raise RuntimeError(f"Can't find config file in {local_path}.")
+
+    with open(config_file, "r") as f:
+        config_json = json.load(f)
+
+    config_json["architectures"] = ["DeepseekV3ForCausalLM"]
+    config_json["model_type"] = "deepseek_v3"
+
+    tmp_path = os.path.join(local_path, "_tmp_config_folder")
+    os.makedirs(tmp_path, exist_ok=True)
+
+    unique_path = os.path.join(tmp_path, f"deepseek_v32_{os.getpid()}")
+    with open(unique_path, "w") as f:
+        json.dump(config_json, f)
+
+    return AutoConfig.from_pretrained(
+        unique_path, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+    )
+
+
 @lru_cache_frozenset(maxsize=32)
 def get_config(
     model: str,
@@ -144,9 +178,17 @@ def get_config(
         client.pull_files(ignore_pattern=["*.pt", "*.safetensors", "*.bin"])
         model = client.get_local_dir()
 
-    config = AutoConfig.from_pretrained(
-        model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
-    )
+    try:
+        config = AutoConfig.from_pretrained(
+            model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+        )
+    except ValueError as e:
+        if not "deepseek_v32" in str(e):
+            raise e
+        config = _load_deepseek_v32_model(
+            model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+        )
+
     if (
         config.architectures is not None
         and config.architectures[0] == "Phi4MMForCausalLM"
