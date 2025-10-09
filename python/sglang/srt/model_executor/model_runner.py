@@ -1671,6 +1671,7 @@ class ModelRunner:
                     ),
                     enable_kvcache_transpose=False,
                     device=self.device,
+                    mamba_pool=self.req_to_token_pool.mamba_pool,
                 )
             else:
                 self.token_to_kv_pool = MHATokenToKVPool(
