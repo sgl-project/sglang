@@ -357,33 +357,31 @@ pub(super) async fn list_conversation_items(
 /// Types marked as "accepted" are stored but return not-implemented warnings
 const SUPPORTED_ITEM_TYPES: &[&str] = &[
     // Fully implemented types
-    "message",              // Input/Output messages (IMPLEMENTED)
-    "function_tool_call",   // Function tool calls (IMPLEMENTED)
-    "function_call_output", // Function call results (IMPLEMENTED)
-    "reasoning",            // Reasoning traces (IMPLEMENTED)
-    "mcp_list_tools",       // MCP tools list (IMPLEMENTED)
-    "mcp_call",             // MCP tool calls (IMPLEMENTED)
-    "item_reference",       // References to other items (IMPLEMENTED)
+    "message",
+    "reasoning",
+    "mcp_list_tools",
+    "mcp_call",
+    "item_reference",
     // Accepted but not yet implemented (stored, warning returned)
-    "file_search_call",        // File search tool calls (NOT IMPLEMENTED)
-    "computer_call",           // Computer use tool calls (NOT IMPLEMENTED)
-    "computer_call_output",    // Computer use results (NOT IMPLEMENTED)
-    "web_search_call",         // Web search tool calls (NOT IMPLEMENTED)
-    "image_generation_call",   // Image generation requests (NOT IMPLEMENTED)
-    "code_interpreter_call",   // Code interpreter tool calls (NOT IMPLEMENTED)
-    "local_shell_call",        // Local shell commands (NOT IMPLEMENTED)
-    "local_shell_call_output", // Local shell results (NOT IMPLEMENTED)
-    "mcp_approval_request",    // MCP approval requests (NOT IMPLEMENTED)
-    "mcp_approval_response",   // MCP approval responses (NOT IMPLEMENTED)
-    "custom_tool_call",        // Custom tool calls (NOT IMPLEMENTED)
-    "custom_tool_call_output", // Custom tool results (NOT IMPLEMENTED)
+    "function_tool_call",
+    "function_call_output",
+    "file_search_call",
+    "computer_call",
+    "computer_call_output",
+    "web_search_call",
+    "image_generation_call",
+    "code_interpreter_call",
+    "local_shell_call",
+    "local_shell_call_output",
+    "mcp_approval_request",
+    "mcp_approval_response",
+    "custom_tool_call",
+    "custom_tool_call_output",
 ];
 
 /// Item types that are fully implemented with business logic
 const IMPLEMENTED_ITEM_TYPES: &[&str] = &[
     "message",
-    "function_tool_call",
-    "function_call_output",
     "reasoning",
     "mcp_list_tools",
     "mcp_call",
@@ -900,31 +898,6 @@ fn item_to_json(item: &crate::data_connector::conversation_items::ConversationIt
                 }
             }
         }
-        "function_tool_call" => {
-            // Extract function_tool_call fields: name, call_id, arguments
-            if let Some(content_obj) = item.content.as_object() {
-                if let Some(name) = content_obj.get("name") {
-                    obj.insert("name".to_string(), name.clone());
-                }
-                if let Some(call_id) = content_obj.get("call_id") {
-                    obj.insert("call_id".to_string(), call_id.clone());
-                }
-                if let Some(arguments) = content_obj.get("arguments") {
-                    obj.insert("arguments".to_string(), arguments.clone());
-                }
-            }
-        }
-        "function_call_output" => {
-            // Extract function_call_output fields: call_id, output
-            if let Some(content_obj) = item.content.as_object() {
-                if let Some(call_id) = content_obj.get("call_id") {
-                    obj.insert("call_id".to_string(), call_id.clone());
-                }
-                if let Some(output) = content_obj.get("output") {
-                    obj.insert("output".to_string(), output.clone());
-                }
-            }
-        }
         _ => {
             // For all other types (message, reasoning, etc.), keep content as-is
             obj.insert("content".to_string(), item.content.clone());
@@ -1113,19 +1086,6 @@ async fn persist_items_with_storages(
 
                 let content = if item_type == "message" {
                     obj.get("content").cloned().unwrap_or(json!([]))
-                } else if item_type == "function_call" || item_type == "function_tool_call" {
-                    json!({
-                        "type": "function_call",
-                        "name": obj.get("name"),
-                        "call_id": obj.get("call_id").or_else(|| obj.get("id")),
-                        "arguments": obj.get("arguments")
-                    })
-                } else if item_type == "function_call_output" {
-                    json!({
-                        "type": "function_call_output",
-                        "call_id": obj.get("call_id"),
-                        "output": obj.get("output")
-                    })
                 } else {
                     output_item.clone()
                 };
