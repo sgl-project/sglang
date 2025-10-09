@@ -1,3 +1,4 @@
+# Adapted from https://github.com/thinking-machines-lab/batch_invariant_ops/blob/main/test_batch_invariance.py
 import math
 import unittest
 
@@ -155,6 +156,7 @@ class TestBatchInvariantOps(CustomTestCase):
             difflist = self._run_multiple_iterations(
                 iters=5, M=M, K=K, N=N, dtype=dtype
             )
+            print(f"Without batch-invariant mode, we get diffs: {difflist}")
 
 
 if __name__ == "__main__":
