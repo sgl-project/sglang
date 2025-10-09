@@ -12,6 +12,7 @@ from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    ModelLaunchSettings,
     check_evaluation_test_results,
     parse_models,
     popen_launch_server,
@@ -44,12 +45,19 @@ MODEL_SCORE_THRESHOLDS = {
 class TestNightlyGsm8KEval(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model_groups = [
-            (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1), False, False),
-            (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2), False, True),
-            (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1), True, False),
-            (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2), True, True),
-        ]
+        cls.models = []
+        models_tp1 = parse_models(
+            DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1
+        ) + parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1)
+        for model_path in models_tp1:
+            cls.models.append(ModelLaunchSettings(model_path, tp_size=1))
+
+        models_tp2 = parse_models(
+            DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2
+        ) + parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2)
+        for model_path in models_tp2:
+            cls.models.append(ModelLaunchSettings(model_path, tp_size=2))
+
         cls.base_url = DEFAULT_URL_FOR_TEST
 
     def test_mgsm_en_all_models(self):
@@ -58,26 +66,24 @@ class TestNightlyGsm8KEval(unittest.TestCase):
         )
         is_first = True
         all_results = []
-        model_count = 0
-        for model_group, is_fp8, is_tp2 in self.model_groups:
-            for model in model_group:
-                model_count += 1
-                with self.subTest(model=model):
-                    other_args = ["--tp", "2"] if is_tp2 else []
+        for model_setup in self.models:
+            with self.subTest(model=model_setup.model_path):
+                other_args = list(model_setup.extra_args)
 
-                    if model == "meta-llama/Llama-3.1-70B-Instruct":
-                        other_args.extend(["--mem-fraction-static", "0.9"])
+                if model_setup.model_path == "meta-llama/Llama-3.1-70B-Instruct":
+                    other_args.extend(["--mem-fraction-static", "0.9"])
 
-                    process = popen_launch_server(
-                        model=model,
-                        other_args=other_args,
-                        base_url=self.base_url,
-                        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                    )
+                process = popen_launch_server(
+                    model=model_setup.model_path,
+                    other_args=other_args,
+                    base_url=self.base_url,
+                    timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                )
 
+                try:
                     args = SimpleNamespace(
                         base_url=self.base_url,
-                        model=model,
+                        model=model_setup.model_path,
                         eval_name="mgsm_en",
                         num_examples=None,
                         num_threads=1024,
@@ -85,14 +91,17 @@ class TestNightlyGsm8KEval(unittest.TestCase):
 
                     metrics = run_eval(args)
                     print(
-                        f"{'=' * 42}\n{model} - metrics={metrics} score={metrics['score']}\n{'=' * 42}\n"
+                        f"{'=' * 42}\n{model_setup.model_path} - metrics={metrics} score={metrics['score']}\n{'=' * 42}\n"
                     )
 
-                    write_results_to_json(model, metrics, "w" if is_first else "a")
+                    write_results_to_json(
+                        model_setup.model_path, metrics, "w" if is_first else "a"
+                    )
                     is_first = False
 
                     # 0.0 for empty latency
-                    all_results.append((model, metrics["score"], 0.0))
+                    all_results.append((model_setup.model_path, metrics["score"], 0.0))
+                finally:
                     kill_process_tree(process.pid)
 
         try:
@@ -107,7 +116,7 @@ class TestNightlyGsm8KEval(unittest.TestCase):
             all_results,
             self.__class__.__name__,
             model_accuracy_thresholds=MODEL_SCORE_THRESHOLDS,
-            model_count=model_count,
+            model_count=len(self.models),
         )
 
 

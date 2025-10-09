@@ -70,11 +70,8 @@ class DisaggregationHiCacheBase(TestDisaggregationBase):
             "wait_complete",
             "--mem-fraction-static",
             "0.8",
-            "--disaggregation-ib-device",
-            "mlx5_roce0",
-            "--disaggregation-transfer-backend",
-            "mooncake",
         ]
+        prefill_args += cls.transfer_backend + cls.rdma_devices
         env = {
             **os.environ,
             "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.temp_dir,
@@ -148,11 +145,8 @@ class TestDisaggregationPrefillWithHiCache(DisaggregationHiCacheBase):
             "0.8",
             "--base-gpu-id",
             "1",
-            "--disaggregation-ib-device",
-            "mlx5_roce0",
-            "--disaggregation-transfer-backend",
-            "mooncake",
         ]
+        decode_args += cls.transfer_backend + cls.rdma_devices
         env = {
             **os.environ,
             "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.temp_dir,
@@ -201,10 +195,6 @@ class TestDisaggregationDecodeWithHiCache(DisaggregationHiCacheBase):
             "0.8",
             "--base-gpu-id",
             "1",
-            "--disaggregation-ib-device",
-            "mlx5_roce0",
-            "--disaggregation-transfer-backend",
-            "mooncake",
             "--disaggregation-decode-enable-offload-kvcache",
             "--hicache-ratio",
             "1.2",
@@ -215,6 +205,7 @@ class TestDisaggregationDecodeWithHiCache(DisaggregationHiCacheBase):
             "--hicache-storage-prefetch-policy",
             "wait_complete",
         ]
+        decode_args += cls.transfer_backend + cls.rdma_devices
         env = {
             **os.environ,
             "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.temp_dir,
