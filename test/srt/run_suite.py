@@ -35,6 +35,7 @@ suites = {
         # TestFile("models/test_gme_qwen_models.py", 45),
         # TestFile("models/test_grok_models.py", 60),  # Disabled due to illegal memory access
         TestFile("models/test_qwen_models.py", 82),
+        TestFile("batch_invariant/test_batch_invariant_ops.py", 10),
         TestFile("models/test_reward_models.py", 132),
         TestFile("models/test_vlm_models.py", 741),
         TestFile("models/test_transformers_models.py", 320),
