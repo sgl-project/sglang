@@ -1,10 +1,11 @@
 use async_trait::async_trait;
 
+use crate::protocols::spec::Tool;
+
 use crate::tool_parser::{
-    errors::ToolParserResult,
-    state::ParseState,
+    errors::ParserResult,
     traits::{TokenToolParser, ToolParser},
-    types::{StreamResult, ToolCall},
+    types::{StreamingParseResult, ToolCall},
 };
 
 /// Placeholder for the Harmony-backed GPT-OSS parser.
@@ -22,22 +23,22 @@ impl GptOssHarmonyParser {
 
 #[async_trait]
 impl ToolParser for GptOssHarmonyParser {
-    async fn parse_complete(&self, output: &str) -> ToolParserResult<(String, Vec<ToolCall>)> {
+    async fn parse_complete(&self, output: &str) -> ParserResult<(String, Vec<ToolCall>)> {
         // Temporary stub: fall back to returning the raw text with no tool calls.
         // Later phases will decode Harmony tokens into structured tool calls.
         Ok((output.to_string(), Vec::new()))
     }
 
     async fn parse_incremental(
-        &self,
+        &mut self,
         _chunk: &str,
-        _state: &mut ParseState,
-    ) -> ToolParserResult<StreamResult> {
+        _tools: &[Tool],
+    ) -> ParserResult<StreamingParseResult> {
         // Temporary stub until the Harmony streaming pipeline is implemented.
-        Ok(StreamResult::Incomplete)
+        Ok(StreamingParseResult::default())
     }
 
-    fn detect_format(&self, text: &str) -> bool {
+    fn has_tool_markers(&self, text: &str) -> bool {
         // Reuse the legacy heuristics for now; this will be replaced with Harmony-specific
         // start-token detection when the parser is fully implemented.
         text.contains("<|channel|>commentary")
@@ -53,7 +54,7 @@ impl TokenToolParser for GptOssHarmonyParser {
     async fn parse_complete_tokens(
         &self,
         _tokens: &[u32],
-    ) -> ToolParserResult<(String, Vec<ToolCall>)> {
+    ) -> ParserResult<(String, Vec<ToolCall>)> {
         // Placeholder until Harmony integration lands. Returning an empty tool list ensures
         // that enabling the parser without full implementation results in a no-op rather
         // than a runtime panic.
@@ -61,10 +62,10 @@ impl TokenToolParser for GptOssHarmonyParser {
     }
 
     async fn parse_incremental_tokens(
-        &self,
+        &mut self,
         _tokens: &[u32],
-        _state: &mut ParseState,
-    ) -> ToolParserResult<StreamResult> {
-        Ok(StreamResult::Incomplete)
+        _tools: &[Tool],
+    ) -> ParserResult<StreamingParseResult> {
+        Ok(StreamingParseResult::default())
     }
 }

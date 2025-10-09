@@ -89,6 +89,12 @@ def do_benchmark(args: argparse.Namespace):
             "Because when the tokenizer counts the output tokens, if there is gibberish, it might count incorrectly.\n"
         )
 
+    if args.dataset_name in ["image", "mmmu"]:
+        args.apply_chat_template = True
+        assert (
+            not args.tokenize_prompt
+        ), "`--tokenize-prompt` not compatible with image dataset"
+
     tokenizer_id = args.tokenizer or args.model
     tokenizer = get_tokenizer(tokenizer_id)
 

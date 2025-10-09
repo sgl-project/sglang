@@ -64,10 +64,17 @@ class OAIChatClient(BaseBackendClient):
                 "model": request_func_input.model,
                 "messages": messages,
                 "temperature": 0.0,
-                "max_tokens": request_func_input.output_len,
+                "max_completion_tokens": request_func_input.output_len,
                 "stream": not self.args.disable_stream,
+                "ignore_eos": not self.args.disable_ignore_eos,
                 **request_func_input.extra_request_body,
             }
+
+            # hack to accommodate different LoRA conventions between SGLang and vLLM.
+            if request_func_input.lora_name:
+                payload["model"] = request_func_input.lora_name
+                payload["lora_path"] = request_func_input.lora_name
+
             headers = get_auth_headers()
 
             output = RequestFuncOutput.init_new(request_func_input)

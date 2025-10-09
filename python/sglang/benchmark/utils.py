@@ -9,7 +9,12 @@ from typing import Dict, Optional, Union
 import aiohttp
 import requests
 from tqdm.asyncio import tqdm
-from transformers import AutoTokenizer, PreTrainedTokenizer, PreTrainedTokenizerFast
+from transformers import (
+    AutoProcessor,
+    AutoTokenizer,
+    PreTrainedTokenizer,
+    PreTrainedTokenizerFast,
+)
 
 
 def create_bench_client_session():
@@ -58,7 +63,7 @@ def get_tokenizer(
     if pretrained_model_name_or_path.endswith(
         ".json"
     ) or pretrained_model_name_or_path.endswith(".model"):
-        from sglang.srt.hf_transformers_utils import get_tokenizer
+        from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
         return get_tokenizer(pretrained_model_name_or_path)
 
@@ -67,6 +72,29 @@ def get_tokenizer(
     ):
         pretrained_model_name_or_path = get_model(pretrained_model_name_or_path)
     return AutoTokenizer.from_pretrained(
+        pretrained_model_name_or_path, trust_remote_code=True
+    )
+
+
+def get_processor(
+    pretrained_model_name_or_path: str,
+) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
+    assert (
+        pretrained_model_name_or_path is not None
+        and pretrained_model_name_or_path != ""
+    )
+    if pretrained_model_name_or_path.endswith(
+        ".json"
+    ) or pretrained_model_name_or_path.endswith(".model"):
+        from sglang.srt.utils.hf_transformers_utils import get_processor
+
+        return get_processor(pretrained_model_name_or_path)
+
+    if pretrained_model_name_or_path is not None and not os.path.exists(
+        pretrained_model_name_or_path
+    ):
+        pretrained_model_name_or_path = get_model(pretrained_model_name_or_path)
+    return AutoProcessor.from_pretrained(
         pretrained_model_name_or_path, trust_remote_code=True
     )
 

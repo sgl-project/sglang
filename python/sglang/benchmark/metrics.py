@@ -15,6 +15,8 @@ from sglang.benchmark.datasets.common import DatasetRow, RequestFuncOutput
 class BenchmarkMetrics:
     completed: int
     total_input: int
+    total_input_text: int
+    total_input_vision: int
     total_output: int
     total_output_retokenized: int
     request_throughput: float
@@ -46,6 +48,7 @@ class BenchmarkMetrics:
 
 
 def do_calculate_metrics(
+    input_requests: List[DatasetRow],
     outputs: List[RequestFuncOutput],
     dur_s: float,
     tokenizer: PreTrainedTokenizerBase,
@@ -53,6 +56,8 @@ def do_calculate_metrics(
     output_lens: List[int] = []
     retokenized_output_lens: List[int] = []
     total_input = 0
+    total_input_text = 0
+    total_input_vision = 0
     completed = 0
     itls: List[float] = []
     tpots: List[float] = []
@@ -66,7 +71,9 @@ def do_calculate_metrics(
                 tokenizer.encode(outputs[i].generated_text, add_special_tokens=False)
             )
             retokenized_output_lens.append(retokenized_output_len)
-            total_input += outputs[i].prompt_len
+            total_input += input_requests[i].prompt_len
+            total_input_text += input_requests[i].text_prompt_len
+            total_input_vision += input_requests[i].vision_prompt_len
             if output_len > 1:
                 tpots.append((outputs[i].latency - outputs[i].ttft) / (output_len - 1))
             itls += outputs[i].itl
@@ -88,6 +95,8 @@ def do_calculate_metrics(
     metrics = BenchmarkMetrics(
         completed=completed,
         total_input=total_input,
+        total_input_text=total_input_text,
+        total_input_vision=total_input_vision,
         total_output=sum(output_lens),
         total_output_retokenized=sum(retokenized_output_lens),
         request_throughput=completed / dur_s,
@@ -131,6 +140,8 @@ def print_metrics(metrics: BenchmarkMetrics, args: Namespace, duration: float):
     print(f"{'Successful requests:':<40} {metrics.completed}")
     print(f"{'Benchmark duration (s):':<40} {duration:.2f}")
     print(f"{'Total input tokens:':<40} {metrics.total_input}")
+    print(f"{'Total input text tokens:':<40} {metrics.total_input_text}")
+    print(f"{'Total input vision tokens:':<40} {metrics.total_input_vision}")
     print(f"{'Total generated tokens:':<40} {metrics.total_output}")
     print(
         f"{'Total generated tokens (retokenized):':<40} {metrics.total_output_retokenized}"
@@ -204,11 +215,11 @@ def save_results(
         output_file_name = args.output_file
     else:
         now = datetime.now().strftime("%m%d")
-        if args.dataset_name == "random-image":
+        if args.dataset_name == "image":
             output_file_name = (
                 f"{args.backend}_{now}_{args.num_prompts}_{args.random_input_len}_"
-                f"{args.random_output_len}_{args.random_image_num_images}imgs_"
-                f"{args.random_image_resolution}.jsonl"
+                f"{args.random_output_len}_{args.image_count}imgs_"
+                f"{args.image_resolution}.jsonl"
             )
         elif args.dataset_name.startswith("random"):
             output_file_name = f"{args.backend}_{now}_{args.num_prompts}_{args.random_input_len}_{args.random_output_len}.jsonl"

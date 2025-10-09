@@ -7,17 +7,17 @@ from sglang.benchmark.datasets.common import BaseDatasetLoader
 from sglang.benchmark.datasets.generated_shared_prefix import (
     GeneratedSharedPrefixLoader,
 )
+from sglang.benchmark.datasets.image import ImageLoader
 from sglang.benchmark.datasets.mmmu import MMMULoader
 from sglang.benchmark.datasets.mooncake import MooncakeLoader
 from sglang.benchmark.datasets.random import RandomLoader
-from sglang.benchmark.datasets.random_image import RandomImageLoader
 from sglang.benchmark.datasets.sharegpt import ShareGPTLoader
 
 DATASET_MAPPING = {
     "sharegpt": ShareGPTLoader,
     "random": RandomLoader,
     "random-ids": RandomLoader,
-    "random-image": RandomImageLoader,
+    "image": ImageLoader,
     "generated-shared-prefix": GeneratedSharedPrefixLoader,
     "mmmu": MMMULoader,
     "mooncake": MooncakeLoader,

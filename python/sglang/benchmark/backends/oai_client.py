@@ -40,6 +40,11 @@ class OAIClient(BaseBackendClient):
                 **request_func_input.extra_request_body,
             }
 
+            # hack to accommodate different LoRA conventions between SGLang and vLLM.
+            if request_func_input.lora_name:
+                payload["model"] = request_func_input.lora_name
+                payload["lora_path"] = request_func_input.lora_name
+
             if request_func_input.image_data:
                 payload["image_data"] = request_func_input.image_data
 

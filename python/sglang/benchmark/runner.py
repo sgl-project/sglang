@@ -191,12 +191,16 @@ class BenchmarkRunner:
                 server_info_json = server_info.json()
                 if "decode" in server_info_json:
                     server_info_json = server_info_json["decode"][0]
-                accept_length = server_info_json["internal_states"][0].get(
-                    "avg_spec_accept_length", None
-                )
+                if (
+                    "internal_states" in server_info_json
+                    and server_info_json["internal_states"]
+                ):
+                    accept_length = server_info_json["internal_states"][0].get(
+                        "avg_spec_accept_length", None
+                    )
 
         metrics, output_lens = do_calculate_metrics(
-            outputs, benchmark_duration, self.tokenizer
+            self.input_requests, outputs, benchmark_duration, self.tokenizer
         )
         metrics.accept_length = accept_length
 

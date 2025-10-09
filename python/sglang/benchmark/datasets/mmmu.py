@@ -1,7 +1,12 @@
 import random
 from typing import List
 
-from sglang.benchmark.datasets.common import BaseDatasetLoader, DatasetRow
+from sglang.benchmark.datasets.common import (
+    BaseDatasetLoader,
+    DatasetRow,
+    create_mm_data_row,
+)
+from sglang.benchmark.utils import get_processor
 
 
 class MMMULoader(BaseDatasetLoader):
@@ -28,8 +33,8 @@ class MMMULoader(BaseDatasetLoader):
             raise ImportError("Please install datasets: pip install datasets")
 
         num_requests = self.args.num_prompts
+        processor = get_processor(self.args.model)
         fixed_output_len = self.args.random_output_len
-        apply_chat_template = self.args.apply_chat_template
         random_sample = True
 
         print("Loading MMMU dataset from HuggingFace...")
@@ -89,48 +94,15 @@ class MMMULoader(BaseDatasetLoader):
                     question = example.get("question")
 
                     # Construct the prompt
-                    prompt = f"Question: {question}\n\nAnswer: "
-                    if apply_chat_template:
-                        try:
-                            prompt = self.tokenizer.apply_chat_template(
-                                [
-                                    {
-                                        "role": "user",
-                                        "content": [
-                                            {
-                                                "type": "image_url",
-                                                "image_url": {"url": image_data},
-                                            },
-                                            {"type": "text", "text": prompt},
-                                        ],
-                                    }
-                                ],
-                                add_generation_prompt=True,
-                                tokenize=False,
-                            )
-                        except Exception as e:
-                            # Note (Xinyuan): This is a workaround for an issue where some tokenizers do not support content as a list. (e.g. InternVL)
-                            print(
-                                f"Error applying chat template: {e}, fallback to <image> tag"
-                            )
-                            prompt = f"<image>{prompt}"
-
-                    # Calculate token lengths for text only (without image data)
-                    prompt_token_ids = self.tokenizer.encode(prompt)
-                    prompt_len = len(prompt_token_ids)
-
+                    text_prompt = f"Question: {question}\n\nAnswer: "
                     output_len = (
                         fixed_output_len if fixed_output_len is not None else 256
                     )
 
-                    filtered_dataset.append(
-                        DatasetRow(
-                            prompt=prompt,
-                            prompt_len=prompt_len,
-                            output_len=output_len,
-                            image_data=[image_data],
-                        )
+                    data_row = create_mm_data_row(
+                        text_prompt, [image], [image_data], output_len, processor
                     )
+                    filtered_dataset.append(data_row)
 
             except Exception as e:
                 print(f"Error processing example {i}: {e}")
