@@ -81,11 +81,53 @@ impl ParserRegistry {
         }
     }
 
+    /// Check if a parser with the given name is registered.
+    pub fn has_parser(&self, name: &str) -> bool {
+        let creators = self.creators.read().unwrap();
+        creators.contains_key(name)
+    }
+
     /// Create a fresh (non-pooled) parser instance by exact name.
     /// Returns a new parser instance for each call - useful for streaming where state isolation is needed.
     pub fn create_parser(&self, name: &str) -> Option<Box<dyn ToolParser>> {
         let creators = self.creators.read().unwrap();
         creators.get(name).map(|creator| creator())
+    }
+
+    /// Check if a parser can be created for a specific model without actually creating it.
+    /// Returns true if a parser is available (registered) for this model.
+    pub fn has_parser_for_model(&self, model: &str) -> bool {
+        // Try exact match first
+        {
+            let mapping = self.model_mapping.read().unwrap();
+            if let Some(parser_name) = mapping.get(model) {
+                let creators = self.creators.read().unwrap();
+                if creators.contains_key(parser_name) {
+                    return true;
+                }
+            }
+        }
+
+        // Try prefix matching
+        let model_mapping = self.model_mapping.read().unwrap();
+        let best_match = model_mapping
+            .iter()
+            .filter(|(pattern, _)| {
+                pattern.ends_with('*') && model.starts_with(&pattern[..pattern.len() - 1])
+            })
+            .max_by_key(|(pattern, _)| pattern.len());
+
+        if let Some((_, parser_name)) = best_match {
+            let creators = self.creators.read().unwrap();
+            if creators.contains_key(parser_name) {
+                return true;
+            }
+        }
+
+        // Check if default parser exists
+        let default = self.default_parser.read().unwrap().clone();
+        let creators = self.creators.read().unwrap();
+        creators.contains_key(&default)
     }
 
     /// Create a fresh (non-pooled) parser instance for a specific model.

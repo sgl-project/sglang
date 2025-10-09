@@ -82,6 +82,12 @@ impl ParserRegistry {
         }
     }
 
+    /// Check if a parser with the given name is registered.
+    pub fn has_parser(&self, name: &str) -> bool {
+        let creators = self.creators.read().unwrap();
+        creators.contains_key(name)
+    }
+
     /// Create a fresh parser instance by exact name (not pooled).
     /// Returns a new parser instance for each call - useful for streaming where state isolation is needed.
     pub fn create_parser(&self, name: &str) -> Option<Box<dyn ReasoningParser>> {
@@ -100,6 +106,21 @@ impl ParserRegistry {
             }
         }
         None
+    }
+
+    /// Check if a parser can be created for a specific model without actually creating it.
+    /// Returns true if a parser is available (registered) for this model.
+    pub fn has_parser_for_model(&self, model_id: &str) -> bool {
+        let patterns = self.patterns.read().unwrap();
+        let model_lower = model_id.to_lowercase();
+
+        for (pattern, parser_name) in patterns.iter() {
+            if model_lower.contains(&pattern.to_lowercase()) {
+                let creators = self.creators.read().unwrap();
+                return creators.contains_key(parser_name);
+            }
+        }
+        false
     }
 
     /// Create a fresh parser instance for a given model ID by pattern matching (not pooled).

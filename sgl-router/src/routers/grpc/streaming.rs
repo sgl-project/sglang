@@ -8,7 +8,6 @@ use axum::{body::Body, http::StatusCode};
 use bytes::Bytes;
 use http::header::{HeaderValue, CONTENT_TYPE};
 use serde_json::{json, Value};
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
@@ -196,6 +195,45 @@ impl StreamingProcessor {
         let created = dispatch.created;
         let system_fingerprint = dispatch.weight_version.as_deref();
 
+        // Check parser availability once upfront (log warning only once per request)
+        let reasoning_parser_available = if separate_reasoning {
+            if let Some(parser_name) = self.configured_reasoning_parser.as_ref() {
+                self.reasoning_parser_factory.registry().has_parser(parser_name)
+            } else {
+                self.reasoning_parser_factory
+                    .registry()
+                    .has_parser_for_model(model)
+            }
+        } else {
+            false
+        };
+
+        let tool_parser_available = if tools.is_some() {
+            if let Some(parser_name) = self.configured_tool_parser.as_ref() {
+                self.tool_parser_factory.registry().has_parser(parser_name)
+            } else {
+                self.tool_parser_factory
+                    .registry()
+                    .has_parser_for_model(model)
+            }
+        } else {
+            false
+        };
+
+        if separate_reasoning && !reasoning_parser_available {
+            warn!(
+                "No reasoning parser found for model '{}', skipping reasoning parsing",
+                model
+            );
+        }
+
+        if tools.is_some() && !tool_parser_available {
+            warn!(
+                "No tool parser found for model '{}', skipping tool call parsing",
+                model
+            );
+        }
+
         // Phase 2: Main streaming loop
         while let Some(response) = grpc_stream.next().await {
             let gen_response = response.map_err(|e| format!("Stream error: {}", e))?;
@@ -277,7 +315,7 @@ impl StreamingProcessor {
                     stream_buffer.push_str(&delta);
 
                     // Reasoning content handling
-                    let in_reasoning = if separate_reasoning {
+                    let in_reasoning = if separate_reasoning && reasoning_parser_available {
                         let (normal_text, reasoning_chunk, in_reasoning) = self
                             .process_reasoning_stream(
                                 &delta,
@@ -304,7 +342,7 @@ impl StreamingProcessor {
                     let tool_choice_enabled =
                         !matches!(tool_choice, Some(ToolChoice::Value(ToolChoiceValue::None)));
 
-                    if !in_reasoning && tool_choice_enabled && tools.is_some() {
+                    if !in_reasoning && tool_choice_enabled && tools.is_some() && tool_parser_available {
                         let tool_chunks = self
                             .process_tool_calls_stream(
                                 &delta,
@@ -964,21 +1002,15 @@ impl StreamingProcessor {
         system_fingerprint: Option<&str>,
     ) -> (String, Option<ChatCompletionStreamResponse>, bool) {
         // Create fresh parser for this index (not pooled, to avoid state pollution)
-        // If no parser is found, don't insert anything and skip reasoning parsing
-        if let Entry::Vacant(e) = reasoning_parsers.entry(index) {
-            if let Some(parser) = utils::create_reasoning_parser(
+        reasoning_parsers.entry(index).or_insert_with(|| {
+            let parser = utils::create_reasoning_parser(
                 &self.reasoning_parser_factory,
                 self.configured_reasoning_parser.as_ref(),
                 model,
-            ) {
-                e.insert(Arc::new(tokio::sync::Mutex::new(parser)));
-            } else {
-                warn!(
-                    "No reasoning parser found for model '{}', skipping reasoning parsing",
-                    model
-                );
-            }
-        }
+            )
+            .expect("Parser should be available - checked upfront");
+            Arc::new(tokio::sync::Mutex::new(parser))
+        });
 
         if let Some(pooled_parser) = reasoning_parsers.get(&index) {
             let (parse_result, in_reasoning) = {
@@ -1046,21 +1078,15 @@ impl StreamingProcessor {
         let mut chunks = Vec::new();
 
         // Create fresh parser for this index (not pooled, to avoid state pollution)
-        // If no parser is found, don't insert anything and skip tool parsing
-        if let Entry::Vacant(e) = tool_parsers.entry(index) {
-            if let Some(parser) = utils::create_tool_parser(
+        tool_parsers.entry(index).or_insert_with(|| {
+            let parser = utils::create_tool_parser(
                 &self.tool_parser_factory,
                 self.configured_tool_parser.as_ref(),
                 model,
-            ) {
-                e.insert(Arc::new(tokio::sync::Mutex::new(parser)));
-            } else {
-                warn!(
-                    "No tool parser found for model '{}', skipping tool call parsing",
-                    model
-                );
-            }
-        }
+            )
+            .expect("Parser should be available - checked upfront");
+            Arc::new(tokio::sync::Mutex::new(parser))
+        });
 
         if let Some(pooled_parser) = tool_parsers.get(&index) {
             let mut parser = pooled_parser.lock().await;
