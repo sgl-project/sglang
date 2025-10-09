@@ -32,9 +32,7 @@ use super::mcp::{
     mcp_manager_from_request_tools, prepare_mcp_payload_for_streaming, send_mcp_list_tools_events,
     McpLoopConfig, ToolLoopState,
 };
-use super::responses::{
-    mask_tools_as_mcp, patch_streaming_response_json, rewrite_streaming_block,
-};
+use super::responses::{mask_tools_as_mcp, patch_streaming_response_json, rewrite_streaming_block};
 use super::utils::{event_types, FunctionCallInProgress, OutputIndexMapper, StreamAction};
 
 // ============================================================================

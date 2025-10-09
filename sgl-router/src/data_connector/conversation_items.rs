@@ -117,9 +117,9 @@ pub type SharedConversationItemStorage = Arc<dyn ConversationItemStorage>;
 
 /// Helper to build id prefix based on item_type
 pub fn make_item_id(item_type: &str) -> ConversationItemId {
-    // Generate a 24-byte random hex string (48 hex chars), consistent with conversation id style
+    // Generate exactly 50 hex characters (25 bytes) for the part after the underscore
     let mut rng = rand::rng();
-    let mut bytes = [0u8; 24];
+    let mut bytes = [0u8; 25];
     rng.fill_bytes(&mut bytes);
     let hex_string: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
 

@@ -1044,7 +1044,8 @@ async fn persist_items_with_storages(
                                 content: content_v,
                                 status: status.clone(),
                             };
-                            create_and_link_item(&item_storage, conv_id_opt.as_ref(), new_item).await?;
+                            create_and_link_item(&item_storage, conv_id_opt.as_ref(), new_item)
+                                .await?;
                         }
                         _ => {
                             // For other types (FunctionToolCall, etc.), serialize the whole item
@@ -1058,7 +1059,8 @@ async fn persist_items_with_storages(
                                 content: item_val,
                                 status: Some("completed".to_string()),
                             };
-                            create_and_link_item(&item_storage, conv_id_opt.as_ref(), new_item).await?;
+                            create_and_link_item(&item_storage, conv_id_opt.as_ref(), new_item)
+                                .await?;
                         }
                     }
                 }
@@ -1083,6 +1085,12 @@ async fn persist_items_with_storages(
                     .get("id")
                     .and_then(|v| v.as_str())
                     .map(ConversationItemId::from);
+
+                if let Some(ref id) = item_id {
+                    info!(item_id = %id.0, item_type = item_type, "Extracting item ID from response output");
+                } else {
+                    warn!(item_type = item_type, "No ID found in output item");
+                }
 
                 let content = if item_type == "message" {
                     obj.get("content").cloned().unwrap_or(json!([]))
