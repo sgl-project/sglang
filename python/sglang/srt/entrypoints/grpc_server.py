@@ -210,50 +210,50 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 grpc_context=context,
             )
 
-            try:
-                async for output in response_generator:
-                    # Handle batch responses (for n>1 non-streaming)
-                    if isinstance(output, list):
-                        for batch_output in output:
-                            if "error" in batch_output:
-                                yield sglang_scheduler_pb2.GenerateResponse(
-                                    request_id=request.request_id,
-                                    error=sglang_scheduler_pb2.GenerateError(
-                                        message=batch_output["error"],
-                                        http_status_code=(
-                                            "500" if "abort" not in batch_output else "499"
-                                        ),
-                                    ),
-                                )
-                            else:
-                                # All non-error batch outputs are final responses
-                                yield self._create_completion_response(
-                                    request.request_id, batch_output
-                                )
-                    else:
-                        # Handle single response (for streaming or n=1 non-streaming)
-                        if "error" in output:
+            async for output in response_generator:
+                # Check if client cancelled before processing/yielding
+                if context.cancelled():
+                    logger.info(f"Client cancelled request {request.request_id}")
+                    # Explicitly abort the request to notify scheduler
+                    await self.request_manager.abort_request(request.request_id)
+                    break
+
+                # Handle batch responses (for n>1 non-streaming)
+                if isinstance(output, list):
+                    for batch_output in output:
+                        if "error" in batch_output:
                             yield sglang_scheduler_pb2.GenerateResponse(
                                 request_id=request.request_id,
                                 error=sglang_scheduler_pb2.GenerateError(
-                                    message=output["error"],
+                                    message=batch_output["error"],
                                     http_status_code=(
-                                        "500" if "abort" not in output else "499"
+                                        "500" if "abort" not in batch_output else "499"
                                     ),
                                 ),
                             )
-                        elif output.get("finished", False):
-                            yield self._create_completion_response(
-                                request.request_id, output
-                            )
                         else:
-                            yield self._create_chunk_response(request.request_id, output)
-            except grpc.aio.AioRpcError as e:
-                if e.code() == grpc.StatusCode.CANCELLED:
-                    logger.info(f"Client cancelled request {request.request_id}")
-                    await self.request_manager.abort_request(request.request_id)
-                    return
-                raise
+                            # All non-error batch outputs are final responses
+                            yield self._create_completion_response(
+                                request.request_id, batch_output
+                            )
+                else:
+                    # Handle single response (for streaming or n=1 non-streaming)
+                    if "error" in output:
+                        yield sglang_scheduler_pb2.GenerateResponse(
+                            request_id=request.request_id,
+                            error=sglang_scheduler_pb2.GenerateError(
+                                message=output["error"],
+                                http_status_code=(
+                                    "500" if "abort" not in output else "499"
+                                ),
+                            ),
+                        )
+                    elif output.get("finished", False):
+                        yield self._create_completion_response(
+                            request.request_id, output
+                        )
+                    else:
+                        yield self._create_chunk_response(request.request_id, output)
 
         except Exception as e:
             logger.error(

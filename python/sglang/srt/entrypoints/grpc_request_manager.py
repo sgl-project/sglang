@@ -319,25 +319,32 @@ class GrpcRequestManager:
             is_stream = getattr(obj, "stream", False)
 
             while True:
-                # Wait for response from scheduler
-                # Client cancellation is detected via exception in grpc_server.py
-                response = await state.out_queue.get()
+                # Client cancelled - notify scheduler and exit
+                if grpc_context and grpc_context.cancelled():
+                    await self.abort_request(request_id)
+                    return
 
-                if is_stream:
-                    yield response
+                try:
+                    response = await asyncio.wait_for(state.out_queue.get(), timeout=4)
 
-                # Non-streaming: yield final response with accumulated tokens from state
-                if isinstance(response, dict) and response.get("finished", False):
-                    if not is_stream:
-                        final_response = response.copy()
-                        final_response["token_ids"] = state.output_ids
-                        yield final_response
-                    break
+                    if is_stream:
+                        yield response
+
+                    # Non-streaming: yield final response with accumulated tokens from state
+                    if isinstance(response, dict) and response.get("finished", False):
+                        if not is_stream:
+                            final_response = response.copy()
+                            final_response["token_ids"] = state.output_ids
+                            yield final_response
+                        break
+
+                except asyncio.TimeoutError:
+                    # Timeout is for periodic client cancellation check
+                    # Continue waiting for scheduler response
+                    continue
 
         finally:
             # Always clean up request state when exiting
-            # This runs when stream closes (including client disconnect)
-            logger.info(f"Cleaning up request {request_id}")
             self._cleanup_request_state(request_id)
 
     def _cleanup_request_state(self, request_id: str):

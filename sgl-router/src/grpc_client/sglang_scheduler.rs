@@ -35,7 +35,7 @@ impl SglangSchedulerClient {
         };
 
         let channel = Channel::from_shared(http_endpoint)?
-            .timeout(Duration::from_secs(600))
+            .timeout(Duration::from_secs(3600))
             .http2_keep_alive_interval(Duration::from_secs(30))
             .keep_alive_timeout(Duration::from_secs(10))
             .keep_alive_while_idle(true)
@@ -68,9 +68,11 @@ impl SglangSchedulerClient {
         &mut self,
     ) -> Result<proto::HealthCheckResponse, Box<dyn std::error::Error + Send + Sync>> {
         debug!("Sending health check request");
-        // Server ignores the request body and creates its own health check internally
         let request = Request::new(proto::HealthCheckRequest {
-            tokenized: None,  // Not used by server
+            tokenized: Some(proto::TokenizedInput {
+                original_text: "Hello".to_string(),
+                input_ids: vec![9906], // Mock token ID for "Hello"
+            }),
         });
 
         let response = self.client.health_check(request).await?;
