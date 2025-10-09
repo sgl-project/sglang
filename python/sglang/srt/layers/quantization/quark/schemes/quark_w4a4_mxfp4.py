@@ -25,19 +25,50 @@ OCP_MX_BLOCK_SIZE = 32
 class QuarkW4A4MXFP4(QuarkScheme):
 
     def __init__(
-        self, weight_quant_spec: dict[str, Any], input_quant_spec: dict[str, Any]
+        self, weight_quant_spec: dict[str, Any], input_quant_spec: dict[str, Any], layer_name: Optional[str] = None
     ):
         self.out_dtype = torch.get_default_dtype()
         self.qscheme = "per_group"
         self.weight_quant_spec = weight_quant_spec
         self.input_quant_spec = input_quant_spec
+        self.layer_name = layer_name
 
     @classmethod
     def get_min_capability(cls) -> int:
         return 70
 
+    def mxfp4_quantize(self, w):
+        w_shape = w.shape
+        w_need_reshape = True if w.dim() != 2 else False
+
+        if w_need_reshape:
+            w_last_dim_size = w_shape[-1]
+            w = w.view(-1, w_last_dim_size)
+
+        w, mx_scales = dynamic_mxfp4_quant(w)
+
+        if w_need_reshape:
+            w_new_shape = w_shape[:-1] + (w.shape[-1],)
+            w = w.view(w_new_shape)
+
+        return w, mx_scales
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        return
+        if self.weight_quant_spec.get("is_dynamic") is True:
+            # NOTE: This step happens after `post_load_weights` for deepseek models.
+            # So it is safe for kv_b_proj quantization of w_kc and w_vc in `quark_post_load_weights`
+            # since kv_b_proj.weight at that point is still bfloat16.
+            w, mx_scales = self.mxfp4_quantize(layer.weight.data)
+            weight = PackedvLLMParameter(
+                data=w,
+                input_dim=1,
+                output_dim=0,
+                packed_dim=1,
+                packed_factor=2,
+                weight_loader=layer.weight.weight_loader,
+            )
+            layer.register_parameter("weight", weight)
+            layer.weight_scale.data = mx_scales
 
     def create_weights(
         self,
@@ -52,16 +83,25 @@ class QuarkW4A4MXFP4(QuarkScheme):
         layer.logical_widths = output_partition_sizes
 
         # WEIGHT
+        if self.weight_quant_spec.get("is_dynamic") is True:
+            # Create and load bfloat16 weight
+            # quantize to mxfp4 during `process_weights_after_loading`
+            pack_factor = 1
+            dtype = torch.bfloat16
+        else:
+            pack_factor = 2
+            dtype = torch.uint8
+
         weight = PackedvLLMParameter(
             data=torch.empty(
                 output_size_per_partition,
-                input_size_per_partition // 2,
-                dtype=torch.uint8,
+                input_size_per_partition // pack_factor,
+                dtype=dtype,
             ),
             input_dim=1,
             output_dim=0,
             packed_dim=1,
-            packed_factor=2,
+            packed_factor=pack_factor,
             weight_loader=weight_loader,
         )
         layer.register_parameter("weight", weight)

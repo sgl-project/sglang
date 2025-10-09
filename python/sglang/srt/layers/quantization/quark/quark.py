@@ -202,10 +202,6 @@ class QuarkConfig(QuantizationConfig):
             logger.debug("Quark model is not in MX-FP4 format: not group_size=32")
             return False
 
-        # Weights need to use static quantization.
-        if weight_quant.get("is_dynamic") is True:
-            logger.debug("Quark model is not in MX-FP4 format: not weight static")
-            return False
 
         # Activations need to use dynamic quantization.
         if input_quant.get("is_dynamic") is False:
@@ -268,7 +264,7 @@ class QuarkConfig(QuantizationConfig):
             )
             return global_quant_config
 
-    def _get_scheme_from_config(self, config: dict[str, Any]) -> "QuarkScheme":
+    def _get_scheme_from_config(self, config: dict[str, Any], layer_name: str) -> "QuarkScheme":
         if config.get("output_tensors") or config.get("bias"):
             raise NotImplementedError(
                 "Currently, Quark models with output_tensors "
@@ -278,7 +274,7 @@ class QuarkConfig(QuantizationConfig):
         input_config = cast(dict[str, Any], config.get("input_tensors"))
 
         if self._is_mx_fp4(weight_config, input_config):
-            return QuarkW4A4MXFP4(weight_config, input_config)
+            return QuarkW4A4MXFP4(weight_config, input_config, layer_name)
 
         raise NotImplementedError(
             "No quark compatible scheme was found. "
@@ -291,7 +287,7 @@ class QuarkConfig(QuantizationConfig):
         layer_quant_config = self._find_matched_config(layer_name, layer)
 
         # Find the quant_scheme
-        scheme = self._get_scheme_from_config(layer_quant_config)
+        scheme = self._get_scheme_from_config(layer_quant_config, layer_name)
 
         # Raise error if device does not support the scheme
         # (e.g. fp8 needs ada lovelace)
