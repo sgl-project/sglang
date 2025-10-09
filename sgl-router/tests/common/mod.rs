@@ -4,7 +4,9 @@
 pub mod mock_mcp_server;
 pub mod mock_openai_server;
 pub mod mock_worker;
+pub mod streaming_helpers;
 pub mod test_app;
+pub mod test_suite;
 
 use serde_json::json;
 use sglang_router_rs::config::RouterConfig;

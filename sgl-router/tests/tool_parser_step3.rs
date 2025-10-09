@@ -185,25 +185,6 @@ async fn test_steptml_format() {
 }
 
 #[tokio::test]
-async fn test_json_parameter_values() {
-    let parser = Step3Parser::new();
-
-    let input = r#"<｜tool_calls_begin｜>
-<｜tool_call_begin｜>function<｜tool_sep｜><steptml:invoke name="config">
-<steptml:parameter name="settings">{"nested": {"value": true}}</steptml:parameter>
-<steptml:parameter name="items">[1, 2, 3]</steptml:parameter>
-</steptml:invoke><｜tool_call_end｜>
-<｜tool_calls_end｜>"#;
-
-    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
-    assert_eq!(tools.len(), 1);
-
-    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
-    assert!(args["settings"].is_object());
-    assert!(args["items"].is_array());
-}
-
-#[tokio::test]
 async fn test_step3_parameter_with_angle_brackets() {
     let parser = Step3Parser::new();
 

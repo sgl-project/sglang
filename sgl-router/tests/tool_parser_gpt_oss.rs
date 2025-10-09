@@ -60,19 +60,6 @@ async fn test_gpt_oss_with_assistant_prefix() {
 }
 
 #[tokio::test]
-async fn test_gpt_oss_empty_args() {
-    let parser = GptOssParser::new();
-
-    let input =
-        r#"<|channel|>commentary to=functions.get_time<|constrain|>json<|message|>{}<|call|>"#;
-
-    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
-    assert_eq!(tools.len(), 1);
-    assert_eq!(tools[0].function.name, "get_time");
-    assert_eq!(tools[0].function.arguments, "{}");
-}
-
-#[tokio::test]
 async fn test_gpt_oss_streaming() {
     let tools = create_test_tools();
 
@@ -128,28 +115,6 @@ async fn test_gpt_oss_with_whitespace() {
     let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0].function.name, "test");
-}
-
-#[tokio::test]
-async fn test_gpt_oss_complex_json() {
-    let parser = GptOssParser::new();
-
-    let input = r#"<|channel|>commentary to=functions.process<|constrain|>json<|message|>{
-    "nested": {
-        "data": [1, 2, 3],
-        "config": {
-            "enabled": true
-        }
-    }
-}<|call|>"#;
-
-    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
-    assert_eq!(tools.len(), 1);
-    assert_eq!(tools[0].function.name, "process");
-
-    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
-    assert!(args["nested"]["data"].is_array());
-    assert_eq!(args["nested"]["config"]["enabled"], true);
 }
 
 #[tokio::test]

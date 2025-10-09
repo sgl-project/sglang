@@ -2,7 +2,6 @@
 //!
 //! Tests for the Qwen parser which handles <tool_call>...</tool_call> format
 
-use serde_json::json;
 use sglang_router_rs::tool_parser::{QwenParser, ToolParser};
 
 mod common;
@@ -43,32 +42,6 @@ async fn test_qwen_multiple_sequential_tools() {
 }
 
 #[tokio::test]
-async fn test_qwen_pretty_printed_json() {
-    let parser = QwenParser::new();
-    let input = r#"<tool_call>
-{
-    "name": "create_document",
-    "arguments": {
-        "title": "Test Document",
-        "content": "This is a test",
-        "metadata": {
-            "author": "Qwen",
-            "tags": ["test", "example"]
-        }
-    }
-}
-</tool_call>"#;
-
-    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
-    assert_eq!(tools.len(), 1);
-    assert_eq!(tools[0].function.name, "create_document");
-
-    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
-    assert_eq!(args["metadata"]["author"], "Qwen");
-    assert_eq!(args["metadata"]["tags"], json!(["test", "example"]));
-}
-
-#[tokio::test]
 async fn test_qwen_with_text_between() {
     let parser = QwenParser::new();
     let input = r#"First, let me search for information.
@@ -88,32 +61,6 @@ Done!"#;
     assert_eq!(normal_text, "First, let me search for information.\n");
     assert_eq!(tools[0].function.name, "search");
     assert_eq!(tools[1].function.name, "translate");
-}
-
-#[tokio::test]
-async fn test_qwen_empty_arguments() {
-    let parser = QwenParser::new();
-    let input = r#"<tool_call>
-{"name": "get_time", "arguments": {}}
-</tool_call>"#;
-
-    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
-    assert_eq!(tools.len(), 1);
-    assert_eq!(tools[0].function.name, "get_time");
-}
-
-#[tokio::test]
-async fn test_qwen_with_newlines_in_strings() {
-    let parser = QwenParser::new();
-    let input = r#"<tool_call>
-{"name": "write_file", "arguments": {"content": "Line 1\nLine 2\nLine 3", "path": "/tmp/test.txt"}}
-</tool_call>"#;
-
-    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
-    assert_eq!(tools.len(), 1);
-
-    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
-    assert_eq!(args["content"], "Line 1\nLine 2\nLine 3");
 }
 
 #[tokio::test]
