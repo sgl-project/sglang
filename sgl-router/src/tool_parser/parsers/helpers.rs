@@ -314,7 +314,7 @@ pub fn handle_json_tool_streaming(
         // Send diff if present
         if let Some(diff) = argument_diff {
             if !diff.is_empty() {
-                if !is_complete && tool_id < streamed_args_for_tool.len() {
+                if tool_id < streamed_args_for_tool.len() {
                     streamed_args_for_tool[tool_id].push_str(&diff);
                 }
                 result.calls.push(ToolCallItem {
