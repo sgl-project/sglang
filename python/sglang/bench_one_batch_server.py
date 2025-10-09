@@ -27,9 +27,10 @@ import requests
 from pydantic import BaseModel
 
 from sglang.bench_serving import (
+    get_processor,
     get_tokenizer,
     sample_mmmu_requests,
-    sample_random_requests, get_processor,
+    sample_random_requests,
 )
 from sglang.profiler import run_profile
 from sglang.srt.entrypoints.http_server import launch_server

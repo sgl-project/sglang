@@ -1294,9 +1294,7 @@ def create_mm_data_row(text_prompt, images: list, images_base64, output_len, pro
         )
     except Exception as e:
         # Note (Xinyuan): This is a workaround for an issue where some tokenizers do not support content as a list. (e.g. InternVL)
-        print(
-            f"Error applying chat template: {e}, fallback to <image> tag"
-        )
+        print(f"Error applying chat template: {e}, fallback to <image> tag")
         # Some tokenizers do not support list content; fall back to a placeholder in the text
         prompt_str = f"<image>{text_prompt}"
 
