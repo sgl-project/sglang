@@ -322,27 +322,21 @@ pub fn handle_json_tool_streaming(
             }
         }
 
+        // Update prev_tool_call_arr with current state
+        if *current_tool_id >= 0 {
+            ensure_capacity(*current_tool_id, prev_tool_call_arr, streamed_args_for_tool);
+            let update_tool_id = *current_tool_id as usize;
+
+            if update_tool_id < prev_tool_call_arr.len() {
+                prev_tool_call_arr[update_tool_id] = current_tool_call;
+            }
+        }
+
         // If complete, advance to next tool
         if is_complete {
             *buffer = current_text[start_idx + end_idx..].to_string();
-            if tool_id < prev_tool_call_arr.len() {
-                prev_tool_call_arr[tool_id] = Value::Null;
-            }
             *current_tool_name_sent = false;
-            if tool_id < streamed_args_for_tool.len() {
-                streamed_args_for_tool[tool_id].clear();
-            }
             *current_tool_id += 1;
-        }
-    }
-
-    // Update prev_tool_call_arr with current state
-    if *current_tool_id >= 0 {
-        ensure_capacity(*current_tool_id, prev_tool_call_arr, streamed_args_for_tool);
-        let tool_id = *current_tool_id as usize;
-
-        if tool_id < prev_tool_call_arr.len() {
-            prev_tool_call_arr[tool_id] = current_tool_call;
         }
     }
 
