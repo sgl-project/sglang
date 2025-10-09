@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use crate::protocols::spec::Tool;
 
 use crate::tool_parser::{
-    errors::{ToolParserError, ToolParserResult},
+    errors::{ParserError, ParserResult},
     parsers::helpers,
     traits::ToolParser,
     types::{FunctionCall, StreamingParseResult, ToolCall, ToolCallItem},
@@ -108,7 +108,7 @@ impl Step3Parser {
     fn parse_partial_tool_call(
         &mut self,
         tool_indices: &HashMap<String, usize>,
-    ) -> ToolParserResult<StreamingParseResult> {
+    ) -> ParserResult<StreamingParseResult> {
         let mut calls = Vec::new();
 
         // Check if we have tool_sep (means we're past the type declaration)
@@ -321,7 +321,7 @@ impl Step3Parser {
     fn parse_steptml_parameters(
         &self,
         params_text: &str,
-    ) -> ToolParserResult<serde_json::Map<String, Value>> {
+    ) -> ParserResult<serde_json::Map<String, Value>> {
         let mut parameters = serde_json::Map::new();
 
         for capture in self.param_extractor.captures_iter(params_text) {
@@ -359,7 +359,7 @@ impl Step3Parser {
     }
 
     /// Parse a single tool call block
-    fn parse_tool_call(&self, block: &str) -> ToolParserResult<Option<ToolCall>> {
+    fn parse_tool_call(&self, block: &str) -> ParserResult<Option<ToolCall>> {
         // Check if it contains function marker and tool separator
         if !block.contains("function") || !block.contains("<｜tool_sep｜>") {
             return Ok(None);
@@ -393,7 +393,7 @@ impl Step3Parser {
             let parameters = self.parse_steptml_parameters(params_text)?;
 
             let arguments_str = serde_json::to_string(&parameters)
-                .map_err(|e| ToolParserError::ParsingFailed(e.to_string()))?;
+                .map_err(|e| ParserError::ParsingFailed(e.to_string()))?;
 
             Ok(Some(ToolCall {
                 function: FunctionCall {
@@ -415,7 +415,7 @@ impl Default for Step3Parser {
 
 #[async_trait]
 impl ToolParser for Step3Parser {
-    async fn parse_complete(&self, text: &str) -> ToolParserResult<(String, Vec<ToolCall>)> {
+    async fn parse_complete(&self, text: &str) -> ParserResult<(String, Vec<ToolCall>)> {
         if !self.has_tool_markers(text) {
             return Ok((text.to_string(), vec![]));
         }
@@ -449,7 +449,7 @@ impl ToolParser for Step3Parser {
         &mut self,
         chunk: &str,
         tools: &[Tool],
-    ) -> ToolParserResult<StreamingParseResult> {
+    ) -> ParserResult<StreamingParseResult> {
         self.buffer.push_str(chunk);
 
         // Build tool indices for validation
@@ -554,5 +554,21 @@ impl ToolParser for Step3Parser {
 
     fn get_unstreamed_tool_args(&self) -> Option<Vec<ToolCallItem>> {
         helpers::get_unstreamed_args(&self.prev_tool_call_arr, &self.streamed_args_for_tool)
+    }
+
+    fn reset(&mut self) {
+        // Reset standard state
+        self.buffer.clear();
+        self.prev_tool_call_arr.clear();
+        self.current_tool_id = -1;
+        self.streamed_args_for_tool.clear();
+
+        // Reset Step3-specific fields
+        self.in_tool_block = false;
+        self.tool_block_finished = false;
+        self.current_function_name.clear();
+        self.current_parameters.clear();
+        self.in_tool_call = false;
+        self.function_name_sent = false;
     }
 }

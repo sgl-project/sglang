@@ -15,10 +15,10 @@ use crate::grpc_client::{proto, SglangSchedulerClient};
 use crate::protocols::spec::{
     ChatCompletionRequest, ChatCompletionResponse, GenerateRequest, GenerateResponse,
 };
-use crate::reasoning_parser::ReasoningParserFactory;
+use crate::reasoning_parser::ParserFactory as ReasoningParserFactory;
 use crate::tokenizer::stop::StopSequenceDecoder;
 use crate::tokenizer::traits::Tokenizer;
-use crate::tool_parser::ToolParserFactory;
+use crate::tool_parser::ParserFactory as ToolParserFactory;
 
 // ============================================================================
 // Core Context Types

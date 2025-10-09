@@ -16,8 +16,8 @@ pub mod parsers;
 mod tests;
 
 // Re-export commonly used types
-pub use errors::{ToolParserError, ToolParserResult};
-pub use factory::{PooledToolParser, ToolParserFactory, ToolParserRegistry};
+pub use errors::{ParserError, ParserResult};
+pub use factory::{ParserFactory, ParserRegistry, PooledParser};
 pub use traits::{PartialJsonParser, ToolParser};
 pub use types::{FunctionCall, PartialToolCall, StreamingParseResult, ToolCall};
 

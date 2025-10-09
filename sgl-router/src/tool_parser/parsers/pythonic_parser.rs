@@ -18,7 +18,7 @@ use std::sync::OnceLock;
 use crate::protocols::spec::Tool;
 
 use crate::tool_parser::{
-    errors::{ToolParserError, ToolParserResult},
+    errors::{ParserError, ParserResult},
     parsers::helpers,
     traits::ToolParser,
     types::{FunctionCall, StreamingParseResult, ToolCall, ToolCallItem},
@@ -74,7 +74,7 @@ impl PythonicParser {
             .replace("<|python_end|>", "")
     }
 
-    fn parse_tool_call_block(&self, block: &str) -> ToolParserResult<Vec<ToolCall>> {
+    fn parse_tool_call_block(&self, block: &str) -> ParserResult<Vec<ToolCall>> {
         let expr = parse_python_expression(block)?;
         match expr {
             Expr::List(list_expr) => list_expr
@@ -83,7 +83,7 @@ impl PythonicParser {
                 .enumerate()
                 .map(|(idx, call_expr)| build_tool_call(call_expr, idx))
                 .collect(),
-            _ => Err(ToolParserError::ParsingFailed(
+            _ => Err(ParserError::ParsingFailed(
                 "Expected a list of function calls in pythonic tool call".to_string(),
             )),
         }
@@ -92,7 +92,7 @@ impl PythonicParser {
 
 #[async_trait]
 impl ToolParser for PythonicParser {
-    async fn parse_complete(&self, text: &str) -> ToolParserResult<(String, Vec<ToolCall>)> {
+    async fn parse_complete(&self, text: &str) -> ParserResult<(String, Vec<ToolCall>)> {
         let cleaned = Self::strip_special_tokens(text);
 
         if let Some((tool_calls_text, normal_text)) = self.extract_tool_calls(&cleaned) {
@@ -120,7 +120,7 @@ impl ToolParser for PythonicParser {
         &mut self,
         chunk: &str,
         tools: &[Tool],
-    ) -> ToolParserResult<StreamingParseResult> {
+    ) -> ParserResult<StreamingParseResult> {
         self.buffer.push_str(chunk);
 
         let cleaned = Self::strip_special_tokens(&self.buffer);
@@ -232,23 +232,23 @@ fn find_matching_bracket(buffer: &str, start: usize) -> Option<usize> {
     None // No matching bracket found
 }
 
-fn parse_python_expression(source: &str) -> ToolParserResult<Expr> {
+fn parse_python_expression(source: &str) -> ParserResult<Expr> {
     let module = parse(source, Mode::Expression, "<pythonic_tool_call>")
-        .map_err(|err| ToolParserError::ParsingFailed(err.to_string()))?;
+        .map_err(|err| ParserError::ParsingFailed(err.to_string()))?;
 
     match module {
         Mod::Expression(expr_mod) => Ok(*expr_mod.body),
-        _ => Err(ToolParserError::ParsingFailed(
+        _ => Err(ParserError::ParsingFailed(
             "Expected a Python expression".to_string(),
         )),
     }
 }
 
-fn build_tool_call(expr: Expr, _index: usize) -> ToolParserResult<ToolCall> {
+fn build_tool_call(expr: Expr, _index: usize) -> ParserResult<ToolCall> {
     match expr {
         Expr::Call(call_expr) => {
             if !call_expr.args.is_empty() {
-                return Err(ToolParserError::ParsingFailed(
+                return Err(ParserError::ParsingFailed(
                     "Positional arguments are not supported in pythonic tool calls".to_string(),
                 ));
             }
@@ -256,7 +256,7 @@ fn build_tool_call(expr: Expr, _index: usize) -> ToolParserResult<ToolCall> {
             let function_name = match *call_expr.func {
                 Expr::Name(name_expr) => name_expr.id.to_string(),
                 _ => {
-                    return Err(ToolParserError::ParsingFailed(
+                    return Err(ParserError::ParsingFailed(
                         "Unsupported function reference in pythonic tool call".to_string(),
                     ))
                 }
@@ -265,7 +265,7 @@ fn build_tool_call(expr: Expr, _index: usize) -> ToolParserResult<ToolCall> {
             let mut arguments_map = Map::with_capacity(call_expr.keywords.len());
             for keyword in call_expr.keywords {
                 let arg_name = keyword.arg.ok_or_else(|| {
-                    ToolParserError::ParsingFailed(
+                    ParserError::ParsingFailed(
                         "pythonic tool calls do not support **kwargs".to_string(),
                     )
                 })?;
@@ -283,13 +283,13 @@ fn build_tool_call(expr: Expr, _index: usize) -> ToolParserResult<ToolCall> {
                 },
             })
         }
-        _ => Err(ToolParserError::ParsingFailed(
+        _ => Err(ParserError::ParsingFailed(
             "Expected function calls inside pythonic tool call list".to_string(),
         )),
     }
 }
 
-fn expression_to_json(expr: &Expr) -> ToolParserResult<Value> {
+fn expression_to_json(expr: &Expr) -> ParserResult<Value> {
     match expr {
         Expr::Constant(expr_constant) => constant_to_json(&expr_constant.value),
         Expr::List(list_expr) => collect_sequence(&list_expr.elts).map(Value::Array),
@@ -300,81 +300,75 @@ fn expression_to_json(expr: &Expr) -> ToolParserResult<Value> {
         Expr::UnaryOp(unary_expr) => match unary_expr.op {
             UnaryOp::USub => match unary_expr.operand.as_ref() {
                 Expr::Constant(const_expr) => negate_constant(&const_expr.value),
-                _ => Err(ToolParserError::ParsingFailed(
+                _ => Err(ParserError::ParsingFailed(
                     "Unsupported unary operand in pythonic tool call".to_string(),
                 )),
             },
             UnaryOp::UAdd => expression_to_json(unary_expr.operand.as_ref()),
-            _ => Err(ToolParserError::ParsingFailed(format!(
+            _ => Err(ParserError::ParsingFailed(format!(
                 "Unsupported unary operator in pythonic tool call: {:?}",
                 unary_expr.op
             ))),
         },
         Expr::Name(name_expr) => Ok(Value::String(name_expr.id.to_string())),
-        _ => Err(ToolParserError::ParsingFailed(format!(
+        _ => Err(ParserError::ParsingFailed(format!(
             "Unsupported expression in pythonic tool call: {:?}",
             expr
         ))),
     }
 }
 
-fn constant_to_json(constant: &Constant) -> ToolParserResult<Value> {
+fn constant_to_json(constant: &Constant) -> ParserResult<Value> {
     match constant {
         Constant::None => Ok(Value::Null),
         Constant::Bool(b) => Ok(Value::Bool(*b)),
         Constant::Int(value) => Ok(integer_constant_to_value(value, false)),
         Constant::Float(f) => Number::from_f64(*f).map(Value::Number).ok_or_else(|| {
-            ToolParserError::ParsingFailed(
-                "Invalid float literal in pythonic tool call".to_string(),
-            )
+            ParserError::ParsingFailed("Invalid float literal in pythonic tool call".to_string())
         }),
         Constant::Str(s) => Ok(Value::String(s.clone())),
         Constant::Bytes(bytes) => Ok(Value::String(String::from_utf8_lossy(bytes).into_owned())),
         Constant::Tuple(values) => constant_tuple_to_array(values).map(Value::Array),
-        Constant::Ellipsis | Constant::Complex { .. } => Err(ToolParserError::ParsingFailed(
+        Constant::Ellipsis | Constant::Complex { .. } => Err(ParserError::ParsingFailed(
             "Unsupported literal in pythonic tool call".to_string(),
         )),
     }
 }
 
-fn negate_constant(constant: &Constant) -> ToolParserResult<Value> {
+fn negate_constant(constant: &Constant) -> ParserResult<Value> {
     match constant {
         Constant::Int(value) => Ok(integer_constant_to_value(value, true)),
         Constant::Float(f) => Number::from_f64(-f).map(Value::Number).ok_or_else(|| {
-            ToolParserError::ParsingFailed(
-                "Invalid float literal in pythonic tool call".to_string(),
-            )
+            ParserError::ParsingFailed("Invalid float literal in pythonic tool call".to_string())
         }),
-        _ => Err(ToolParserError::ParsingFailed(
+        _ => Err(ParserError::ParsingFailed(
             "Unsupported unary operand in pythonic tool call".to_string(),
         )),
     }
 }
 
-fn value_to_key_string(value: Value) -> ToolParserResult<String> {
+fn value_to_key_string(value: Value) -> ParserResult<String> {
     match value {
         Value::String(s) => Ok(s),
         Value::Number(num) => Ok(num.to_string()),
         Value::Bool(b) => Ok(b.to_string()),
         Value::Null => Ok("null".to_string()),
-        other => Err(ToolParserError::ParsingFailed(format!(
+        other => Err(ParserError::ParsingFailed(format!(
             "Unsupported key type in pythonic tool call: {:?}",
             other
         ))),
     }
 }
 
-fn collect_sequence(elements: &[Expr]) -> ToolParserResult<Vec<Value>> {
+fn collect_sequence(elements: &[Expr]) -> ParserResult<Vec<Value>> {
     elements.iter().map(expression_to_json).collect()
 }
 
-fn collect_dict(keys: &[Option<Expr>], values: &[Expr]) -> ToolParserResult<Map<String, Value>> {
+fn collect_dict(keys: &[Option<Expr>], values: &[Expr]) -> ParserResult<Map<String, Value>> {
     let mut map = Map::with_capacity(keys.len());
     for (key_expr, value_expr) in keys.iter().zip(values.iter()) {
         let key_expr = key_expr.as_ref().ok_or_else(|| {
-            ToolParserError::ParsingFailed(
-                "pythonic tool calls do not support **kwargs".to_string(),
-            )
+            ParserError::ParsingFailed("pythonic tool calls do not support **kwargs".to_string())
         })?;
         let key_value = expression_to_json(key_expr)?;
         let key = value_to_key_string(key_value)?;
@@ -384,7 +378,7 @@ fn collect_dict(keys: &[Option<Expr>], values: &[Expr]) -> ToolParserResult<Map<
     Ok(map)
 }
 
-fn constant_tuple_to_array(values: &[Constant]) -> ToolParserResult<Vec<Value>> {
+fn constant_tuple_to_array(values: &[Constant]) -> ParserResult<Vec<Value>> {
     values.iter().map(constant_to_json).collect()
 }
 
