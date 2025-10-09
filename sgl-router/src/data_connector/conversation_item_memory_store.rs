@@ -148,6 +148,20 @@ impl ConversationItemStorage for MemoryConversationItemStorage {
         Ok(items.get(item_id).cloned())
     }
 
+    async fn is_item_linked(
+        &self,
+        conversation_id: &ConversationId,
+        item_id: &ConversationItemId,
+    ) -> Result<bool> {
+        let links = self.links.read().unwrap();
+        if let Some(conv_links) = links.get(conversation_id) {
+            // Check if any link in this conversation points to this item_id
+            Ok(conv_links.values().any(|id| id == item_id))
+        } else {
+            Ok(false)
+        }
+    }
+
     async fn delete_item(
         &self,
         conversation_id: &ConversationId,

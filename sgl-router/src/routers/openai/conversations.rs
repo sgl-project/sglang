@@ -595,6 +595,29 @@ pub(super) async fn get_conversation_item(
         }
     }
 
+    // First check if the item is linked to this conversation
+    let is_linked = match item_storage
+        .is_item_linked(&conversation_id, &item_id)
+        .await
+    {
+        Ok(linked) => linked,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("Failed to check item link: {}", e)})),
+            )
+                .into_response();
+        }
+    };
+
+    if !is_linked {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "Item not found in this conversation"})),
+        )
+            .into_response();
+    }
+
     // Get the item
     match item_storage.get_item(&item_id).await {
         Ok(Some(item)) => {

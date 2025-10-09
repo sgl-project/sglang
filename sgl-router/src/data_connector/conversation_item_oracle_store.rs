@@ -289,6 +289,26 @@ impl ConversationItemStorage for OracleConversationItemStorage {
         .await
     }
 
+    async fn is_item_linked(
+        &self,
+        conversation_id: &ConversationId,
+        item_id: &ConversationItemId,
+    ) -> ItemResult<bool> {
+        let cid = conversation_id.0.clone();
+        let iid = item_id.0.clone();
+
+        self.with_connection(move |conn| {
+            let count: i64 = conn
+                .query_row_as(
+                    "SELECT COUNT(*) FROM conversation_item_links WHERE conversation_id = :1 AND item_id = :2",
+                    &[&cid, &iid],
+                )
+                .map_err(map_oracle_error)?;
+            Ok(count > 0)
+        })
+        .await
+    }
+
     async fn delete_item(
         &self,
         conversation_id: &ConversationId,

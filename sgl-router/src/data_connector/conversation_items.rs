@@ -98,6 +98,13 @@ pub trait ConversationItemStorage: Send + Sync + 'static {
     /// Get a single item by ID
     async fn get_item(&self, item_id: &ConversationItemId) -> Result<Option<ConversationItem>>;
 
+    /// Check if an item is linked to a conversation
+    async fn is_item_linked(
+        &self,
+        conversation_id: &ConversationId,
+        item_id: &ConversationItemId,
+    ) -> Result<bool>;
+
     /// Delete an item link from a conversation (does not delete the item itself)
     async fn delete_item(
         &self,
