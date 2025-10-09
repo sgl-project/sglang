@@ -1,13 +1,17 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.managers.schedule_batch import ModelWorkerBatch
-from sglang.srt.managers.scheduler import GenerationBatchResult
-from sglang.srt.speculative.eagle_info import EagleDraftInput
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import get_compiler_backend
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import ModelWorkerBatch
+    from sglang.srt.managers.scheduler import GenerationBatchResult
+    from sglang.srt.speculative.eagle_info import EagleDraftInput
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
 @torch.compile(dynamic=True, backend=get_compiler_backend())

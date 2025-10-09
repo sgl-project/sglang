@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
@@ -12,11 +14,11 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.speculative.build_eagle_tree import TreeMaskMode
-from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
-    EAGLEDraftCudaGraphRunner,
-)
 
 if TYPE_CHECKING:
+    from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
+        EAGLEDraftCudaGraphRunner,
+    )
     from sglang.srt.speculative.eagle_info import EagleDraftInput
 
 
