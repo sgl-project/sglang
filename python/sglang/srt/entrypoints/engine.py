@@ -147,6 +147,35 @@ class Engine(EngineBase):
                 thread_label = "Tokenizer"
                 trace_set_thread_info(thread_label)
 
+    def _remove_output_ids_prefix_overlap(self, ret):
+        """
+        Remove the overlapping prefix from output_ids using completion_tokens.
+
+        This trims the beginning of output_ids if it overlaps with the input prompt.
+        Only trims if output_ids length is greater than completion_tokens.
+        Modifies ret in-place and returns it.
+        """
+        def _trim_one(item):
+            if not isinstance(item, dict):
+                return item
+            output_ids = item.get("output_ids", [])
+            meta_info = item.get("meta_info", {})
+            completion_tokens = meta_info.get("completion_tokens", 0)
+            if isinstance(output_ids, list) and isinstance(completion_tokens, int) and completion_tokens > 0 and len(output_ids) > completion_tokens:
+                item["output_ids"] = output_ids[-completion_tokens:]
+            return item
+
+        # single input
+        if isinstance(ret, dict):
+            return _trim_one(ret)
+        # batch input
+        elif isinstance(ret, list):
+            for item in ret:
+                _trim_one(item)
+            return ret
+
+        return ret
+    
     def generate(
         self,
         # The input prompt. It can be a single prompt or a batch of prompts.
