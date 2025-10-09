@@ -40,6 +40,7 @@ from sglang.srt.utils import configure_logger, prepare_model_and_tokenizer
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
+HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 60000))
 
 
 def _run_scheduler_with_signal_handling(*args, **kwargs):
@@ -188,7 +189,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         # Start the request manager's event loop using auto_create_handle_loop
         self.request_manager.auto_create_handle_loop()
 
-        logger.info("Standalone gRPC scheduler service initialized")
+        logger.info("gRPC scheduler servicer initialized")
 
     async def Generate(
         self,
@@ -196,7 +197,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         context: grpc.aio.ServicerContext,
     ) -> AsyncIterator[sglang_scheduler_pb2.GenerateResponse]:
         """Handle generation requests with streaming responses."""
-        logger.info(f"Generation request: {request.request_id}")
+        logger.debug(f"Receive generation request: {request.request_id}")
 
         try:
             # Convert gRPC request to internal format
@@ -248,7 +249,10 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                         yield self._create_chunk_response(request.request_id, output)
 
         except Exception as e:
-            logger.error(f"Generate failed: {e}\n{get_exception_traceback()}")
+            logger.error(
+                f"Generate failed for request {request.request_id}: {e}\n"
+                f"{get_exception_traceback()}"
+            )
             yield sglang_scheduler_pb2.GenerateResponse(
                 request_id=request.request_id,
                 error=sglang_scheduler_pb2.GenerateError(
@@ -261,10 +265,10 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
     async def Embed(
         self,
         request: sglang_scheduler_pb2.EmbedRequest,
-        context: grpc.aio.ServicerContext,
+        _context: grpc.aio.ServicerContext,
     ) -> sglang_scheduler_pb2.EmbedResponse:
         """Handle embedding requests."""
-        logger.info(f"Embedding request: {request.request_id}")
+        logger.debug(f"Receive embedding request: {request.request_id}")
 
         try:
             # Convert request
@@ -291,7 +295,10 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             )
 
         except Exception as e:
-            logger.error(f"Embed failed: {e}\n{get_exception_traceback()}")
+            logger.error(
+                f"Embed failed for request {request.request_id}: {e}\n"
+                f"{get_exception_traceback()}"
+            )
             return sglang_scheduler_pb2.EmbedResponse(
                 request_id=request.request_id,
                 error=sglang_scheduler_pb2.EmbedError(
@@ -343,28 +350,38 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 health_request.bootstrap_host = FAKE_BOOTSTRAP_HOST
                 health_request.bootstrap_room = 0
 
-            logger.info(f"Sending health check request to request manager...")
+            logger.debug(f"Receive health check request: {rid}")
 
             # Submit and wait for response
-            # No timeout here - router layer handles request timeout
-            # This prevents false failures when scheduler is busy but still processing
             output_generator = self.request_manager.generate_request(
-                health_request, request_id=rid, grpc_context=context
+                health_request, request_id=rid
             )
 
-            # Wait for response (router will cancel via gRPC context if timeout)
-            response = await output_generator.__anext__()
+            try:
+                # Get first response with timeout
+                response = await asyncio.wait_for(
+                    output_generator.__anext__(), timeout=HEALTH_CHECK_TIMEOUT
+                )
 
-            # Clean up
-            if rid in self.request_manager.rid_to_state:
-                del self.request_manager.rid_to_state[rid]
+                # Clean up
+                if rid in self.request_manager.rid_to_state:
+                    del self.request_manager.rid_to_state[rid]
 
-            return sglang_scheduler_pb2.HealthCheckResponse(
-                healthy=True, message="Health check passed"
-            )
+                return sglang_scheduler_pb2.HealthCheckResponse(
+                    healthy=True, message="Health check passed"
+                )
+
+            except asyncio.TimeoutError:
+                # Clean up on timeout
+                if rid in self.request_manager.rid_to_state:
+                    del self.request_manager.rid_to_state[rid]
+
+                return sglang_scheduler_pb2.HealthCheckResponse(
+                    healthy=False, message="Health check timeout"
+                )
 
         except Exception as e:
-            logger.error(f"Health check failed: {e}")
+            logger.error(f"Health check failed: {e}\n{get_exception_traceback()}")
             return sglang_scheduler_pb2.HealthCheckResponse(
                 healthy=False, message=f"Health check error: {str(e)}"
             )
@@ -372,10 +389,10 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
     async def Abort(
         self,
         request: sglang_scheduler_pb2.AbortRequest,
-        context: grpc.aio.ServicerContext,
+        _context: grpc.aio.ServicerContext,
     ) -> sglang_scheduler_pb2.AbortResponse:
         """Abort an ongoing request."""
-        logger.info(f"Aborting request: {request.request_id}")
+        logger.debug(f"Receive abort request: {request.request_id}")
 
         try:
             success = await self.request_manager.abort_request(request.request_id)
@@ -385,7 +402,10 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 message=f"Request {request.request_id} {'aborted' if success else 'not found'}",
             )
         except Exception as e:
-            logger.error(f"Abort failed: {e}")
+            logger.error(
+                f"Abort failed for request {request.request_id}: {e}\n"
+                f"{get_exception_traceback()}"
+            )
             return sglang_scheduler_pb2.AbortResponse(
                 success=False,
                 message=str(e),
@@ -393,11 +413,11 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
 
     async def GetModelInfo(
         self,
-        request: sglang_scheduler_pb2.GetModelInfoRequest,
-        context: grpc.aio.ServicerContext,
+        _request: sglang_scheduler_pb2.GetModelInfoRequest,
+        _context: grpc.aio.ServicerContext,
     ) -> sglang_scheduler_pb2.GetModelInfoResponse:
         """Get model information."""
-        logger.info("Model info request received")
+        logger.debug("Receive model info request")
 
         is_generation = self.scheduler_info.get("is_generation")
         if is_generation is None:
@@ -424,11 +444,11 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
 
     async def GetServerInfo(
         self,
-        request: sglang_scheduler_pb2.GetServerInfoRequest,
-        context: grpc.aio.ServicerContext,
+        _request: sglang_scheduler_pb2.GetServerInfoRequest,
+        _context: grpc.aio.ServicerContext,
     ) -> sglang_scheduler_pb2.GetServerInfoResponse:
         """Get server information."""
-        logger.info("Server info request received")
+        logger.debug("Receive server info request")
 
         server_args_dict = dataclasses.asdict(self.server_args)
         server_args_struct = Struct()
@@ -850,9 +870,8 @@ async def serve_grpc(
     listen_addr = f"{server_args.host}:{server_args.port}"
     server.add_insecure_port(listen_addr)
 
-    logger.info(f"Starting standalone gRPC server on {listen_addr}")
-
     await server.start()
+    logger.info(f"gRPC server listening on {listen_addr}")
 
     # Handle shutdown signals
     loop = asyncio.get_running_loop()
