@@ -32,9 +32,7 @@ use super::mcp::{
     mcp_manager_from_request_tools, prepare_mcp_payload_for_streaming, send_mcp_list_tools_events,
     McpLoopConfig, ToolLoopState,
 };
-use super::responses::{
-    mask_tools_as_mcp, patch_streaming_response_json, rewrite_streaming_block, store_response_impl,
-};
+use super::responses::{mask_tools_as_mcp, patch_streaming_response_json, rewrite_streaming_block};
 use super::utils::{event_types, FunctionCallInProgress, OutputIndexMapper, StreamAction};
 
 // ============================================================================
@@ -1082,26 +1080,17 @@ pub(super) async fn handle_simple_streaming_passthrough(
                     previous_response_id.as_deref(),
                 );
 
-                if persist_needed {
-                    if let Err(err) = persist_conversation_items(
-                        conversation_storage.clone(),
-                        conversation_item_storage.clone(),
-                        response_storage.clone(),
-                        &response_json,
-                        &original_request,
-                    )
-                    .await
-                    {
-                        warn!("Failed to persist conversation items (stream): {}", err);
-                    }
-                } else if should_store {
-                    // Store response only if no conversation (persist_conversation_items already stores it)
-                    if let Err(err) =
-                        store_response_impl(&response_storage, &response_json, &original_request)
-                            .await
-                    {
-                        warn!("Failed to store streaming response: {}", err);
-                    }
+                // Always persist conversation items and response (even without conversation)
+                if let Err(err) = persist_conversation_items(
+                    conversation_storage.clone(),
+                    conversation_item_storage.clone(),
+                    response_storage.clone(),
+                    &response_json,
+                    &original_request,
+                )
+                .await
+                {
+                    warn!("Failed to persist conversation items (stream): {}", err);
                 }
             } else if let Some(error_payload) = encountered_error {
                 warn!("Upstream streaming error payload: {}", error_payload);
@@ -1390,32 +1379,20 @@ pub(super) async fn handle_streaming_with_tool_interception(
                         previous_response_id.as_deref(),
                     );
 
-                    if persist_needed {
-                        if let Err(err) = persist_conversation_items(
-                            conversation_storage.clone(),
-                            conversation_item_storage.clone(),
-                            response_storage.clone(),
-                            &response_json,
-                            &original_request,
-                        )
-                        .await
-                        {
-                            warn!(
-                                "Failed to persist conversation items (stream + MCP): {}",
-                                err
-                            );
-                        }
-                    } else if should_store {
-                        // Store response only if no conversation (persist_conversation_items already stores it)
-                        if let Err(err) = store_response_impl(
-                            &response_storage,
-                            &response_json,
-                            &original_request,
-                        )
-                        .await
-                        {
-                            warn!("Failed to store streaming response: {}", err);
-                        }
+                    // Always persist conversation items and response (even without conversation)
+                    if let Err(err) = persist_conversation_items(
+                        conversation_storage.clone(),
+                        conversation_item_storage.clone(),
+                        response_storage.clone(),
+                        &response_json,
+                        &original_request,
+                    )
+                    .await
+                    {
+                        warn!(
+                            "Failed to persist conversation items (stream + MCP): {}",
+                            err
+                        );
                     }
                 }
 
