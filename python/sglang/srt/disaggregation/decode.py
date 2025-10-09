@@ -151,10 +151,10 @@ class HybridDecodeReqToTokenPool(HybridReqToTokenPool):
             pre_alloc_size=pre_alloc_size,
         )
         self.mamba_pool = MambaPool(
-            size + pre_alloc_size,
-            cache_params,
-            device,
-            speculative_num_draft_tokens,
+            size=size + pre_alloc_size,
+            cache_params=cache_params,
+            device=device,
+            speculative_num_draft_tokens=speculative_num_draft_tokens,
         )
         self.mamba_map = {layer_id: i for i, layer_id in enumerate(cache_params.layers)}
 
