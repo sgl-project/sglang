@@ -25,12 +25,14 @@ from concurrent import futures
 from dataclasses import dataclass
 from http import HTTPStatus
 from types import SimpleNamespace
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Deque, Dict, List, Optional, Tuple, Union
 
 import psutil
 import setproctitle
 import torch
 import zmq
+from torch.cuda import Stream as CudaStream
+from torch.cuda import StreamContext as CudaStreamContext
 from torch.distributed import barrier
 
 from sglang.global_config import global_config
@@ -60,11 +62,6 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.hf_transformers_utils import (
-    get_processor,
-    get_tokenizer,
-    get_tokenizer_from_processor,
-)
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe import initialize_moe_config
@@ -78,6 +75,7 @@ from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
+    ExpertDistributionReqType,
     FlushCacheReqInput,
     FlushCacheReqOutput,
     FreezeGCReq,
@@ -116,8 +114,10 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.mm_utils import init_embedding_cache
+from sglang.srt.managers.overlap_utils import FutureIndices, FutureMap
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
+    ModelWorkerBatch,
     MultimodalInputs,
     Req,
     RequestStage,
@@ -143,15 +143,13 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
     SchedulerUpdateWeightsMixin,
 )
 from sglang.srt.managers.session_controller import Session
-from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient
 from sglang.srt.managers.utils import validate_input_length
 from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.model_executor.forward_batch_info import (
-    ForwardBatchOutput,
+    ForwardBatch,
     ForwardMode,
     PPProxyTensors,
 )
@@ -189,6 +187,11 @@ from sglang.srt.utils import (
     set_random_seed,
     suppress_other_loggers,
 )
+from sglang.srt.utils.hf_transformers_utils import (
+    get_processor,
+    get_tokenizer,
+    get_tokenizer_from_processor,
+)
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -200,40 +203,48 @@ GRAMMAR_TIMEOUT = float(os.environ.get("SGLANG_GRAMMAR_TIMEOUT", 300))
 
 @dataclass
 class GenerationBatchResult:
-    logits_output: Optional[LogitsProcessorOutput]
-    pp_hidden_states_proxy_tensors: Optional[PPProxyTensors]
-    next_token_ids: Optional[List[int]]
-    can_run_cuda_graph: bool
+    logits_output: Optional[LogitsProcessorOutput] = None
+    pp_hidden_states_proxy_tensors: Optional[PPProxyTensors] = None
+    next_token_ids: Optional[torch.Tensor] = None
+    num_accepted_tokens: Optional[int] = None
+    can_run_cuda_graph: bool = False
 
     # For output processing
-    extend_input_len_per_req: List[int]
-    extend_logprob_start_len_per_req: List[int]
+    extend_input_len_per_req: Optional[List[int]] = None
+    extend_logprob_start_len_per_req: Optional[List[int]] = None
 
-    @classmethod
-    def from_forward_batch_output(
-        cls,
-        forward_batch_output: ForwardBatchOutput,
-        extend_input_len_per_req: List[int],
-        extend_logprob_start_len_per_req: List[int],
-    ):
-        # TODO(lsyin): remove this workaround logic and try to unify output classes
+    # For overlap scheduling
+    copy_done: Optional[torch.cuda.Event] = None
+    delay_sample_launch: bool = False
+    forward_batch: Optional[ForwardBatch] = None
+    future_indices: Optional[FutureIndices] = None
 
-        return cls(
-            logits_output=forward_batch_output.logits_output,
-            pp_hidden_states_proxy_tensors=forward_batch_output.pp_proxy_tensors,
-            next_token_ids=forward_batch_output.next_token_ids,
-            extend_input_len_per_req=extend_input_len_per_req,
-            extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
-            can_run_cuda_graph=forward_batch_output.can_run_cuda_graph,
-        )
+    def copy_to_cpu(self, return_logprob: bool = False):
+        """Copy tensors to CPU in overlap scheduling.
+        Only the tensors which are needed for processing results are copied,
+        e.g., next_token_ids, logits outputs
+        """
+        if return_logprob:
+            if self.logits_output.next_token_logits is not None:
+                self.logits_output.next_token_logits = (
+                    self.logits_output.next_token_logits.to("cpu", non_blocking=True)
+                )
+            if self.logits_output.input_token_logprobs is not None:
+                self.logits_output.input_token_logprobs = (
+                    self.logits_output.input_token_logprobs.to("cpu", non_blocking=True)
+                )
+        if self.logits_output.hidden_states is not None:
+            self.logits_output.hidden_states = self.logits_output.hidden_states.to(
+                "cpu", non_blocking=True
+            )
+        self.next_token_ids = self.next_token_ids.to("cpu", non_blocking=True)
+        self.copy_done.record()
 
     @classmethod
     def from_pp_proxy(
         cls, logits_output, next_pp_outputs: PPProxyTensors, can_run_cuda_graph
     ):
-        # TODO(lsyin): also simplify this logic
-        # Current PP implementation in scheduler is not compatible with ForwardBatchOutput
-        # Maybe introduce a ProxyBatchOutput for PP and the original ForwardBatchOutput for TP
+        # TODO(lsyin): refactor PP and avoid using dict
         proxy_dict = next_pp_outputs.tensors
         return cls(
             logits_output=logits_output,
@@ -261,6 +272,48 @@ class Scheduler(
     SchedulerDisaggregationPrefillMixin,
 ):
     """A scheduler that manages a tensor parallel GPU worker."""
+
+    def launch_draft_worker(
+        self, gpu_id, tp_rank, moe_ep_rank, server_args, port_args, dp_rank
+    ):
+        if self.spec_algorithm.is_eagle():
+            from sglang.srt.speculative.eagle_worker import EAGLEWorker
+
+            self.draft_worker = EAGLEWorker(
+                gpu_id=gpu_id,
+                tp_rank=tp_rank,
+                moe_ep_rank=moe_ep_rank,
+                server_args=server_args,
+                nccl_port=port_args.nccl_port,
+                target_worker=self.tp_worker,
+                dp_rank=dp_rank,
+            )
+        elif self.spec_algorithm.is_standalone():
+            from sglang.srt.speculative.standalone_worker import StandaloneWorker
+
+            self.draft_worker = StandaloneWorker(
+                gpu_id=gpu_id,
+                tp_rank=tp_rank,
+                moe_ep_rank=moe_ep_rank,
+                server_args=server_args,
+                nccl_port=port_args.nccl_port,
+                target_worker=self.tp_worker,
+                dp_rank=dp_rank,
+            )
+        elif self.spec_algorithm.is_ngram():
+            from sglang.srt.speculative.ngram_worker import NGRAMWorker
+
+            self.draft_worker = NGRAMWorker(
+                gpu_id=gpu_id,
+                tp_rank=tp_rank,
+                moe_ep_rank=moe_ep_rank,
+                server_args=server_args,
+                nccl_port=port_args.nccl_port,
+                target_worker=self.tp_worker,
+                dp_rank=dp_rank,
+            )
+        else:
+            self.draft_worker = None
 
     def __init__(
         self,
@@ -298,7 +351,9 @@ class Scheduler(
         self.enable_metrics_for_all_schedulers = (
             server_args.enable_metrics_for_all_schedulers
         )
-        self.enable_kv_cache_events = server_args.kv_events_config and tp_rank == 0
+        self.enable_kv_cache_events = bool(
+            server_args.kv_events_config and tp_rank == 0
+        )
         self.enable_trace = server_args.enable_trace
         self.stream_interval = server_args.stream_interval
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
@@ -385,12 +440,10 @@ class Scheduler(
             logger.info("Overlap scheduler is disabled for embedding models.")
 
         # Launch a tensor parallel worker
-        if self.enable_overlap:
-            TpWorkerClass = TpModelWorkerClient
-        else:
-            TpWorkerClass = TpModelWorker
 
-        self.tp_worker = TpWorkerClass(
+        from sglang.srt.managers.tp_worker import TpModelWorker
+
+        self.tp_worker = TpModelWorker(
             server_args=server_args,
             gpu_id=gpu_id,
             tp_rank=tp_rank,
@@ -401,44 +454,9 @@ class Scheduler(
         )
 
         # Launch a draft worker for speculative decoding
-        if self.spec_algorithm.is_eagle():
-            from sglang.srt.speculative.eagle_worker import EAGLEWorker
-
-            self.draft_worker = EAGLEWorker(
-                gpu_id=gpu_id,
-                tp_rank=tp_rank,
-                moe_ep_rank=moe_ep_rank,
-                server_args=server_args,
-                nccl_port=port_args.nccl_port,
-                target_worker=self.tp_worker,
-                dp_rank=dp_rank,
-            )
-        elif self.spec_algorithm.is_standalone():
-            from sglang.srt.speculative.standalone_worker import StandaloneWorker
-
-            self.draft_worker = StandaloneWorker(
-                gpu_id=gpu_id,
-                tp_rank=tp_rank,
-                moe_ep_rank=moe_ep_rank,
-                server_args=server_args,
-                nccl_port=port_args.nccl_port,
-                target_worker=self.tp_worker,
-                dp_rank=dp_rank,
-            )
-        elif self.spec_algorithm.is_ngram():
-            from sglang.srt.speculative.ngram_worker import NGRAMWorker
-
-            self.draft_worker = NGRAMWorker(
-                gpu_id=gpu_id,
-                tp_rank=tp_rank,
-                moe_ep_rank=moe_ep_rank,
-                server_args=server_args,
-                nccl_port=port_args.nccl_port,
-                target_worker=self.tp_worker,
-                dp_rank=dp_rank,
-            )
-        else:
-            self.draft_worker = None
+        self.launch_draft_worker(
+            gpu_id, tp_rank, moe_ep_rank, server_args, port_args, dp_rank
+        )
 
         # Dispatch the model worker
         if self.spec_algorithm.is_none():
@@ -461,8 +479,8 @@ class Scheduler(
             _,
             _,
         ) = self.tp_worker.get_worker_info()
-        if global_server_args_dict["max_micro_batch_size"] is None:
-            global_server_args_dict["max_micro_batch_size"] = max(
+        if global_server_args_dict["pp_max_micro_batch_size"] is None:
+            global_server_args_dict["pp_max_micro_batch_size"] = max(
                 self.max_running_requests // server_args.pp_size, 1
             )
 
@@ -522,9 +540,11 @@ class Scheduler(
         self.kv_transfer_speed_gb_s: float = 0.0
         self.kv_transfer_latency_ms: float = 0.0
         self.sessions: Dict[str, Session] = {}
-        self.current_stream = torch.get_device_module(self.device).current_stream()
+        self.default_stream: CudaStream = torch.get_device_module(
+            self.device
+        ).current_stream()
         if self.device == "cpu":
-            self.current_stream.synchronize = lambda: None  # No-op for CPU
+            self.default_stream.synchronize = lambda: None  # No-op for CPU
         self.forward_sleep_time = None
 
         # Init chunked prefill
@@ -614,6 +634,9 @@ class Scheduler(
 
         # Init prefill kv split size when deterministic inference is enabled with various attention backends
         self.init_deterministic_inference_config()
+
+        # Init overlap
+        self.init_overlap()
 
         # Init request dispatcher
         self._request_dispatcher = TypeBasedDispatcher(
@@ -759,6 +782,7 @@ class Scheduler(
                     hicache_storage_prefetch_policy=server_args.hicache_storage_prefetch_policy,
                     model_name=server_args.served_model_name,
                     storage_backend_extra_config=server_args.hicache_storage_backend_extra_config,
+                    is_eagle=self.spec_algorithm.is_eagle(),
                 )
                 self.tp_worker.register_hicache_layer_transfer_counter(
                     self.tree_cache.cache_controller.layer_done_counter
@@ -773,6 +797,7 @@ class Scheduler(
                     sliding_window_size=self.sliding_window_size,
                     page_size=self.page_size,
                     disable=server_args.disable_radix_cache,
+                    is_eagle=self.spec_algorithm.is_eagle(),
                 )
             elif server_args.enable_lmcache:
                 from sglang.srt.mem_cache.storage.lmcache.lmc_radix_cache import (
@@ -927,6 +952,32 @@ class Scheduler(
             # The prefill requests that are in the middle of kv sending
             self.disagg_prefill_inflight_queue: List[Req] = []
 
+    def init_overlap(self):
+        if not self.enable_overlap:
+            return
+
+        self.forward_stream: CudaStream = torch.get_device_module(self.device).Stream()
+        self.forward_stream_ctx: CudaStreamContext = torch.get_device_module(
+            self.device
+        ).stream(self.forward_stream)
+        self.copy_stream: CudaStream = torch.get_device_module(self.device).Stream()
+        self.copy_stream_ctx: CudaStreamContext = torch.get_device_module(
+            self.device
+        ).stream(self.copy_stream)
+
+        self.future_map = FutureMap(self.max_running_requests, self.device)
+        self.batch_record_buf = [None] * 2
+        self.batch_record_ct = 0
+
+    def record_batch_in_overlap(self, model_worker_batch: ModelWorkerBatch):
+        # FIXME(lsyin): hacky way to keep a reference to avoid GPU tensors being freed by torch GC
+        # NOTE: More Reliable: record all tensors into the forward stream
+        # NOTE: - for all future tensors, we shall always read from future map
+        #       - for all non-future tensors (produced only by schedule stream),
+        #       we shall keep its reference not being release during all the forwarding pass
+        self.batch_record_ct = (self.batch_record_ct + 1) % 2
+        self.batch_record_buf[self.batch_record_ct] = model_worker_batch
+
     def init_moe_config(self):
         if hasattr(self.model_config.hf_config, "num_experts_per_tok"):
             initialize_moe_config(self.server_args)
@@ -953,9 +1004,11 @@ class Scheduler(
     @DynamicGradMode()
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
-        self.result_queue = deque()
+        self.result_queue: Deque[Tuple[ScheduleBatch, GenerationBatchResult]] = deque()
 
         while True:
+            self.launch_last_batch_sample_if_needed()
+
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
 
@@ -963,30 +1016,13 @@ class Scheduler(
             self.cur_batch = batch
 
             if batch:
-                batch.launch_done = threading.Event()
                 result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), result))
-
-                if self.last_batch is None:
-                    # Create a dummy first batch to start the pipeline for overlap schedule.
-                    # It is now used for triggering the sampling_info_done event.
-                    tmp_batch = ScheduleBatch(
-                        reqs=None,
-                        forward_mode=ForwardMode.DUMMY_FIRST,
-                        next_batch_sampling_info=self.tp_worker.cur_sampling_info,
-                    )
-                    self.process_batch_result(tmp_batch, None, batch.launch_done)
 
             if self.last_batch:
                 # Process the results of the last batch
                 tmp_batch, tmp_result = self.result_queue.popleft()
-                tmp_batch.next_batch_sampling_info = (
-                    self.tp_worker.cur_sampling_info if batch else None
-                )
-                # NOTE: we should use current launched batch's launch_done event Instead of the last batch's
-                self.process_batch_result(
-                    tmp_batch, tmp_result, batch.launch_done if batch else None
-                )
+                self.process_batch_result(tmp_batch, tmp_result)
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
@@ -1487,12 +1523,12 @@ class Scheduler(
                 req.priority = -sys.maxsize - 1
         elif not self.enable_priority_scheduling and req.priority is not None:
             abort_req = AbortReq(
-                req.rid,
                 finished_reason={
                     "type": "abort",
                     "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
                     "message": "Using priority is disabled for this server. Please send a new request without a priority.",
                 },
+                rid=req.rid,
             )
             self.send_to_tokenizer.send_pyobj(abort_req)
 
@@ -1528,12 +1564,12 @@ class Scheduler(
 
         self.send_to_tokenizer.send_pyobj(
             AbortReq(
-                req_to_abort.rid,
                 finished_reason={
                     "type": "abort",
                     "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
                     "message": message,
                 },
+                rid=req_to_abort.rid,
             )
         )
         return req_to_abort.rid == recv_req.rid
@@ -1741,7 +1777,7 @@ class Scheduler(
             chunked_req_to_exclude.add(self.chunked_req)
             self.tree_cache.cache_unfinished_req(self.chunked_req, chunked=True)
             # chunked request keeps its rid but will get a new req_pool_idx
-            if self.tp_worker.worker.model_runner.is_hybrid_gdn:
+            if self.tp_worker.worker.model_runner.mambaish_config is not None:
                 self.req_to_token_pool.free(
                     self.chunked_req.req_pool_idx, free_mamba_cache=False
                 )
@@ -1798,7 +1834,7 @@ class Scheduler(
         return ret
 
     def get_num_allocatable_reqs(self, running_bs):
-        res = global_server_args_dict["max_micro_batch_size"] - running_bs
+        res = global_server_args_dict["pp_max_micro_batch_size"] - running_bs
         if self.pp_size > 1:
             res = min(res, self.req_to_token_pool.available_size())
         return res
@@ -2005,7 +2041,7 @@ class Scheduler(
             self.new_token_ratio = new_token_ratio
             for req in reqs_to_abort:
                 self.send_to_tokenizer.send_pyobj(
-                    AbortReq(req.rid, abort_reason=req.to_abort_message)
+                    AbortReq(abort_reason=req.to_abort_message, rid=req.rid)
                 )
 
             logger.info(
@@ -2051,18 +2087,59 @@ class Scheduler(
                 # FIXME(lsyin): remove this if and finally unify the abstraction
                 batch_or_worker_batch = batch.get_model_worker_batch()
 
-            forward_batch_output = self.model_worker.forward_batch_generation(
-                batch_or_worker_batch
-            )
+            if self.enable_overlap:
+                # FIXME: remove this assert
+                assert isinstance(batch_or_worker_batch, ModelWorkerBatch)
+                model_worker_batch = batch_or_worker_batch
+                self.record_batch_in_overlap(model_worker_batch)
+
+                # Sampling info will be modified during forward
+                model_worker_batch.sampling_info = (
+                    model_worker_batch.sampling_info.copy_for_forward()
+                )
+
+                bs = len(model_worker_batch.seq_lens)
+                future_indices = self.future_map.alloc_future_indices(bs)
+
+                with self.forward_stream_ctx:
+                    self.forward_stream.wait_stream(self.default_stream)
+                    self.future_map.resolve_future(model_worker_batch)
+                    if batch.sampling_info.grammars is not None:
+                        model_worker_batch.delay_sample_launch = True
+                    batch_result = self.model_worker.forward_batch_generation(
+                        batch_or_worker_batch
+                    )
+                    # FIXME(lsyin): maybe move this to forward_batch_generation
+                    batch_result.copy_done = torch.get_device_module(
+                        self.device
+                    ).Event()
+                    if not model_worker_batch.delay_sample_launch:
+                        self.future_map.store_to_map(
+                            future_indices, batch_result.next_token_ids
+                        )
+                        batch_result.copy_to_cpu()
+                    else:
+                        batch_result.future_indices = future_indices
+
+                # FIXME(lsyin): move this assignment elsewhere
+                maybe_future_next_token_ids = -future_indices.indices
+            else:
+                batch_result = self.model_worker.forward_batch_generation(
+                    batch_or_worker_batch
+                )
+                maybe_future_next_token_ids = batch_result.next_token_ids
 
             if not self.spec_algorithm.is_none():
                 # TODO(lsyin): unify this metric-updating logic with non-spec, and move it to decode processing
-                self.udpate_spec_metrics(
-                    batch.batch_size(), forward_batch_output.num_accepted_tokens
+                self.update_spec_metrics(
+                    batch.batch_size(), batch_result.num_accepted_tokens
                 )
 
-            # update batch's output ids
-            batch.output_ids = forward_batch_output.next_token_ids
+            # NOTE: maybe_future_next_token_ids is used in ScheduleBatch,
+            #       which can probably be replaced by future_indices later [TODO(lsyin)].
+            #       we shall still keep the original outputs, e.g. next_token_ids
+            #       in the GenerationBatchOutput for processing after copy_done.
+            batch.output_ids = maybe_future_next_token_ids
 
             # These 2 values are needed for processing the output, but the values can be
             # modified by overlap schedule. So we have to copy them here so that
@@ -2079,39 +2156,60 @@ class Scheduler(
             else:
                 extend_logprob_start_len_per_req = None
 
-            return GenerationBatchResult.from_forward_batch_output(
-                forward_batch_output=forward_batch_output,
-                extend_input_len_per_req=extend_input_len_per_req,
-                extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
+            batch_result.extend_input_len_per_req = extend_input_len_per_req
+            batch_result.extend_logprob_start_len_per_req = (
+                extend_logprob_start_len_per_req
             )
+            return batch_result
         else:  # embedding or reward model
             model_worker_batch = batch.get_model_worker_batch()
             embeddings = self.tp_worker.forward_batch_embedding(model_worker_batch)
             ret = EmbeddingBatchResult(embeddings=embeddings)
         return ret
 
+    def launch_last_batch_sample_if_needed(
+        self,
+    ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
+        if len(self.result_queue) == 0:
+            return
+
+        tmp_batch, tmp_result = self.result_queue.popleft()
+
+        tmp_result: GenerationBatchResult
+        if not tmp_result.delay_sample_launch:
+            self.result_queue.appendleft((tmp_batch, tmp_result))
+            return
+
+        with self.forward_stream_ctx:
+            self.forward_stream.wait_stream(self.default_stream)
+            tmp_result.next_token_ids = self.model_worker.model_runner.sample(
+                tmp_result.logits_output,
+                tmp_result.forward_batch,
+            )
+            future_indices = tmp_result.future_indices
+            self.future_map.store_to_map(future_indices, tmp_result.next_token_ids)
+            tmp_result.copy_to_cpu()
+            self.result_queue.appendleft((tmp_batch, tmp_result))
+
     def process_batch_result(
         self,
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
-        launch_done: Optional[threading.Event] = None,
     ):
         if batch.forward_mode.is_decode():
-            self.process_batch_result_decode(batch, result, launch_done)
+            self.process_batch_result_decode(batch, result)
             if self.enable_trace:
                 trace_slice_batch("decode loop", batch.reqs)
 
         elif batch.forward_mode.is_extend():
-            self.process_batch_result_prefill(batch, result, launch_done)
+            self.process_batch_result_prefill(batch, result)
             if self.enable_trace:
                 trace_slice_batch("prefill", batch.reqs)
 
         elif batch.forward_mode.is_idle():
             if self.enable_overlap:
-                self.tp_worker.resolve_last_batch_result(launch_done)
-                self.set_next_batch_sampling_info_done(batch)
-        elif batch.forward_mode.is_dummy_first():
-            self.set_next_batch_sampling_info_done(batch)
+                if result.copy_done is not None:
+                    result.copy_done.synchronize()
 
         self.maybe_send_health_check_signal()
 
@@ -2321,13 +2419,6 @@ class Scheduler(
             self._add_request_to_queue(req)
         self.grammar_queue = self.grammar_queue[num_ready_reqs:]
 
-    def set_next_batch_sampling_info_done(self, batch: ScheduleBatch):
-        if batch.next_batch_sampling_info:
-            if batch.next_batch_sampling_info.grammars is not None:
-                batch.next_batch_sampling_info.update_regex_vocab_mask()
-                self.current_stream.synchronize()
-            batch.next_batch_sampling_info.sampling_info_done.set()
-
     def watchdog_thread(self):
         """A watch dog thread that will try to kill the server itself if one forward batch takes too long."""
         self.watchdog_last_forward_ct = 0
@@ -2506,7 +2597,7 @@ class Scheduler(
         server_args_dict = recv_req.server_args
         args_allow_update = set(
             [
-                "max_micro_batch_size",
+                "pp_max_micro_batch_size",
                 "speculative_accept_threshold_single",
                 "speculative_accept_threshold_acc",
             ]
@@ -2517,7 +2608,7 @@ class Scheduler(
                 logging.warning(f"Updating {k} is not supported.")
                 if_success = False
                 break
-            elif k == "max_micro_batch_size" and (
+            elif k == "pp_max_micro_batch_size" and (
                 v > self.max_running_requests // self.pp_size or v < 1
             ):
                 logging.warning(
@@ -2575,7 +2666,7 @@ class Scheduler(
             if self.enable_hicache_storage:
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)
-            self.send_to_tokenizer.send_pyobj(AbortReq(req.rid))
+            self.send_to_tokenizer.send_pyobj(AbortReq(rid=req.rid))
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 self.tree_cache.cache_finished_req(req)
@@ -2596,31 +2687,31 @@ class Scheduler(
         # Delete requests not in the waiting queue when PD disaggregation is enabled
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             # Abort requests that have not yet been bootstrapped
-            for i, req in enumerate(self.disagg_prefill_bootstrap_queue.queue):
-                logger.debug(f"Abort bootstrap queue request. {req.rid=}")
+            for req in self.disagg_prefill_bootstrap_queue.queue:
                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+                    logger.debug(f"Abort bootstrap queue request. {req.rid=}")
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
 
             # Abort in-flight requests
-            for i, req in enumerate(self.disagg_prefill_inflight_queue):
-                logger.debug(f"Abort inflight queue request. {req.rid=}")
+            for req in self.disagg_prefill_inflight_queue:
                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+                    logger.debug(f"Abort inflight queue request. {req.rid=}")
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
 
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             # Abort requests that have not yet finished preallocation
-            for i, decode_req in enumerate(self.disagg_decode_prealloc_queue.queue):
-                logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
+            for decode_req in self.disagg_decode_prealloc_queue.queue:
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
+                    logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
                     if hasattr(decode_req.kv_receiver, "abort"):
                         decode_req.kv_receiver.abort()
 
             # Abort requests waiting for kvcache to release tree cache
-            for i, decode_req in enumerate(self.disagg_decode_transfer_queue.queue):
-                logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
+            for decode_req in self.disagg_decode_transfer_queue.queue:
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
+                    logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
                     if hasattr(decode_req.kv_receiver, "abort"):
                         decode_req.kv_receiver.abort()
 
@@ -2687,11 +2778,12 @@ class Scheduler(
         return SlowDownReqOutput()
 
     def expert_distribution_handle(self, recv_req: ExpertDistributionReq):
-        if recv_req == ExpertDistributionReq.START_RECORD:
+        action = recv_req.action
+        if action == ExpertDistributionReqType.START_RECORD:
             get_global_expert_distribution_recorder().start_record()
-        elif recv_req == ExpertDistributionReq.STOP_RECORD:
+        elif action == ExpertDistributionReqType.STOP_RECORD:
             get_global_expert_distribution_recorder().stop_record()
-        elif recv_req == ExpertDistributionReq.DUMP_RECORD:
+        elif action == ExpertDistributionReqType.DUMP_RECORD:
             get_global_expert_distribution_recorder().dump_record()
         else:
             raise ValueError(f"Unrecognized ExpertDistributionReq value: {recv_req=}")
@@ -2774,7 +2866,8 @@ class IdleSleeper:
 
 
 def is_health_check_generate_req(recv_req):
-    return getattr(recv_req, "rid", "").startswith("HEALTH_CHECK")
+    rid = getattr(recv_req, "rid", None)
+    return rid is not None and rid.startswith("HEALTH_CHECK")
 
 
 def is_work_request(recv_req):

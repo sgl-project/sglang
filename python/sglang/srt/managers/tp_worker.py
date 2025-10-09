@@ -15,19 +15,12 @@
 from __future__ import annotations
 
 import logging
-import threading
-from typing import TYPE_CHECKING, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import get_pp_group, get_world_group
-from sglang.srt.hf_transformers_utils import (
-    get_processor,
-    get_tokenizer,
-    get_tokenizer_from_processor,
-)
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     GetWeightsByNameReqInput,
@@ -41,17 +34,19 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, global_server_args_dict
+from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.model_executor.forward_batch_info import (
-    ForwardBatch,
-    ForwardBatchOutput,
-    PPProxyTensors,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.patch_torch import monkey_patch_torch_reductions
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
+from sglang.srt.utils.hf_transformers_utils import (
+    get_processor,
+    get_tokenizer,
+    get_tokenizer_from_processor,
+)
+from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
@@ -236,9 +231,8 @@ class TpModelWorker:
     def forward_batch_generation(
         self,
         model_worker_batch: ModelWorkerBatch,
-        launch_done: Optional[threading.Event] = None,
-        skip_sample: bool = False,
-    ) -> ForwardBatchOutput:
+        is_verify: bool = False,
+    ) -> GenerationBatchResult:
         # update the consumer index of hicache to the running batch
         self.set_hicache_consumer(model_worker_batch.hicache_consumer_index)
 
@@ -256,35 +250,49 @@ class TpModelWorker:
             logits_output, can_run_cuda_graph = self.model_runner.forward(
                 forward_batch, pp_proxy_tensors=pp_proxy_tensors
             )
-            if launch_done is not None:
-                launch_done.set()
+            batch_result = GenerationBatchResult(
+                logits_output=logits_output,
+                can_run_cuda_graph=can_run_cuda_graph,
+            )
 
-            if skip_sample:
-                next_token_ids = None
-                # For prefill-only requests, we still need to compute logprobs even when sampling is skipped
+            if is_verify:
+                # Skip sampling and return logits for target forward
+                return batch_result
+
+            if model_worker_batch.delay_sample_launch:
+                batch_result.delay_sample_launch = True
+                batch_result.forward_batch = forward_batch
+                return batch_result
+
+            if model_worker_batch.is_prefill_only:
+                # For prefill-only requests, create dummy token IDs on CPU
+                # The size should match the batch size (number of sequences), not total tokens
+                batch_result.next_token_ids = torch.zeros(
+                    len(model_worker_batch.seq_lens),
+                    dtype=torch.long,
+                    device=model_worker_batch.input_ids.device,
+                )
                 if (
-                    model_worker_batch.is_prefill_only
-                    and model_worker_batch.return_logprob
+                    model_worker_batch.return_logprob
+                    and logits_output.next_token_logits is not None
                 ):
-                    # Compute logprobs without full sampling
+                    # NOTE: Compute logprobs without full sampling
                     self.model_runner.compute_logprobs_only(
                         logits_output, model_worker_batch
                     )
             else:
-                next_token_ids = self.model_runner.sample(logits_output, forward_batch)
+                batch_result.next_token_ids = self.model_runner.sample(
+                    logits_output, forward_batch
+                )
 
-            return ForwardBatchOutput(
-                logits_output=logits_output,
-                next_token_ids=next_token_ids,
-                can_run_cuda_graph=can_run_cuda_graph,
-            )
+            return batch_result
         else:
             pp_proxy_tensors, can_run_cuda_graph = self.model_runner.forward(
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
-            return ForwardBatchOutput(
-                pp_proxy_tensors=pp_proxy_tensors,
+            return GenerationBatchResult(
+                pp_hidden_states_proxy_tensors=pp_proxy_tensors,
                 can_run_cuda_graph=can_run_cuda_graph,
             )
 

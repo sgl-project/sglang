@@ -19,11 +19,10 @@ import grpc
 import zmq
 import zmq.asyncio
 
-from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
     AbortReq,
-    BatchEmbeddingOut,
-    BatchTokenIDOut,
+    BatchEmbeddingOutput,
+    BatchTokenIDOutput,
     HealthCheckOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -111,6 +110,7 @@ class GrpcRequestManager:
         self,
         server_args: ServerArgs,
         port_args: PortArgs,
+        bootstrap_server=None,
     ):
         """Initialize the gRPC request manager."""
         self.server_args = server_args
@@ -147,8 +147,8 @@ class GrpcRequestManager:
         self.crash_dump_request_list = []
         self.crash_dump_performed = False
 
-        # Bootstrap server for disaggregation mode
-        self.bootstrap_server = start_disagg_service(server_args)
+        # Bootstrap server (passed from serve_grpc, not started here)
+        self.bootstrap_server = bootstrap_server
 
         logger.info(
             f"GrpcRequestManager initialized with ZMQ IPC: "
@@ -157,7 +157,7 @@ class GrpcRequestManager:
         )
         if self.bootstrap_server:
             logger.info(
-                f"Bootstrap server started for disaggregation mode: "
+                f"Bootstrap server initialized for disaggregation mode: "
                 f"{server_args.disaggregation_mode}"
             )
 
@@ -263,8 +263,8 @@ class GrpcRequestManager:
                         response = await task
 
                         # Add index for client-side ordering
-                        if isinstance(response, dict) and "meta_info" in response:
-                            response_rid = response["meta_info"].get("id", "")
+                        if isinstance(response, dict):
+                            response_rid = response.get("request_id", "")
                             if response_rid in rid_to_index:
                                 response["index"] = rid_to_index[response_rid]
 
@@ -397,9 +397,7 @@ class GrpcRequestManager:
         # Wait for result in background
         async def wait_for_result():
             try:
-                # Wait for completion
                 await state.event.wait()
-                # Get result from queue
                 result = await state.out_queue.get()
                 future.set_result(result)
             except Exception as e:
@@ -437,19 +435,6 @@ class GrpcRequestManager:
 
         return True
 
-    async def pause_generation(self):
-        """Pause generation processing."""
-        async with self.is_pause_cond:
-            self.is_pause = True
-            logger.info("Generation paused")
-
-    async def resume_generation(self):
-        """Resume generation processing."""
-        async with self.is_pause_cond:
-            self.is_pause = False
-            self.is_pause_cond.notify_all()
-            logger.info("Generation resumed")
-
     async def handle_loop(self):
         """
         Main event loop - processes outputs from scheduler.
@@ -467,9 +452,9 @@ class GrpcRequestManager:
                         await self.is_pause_cond.wait()
 
                 # Handle different output types
-                if isinstance(recv_obj, BatchTokenIDOut):
+                if isinstance(recv_obj, BatchTokenIDOutput):
                     await self._handle_batch_output(recv_obj)
-                elif isinstance(recv_obj, BatchEmbeddingOut):
+                elif isinstance(recv_obj, BatchEmbeddingOutput):
                     await self._handle_embedding_output(recv_obj)
                 elif isinstance(recv_obj, HealthCheckOutput):
                     await self._handle_health_check_output(recv_obj)
@@ -498,7 +483,7 @@ class GrpcRequestManager:
     def _convert_logprob_style(
         self,
         state: GrpcReqState,
-        batch_out: BatchTokenIDOut,
+        batch_out: BatchTokenIDOutput,
         batch_index: int,
     ):
         """
@@ -545,7 +530,7 @@ class GrpcRequestManager:
                 batch_out.output_top_logprobs_idx[batch_index]
             )
 
-    async def _handle_batch_output(self, batch_out: BatchTokenIDOut):
+    async def _handle_batch_output(self, batch_out: BatchTokenIDOutput):
         """Handle batch generation output from scheduler."""
         # Process each request in the batch
         for i, rid in enumerate(batch_out.rids):
@@ -666,7 +651,7 @@ class GrpcRequestManager:
 
                 asyncio.create_task(cleanup())
 
-    async def _handle_embedding_output(self, batch_out: BatchEmbeddingOut):
+    async def _handle_embedding_output(self, batch_out: BatchEmbeddingOutput):
         """Handle batch embedding output from scheduler."""
         for i, rid in enumerate(batch_out.rids):
             if rid not in self.rid_to_state:

@@ -102,6 +102,34 @@ impl BasicWorkerBuilder {
         };
         use tokio::sync::{Mutex, RwLock};
 
+        let bootstrap_host = match url::Url::parse(&self.url) {
+            Ok(parsed) => parsed.host_str().unwrap_or("localhost").to_string(),
+            Err(_) if !self.url.contains("://") => {
+                match url::Url::parse(&format!("http://{}", self.url)) {
+                    Ok(parsed) => parsed.host_str().unwrap_or("localhost").to_string(),
+                    Err(_) => {
+                        tracing::warn!(
+                            "Failed to parse URL '{}', defaulting to localhost",
+                            self.url
+                        );
+                        "localhost".to_string()
+                    }
+                }
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "Failed to parse URL '{}', defaulting to localhost",
+                    self.url
+                );
+                "localhost".to_string()
+            }
+        };
+
+        let bootstrap_port = match self.worker_type {
+            WorkerType::Prefill { bootstrap_port } => bootstrap_port,
+            _ => None,
+        };
+
         let metadata = WorkerMetadata {
             url: self.url.clone(),
             api_key: self.api_key,
@@ -109,6 +137,8 @@ impl BasicWorkerBuilder {
             connection_mode: self.connection_mode,
             labels: self.labels,
             health_config: self.health_config,
+            bootstrap_host,
+            bootstrap_port,
         };
 
         let grpc_client = Arc::new(RwLock::new(

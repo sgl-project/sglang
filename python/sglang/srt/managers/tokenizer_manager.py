@@ -43,23 +43,17 @@ from fastapi import BackgroundTasks
 from sglang.srt.aio_rwlock import RWLock
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.hf_transformers_utils import (
-    get_processor,
-    get_tokenizer,
-    get_tokenizer_from_processor,
-)
-from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
+from sglang.srt.lora.lora_registry import LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
     AbortReq,
-    BatchEmbeddingOut,
-    BatchMultimodalOut,
-    BatchStrOut,
-    BatchTokenIDOut,
+    BatchEmbeddingOutput,
+    BatchMultimodalOutput,
+    BatchStrOutput,
+    BatchTokenIDOutput,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
-    CloseSessionReqInput,
     ConfigureLoggingReq,
     EmbeddingReqInput,
     FreezeGCReq,
@@ -67,7 +61,6 @@ from sglang.srt.managers.io_struct import (
     GetLoadReqInput,
     HealthCheckOutput,
     MultiTokenizerWrapper,
-    OpenSessionReqInput,
     OpenSessionReqOutput,
     SessionParams,
     TokenizedEmbeddingReqInput,
@@ -100,6 +93,11 @@ from sglang.srt.utils import (
     get_origin_rid,
     get_zmq_socket,
     kill_process_tree,
+)
+from sglang.srt.utils.hf_transformers_utils import (
+    get_processor,
+    get_tokenizer,
+    get_tokenizer_from_processor,
 )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
@@ -184,6 +182,8 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             if speculative_algorithm.is_none()
             else server_args.speculative_num_draft_tokens
         )
+        # Initialize delimiter text for multi-item scoring (will be set after tokenizer is loaded)
+        self.multi_item_delimiter_text = None
 
         if self.model_config.is_multimodal:
             import_processors("sglang.srt.multimodal.processors")
@@ -225,6 +225,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 self.processor = _processor
                 self.tokenizer = get_tokenizer_from_processor(self.processor)
                 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+                self._initialize_multi_item_delimiter_text()
         else:
             self.mm_processor = self.processor = None
 
@@ -237,6 +238,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     trust_remote_code=server_args.trust_remote_code,
                     revision=server_args.revision,
                 )
+                self._initialize_multi_item_delimiter_text()
         # Initialize async dynamic batch tokenizer if enabled (common for both multimodal and non-multimodal)
         if (
             server_args.enable_dynamic_batch_tokenizer
@@ -341,10 +343,10 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             [
                 (
                     (
-                        BatchStrOut,
-                        BatchEmbeddingOut,
-                        BatchTokenIDOut,
-                        BatchMultimodalOut,
+                        BatchStrOutput,
+                        BatchEmbeddingOutput,
+                        BatchTokenIDOutput,
+                        BatchMultimodalOutput,
                     ),
                     self._handle_batch_output,
                 ),
@@ -716,7 +718,6 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             )
 
             tokenized_obj = TokenizedGenerateReqInput(
-                obj.rid,
                 input_text,
                 input_ids,
                 mm_inputs,
@@ -726,6 +727,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 obj.top_logprobs_num,
                 obj.token_ids_logprob,
                 obj.stream,
+                rid=obj.rid,
                 bootstrap_host=obj.bootstrap_host,
                 bootstrap_port=obj.bootstrap_port,
                 bootstrap_room=obj.bootstrap_room,
@@ -740,12 +742,12 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(
-                obj.rid,
                 input_text,
                 input_ids,
                 mm_inputs,
                 token_type_ids,
                 sampling_params,
+                rid=obj.rid,
                 priority=obj.priority,
             )
 
@@ -1038,7 +1040,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
     def abort_request(self, rid: str = "", abort_all: bool = False):
         if not abort_all and rid not in self.rid_to_state:
             return
-        req = AbortReq(rid, abort_all)
+        req = AbortReq(rid=rid, abort_all=abort_all)
         self.send_to_scheduler.send_pyobj(req)
         if self.enable_metrics:
             # TODO: also use custom_labels from the request
@@ -1303,7 +1305,10 @@ class TokenizerManager(TokenizerCommunicatorMixin):
     def _handle_batch_output(
         self,
         recv_obj: Union[
-            BatchStrOut, BatchEmbeddingOut, BatchMultimodalOut, BatchTokenIDOut
+            BatchStrOutput,
+            BatchEmbeddingOutput,
+            BatchMultimodalOutput,
+            BatchTokenIDOutput,
         ],
     ):
         for i, rid in enumerate(recv_obj.rids):
@@ -1337,7 +1342,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     i,
                 )
 
-            if not isinstance(recv_obj, BatchEmbeddingOut):
+            if not isinstance(recv_obj, BatchEmbeddingOutput):
                 meta_info.update(
                     {
                         "completion_tokens": recv_obj.completion_tokens[i],
@@ -1348,7 +1353,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             if getattr(recv_obj, "output_hidden_states", None):
                 meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
 
-            if isinstance(recv_obj, BatchStrOut):
+            if isinstance(recv_obj, BatchStrOutput):
                 state.text += recv_obj.output_strs[i]
                 if state.obj.stream:
                     state.output_ids.extend(recv_obj.output_ids[i])
@@ -1363,7 +1368,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     "output_ids": output_token_ids,
                     "meta_info": meta_info,
                 }
-            elif isinstance(recv_obj, BatchTokenIDOut):
+            elif isinstance(recv_obj, BatchTokenIDOutput):
                 if self.server_args.stream_output and state.obj.stream:
                     state.output_ids.extend(recv_obj.output_ids[i])
                     output_token_ids = state.output_ids[state.last_output_offset :]
@@ -1376,10 +1381,10 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     "output_ids": output_token_ids,
                     "meta_info": meta_info,
                 }
-            elif isinstance(recv_obj, BatchMultimodalOut):
+            elif isinstance(recv_obj, BatchMultimodalOutput):
                 raise NotImplementedError("BatchMultimodalOut not implemented")
             else:
-                assert isinstance(recv_obj, BatchEmbeddingOut)
+                assert isinstance(recv_obj, BatchEmbeddingOutput)
                 out_dict = {
                     "embedding": recv_obj.embeddings[i],
                     "meta_info": meta_info,
@@ -1418,7 +1423,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         top_logprobs_num: int,
         token_ids_logprob: List[int],
         return_text_in_logprobs: bool,
-        recv_obj: BatchStrOut,
+        recv_obj: BatchStrOutput,
         recv_obj_index: int,
     ):
         if recv_obj.input_token_logprobs_val is None:
@@ -1536,7 +1541,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 ret.append(None)
         return ret
 
-    def collect_metrics(self, state: ReqState, recv_obj: BatchStrOut, i: int):
+    def collect_metrics(self, state: ReqState, recv_obj: BatchStrOutput, i: int):
         completion_tokens = (
             recv_obj.completion_tokens[i]
             if getattr(recv_obj, "completion_tokens", None)
@@ -1632,7 +1637,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
         asyncio.create_task(asyncio.to_thread(background_task))
 
-    def _handle_abort_req(self, recv_obj):
+    def _handle_abort_req(self, recv_obj: AbortReq):
         if is_health_check_generate_req(recv_obj):
             return
         state = self.rid_to_state[recv_obj.rid]
@@ -1677,6 +1682,201 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             if len(self.model_update_tmp) == self.server_args.dp_size:
                 self.model_update_result.set_result(self.model_update_tmp)
 
+    def _initialize_multi_item_delimiter_text(self):
+        """Initialize multi-item delimiter text from token ID after tokenizer is loaded."""
+        if (
+            hasattr(self.server_args, "multi_item_scoring_delimiter")
+            and self.server_args.multi_item_scoring_delimiter is not None
+            and self.tokenizer is not None
+        ):
+            try:
+                self.multi_item_delimiter_text = self.tokenizer.decode(
+                    [self.server_args.multi_item_scoring_delimiter],
+                    skip_special_tokens=False,
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to decode delimiter token {self.server_args.multi_item_scoring_delimiter}: {e}"
+                )
+                self.multi_item_delimiter_text = None
+
+    def _build_multi_item_token_sequence(
+        self, query: List[int], items: List[List[int]], delimiter_token_id: int
+    ) -> List[int]:
+        """
+        Build a single token sequence for multi-item scoring.
+        Format: query<delimiter>item1<delimiter>item2<delimiter>item3<delimiter>
+
+        Args:
+            query: Query token IDs
+            items: List of item token ID sequences
+            delimiter_token_id: Token ID to use as delimiter
+
+        Returns:
+            Combined token sequence
+        """
+        combined_sequence = query[:]  # Start with query
+
+        for item in items:
+            combined_sequence.append(delimiter_token_id)  # Add delimiter
+            combined_sequence.extend(item)  # Add item tokens
+
+        # Add final delimiter after the last item for logprob extraction
+        combined_sequence.append(delimiter_token_id)
+
+        return combined_sequence
+
+    def _extract_logprobs_for_tokens(
+        self, logprobs_data: List, label_token_ids: List[int]
+    ) -> Dict[int, float]:
+        """
+        Extract logprobs for specified token IDs from logprobs data.
+
+        Args:
+            logprobs_data: List of (logprob, token_id, text) tuples
+            label_token_ids: Token IDs to extract logprobs for
+
+        Returns:
+            Dictionary mapping token_id to logprob
+        """
+        logprobs = {}
+        if logprobs_data:
+            for logprob, token_id, _ in logprobs_data:
+                if token_id in label_token_ids:
+                    logprobs[token_id] = logprob
+        return logprobs
+
+    def _convert_logprobs_to_scores(
+        self,
+        logprobs: Dict[int, float],
+        label_token_ids: List[int],
+        apply_softmax: bool,
+    ) -> List[float]:
+        """
+        Convert logprobs dictionary to ordered score list.
+
+        Args:
+            logprobs: Dictionary mapping token_id to logprob
+            label_token_ids: Token IDs in desired order
+            apply_softmax: Whether to apply softmax normalization
+
+        Returns:
+            List of scores in the same order as label_token_ids
+        """
+        score_list = [
+            logprobs.get(token_id, float("-inf")) for token_id in label_token_ids
+        ]
+
+        if apply_softmax:
+            score_list = torch.softmax(torch.tensor(score_list), dim=0).tolist()
+        else:
+            # Convert logprobs to probabilities if not using softmax
+            score_list = [
+                math.exp(x) if x != float("-inf") else 0.0 for x in score_list
+            ]
+
+        return score_list
+
+    def _process_multi_item_scoring_results(
+        self,
+        results: Any,
+        items: List,
+        label_token_ids: List[int],
+        apply_softmax: bool,
+        batch_request=None,
+    ) -> List[List[float]]:
+        """
+        Process results from multi-item scoring request.
+        Extracts logprobs at delimiter positions from input_token_ids_logprobs.
+
+        Args:
+            results: Results from generate_request
+            items: List of items being scored
+            label_token_ids: Token IDs to extract scores for
+            apply_softmax: Whether to apply softmax normalization
+            batch_request: The original batch request containing input sequence
+
+        Returns:
+            List of score lists, one for each item
+        """
+        single_result = results[0] if isinstance(results, list) else results
+
+        # For multi-item scoring, logprobs are in input_token_ids_logprobs
+        input_logprobs = single_result["meta_info"].get("input_token_ids_logprobs", [])
+
+        if not input_logprobs:
+            raise RuntimeError(
+                f"input_token_ids_logprobs is empty for multi-item scoring request {single_result['meta_info'].get('id', '<unknown>')}. "
+                "This indicates token_ids_logprobs were not computed properly for Mutil Item Scoring."
+            )
+
+        scores = []
+        num_items = len(items) if isinstance(items, list) else 1
+
+        # Check if we have the expected number of logprobs
+        expected_logprobs_count = num_items + 1
+        if len(input_logprobs) != expected_logprobs_count:
+            raise RuntimeError(
+                f"Expected {expected_logprobs_count} input_token_ids_logprobs for multi-item scoring "
+                f"with {num_items} items, but got {len(input_logprobs)}. "
+                f"Request ID: {single_result['meta_info'].get('id', '<unknown>')}"
+            )
+
+        # Skip the first delimiter (between query and first item) and process remaining delimiter positions
+        # We want to exclude the first one since it represents the boundary between query and first item, not an item boundary
+        start_idx = 1 if len(input_logprobs) > 1 else 0
+
+        # Process logprobs for each item position (excluding first delimiter)
+        for item_idx in range(num_items):
+            logprob_idx = start_idx + item_idx
+            item_logprobs_data = input_logprobs[logprob_idx]
+            logprobs = self._extract_logprobs_for_tokens(
+                item_logprobs_data, label_token_ids
+            )
+            score_list = self._convert_logprobs_to_scores(
+                logprobs, label_token_ids, apply_softmax
+            )
+            scores.append(score_list)
+
+        return scores
+
+    def _process_single_item_scoring_results(
+        self, results: Any, label_token_ids: List[int], apply_softmax: bool
+    ) -> List[List[float]]:
+        """
+        Process results from single-item scoring request.
+        Single-item scoring results are stored in output_token_ids_logprobs.
+
+        Args:
+            results: Results from generate_request
+            label_token_ids: Token IDs to extract scores for
+            apply_softmax: Whether to apply softmax normalization
+
+        Returns:
+            List of score lists, one for each result
+        """
+        scores = []
+
+        for result in results:
+            # For single-item scoring, logprobs are in output_token_ids_logprobs
+            output_logprobs = result["meta_info"].get("output_token_ids_logprobs", [])
+
+            if not output_logprobs or len(output_logprobs) == 0:
+                raise RuntimeError(
+                    f"output_logprobs is empty for request {result['meta_info'].get('id', '<unknown>')}."
+                )
+
+            # Extract logprobs for the first (and only) position
+            logprobs = self._extract_logprobs_for_tokens(
+                output_logprobs[0], label_token_ids
+            )
+            score_list = self._convert_logprobs_to_scores(
+                logprobs, label_token_ids, apply_softmax
+            )
+            scores.append(score_list)
+
+        return scores
+
     async def score_request(
         self,
         query: Optional[Union[str, List[int]]] = None,
@@ -1687,7 +1887,29 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         request: Optional[Any] = None,
     ) -> List[List[float]]:
         """
-        See Engine.score() for more details.
+        Score the probability of specified token IDs appearing after the given (query + item) pair.
+
+        This method supports two scoring approaches:
+        1. Single-Item scoring (default): Process each query+item pair independently
+        2. Multi-Item scoring: When multi_item_scoring_delimiter is set, combine query and
+           multiple items into a single sequence using delimiter for efficient processing.
+           Note: item_first parameter is ignored in multi-item scoring mode since it uses
+           a fixed format: query<delimiter>item1<delimiter>item2<delimiter>item3<delimiter>
+
+           Multi-item scoring works with both text and pre-tokenized inputs:
+           - Text: query<delimiter_text>item1<delimiter_text>item2<delimiter_text>item3<delimiter_text>
+           - Tokens: query<delimiter_token_id>item1<delimiter_token_id>item2<delimiter_token_id>item3<delimiter_token_id>
+
+        Args:
+            query: The query text or pre-tokenized query token IDs
+            items: The item text(s) or pre-tokenized item token IDs
+            label_token_ids: List of token IDs to compute probabilities for
+            apply_softmax: Whether to normalize probabilities using softmax
+            item_first: If True, prepend items to query. Ignored for multi-item scoring.
+            request: Optional FastAPI request object
+
+        Returns:
+            List of lists containing probabilities for each item and each label token
         """
         if label_token_ids is None:
             raise ValueError("label_token_ids must be provided")
@@ -1700,9 +1922,17 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                         f"Token ID {token_id} is out of vocabulary (vocab size: {vocab_size})"
                     )
 
+        # Check if multi-item scoring is enabled by presence of delimiter
+        use_multi_item_scoring = (
+            self.server_args.multi_item_scoring_delimiter is not None
+            and self.multi_item_delimiter_text is not None
+        )
+
         batch_request = GenerateReqInput(
             token_ids_logprob=label_token_ids,
             return_logprob=True,
+            # Set logprob_start_len=0 for multi-item scoring since we want logprobs at all delimiter positions
+            logprob_start_len=0 if use_multi_item_scoring else -1,
             stream=False,
             sampling_params={"max_new_tokens": 0},
         )
@@ -1714,12 +1944,23 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         ):
             # Both query and items are text
             items_list = [items] if isinstance(items, str) else items
-            if item_first:
-                prompts = [f"{item}{query}" for item in items_list]
-            else:
-                prompts = [f"{query}{item}" for item in items_list]
 
-            batch_request.text = prompts
+            if use_multi_item_scoring:
+                # Multi-item scoring: create single prompt with delimiter text
+                # Always use format: query<delimiter>item1<delimiter>item2<delimiter>item3<delimiter>
+                # (item_first is ignored for multi-item scoring)
+                delimiter = self.multi_item_delimiter_text
+                combined_items = delimiter.join(items_list)
+                # Add final delimiter after the last item for logprob extraction
+                single_prompt = f"{query}{delimiter}{combined_items}{delimiter}"
+                batch_request.text = [single_prompt]
+            else:
+                # Single-item scoring: create separate prompts for each item
+                if item_first:
+                    prompts = [f"{item}{query}" for item in items_list]
+                else:
+                    prompts = [f"{query}{item}" for item in items_list]
+                batch_request.text = prompts
 
         elif (
             isinstance(query, list)
@@ -1728,61 +1969,38 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             and isinstance(items[0], list)
         ):
             # Both query and items are token IDs
-            if item_first:
-                input_ids_list = [item + query for item in items]
+            if use_multi_item_scoring:
+                # Multi-item scoring: concatenate with delimiter token ID
+                # Format: query<delimiter_token_id>item1<delimiter_token_id>item2<delimiter_token_id>item3<delimiter_token_id>
+                delimiter_token_id = self.server_args.multi_item_scoring_delimiter
+                combined_input_ids = self._build_multi_item_token_sequence(
+                    query, items, delimiter_token_id
+                )
+                batch_request.input_ids = [combined_input_ids]
             else:
-                input_ids_list = [query + item for item in items]
-
-            batch_request.input_ids = input_ids_list
+                # Single-item scoring: process each item separately
+                if item_first:
+                    input_ids_list = [item + query for item in items]
+                else:
+                    input_ids_list = [query + item for item in items]
+                batch_request.input_ids = input_ids_list
         else:
             raise ValueError(
                 "Invalid combination of query/items types for score_request."
             )
 
         results = await self.generate_request(batch_request, request).__anext__()
-        scores = []
 
-        for result in results:
-            # Get logprobs for each token
-            logprobs = {}
-
-            # For scoring requests, we read from output_token_ids_logprobs since we want
-            # the logprobs for specific tokens mentioned in the label_token_ids at
-            # the next position after the last token in the prompt
-            output_logprobs = result["meta_info"].get("output_token_ids_logprobs", [])
-
-            # Check if output_logprobs is properly populated
-            if (
-                output_logprobs is None
-                or not output_logprobs
-                or len(output_logprobs) == 0
-            ):
-                raise RuntimeError(
-                    f"output_logprobs is empty for request {result['meta_info'].get('id', '<unknown>')}. "
-                    "This indicates token_ids_logprobs were not computed properly for the scoring request."
-                )
-
-            for logprob, token_id, _ in output_logprobs[0]:
-                if token_id in label_token_ids:
-                    logprobs[token_id] = logprob
-
-            # Get scores in order of label_token_ids
-            score_list = [
-                logprobs.get(token_id, float("-inf")) for token_id in label_token_ids
-            ]
-
-            # Apply softmax to logprobs if needed
-            if apply_softmax:
-                score_list = torch.softmax(torch.tensor(score_list), dim=0).tolist()
-            else:
-                # Convert logprobs to probabilities if not using softmax
-                score_list = [
-                    math.exp(x) if x != float("-inf") else 0.0 for x in score_list
-                ]
-
-            scores.append(score_list)
-
-        return scores
+        if use_multi_item_scoring:
+            # Multi-item scoring: extract scores from input_token_ids_logprobs
+            return self._process_multi_item_scoring_results(
+                results, items, label_token_ids, apply_softmax, batch_request
+            )
+        else:
+            # Single-item scoring: process each result separately
+            return self._process_single_item_scoring_results(
+                results, label_token_ids, apply_softmax
+            )
 
     async def watch_load_thread(self):
         # Only for dp_controller when dp_size > 1
