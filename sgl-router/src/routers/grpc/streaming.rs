@@ -8,6 +8,7 @@ use axum::{body::Body, http::StatusCode};
 use bytes::Bytes;
 use http::header::{HeaderValue, CONTENT_TYPE};
 use serde_json::{json, Value};
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
@@ -963,15 +964,21 @@ impl StreamingProcessor {
         system_fingerprint: Option<&str>,
     ) -> (String, Option<ChatCompletionStreamResponse>, bool) {
         // Create fresh parser for this index (not pooled, to avoid state pollution)
-        reasoning_parsers.entry(index).or_insert_with(|| {
-            let parser = utils::create_reasoning_parser(
+        // If no parser is found, don't insert anything and skip reasoning parsing
+        if let Entry::Vacant(e) = reasoning_parsers.entry(index) {
+            if let Some(parser) = utils::create_reasoning_parser(
                 &self.reasoning_parser_factory,
                 self.configured_reasoning_parser.as_ref(),
                 model,
-            )
-            .expect("Failed to create reasoning parser");
-            Arc::new(tokio::sync::Mutex::new(parser))
-        });
+            ) {
+                e.insert(Arc::new(tokio::sync::Mutex::new(parser)));
+            } else {
+                warn!(
+                    "No reasoning parser found for model '{}', skipping reasoning parsing",
+                    model
+                );
+            }
+        }
 
         if let Some(pooled_parser) = reasoning_parsers.get(&index) {
             let (parse_result, in_reasoning) = {
@@ -1039,15 +1046,21 @@ impl StreamingProcessor {
         let mut chunks = Vec::new();
 
         // Create fresh parser for this index (not pooled, to avoid state pollution)
-        tool_parsers.entry(index).or_insert_with(|| {
-            let parser = utils::create_tool_parser(
+        // If no parser is found, don't insert anything and skip tool parsing
+        if let Entry::Vacant(e) = tool_parsers.entry(index) {
+            if let Some(parser) = utils::create_tool_parser(
                 &self.tool_parser_factory,
                 self.configured_tool_parser.as_ref(),
                 model,
-            )
-            .expect("Failed to create tool parser");
-            Arc::new(tokio::sync::Mutex::new(parser))
-        });
+            ) {
+                e.insert(Arc::new(tokio::sync::Mutex::new(parser)));
+            } else {
+                warn!(
+                    "No tool parser found for model '{}', skipping tool call parsing",
+                    model
+                );
+            }
+        }
 
         if let Some(pooled_parser) = tool_parsers.get(&index) {
             let mut parser = pooled_parser.lock().await;
