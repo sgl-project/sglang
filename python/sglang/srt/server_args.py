@@ -2983,7 +2983,6 @@ class ServerArgs:
             None,
         }, "moe_dense_tp_size only support 1 and None currently"
 
-
         # Check LoRA
         self.check_lora_server_args()
 

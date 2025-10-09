@@ -624,11 +624,14 @@ class ModelRunner:
                     "Setting hicache_io_backend to vanilla I/O, which may lead to suboptimal performance with small page sizes."
                 )
 
-        if self.model_config.hf_config.model_type == "qwen3_vl_moe" and hasattr(self.model_config.hf_config,
-                                                                                "quantization_config"):
+        if self.model_config.hf_config.model_type == "qwen3_vl_moe" and hasattr(
+            self.model_config.hf_config, "quantization_config"
+        ):
             if self.tp_size == 8 and self.moe_ep_size != self.tp_size:
                 self.moe_ep_size = 8
-                logger.info(f"Automatically set ep_size=tp_size={self.tp_size} for qwen3-vl-fp8 models")
+                logger.info(
+                    f"Automatically set ep_size=tp_size={self.tp_size} for qwen3-vl-fp8 models"
+                )
 
     def init_torch_distributed(self):
         logger.info("Init torch distributed begin.")
@@ -1532,7 +1535,7 @@ class ModelRunner:
                 self.req_to_token_pool = DecodeReqToTokenPool(
                     size=max_num_reqs,
                     max_context_len=self.model_config.context_len
-                                    + extra_max_context_len,
+                    + extra_max_context_len,
                     device=self.device,
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     pre_alloc_size=pre_alloc_size,
@@ -1541,7 +1544,7 @@ class ModelRunner:
                 self.req_to_token_pool = HybridReqToTokenPool(
                     size=max_num_reqs,
                     max_context_len=self.model_config.context_len
-                                    + extra_max_context_len,
+                    + extra_max_context_len,
                     device=self.device,
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     cache_params=config.mamba2_cache_params,
@@ -1551,7 +1554,7 @@ class ModelRunner:
                 self.req_to_token_pool = ReqToTokenPool(
                     size=max_num_reqs,
                     max_context_len=self.model_config.context_len
-                                    + extra_max_context_len,
+                    + extra_max_context_len,
                     device=self.device,
                     enable_memory_saver=self.server_args.enable_memory_saver,
                 )
