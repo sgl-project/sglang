@@ -313,78 +313,10 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         request: sglang_scheduler_pb2.HealthCheckRequest,
         context: grpc.aio.ServicerContext,
     ) -> sglang_scheduler_pb2.HealthCheckResponse:
-        """Health check by generating from client input."""
-        try:
-            # Check if request manager is shutting down
-            if self.request_manager.gracefully_exit:
-                return sglang_scheduler_pb2.HealthCheckResponse(
-                    healthy=False, message="Server shutting down"
-                )
-
-            # Extract tokenized input from request
-            if not request.HasField("tokenized"):
-                return sglang_scheduler_pb2.HealthCheckResponse(
-                    healthy=False, message="Tokenized input required for health check"
-                )
-
-            input_text = request.tokenized.original_text
-            input_ids = list(request.tokenized.input_ids)
-
-            # Create health check request
-            rid = f"HEALTH_CHECK_GRPC_{time.time()}"
-
-            health_request = TokenizedGenerateReqInput(
-                rid=rid,
-                input_text=input_text,
-                input_ids=input_ids,
-                sampling_params=SGLSamplingParams(max_new_tokens=1, temperature=0.0),
-                stream=False,
-                mm_inputs=None,
-                return_logprob=False,
-                logprob_start_len=-1,
-                top_logprobs_num=0,
-                token_ids_logprob=None,
-            )
-
-            if self.server_args.disaggregation_mode != DisaggregationMode.NULL:
-                health_request.bootstrap_host = FAKE_BOOTSTRAP_HOST
-                health_request.bootstrap_room = 0
-
-            logger.debug(f"Receive health check request: {rid}")
-
-            # Submit and wait for response
-            output_generator = self.request_manager.generate_request(
-                health_request, request_id=rid
-            )
-
-            try:
-                # Get first response with timeout
-                response = await asyncio.wait_for(
-                    output_generator.__anext__(), timeout=HEALTH_CHECK_TIMEOUT
-                )
-
-                # Clean up
-                if rid in self.request_manager.rid_to_state:
-                    del self.request_manager.rid_to_state[rid]
-
-                return sglang_scheduler_pb2.HealthCheckResponse(
-                    healthy=True, message="Health check passed"
-                )
-
-            except asyncio.TimeoutError:
-                # Clean up on timeout
-                if rid in self.request_manager.rid_to_state:
-                    del self.request_manager.rid_to_state[rid]
-
-                return sglang_scheduler_pb2.HealthCheckResponse(
-                    healthy=False, message="Health check timeout"
-                )
-
-        except Exception as e:
-            logger.error(f"Health check failed: {e}\n{get_exception_traceback()}")
-            return sglang_scheduler_pb2.HealthCheckResponse(
-                healthy=False, message=f"Health check error: {str(e)}"
-            )
+        """Health check - always returns healthy after server started."""
+        return sglang_scheduler_pb2.HealthCheckResponse(
+            healthy=True, message="Health check passed"
+        )
 
     async def Abort(
         self,
