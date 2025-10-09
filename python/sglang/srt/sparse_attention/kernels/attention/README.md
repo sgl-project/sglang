@@ -1,0 +1,1 @@
+The implementations in this directory are copied and modified from https://github.com/Dao-AILab/flash-attention/tree/main/flash_attn/cute. The main modifications include support for paged attention on SM90 and support for different paged indices for different Groups in GQA.

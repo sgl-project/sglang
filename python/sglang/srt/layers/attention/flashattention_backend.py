@@ -19,9 +19,9 @@ if TYPE_CHECKING:
 
 from sgl_kernel import merge_state_v2
 from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
-from memattention.updater.flashattention.cache_updater import LServerUpdaterFlashAttentionBackend
-from memattention.cache_manager.cache_manager import ManagerConfig
-
+from sglang.srt.sparse_attention.updater.flashattention.cache_updater import LServerUpdaterFlashAttentionBackend
+from sglang.srt.sparse_attention.cache_manager.cache_manager import ManagerConfig
+from sglang.srt.sparse_attention.kernels.attention.interface import flash_attn_with_kvcache as cute_flash_attn_with_kvcache
 
 @dataclass
 class FlashAttentionMetadata:
@@ -336,21 +336,25 @@ class FlashAttentionBackend(AttentionBackend):
         self.speculative_step_id = speculative_step_id
         self.sparse_attn = model_runner.server_args.is_sparse_attn
         self.sparse_attn_algo = model_runner.server_args.sparse_attn_algo
-        manager_config = ManagerConfig(
-            keys=model_runner.token_to_kv_pool.k_buffer,
-            values=model_runner.token_to_kv_pool.v_buffer,
-            num_layers=model_runner.token_to_kv_pool.layer_num,
-            use_cuda_graph=not model_runner.server_args.disable_cuda_graph,
-            max_bs=1,
-            page_size=self.page_size,
-            retrive_budget_per_seq=1024,
-            device=model_runner.device,
-            async_retrive=True,
-            req_to_token=model_runner.req_to_token_pool.req_to_token,
-            max_seq_len=self.max_context_len,
-        )
-        self.sparse_cache_updater = LServerUpdaterFlashAttentionBackend(manager_config)
-        self.sparse_cache_updater.cache_manager.start_retrive_loop()
+        if self.sparse_attn:
+            manager_config = ManagerConfig(
+                keys=model_runner.token_to_kv_pool.k_buffer,
+                values=model_runner.token_to_kv_pool.v_buffer,
+                num_layers=model_runner.token_to_kv_pool.layer_num,
+                use_cuda_graph=not model_runner.server_args.disable_cuda_graph,
+                max_bs=32,
+                page_size=self.page_size,
+                top_k=26,
+                retrive_budget_per_seq=2048,
+                device=model_runner.device,
+                async_retrive=True,
+                req_to_token=model_runner.req_to_token_pool.req_to_token,
+                max_seq_len=self.max_context_len,
+                stream_budget=(128, 256)
+            )
+        
+            self.sparse_cache_updater = LServerUpdaterFlashAttentionBackend(manager_config)
+            self.sparse_cache_updater.cache_manager.start_retrive_loop()
 
         # Local attention settings
         self.attention_chunk_size = (
@@ -581,6 +585,13 @@ class FlashAttentionBackend(AttentionBackend):
         elif forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
             if self.sparse_attn:
                 self.sparse_cache_updater.update_extend(forward_batch, metadata)
+                
+                self.strided_indices = torch.arange(
+                    0, metadata.page_table.shape[1], self.page_size, device=self.device
+                )
+                metadata.page_table = (
+                    metadata.page_table[:, self.strided_indices] // self.page_size
+                )
             else:
                 metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
                 metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
@@ -675,6 +686,8 @@ class FlashAttentionBackend(AttentionBackend):
                         k,
                         k_rope,
                     )
+        if self.sparse_attn:
+            self.sparse_cache_updater.update_extend_proxy_k_tensor(forward_batch)
 
         # Use precomputed metadata across all layers
         metadata = self.forward_metadata
@@ -1057,25 +1070,43 @@ class FlashAttentionBackend(AttentionBackend):
                     -1, layer.tp_q_head_num, layer.head_dim
                 )
 
-                # Default: single-token self-attention
-                result = flash_attn_with_kvcache(
-                    q=q_reshaped,
-                    k_cache=key_cache,
-                    v_cache=value_cache,
-                    page_table=page_table,
-                    cache_seqlens=cache_seqlens,
-                    cu_seqlens_q=metadata.cu_seqlens_q,
-                    cu_seqlens_k_new=cu_seqlens_k,
-                    max_seqlen_q=max_seqlen_q,
-                    softmax_scale=layer.scaling,
-                    causal=False if use_cascade_attn else causal,
-                    window_size=window_size,
-                    softcap=layer.logit_cap,
-                    k_descale=k_descale,
-                    v_descale=v_descale,
-                    return_softmax_lse=use_cascade_attn,
-                    **kwargs,
-                )
+                # # Default: single-token self-attention
+                if not self.sparse_attn:
+                    result = flash_attn_with_kvcache(
+                        q=q_reshaped,
+                        k_cache=key_cache,
+                        v_cache=value_cache,
+                        # page_table=page_table[[0,8], :],
+                        page_table=page_table,
+                        cache_seqlens=cache_seqlens,
+                        cu_seqlens_q=metadata.cu_seqlens_q,
+                        cu_seqlens_k_new=cu_seqlens_k,
+                        max_seqlen_q=max_seqlen_q,
+                        softmax_scale=layer.scaling,
+                        causal=False if use_cascade_attn else causal,
+                        window_size=window_size,
+                        softcap=layer.logit_cap,
+                        k_descale=k_descale,
+                        v_descale=v_descale,
+                        return_softmax_lse=use_cascade_attn,
+                        **kwargs,
+                    )
+                
+                else:
+                    result = cute_flash_attn_with_kvcache(
+                        q_reshaped, 
+                        key_cache, 
+                        value_cache, 
+                        cache_seqlens=cache_seqlens, 
+                        cu_seqlens_q=metadata.cu_seqlens_q, 
+                        max_seqlen_q=1, 
+                        page_table=page_table, 
+                        causal=True, 
+                        groupwise=True,
+                        softmax_scale=layer.scaling,
+                        softcap=layer.logit_cap,
+                    )
+                # exit(-1)
                 if use_cascade_attn:
                     o, softmax_lse, *rest = result
                     o_expand, softmax_lse_expand, *rest_expand = (
