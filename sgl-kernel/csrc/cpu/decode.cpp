@@ -338,21 +338,17 @@ struct tinygemm_kernel_nt<at::Half, index_t, BLOCK_M, BLOCK_N> {
       constexpr int col = i % COLS;
 
       if constexpr (col == 0) {
-        __m512i a512 = _mm512_loadu_si512((__m512i const*)(A + row * lda + k));
-        __m256i lo = _mm512_extracti32x8_epi32(a512, 0);
-        __m256i hi = _mm512_extracti32x8_epi32(a512, 1);
-        va0 = _mm512_cvtph_ps(lo);
-        va1 = _mm512_cvtph_ps(hi);
+        __m512i a16 = _mm512_loadu_si512((__m512i const*)(A + row * lda + k));
+        va0 = CVT_FP16_TO_FP32(_mm512_extracti32x8_epi32(a16, 0));
+        va1 = CVT_FP16_TO_FP32(_mm512_extracti32x8_epi32(a16, 1));
       }
 
       if constexpr (row == 0) {
         int64_t b_idx = indices[col];
         TORCH_CHECK(b_idx < max_tokens, "token index out of scope!");
-        __m512i b512 = _mm512_loadu_si512((__m512i const*)(B + b_idx * ldb + k));
-        __m256i lo = _mm512_extracti32x8_epi32(b512, 0);
-        __m256i hi = _mm512_extracti32x8_epi32(b512, 1);
-        vb0[col] = _mm512_cvtph_ps(lo);
-        vb1[col] = _mm512_cvtph_ps(hi);
+        __m512i b16 = _mm512_loadu_si512((__m512i const*)(B + b_idx * ldb + k));
+        vb0[col] = CVT_FP16_TO_FP32(_mm512_extracti32x8_epi32(b16, 0));
+        vb1[col] = CVT_FP16_TO_FP32(_mm512_extracti32x8_epi32(b16, 1));
       }
 
       vc[i] = _mm512_fmadd_ps(va0, vb0[col], _mm512_fmadd_ps(va1, vb1[col], vc[i]));
@@ -363,21 +359,17 @@ struct tinygemm_kernel_nt<at::Half, index_t, BLOCK_M, BLOCK_N> {
       constexpr int col = i % COLS;
 
       if constexpr (col == 0) {
-        __m512i a512 = _mm512_maskz_loadu_epi16(mask, (const void*)(A + row * lda + k));
-        __m256i lo = _mm512_extracti32x8_epi32(a512, 0);
-        __m256i hi = _mm512_extracti32x8_epi32(a512, 1);
-        va0 = _mm512_cvtph_ps(lo);
-        va1 = _mm512_cvtph_ps(hi);
+        __m512i a16 = _mm512_maskz_loadu_epi16(mask, (const void*)(A + row * lda + k));
+        va0 = CVT_FP16_TO_FP32(_mm512_extracti32x8_epi32(a16, 0));
+        va1 = CVT_FP16_TO_FP32(_mm512_extracti32x8_epi32(a16, 1));
       }
 
       if constexpr (row == 0) {
         int64_t b_idx = indices[col];
         TORCH_CHECK(b_idx < max_tokens, "token index out of scope!");
-        __m512i b512 = _mm512_maskz_loadu_epi16(mask, (const void*)(B + b_idx * ldb + k));
-        __m256i lo = _mm512_extracti32x8_epi32(b512, 0);
-        __m256i hi = _mm512_extracti32x8_epi32(b512, 1);
-        vb0[col] = _mm512_cvtph_ps(lo);
-        vb1[col] = _mm512_cvtph_ps(hi);
+        __m512i b16 = _mm512_maskz_loadu_epi16(mask, (const void*)(B + b_idx * ldb + k));
+        vb0[col] = CVT_FP16_TO_FP32(_mm512_extracti32x8_epi32(b16, 0));
+        vb1[col] = CVT_FP16_TO_FP32(_mm512_extracti32x8_epi32(b16, 1));
       }
 
       vc[i] = _mm512_fmadd_ps(va0, vb0[col], _mm512_fmadd_ps(va1, vb1[col], vc[i]));
@@ -594,14 +586,12 @@ struct tinygemm_kernel_nn<at::Half, index_t, BLOCK_M, BLOCK_N> {
         if constexpr (COLS % 2 == 0) {
           if constexpr (col % 2 == 0) {
             __m512i b16 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(B + b_idx * ldb + col * 16));
-            __m256i lo = _mm512_extracti32x8_epi32(b16, 0);
-            __m256i hi = _mm512_extracti32x8_epi32(b16, 1);
-            vb[col + 0] = _mm512_cvtph_ps(lo);
-            vb[col + 1] = _mm512_cvtph_ps(hi);
+            vb[col + 0] = CVT_FP16_TO_FP32(_mm512_extracti32x8_epi32(b16, 0));
+            vb[col + 1] = CVT_FP16_TO_FP32(_mm512_extracti32x8_epi32(b16, 1));
           }
         } else {
           __m256i b16 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(B + b_idx * ldb + col * 16));
-          vb[col] = _mm512_cvtph_ps(b16);
+          vb[col] = CVT_FP16_TO_FP32(b16);
         }
       }
       vc[i] = _mm512_fmadd_ps(va, vb[col], vc[i]);
