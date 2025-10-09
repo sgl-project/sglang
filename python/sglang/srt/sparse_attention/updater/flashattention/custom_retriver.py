@@ -10,6 +10,7 @@ from sglang.srt.sparse_attention.cache_manager.cache_manager import CacheManager
 
 from sglang.srt.sparse_attention.kernels.compute_scores.compute_scores_average import compute_average_score as compute_score
 from sglang.srt.sparse_attention.kernels.proxy_k_tensor.proxy_k_tensor_average import proxy_k_tensor_decode, proxy_k_tensor_extend
+from sglang.srt.sparse_attention.kernels.combine_indices_paged import combine_indices
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -86,23 +87,9 @@ class NaiveDecodeSparseRetriver:
             )
 
     def build_stream(self, forward_batch: "ForwardBatch", metadata: "FlashAttentionMetadata") -> "FlashAttentionMetadata":
-        device = forward_batch.seq_lens.device
-        positions_in_page = ((forward_batch.seq_lens - 1) % self.cache_manager.config.page_size).to(torch.int32)
-        diff = self.cache_manager.config.page_size - positions_in_page - 1
+        self.stream_indices_page = self._get_stream_indices(forward_batch)
         
-        seq_lens = torch.full((forward_batch.batch_size,), self.budget_per_seq, device=device, dtype=torch.int32) - diff
-        metadata.cache_seqlens_int32 = seq_lens
-        metadata.max_seq_len_k = self.budget_per_seq - diff.max().item()
-        metadata.cu_seqlens_k = torch.nn.functional.pad(
-            torch.cumsum(seq_lens, dim=0, dtype=torch.int32), (1, 0)
-        )
-        metadata.cu_seqlens_q = torch.arange(
-            0, forward_batch.batch_size + 1, dtype=torch.int32, device=forward_batch.seq_lens.device
-        )
-        self.stream_indices_page = self._get_stream_indices(forward_batch, metadata)
-        return metadata
-        
-    def _get_stream_indices(self, forward_batch: "ForwardBatch", metadata: "FlashAttentionMetadata"):
+    def _get_stream_indices(self, forward_batch: "ForwardBatch"):
         token_indices = forward_batch.req_to_token_pool.req_to_token[forward_batch.req_pool_indices, :]
         
         strided_indices = torch.arange(0, token_indices.shape[1], self.cache_manager.config.page_size, device=token_indices.device)
@@ -154,7 +141,6 @@ class NaiveDecodeSparseRetriver:
                     )
         _, topk_indices = torch.topk(score[:query.shape[0], :, :], k=top_k, dim=2, sorted=False)
         selected_page_indices[:query.shape[0], :, :] = topk_indices
-        return selected_page_indices
         
     def _call_after_update_query(self,
                                  key_cache: torch.Tensor,
@@ -191,20 +177,46 @@ class NaiveDecodeSparseRetriver:
         combined_page_indices = torch.cat([retrived_cache_indices[:bs], stream_indices_expanded], dim=2).reshape(bs * num_heads, self.cache_manager.config.top_k + stream_len)
         return combined_page_indices
         
-    def _combine_indices_async(self, retrive_result: RetriveResult, req_pool_indices: torch.Tensor, req_to_token: torch.Tensor, seq_lens: torch.Tensor):
-        
+    def _combine_indices_async(self, retrive_result: RetriveResult, req_pool_indices: torch.Tensor, req_to_token: torch.Tensor, seq_lens: torch.Tensor, diff: torch.Tensor):
+        return combine_indices(
+                stream_indices=self.stream_indices_page,
+                retrived_cache_indices=retrive_result.retrived_cache_indices_page,
+                cur_req_pool_indices=req_pool_indices,
+                pre_req_pool_indices=retrive_result.req_pool_indices,
+                req_to_token=req_to_token,
+                seq_lens=seq_lens,
+                page_table=retrive_result.page_table,
+                diff=diff,
+                page_size=self.cache_manager.config.page_size,
+        )
         
     
     def retrive_decode(self, query: torch.Tensor, forward_batch: "ForwardBatch", metadata: "FlashAttentionMetadata", layer: "RadixAttention"):
         self.cache_manager.update_query(query, forward_batch.req_pool_indices, forward_batch.seq_lens, metadata.cu_seqlens_k, metadata.max_seq_len_k, layer.layer_id)
-
+        
+        device = forward_batch.seq_lens.device
+        positions_in_page = ((forward_batch.seq_lens - 1) % self.cache_manager.config.page_size).to(torch.int32)
+        diff = self.cache_manager.config.page_size - positions_in_page - 1
+        
+        metadata.cu_seqlens_q = torch.arange(
+            0, forward_batch.batch_size + 1, dtype=torch.int32, device=forward_batch.seq_lens.device
+        )
+        
         if self.cache_manager.config.async_retrive:
             retrive_result = self.cache_manager.get_result(layer.layer_id)
-            self._combine_indices_async(retrive_result, forward_batch.req_pool_indices, forward_batch.req_to_token_pool.req_to_token, forward_batch.seq_lens)
-            metadata.page_table = retrive_result
+            new_seq_lens = self._combine_indices_async(retrive_result, forward_batch.req_pool_indices, forward_batch.req_to_token_pool.req_to_token, forward_batch.seq_lens, diff)
+            
+            num_heads = self.cache_manager.config.keys[0].shape[1]
+            
+            # set metadata info
+            metadata.page_table = retrive_result.page_table[:forward_batch.batch_size, :, :].reshape(forward_batch.batch_size * num_heads, -1)
+            metadata.cache_seqlens_int32 = new_seq_lens
+            metadata.cu_seqlens_k = torch.nn.functional.pad(
+                torch.cumsum(new_seq_lens, dim=0, dtype=torch.int32), (1, 0)
+            )
         else:
             query = self.cache_manager.retrived_query[layer.layer_id]
-            selected_page_indices = self._retrive_cache_indices(
+            self._retrive_cache_indices(
                     query=query.query, 
                     proxy_k_tensor=query.proxy_k_tensor, 
                     req_to_token=forward_batch.req_to_token_pool.req_to_token,
@@ -216,7 +228,14 @@ class NaiveDecodeSparseRetriver:
             )
             
             combined_page_indices = self._combine_indices(
-                retrived_cache_indices=selected_page_indices,
+                retrived_cache_indices=query.selected_page_indices,
                 seq_lens=query.seq_lens,
             )
+
+            # set metadata info
+            seq_lens = torch.full((forward_batch.batch_size,), self.budget_per_seq, device=device, dtype=torch.int32) - diff
             metadata.page_table = combined_page_indices
+            metadata.cache_seqlens_int32 = seq_lens
+            metadata.cu_seqlens_k = torch.nn.functional.pad(
+                torch.cumsum(seq_lens, dim=0, dtype=torch.int32), (1, 0)
+            )

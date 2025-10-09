@@ -72,8 +72,7 @@ class RetriveResult:
     def __init__(self, config: ManagerConfig):
         self.retrive_budget_per_seq = config.retrive_budget_per_seq
         self.page_table = torch.zeros(
-            config.max_bs,
-            config.max_seq_len,
+            (config.max_bs, config.keys[0].shape[1], config.max_seq_len // config.page_size),
             dtype=torch.int32,
             device=config.device,
         )
@@ -101,12 +100,11 @@ class RetriveResult:
             device=config.device,
         )
         
-        #num_stream_pages = (config.stream_budget[0] + config.stream_budget[1]) // config.page_size
-        self.retrived_cache_indices_page = torch.zeros(
-            config.max_bs * config.keys[0].shape[1],
-            (config.max_seq_len + config.page_size - 1) // config.page_size, 
-            dtype=torch.int32,
-            device=config.device,
+        self.retrived_cache_indices_page = torch.full(
+            (config.max_bs, config.keys[0].shape[1], config.top_k), 
+            -1, 
+            dtype=torch.int32, 
+            device=config.device
         )
         self.updated = False
         
@@ -118,8 +116,8 @@ class RetriveResult:
                 ):
         self.req_pool_indices = req_pool_indices[:bs]
         self.seq_lens = seq_lens[:bs]
-        self.retrived_cache_indices_page[:bs,:retrived_cache_indices_page.shape[1]].copy_(retrived_cache_indices_page)
-        #self.retrived_cache_indices_page = retrived_cache_indices_page
+        # self.retrived_cache_indices_page[:bs,:retrived_cache_indices_page.shape[1]].copy_(retrived_cache_indices_page)
+        self.retrived_cache_indices_page = retrived_cache_indices_page
         self.updated = True
         
 class CacheManager:
@@ -170,7 +168,7 @@ class CacheManager:
                 for layer_id in range(self.config.num_layers):
                     if self.retrived_query[layer_id].updated:
                         query = self.retrived_query[layer_id]
-                        retrived_cache_indices_page, bs = self._retrive_cache_indices(
+                        self._retrive_cache_indices(
                             query=query.query, 
                             proxy_k_tensor=query.proxy_k_tensor, 
                             req_to_token=self.config.req_to_token,
@@ -181,10 +179,10 @@ class CacheManager:
                             selected_page_indices=query.selected_page_indices,
                         )
                         self.retrived_result[layer_id].copy_from(
-                            bs=bs, 
+                            bs=query.seq_lens.shape[0], 
                             req_pool_indices=query.req_pool_indices, 
                             seq_lens=query.seq_lens, 
-                            retrived_cache_indices_page=retrived_cache_indices_page,
+                            retrived_cache_indices_page=query.selected_page_indices,
                         )
                         self.retrived_query[layer_id].updated = False
                 time.sleep(0.001)
