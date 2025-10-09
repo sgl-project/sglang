@@ -170,9 +170,7 @@ impl SglangSchedulerClient {
     ) -> Result<proto::HealthCheckResponse, Box<dyn std::error::Error + Send + Sync>> {
         debug!("Sending health check request");
         // Server ignores the request body and creates its own health check internally
-        let request = Request::new(proto::HealthCheckRequest {
-            tokenized: None,
-        });
+        let request = Request::new(proto::HealthCheckRequest { tokenized: None });
 
         let mut client = self.client.clone();
         let response = client.health_check(request).await?;
