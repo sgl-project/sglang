@@ -48,6 +48,7 @@ The core features include:
    advanced_features/router.md
    advanced_features/observability.md
    advanced_features/attention_backend.md
+   advanced_features/hicache.rst
 
 .. toctree::
    :maxdepth: 1

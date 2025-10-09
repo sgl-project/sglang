@@ -25,7 +25,7 @@ pub trait ToolParser: Send + Sync {
     ) -> ToolParserResult<StreamingParseResult>;
 
     /// Check if text contains tool calls in this parser's format
-    fn detect_format(&self, text: &str) -> bool;
+    fn has_tool_markers(&self, text: &str) -> bool;
 
     /// Optionally expose a token-aware parser implementation.
     /// Default returns `None`, meaning the parser only supports text input.
