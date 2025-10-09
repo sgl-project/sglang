@@ -105,7 +105,7 @@ class FutureMap:
             if draft_input is None:
                 # FIXME(lsyin): No future exists, only for prefill batch, not compatible with mixed mode
                 return
-            indices = -draft_input.future_indices.indices
+            indices = draft_input.future_indices.indices
             draft_input.topk_p = self.topk_p_buf[indices]
             draft_input.topk_index = self.topk_index_buf[indices]
             draft_input.hidden_states = self.hidden_states_buf[indices]
