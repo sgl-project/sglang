@@ -555,4 +555,20 @@ impl ToolParser for Step3Parser {
     fn get_unstreamed_tool_args(&self) -> Option<Vec<ToolCallItem>> {
         helpers::get_unstreamed_args(&self.prev_tool_call_arr, &self.streamed_args_for_tool)
     }
+
+    fn reset(&mut self) {
+        // Reset standard state
+        self.buffer.clear();
+        self.prev_tool_call_arr.clear();
+        self.current_tool_id = -1;
+        self.streamed_args_for_tool.clear();
+
+        // Reset Step3-specific fields
+        self.in_tool_block = false;
+        self.tool_block_finished = false;
+        self.current_function_name.clear();
+        self.current_parameters.clear();
+        self.in_tool_call = false;
+        self.function_name_sent = false;
+    }
 }

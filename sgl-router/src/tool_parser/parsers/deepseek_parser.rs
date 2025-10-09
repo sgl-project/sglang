@@ -314,4 +314,12 @@ impl ToolParser for DeepSeekParser {
     fn get_unstreamed_tool_args(&self) -> Option<Vec<ToolCallItem>> {
         helpers::get_unstreamed_args(&self.prev_tool_call_arr, &self.streamed_args_for_tool)
     }
+
+    fn reset(&mut self) {
+        self.buffer.clear();
+        self.prev_tool_call_arr.clear();
+        self.current_tool_id = -1;
+        self.current_tool_name_sent = false;
+        self.streamed_args_for_tool.clear();
+    }
 }

@@ -117,7 +117,7 @@ pub fn reset_parser_state(
 ) {
     buffer.clear();
     prev_tool_call_arr.clear();
-    *current_tool_id = 0;
+    *current_tool_id = -1;
     *current_tool_name_sent = false;
     streamed_args_for_tool.clear();
 }

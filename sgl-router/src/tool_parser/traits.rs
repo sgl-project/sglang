@@ -38,6 +38,12 @@ pub trait ToolParser: Send + Sync {
     fn get_unstreamed_tool_args(&self) -> Option<Vec<crate::tool_parser::types::ToolCallItem>> {
         None
     }
+
+    /// Reset the parser state for reuse across requests.
+    /// This should clear all buffers and reset state to initial values.
+    fn reset(&mut self) {
+        // Default no-op implementation
+    }
 }
 
 /// Trait for partial JSON parsing
