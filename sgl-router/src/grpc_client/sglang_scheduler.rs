@@ -1,6 +1,6 @@
 use std::convert::TryFrom;
 use std::time::Duration;
-use tonic::{transport::Channel, Request};
+use tonic::{transport::Channel, Request, Streaming};
 use tracing::debug;
 
 use crate::protocols::spec::{
@@ -54,18 +54,18 @@ impl SglangSchedulerClient {
 
     /// Submit a generation request (returns streaming response)
     pub async fn generate(
-        &mut self,
+        &self,
         req: proto::GenerateRequest,
-    ) -> Result<tonic::Streaming<proto::GenerateResponse>, Box<dyn std::error::Error + Send + Sync>>
-    {
+    ) -> Result<Streaming<proto::GenerateResponse>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut client = self.client.clone();
         let request = Request::new(req);
-        let response = self.client.generate(request).await?;
+        let response = client.generate(request).await?;
         Ok(response.into_inner())
     }
 
     /// Perform health check
     pub async fn health_check(
-        &mut self,
+        &self,
     ) -> Result<proto::HealthCheckResponse, Box<dyn std::error::Error + Send + Sync>> {
         debug!("Sending health check request");
         let request = Request::new(proto::HealthCheckRequest {
@@ -75,43 +75,47 @@ impl SglangSchedulerClient {
             }),
         });
 
-        let response = self.client.health_check(request).await?;
+        let mut client = self.client.clone();
+        let response = client.health_check(request).await?;
         debug!("Health check response received");
         Ok(response.into_inner())
     }
 
     /// Abort a request
     pub async fn abort_request(
-        &mut self,
+        &self,
         request_id: String,
         reason: String,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let request = Request::new(proto::AbortRequest { request_id, reason });
 
-        self.client.abort(request).await?;
+        let mut client = self.client.clone();
+        client.abort(request).await?;
         Ok(())
     }
 
     /// Get model information
     pub async fn get_model_info(
-        &mut self,
+        &self,
     ) -> Result<proto::GetModelInfoResponse, Box<dyn std::error::Error + Send + Sync>> {
         debug!("Requesting model info");
         let request = Request::new(proto::GetModelInfoRequest {});
 
-        let response = self.client.get_model_info(request).await?;
+        let mut client = self.client.clone();
+        let response = client.get_model_info(request).await?;
         debug!("Model info response received");
         Ok(response.into_inner())
     }
 
     /// Get server information
     pub async fn get_server_info(
-        &mut self,
+        &self,
     ) -> Result<proto::GetServerInfoResponse, Box<dyn std::error::Error + Send + Sync>> {
         debug!("Requesting server info");
         let request = Request::new(proto::GetServerInfoRequest {});
 
-        let response = self.client.get_server_info(request).await?;
+        let mut client = self.client.clone();
+        let response = client.get_server_info(request).await?;
         debug!("Server info response received");
         Ok(response.into_inner())
     }
