@@ -627,10 +627,13 @@ class ModelRunner:
         if self.model_config.hf_config.model_type == "qwen3_vl_moe" and hasattr(
             self.model_config.hf_config, "quantization_config"
         ):
-            if self.tp_size == 8 and self.moe_ep_size != self.tp_size:
-                self.moe_ep_size = 8
-                logger.info(
-                    f"Automatically set ep_size=tp_size={self.tp_size} for qwen3-vl-fp8 models"
+            text_config = self.model_config.hf_text_config
+
+            if (
+                text_config.moe_intermediate_size // (self.tp_size // self.moe_ep_size)
+            ) % 128 != 0:
+                raise ValueError(
+                    f"For qwen3-vl-fp8 models, please make sure ({text_config.moe_intermediate_size=} // ({self.tp_size=} // {self.moe_ep_size=})) % 128 == 0"
                 )
 
     def init_torch_distributed(self):
