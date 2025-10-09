@@ -128,6 +128,8 @@ impl RouterFactory {
             base_url,
             Some(ctx.router_config.circuit_breaker.clone()),
             ctx.response_storage.clone(),
+            ctx.conversation_storage.clone(),
+            ctx.conversation_item_storage.clone(),
         )
         .await?;
 
