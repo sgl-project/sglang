@@ -53,7 +53,7 @@ from sglang.srt.mem_cache.memory_pool import (
     NSATokenToKVPool,
     SWAKVPool,
 )
-from sglang.srt.tracing.trace import trace_event, trace_slice, trace_slice_end
+from sglang.srt.tracing.trace import trace_event_batch, trace_slice, trace_slice_end
 from sglang.srt.utils import broadcast_pyobj, point_to_point_pyobj, require_mlp_sync
 
 if TYPE_CHECKING:
@@ -324,8 +324,7 @@ class SchedulerDisaggregationPrefillMixin:
             batch = self.get_new_batch_prefill()
             if batch:
                 attrs = {"bid": hex(id(batch)), "batch_size": batch.batch_size()}
-                for req in batch.reqs:
-                    trace_event("schedule", req.rid, attrs=attrs)
+                trace_event_batch("schedule", batch.reqs, attrs=attrs)
 
             if require_mlp_sync(self.server_args):
                 batch = self.prepare_mlp_sync_batch(batch)
@@ -360,8 +359,7 @@ class SchedulerDisaggregationPrefillMixin:
             batch = self.get_new_batch_prefill()
             if batch:
                 attrs = {"bid": hex(id(batch)), "batch_size": batch.batch_size()}
-                for req in batch.reqs:
-                    trace_event("schedule", req.rid, attrs=attrs)
+                trace_event_batch("schedule", batch.reqs, attrs=attrs)
 
             if require_mlp_sync(self.server_args):
                 batch = self.prepare_mlp_sync_batch(batch)
