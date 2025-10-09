@@ -1127,7 +1127,9 @@ class MRotaryEmbedding(RotaryEmbedding):
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if video_grid_thw is not None:
-            video_grid_thw = torch.repeat_interleave(video_grid_thw, video_grid_thw[:, 0], dim=0)
+            video_grid_thw = torch.repeat_interleave(
+                video_grid_thw, video_grid_thw[:, 0], dim=0
+            )
             video_grid_thw[:, 0] = 1
         mrope_position_deltas = []
         if input_ids is not None and (

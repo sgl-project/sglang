@@ -49,6 +49,7 @@ class TestQwen2VLServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
         )
         cls.base_url += "/v1"
 
+
 class TestQwen3VLServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
     @classmethod
     def setUpClass(cls):
