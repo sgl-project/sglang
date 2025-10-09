@@ -1587,6 +1587,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                     self.w_kc.to(torch.bfloat16) * self.w_scale,
                 )
         elif self.w_kc.dtype == torch.float8_e4m3fn:
+            # TODO fix the per_tensor_quant_mla_fp8 for cublas 12.9
             if _is_cublas_ge_129:
                 q_nope_val, q_nope_scale = input_to_float8(
                     q_nope.transpose(0, 1), torch.float8_e4m3fn
