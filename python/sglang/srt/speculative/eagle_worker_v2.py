@@ -2,18 +2,23 @@ from typing import Optional
 
 import torch
 from torch.cuda import Stream as CudaStream
+from traitlets import List
 
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, Req
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.build_eagle_tree import TreeMaskMode
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
-from sglang.srt.speculative.eagle_info_v2 import build_tree_kernel_efficient_tmp
+from sglang.srt.speculative.eagle_info_v2 import (
+    build_tree_kernel_efficient_tmp,
+    select_top_k_tokens_tmp,
+)
 from sglang.srt.speculative.eagle_worker import EAGLEWorker
+from sglang.srt.utils.common import fast_topk
 
 # TODO: [ ] add related fields in spec info (EagleDraftInput)
 # TODO: [ ] add future map related logic
@@ -135,6 +140,80 @@ class EAGLEWorkerV2(EAGLEWorker):
             topk=self.topk,
             num_draft_tokens=self.speculative_num_draft_tokens,
         )
+
+    def draft_forward(self, forward_batch: ForwardBatch):
+        # Parse args
+        spec_info: EagleDraftInput = forward_batch.spec_info
+        out_cache_loc = forward_batch.out_cache_loc
+        topk_p, topk_index, hidden_states = (
+            spec_info.topk_p,
+            spec_info.topk_index,
+            spec_info.hidden_states,
+        )
+        if self.hot_token_id is not None:
+            topk_index = self.hot_token_id[topk_index]
+
+        out_cache_loc = out_cache_loc.reshape(
+            forward_batch.batch_size, self.topk, self.num_steps
+        )
+        out_cache_loc = out_cache_loc.permute((2, 0, 1)).reshape(self.num_steps, -1)
+
+        # Return values
+        score_list: List[torch.Tensor] = []
+        token_list: List[torch.Tensor] = []
+        parents_list: List[torch.Tensor] = []
+
+        # Forward multiple steps
+        scores = None
+        for i in range(self.num_steps):
+            input_ids, hidden_states, scores, tree_info = select_top_k_tokens_tmp(
+                i, topk_p, topk_index, hidden_states, scores, self.topk
+            )
+            score_list.append(tree_info[0])
+            token_list.append(tree_info[1])
+            parents_list.append(tree_info[2])
+
+            # We don't need to run the last forward. we get 1 token from draft prefill and (#spec steps - 1) tokens here
+            if i == self.speculative_num_steps - 1:
+                break
+
+            # Set inputs
+            forward_batch.input_ids = input_ids
+            forward_batch.out_cache_loc = out_cache_loc[i]
+            forward_batch.positions.add_(1)
+            forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
+            spec_info.hidden_states = hidden_states
+
+            # Run forward
+            logits_output = self.draft_model_runner.model.forward(
+                forward_batch.input_ids, forward_batch.positions, forward_batch
+            )
+            self._detect_nan_if_needed(logits_output)
+            probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+            topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            if self.hot_token_id is not None:
+                topk_index = self.hot_token_id[topk_index]
+            hidden_states = logits_output.hidden_states
+
+        # Organize the results
+        score_list = torch.cat(score_list, dim=1).flatten(
+            1
+        )  # b, n, topk; n= 1 + (num_steps-1) * self.topk
+        ss_token_list = torch.cat(
+            token_list, dim=1
+        )  # b, (self.topk + (num_steps-1) * self.topk)
+        top_scores = torch.topk(score_list, self.num_draft_tokens - 1, dim=-1)
+        top_scores_index = top_scores.indices
+        top_scores_index = torch.sort(top_scores_index).values
+        draft_tokens = torch.gather(ss_token_list, index=top_scores_index, dim=1)
+
+        if len(parents_list) > 1:
+            parent_list = torch.cat(parents_list[:-1], dim=1)
+        else:
+            batch_size = parents_list[0].shape[0]
+            parent_list = torch.empty(batch_size, 0, device=parents_list[0].device)
+
+        return parent_list, top_scores_index, draft_tokens
 
     def verify(
         self, model_worker_batch: ModelWorkerBatch, allocate_lens: torch.Tensor
