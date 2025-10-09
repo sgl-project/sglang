@@ -17,6 +17,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sglang.srt.speculative.eagle_info_v2 import EagleDraftInputV2Mixin
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
@@ -563,7 +564,7 @@ class EagleVerifyInput(SpecInput):
 
 
 @dataclass
-class EagleDraftInput(SpecInput):
+class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     # The inputs for decode
     # shape: (b, topk)
     topk_p: torch.Tensor = None
