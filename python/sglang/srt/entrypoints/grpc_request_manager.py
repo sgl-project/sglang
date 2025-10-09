@@ -319,13 +319,8 @@ class GrpcRequestManager:
             is_stream = getattr(obj, "stream", False)
 
             while True:
-                # Client cancelled - notify scheduler and exit
-                if grpc_context and grpc_context.cancelled():
-                    await self.abort_request(request_id)
-                    return
-
                 try:
-                    response = await asyncio.wait_for(state.out_queue.get(), timeout=4)
+                    response = await state.out_queue.get()
 
                     if is_stream:
                         yield response
@@ -338,10 +333,11 @@ class GrpcRequestManager:
                             yield final_response
                         break
 
-                except asyncio.TimeoutError:
-                    # Timeout is for periodic client cancellation check
-                    # Continue waiting for scheduler response
-                    continue
+                except asyncio.CancelledError:
+                    # Task was cancelled by gRPC framework when client disconnected
+                    logger.info(f"Request {request_id} cancelled by client")
+                    await self.abort_request(request_id)
+                    raise  # Re-raise to let gRPC server handle cleanup
 
         finally:
             # Always clean up request state when exiting
@@ -411,19 +407,26 @@ class GrpcRequestManager:
     async def abort_request(self, request_id: str) -> bool:
         """Abort a running request.
 
-        Sends abort request to scheduler, which will send back an AbortReq
-        that will be handled by _handle_abort_req to notify the client.
+        Sends abort request to scheduler and marks local state as finished
+        to stop processing any further outputs from the scheduler.
         """
         # Skip aborting health check requests (they clean themselves up)
         if request_id.startswith("HEALTH_CHECK"):
             return False
+
+        # Mark state as finished immediately to stop processing scheduler outputs
+        state = self.rid_to_state.get(request_id)
+        if state:
+            state.finished = True
+            state.stream_finished = True
+            logger.debug(f"Marked request {request_id} as aborted locally")
 
         # Send abort to scheduler - the scheduler will send AbortReq back
         # which will be handled by _handle_abort_req
         abort_req = AbortReq(rid=request_id)
         try:
             await self._send_to_scheduler(abort_req)
-            logger.info(f"Sent abort to scheduler for request {request_id}")
+            logger.debug(f"Sent abort to scheduler for request {request_id}")
         except Exception as e:
             logger.error(f"Failed to send abort request to scheduler: {e}")
             return False
@@ -535,6 +538,11 @@ class GrpcRequestManager:
                 continue
 
             state = self.rid_to_state[rid]
+
+            # Skip if already aborted/finished locally (client cancelled)
+            if state.finished:
+                logger.debug(f"Skipping output for aborted request {rid}")
+                continue
 
             # Update metrics
             now = time.time()
@@ -722,7 +730,7 @@ class GrpcRequestManager:
         # Check if request still exists
         if recv_obj.rid not in self.rid_to_state:
             logger.debug(
-                f"Abort request for {request_id} not in local state (may have already finished or not started yet)"
+                f"Abort request for {recv_obj.rid} not in local state (may have already finished or not started yet)"
             )
             return
 
