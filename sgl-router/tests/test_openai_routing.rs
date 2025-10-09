@@ -22,7 +22,7 @@ use sglang_router_rs::{
         ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateRequest, ResponseInput,
         ResponsesGetParams, ResponsesRequest, UserMessageContent,
     },
-    routers::{openai_router::OpenAIRouter, RouterTrait},
+    routers::{openai::OpenAIRouter, RouterTrait},
 };
 use std::collections::HashMap;
 use std::sync::{
