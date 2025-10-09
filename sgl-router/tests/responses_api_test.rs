@@ -1,5 +1,6 @@
 // Integration test for Responses API
 
+use axum::http::StatusCode;
 use sglang_router_rs::protocols::spec::{
     GenerationRequest, ReasoningEffort, ResponseInput, ResponseReasoningParam, ResponseStatus,
     ResponseTool, ResponseToolType, ResponsesRequest, ResponsesResponse, ServiceTier, ToolChoice,
@@ -99,11 +100,11 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
         parallel_tool_calls: true,
         previous_response_id: None,
         reasoning: None,
-        service_tier: sglang_router_rs::protocols::spec::ServiceTier::Auto,
+        service_tier: ServiceTier::Auto,
         store: true,
         stream: false,
         temperature: Some(0.2),
-        tool_choice: sglang_router_rs::protocols::spec::ToolChoice::default(),
+        tool_choice: ToolChoice::default(),
         tools: vec![ResponseTool {
             r#type: ResponseToolType::Mcp,
             server_url: Some(mcp.url()),
@@ -115,7 +116,7 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
         }],
         top_logprobs: 0,
         top_p: None,
-        truncation: sglang_router_rs::protocols::spec::Truncation::Disabled,
+        truncation: Truncation::Disabled,
         user: None,
         request_id: "resp_test_mcp_e2e".to_string(),
         priority: 0,
@@ -132,7 +133,7 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
         .route_responses(None, &req, req.model.as_deref())
         .await;
 
-    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::OK);
 
     let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await
@@ -289,7 +290,7 @@ async fn test_conversations_crud_basic() {
     // Create
     let create_body = serde_json::json!({ "metadata": { "project": "alpha" } });
     let create_resp = router.create_conversation(None, &create_body).await;
-    assert_eq!(create_resp.status(), axum::http::StatusCode::OK);
+    assert_eq!(create_resp.status(), StatusCode::OK);
     let create_bytes = axum::body::to_bytes(create_resp.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -300,7 +301,7 @@ async fn test_conversations_crud_basic() {
 
     // Get
     let get_resp = router.get_conversation(None, conv_id).await;
-    assert_eq!(get_resp.status(), axum::http::StatusCode::OK);
+    assert_eq!(get_resp.status(), StatusCode::OK);
     let get_bytes = axum::body::to_bytes(get_resp.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -312,7 +313,7 @@ async fn test_conversations_crud_basic() {
     let upd_resp = router
         .update_conversation(None, conv_id, &update_body)
         .await;
-    assert_eq!(upd_resp.status(), axum::http::StatusCode::OK);
+    assert_eq!(upd_resp.status(), StatusCode::OK);
     let upd_bytes = axum::body::to_bytes(upd_resp.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -322,7 +323,7 @@ async fn test_conversations_crud_basic() {
 
     // Delete
     let del_resp = router.delete_conversation(None, conv_id).await;
-    assert_eq!(del_resp.status(), axum::http::StatusCode::OK);
+    assert_eq!(del_resp.status(), StatusCode::OK);
     let del_bytes = axum::body::to_bytes(del_resp.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -331,7 +332,7 @@ async fn test_conversations_crud_basic() {
 
     // Get again -> 404
     let not_found = router.get_conversation(None, conv_id).await;
-    assert_eq!(not_found.status(), axum::http::StatusCode::NOT_FOUND);
+    assert_eq!(not_found.status(), StatusCode::NOT_FOUND);
 }
 
 #[test]
@@ -662,11 +663,7 @@ async fn test_multi_turn_loop_with_mcp() {
     let response = router.route_responses(None, &req, None).await;
 
     // Check status
-    assert_eq!(
-        response.status(),
-        axum::http::StatusCode::OK,
-        "Request should succeed"
-    );
+    assert_eq!(response.status(), StatusCode::OK, "Request should succeed");
 
     // Read the response body
     use axum::body::to_bytes;
@@ -837,7 +834,7 @@ async fn test_max_tool_calls_limit() {
     };
 
     let response = router.route_responses(None, &req, None).await;
-    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::OK);
 
     use axum::body::to_bytes;
     let response_body = response.into_body();
@@ -1037,7 +1034,7 @@ async fn test_streaming_with_mcp_tool_calls() {
     // Verify streaming response
     assert_eq!(
         response.status(),
-        axum::http::StatusCode::OK,
+        StatusCode::OK,
         "Streaming request should succeed"
     );
 
@@ -1312,7 +1309,7 @@ async fn test_streaming_multi_turn_with_mcp() {
     };
 
     let response = router.route_responses(None, &req, None).await;
-    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::OK);
 
     use axum::body::to_bytes;
     let body_bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();

@@ -82,9 +82,15 @@ impl ParserRegistry {
         }
     }
 
-    /// Get a parser by exact name (creates new instance, not pooled).
-    /// Use this for compatibility or when you need a fresh instance.
-    pub fn get_parser(&self, name: &str) -> Option<Box<dyn ReasoningParser>> {
+    /// Check if a parser with the given name is registered.
+    pub fn has_parser(&self, name: &str) -> bool {
+        let creators = self.creators.read().unwrap();
+        creators.contains_key(name)
+    }
+
+    /// Create a fresh parser instance by exact name (not pooled).
+    /// Returns a new parser instance for each call - useful for streaming where state isolation is needed.
+    pub fn create_parser(&self, name: &str) -> Option<Box<dyn ReasoningParser>> {
         let creators = self.creators.read().unwrap();
         creators.get(name).map(|creator| creator())
     }
@@ -102,14 +108,30 @@ impl ParserRegistry {
         None
     }
 
-    /// Find a parser for a given model ID by pattern matching (creates new instance).
-    pub fn find_parser_for_model(&self, model_id: &str) -> Option<Box<dyn ReasoningParser>> {
+    /// Check if a parser can be created for a specific model without actually creating it.
+    /// Returns true if a parser is available (registered) for this model.
+    pub fn has_parser_for_model(&self, model_id: &str) -> bool {
         let patterns = self.patterns.read().unwrap();
         let model_lower = model_id.to_lowercase();
 
         for (pattern, parser_name) in patterns.iter() {
             if model_lower.contains(&pattern.to_lowercase()) {
-                return self.get_parser(parser_name);
+                let creators = self.creators.read().unwrap();
+                return creators.contains_key(parser_name);
+            }
+        }
+        false
+    }
+
+    /// Create a fresh parser instance for a given model ID by pattern matching (not pooled).
+    /// Returns a new parser instance for each call - useful for streaming where state isolation is needed.
+    pub fn create_for_model(&self, model_id: &str) -> Option<Box<dyn ReasoningParser>> {
+        let patterns = self.patterns.read().unwrap();
+        let model_lower = model_id.to_lowercase();
+
+        for (pattern, parser_name) in patterns.iter() {
+            if model_lower.contains(&pattern.to_lowercase()) {
+                return self.create_parser(parser_name);
             }
         }
         None
@@ -131,11 +153,11 @@ impl Default for ParserRegistry {
 
 /// Factory for creating reasoning parsers based on model type.
 #[derive(Clone)]
-pub struct ReasoningParserFactory {
+pub struct ParserFactory {
     registry: ParserRegistry,
 }
 
-impl ReasoningParserFactory {
+impl ParserFactory {
     /// Create a new factory with default parsers registered.
     pub fn new() -> Self {
         let registry = ParserRegistry::new();
@@ -211,7 +233,7 @@ impl ReasoningParserFactory {
     /// Use this when you need an isolated parser instance.
     pub fn create(&self, model_id: &str) -> Result<Box<dyn ReasoningParser>, ParseError> {
         // First try to find by pattern
-        if let Some(parser) = self.registry.find_parser_for_model(model_id) {
+        if let Some(parser) = self.registry.create_for_model(model_id) {
             return Ok(parser);
         }
 
@@ -240,7 +262,7 @@ impl ReasoningParserFactory {
     }
 }
 
-impl Default for ReasoningParserFactory {
+impl Default for ParserFactory {
     fn default() -> Self {
         Self::new()
     }
@@ -252,35 +274,35 @@ mod tests {
 
     #[test]
     fn test_factory_creates_deepseek_r1() {
-        let factory = ReasoningParserFactory::new();
+        let factory = ParserFactory::new();
         let parser = factory.create("deepseek-r1-distill").unwrap();
         assert_eq!(parser.model_type(), "deepseek_r1");
     }
 
     #[test]
     fn test_factory_creates_qwen3() {
-        let factory = ReasoningParserFactory::new();
+        let factory = ParserFactory::new();
         let parser = factory.create("qwen3-7b").unwrap();
         assert_eq!(parser.model_type(), "qwen3");
     }
 
     #[test]
     fn test_factory_creates_kimi() {
-        let factory = ReasoningParserFactory::new();
+        let factory = ParserFactory::new();
         let parser = factory.create("kimi-chat").unwrap();
         assert_eq!(parser.model_type(), "kimi");
     }
 
     #[test]
     fn test_factory_fallback_to_passthrough() {
-        let factory = ReasoningParserFactory::new();
+        let factory = ParserFactory::new();
         let parser = factory.create("unknown-model").unwrap();
         assert_eq!(parser.model_type(), "passthrough");
     }
 
     #[test]
     fn test_case_insensitive_matching() {
-        let factory = ReasoningParserFactory::new();
+        let factory = ParserFactory::new();
         let parser1 = factory.create("DeepSeek-R1").unwrap();
         let parser2 = factory.create("QWEN3").unwrap();
         let parser3 = factory.create("Kimi").unwrap();
@@ -292,21 +314,21 @@ mod tests {
 
     #[test]
     fn test_step3_model() {
-        let factory = ReasoningParserFactory::new();
+        let factory = ParserFactory::new();
         let step3 = factory.create("step3-model").unwrap();
         assert_eq!(step3.model_type(), "step3");
     }
 
     #[test]
     fn test_glm45_model() {
-        let factory = ReasoningParserFactory::new();
+        let factory = ParserFactory::new();
         let glm45 = factory.create("glm45-v2").unwrap();
         assert_eq!(glm45.model_type(), "glm45");
     }
 
     #[tokio::test]
     async fn test_pooled_parser_reuse() {
-        let factory = ReasoningParserFactory::new();
+        let factory = ParserFactory::new();
 
         // Get the same parser twice - should be the same instance
         let parser1 = factory.get_pooled("deepseek-r1");
@@ -322,7 +344,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_pooled_parser_concurrent_access() {
-        let factory = ReasoningParserFactory::new();
+        let factory = ParserFactory::new();
         let parser = factory.get_pooled("deepseek-r1");
 
         // Spawn multiple async tasks that use the same parser
@@ -348,7 +370,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_pool_clearing() {
-        let factory = ReasoningParserFactory::new();
+        let factory = ParserFactory::new();
 
         // Get a pooled parser
         let parser1 = factory.get_pooled("deepseek-r1");
@@ -365,7 +387,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_passthrough_parser_pooling() {
-        let factory = ReasoningParserFactory::new();
+        let factory = ParserFactory::new();
 
         // Unknown models should get passthrough parser
         let parser1 = factory.get_pooled("unknown-model-1");
@@ -383,7 +405,7 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::time::Instant;
 
-        let factory = ReasoningParserFactory::new();
+        let factory = ParserFactory::new();
         let num_tasks = 100;
         let requests_per_task = 50;
         let models = vec!["deepseek-r1", "qwen3", "kimi", "qwen3-thinking"];
@@ -512,7 +534,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_concurrent_pool_modifications() {
-        let factory = ReasoningParserFactory::new();
+        let factory = ParserFactory::new();
         let mut handles = vec![];
 
         // Task 1: Continuously get parsers
