@@ -415,7 +415,7 @@ mod tests {
 
         assert_eq!(buffer, "");
         assert_eq!(prev_tools.len(), 0);
-        assert_eq!(current_tool_id, 0);
+        assert_eq!(current_tool_id, -1);
         assert!(!current_tool_name_sent);
         assert_eq!(streamed_args.len(), 0);
     }

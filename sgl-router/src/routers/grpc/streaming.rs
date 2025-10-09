@@ -198,7 +198,9 @@ impl StreamingProcessor {
         // Check parser availability once upfront (log warning only once per request)
         let reasoning_parser_available = if separate_reasoning {
             if let Some(parser_name) = self.configured_reasoning_parser.as_ref() {
-                self.reasoning_parser_factory.registry().has_parser(parser_name)
+                self.reasoning_parser_factory
+                    .registry()
+                    .has_parser(parser_name)
             } else {
                 self.reasoning_parser_factory
                     .registry()
@@ -342,7 +344,11 @@ impl StreamingProcessor {
                     let tool_choice_enabled =
                         !matches!(tool_choice, Some(ToolChoice::Value(ToolChoiceValue::None)));
 
-                    if !in_reasoning && tool_choice_enabled && tools.is_some() && tool_parser_available {
+                    if !in_reasoning
+                        && tool_choice_enabled
+                        && tools.is_some()
+                        && tool_parser_available
+                    {
                         let tool_chunks = self
                             .process_tool_calls_stream(
                                 &delta,
