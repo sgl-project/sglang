@@ -1,6 +1,9 @@
 //! DeepSeek V3 Parser Integration Tests
 
-use sglang_router_rs::tool_parser::{DeepSeekParser, ParseState, StreamResult, ToolParser};
+use sglang_router_rs::tool_parser::{DeepSeekParser, ToolParser};
+
+mod common;
+use common::create_test_tools;
 
 #[tokio::test]
 async fn test_deepseek_complete_parsing() {
@@ -13,8 +16,9 @@ async fn test_deepseek_complete_parsing() {
 ```<｜tool▁call▁end｜><｜tool▁calls▁end｜>
 The weather in Tokyo is..."#;
 
-    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
     assert_eq!(tools.len(), 1);
+    assert_eq!(normal_text, "Let me help you with that.\n");
     assert_eq!(tools[0].function.name, "get_weather");
 
     let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
@@ -45,8 +49,9 @@ async fn test_deepseek_multiple_tools() {
 
 #[tokio::test]
 async fn test_deepseek_streaming() {
-    let parser = DeepSeekParser::new();
-    let mut state = ParseState::new();
+    let tools = create_test_tools();
+
+    let mut parser = DeepSeekParser::new();
 
     // Simulate streaming chunks
     let chunks = vec![
@@ -60,25 +65,19 @@ async fn test_deepseek_streaming() {
     ];
 
     let mut found_name = false;
-    let mut found_complete = false;
 
     for chunk in chunks {
-        let result = parser.parse_incremental(chunk, &mut state).await.unwrap();
+        let result = parser.parse_incremental(chunk, &tools).await.unwrap();
 
-        match result {
-            StreamResult::ToolName { name, .. } => {
+        for call in result.calls {
+            if let Some(name) = call.name {
                 assert_eq!(name, "get_weather");
                 found_name = true;
             }
-            StreamResult::ToolComplete(tool) => {
-                assert_eq!(tool.function.name, "get_weather");
-                found_complete = true;
-            }
-            _ => {}
         }
     }
 
-    assert!(found_name || found_complete);
+    assert!(found_name, "Should have found tool name during streaming");
 }
 
 #[tokio::test]
@@ -109,13 +108,13 @@ fn test_deepseek_format_detection() {
     let parser = DeepSeekParser::new();
 
     // Should detect DeepSeek format
-    assert!(parser.detect_format("<｜tool▁calls▁begin｜>"));
-    assert!(parser.detect_format("text with <｜tool▁calls▁begin｜> marker"));
+    assert!(parser.has_tool_markers("<｜tool▁calls▁begin｜>"));
+    assert!(parser.has_tool_markers("text with <｜tool▁calls▁begin｜> marker"));
 
     // Should not detect other formats
-    assert!(!parser.detect_format("[TOOL_CALLS]"));
-    assert!(!parser.detect_format("<tool_call>"));
-    assert!(!parser.detect_format("plain text"));
+    assert!(!parser.has_tool_markers("[TOOL_CALLS]"));
+    assert!(!parser.has_tool_markers("<tool_call>"));
+    assert!(!parser.has_tool_markers("plain text"));
 }
 
 #[tokio::test]
@@ -138,25 +137,6 @@ async fn test_deepseek_malformed_json_handling() {
     // Only the valid tool call should be parsed
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0].function.name, "valid");
-}
-
-#[tokio::test]
-async fn test_normal_text_extraction() {
-    let parser = DeepSeekParser::new();
-
-    // Python extracts text before tool calls as normal_text
-    let input = r#"Let me help you with that.
-<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather
-```json
-{"location": "Tokyo"}
-```<｜tool▁call▁end｜><｜tool▁calls▁end｜>"#;
-
-    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
-    assert_eq!(tools.len(), 1);
-    assert_eq!(tools[0].function.name, "get_weather");
-
-    // TODO: Verify normal text extraction when parser returns it
-    // In Python: normal_text = "Let me help you with that."
 }
 
 #[tokio::test]

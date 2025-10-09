@@ -141,7 +141,17 @@ def create_app(args: argparse.Namespace) -> FastAPI:
     @app.get("/get_load")
     async def get_load(request: Request):
         check_api_key(request)
-        return JSONResponse({"load": _inflight})
+        # Return format matching real workers: array of load info per DP rank
+        return JSONResponse(
+            [
+                {
+                    "dp_rank": 0,
+                    "num_reqs": _inflight,
+                    "num_waiting_reqs": 0,
+                    "num_tokens": _inflight,
+                }
+            ]
+        )
 
     def make_json_response(obj: dict, status_code: int = 200) -> JSONResponse:
         resp = JSONResponse(obj, status_code=status_code)
