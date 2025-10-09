@@ -224,6 +224,7 @@ class SchedulerOutputProcessorMixin:
         # NOTE: the length of reqs and next_token_ids don't match if it is spec decoding.
         # We should ignore using next_token_ids for spec decoding cases.
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
+            req: Req
             if req.is_retracted:
                 continue
 
