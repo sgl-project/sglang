@@ -94,6 +94,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     block_quant_dequant,
     block_quant_to_tensor_quant,
     channel_quant_to_tensor_quant,
+    input_to_float8,
     normalize_e4m3fn_to_e4m3fnuz,
     requant_weight_ue8m0_inplace,
 )
@@ -207,14 +208,6 @@ def add_forward_absorb_core_attention_backend(backend_name):
     if backend_name not in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
         FORWARD_ABSORB_CORE_ATTENTION_BACKENDS.append(backend_name)
         logger.info(f"Added {backend_name} to FORWARD_ABSORB_CORE_ATTENTION_BACKENDS.")
-
-def to_float8(x, dtype=torch.float8_e4m3fn):
-    finfo = torch.finfo(dtype)
-    min_val, max_val = x.aminmax()
-    amax = torch.maximum(min_val.abs(), max_val.abs()).clamp(min=1e-12)
-    scale = finfo.max / amax
-    x_scl_sat = (x * scale).clamp(min=finfo.min, max=finfo.max)
-    return x_scl_sat.to(dtype), scale.float().reciprocal()
 
 
 class AttnForwardMethod(IntEnum):
@@ -1580,8 +1573,8 @@ class DeepseekV2AttentionMLA(nn.Module):
                     self.w_kc.to(torch.bfloat16) * self.w_scale,
                 )
         elif self.w_kc.dtype == torch.float8_e4m3fn:
-            q_nope_val, q_nope_scale = to_float8(
-                q_nope.transpose(0, 1)
+            q_nope_val, q_nope_scale = input_to_float8(
+                q_nope.transpose(0, 1), torch.float8_e4m3fn
             )
             q_nope_val = q_nope_val.contiguous()
             q_nope_out = bmm_fp8(
@@ -1724,8 +1717,8 @@ class DeepseekV2AttentionMLA(nn.Module):
                 attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
 
         elif self.w_vc.dtype == torch.float8_e4m3fn:
-            attn_output_val, attn_output_scale = to_float8(
-                attn_output.transpose(0, 1)
+            attn_output_val, attn_output_scale = input_to_float8(
+                attn_output.transpose(0, 1), torch.float8_e4m3fn
             )
             attn_output_val = attn_output_val.contiguous()
             attn_bmm_output = bmm_fp8(
