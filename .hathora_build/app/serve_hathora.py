@@ -105,7 +105,7 @@ def _load_deployment_config() -> DeploymentConfig:
         quantization=os.environ.get("QUANTIZATION") or None,
         kv_cache_dtype=os.environ.get("KV_CACHE_DTYPE", "auto"),
         tp_size=int(os.environ.get("TP_SIZE", "1")),
-        max_total_tokens=(int(os.environ["MAX_TOTAL_TOKENS"]) if os.environ.get("MAX_TOTAL_TOKENS") else None),
+        max_total_tokens=int(os.environ.get("MAX_TOTAL_TOKENS", "4096")),
         mem_fraction_static=(
             float(os.environ["MEM_FRACTION_STATIC"]) if os.environ.get("MEM_FRACTION_STATIC") else None
         ),
@@ -507,21 +507,9 @@ async def lifespan(app: FastAPI):
 # --- Pydantic Models for OpenAI compatibility ---
 
 
-class ImageUrl(BaseModel):
-    url: str
-    detail: Optional[str] = "auto"
-
-
-class ContentPart(BaseModel):
-    type: str  # "text", "image_url", "video_url"
-    text: Optional[str] = None
-    image_url: Optional[Union[str, ImageUrl]] = None
-    video_url: Optional[Union[str, ImageUrl]] = None
-
-
 class ChatMessage(BaseModel):
     role: str
-    content: Union[str, List[ContentPart]]
+    content: str
 
 
 class ChatCompletionRequest(BaseModel):
@@ -598,83 +586,15 @@ class ChatCompletionStreamResponse(BaseModel):
 # --- Utility Functions ---
 
 
-def _is_multimodal_content(messages: List[ChatMessage]) -> bool:
-    """Check if any message contains multimodal content (images or videos)."""
-    for msg in messages:
-        if isinstance(msg.content, list):
-            return True
-    return False
-
-
-def _convert_openai_to_sglang_content(content: Union[str, List[ContentPart]]) -> Union[str, List[Dict]]:
-    """Convert OpenAI-style content to SGLang format."""
-    if isinstance(content, str):
-        return content
-    
-    # Convert list of ContentParts to SGLang format
-    sglang_content = []
-    for part in content:
-        if part.type == "text":
-            sglang_content.append({
-                "type": "text",
-                "text": part.text
-            })
-        elif part.type == "image_url":
-            # Extract URL from ImageUrl object or string
-            if isinstance(part.image_url, str):
-                url = part.image_url
-            elif part.image_url and hasattr(part.image_url, 'url'):
-                url = part.image_url.url
-            else:
-                url = str(part.image_url)
-            
-            sglang_content.append({
-                "type": "image_url",
-                "image_url": {"url": url}
-            })
-        elif part.type == "video_url":
-            # Extract URL from ImageUrl object or string (reusing ImageUrl for video)
-            if isinstance(part.video_url, str):
-                url = part.video_url
-            elif part.video_url and hasattr(part.video_url, 'url'):
-                url = part.video_url.url
-            else:
-                url = str(part.video_url)
-            
-            sglang_content.append({
-                "type": "video_url",
-                "video_url": {"url": url}
-            })
-    
-    return sglang_content
-
-
-def extract_prompt_from_messages(messages: List[ChatMessage]) -> Union[str, List[Dict]]:
+def extract_prompt_from_messages(messages: List[ChatMessage]) -> str:
     """Extract a formatted prompt from chat messages.
 
     Prefer the HF tokenizer's built-in chat template when available; fall back to a
     simple plain-text template otherwise.
-    
-    For multimodal content, returns the messages in SGLang format.
     """
     logger.debug(f"Extracting prompt from {len(messages)} messages")
 
-    # Check if this is multimodal content
-    is_multimodal = _is_multimodal_content(messages)
-    
-    if is_multimodal:
-        # Convert to SGLang multimodal format
-        sglang_messages = []
-        for msg in messages:
-            sglang_msg = {
-                "role": msg.role,
-                "content": _convert_openai_to_sglang_content(msg.content)
-            }
-            sglang_messages.append(sglang_msg)
-        logger.debug(f"Converted to SGLang multimodal format: {len(sglang_messages)} messages")
-        return sglang_messages
-
-    # For text-only, try to use the model's tokenizer chat template
+    # Try to use the model's tokenizer chat template
     try:
         tok = getattr(getattr(engine, "tokenizer_manager", None), "tokenizer", None)
         if tok is not None and hasattr(tok, "apply_chat_template"):
@@ -692,13 +612,12 @@ def extract_prompt_from_messages(messages: List[ChatMessage]) -> Union[str, List
     # Fallback: minimal plain-text formatting
     formatted_messages = []
     for msg in messages:
-        content_text = msg.content if isinstance(msg.content, str) else str(msg.content)
         if msg.role == "system":
-            formatted_messages.append(f"System: {content_text}")
+            formatted_messages.append(f"System: {msg.content}")
         elif msg.role == "user":
-            formatted_messages.append(f"User: {content_text}")
+            formatted_messages.append(f"User: {msg.content}")
         elif msg.role == "assistant":
-            formatted_messages.append(f"Assistant: {content_text}")
+            formatted_messages.append(f"Assistant: {msg.content}")
 
     formatted_messages.append("Assistant:")
     prompt = "\n".join(formatted_messages)
@@ -713,16 +632,11 @@ def generate_request_id() -> str:
 
 async def generate_response_sglang(
     request: ChatCompletionRequest,
-    prompt: Union[str, List[Dict]]
+    prompt: str
 ) -> tuple[str, float, dict, float]:
     """Generate response using SGLang engine."""
     request_id = generate_request_id()
-    
-    # Log appropriate info based on prompt type
-    if isinstance(prompt, str):
-        logger.info(f"[{request_id}] Starting generation for prompt length: {len(prompt)}")
-    else:
-        logger.info(f"[{request_id}] Starting multimodal generation with {len(prompt)} messages")
+    logger.info(f"[{request_id}] Starting generation for prompt length: {len(prompt)}")
     
     inference_start_ns = time.perf_counter_ns()
     
@@ -803,9 +717,6 @@ async def generate_response_sglang(
 
         if isinstance(result, dict) and isinstance(result.get("meta_info"), dict):
             response_text = generated_text.strip()
-        elif isinstance(prompt, list):
-            # For multimodal (messages), the response is the complete generated text
-            response_text = generated_text.strip()
         else:
             response_text = generated_text[len(prompt):].strip()
         
@@ -826,24 +737,7 @@ async def generate_response_sglang(
             if tokenizer is None:
                 raise HTTPException(status_code=500, detail="Tokenizer not initialized")
             try:
-                # For multimodal, we can't easily count prompt tokens from messages
-                # So we estimate or use a placeholder
-                if isinstance(prompt, list):
-                    # Estimate prompt tokens for multimodal - this is approximate
-                    prompt_tokens = 0
-                    for msg in prompt:
-                        if isinstance(msg.get("content"), str):
-                            prompt_tokens += len(tokenizer.encode(msg["content"]))
-                        elif isinstance(msg.get("content"), list):
-                            for part in msg["content"]:
-                                if part.get("type") == "text":
-                                    prompt_tokens += len(tokenizer.encode(part.get("text", "")))
-                                # Add fixed token count for images/videos (approximate)
-                                elif part.get("type") in ["image_url", "video_url"]:
-                                    prompt_tokens += 100  # Placeholder for vision tokens
-                else:
-                    prompt_tokens = len(tokenizer.encode(prompt))
-                    
+                prompt_tokens = len(tokenizer.encode(prompt))
                 completion_tokens = len(tokenizer.encode(response_text))
                 usage_info = {
                     "prompt_tokens": prompt_tokens,
@@ -885,16 +779,11 @@ def build_non_streaming_response(
 
 async def stream_response_sglang(
     request: ChatCompletionRequest,
-    prompt: Union[str, List[Dict]]
+    prompt: str
 ) -> AsyncGenerator[str, None]:
     """Stream response using SGLang engine."""
     request_id = generate_request_id()
-    
-    # Log appropriate info based on prompt type
-    if isinstance(prompt, str):
-        logger.info(f"[{request_id}] Starting streaming generation for prompt length: {len(prompt)}")
-    else:
-        logger.info(f"[{request_id}] Starting streaming multimodal generation with {len(prompt)} messages")
+    logger.info(f"[{request_id}] Starting streaming generation for prompt length: {len(prompt)}")
     
     try:
         # Validate unsupported params (allow 'seed' and 'top_a' for compatibility; currently ignored)
@@ -1444,7 +1333,6 @@ if __name__ == "__main__":
         f"QUANT={CONFIG.quantization}, KV={CONFIG.kv_cache_dtype}"
     )
     
-    # Keep a single uvicorn worker; concurrency comes from Engine tokenization & scheduler, not multiple processes
     uvicorn.run(
         app,
         host=CONFIG.host,
@@ -1453,5 +1341,5 @@ if __name__ == "__main__":
         access_log=True,
         loop="uvloop",
         timeout_keep_alive=10,
-        workers=1,
+        workers=int(os.environ.get("TOKENIZER_WORKERS", os.cpu_count() or 1)) if os.environ.get("TOKENIZER_WORKERS") else 1,
     )

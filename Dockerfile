@@ -35,6 +35,7 @@ RUN pip install --no-cache-dir -e /opt/sglang-src/python[all]
 # Move app code and build. 
 COPY .hathora_build/app/* /app/
 RUN chmod +x /app/entrypoint.sh
+RUN chmod +x /app/entrypoint_sglang_native.sh
 
 EXPOSE 8000
 
@@ -42,4 +43,4 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 CMD curl -fsS http://127.0.0.1:8000/health || exit 1
 
 # Use entrypoint script
-ENTRYPOINT ["./entrypoint.sh"]
+ENTRYPOINT ["./entrypoint_sglang_native.sh"]
