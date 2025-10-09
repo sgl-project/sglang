@@ -325,6 +325,7 @@ class ServerArgs:
     enable_expert_distribution_metrics: bool = False
     deepep_config: Optional[str] = None
     moe_dense_tp_size: Optional[int] = None
+    fake_node: int = 1
 
     # Mamba cache
     max_mamba_cache_size: Optional[int] = None
@@ -2081,6 +2082,12 @@ class ServerArgs:
             type=str,
             default=ServerArgs.ep_dispatch_algorithm,
             help="The algorithm to choose ranks for redundant experts in expert parallel.",
+        )
+        parser.add_argument(
+            "--fake-node",
+            type=int,
+            default=ServerArgs.fake_node,
+            help="Allocate this number of dispatch nodes in fake mode. Useful when --ep-dispatch-algorithm=fake is set.",
         )
         parser.add_argument(
             "--init-expert-location",
