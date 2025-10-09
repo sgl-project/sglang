@@ -248,6 +248,7 @@ class Engine(EngineBase):
                 while True:
                     try:
                         chunk = loop.run_until_complete(generator.__anext__())
+                        chunk = self._remove_output_ids_prefix_overlap(chunk)
                         yield chunk
                     except StopAsyncIteration:
                         break
@@ -255,6 +256,7 @@ class Engine(EngineBase):
             return generator_wrapper()
         else:
             ret = loop.run_until_complete(generator.__anext__())
+            ret = self._remove_output_ids_prefix_overlap(ret)
             return ret
 
     async def async_generate(
@@ -325,8 +327,13 @@ class Engine(EngineBase):
         generator = self.tokenizer_manager.generate_request(obj, None)
 
         if stream is True:
-            return generator
+            async def _trimmed_stream(agen):
+                async for chunk in agen:
+                    yield self._remove_output_ids_prefix_overlap(chunk)
+            return _trimmed_stream(generator)
         else:
+            ret = await generator.__anext__()
+            ret = self._remove_output_ids_prefix_overlap(ret)
             return await generator.__anext__()
 
     def encode(
