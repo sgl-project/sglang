@@ -33,8 +33,7 @@ use super::mcp::{
     McpLoopConfig, ToolLoopState,
 };
 use super::responses::{
-    mask_tools_as_mcp, patch_streaming_response_json, rewrite_streaming_block,
-    store_response_impl,
+    mask_tools_as_mcp, patch_streaming_response_json, rewrite_streaming_block, store_response_impl,
 };
 use super::utils::{event_types, FunctionCallInProgress, OutputIndexMapper, StreamAction};
 
@@ -105,10 +104,7 @@ impl StreamingResponseAccumulator {
         let mut response = self.initial_response.clone()?;
 
         if let Some(obj) = response.as_object_mut() {
-            obj.insert(
-                "status".to_string(),
-                Value::String("completed".to_string()),
-            );
+            obj.insert("status".to_string(), Value::String("completed".to_string()));
 
             let mut output_items = self.output_items.clone();
             output_items.sort_by_key(|(index, _)| *index);
@@ -198,10 +194,7 @@ impl StreamingResponseAccumulator {
         let mut response = self.initial_response.clone()?;
 
         if let Some(obj) = response.as_object_mut() {
-            obj.insert(
-                "status".to_string(),
-                Value::String("completed".to_string()),
-            );
+            obj.insert("status".to_string(), Value::String("completed".to_string()));
 
             self.output_items.sort_by_key(|(index, _)| *index);
             let outputs: Vec<Value> = self
@@ -300,8 +293,7 @@ impl StreamingToolHandler {
         match event_type.as_str() {
             event_types::RESPONSE_CREATED => {
                 if self.original_response_id.is_none() {
-                    if let Some(response_obj) = parsed.get("response").and_then(|v| v.as_object())
-                    {
+                    if let Some(response_obj) = parsed.get("response").and_then(|v| v.as_object()) {
                         if let Some(id) = response_obj.get("id").and_then(|v| v.as_str()) {
                             self.original_response_id = Some(id.to_string());
                         }
@@ -325,10 +317,8 @@ impl StreamingToolHandler {
                                 Some(idx) => {
                                     let output_index = idx as usize;
                                     let assigned_index = self.ensure_output_index(output_index);
-                                    let call_id = item
-                                        .get("call_id")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("");
+                                    let call_id =
+                                        item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
                                     let name =
                                         item.get("name").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -872,9 +862,7 @@ pub(super) fn forward_streaming_event(
     // After sending output_item.added for mcp_call, inject mcp_call.in_progress event
     if event_name == Some(event_types::OUTPUT_ITEM_ADDED) {
         if let Some(item) = parsed_data.get("item") {
-            if item.get("type").and_then(|v| v.as_str())
-                == Some(event_types::ITEM_TYPE_MCP_CALL)
-            {
+            if item.get("type").and_then(|v| v.as_str()) == Some(event_types::ITEM_TYPE_MCP_CALL) {
                 // Already transformed to mcp_call
                 if let (Some(item_id), Some(output_index)) = (
                     item.get("id").and_then(|v| v.as_str()),
@@ -938,10 +926,7 @@ pub(super) fn send_final_response_event(
     patch_streaming_response_json(&mut final_response, original_request, previous_response_id);
 
     if let Some(obj) = final_response.as_object_mut() {
-        obj.insert(
-            "status".to_string(),
-            Value::String("completed".to_string()),
-        );
+        obj.insert("status".to_string(), Value::String("completed".to_string()));
     }
 
     let completed_payload = json!({
@@ -1305,8 +1290,8 @@ pub(super) async fn handle_streaming_with_tool_interception(
                                             {
                                                 seen_in_progress = true;
                                                 if !mcp_list_tools_sent {
-                                                    let list_tools_index = handler
-                                                        .allocate_synthetic_output_index();
+                                                    let list_tools_index =
+                                                        handler.allocate_synthetic_output_index();
                                                     if !send_mcp_list_tools_events(
                                                         &tx,
                                                         &active_mcp_clone,
