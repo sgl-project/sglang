@@ -414,30 +414,26 @@ class GrpcRequestManager:
         if request_id.startswith("HEALTH_CHECK"):
             return False
 
-        if request_id not in self.rid_to_state:
-            logger.warning(
-                f"Abort request for {request_id} but not found in rid_to_state. "
-                f"Current requests: {list(self.rid_to_state.keys())[:5]}"
-            )
-            return False
-
-        # Send abort to scheduler
         abort_req = AbortReq(rid=request_id)
         try:
             await self._send_to_scheduler(abort_req)
+            logger.info(f"Sent abort to scheduler for request {request_id}")
         except Exception as e:
-            logger.error(f"Failed to send abort request: {e}")
+            logger.error(f"Failed to send abort request to scheduler: {e}")
             return False
 
-        # Mark as finished
-        state = self.rid_to_state.get(request_id)
-        if state:
+        if request_id in self.rid_to_state:
+            state = self.rid_to_state[request_id]
             state.finished = True
             state.stream_finished = True
             state.event.set()
 
             # Send abort notification to output queue
             await state.out_queue.put({"error": "Request aborted", "abort": True})
+        else:
+            logger.debug(
+                f"Abort request for {request_id} not in local state (may have already finished or not started yet)"
+            )
 
         return True
 
