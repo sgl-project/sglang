@@ -136,7 +136,7 @@ class EAGLEWorkerV2(EAGLEWorker):
             retrive_next_token=retrive_next_token,
             retrive_next_sibling=retrive_next_sibling,
             retrive_cum_len=None,
-            num_steps=self.speculative_num_steps,
+            spec_steps=self.speculative_num_steps,
             topk=self.topk,
             num_draft_tokens=self.speculative_num_draft_tokens,
         )
@@ -154,9 +154,11 @@ class EAGLEWorkerV2(EAGLEWorker):
             topk_index = self.hot_token_id[topk_index]
 
         out_cache_loc = out_cache_loc.reshape(
-            forward_batch.batch_size, self.topk, self.num_steps
+            forward_batch.batch_size, self.topk, self.speculative_num_steps
         )
-        out_cache_loc = out_cache_loc.permute((2, 0, 1)).reshape(self.num_steps, -1)
+        out_cache_loc = out_cache_loc.permute((2, 0, 1)).reshape(
+            self.speculative_num_steps, -1
+        )
 
         # Return values
         score_list: List[torch.Tensor] = []
@@ -165,7 +167,7 @@ class EAGLEWorkerV2(EAGLEWorker):
 
         # Forward multiple steps
         scores = None
-        for i in range(self.num_steps):
+        for i in range(self.speculative_num_steps):
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens_tmp(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
             )
