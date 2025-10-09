@@ -31,14 +31,15 @@ use tracing::{info, warn};
 
 // Import from sibling modules
 use super::conversations::{
-    create_conversation, delete_conversation, get_conversation, list_conversation_items,
-    persist_conversation_items, update_conversation,
+    create_conversation, create_conversation_items, delete_conversation, delete_conversation_item,
+    get_conversation, get_conversation_item, list_conversation_items, persist_conversation_items,
+    update_conversation,
 };
 use super::mcp::{
     execute_tool_loop, mcp_manager_from_request_tools, prepare_mcp_payload_for_streaming,
     McpLoopConfig,
 };
-use super::responses::{mask_tools_as_mcp, patch_streaming_response_json, store_response_internal};
+use super::responses::{mask_tools_as_mcp, patch_streaming_response_json};
 use super::streaming::handle_streaming_response;
 
 // ============================================================================
@@ -230,26 +231,17 @@ impl OpenAIRouter {
             original_previous_response_id.as_deref(),
         );
 
-        // Persist conversation items if conversation is provided
-        if original_body.conversation.is_some() {
-            if let Err(err) = persist_conversation_items(
-                self.conversation_storage.clone(),
-                self.conversation_item_storage.clone(),
-                self.response_storage.clone(),
-                &response_json,
-                original_body,
-            )
-            .await
-            {
-                warn!("Failed to persist conversation items: {}", err);
-            }
-        } else {
-            // Store response only if no conversation (persist_conversation_items already stores it)
-            if let Err(err) =
-                store_response_internal(&self.response_storage, &response_json, original_body).await
-            {
-                warn!("Failed to store response: {}", err);
-            }
+        // Always persist conversation items and response (even without conversation)
+        if let Err(err) = persist_conversation_items(
+            self.conversation_storage.clone(),
+            self.conversation_item_storage.clone(),
+            self.response_storage.clone(),
+            &response_json,
+            original_body,
+        )
+        .await
+        {
+            warn!("Failed to persist conversation items: {}", err);
         }
 
         (StatusCode::OK, Json(response_json)).into_response()
@@ -903,6 +895,53 @@ impl crate::routers::RouterTrait for OpenAIRouter {
             &self.conversation_item_storage,
             conversation_id,
             query_params,
+        )
+        .await
+    }
+
+    async fn create_conversation_items(
+        &self,
+        _headers: Option<&HeaderMap>,
+        conversation_id: &str,
+        body: &Value,
+    ) -> Response {
+        create_conversation_items(
+            &self.conversation_storage,
+            &self.conversation_item_storage,
+            conversation_id,
+            body.clone(),
+        )
+        .await
+    }
+
+    async fn get_conversation_item(
+        &self,
+        _headers: Option<&HeaderMap>,
+        conversation_id: &str,
+        item_id: &str,
+        include: Option<Vec<String>>,
+    ) -> Response {
+        get_conversation_item(
+            &self.conversation_storage,
+            &self.conversation_item_storage,
+            conversation_id,
+            item_id,
+            include,
+        )
+        .await
+    }
+
+    async fn delete_conversation_item(
+        &self,
+        _headers: Option<&HeaderMap>,
+        conversation_id: &str,
+        item_id: &str,
+    ) -> Response {
+        delete_conversation_item(
+            &self.conversation_storage,
+            &self.conversation_item_storage,
+            conversation_id,
+            item_id,
         )
         .await
     }

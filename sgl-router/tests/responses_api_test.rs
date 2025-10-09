@@ -1333,3 +1333,519 @@ async fn test_streaming_multi_turn_with_mcp() {
     worker.stop().await;
     mcp.stop().await;
 }
+
+#[tokio::test]
+async fn test_conversation_items_create_and_get() {
+    // Test creating items and getting a specific item
+    let router_cfg = RouterConfig {
+        mode: RoutingMode::OpenAI {
+            worker_urls: vec!["http://localhost".to_string()],
+        },
+        connection_mode: ConnectionMode::Http,
+        policy: PolicyConfig::Random,
+        host: "127.0.0.1".to_string(),
+        port: 0,
+        max_payload_size: 8 * 1024 * 1024,
+        request_timeout_secs: 60,
+        worker_startup_timeout_secs: 1,
+        worker_startup_check_interval_secs: 1,
+        dp_aware: false,
+        api_key: None,
+        discovery: None,
+        metrics: None,
+        log_dir: None,
+        log_level: Some("warn".to_string()),
+        request_id_headers: None,
+        max_concurrent_requests: 8,
+        queue_size: 0,
+        queue_timeout_secs: 5,
+        rate_limit_tokens_per_second: None,
+        cors_allowed_origins: vec![],
+        retry: RetryConfig::default(),
+        circuit_breaker: CircuitBreakerConfig::default(),
+        disable_retries: false,
+        disable_circuit_breaker: false,
+        health_check: HealthCheckConfig::default(),
+        enable_igw: false,
+        model_path: None,
+        tokenizer_path: None,
+        history_backend: sglang_router_rs::config::HistoryBackend::Memory,
+        oracle: None,
+        reasoning_parser: None,
+        tool_call_parser: None,
+    };
+
+    let ctx = AppContext::new(router_cfg, reqwest::Client::new(), 8, None).expect("ctx");
+    let router = RouterFactory::create_router(&Arc::new(ctx))
+        .await
+        .expect("router");
+
+    // Create conversation
+    let create_conv = serde_json::json!({});
+    let conv_resp = router.create_conversation(None, &create_conv).await;
+    assert_eq!(conv_resp.status(), StatusCode::OK);
+    let conv_bytes = axum::body::to_bytes(conv_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let conv_json: serde_json::Value = serde_json::from_slice(&conv_bytes).unwrap();
+    let conv_id = conv_json["id"].as_str().unwrap();
+
+    // Create items
+    let create_items = serde_json::json!({
+        "items": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Hello"}]
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Hi there!"}]
+            }
+        ]
+    });
+
+    let items_resp = router
+        .create_conversation_items(None, conv_id, &create_items)
+        .await;
+    assert_eq!(items_resp.status(), StatusCode::OK);
+    let items_bytes = axum::body::to_bytes(items_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let items_json: serde_json::Value = serde_json::from_slice(&items_bytes).unwrap();
+
+    // Verify response structure
+    assert_eq!(items_json["object"], "list");
+    assert!(items_json["data"].is_array());
+
+    // Get first item
+    let item_id = items_json["data"][0]["id"].as_str().unwrap();
+    let get_resp = router
+        .get_conversation_item(None, conv_id, item_id, None)
+        .await;
+    assert_eq!(get_resp.status(), StatusCode::OK);
+    let get_bytes = axum::body::to_bytes(get_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let get_json: serde_json::Value = serde_json::from_slice(&get_bytes).unwrap();
+
+    // Verify item structure
+    assert_eq!(get_json["id"], item_id);
+    assert_eq!(get_json["type"], "message");
+    assert_eq!(get_json["role"], "user");
+}
+
+#[tokio::test]
+async fn test_conversation_items_delete() {
+    // Test deleting an item from a conversation
+    let router_cfg = RouterConfig {
+        mode: RoutingMode::OpenAI {
+            worker_urls: vec!["http://localhost".to_string()],
+        },
+        connection_mode: ConnectionMode::Http,
+        policy: PolicyConfig::Random,
+        host: "127.0.0.1".to_string(),
+        port: 0,
+        max_payload_size: 8 * 1024 * 1024,
+        request_timeout_secs: 60,
+        worker_startup_timeout_secs: 1,
+        worker_startup_check_interval_secs: 1,
+        dp_aware: false,
+        api_key: None,
+        discovery: None,
+        metrics: None,
+        log_dir: None,
+        log_level: Some("warn".to_string()),
+        request_id_headers: None,
+        max_concurrent_requests: 8,
+        queue_size: 0,
+        queue_timeout_secs: 5,
+        rate_limit_tokens_per_second: None,
+        cors_allowed_origins: vec![],
+        retry: RetryConfig::default(),
+        circuit_breaker: CircuitBreakerConfig::default(),
+        disable_retries: false,
+        disable_circuit_breaker: false,
+        health_check: HealthCheckConfig::default(),
+        enable_igw: false,
+        model_path: None,
+        tokenizer_path: None,
+        history_backend: sglang_router_rs::config::HistoryBackend::Memory,
+        oracle: None,
+        reasoning_parser: None,
+        tool_call_parser: None,
+    };
+
+    let ctx = AppContext::new(router_cfg, reqwest::Client::new(), 8, None).expect("ctx");
+    let router = RouterFactory::create_router(&Arc::new(ctx))
+        .await
+        .expect("router");
+
+    // Create conversation
+    let create_conv = serde_json::json!({});
+    let conv_resp = router.create_conversation(None, &create_conv).await;
+    let conv_bytes = axum::body::to_bytes(conv_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let conv_json: serde_json::Value = serde_json::from_slice(&conv_bytes).unwrap();
+    let conv_id = conv_json["id"].as_str().unwrap();
+
+    // Create item
+    let create_items = serde_json::json!({
+        "items": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Test"}]
+            }
+        ]
+    });
+
+    let items_resp = router
+        .create_conversation_items(None, conv_id, &create_items)
+        .await;
+    let items_bytes = axum::body::to_bytes(items_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let items_json: serde_json::Value = serde_json::from_slice(&items_bytes).unwrap();
+    let item_id = items_json["data"][0]["id"].as_str().unwrap();
+
+    // List items (should have 1)
+    let list_resp = router
+        .list_conversation_items(None, conv_id, None, None, None)
+        .await;
+    let list_bytes = axum::body::to_bytes(list_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let list_json: serde_json::Value = serde_json::from_slice(&list_bytes).unwrap();
+    assert_eq!(list_json["data"].as_array().unwrap().len(), 1);
+
+    // Delete item
+    let del_resp = router
+        .delete_conversation_item(None, conv_id, item_id)
+        .await;
+    assert_eq!(del_resp.status(), StatusCode::OK);
+
+    // List items again (should have 0)
+    let list_resp2 = router
+        .list_conversation_items(None, conv_id, None, None, None)
+        .await;
+    let list_bytes2 = axum::body::to_bytes(list_resp2.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let list_json2: serde_json::Value = serde_json::from_slice(&list_bytes2).unwrap();
+    assert_eq!(list_json2["data"].as_array().unwrap().len(), 0);
+
+    // Item should NOT be gettable from this conversation after deletion (link removed)
+    let get_resp = router
+        .get_conversation_item(None, conv_id, item_id, None)
+        .await;
+    assert_eq!(get_resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_conversation_items_max_limit() {
+    // Test that creating > 20 items returns error
+    let router_cfg = RouterConfig {
+        mode: RoutingMode::OpenAI {
+            worker_urls: vec!["http://localhost".to_string()],
+        },
+        connection_mode: ConnectionMode::Http,
+        policy: PolicyConfig::Random,
+        host: "127.0.0.1".to_string(),
+        port: 0,
+        max_payload_size: 8 * 1024 * 1024,
+        request_timeout_secs: 60,
+        worker_startup_timeout_secs: 1,
+        worker_startup_check_interval_secs: 1,
+        dp_aware: false,
+        api_key: None,
+        discovery: None,
+        metrics: None,
+        log_dir: None,
+        log_level: Some("warn".to_string()),
+        request_id_headers: None,
+        max_concurrent_requests: 8,
+        queue_size: 0,
+        queue_timeout_secs: 5,
+        rate_limit_tokens_per_second: None,
+        cors_allowed_origins: vec![],
+        retry: RetryConfig::default(),
+        circuit_breaker: CircuitBreakerConfig::default(),
+        disable_retries: false,
+        disable_circuit_breaker: false,
+        health_check: HealthCheckConfig::default(),
+        enable_igw: false,
+        model_path: None,
+        tokenizer_path: None,
+        history_backend: sglang_router_rs::config::HistoryBackend::Memory,
+        oracle: None,
+        reasoning_parser: None,
+        tool_call_parser: None,
+    };
+
+    let ctx = AppContext::new(router_cfg, reqwest::Client::new(), 8, None).expect("ctx");
+    let router = RouterFactory::create_router(&Arc::new(ctx))
+        .await
+        .expect("router");
+
+    // Create conversation
+    let create_conv = serde_json::json!({});
+    let conv_resp = router.create_conversation(None, &create_conv).await;
+    let conv_bytes = axum::body::to_bytes(conv_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let conv_json: serde_json::Value = serde_json::from_slice(&conv_bytes).unwrap();
+    let conv_id = conv_json["id"].as_str().unwrap();
+
+    // Try to create 21 items (over limit)
+    let mut items = Vec::new();
+    for i in 0..21 {
+        items.push(serde_json::json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": format!("Message {}", i)}]
+        }));
+    }
+    let create_items = serde_json::json!({"items": items});
+
+    let items_resp = router
+        .create_conversation_items(None, conv_id, &create_items)
+        .await;
+    assert_eq!(items_resp.status(), StatusCode::BAD_REQUEST);
+
+    let items_bytes = axum::body::to_bytes(items_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let items_text = String::from_utf8_lossy(&items_bytes);
+    assert!(items_text.contains("Cannot add more than 20 items"));
+}
+
+#[tokio::test]
+async fn test_conversation_items_unsupported_type() {
+    // Test that unsupported item types return error
+    let router_cfg = RouterConfig {
+        mode: RoutingMode::OpenAI {
+            worker_urls: vec!["http://localhost".to_string()],
+        },
+        connection_mode: ConnectionMode::Http,
+        policy: PolicyConfig::Random,
+        host: "127.0.0.1".to_string(),
+        port: 0,
+        max_payload_size: 8 * 1024 * 1024,
+        request_timeout_secs: 60,
+        worker_startup_timeout_secs: 1,
+        worker_startup_check_interval_secs: 1,
+        dp_aware: false,
+        api_key: None,
+        discovery: None,
+        metrics: None,
+        log_dir: None,
+        log_level: Some("warn".to_string()),
+        request_id_headers: None,
+        max_concurrent_requests: 8,
+        queue_size: 0,
+        queue_timeout_secs: 5,
+        rate_limit_tokens_per_second: None,
+        cors_allowed_origins: vec![],
+        retry: RetryConfig::default(),
+        circuit_breaker: CircuitBreakerConfig::default(),
+        disable_retries: false,
+        disable_circuit_breaker: false,
+        health_check: HealthCheckConfig::default(),
+        enable_igw: false,
+        model_path: None,
+        tokenizer_path: None,
+        history_backend: sglang_router_rs::config::HistoryBackend::Memory,
+        oracle: None,
+        reasoning_parser: None,
+        tool_call_parser: None,
+    };
+
+    let ctx = AppContext::new(router_cfg, reqwest::Client::new(), 8, None).expect("ctx");
+    let router = RouterFactory::create_router(&Arc::new(ctx))
+        .await
+        .expect("router");
+
+    // Create conversation
+    let create_conv = serde_json::json!({});
+    let conv_resp = router.create_conversation(None, &create_conv).await;
+    let conv_bytes = axum::body::to_bytes(conv_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let conv_json: serde_json::Value = serde_json::from_slice(&conv_bytes).unwrap();
+    let conv_id = conv_json["id"].as_str().unwrap();
+
+    // Try to create item with completely unsupported type
+    let create_items = serde_json::json!({
+        "items": [
+            {
+                "type": "totally_invalid_type",
+                "content": []
+            }
+        ]
+    });
+
+    let items_resp = router
+        .create_conversation_items(None, conv_id, &create_items)
+        .await;
+    assert_eq!(items_resp.status(), StatusCode::BAD_REQUEST);
+
+    let items_bytes = axum::body::to_bytes(items_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let items_text = String::from_utf8_lossy(&items_bytes);
+    assert!(items_text.contains("Unsupported item type"));
+}
+
+#[tokio::test]
+async fn test_conversation_items_multi_conversation_sharing() {
+    // Test that items can be shared across conversations via soft delete
+    let router_cfg = RouterConfig {
+        mode: RoutingMode::OpenAI {
+            worker_urls: vec!["http://localhost".to_string()],
+        },
+        connection_mode: ConnectionMode::Http,
+        policy: PolicyConfig::Random,
+        host: "127.0.0.1".to_string(),
+        port: 0,
+        max_payload_size: 8 * 1024 * 1024,
+        request_timeout_secs: 60,
+        worker_startup_timeout_secs: 1,
+        worker_startup_check_interval_secs: 1,
+        dp_aware: false,
+        api_key: None,
+        discovery: None,
+        metrics: None,
+        log_dir: None,
+        log_level: Some("warn".to_string()),
+        request_id_headers: None,
+        max_concurrent_requests: 8,
+        queue_size: 0,
+        queue_timeout_secs: 5,
+        rate_limit_tokens_per_second: None,
+        cors_allowed_origins: vec![],
+        retry: RetryConfig::default(),
+        circuit_breaker: CircuitBreakerConfig::default(),
+        disable_retries: false,
+        disable_circuit_breaker: false,
+        health_check: HealthCheckConfig::default(),
+        enable_igw: false,
+        model_path: None,
+        tokenizer_path: None,
+        history_backend: sglang_router_rs::config::HistoryBackend::Memory,
+        oracle: None,
+        reasoning_parser: None,
+        tool_call_parser: None,
+    };
+
+    let ctx = AppContext::new(router_cfg, reqwest::Client::new(), 8, None).expect("ctx");
+    let router = RouterFactory::create_router(&Arc::new(ctx))
+        .await
+        .expect("router");
+
+    // Create two conversations
+    let conv_a_resp = router
+        .create_conversation(None, &serde_json::json!({}))
+        .await;
+    let conv_a_bytes = axum::body::to_bytes(conv_a_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let conv_a_json: serde_json::Value = serde_json::from_slice(&conv_a_bytes).unwrap();
+    let conv_a_id = conv_a_json["id"].as_str().unwrap();
+
+    let conv_b_resp = router
+        .create_conversation(None, &serde_json::json!({}))
+        .await;
+    let conv_b_bytes = axum::body::to_bytes(conv_b_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let conv_b_json: serde_json::Value = serde_json::from_slice(&conv_b_bytes).unwrap();
+    let conv_b_id = conv_b_json["id"].as_str().unwrap();
+
+    // Create item in conversation A
+    let create_items = serde_json::json!({
+        "items": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Shared message"}]
+            }
+        ]
+    });
+
+    let items_a_resp = router
+        .create_conversation_items(None, conv_a_id, &create_items)
+        .await;
+    let items_a_bytes = axum::body::to_bytes(items_a_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let items_a_json: serde_json::Value = serde_json::from_slice(&items_a_bytes).unwrap();
+    let item_id = items_a_json["data"][0]["id"].as_str().unwrap();
+
+    // Reference the same item in conversation B
+    let reference_items = serde_json::json!({
+        "items": [
+            {
+                "type": "item_reference",
+                "id": item_id
+            }
+        ]
+    });
+
+    let items_b_resp = router
+        .create_conversation_items(None, conv_b_id, &reference_items)
+        .await;
+    assert_eq!(items_b_resp.status(), StatusCode::OK);
+
+    // Verify item appears in both conversations
+    let list_a = router
+        .list_conversation_items(None, conv_a_id, None, None, None)
+        .await;
+    let list_a_bytes = axum::body::to_bytes(list_a.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let list_a_json: serde_json::Value = serde_json::from_slice(&list_a_bytes).unwrap();
+    assert_eq!(list_a_json["data"].as_array().unwrap().len(), 1);
+
+    let list_b = router
+        .list_conversation_items(None, conv_b_id, None, None, None)
+        .await;
+    let list_b_bytes = axum::body::to_bytes(list_b.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let list_b_json: serde_json::Value = serde_json::from_slice(&list_b_bytes).unwrap();
+    assert_eq!(list_b_json["data"].as_array().unwrap().len(), 1);
+
+    // Delete from conversation A
+    router
+        .delete_conversation_item(None, conv_a_id, item_id)
+        .await;
+
+    // Should be removed from A
+    let list_a2 = router
+        .list_conversation_items(None, conv_a_id, None, None, None)
+        .await;
+    let list_a2_bytes = axum::body::to_bytes(list_a2.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let list_a2_json: serde_json::Value = serde_json::from_slice(&list_a2_bytes).unwrap();
+    assert_eq!(list_a2_json["data"].as_array().unwrap().len(), 0);
+
+    // Should still exist in B (soft delete)
+    let list_b2 = router
+        .list_conversation_items(None, conv_b_id, None, None, None)
+        .await;
+    let list_b2_bytes = axum::body::to_bytes(list_b2.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let list_b2_json: serde_json::Value = serde_json::from_slice(&list_b2_bytes).unwrap();
+    assert_eq!(list_b2_json["data"].as_array().unwrap().len(), 1);
+
+    // Item should still be directly gettable
+    let get_resp = router
+        .get_conversation_item(None, conv_b_id, item_id, None)
+        .await;
+    assert_eq!(get_resp.status(), StatusCode::OK);
+}

@@ -190,6 +190,50 @@ pub trait RouterTrait: Send + Sync + Debug {
             .into_response()
     }
 
+    /// Create items in a conversation
+    async fn create_conversation_items(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _conversation_id: &str,
+        _body: &Value,
+    ) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Conversation items create endpoint not implemented",
+        )
+            .into_response()
+    }
+
+    /// Get a single conversation item
+    /// The `include` parameter is accepted but not yet implemented
+    async fn get_conversation_item(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _conversation_id: &str,
+        _item_id: &str,
+        _include: Option<Vec<String>>,
+    ) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Conversation item get endpoint not implemented",
+        )
+            .into_response()
+    }
+
+    /// Delete a conversation item
+    async fn delete_conversation_item(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _conversation_id: &str,
+        _item_id: &str,
+    ) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Conversation item delete endpoint not implemented",
+        )
+            .into_response()
+    }
+
     /// Get router type name
     fn router_type(&self) -> &'static str;
 
