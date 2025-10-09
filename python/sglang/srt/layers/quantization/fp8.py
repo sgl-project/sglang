@@ -551,8 +551,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 self.quant_config.weight_block_size[0],
                 self.quant_config.weight_block_size[1],
             )
-            # print(f"{intermediate_size_per_partition=}")
-            # print(f"{block_n=}")
             # NOTE(HandH1998): To ensure proper alignment of the block-wise quantization scales, the output_size of the weights for both the gate and up layers must be divisible by block_n.
             # Required by column parallel or enabling merged weights
             if intermediate_size_per_partition % block_n != 0:

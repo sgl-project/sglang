@@ -628,7 +628,6 @@ class ModelRunner:
             self.model_config.hf_config, "quantization_config"
         ):
             text_config = self.model_config.hf_text_config
-
             if (
                 text_config.moe_intermediate_size // (self.tp_size // self.moe_ep_size)
             ) % 128 != 0:
