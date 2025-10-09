@@ -653,6 +653,10 @@ class MooncakeKVManager(CommonKVManager):
             return self._send_extra_swa(
                 req, prefill_extra_pool_indices, dst_extra_pool_data_ptrs
             )
+        elif extra_pool_type == "nsa":
+            return self._send_extra_nsa(
+                req, prefill_extra_pool_indices, dst_extra_pool_data_ptrs
+            )
 
     def _send_extra_mamba(
         self,
@@ -686,6 +690,25 @@ class MooncakeKVManager(CommonKVManager):
         """Transfer SWA window KV cache (reuses optimized generic KV transfer logic)."""
         prefill_kv_indices = np.array(prefill_swa_kv_indices, dtype=np.int32)
         dst_kv_indices = np.array(req.dst_extra_pool_indices, dtype=np.int32)
+
+        return self._send_kvcache_generic(
+            mooncake_session_id=req.mooncake_session_id,
+            src_data_ptrs=self.kv_args.extra_pool_data_ptrs,
+            dst_data_ptrs=dst_extra_pool_data_ptrs,
+            item_lens=self.kv_args.extra_pool_item_lens,
+            prefill_kv_indices=prefill_kv_indices,
+            dst_kv_indices=dst_kv_indices,
+            executor=self.extra_pool_executors,
+        )
+
+    def _send_extra_nsa(
+        self,
+        req: TransferInfo,
+        prefill_nsa_indices: list[int],
+        dst_extra_pool_data_ptrs: list[int],
+    ):
+        prefill_kv_indices = np.array(prefill_nsa_indices, dtype=np.int32)
+        dst_kv_indices = np.array(req.kv_indices, dtype=np.int32)
 
         return self._send_kvcache_generic(
             mooncake_session_id=req.mooncake_session_id,
