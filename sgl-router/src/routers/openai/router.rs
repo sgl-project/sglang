@@ -39,7 +39,7 @@ use super::mcp::{
     execute_tool_loop, mcp_manager_from_request_tools, prepare_mcp_payload_for_streaming,
     McpLoopConfig,
 };
-use super::responses::{mask_tools_as_mcp, patch_streaming_response_json, store_response_internal};
+use super::responses::{mask_tools_as_mcp, patch_streaming_response_json};
 use super::streaming::handle_streaming_response;
 
 // ============================================================================
@@ -231,26 +231,17 @@ impl OpenAIRouter {
             original_previous_response_id.as_deref(),
         );
 
-        // Persist conversation items if conversation is provided
-        if original_body.conversation.is_some() {
-            if let Err(err) = persist_conversation_items(
-                self.conversation_storage.clone(),
-                self.conversation_item_storage.clone(),
-                self.response_storage.clone(),
-                &response_json,
-                original_body,
-            )
-            .await
-            {
-                warn!("Failed to persist conversation items: {}", err);
-            }
-        } else {
-            // Store response only if no conversation (persist_conversation_items already stores it)
-            if let Err(err) =
-                store_response_internal(&self.response_storage, &response_json, original_body).await
-            {
-                warn!("Failed to store response: {}", err);
-            }
+        // Always persist conversation items and response (even without conversation)
+        if let Err(err) = persist_conversation_items(
+            self.conversation_storage.clone(),
+            self.conversation_item_storage.clone(),
+            self.response_storage.clone(),
+            &response_json,
+            original_body,
+        )
+        .await
+        {
+            warn!("Failed to persist conversation items: {}", err);
         }
 
         (StatusCode::OK, Json(response_json)).into_response()
