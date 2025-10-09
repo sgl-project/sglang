@@ -73,17 +73,18 @@ def process_hidden_states_from_ret(
     return hidden_states
 
 
-def build_metric_labels(server_args: ServerArgs, endpoint_path: str) -> Dict[str, str]:
+def build_metric_labels(
+    server_args: ServerArgs,
+    endpoint_path: Optional[str] = None,
+    http_status: Optional[str] = None,
+) -> Dict[str, str]:
     """Build metric labels based on server configuration flags."""
     labels = {}
 
-    if server_args.metrics_label_request_type:
+    if server_args.metrics_label_request_type and endpoint_path is not None:
         labels["request_type"] = endpoint_path
 
-    # Future: Add more flags here
-    # if server_args.metrics_label_user_id:
-    #     labels["user_id"] = extract_user_id(request)
-    # if server_args.metrics_label_model_version:
-    #     labels["model_version"] = server_args.weight_version
+    if server_args.metrics_label_http_status and http_status is not None:
+        labels["http_status"] = http_status
 
     return labels

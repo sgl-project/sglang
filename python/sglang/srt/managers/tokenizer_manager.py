@@ -322,6 +322,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             # Add request_type label if enabled
             if server_args.metrics_label_request_type:
                 labels["request_type"] = ""
+            # Add http_status label if enabled
+            if server_args.metrics_label_http_status:
+                labels["http_status"] = ""
             if server_args.tokenizer_metrics_allowed_custom_labels:
                 for label in server_args.tokenizer_metrics_allowed_custom_labels:
                     labels[label] = ""

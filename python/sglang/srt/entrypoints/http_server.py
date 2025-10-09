@@ -305,6 +305,21 @@ async def validation_exception_handler(request: Request, exc: HTTPException):
     For /v1/responses, emit OpenAI-style nested error envelope:
     {"error": {"message": "...", "type": "...", "param": null, "code": <status>}}
     """
+    # Increment received requests metric for HTTP exceptions
+    if _global_state.tokenizer_manager.enable_metrics:
+        metric_labels = build_metric_labels(
+            _global_state.tokenizer_manager.server_args,
+            request.url.path,
+            str(exc.status_code),
+        )
+        labels = {
+            **_global_state.tokenizer_manager.metrics_collector.labels,
+            **metric_labels,
+        }
+        _global_state.tokenizer_manager.metrics_collector.observe_one_received_request(
+            labels
+        )
+
     # adjust fmt for responses api
     if request.url.path.startswith("/v1/responses"):
         nested_error = {
@@ -333,6 +348,19 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
     For /v1/responses, emit OpenAI-style nested error envelope; for other endpoints keep legacy format.
     """
+    # Increment received requests metric for validation failures
+    if _global_state.tokenizer_manager.enable_metrics:
+        metric_labels = build_metric_labels(
+            _global_state.tokenizer_manager.server_args, request.url.path, "400"
+        )
+        labels = {
+            **_global_state.tokenizer_manager.metrics_collector.labels,
+            **metric_labels,
+        }
+        _global_state.tokenizer_manager.metrics_collector.observe_one_received_request(
+            labels
+        )
+
     exc_str = str(exc)
     errors_str = str(exc.errors())
 
@@ -411,10 +439,6 @@ async def health_generate(request: Request) -> Response:
             input_ids=[0],
             sampling_params=sampling_params,
             log_metrics=False,
-            custom_labels=build_metric_labels(
-                _global_state.tokenizer_manager.server_args, "/health_generate"
-            )
-            or None,
         )
         if (
             _global_state.tokenizer_manager.server_args.disaggregation_mode
@@ -509,15 +533,6 @@ async def set_internal_state(obj: SetInternalStateReq, request: Request):
 # fastapi implicitly converts json in the request to obj (dataclass)
 @app.api_route("/generate", methods=["POST", "PUT"])
 async def generate_request(obj: GenerateReqInput, request: Request):
-    # If there are no custom metric labels already set (e.g. from the method which constructed
-    # the GenerateReqInput object), set metric labels for the input request based on server configuration.
-    if not obj.custom_labels:
-        metric_labels = build_metric_labels(
-            _global_state.tokenizer_manager.server_args, "/generate"
-        )
-        if metric_labels:
-            obj.custom_labels = metric_labels
-
     if obj.stream:
 
         async def stream_results() -> AsyncIterator[bytes]:
@@ -536,6 +551,19 @@ async def generate_request(obj: GenerateReqInput, request: Request):
                 ) + b"\n\n"
             yield b"data: [DONE]\n\n"
 
+        if _global_state.tokenizer_manager.enable_metrics:
+            metric_labels = build_metric_labels(
+                _global_state.tokenizer_manager.server_args, "/generate", "200"
+            )
+            labels = {
+                **_global_state.tokenizer_manager.metrics_collector.labels,
+                **metric_labels,
+                **obj.custom_labels,
+            }
+            _global_state.tokenizer_manager.metrics_collector.observe_one_received_request(
+                labels
+            )
+
         return StreamingResponse(
             stream_results(),
             media_type="text/event-stream",
@@ -546,9 +574,37 @@ async def generate_request(obj: GenerateReqInput, request: Request):
             ret = await _global_state.tokenizer_manager.generate_request(
                 obj, request
             ).__anext__()
+
+            if _global_state.tokenizer_manager.enable_metrics:
+                metric_labels = build_metric_labels(
+                    _global_state.tokenizer_manager.server_args, "/generate", "200"
+                )
+                labels = {
+                    **_global_state.tokenizer_manager.metrics_collector.labels,
+                    **metric_labels,
+                    **(obj.custom_labels or {}),
+                }
+                _global_state.tokenizer_manager.metrics_collector.observe_one_received_request(
+                    labels
+                )
+
             return ret
         except ValueError as e:
             logger.error(f"[http_server] Error: {e}")
+
+            if _global_state.tokenizer_manager.enable_metrics:
+                metric_labels = build_metric_labels(
+                    _global_state.tokenizer_manager.server_args, "/generate", "400"
+                )
+                labels = {
+                    **_global_state.tokenizer_manager.metrics_collector.labels,
+                    **metric_labels,
+                    **obj.custom_labels,
+                }
+                _global_state.tokenizer_manager.metrics_collector.observe_one_received_request(
+                    labels
+                )
+
             return _create_error_response(e)
 
 
@@ -564,19 +620,47 @@ async def generate_from_file_request(file: UploadFile, request: Request):
             "temperature": 0.0,
             "max_new_tokens": 512,
         },
-        custom_labels=build_metric_labels(
-            _global_state.tokenizer_manager.server_args, "/generate_from_file"
-        )
-        or None,
     )
 
     try:
         ret = await _global_state.tokenizer_manager.generate_request(
             obj, request
         ).__anext__()
+
+        if _global_state.tokenizer_manager.enable_metrics:
+            metric_labels = build_metric_labels(
+                _global_state.tokenizer_manager.server_args,
+                "/generate_from_file",
+                "200",
+            )
+            labels = {
+                **_global_state.tokenizer_manager.metrics_collector.labels,
+                **metric_labels,
+                **obj.custom_labels,
+            }
+            _global_state.tokenizer_manager.metrics_collector.observe_one_received_request(
+                labels
+            )
+
         return ret
     except ValueError as e:
         logger.error(f"Error: {e}")
+
+        if _global_state.tokenizer_manager.enable_metrics:
+            metric_labels = build_metric_labels(
+                _global_state.tokenizer_manager.server_args,
+                "/generate_from_file",
+                "400",
+            )
+            labels = {
+                **_global_state.tokenizer_manager.metrics_collector.labels,
+                **metric_labels,
+                **obj.custom_labels,
+            }
+            _global_state.tokenizer_manager.metrics_collector.observe_one_received_request(
+                labels
+            )
+
         return _create_error_response(e)
 
 
@@ -587,8 +671,35 @@ async def encode_request(obj: EmbeddingReqInput, request: Request):
         ret = await _global_state.tokenizer_manager.generate_request(
             obj, request
         ).__anext__()
+
+        if _global_state.tokenizer_manager.enable_metrics:
+            metric_labels = build_metric_labels(
+                _global_state.tokenizer_manager.server_args, "/encode", "200"
+            )
+            labels = {
+                **_global_state.tokenizer_manager.metrics_collector.labels,
+                **metric_labels,
+                **obj.custom_labels,
+            }
+            _global_state.tokenizer_manager.metrics_collector.observe_one_received_request(
+                labels
+            )
+
         return ret
     except ValueError as e:
+        if _global_state.tokenizer_manager.enable_metrics:
+            metric_labels = build_metric_labels(
+                _global_state.tokenizer_manager.server_args, "/encode", "400"
+            )
+            labels = {
+                **_global_state.tokenizer_manager.metrics_collector.labels,
+                **metric_labels,
+                **obj.custom_labels,
+            }
+            _global_state.tokenizer_manager.metrics_collector.observe_one_received_request(
+                labels
+            )
+
         return _create_error_response(e)
 
 
@@ -599,8 +710,35 @@ async def classify_request(obj: EmbeddingReqInput, request: Request):
         ret = await _global_state.tokenizer_manager.generate_request(
             obj, request
         ).__anext__()
+
+        if _global_state.tokenizer_manager.enable_metrics:
+            metric_labels = build_metric_labels(
+                _global_state.tokenizer_manager.server_args, "/classify", "200"
+            )
+            labels = {
+                **_global_state.tokenizer_manager.metrics_collector.labels,
+                **metric_labels,
+                **obj.custom_labels,
+            }
+            _global_state.tokenizer_manager.metrics_collector.observe_one_received_request(
+                labels
+            )
+
         return ret
     except ValueError as e:
+        if _global_state.tokenizer_manager.enable_metrics:
+            metric_labels = build_metric_labels(
+                _global_state.tokenizer_manager.server_args, "/classify", "400"
+            )
+            labels = {
+                **_global_state.tokenizer_manager.metrics_collector.labels,
+                **metric_labels,
+                **obj.custom_labels,
+            }
+            _global_state.tokenizer_manager.metrics_collector.observe_one_received_request(
+                labels
+            )
+
         return _create_error_response(e)
 
 
@@ -1218,10 +1356,6 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput, raw_request: Reque
     ] or None
     req = GenerateReqInput(
         **inputs,
-        custom_labels=build_metric_labels(
-            _global_state.tokenizer_manager.server_args, "/vertex_generate"
-        )
-        or None,
         image_data=image_data,
         **(vertex_req.parameters or {}),
     )

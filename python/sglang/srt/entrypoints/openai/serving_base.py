@@ -43,6 +43,19 @@ class OpenAIServingBase(ABC):
             # Validate request
             error_msg = self._validate_request(request)
             if error_msg:
+                # Increment received requests metric for validation failures
+                if self.tokenizer_manager.enable_metrics:
+                    metric_labels = self.build_metric_labels(
+                        raw_request.url.path, "400"
+                    )
+                    labels = {
+                        **self.tokenizer_manager.metrics_collector.labels,
+                        **metric_labels,
+                        **request.custom_labels,
+                    }
+                    self.tokenizer_manager.metrics_collector.observe_one_received_request(
+                        labels
+                    )
                 return self.create_error_response(error_msg)
 
             # Convert to internal format
@@ -52,30 +65,81 @@ class OpenAIServingBase(ABC):
 
             # Note(Xinyuan): raw_request below is only used for detecting the connection of the client
             if hasattr(request, "stream") and request.stream:
-                return await self._handle_streaming_request(
+                response = await self._handle_streaming_request(
                     adapted_request, processed_request, raw_request
                 )
             else:
-                return await self._handle_non_streaming_request(
+                response = await self._handle_non_streaming_request(
                     adapted_request, processed_request, raw_request
                 )
+
+            if self.tokenizer_manager.enable_metrics:
+                metric_labels = self.build_metric_labels(raw_request.url.path, "200")
+                labels = {
+                    **self.tokenizer_manager.metrics_collector.labels,
+                    **metric_labels,
+                    **adapted_request.custom_labels,
+                }
+                self.tokenizer_manager.metrics_collector.observe_one_received_request(
+                    labels
+                )
+
+            return response
         except HTTPException as e:
-            return self.create_error_response(
+            error_response = self.create_error_response(
                 message=e.detail, err_type=str(e.status_code), status_code=e.status_code
             )
+            # Increment received requests metric with proper labels
+            if self.tokenizer_manager.enable_metrics:
+                metric_labels = self.build_metric_labels(
+                    raw_request.url.path, e.status_code
+                )
+                labels = {
+                    **self.tokenizer_manager.metrics_collector.labels,
+                    **metric_labels,
+                    **request.custom_labels,
+                }
+                self.tokenizer_manager.metrics_collector.observe_one_received_request(
+                    labels
+                )
+            return error_response
         except ValueError as e:
-            return self.create_error_response(
+            error_response = self.create_error_response(
                 message=str(e),
                 err_type="BadRequest",
                 status_code=400,
             )
+            # Increment received requests metric with proper labels
+            if self.tokenizer_manager.enable_metrics:
+                metric_labels = self.build_metric_labels(raw_request.url.path, "400")
+                labels = {
+                    **self.tokenizer_manager.metrics_collector.labels,
+                    **metric_labels,
+                    **request.custom_labels,
+                }
+                self.tokenizer_manager.metrics_collector.observe_one_received_request(
+                    labels
+                )
+            return error_response
         except Exception as e:
             logger.exception(f"Error in request: {e}")
-            return self.create_error_response(
+            error_response = self.create_error_response(
                 message=f"Internal server error: {str(e)}",
                 err_type="InternalServerError",
                 status_code=500,
             )
+            # Increment received requests metric with proper labels
+            if self.tokenizer_manager.enable_metrics:
+                metric_labels = self.build_metric_labels(raw_request.url.path, "500")
+                labels = {
+                    **self.tokenizer_manager.metrics_collector.labels,
+                    **metric_labels,
+                    **request.custom_labels,
+                }
+                self.tokenizer_manager.metrics_collector.observe_one_received_request(
+                    labels
+                )
+            return error_response
 
     @abstractmethod
     def _request_id_prefix(self) -> str:
@@ -214,6 +278,10 @@ class OpenAIServingBase(ABC):
             }
         return custom_labels
 
-    def build_metric_labels(self, endpoint_path: str) -> Dict[str, str]:
+    def build_metric_labels(
+        self, endpoint_path: Optional[str] = None, http_status: Optional[str] = None
+    ) -> Dict[str, str]:
         """Build metric labels based on server configuration flags."""
-        return build_metric_labels(self.tokenizer_manager.server_args, endpoint_path)
+        return build_metric_labels(
+            self.tokenizer_manager.server_args, endpoint_path, http_status
+        )
