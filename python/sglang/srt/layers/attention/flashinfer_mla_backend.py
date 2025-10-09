@@ -1060,7 +1060,7 @@ def fast_mla_decode_plan(
 
     try:
         # Standard version with just the required arguments (no use_profiler)
-        self._cached_module.plan.default(
+        self._cached_module.plan(
             self._float_workspace_buffer,
             self._int_workspace_buffer,
             self._pin_memory_int_workspace_buffer,
