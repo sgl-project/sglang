@@ -43,7 +43,7 @@ apt-get update && apt-get install -y libfabric-dev
 # Install NVSHMEM
 cd /opt/nvshmem
 wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.4.5/source/nvshmem_src_cuda13-all-all-3.4.5.tar.gz
-tar -xf nvshmem_src_cuda12-all-all-3.4.5.tar.gz
+tar -xf nvshmem_src_cuda13-all-all-3.4.5.tar.gz
 mv nvshmem_src nvshmem && cd nvshmem
 NVSHMEM_SHMEM_SUPPORT=0 \
 NVSHMEM_UCX_SUPPORT=0 \
