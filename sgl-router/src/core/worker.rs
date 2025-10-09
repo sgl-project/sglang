@@ -554,7 +554,7 @@ impl Worker for BasicWorker {
             return Ok(false);
         };
 
-        let mut client = grpc_client.lock().await;
+        let client = grpc_client.lock().await;
         match time::timeout(timeout, client.health_check()).await {
             Ok(Ok(resp)) => {
                 tracing::debug!(
