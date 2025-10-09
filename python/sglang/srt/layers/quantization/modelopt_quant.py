@@ -47,6 +47,7 @@ if TYPE_CHECKING:
         CombineInput,
         StandardDispatchOutput,
     )
+    from sglang.srt.single_batch_overlap import DownGemmOverlapArgs
 
 if is_cuda():
     from sgl_kernel import scaled_fp4_quant
@@ -77,6 +78,13 @@ logger = logging.getLogger(__name__)
 CUTEDSL_MOE_SCALAR_INPUT_SCALE = get_bool_env_var(
     "SGLANG_CUTEDSL_MOE_SCALAR_INPUT_SCALE", "true"
 )
+USE_CUTLASS_BACKEND_FOR_FP4_GEMM = get_bool_env_var(
+    "SGLANG_USE_CUTLASS_BACKEND_FOR_FP4_GEMM"
+)
+# TODO make it true by default when the DeepEP PR is merged
+CUTEDSL_MOE_NVFP4_DISPATCH = get_bool_env_var(
+    "SGLANG_CUTEDSL_MOE_NVFP4_DISPATCH", "false"
+)
 
 # Supported activation schemes for the current configuration
 ACTIVATION_SCHEMES = ["static"]
@@ -105,7 +113,7 @@ class ModelOptFp8Config(QuantizationConfig):
 
     @classmethod
     def get_name(cls) -> str:
-        return "modelopt"
+        return "modelopt_fp8"
 
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
@@ -844,14 +852,25 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         if enable_flashinfer_fp4_gemm:
             w = layer.weight.T
             w_scale_interleaved = layer.weight_scale_interleaved.T
-        out = fp4_gemm(
-            x_fp4,
-            w,
-            x_scale_interleaved,
-            w_scale_interleaved,
-            layer.alpha,
-            output_dtype,
-        )
+        if USE_CUTLASS_BACKEND_FOR_FP4_GEMM:
+            out = fp4_gemm(
+                x_fp4,
+                w,
+                x_scale_interleaved,
+                w_scale_interleaved,
+                layer.alpha,
+                output_dtype,
+                backend="cutlass",
+            )
+        else:
+            out = fp4_gemm(
+                x_fp4,
+                w,
+                x_scale_interleaved,
+                w_scale_interleaved,
+                layer.alpha,
+                output_dtype,
+            )
         if bias is not None:
             out = out + bias
         return out.view(*output_shape)
@@ -1220,6 +1239,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
             w13_input_scale = _slice_scale(w13_input_scale)
             w2_input_scale = _slice_scale(w2_input_scale)
+
+            if CUTEDSL_MOE_NVFP4_DISPATCH:
+                assert torch.all(w13_input_scale == w13_input_scale[0])
+                w13_input_scale = w13_input_scale[0]
         else:
             w13_input_scale = layer.w13_input_scale.max(dim=1).values.to(torch.float32)
             w2_input_scale = layer.w2_input_scale
@@ -1446,6 +1469,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         x: torch.Tensor,
         masked_m: torch.Tensor,
         moe_runner_config: MoeRunnerConfig,
+        down_gemm_overlap_args: Optional["DownGemmOverlapArgs"],
     ) -> torch.Tensor:
         assert (
             moe_runner_config.activation == "silu"
@@ -1462,7 +1486,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         out = flashinfer_cutedsl_moe_masked(
             hidden_states=x,
-            input_global_scale=layer.w13_input_scale_quant,
+            input_global_scale=(
+                None if CUTEDSL_MOE_NVFP4_DISPATCH else layer.w13_input_scale_quant
+            ),
             w1=layer.w13_weight,
             w1_blockscale=layer.w13_blockscale_swizzled,
             w1_alpha=layer.g1_alphas,
@@ -1471,5 +1497,14 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w2_blockscale=layer.w2_blockscale_swizzled,
             w2_alpha=layer.g2_alphas,
             masked_m=masked_m,
+            **(
+                dict(
+                    down_sm_count=down_gemm_overlap_args.num_sms,
+                    down_signals=down_gemm_overlap_args.signal,
+                    down_start_event=down_gemm_overlap_args.start_event,
+                )
+                if down_gemm_overlap_args is not None
+                else {}
+            ),
         )
         return out

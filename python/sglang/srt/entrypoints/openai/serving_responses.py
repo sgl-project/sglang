@@ -123,6 +123,39 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         self.background_tasks: dict[str, asyncio.Task] = {}
 
+    # error helpers dedicated for v1/responses
+    def create_error_response(
+        self,
+        message: str,
+        err_type: str = "invalid_request_error",
+        status_code: int = 400,
+        param: Optional[str] = None,
+    ) -> ORJSONResponse:
+        nested_error = {
+            "message": message,
+            "type": err_type,
+            "param": param,
+            "code": status_code,
+        }
+        return ORJSONResponse(content={"error": nested_error}, status_code=status_code)
+
+    def create_streaming_error_response(
+        self,
+        message: str,
+        err_type: str = "BadRequestError",
+        status_code: int = 400,
+    ) -> str:
+        return json.dumps(
+            {
+                "error": {
+                    "message": message,
+                    "type": err_type,
+                    "param": None,
+                    "code": status_code,
+                }
+            }
+        )
+
     def _request_id_prefix(self) -> str:
         return "resp_"
 
@@ -245,6 +278,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         sampling_params=sampling_params,
                         stream=request.stream,
                         rid=request.request_id,
+                        extra_key=self._compute_extra_key(request),
                         background=request.background,
                     )
 
@@ -833,6 +867,13 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         async for ctx in result_generator:
 
+            # Only process context objects that implement the `is_expecting_start()` method,
+            # which indicates they support per-turn streaming (e.g., StreamingHarmonyContext).
+            # Contexts without this method are skipped, as they do not represent a new turn
+            # or are not compatible with per-turn handling in the /v1/responses endpoint.
+            if not hasattr(ctx, "is_expecting_start"):
+                continue
+
             if ctx.is_expecting_start():
                 current_output_index += 1
                 sent_output_item_added = False
@@ -1250,6 +1291,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 sampling_params=sampling_params,
                 stream=adapted_request.stream,
                 rid=request_id,
+                extra_key=adapted_request.extra_key,
                 return_logprob=adapted_request.return_logprob,
                 logprob_start_len=adapted_request.logprob_start_len,
                 top_logprobs_num=adapted_request.top_logprobs_num,

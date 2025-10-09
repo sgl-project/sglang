@@ -1,12 +1,13 @@
 use axum::{
-    extract::Request, extract::State, http::HeaderValue, http::StatusCode, middleware::Next,
-    response::IntoResponse, response::Response,
+    body::Body, extract::Request, extract::State, http::header, http::HeaderValue,
+    http::StatusCode, middleware::Next, response::IntoResponse, response::Response,
 };
 use rand::Rng;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
+use subtle::ConstantTimeEq;
 use tokio::sync::{mpsc, oneshot};
 use tower::{Layer, Service};
 use tower_http::trace::{MakeSpan, OnRequest, OnResponse, TraceLayer};
@@ -16,6 +17,49 @@ pub use crate::core::token_bucket::TokenBucket;
 
 use crate::metrics::RouterMetrics;
 use crate::server::AppState;
+
+#[derive(Clone)]
+pub struct AuthConfig {
+    pub api_key: Option<String>,
+}
+
+/// Middleware to validate Bearer token against configured API key
+/// Only active when router has an API key configured
+pub async fn auth_middleware(
+    State(auth_config): State<AuthConfig>,
+    request: Request<Body>,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    if let Some(expected_key) = &auth_config.api_key {
+        // Extract Authorization header
+        let auth_header = request
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|h| h.to_str().ok());
+
+        match auth_header {
+            Some(header_value) if header_value.starts_with("Bearer ") => {
+                let token = &header_value[7..]; // Skip "Bearer "
+                                                // Use constant-time comparison to prevent timing attacks
+                let token_bytes = token.as_bytes();
+                let expected_bytes = expected_key.as_bytes();
+
+                // Check if lengths match first (this is not constant-time but necessary)
+                if token_bytes.len() != expected_bytes.len() {
+                    return Err(StatusCode::UNAUTHORIZED);
+                }
+
+                // Constant-time comparison of the actual values
+                if token_bytes.ct_eq(expected_bytes).unwrap_u8() != 1 {
+                    return Err(StatusCode::UNAUTHORIZED);
+                }
+            }
+            _ => return Err(StatusCode::UNAUTHORIZED),
+        }
+    }
+
+    Ok(next.run(request).await)
+}
 
 /// Generate OpenAI-compatible request ID based on endpoint
 fn generate_request_id(path: &str) -> String {
@@ -134,8 +178,6 @@ where
     }
 }
 
-// ============= Logging Middleware =============
-
 /// Custom span maker that includes request ID
 #[derive(Clone, Debug)]
 pub struct RequestSpan;
@@ -194,7 +236,7 @@ impl Default for ResponseLogger {
 }
 
 impl<B> OnResponse<B> for ResponseLogger {
-    fn on_response(self, response: &Response<B>, latency: std::time::Duration, span: &Span) {
+    fn on_response(self, response: &Response<B>, latency: Duration, span: &Span) {
         let status = response.status();
 
         // Record these in the span for structured logging/observability tools
@@ -292,8 +334,6 @@ pub fn log_request(entry: RequestLogEntry) {
     }
 }
 
-// ============ Concurrency Limiting with Queue Support ============
-
 /// Request queue entry
 pub struct QueuedRequest {
     /// Time when the request was queued
@@ -305,10 +345,10 @@ pub struct QueuedRequest {
 /// Queue metrics for monitoring
 #[derive(Debug, Default)]
 pub struct QueueMetrics {
-    pub total_queued: std::sync::atomic::AtomicU64,
-    pub current_queued: std::sync::atomic::AtomicU64,
-    pub total_timeout: std::sync::atomic::AtomicU64,
-    pub total_rejected: std::sync::atomic::AtomicU64,
+    pub total_queued: AtomicU64,
+    pub current_queued: AtomicU64,
+    pub total_timeout: AtomicU64,
+    pub total_rejected: AtomicU64,
 }
 
 /// Queue processor that handles queued requests
@@ -407,7 +447,7 @@ impl ConcurrencyLimiter {
 /// Middleware function for concurrency limiting with optional queuing
 pub async fn concurrency_limit_middleware(
     State(app_state): State<Arc<AppState>>,
-    request: Request<axum::body::Body>,
+    request: Request<Body>,
     next: Next,
 ) -> Response {
     // Static counter for embeddings queue size

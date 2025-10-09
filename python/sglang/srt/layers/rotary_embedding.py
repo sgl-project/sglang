@@ -12,6 +12,7 @@ from sglang.srt.custom_op import CustomOp
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
+    get_compiler_backend,
     is_cpu,
     is_cuda,
     is_hip,
@@ -26,12 +27,18 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 
 if _is_cuda:
-    from sgl_kernel import apply_rope_with_cos_sin_cache_inplace
+    from sgl_kernel import FusedSetKVBufferArg, apply_rope_with_cos_sin_cache_inplace
+else:
+    FusedSetKVBufferArg = None
+
 if _use_aiter:
     from aiter.rotary_embedding import get_rope as aiter_get_rope
 
 if is_npu():
     import torch_npu
+
+    NPU_ROTARY_MUL_MAX_NUM_HEADS = 1000
+    NPU_ROTARY_MUL_MAX_HEAD_SIZE = 896
 
 
 def _rotate_neox(x: torch.Tensor) -> torch.Tensor:
@@ -142,8 +149,13 @@ class RotaryEmbedding(CustomOp):
         query: torch.Tensor,
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
+        fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """A PyTorch-native implementation of forward()."""
+        assert (
+            fused_set_kv_buffer_arg is None
+        ), "fused_set_kv_buffer_arg is not supported for native implementation"
+
         if offsets is not None:
             positions = positions + offsets
         positions = positions.flatten()
@@ -172,12 +184,17 @@ class RotaryEmbedding(CustomOp):
         query: torch.Tensor,
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
+        fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """A PyTorch-npu implementation of forward()."""
-        import os
+        assert (
+            fused_set_kv_buffer_arg is None
+        ), "fused_set_kv_buffer_arg is not supported for npu implementation"
 
         if get_bool_env_var("SGLANG_ENABLE_TORCH_COMPILE"):
-            return self.forward_native(positions, query, key, offsets)
+            return self.forward_native(
+                positions, query, key, offsets, fused_set_kv_buffer_arg
+            )
         else:
             rotary_mode = "half"
             if self.is_neox_style:
@@ -202,7 +219,12 @@ class RotaryEmbedding(CustomOp):
         query: torch.Tensor,
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
+        fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        assert (
+            fused_set_kv_buffer_arg is None
+        ), "fused_set_kv_buffer_arg is not supported for cpu implementation"
+
         positions = torch.add(positions, offsets) if offsets is not None else positions
         if _is_cpu_amx_available:
             return torch.ops.sgl_kernel.rotary_embedding_cpu(
@@ -214,7 +236,9 @@ class RotaryEmbedding(CustomOp):
                 self.is_neox_style,
             )
         else:
-            return self.forward_native(positions, query, key, offsets)
+            return self.forward_native(
+                positions, query, key, offsets, fused_set_kv_buffer_arg
+            )
 
     def forward_cuda(
         self,
@@ -222,7 +246,7 @@ class RotaryEmbedding(CustomOp):
         query: torch.Tensor,
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
-        fused_set_kv_buffer_arg=None,  # Optional[FusedSetKVBufferArg]
+        fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if _is_cuda and (self.head_size in [64, 128, 256, 512]):
             apply_rope_with_cos_sin_cache_inplace(
@@ -782,27 +806,33 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # NOTE: now npu_mrope can only support `numQHeads*headSize <= 4096` pattern,
-        # and generalization to more scenarios will be supported in the future.
-        if query.shape[1] * query.shape[2] > 4096:
-            return self.forward_native(positions, query, key, offsets)
-        num_tokens = query.shape[0]
-        rotary_mode = "half" if self.is_neox_style else "interleave"
+        num_tokens, num_q_heads, _ = query.shape
+        num_k_heads = key.shape[1]
+
         self.cos_sin_cache: torch.Tensor = self.cos_sin_cache.to(positions.device)
+        cos_sin = self.cos_sin_cache[
+            torch.add(positions, offsets) if offsets is not None else positions
+        ]
+        cos, sin = cos_sin.chunk(2, dim=-1)
+        # Reshape to [batchsize, head_dim, seq, rotary_dim]
+        cos = cos.repeat(1, 2).unsqueeze(-2).unsqueeze(-2)
+        sin = sin.repeat(1, 2).unsqueeze(-2).unsqueeze(-2)
+
         query_rot = query[..., : self.rotary_dim]
         key_rot = key[..., : self.rotary_dim]
         if self.rotary_dim < self.head_size:
             query_pass = query[..., self.rotary_dim :]
             key_pass = key[..., self.rotary_dim :]
 
-        query_rot, key_rot = torch_npu.npu_mrope(
-            torch.add(positions, offsets) if offsets is not None else positions,
-            query_rot.reshape(num_tokens, -1),
-            key_rot.reshape(num_tokens, -1),
-            self.cos_sin_cache,
-            self.rotary_dim,
-            mrope_section=[0, 0, 0],
-            rotary_mode=rotary_mode,
+        query_rot = torch_npu.npu_interleave_rope(
+            query_rot.reshape(num_tokens, num_q_heads, 1, self.rotary_dim),
+            cos,
+            sin,
+        )
+        key_rot = torch_npu.npu_interleave_rope(
+            key_rot.reshape(num_tokens, num_k_heads, 1, self.rotary_dim),
+            cos,
+            sin,
         )
         query_rot = query_rot.reshape(num_tokens, -1, self.rotary_dim)
         key_rot = key_rot.reshape(num_tokens, -1, self.rotary_dim)
@@ -1029,12 +1059,13 @@ class MRotaryEmbedding(RotaryEmbedding):
                     f"Corrected mrope_section: {self.mrope_section} (sum={sum(self.mrope_section)})"
                 )
 
-    @torch.compile(dynamic=True)
+    @torch.compile(dynamic=True, backend=get_compiler_backend())
     def forward(
         self,
         positions: torch.Tensor,
         query: torch.Tensor,
         key: torch.Tensor,
+        fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """PyTorch-native implementation equivalent to forward().
 
@@ -1045,6 +1076,9 @@ class MRotaryEmbedding(RotaryEmbedding):
             query: [num_tokens, num_heads * head_size]
             key: [num_tokens, num_kv_heads * head_size]
         """
+        assert (
+            fused_set_kv_buffer_arg is None
+        ), "save kv cache is not supported for MRotaryEmbedding."
         assert positions.ndim == 1 or positions.ndim == 2
 
         num_tokens = positions.shape[-1]
@@ -1177,7 +1211,7 @@ class MRotaryEmbedding(RotaryEmbedding):
 
                         time_tensor_long = time_tensor.long()
                         t_index = time_tensor_long.flatten()
-                    elif model_type == "qwen2_vl":
+                    elif model_type in ("qwen2_vl", "qwen3_vl", "qwen3_vl_moe"):
                         t_index = (
                             torch.arange(llm_grid_t)
                             .view(-1, 1)
@@ -1888,17 +1922,30 @@ def apply_rotary_pos_emb_npu(
     sin: torch.Tensor,
     unsqueeze_dim=1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    if q.shape[1] != 128:
+    """Ascend implementation equivalent to apply_rotary_pos_emb_native.
+
+    Args:
+        q: [num_tokens, num_heads, head_size]
+        k: [num_tokens, num_kv_heads, head_size]
+        cos: [num_tokens, head_size]
+        sin: [num_tokens, head_size]
+    """
+    if (
+        cos.dim() != 2
+        or q.dim() != 3
+        or q.shape[1] >= NPU_ROTARY_MUL_MAX_NUM_HEADS
+        or q.shape[2] >= NPU_ROTARY_MUL_MAX_HEAD_SIZE
+    ):
+        # Note: num_heads and head_size of q must be less than 1000 and 896, respectively
         return apply_rotary_pos_emb_native(q, k, cos, sin, unsqueeze_dim)
-    cos = cos.unsqueeze(unsqueeze_dim)
-    cos = torch.transpose(cos, 1, 2)
-    sin = sin.unsqueeze(unsqueeze_dim)
-    sin = torch.transpose(sin, 1, 2)
-    q = torch.transpose(q, 1, 2)
-    k = torch.transpose(k, 1, 2)
-    q_embed, k_embed = torch_npu.npu_apply_rotary_pos_emb(q, k, cos, sin)
-    q_embed = torch.transpose(q_embed, 1, 2)
-    k_embed = torch.transpose(k_embed, 1, 2)
+    cos = cos.unsqueeze(unsqueeze_dim).unsqueeze(0)
+    sin = sin.unsqueeze(unsqueeze_dim).unsqueeze(0)
+    q = q.unsqueeze(0)
+    k = k.unsqueeze(0)
+    q_embed = torch_npu.npu_rotary_mul(q, cos, sin)
+    k_embed = torch_npu.npu_rotary_mul(k, cos, sin)
+    q_embed = q_embed.squeeze(0)
+    k_embed = k_embed.squeeze(0)
     return q_embed, k_embed
 
 

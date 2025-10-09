@@ -27,7 +27,7 @@ import torch
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
+from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
@@ -174,11 +174,14 @@ class SchedulePolicy:
         self.waiting_queue_radix_tree.reset()
 
         for r in waiting_queue:
-            prefix_ids = r.adjust_max_prefix_ids()
+            prefix_ids = r.origin_input_ids + r.output_ids
+            extra_key = r.extra_key
 
             # NOTE: the prefix_indices must always be aligned with last_node
             r.prefix_indices, r.last_node, r.last_host_node, r.host_hit_length = (
-                self.tree_cache.match_prefix(rid=r.rid, key=prefix_ids)
+                self.tree_cache.match_prefix(
+                    rid=r.rid, key=RadixKey(token_ids=prefix_ids, extra_key=extra_key)
+                )
             )
 
             # NOTE(sang): This logic is for in-batch prefix caching;
@@ -191,7 +194,8 @@ class SchedulePolicy:
             if len(r.prefix_indices) <= IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD:
                 in_batch_matching_prefixes, _, _, _ = (
                     self.waiting_queue_radix_tree.match_prefix(
-                        rid=r.rid, key=prefix_ids
+                        rid=r.rid,
+                        key=RadixKey(token_ids=prefix_ids, extra_key=extra_key),
                     )
                 )
                 if (
@@ -202,7 +206,8 @@ class SchedulePolicy:
                 else:
                     # Insert with a dummy key
                     self.waiting_queue_radix_tree.insert(
-                        prefix_ids, torch.empty(len(prefix_ids), dtype=torch.bool)
+                        RadixKey(token_ids=prefix_ids, extra_key=extra_key),
+                        torch.empty(len(prefix_ids), dtype=torch.bool),
                     )
         return temporary_deprioritized
 
@@ -271,9 +276,13 @@ class SchedulePolicy:
     ) -> None:
         """Sorts the waiting queue based on the request priority then received titmestamp."""
         if schedule_low_priority_values_first:
-            waiting_queue.sort(key=lambda x: (x.priority, x.queue_time_start))
+            waiting_queue.sort(
+                key=lambda x: (x.priority, x.time_stats.wait_queue_entry_time)
+            )
         else:
-            waiting_queue.sort(key=lambda x: (-x.priority, x.queue_time_start))
+            waiting_queue.sort(
+                key=lambda x: (-x.priority, x.time_stats.wait_queue_entry_time)
+            )
 
     @staticmethod
     def _calc_weight(cur_node: TreeNode, node_to_weight: Dict[TreeNode, int]) -> None:
@@ -541,7 +550,9 @@ class PrefillAdder:
 
         return self.budget_state()
 
-    def add_one_req(self, req: Req, has_chunked_req: bool):
+    def add_one_req(
+        self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
+    ):
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req, has_chunked_req)
 
@@ -572,6 +583,7 @@ class PrefillAdder:
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                 req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
                 prefix_len = len(req.prefix_indices)
+                req.last_matched_prefix_len = prefix_len
 
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)
 
@@ -600,6 +612,17 @@ class PrefillAdder:
                 if trunc_len <= 0:
                     return AddReqResult.OTHER
 
+                # When truncation align size is set, we want to assert that the prefill prefix length is multiple of truncation align size
+                # A typical use case is when deterministic inference is enabled with flashinfer attention backend,
+                # we need the prefill prefix length to be multiple of attention split size
+                if truncation_align_size is not None:
+                    if trunc_len < truncation_align_size:
+                        return AddReqResult.OTHER
+                    else:
+                        trunc_len = truncation_align_size * (
+                            trunc_len // truncation_align_size
+                        )
+
                 # Chunked prefill
                 req.extend_input_len = trunc_len
                 req.fill_ids = req.fill_ids[: len(req.prefix_indices) + trunc_len]
@@ -624,12 +647,12 @@ class PrefillAdder:
         if server_args.schedule_low_priority_values_first:
             sorted_running_reqs = sorted(
                 self.running_batch.reqs,
-                key=lambda x: (-x.priority, -x.queue_time_start),
+                key=lambda x: (-x.priority, -x.time_stats.wait_queue_entry_time),
             )
         else:
             sorted_running_reqs = sorted(
                 self.running_batch.reqs,
-                key=lambda x: (x.priority, -x.queue_time_start),
+                key=lambda x: (x.priority, -x.time_stats.wait_queue_entry_time),
             )
         preemptible_reqs = []
         min_tokens_to_remove = (

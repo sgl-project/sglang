@@ -349,10 +349,8 @@ class W8A8Int8LinearMethod(LinearMethodBase):
             _amx_process_weight_after_loading(layer, ["weight"])
         elif _is_hip:
             layer.weight = Parameter(layer.weight.data, requires_grad=False)
-            self.gemm_func = w8a8_per_channel_per_token_matmul
         elif _is_cuda:
             layer.weight = Parameter(layer.weight.t(), requires_grad=False)
-            self.gemm_func = int8_scaled_mm
         layer.weight_scale = Parameter(layer.weight_scale.data, requires_grad=False)
 
     def create_weights(
@@ -401,12 +399,32 @@ class W8A8Int8LinearMethod(LinearMethodBase):
                 x.dtype,
                 True,  # is_vnni
             )
-
         x_q, x_scale = per_token_quant_int8(x)
 
-        return self.gemm_func(
-            x_q, layer.weight, x_scale, layer.weight_scale, out_dtype=x.dtype, bias=bias
+        if _is_hip:
+            return w8a8_per_channel_per_token_matmul(
+                x_q,
+                layer.weight,
+                x_scale,
+                layer.weight_scale,
+                out_dtype=x.dtype,
+                bias=bias,
+            )
+
+        x_q_2d = x_q.view(-1, x_q.shape[-1])
+        x_scale_2d = x_scale.view(-1, x_scale.shape[-1])
+        output_shape = [*x_q.shape[:-1], layer.weight.shape[1]]
+
+        output = int8_scaled_mm(
+            x_q_2d,
+            layer.weight,
+            x_scale_2d,
+            layer.weight_scale,
+            out_dtype=x.dtype,
+            bias=bias,
         )
+
+        return output.view(output_shape)
 
 
 class W8A8Int8MoEMethod(FusedMoEMethodBase):
@@ -646,6 +664,7 @@ class NPU_W8A8LinearMethodImpl:
             layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
         layer.weight_scale.data = torch.flatten(layer.weight_scale.data)
         layer.weight_offset.data = torch.flatten(layer.weight_offset.data)
+        layer.weight.data = torch_npu.npu_format_cast(layer.weight.data, 29)
 
 
 class NPU_W8A8LinearMethodMTImpl:
@@ -838,6 +857,7 @@ class NPU_W8A8DynamicLinearMethodImpl:
         layer.weight_scale.data = layer.weight_scale.data.flatten()
         layer.weight_scale_fp32 = layer.weight_scale.data.to(torch.float32)
         layer.weight_offset.data = layer.weight_offset.data.flatten()
+        layer.weight.data = torch_npu.npu_format_cast(layer.weight.data, 29)
 
 
 class NPU_W8A8DynamicLinearMethod(LinearMethodBase):

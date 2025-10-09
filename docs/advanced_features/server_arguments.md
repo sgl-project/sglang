@@ -8,6 +8,23 @@ You can find all arguments by `python3 -m sglang.launch_server --help`
 
 ## Common launch commands
 
+- To use a configuration file, create a YAML file with your server arguments and specify it with `--config`. CLI arguments will override config file values.
+
+  ```bash
+  # Create config.yaml
+  cat > config.yaml << EOF
+  model-path: meta-llama/Meta-Llama-3-8B-Instruct
+  host: 0.0.0.0
+  port: 30000
+  tensor-parallel-size: 2
+  enable-metrics: true
+  log-requests: true
+  EOF
+
+  # Launch server with config file
+  python -m sglang.launch_server --config config.yaml
+  ```
+
 - To enable multi-GPU tensor parallelism, add `--tp 2`. If it reports the error "peer access is not supported between these two devices", add `--enable-p2p-check` to the server launch command.
 
   ```bash
@@ -65,6 +82,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 
 | Arguments | Description | Defaults |
 |-----------|-------------|----------|
+| `--config` | Path to a YAML configuration file containing server arguments. Arguments in the config file will be merged with command-line arguments, with CLI arguments taking precedence. | None |
 | `--model-path` | The path of the model weights. This can be a local folder or a Hugging Face repo ID. | None |
 | `--tokenizer-path` | The path of the tokenizer. | None |
 | `--tokenizer-mode` | Tokenizer mode. 'auto' will use the fast tokenizer if available, and 'slow' will always use the slow tokenizer. | auto |
@@ -95,6 +113,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--quantization` | The quantization method. | None |
 | `--quantization-param-path` | Path to the JSON file containing the KV cache scaling factors. This should generally be supplied, when KV cache dtype is FP8. Otherwise, KV cache scaling factors default to 1.0, which may cause accuracy issues. | None |
 | `--kv-cache-dtype` | Data type for kv cache storage. 'auto' will use model data type. 'fp8_e5m2' and 'fp8_e4m3' is supported for CUDA 11.8+. | auto |
+| `--enable-fp32-lm-head` | If set, the LM head outputs (logits) are in FP32. | False |
 
 ## Memory and scheduling
 
@@ -117,7 +136,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--device` | The device to use ('cuda', 'xpu', 'hpu', 'npu', 'cpu'). Defaults to auto-detection if not specified. | None |
 | `--tp-size` | The tensor parallelism size. | 1 |
 | `--pp-size` | The pipeline parallelism size. | 1 |
-| `--max-micro-batch-size` | The maximum micro batch size in pipeline parallelism. | None |
+| `--pp-max-micro-batch-size` | The maximum micro batch size in pipeline parallelism. | None |
 | `--stream-interval` | The interval (or buffer size) for streaming in terms of the token length. A smaller value makes streaming smoother, while a larger value makes the throughput higher. | 1 |
 | `--stream-output` | Whether to output as a sequence of disjoint segments. | False |
 | `--random-seed` | The random seed. | None |
@@ -146,8 +165,8 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--kv-events-config`                  | Config in json format for NVIDIA dynamo KV event publishing. Publishing will be enabled if this flag is used.                                                                                                                                                                                                                                                                                | None     |
 | `--decode-log-interval`               | The log interval of decode batch.                                                                                                                                                                                                                                                                                                                                                            | 40       |
 | `--enable-request-time-stats-logging` | Enable per request time stats logging.                                                                                                                                                                                                                                                                                                                                                       | False    |
-| `--prompt-tokens-buckets`             | The buckets rule of prompt tokens. Supports 3 rule types: 'default' uses predefined buckets; 'tse <middle> <base> <count>' generates two sides exponential distributed buckets (e.g., 'tse 1000 2 8' generates buckets [984.0, 992.0, 996.0, 998.0, 1000.0, 1002.0, 1004.0, 1008.0, 1016.0]).); 'customer <value1> <value2> ...' uses custom bucket values (e.g., 'customer 10 50 100 500'). | None     |
-| `--generation-tokens-buckets`         | The buckets rule of prompt tokens. Supports 3 rule types: 'default' uses predefined buckets; 'tse <middle> <base> <count>' generates two sides exponential distributed buckets (e.g., 'tse 1000 2 8' generates buckets [984.0, 992.0, 996.0, 998.0, 1000.0, 1002.0, 1004.0, 1008.0, 1016.0]).); 'customer <value1> <value2> ...' uses custom bucket values (e.g., 'customer 10 50 100 500'). | None     |
+| `--prompt-tokens-buckets`             | The buckets rule of prompt tokens. Supports 3 rule types: 'default' uses predefined buckets; 'tse <middle> <base> <count>' generates two sides exponential distributed buckets (e.g., 'tse 1000 2 8' generates buckets [984.0, 992.0, 996.0, 998.0, 1000.0, 1002.0, 1004.0, 1008.0, 1016.0]).); 'custom <value1> <value2> ...' uses custom bucket values (e.g., 'custom 10 50 100 500'). | None     |
+| `--generation-tokens-buckets`         | The buckets rule of generation tokens. Supports 3 rule types: 'default' uses predefined buckets; 'tse <middle> <base> <count>' generates two sides exponential distributed buckets (e.g., 'tse 1000 2 8' generates buckets [984.0, 992.0, 996.0, 998.0, 1000.0, 1002.0, 1004.0, 1008.0, 1016.0]).); 'custom <value1> <value2> ...' uses custom bucket values (e.g., 'custom 10 50 100 500'). | None     |
 
 ## API related
 
@@ -227,7 +246,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 |-----------|-------------|----------|
 | `--ep-size` | The expert parallelism size. | 1 |
 | `--moe-a2a-backend` | Select the backend for all-to-all communication for expert parallelism. | none |
-| `--moe-runner-backend` | Select the runner backend for MoE. | 'triton' |
+| `--moe-runner-backend` | Select the runner backend for MoE. | auto |
 | `--deepep-mode` | Select the mode when enable DeepEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch. | auto |
 | `--ep-num-redundant-experts` | Allocate this number of redundant experts in expert parallel. | 0 |
 | `--ep-dispatch-algorithm` | The algorithm to choose ranks for redundant experts in EPLB. | None |
@@ -275,6 +294,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--enable-dp-lm-head` | Enable vocabulary parallel across the attention TP group to avoid all-gather across DP groups, optimizing performance under DP attention. | False |
 | `--enable-two-batch-overlap` | Enabling two micro batches to overlap. | False |
 | `--tbo-token-distribution-threshold` | The threshold of token distribution between two batches in micro-batch-overlap, determines whether to two-batch-overlap or two-chunk-overlap. Set to 0 denote disable two-chunk-overlap. | 0.48 |
+| `--enable-single-batch-overlap` | Enabling single batch overlap. | False |
 | `--enable-torch-compile` | Optimize the model with torch.compile. Experimental feature. | False |
 | `--torch-compile-max-bs` | Set the maximum batch size when using torch compile. | 32 |
 | `--torchao-config` | Optimize the model with torchao. Experimental feature. Current choices are: int8dq, int8wo, int4wo-<group_size>, fp8wo, fp8dq-per_tensor, fp8dq-per_row. |  |
@@ -285,6 +305,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--num-continuous-decode-steps` | Run multiple continuous decoding steps to reduce scheduling overhead. This can potentially increase throughput but may also increase time-to-first-token latency. The default value is 1, meaning only run one decoding step at a time. | 1 |
 | `--delete-ckpt-after-loading` | Delete the model checkpoint after loading the model. | False |
 | `--enable-memory-saver` | Allow saving memory using release_memory_occupation and resume_memory_occupation. | False |
+| `--enable-weights-cpu-backup` | Save model weights to CPU memory during release_weights_occupation and resume_weights_occupation | False |
 | `--allow-auto-truncate` | Allow automatically truncating requests that exceed the maximum input length instead of returning an error. | False |
 | `--enable-custom-logit-processor` | Enable users to pass custom logit processors to the server (disabled by default for security). | False |
 | `--flashinfer-mla-disable-ragged` | Disable ragged processing in Flashinfer MLA. | False |
