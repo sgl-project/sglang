@@ -5,354 +5,43 @@
 /// [tool1(arg1=val1, arg2=val2), tool2(arg1=val3)]
 /// ```
 ///
-/// This format is used by Llama-4 models and uses Python literals
+/// This format is used by Llama models and uses Python literals
 /// rather than JSON for arguments.
 use async_trait::async_trait;
+use num_traits::ToPrimitive;
 use regex::Regex;
-use serde_json::{json, Value};
+use rustpython_parser::ast::{Constant, Expr, Mod, UnaryOp};
+use rustpython_parser::{parse, Mode};
+use serde_json::{Map, Number, Value};
+use std::sync::OnceLock;
+
+use crate::protocols::spec::Tool;
 
 use crate::tool_parser::{
-    errors::ToolParserResult,
-    python_literal_parser::parse_python_literal,
-    state::ParseState,
+    errors::{ParserError, ParserResult},
+    parsers::helpers,
     traits::ToolParser,
-    types::{FunctionCall, StreamResult, ToolCall},
+    types::{FunctionCall, StreamingParseResult, ToolCall, ToolCallItem},
 };
+
+static PYTHONIC_BLOCK_REGEX: OnceLock<Regex> = OnceLock::new();
+
+/// Lazily compiled regex that locates pythonic tool call blocks.
+fn pythonic_block_regex() -> &'static Regex {
+    PYTHONIC_BLOCK_REGEX.get_or_init(|| {
+        // Matches one or more function calls inside a list. The `(?s)` flag allows
+        // newlines inside argument lists while keeping the pattern anchored to
+        // identifiers followed by parentheses, preventing plain lists like
+        // `[1, 2, 3]` from matching.
+        Regex::new(r"(?s)\[\s*[A-Za-z_]\w*\s*\(.*?\)\s*(?:,\s*[A-Za-z_]\w*\s*\(.*?\)\s*)*\]")
+            .expect("pythonic tool call regex must compile")
+    })
+}
 
 /// Parser for Pythonic tool call format
 pub struct PythonicParser {
-    /// Regex to detect tool calls in Pythonic format
-    tool_call_regex: Regex,
-    /// Regex to parse function calls - cached for reuse
-    call_regex: Regex,
-}
-
-impl PythonicParser {
-    /// Create a new Pythonic parser
-    pub fn new() -> Self {
-        // Simple regex to detect start of Pythonic tool calls
-        // We'll use manual parsing for the actual extraction
-        let pattern = r"\[[a-zA-Z_]\w*\(";
-        let tool_call_regex = Regex::new(pattern).expect("Valid regex pattern");
-
-        // Compile the function call regex once
-        let call_regex = Regex::new(r"(?s)^([a-zA-Z_]\w*)\((.*)\)$").expect("Valid regex pattern");
-
-        Self {
-            tool_call_regex,
-            call_regex,
-        }
-    }
-
-    /// Extract tool calls using bracket counting (similar to MistralParser)
-    fn extract_tool_calls(&self, text: &str) -> Option<String> {
-        // Find the start of a tool call list - look for [ followed by a function name
-        let chars: Vec<char> = text.chars().collect();
-
-        for start_idx in 0..chars.len() {
-            if chars[start_idx] != '[' {
-                continue;
-            }
-
-            // Check if this looks like a tool call
-            // Skip whitespace after [
-            let mut check_idx = start_idx + 1;
-            while check_idx < chars.len() && chars[check_idx].is_whitespace() {
-                check_idx += 1;
-            }
-
-            // Check if we have a function name (starts with letter or underscore)
-            if check_idx >= chars.len()
-                || (!chars[check_idx].is_alphabetic() && chars[check_idx] != '_')
-            {
-                continue;
-            }
-
-            // Now count brackets to find the matching ]
-            let mut bracket_count = 0;
-            let mut _paren_count = 0;
-            let mut _brace_count = 0;
-            let mut in_string = false;
-            let mut string_char = ' ';
-            let mut escape_next = false;
-
-            for i in start_idx..chars.len() {
-                let ch = chars[i];
-
-                if escape_next {
-                    escape_next = false;
-                    continue;
-                }
-
-                if ch == '\\' && in_string {
-                    escape_next = true;
-                    continue;
-                }
-
-                if !in_string && (ch == '"' || ch == '\'') {
-                    in_string = true;
-                    string_char = ch;
-                } else if in_string && ch == string_char && !escape_next {
-                    in_string = false;
-                } else if !in_string {
-                    match ch {
-                        '[' => bracket_count += 1,
-                        ']' => {
-                            bracket_count -= 1;
-                            if bracket_count == 0 {
-                                // Found the matching bracket
-                                let extracted: String = chars[start_idx..=i].iter().collect();
-                                // Verify this actually contains a function call
-                                if extracted.contains('(') && extracted.contains(')') {
-                                    return Some(extracted);
-                                }
-                            }
-                        }
-                        '(' => _paren_count += 1,
-                        ')' => _paren_count -= 1,
-                        '{' => _brace_count += 1,
-                        '}' => _brace_count -= 1,
-                        _ => {}
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    /// Strip special tokens that Llama 4 might output
-    fn strip_special_tokens(text: &str) -> String {
-        text.replace("<|python_start|>", "")
-            .replace("<|python_end|>", "")
-    }
-
-    /// Parse a single function call from Python syntax
-    fn parse_function_call(&self, call_str: &str) -> ToolParserResult<Option<ToolCall>> {
-        // Use cached regex instead of creating new one
-        if let Some(captures) = self.call_regex.captures(call_str.trim()) {
-            let function_name = captures.get(1).unwrap().as_str();
-            let args_str = captures.get(2).unwrap().as_str();
-
-            // Parse arguments
-            let arguments = self.parse_arguments(args_str)?;
-
-            Ok(Some(ToolCall {
-                id: format!("call_{}", uuid::Uuid::new_v4()),
-                r#type: "function".to_string(),
-                function: FunctionCall {
-                    name: function_name.to_string(),
-                    arguments: serde_json::to_string(&arguments)?,
-                },
-            }))
-        } else {
-            Ok(None)
-        }
-    }
-
-    /// Parse Python-style arguments into JSON
-    fn parse_arguments(&self, args_str: &str) -> ToolParserResult<Value> {
-        if args_str.trim().is_empty() {
-            return Ok(json!({}));
-        }
-
-        let mut result = serde_json::Map::new();
-        let mut current_key = String::new();
-        let mut current_value = String::new();
-        let mut in_key = true;
-        let mut depth = 0;
-        let mut in_string = false;
-        let mut string_char = ' ';
-        let mut escape_next = false;
-
-        let chars: Vec<char> = args_str.chars().collect();
-        let mut i = 0;
-
-        while i < chars.len() {
-            let ch = chars[i];
-
-            if escape_next {
-                if in_key {
-                    current_key.push(ch);
-                } else {
-                    current_value.push(ch);
-                }
-                escape_next = false;
-                i += 1;
-                continue;
-            }
-
-            if ch == '\\' && in_string {
-                escape_next = true;
-                current_value.push(ch);
-                i += 1;
-                continue;
-            }
-
-            // Handle string literals
-            if !in_string && (ch == '"' || ch == '\'') {
-                in_string = true;
-                string_char = ch;
-                if !in_key {
-                    current_value.push(ch);
-                }
-            } else if in_string && ch == string_char && !escape_next {
-                in_string = false;
-                if !in_key {
-                    current_value.push(ch);
-                }
-            } else if in_string {
-                if in_key {
-                    current_key.push(ch);
-                } else {
-                    current_value.push(ch);
-                }
-            } else {
-                // Not in string
-                match ch {
-                    '=' if in_key && depth == 0 => {
-                        in_key = false;
-                    }
-                    ',' if depth == 0 => {
-                        // End of current argument
-                        if !current_key.is_empty() {
-                            let value = parse_python_literal(current_value.trim())?;
-                            result.insert(current_key.trim().to_string(), value);
-                        }
-                        current_key.clear();
-                        current_value.clear();
-                        in_key = true;
-                    }
-                    '[' | '{' | '(' => {
-                        depth += 1;
-                        if !in_key {
-                            current_value.push(ch);
-                        }
-                    }
-                    ']' | '}' | ')' => {
-                        depth -= 1;
-                        if !in_key {
-                            current_value.push(ch);
-                        }
-                    }
-                    _ => {
-                        if in_key {
-                            if !ch.is_whitespace() || !current_key.is_empty() {
-                                current_key.push(ch);
-                            }
-                        } else {
-                            current_value.push(ch);
-                        }
-                    }
-                }
-            }
-
-            i += 1;
-        }
-
-        // Handle the last argument
-        if !current_key.is_empty() {
-            let value = parse_python_literal(current_value.trim())?;
-            result.insert(current_key.trim().to_string(), value);
-        }
-
-        Ok(Value::Object(result))
-    }
-}
-
-#[async_trait]
-impl ToolParser for PythonicParser {
-    async fn parse_complete(&self, text: &str) -> ToolParserResult<Vec<ToolCall>> {
-        let cleaned = Self::strip_special_tokens(text);
-
-        // Extract tool calls using bracket counting
-        if let Some(tool_calls_text) = self.extract_tool_calls(&cleaned) {
-            // Remove the outer brackets
-            let tool_calls_str = &tool_calls_text[1..tool_calls_text.len() - 1];
-
-            // Split into individual function calls
-            let mut calls = Vec::new();
-            let mut current_call = String::new();
-            let mut paren_depth = 0;
-            let mut in_string = false;
-            let mut string_char = ' ';
-
-            for ch in tool_calls_str.chars() {
-                if !in_string && (ch == '"' || ch == '\'') {
-                    in_string = true;
-                    string_char = ch;
-                    current_call.push(ch);
-                } else if in_string && ch == string_char {
-                    in_string = false;
-                    current_call.push(ch);
-                } else if in_string {
-                    current_call.push(ch);
-                } else {
-                    match ch {
-                        '(' => {
-                            paren_depth += 1;
-                            current_call.push(ch);
-                        }
-                        ')' => {
-                            paren_depth -= 1;
-                            current_call.push(ch);
-                        }
-                        ',' if paren_depth == 0 => {
-                            // End of current function call
-                            if let Some(call) = self.parse_function_call(current_call.trim())? {
-                                calls.push(call);
-                            }
-                            current_call.clear();
-                        }
-                        _ => {
-                            if !ch.is_whitespace() || !current_call.is_empty() {
-                                current_call.push(ch);
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Handle the last call (important for single calls or the last call in a list)
-            if !current_call.trim().is_empty() {
-                if let Some(call) = self.parse_function_call(current_call.trim())? {
-                    calls.push(call);
-                }
-            }
-
-            Ok(calls)
-        } else {
-            Ok(vec![])
-        }
-    }
-
-    async fn parse_incremental(
-        &self,
-        chunk: &str,
-        state: &mut ParseState,
-    ) -> ToolParserResult<StreamResult> {
-        // For Pythonic format, we accumulate until we have a complete tool call
-        // This is a simplified implementation
-        state.buffer.push_str(chunk);
-
-        // Try to parse if we have a complete tool call
-        let cleaned = Self::strip_special_tokens(&state.buffer);
-        if self.extract_tool_calls(&cleaned).is_some() {
-            let result = self.parse_complete(&state.buffer).await?;
-            if !result.is_empty() {
-                state.buffer.clear();
-                return Ok(StreamResult::ToolComplete(
-                    result.into_iter().next().unwrap(),
-                ));
-            }
-        }
-
-        Ok(StreamResult::Incomplete)
-    }
-
-    fn detect_format(&self, text: &str) -> bool {
-        let cleaned = Self::strip_special_tokens(text);
-        self.tool_call_regex.is_match(&cleaned)
-    }
+    /// Buffer for accumulating chunks
+    buffer: String,
 }
 
 impl Default for PythonicParser {
@@ -361,74 +50,360 @@ impl Default for PythonicParser {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_single_function_call() {
-        let parser = PythonicParser::new();
-        let input = r#"[search_web(query="Rust programming", max_results=5)]"#;
-
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.name, "search_web");
-
-        let args: Value = serde_json::from_str(&result[0].function.arguments).unwrap();
-        assert_eq!(args["query"], "Rust programming");
-        assert_eq!(args["max_results"], 5);
+impl PythonicParser {
+    /// Create a new Pythonic parser
+    pub fn new() -> Self {
+        Self {
+            buffer: String::new(),
+        }
     }
 
-    #[tokio::test]
-    async fn test_multiple_function_calls() {
-        let parser = PythonicParser::new();
-        let input = r#"[get_weather(city="Tokyo"), search(query="news")]"#;
-
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].function.name, "get_weather");
-        assert_eq!(result[1].function.name, "search");
+    /// Extract the first pythonic tool call block and return it along with the
+    /// surrounding "normal" content.
+    fn extract_tool_calls(&self, text: &str) -> Option<(String, String)> {
+        pythonic_block_regex().find(text).map(|mat| {
+            let block = mat.as_str().to_string();
+            let normal = format!("{}{}", &text[..mat.start()], &text[mat.end()..]);
+            (block, normal)
+        })
     }
 
-    #[tokio::test]
-    async fn test_python_literals() {
-        let parser = PythonicParser::new();
-        let input = r#"[test(flag=True, disabled=False, optional=None)]"#;
-
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-
-        let args: Value = serde_json::from_str(&result[0].function.arguments).unwrap();
-        assert_eq!(args["flag"], true);
-        assert_eq!(args["disabled"], false);
-        assert_eq!(args["optional"], Value::Null);
+    /// Strip special tokens that Llama models might output
+    fn strip_special_tokens(text: &str) -> String {
+        text.replace("<|python_start|>", "")
+            .replace("<|python_end|>", "")
     }
 
-    #[tokio::test]
-    async fn test_special_tokens() {
-        let parser = PythonicParser::new();
-        let input = r#"<|python_start|>[calculate(x=10, y=20)]<|python_end|>"#;
+    fn parse_tool_call_block(&self, block: &str) -> ParserResult<Vec<ToolCall>> {
+        let expr = parse_python_expression(block)?;
+        match expr {
+            Expr::List(list_expr) => list_expr
+                .elts
+                .into_iter()
+                .enumerate()
+                .map(|(idx, call_expr)| build_tool_call(call_expr, idx))
+                .collect(),
+            _ => Err(ParserError::ParsingFailed(
+                "Expected a list of function calls in pythonic tool call".to_string(),
+            )),
+        }
+    }
+}
 
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.name, "calculate");
+#[async_trait]
+impl ToolParser for PythonicParser {
+    async fn parse_complete(&self, text: &str) -> ParserResult<(String, Vec<ToolCall>)> {
+        let cleaned = Self::strip_special_tokens(text);
 
-        let args: Value = serde_json::from_str(&result[0].function.arguments).unwrap();
-        assert_eq!(args["x"], 10);
-        assert_eq!(args["y"], 20);
+        if let Some((tool_calls_text, normal_text)) = self.extract_tool_calls(&cleaned) {
+            match self.parse_tool_call_block(&tool_calls_text) {
+                Ok(calls) => {
+                    if calls.is_empty() {
+                        // No tools successfully parsed despite having markers
+                        Ok((text.to_string(), vec![]))
+                    } else {
+                        Ok((normal_text, calls))
+                    }
+                }
+                Err(e) => {
+                    // Log warning and return entire text as fallback
+                    tracing::warn!("Failed to parse pythonic tool calls: {}", e);
+                    Ok((text.to_string(), vec![]))
+                }
+            }
+        } else {
+            Ok((text.to_string(), vec![]))
+        }
     }
 
-    #[tokio::test]
-    async fn test_llama4_format() {
-        let parser = PythonicParser::new();
-        let input = r#"[get_weather(city="London", units="celsius")]"#;
+    async fn parse_incremental(
+        &mut self,
+        chunk: &str,
+        tools: &[Tool],
+    ) -> ParserResult<StreamingParseResult> {
+        self.buffer.push_str(chunk);
 
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.name, "get_weather");
+        let cleaned = Self::strip_special_tokens(&self.buffer);
 
-        let args: Value = serde_json::from_str(&result[0].function.arguments).unwrap();
-        assert_eq!(args["city"], "London");
-        assert_eq!(args["units"], "celsius");
+        // Look for opening bracket
+        if let Some(start) = cleaned.find('[') {
+            let normal_text = if start > 0 {
+                cleaned[..start].to_string()
+            } else {
+                String::new()
+            };
+
+            // Look for matching closing bracket
+            if let Some(end) = find_matching_bracket(&cleaned, start) {
+                // Found complete tool call - extract it and parse using parse_complete
+                let call_text = &cleaned[start..=end];
+
+                match self.parse_complete(call_text).await {
+                    Ok((_, calls)) => {
+                        // Update buffer with remaining text after tool call
+                        let remaining_text = &cleaned[end + 1..];
+                        self.buffer = remaining_text.to_string();
+
+                        // Validate tool names and convert ToolCall to ToolCallItem
+                        let tool_indices = helpers::get_tool_indices(tools);
+                        let items: Vec<ToolCallItem> = calls
+                            .into_iter()
+                            .enumerate()
+                            .filter_map(|(idx, tool)| {
+                                if !tool_indices.contains_key(&tool.function.name) {
+                                    tracing::warn!(
+                                        "Invalid tool name '{}' - skipping",
+                                        tool.function.name
+                                    );
+                                    return None;
+                                }
+
+                                Some(ToolCallItem {
+                                    tool_index: idx,
+                                    name: Some(tool.function.name),
+                                    parameters: tool.function.arguments,
+                                })
+                            })
+                            .collect();
+
+                        return Ok(StreamingParseResult {
+                            normal_text,
+                            calls: items,
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to parse pythonic tool call: {}", e);
+                        // Clear buffer on error
+                        self.buffer.clear();
+                        return Ok(StreamingParseResult::default());
+                    }
+                }
+            } else {
+                // We have an opening bracket but no closing bracket yet
+                // Put back everything from the bracket onwards
+                self.buffer = cleaned[start..].to_string();
+
+                if !normal_text.is_empty() {
+                    return Ok(StreamingParseResult {
+                        normal_text,
+                        calls: vec![],
+                    });
+                }
+
+                // Still accumulating a potential tool call
+                return Ok(StreamingParseResult::default());
+            }
+        }
+
+        // No tool call bracket found
+        self.buffer.clear();
+        Ok(StreamingParseResult {
+            normal_text: cleaned,
+            calls: vec![],
+        })
+    }
+
+    fn has_tool_markers(&self, text: &str) -> bool {
+        let cleaned = Self::strip_special_tokens(text);
+        if pythonic_block_regex().is_match(&cleaned) {
+            return true;
+        }
+
+        false
+    }
+}
+
+/// Find the matching closing bracket for the opening bracket at start position.
+/// Properly handles nested brackets.
+fn find_matching_bracket(buffer: &str, start: usize) -> Option<usize> {
+    let mut bracket_count = 0;
+    let chars: Vec<char> = buffer.chars().collect();
+
+    for (i, &ch) in chars.iter().enumerate().skip(start) {
+        if ch == '[' {
+            bracket_count += 1;
+        } else if ch == ']' {
+            bracket_count -= 1;
+            if bracket_count == 0 {
+                return Some(i);
+            }
+        }
+    }
+    None // No matching bracket found
+}
+
+fn parse_python_expression(source: &str) -> ParserResult<Expr> {
+    let module = parse(source, Mode::Expression, "<pythonic_tool_call>")
+        .map_err(|err| ParserError::ParsingFailed(err.to_string()))?;
+
+    match module {
+        Mod::Expression(expr_mod) => Ok(*expr_mod.body),
+        _ => Err(ParserError::ParsingFailed(
+            "Expected a Python expression".to_string(),
+        )),
+    }
+}
+
+fn build_tool_call(expr: Expr, _index: usize) -> ParserResult<ToolCall> {
+    match expr {
+        Expr::Call(call_expr) => {
+            if !call_expr.args.is_empty() {
+                return Err(ParserError::ParsingFailed(
+                    "Positional arguments are not supported in pythonic tool calls".to_string(),
+                ));
+            }
+
+            let function_name = match *call_expr.func {
+                Expr::Name(name_expr) => name_expr.id.to_string(),
+                _ => {
+                    return Err(ParserError::ParsingFailed(
+                        "Unsupported function reference in pythonic tool call".to_string(),
+                    ))
+                }
+            };
+
+            let mut arguments_map = Map::with_capacity(call_expr.keywords.len());
+            for keyword in call_expr.keywords {
+                let arg_name = keyword.arg.ok_or_else(|| {
+                    ParserError::ParsingFailed(
+                        "pythonic tool calls do not support **kwargs".to_string(),
+                    )
+                })?;
+                let value_json = expression_to_json(&keyword.value)?;
+                arguments_map.insert(arg_name.to_string(), value_json);
+            }
+
+            let arguments_json = Value::Object(arguments_map);
+            let arguments_string = serde_json::to_string(&arguments_json)?;
+
+            Ok(ToolCall {
+                function: FunctionCall {
+                    name: function_name,
+                    arguments: arguments_string,
+                },
+            })
+        }
+        _ => Err(ParserError::ParsingFailed(
+            "Expected function calls inside pythonic tool call list".to_string(),
+        )),
+    }
+}
+
+fn expression_to_json(expr: &Expr) -> ParserResult<Value> {
+    match expr {
+        Expr::Constant(expr_constant) => constant_to_json(&expr_constant.value),
+        Expr::List(list_expr) => collect_sequence(&list_expr.elts).map(Value::Array),
+        Expr::Tuple(tuple_expr) => collect_sequence(&tuple_expr.elts).map(Value::Array),
+        Expr::Dict(dict_expr) => {
+            collect_dict(&dict_expr.keys, &dict_expr.values).map(Value::Object)
+        }
+        Expr::UnaryOp(unary_expr) => match unary_expr.op {
+            UnaryOp::USub => match unary_expr.operand.as_ref() {
+                Expr::Constant(const_expr) => negate_constant(&const_expr.value),
+                _ => Err(ParserError::ParsingFailed(
+                    "Unsupported unary operand in pythonic tool call".to_string(),
+                )),
+            },
+            UnaryOp::UAdd => expression_to_json(unary_expr.operand.as_ref()),
+            _ => Err(ParserError::ParsingFailed(format!(
+                "Unsupported unary operator in pythonic tool call: {:?}",
+                unary_expr.op
+            ))),
+        },
+        Expr::Name(name_expr) => Ok(Value::String(name_expr.id.to_string())),
+        _ => Err(ParserError::ParsingFailed(format!(
+            "Unsupported expression in pythonic tool call: {:?}",
+            expr
+        ))),
+    }
+}
+
+fn constant_to_json(constant: &Constant) -> ParserResult<Value> {
+    match constant {
+        Constant::None => Ok(Value::Null),
+        Constant::Bool(b) => Ok(Value::Bool(*b)),
+        Constant::Int(value) => Ok(integer_constant_to_value(value, false)),
+        Constant::Float(f) => Number::from_f64(*f).map(Value::Number).ok_or_else(|| {
+            ParserError::ParsingFailed("Invalid float literal in pythonic tool call".to_string())
+        }),
+        Constant::Str(s) => Ok(Value::String(s.clone())),
+        Constant::Bytes(bytes) => Ok(Value::String(String::from_utf8_lossy(bytes).into_owned())),
+        Constant::Tuple(values) => constant_tuple_to_array(values).map(Value::Array),
+        Constant::Ellipsis | Constant::Complex { .. } => Err(ParserError::ParsingFailed(
+            "Unsupported literal in pythonic tool call".to_string(),
+        )),
+    }
+}
+
+fn negate_constant(constant: &Constant) -> ParserResult<Value> {
+    match constant {
+        Constant::Int(value) => Ok(integer_constant_to_value(value, true)),
+        Constant::Float(f) => Number::from_f64(-f).map(Value::Number).ok_or_else(|| {
+            ParserError::ParsingFailed("Invalid float literal in pythonic tool call".to_string())
+        }),
+        _ => Err(ParserError::ParsingFailed(
+            "Unsupported unary operand in pythonic tool call".to_string(),
+        )),
+    }
+}
+
+fn value_to_key_string(value: Value) -> ParserResult<String> {
+    match value {
+        Value::String(s) => Ok(s),
+        Value::Number(num) => Ok(num.to_string()),
+        Value::Bool(b) => Ok(b.to_string()),
+        Value::Null => Ok("null".to_string()),
+        other => Err(ParserError::ParsingFailed(format!(
+            "Unsupported key type in pythonic tool call: {:?}",
+            other
+        ))),
+    }
+}
+
+fn collect_sequence(elements: &[Expr]) -> ParserResult<Vec<Value>> {
+    elements.iter().map(expression_to_json).collect()
+}
+
+fn collect_dict(keys: &[Option<Expr>], values: &[Expr]) -> ParserResult<Map<String, Value>> {
+    let mut map = Map::with_capacity(keys.len());
+    for (key_expr, value_expr) in keys.iter().zip(values.iter()) {
+        let key_expr = key_expr.as_ref().ok_or_else(|| {
+            ParserError::ParsingFailed("pythonic tool calls do not support **kwargs".to_string())
+        })?;
+        let key_value = expression_to_json(key_expr)?;
+        let key = value_to_key_string(key_value)?;
+        let value_json = expression_to_json(value_expr)?;
+        map.insert(key, value_json);
+    }
+    Ok(map)
+}
+
+fn constant_tuple_to_array(values: &[Constant]) -> ParserResult<Vec<Value>> {
+    values.iter().map(constant_to_json).collect()
+}
+
+fn integer_constant_to_value<T>(value: &T, negate: bool) -> Value
+where
+    T: ToPrimitive + std::fmt::Display,
+{
+    if let Some(mut i) = value.to_i64() {
+        if negate {
+            i = -i;
+        }
+        return Value::Number(Number::from(i));
+    }
+
+    if negate {
+        if let Some(u) = value.to_u64() {
+            if u <= i64::MAX as u64 {
+                return Value::Number(Number::from(-(u as i64)));
+            }
+            return Value::String(format!("-{}", value));
+        }
+        Value::String(format!("-{}", value))
+    } else if let Some(u) = value.to_u64() {
+        Value::Number(Number::from(u))
+    } else {
+        Value::String(value.to_string())
     }
 }

@@ -39,4 +39,4 @@ jobs:
         timeout-minutes: 30
         run: |
           cd test/srt
-          python3 run_suite.py --suite vllm_dependency_test --timeout-per-file 600
+          python3 run_suite.py --suite vllm_dependency_test

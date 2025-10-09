@@ -19,13 +19,8 @@ from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.utils import is_npu, set_weight_attrs
 
-_is_npu = is_npu()
-if not _is_npu:
-    from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
-
 if TYPE_CHECKING:
     from sglang.srt.layers.moe import MoeRunnerConfig
-    from sglang.srt.layers.moe.ep_moe.layer import EPMoE
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
         StandardDispatchOutput,
@@ -98,9 +93,7 @@ class W4AFp8Config(QuantizationConfig):
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional[QuantizeMethodBase]:
         from sglang.srt.layers.linear import LinearBase
-        from sglang.srt.layers.moe.ep_moe.layer import EPMoE
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-        from sglang.srt.managers.schedule_batch import global_server_args_dict
 
         if isinstance(layer, LinearBase):
             if is_layer_skipped(prefix, self.ignored_layers):
@@ -137,7 +130,7 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
 
     def create_weights(
         self,
-        layer: EPMoE,
+        layer: Module,
         num_experts: int,
         hidden_size: int,
         intermediate_size_per_partition: int,
@@ -296,7 +289,7 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
 
     def apply(
         self,
-        layer: EPMoE,
+        layer: Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
 
@@ -307,18 +300,8 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         topk_output = dispatch_output.topk_output
 
         topk_weights, topk_ids, _ = topk_output
-        local_topk_ids = topk_ids
-        if get_moe_expert_parallel_world_size() > 1:
-            local_topk_ids = torch.where(
-                topk_ids == -1,
-                layer.num_experts,
-                topk_ids,
-            )
 
         output = cutlass_w4a8_moe(
-            layer.start_expert_id,
-            layer.end_expert_id,
-            layer.num_experts,
             x,
             layer.w13_weight,
             layer.w2_weight,
@@ -326,7 +309,6 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             layer.w2_weight_scale_inv,
             topk_weights,
             topk_ids,
-            local_topk_ids,
             self.a_strides1,
             self.b_strides1,
             self.c_strides1,
