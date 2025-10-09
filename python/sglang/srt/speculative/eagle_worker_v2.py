@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 
 class EAGLEWorkerV2(EAGLEWorker):
-    def __call__(
+    def __init__(
         self,
         server_args: ServerArgs,
         gpu_id: int,
@@ -39,7 +39,7 @@ class EAGLEWorkerV2(EAGLEWorker):
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
-        super().__call__(
+        super().__init__(
             server_args,
             gpu_id,
             tp_rank,
@@ -142,6 +142,9 @@ class EAGLEWorkerV2(EAGLEWorker):
             spec_steps=self.speculative_num_steps,
             topk=self.topk,
             draft_token_num=self.speculative_num_draft_tokens,
+            capture_hidden_mode=None,
+            seq_lens_sum=None,
+            seq_lens_cpu=None,
         )
 
     def draft_forward(self, forward_batch: ForwardBatch):

@@ -26,7 +26,7 @@ from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
     generate_simulated_accept_index,
 )
-from sglang.srt.utils.common import fast_topk, next_power_of_2
+from sglang.srt.utils.common import fast_topk, is_cuda, next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tp_worker import TpModelWorker
@@ -160,7 +160,7 @@ class EagleVerifyInputV2Mixin:
         return verify_forward_batch, can_run_cuda_graph
 
     def sample(
-        self,
+        self: EagleVerifyInput,
         batch: ModelWorkerBatch,
         logits_output: LogitsProcessorOutput,
     ):

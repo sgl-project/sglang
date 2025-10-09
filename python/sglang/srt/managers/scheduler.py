@@ -428,8 +428,11 @@ class Scheduler(
         # Launch a draft worker for speculative decoding
         if self.spec_algorithm.is_eagle():
             from sglang.srt.speculative.eagle_worker import EAGLEWorker
+            from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
 
-            self.draft_worker = EAGLEWorker(
+            WorkerClass = EAGLEWorkerV2 if self.enable_overlap else EAGLEWorker
+
+            self.draft_worker = WorkerClass(
                 gpu_id=gpu_id,
                 tp_rank=tp_rank,
                 moe_ep_rank=moe_ep_rank,
@@ -972,7 +975,9 @@ class Scheduler(
             self.device
         ).stream(self.copy_stream)
 
-        self.future_map = FutureMap(self.max_running_requests, self.device)
+        self.future_map = FutureMap(
+            self.max_running_requests, self.device, self.spec_algorithm
+        )
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
 
@@ -2090,7 +2095,7 @@ class Scheduler(
 
             batch_or_worker_batch = batch
 
-            if self.spec_algorithm.is_none():
+            if self.enable_overlap or self.spec_algorithm.is_none():
                 # FIXME(lsyin): remove this if and finally unify the abstraction
                 batch_or_worker_batch = batch.get_model_worker_batch()
 
@@ -2114,7 +2119,7 @@ class Scheduler(
                     if batch.sampling_info.grammars is not None:
                         model_worker_batch.delay_sample_launch = True
                     batch_result = self.model_worker.forward_batch_generation(
-                        batch_or_worker_batch
+                        model_worker_batch
                     )
                     # FIXME(lsyin): maybe move this to forward_batch_generation
                     batch_result.copy_done = torch.get_device_module(
@@ -2127,18 +2132,23 @@ class Scheduler(
                         batch_result.future_indices = future_indices
 
                 # FIXME(lsyin): move this assignment elsewhere
-                maybe_future_next_token_ids = -future_indices.indices
+                future_indices_or_next_token_ids = -future_indices.indices
+
+                if batch.is_v2_eagle:
+                    # FIXME(lsyin): tmp code for eagle v2
+                    batch.spec_info = batch_result.next_draft_input
+                    batch.spec_info.future_indices = future_indices
             else:
                 batch_result = self.model_worker.forward_batch_generation(
                     batch_or_worker_batch
                 )
-                maybe_future_next_token_ids = batch_result.next_token_ids
+                future_indices_or_next_token_ids = batch_result.next_token_ids
 
-            # NOTE: maybe_future_next_token_ids is used in ScheduleBatch,
+            # NOTE: future_indices_or_next_token_ids is used in ScheduleBatch,
             #       which can probably be replaced by future_indices later [TODO(lsyin)].
             #       we shall still keep the original outputs, e.g. next_token_ids
             #       in the GenerationBatchOutput for processing after copy_done.
-            batch.output_ids = maybe_future_next_token_ids
+            batch.output_ids = future_indices_or_next_token_ids
 
             # These 2 values are needed for processing the output, but the values can be
             # modified by overlap schedule. So we have to copy them here so that

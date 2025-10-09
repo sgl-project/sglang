@@ -18,7 +18,10 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
-from sglang.srt.speculative.eagle_info_v2 import EagleDraftInputV2Mixin
+from sglang.srt.speculative.eagle_info_v2 import (
+    EagleDraftInputV2Mixin,
+    EagleVerifyInputV2Mixin,
+)
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
@@ -48,7 +51,7 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class EagleVerifyInput(SpecInput):
+class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
     draft_token: torch.Tensor
     custom_mask: torch.Tensor
     positions: torch.Tensor

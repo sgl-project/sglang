@@ -43,7 +43,7 @@ class FutureMap:
         self.future_buffer_len = max_running_requests * 5
         self.device = device
         self.spec_algo = spec_algo
-        self.inited = False
+        self.buf_initialized = False
 
         if self.spec_algo.is_none():
             self.token_ids_buf = torch.empty(
@@ -51,10 +51,10 @@ class FutureMap:
             )
 
     def _lazy_init_buf(self, draft_input: EagleDraftInput):
-        if self.buf_inited or not self.spec_algo.is_eagle():
+        if self.buf_initialized or not self.spec_algo.is_eagle():
             return
 
-        self.buf_inited = True
+        self.buf_initialized = True
 
         # get the template for each tensor
         topk_p0 = draft_input.topk_p[0]
@@ -102,7 +102,10 @@ class FutureMap:
         if self.spec_algo.is_eagle():
             # TODO(lsyin): write future indices into spec_info.future_indices
             draft_input: EagleDraftInput = model_worker_batch.spec_info
-            indices = draft_input.future_indices.indices
+            if draft_input is None:
+                # FIXME(lsyin): No future exists, only for prefill batch, not compatible with mixed mode
+                return
+            indices = -draft_input.future_indices.indices
             draft_input.topk_p = self.topk_p_buf[indices]
             draft_input.topk_index = self.topk_index_buf[indices]
             draft_input.hidden_states = self.hidden_states_buf[indices]
