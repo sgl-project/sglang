@@ -1280,6 +1280,17 @@ class ModelRunner:
                 * num_layers
                 * torch._utils._element_size(self.kv_cache_dtype)
             )
+            # Add indexer KV cache overhead for NSA models (DeepSeek V3.2)
+            if is_deepseek_nsa(self.model_config.hf_config):
+                index_head_dim = get_nsa_index_head_dim(self.model_config.hf_config)
+                indexer_size_per_token = (
+                    index_head_dim
+                    + index_head_dim // NSATokenToKVPool.quant_block_size * 4
+                )
+                element_size = torch._utils._element_size(
+                    NSATokenToKVPool.index_k_with_scale_buffer_dtype
+                )
+                cell_size += indexer_size_per_token * num_layers * element_size
         else:
             cell_size = (
                 self.model_config.get_num_kv_heads(get_attention_tp_size())
