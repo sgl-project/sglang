@@ -230,13 +230,6 @@ impl OpenAIRouter {
             original_previous_response_id.as_deref(),
         );
 
-        // Store response if requested
-        if let Err(err) =
-            store_response_internal(&self.response_storage, &response_json, original_body).await
-        {
-            warn!("Failed to store response: {}", err);
-        }
-
         // Persist conversation items if conversation is provided
         if original_body.conversation.is_some() {
             if let Err(err) = persist_conversation_items(
@@ -249,6 +242,13 @@ impl OpenAIRouter {
             .await
             {
                 warn!("Failed to persist conversation items: {}", err);
+            }
+        } else {
+            // Store response only if no conversation (persist_conversation_items already stores it)
+            if let Err(err) =
+                store_response_internal(&self.response_storage, &response_json, original_body).await
+            {
+                warn!("Failed to store response: {}", err);
             }
         }
 
@@ -616,19 +616,30 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                     .into_response();
             }
 
-            // Load conversation history (descending order - most recent first)
+            // Load conversation history (ascending order for chronological context)
             let params = ListParams {
                 limit: Self::MAX_CONVERSATION_HISTORY_ITEMS,
-                order: SortOrder::Desc,
+                order: SortOrder::Asc,
                 after: None,
             };
 
             match self.conversation_item_storage.list_items(&conv_id, params).await {
                 Ok(stored_items) => {
-                    let mut items: Vec<ResponseInputOutputItem> = stored_items
-                        .into_iter()
-                        .filter_map(|item| serde_json::from_value(item.content).ok())
-                        .collect();
+                    let mut items: Vec<ResponseInputOutputItem> = Vec::new();
+                    for item in stored_items.into_iter() {
+                        // Only use message items for conversation context
+                        // Skip non-message items (reasoning, function calls, etc.)
+                        if item.item_type == "message" {
+                            if let Ok(content_parts) = serde_json::from_value::<Vec<ResponseContentPart>>(item.content.clone()) {
+                                items.push(ResponseInputOutputItem::Message {
+                                    id: item.id.0.clone(),
+                                    role: item.role.clone().unwrap_or_else(|| "user".to_string()),
+                                    content: content_parts,
+                                    status: item.status.clone(),
+                                });
+                            }
+                        }
+                    }
 
                     // Append current request
                     match &request_body.input {
