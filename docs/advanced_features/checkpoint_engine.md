@@ -7,7 +7,7 @@ ckpt-engine is a lightweight library specifically designed to accelerate weight 
 Two key scenarios can benefit from this ckpt-engine:
 
 - Reinforcement Learning (RL) Workloads – including RLHF, DPO, and continual pre-training – where model weights are updated frequently. Current methods for synchronizing these updates into the inference engine introduce significant latency, creating a bottleneck. This underutilizes GPUs during weight updates and slows the overall training-inference loop.
-- Bulk Deployment – The boot time is a performance bottleneck when launching multiple SGLang instances. 
+- Bulk Deployment – The boot time is a performance bottleneck when launching multiple SGLang instances.
 
 ## Use Cases
 
@@ -137,13 +137,13 @@ class CkptEngineModelLoader(BaseModelLoader):
     def load_model(self, *, model_config: ModelConfig, device_config: DeviceConfig) -> nn.Module:
         """Load model using checkpoint engine format."""
         logger.info("Loading weights from checkpoint engine format ...")
-        
+
         model_weights = f"ckptengine://"
-        
+
         with set_default_torch_dtype(model_config.dtype):
             with torch.device(device_config.device):
                 model = _initialize_model(model_config, self.load_config)
-                
+
             with create_remote_connector(model_weights, device_config.device) as client:
                 connector_type = get_connector_type(client)
                 if connector_type == ConnectorType.CKPTENGINE:
@@ -152,7 +152,7 @@ class CkptEngineModelLoader(BaseModelLoader):
                     )
                 else:
                     raise ValueError(f"Unsupported connector type {connector_type}")
-        
+
         return model.eval()
 ```
 
@@ -248,4 +248,3 @@ Efficient weight management for large-scale model serving deployments.
 1. **Parallel Transfer**: Parallel weight transfer for large models
 2. **Streaming**: Streaming weight updates for very large models
 3. **GPU Direct**: GPU-direct memory transfer for improved performance
-

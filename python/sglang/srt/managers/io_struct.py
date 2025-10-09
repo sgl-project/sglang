@@ -1055,6 +1055,7 @@ class UpdateWeightsFromCkptEngineReqOutput(BaseReq):
     # Number of paused requests during weight sync.
     num_paused_requests: Optional[int] = 0
 
+
 class InitWeightsSendGroupForRemoteInstanceReqInput(BaseReq):
     # The master address
     master_address: str

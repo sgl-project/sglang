@@ -54,7 +54,9 @@ class FlattenedTensorMetadata(TypedDict):
 
 class CkptEngineConnector(BaseConnector):
 
-    def __init__(self, url: str, device: torch.device = "cpu", ckpt_engine_port: int = 33001):
+    def __init__(
+        self, url: str, device: torch.device = "cpu", ckpt_engine_port: int = 33001
+    ):
         super().__init__(url)
         self.url = url
         self.device = device
@@ -96,7 +98,9 @@ class CkptEngineConnector(BaseConnector):
                 socket.close()
 
             if data is None:
-                raise RuntimeError("Rank 0 failed to receive or parse the ZMQ handle data.")
+                raise RuntimeError(
+                    "Rank 0 failed to receive or parse the ZMQ handle data."
+                )
 
             data_container[0] = data
             logger.info("Rank 0: Received handle data. Broadcasting to other ranks...")
