@@ -88,7 +88,7 @@ impl PDRouter {
 
                 match res.bytes().await {
                     Ok(body) => {
-                        let mut response = Response::new(axum::body::Body::from(body));
+                        let mut response = Response::new(Body::from(body));
                         *response.status_mut() = StatusCode::OK;
                         *response.headers_mut() = response_headers;
                         response
@@ -186,12 +186,6 @@ impl PDRouter {
         prefill_worker: &dyn Worker,
         batch_size: Option<usize>,
     ) -> Result<Value, String> {
-        let bootstrap_port = match prefill_worker.worker_type() {
-            crate::core::WorkerType::Prefill { bootstrap_port } => bootstrap_port,
-            _ => None,
-        };
-        let hostname = super::pd_types::get_hostname(prefill_worker.url());
-
         let obj = original
             .as_object_mut()
             .ok_or_else(|| "Request must be a JSON object".to_string())?;
@@ -201,13 +195,13 @@ impl PDRouter {
             let mut ports = Vec::with_capacity(n);
             let mut rooms = Vec::with_capacity(n);
             for _ in 0..n {
-                hosts.push(hostname.clone());
-                ports.push(bootstrap_port);
+                hosts.push(prefill_worker.bootstrap_host());
+                ports.push(prefill_worker.bootstrap_port());
                 rooms.push(super::pd_types::generate_room_id());
             }
             obj.insert(
                 "bootstrap_host".to_string(),
-                Value::Array(hosts.into_iter().map(serde_json::Value::from).collect()),
+                Value::Array(hosts.into_iter().map(Value::from).collect()),
             );
             obj.insert(
                 "bootstrap_port".to_string(),
@@ -215,7 +209,7 @@ impl PDRouter {
                     ports
                         .into_iter()
                         .map(|p| match p {
-                            Some(v) => serde_json::Value::from(v),
+                            Some(v) => Value::from(v),
                             None => Value::Null,
                         })
                         .collect(),
@@ -223,23 +217,23 @@ impl PDRouter {
             );
             obj.insert(
                 "bootstrap_room".to_string(),
-                Value::Array(rooms.into_iter().map(serde_json::Value::from).collect()),
+                Value::Array(rooms.into_iter().map(Value::from).collect()),
             );
         } else {
             obj.insert(
                 "bootstrap_host".to_string(),
-                serde_json::Value::from(hostname),
+                Value::from(prefill_worker.bootstrap_host()),
             );
             obj.insert(
                 "bootstrap_port".to_string(),
-                match bootstrap_port {
-                    Some(v) => serde_json::Value::from(v),
+                match prefill_worker.bootstrap_port() {
+                    Some(v) => Value::from(v),
                     None => Value::Null,
                 },
             );
             obj.insert(
                 "bootstrap_room".to_string(),
-                serde_json::Value::from(super::pd_types::generate_room_id()),
+                Value::from(super::pd_types::generate_room_id()),
             );
         }
         Ok(original)
@@ -514,8 +508,7 @@ impl PDRouter {
 
                         match res.bytes().await {
                             Ok(decode_body) => {
-                                let mut response =
-                                    Response::new(axum::body::Body::from(decode_body));
+                                let mut response = Response::new(Body::from(decode_body));
                                 *response.status_mut() = status;
                                 *response.headers_mut() = response_headers;
                                 response
@@ -957,7 +950,6 @@ impl RouterTrait for PDRouter {
     }
 
     async fn health_generate(&self, _req: Request<Body>) -> Response {
-        // Test model generation capability by selecting a random pair and testing them
         // Note: This endpoint actually causes the model to generate tokens, so we only test one pair
 
         // Select a random worker pair using the policy
@@ -972,7 +964,6 @@ impl RouterTrait for PDRouter {
             }
         };
 
-        // Test prefill server's health_generate
         let prefill_url = format!("{}/health_generate", prefill.url());
         let (prefill_result, decode_result) = tokio::join!(
             self.client.get(&prefill_url).send(),
@@ -1373,7 +1364,7 @@ mod tests {
         assert_eq!(decode_ref.load(), 0);
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
+        let stream = UnboundedReceiverStream::new(rx);
 
         let _response = router.create_streaming_response(
             stream.map(Ok),

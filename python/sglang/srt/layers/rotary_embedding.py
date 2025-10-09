@@ -29,7 +29,10 @@ _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 
 if _is_cuda:
-    from sgl_kernel import apply_rope_with_cos_sin_cache_inplace
+    from sgl_kernel import FusedSetKVBufferArg, apply_rope_with_cos_sin_cache_inplace
+else:
+    FusedSetKVBufferArg = None
+
 if _use_aiter:
     from aiter.rotary_embedding import get_rope as aiter_get_rope
 
@@ -150,8 +153,13 @@ class RotaryEmbedding(CustomOp):
         query: torch.Tensor,
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
+        fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """A PyTorch-native implementation of forward()."""
+        assert (
+            fused_set_kv_buffer_arg is None
+        ), "fused_set_kv_buffer_arg is not supported for native implementation"
+
         if offsets is not None:
             positions = positions + offsets
         positions = positions.flatten()
@@ -180,12 +188,17 @@ class RotaryEmbedding(CustomOp):
         query: torch.Tensor,
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
+        fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """A PyTorch-npu implementation of forward()."""
-        import os
+        assert (
+            fused_set_kv_buffer_arg is None
+        ), "fused_set_kv_buffer_arg is not supported for npu implementation"
 
         if get_bool_env_var("SGLANG_ENABLE_TORCH_COMPILE"):
-            return self.forward_native(positions, query, key, offsets)
+            return self.forward_native(
+                positions, query, key, offsets, fused_set_kv_buffer_arg
+            )
         else:
             rotary_mode = "half"
             if self.is_neox_style:
@@ -210,7 +223,12 @@ class RotaryEmbedding(CustomOp):
         query: torch.Tensor,
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
+        fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        assert (
+            fused_set_kv_buffer_arg is None
+        ), "fused_set_kv_buffer_arg is not supported for cpu implementation"
+
         positions = torch.add(positions, offsets) if offsets is not None else positions
         if _is_cpu_amx_available:
             return torch.ops.sgl_kernel.rotary_embedding_cpu(
@@ -222,7 +240,9 @@ class RotaryEmbedding(CustomOp):
                 self.is_neox_style,
             )
         else:
-            return self.forward_native(positions, query, key, offsets)
+            return self.forward_native(
+                positions, query, key, offsets, fused_set_kv_buffer_arg
+            )
 
     def forward_cuda(
         self,
@@ -230,7 +250,7 @@ class RotaryEmbedding(CustomOp):
         query: torch.Tensor,
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
-        fused_set_kv_buffer_arg=None,  # Optional[FusedSetKVBufferArg]
+        fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if _is_cuda and (self.head_size in [64, 128, 256, 512]):
             apply_rope_with_cos_sin_cache_inplace(
@@ -1059,6 +1079,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         positions: torch.Tensor,
         query: torch.Tensor,
         key: torch.Tensor,
+        fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """PyTorch-native implementation equivalent to forward().
 
@@ -1069,6 +1090,9 @@ class MRotaryEmbedding(RotaryEmbedding):
             query: [num_tokens, num_heads * head_size]
             key: [num_tokens, num_kv_heads * head_size]
         """
+        assert (
+            fused_set_kv_buffer_arg is None
+        ), "save kv cache is not supported for MRotaryEmbedding."
         assert positions.ndim == 1 or positions.ndim == 2
 
         num_tokens = positions.shape[-1]
