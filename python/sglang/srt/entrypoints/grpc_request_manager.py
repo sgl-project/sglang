@@ -409,11 +409,17 @@ class GrpcRequestManager:
         return future
 
     async def abort_request(self, request_id: str) -> bool:
-        """Abort a running request."""
+        """Abort a running request.
+
+        Sends abort request to scheduler, which will send back an AbortReq
+        that will be handled by _handle_abort_req to notify the client.
+        """
         # Skip aborting health check requests (they clean themselves up)
         if request_id.startswith("HEALTH_CHECK"):
             return False
 
+        # Send abort to scheduler - the scheduler will send AbortReq back
+        # which will be handled by _handle_abort_req
         abort_req = AbortReq(rid=request_id)
         try:
             await self._send_to_scheduler(abort_req)
@@ -421,19 +427,6 @@ class GrpcRequestManager:
         except Exception as e:
             logger.error(f"Failed to send abort request to scheduler: {e}")
             return False
-
-        if request_id in self.rid_to_state:
-            state = self.rid_to_state[request_id]
-            state.finished = True
-            state.stream_finished = True
-            state.event.set()
-
-            # Send abort notification to output queue
-            await state.out_queue.put({"error": "Request aborted", "abort": True})
-        else:
-            logger.debug(
-                f"Abort request for {request_id} not in local state (may have already finished or not started yet)"
-            )
 
         return True
 
@@ -460,6 +453,8 @@ class GrpcRequestManager:
                     await self._handle_embedding_output(recv_obj)
                 elif isinstance(recv_obj, HealthCheckOutput):
                     await self._handle_health_check_output(recv_obj)
+                elif isinstance(recv_obj, AbortReq):
+                    await self._handle_abort_req(recv_obj)
                 else:
                     logger.warning(f"Unknown output type: {type(recv_obj)}")
 
@@ -712,6 +707,67 @@ class GrpcRequestManager:
         state.finished = True
         state.finished_time = time.time()
         state.event.set()
+
+    async def _handle_abort_req(self, recv_obj: AbortReq):
+        """Handle abort request from scheduler.
+
+        The scheduler sends AbortReq back to notify us that a request was aborted,
+        either due to explicit abort_request() call or scheduler-initiated abort
+        (priority preemption, queue full, KV cache pressure, etc).
+        """
+        # Skip health check requests
+        if recv_obj.rid.startswith("HEALTH_CHECK"):
+            return
+
+        # Check if request still exists
+        if recv_obj.rid not in self.rid_to_state:
+            logger.debug(
+                f"Abort request for {request_id} not in local state (may have already finished or not started yet)"
+            )
+            return
+
+        state = self.rid_to_state[recv_obj.rid]
+
+        # Mark as finished
+        state.finished = True
+        state.stream_finished = True
+
+        # Create abort response
+        if recv_obj.finished_reason:
+            # Scheduler provided a specific finish reason (e.g., priority preemption, queue full)
+            abort_response = {
+                "request_id": recv_obj.rid,
+                "error": recv_obj.finished_reason.get("message", "Request aborted"),
+                "finished": True,
+                "meta_info": {
+                    "id": recv_obj.rid,
+                    "finish_reason": recv_obj.finished_reason,
+                },
+            }
+        else:
+            # Generic abort (e.g., explicit abort_request call)
+            abort_response = {
+                "request_id": recv_obj.rid,
+                "error": "Request aborted",
+                "finished": True,
+                "meta_info": {
+                    "id": recv_obj.rid,
+                    "finish_reason": {
+                        "type": "abort",
+                        "message": "Abort before prefill",
+                    },
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                },
+            }
+
+        # Send abort notification to output queue
+        await state.out_queue.put(abort_response)
+
+        # Wake up any waiting coroutines
+        state.event.set()
+
+        logger.debug(f"Handled abort request for {recv_obj.rid}")
 
     async def _send_to_scheduler(self, obj):
         """Send an object to the scheduler via ZMQ."""
