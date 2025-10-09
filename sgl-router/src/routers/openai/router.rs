@@ -137,37 +137,6 @@ impl OpenAIRouter {
         })
     }
 
-    // Accessor methods for use by other modules
-    #[allow(dead_code)]
-    pub(super) fn client(&self) -> &reqwest::Client {
-        &self.client
-    }
-
-    #[allow(dead_code)]
-    pub(super) fn circuit_breaker(&self) -> &CircuitBreaker {
-        &self.circuit_breaker
-    }
-
-    #[allow(dead_code)]
-    pub(super) fn response_storage(&self) -> &SharedResponseStorage {
-        &self.response_storage
-    }
-
-    #[allow(dead_code)]
-    pub(super) fn conversation_storage(&self) -> &SharedConversationStorage {
-        &self.conversation_storage
-    }
-
-    #[allow(dead_code)]
-    pub(super) fn conversation_item_storage(&self) -> &SharedConversationItemStorage {
-        &self.conversation_item_storage
-    }
-
-    #[allow(dead_code)]
-    pub(super) fn mcp_manager(&self) -> Option<&Arc<crate::mcp::McpClientManager>> {
-        self.mcp_manager.as_ref()
-    }
-
     /// Handle non-streaming response with optional MCP tool loop
     async fn handle_non_streaming_response(
         &self,
@@ -647,10 +616,10 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                     .into_response();
             }
 
-            // Load conversation history
+            // Load conversation history (descending order - most recent first)
             let params = ListParams {
                 limit: Self::MAX_CONVERSATION_HISTORY_ITEMS,
-                order: SortOrder::Asc,
+                order: SortOrder::Desc,
                 after: None,
             };
 
@@ -728,7 +697,9 @@ impl crate::routers::RouterTrait for OpenAIRouter {
             for key in [
                 "request_id",
                 "priority",
+                "top_k",
                 "frequency_penalty",
+                "presence_penalty",
                 "min_p",
                 "min_tokens",
                 "regex",
@@ -893,18 +864,19 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         _headers: Option<&HeaderMap>,
         conversation_id: &str,
         limit: Option<usize>,
-        _order: Option<String>,
+        order: Option<String>,
         after: Option<String>,
     ) -> Response {
-        let query_params = [
-            ("limit".to_string(), limit.unwrap_or(100).to_string()),
-            (
-                "after".to_string(),
-                after.unwrap_or_else(|| String::new()),
-            ),
-        ]
-        .into_iter()
-        .collect();
+        let mut query_params = std::collections::HashMap::new();
+        query_params.insert("limit".to_string(), limit.unwrap_or(100).to_string());
+        if let Some(after_val) = after {
+            if !after_val.is_empty() {
+                query_params.insert("after".to_string(), after_val);
+            }
+        }
+        if let Some(order_val) = order {
+            query_params.insert("order".to_string(), order_val);
+        }
 
         list_conversation_items(
             &self.conversation_storage,

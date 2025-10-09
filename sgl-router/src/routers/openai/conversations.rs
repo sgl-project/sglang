@@ -1,7 +1,7 @@
 //! Conversation CRUD operations and persistence
 
 use crate::data_connector::{
-    conversation_items::ListParams, conversation_items::SortOrder, ConversationId,
+    conversation_items::ListParams, conversation_items::SortOrder, Conversation, ConversationId,
     ConversationItemStorage, ConversationStorage, NewConversation, NewConversationItem,
     ResponseId, ResponseStorage, SharedConversationItemStorage, SharedConversationStorage,
     StoredResponse,
@@ -19,7 +19,6 @@ use tracing::{info, warn};
 use super::responses::extract_primary_output_text;
 
 /// Maximum number of properties allowed in conversation metadata
-#[allow(dead_code)]
 pub(crate) const MAX_METADATA_PROPERTIES: usize = 16;
 
 // ============================================================================
@@ -64,7 +63,7 @@ pub(super) async fn create_conversation(
             info!(conversation_id = %conversation.id.0, "Created conversation");
             (
                 StatusCode::OK,
-                Json(conversation_to_json(&conversation.id)),
+                Json(conversation_to_json(&conversation)),
             )
                 .into_response()
         }
@@ -87,8 +86,8 @@ pub(super) async fn get_conversation(
         .get_conversation(&conversation_id)
         .await
     {
-        Ok(Some(_conv_meta)) => {
-            (StatusCode::OK, Json(conversation_to_json(&conversation_id))).into_response()
+        Ok(Some(conversation)) => {
+            (StatusCode::OK, Json(conversation_to_json(&conversation))).into_response()
         }
         Ok(None) => (
             StatusCode::NOT_FOUND,
@@ -193,9 +192,9 @@ pub(super) async fn update_conversation(
         .update_conversation(&conversation_id, final_metadata)
         .await
     {
-        Ok(Some(_conv)) => {
+        Ok(Some(conversation)) => {
             info!(conversation_id = %conversation_id.0, "Updated conversation");
-            (StatusCode::OK, Json(conversation_to_json(&conversation_id))).into_response()
+            (StatusCode::OK, Json(conversation_to_json(&conversation))).into_response()
         }
         Ok(None) => (
             StatusCode::NOT_FOUND,
@@ -291,9 +290,19 @@ pub(super) async fn list_conversation_items(
 
     let after = query_params.get("after").map(|s| s.to_string());
 
+    // Default to descending order (most recent first)
+    let order = query_params
+        .get("order")
+        .and_then(|s| match s.as_str() {
+            "asc" => Some(SortOrder::Asc),
+            "desc" => Some(SortOrder::Desc),
+            _ => None,
+        })
+        .unwrap_or(SortOrder::Desc);
+
     let params = ListParams {
         limit,
-        order: SortOrder::Asc,
+        order,
         after,
     };
 
@@ -585,10 +594,21 @@ async fn persist_items_with_storages(
 // Helper Functions
 // ============================================================================
 
-/// Convert conversation ID to JSON response
-fn conversation_to_json(conv_id: &ConversationId) -> Value {
-    json!({
-        "id": conv_id.0,
-        "object": "realtime.conversation"
-    })
+/// Convert conversation to JSON response
+fn conversation_to_json(conversation: &Conversation) -> Value {
+    let mut response = json!({
+        "id": conversation.id.0,
+        "object": "conversation",
+        "created_at": conversation.created_at.timestamp()
+    });
+
+    if let Some(metadata) = &conversation.metadata {
+        if !metadata.is_empty() {
+            if let Some(obj) = response.as_object_mut() {
+                obj.insert("metadata".to_string(), Value::Object(metadata.clone()));
+            }
+        }
+    }
+
+    response
 }
