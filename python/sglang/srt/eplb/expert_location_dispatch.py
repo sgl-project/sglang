@@ -47,13 +47,11 @@ class ExpertLocationDispatchInfo:
 
         precomputed_balanced_tensor_map = {}
         if ep_dispatch_algorithm == "fake":
-            # 定义常见形状和参数用于预计算
             nnodes = global_server_args_dict["nnodes"]
             node_rank = global_server_args_dict["node_rank"]
             device = global_server_args_dict["device"]
             num_physical_experts = expert_location_metadata.num_physical_experts
             dispatch_node = global_server_args_dict["fake_node"]
-            # 创建虚拟 topk_ids 用于预计算
             dummy_topk_ids_shape = DUMMY_MAX_TOPK_SHAPE
             balanced_tensor = generate_balanced_expert_selection(
                 dummy_topk_ids_shape,
@@ -165,7 +163,8 @@ def generate_balanced_expert_selection(
 
     repeat = []
     remaining_list = []
-    for i in range(dispatch_node):  # Select experts from multiple nodes
+    # Select experts from multiple nodes
+    for i in range(dispatch_node):
         start = (node_rank + i) * experts_per_node
         end = (node_rank + i + 1) * experts_per_node
         base = torch.arange(start, end, device=device) % total_experts
