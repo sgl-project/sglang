@@ -301,10 +301,13 @@ class BaseFormatDetector(ABC):
                                 )
                             ],
                         )
-                        if not is_current_complete:
-                            self.streamed_args_for_tool[
-                                self.current_tool_id
-                            ] += argument_diff
+                        # Update streamed_args_for_tool to track what we've sent
+                        # Use completing_tool_id for completed tools (before current_tool_id was incremented)
+                        # Use current_tool_id for ongoing tools
+                        update_tool_id = (
+                            completing_tool_id if is_current_complete else self.current_tool_id
+                        )
+                        self.streamed_args_for_tool[update_tool_id] += argument_diff
 
             return res
 
