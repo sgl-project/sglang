@@ -304,7 +304,7 @@ impl StreamingProcessor {
                         !matches!(tool_choice, Some(ToolChoice::Value(ToolChoiceValue::None)));
 
                     if !in_reasoning && tool_choice_enabled && tools.is_some() {
-                        let (should_skip, tool_chunks) = self
+                        let tool_chunks = self
                             .process_tool_calls_stream(
                                 &delta,
                                 index,
@@ -325,10 +325,9 @@ impl StreamingProcessor {
                                 .map_err(|_| "Failed to send tool call chunk".to_string())?;
                         }
 
-                        // Continue to process the next chunk as we have tool chunks
-                        if should_skip {
-                            continue;
-                        }
+                        // Always skip regular content when tool parsing is active
+                        // Parser either emitted chunks or buffered content
+                        continue;
                     }
 
                     // Regular content emission
@@ -1034,7 +1033,7 @@ impl StreamingProcessor {
         created: u64,
         system_fingerprint: Option<&str>,
         history_tool_calls_count: usize,
-    ) -> (bool, Vec<ChatCompletionStreamResponse>) {
+    ) -> Vec<ChatCompletionStreamResponse> {
         let mut chunks = Vec::new();
 
         // Get or create parser for this index
@@ -1129,8 +1128,7 @@ impl StreamingProcessor {
                         });
                     }
 
-                    // If we emitted chunks, skip regular content
-                    return (!chunks.is_empty(), chunks);
+                    return chunks;
                 }
                 Err(e) => {
                     error!("Tool call parsing error: {}", e);
@@ -1138,7 +1136,7 @@ impl StreamingProcessor {
             }
         }
 
-        (false, chunks)
+        chunks
     }
 
     /// Format a response as SSE chunk into a reusable buffer
