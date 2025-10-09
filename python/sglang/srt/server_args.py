@@ -178,6 +178,8 @@ class ServerArgs:
     model_loader_extra_config: str = "{}"
     trust_remote_code: bool = False
     modelopt_quant: Optional[Union[str, Dict]] = None
+    modelopt_checkpoint_restore_path: Optional[str] = None
+    modelopt_checkpoint_save_path: Optional[str] = None
     context_length: Optional[int] = None
     is_embedding: bool = False
     enable_multimodal: Optional[bool] = None
