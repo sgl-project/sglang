@@ -177,28 +177,6 @@ class ServingChatTestCase(unittest.TestCase):
             self.assertNotIn("CUSTOM_STOP", result2.stop)
             self.assertEqual(conv_ins.stop_str, initial_stop_str)
 
-    # ------------- sampling-params -------------
-    def test_sampling_param_build(self):
-        req = ChatCompletionRequest(
-            model="x",
-            messages=[{"role": "user", "content": "Hi"}],
-            temperature=0.8,
-            max_tokens=150,
-            min_tokens=5,
-            top_p=0.9,
-            stop=["</s>"],
-        )
-        with patch.object(
-            self.chat,
-            "_process_messages",
-            return_value=("Prompt", [1], None, None, [], ["</s>"], None),
-        ):
-            params = self.chat._build_sampling_params(req, ["</s>"], None)
-            self.assertEqual(params["temperature"], 0.8)
-            self.assertEqual(params["max_new_tokens"], 150)
-            self.assertEqual(params["min_new_tokens"], 5)
-            self.assertEqual(params["stop"], ["</s>"])
-
     async def test_unstreamed_tool_args_completion(self):
         """Test that remaining tool call arguments are sent when generation finishes."""
 

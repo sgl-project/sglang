@@ -55,7 +55,7 @@ FetchContent_Populate(repo-cutlass)
 FetchContent_Declare(
     repo-deepgemm
     GIT_REPOSITORY https://github.com/sgl-project/DeepGEMM
-    GIT_TAG        sgl
+    GIT_TAG        4d23df0a07b057fbb4a44ff8666e528a600feb5e
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-deepgemm)
@@ -90,7 +90,7 @@ FetchContent_Populate(repo-flashinfer)
 FetchContent_Declare(
     repo-flash-attention
     GIT_REPOSITORY https://github.com/sgl-project/sgl-attn
-    GIT_TAG        sgl-kernel
+    GIT_TAG        f9af0c2a1d82ab1812e6987e9338363cc2bf0f8d
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-flash-attention)
@@ -268,6 +268,7 @@ set(SOURCES
     "csrc/elementwise/concat_mla.cu"
     "csrc/elementwise/fused_add_rms_norm_kernel.cu"
     "csrc/elementwise/rope.cu"
+    "csrc/elementwise/topk.cu"
     "csrc/common_extension.cc"
 
     "csrc/gemm/awq_kernel.cu"

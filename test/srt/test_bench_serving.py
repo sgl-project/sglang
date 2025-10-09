@@ -4,17 +4,20 @@ import unittest
 
 import requests
 
+from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.test_utils import (
     DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
     DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST_FP8,
     DEFAULT_MOE_MODEL_NAME_FOR_TEST,
+    DEFAULT_SMALL_MODEL_NAME_FOR_TEST_SCORE,
     DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST,
     CustomTestCase,
     is_in_amd_ci,
     is_in_ci,
     run_bench_serving,
+    run_score_benchmark,
     write_github_step_summary,
 )
 
@@ -403,7 +406,7 @@ class TestBenchServing(CustomTestCase):
             request_rate=float("inf"),
             random_input_len=1,
             random_output_len=1024,
-            other_server_args=["--pp", "2"],
+            other_server_args=["--pp-size", "2"],
             need_warmup=True,
             seed=42,
         )
@@ -426,8 +429,8 @@ class TestBenchServing(CustomTestCase):
             other_server_args=[
                 "--quantization",
                 "fp8",
-                "--pp",
-                2,
+                "--pp-size",
+                "2",
             ],
             need_warmup=False,
             seed=42,
@@ -439,6 +442,71 @@ class TestBenchServing(CustomTestCase):
                 f"input_throughput: {res['input_throughput']:.2f} ms\n"
             )
             self.assertGreater(res["input_throughput"], 4000)
+
+    def test_score_api_latency_throughput(self):
+        """Test score API latency and throughput performance"""
+        res = run_score_benchmark(
+            model=DEFAULT_SMALL_MODEL_NAME_FOR_TEST_SCORE,
+            num_requests=1000,
+            batch_size=10,
+            other_server_args=[],
+            need_warmup=True,
+        )
+
+        if is_in_ci():
+            write_github_step_summary(
+                f"### test_score_api_throughput\n"
+                f"Average latency: {res['avg_latency_ms']:.2f} ms\n"
+                f"P95 latency: {res['p95_latency_ms']:.2f} ms\n"
+                f"Score API throughput: {res['throughput']:.2f} req/s\n"
+                f"Successful requests: {res['successful_requests']}/{res['total_requests']}\n"
+            )
+
+        self.assertEqual(res["successful_requests"], res["total_requests"])
+        self.assertLess(res["avg_latency_ms"], 48)
+        self.assertLess(res["p95_latency_ms"], 50)
+        self.assertGreater(res["throughput"], 20)
+
+    def test_score_api_batch_scaling(self):
+        """Test score API performance with different batch sizes"""
+        batch_sizes = [10, 25, 50]
+
+        for batch_size in batch_sizes:
+            res = run_score_benchmark(
+                model=DEFAULT_SMALL_MODEL_NAME_FOR_TEST_SCORE,
+                num_requests=500,
+                batch_size=batch_size,
+            )
+
+            if is_in_ci():
+                write_github_step_summary(
+                    f"### test_score_api_batch_scaling_size_{batch_size}\n"
+                    f"Batch size: {batch_size}\n"
+                    f"Average latency: {res['avg_latency_ms']:.2f} ms\n"
+                    f"P95 latency: {res['p95_latency_ms']:.2f} ms\n"
+                    f"Throughput: {res['throughput']:.2f} req/s\n"
+                    f"Successful requests: {res['successful_requests']}/{res['total_requests']}\n"
+                )
+
+            self.assertEqual(res["successful_requests"], res["total_requests"])
+            if batch_size == 10:
+                avg_latency_bound = 45
+            elif batch_size == 25:
+                avg_latency_bound = 50
+            elif batch_size == 50:
+                avg_latency_bound = 60
+            else:
+                avg_latency_bound = 60
+            self.assertLess(res["avg_latency_ms"], avg_latency_bound)
+            if batch_size == 10:
+                p95_latency_bound = 50
+            elif batch_size == 25:
+                p95_latency_bound = 60
+            elif batch_size == 50:
+                p95_latency_bound = 65
+            else:
+                p95_latency_bound = 65
+            self.assertLess(res["p95_latency_ms"], p95_latency_bound)
 
 
 if __name__ == "__main__":
