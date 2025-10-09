@@ -316,17 +316,12 @@ pub(super) async fn list_conversation_items(
             let item_values: Vec<Value> = items
                 .iter()
                 .map(|item| {
-                    let mut obj = serde_json::Map::new();
-                    obj.insert("id".to_string(), json!(item.id.0));
-                    obj.insert("type".to_string(), json!(item.item_type));
-                    obj.insert("created_at".to_string(), json!(item.created_at));
-
-                    obj.insert("content".to_string(), item.content.clone());
-                    if let Some(status) = &item.status {
-                        obj.insert("status".to_string(), json!(status));
+                    let mut item_json = item_to_json(item);
+                    // Add created_at field for list view
+                    if let Some(obj) = item_json.as_object_mut() {
+                        obj.insert("created_at".to_string(), json!(item.created_at));
                     }
-
-                    Value::Object(obj)
+                    item_json
                 })
                 .collect();
 
