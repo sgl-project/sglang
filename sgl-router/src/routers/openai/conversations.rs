@@ -453,7 +453,58 @@ pub(super) async fn create_conversation_items(
     let added_at = Utc::now();
 
     for item_val in items_array {
-        // Parse item based on structure (input message, item, or item_reference)
+        let item_type = item_val
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("message");
+
+        // Handle item_reference specially - link existing item instead of creating new
+        if item_type == "item_reference" {
+            let ref_id = match item_val.get("id").and_then(|v| v.as_str()) {
+                Some(id) => id,
+                None => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({"error": "item_reference requires 'id' field"})),
+                    )
+                        .into_response();
+                }
+            };
+
+            let existing_item_id = ConversationItemId::from(ref_id);
+
+            // Retrieve the existing item
+            let existing_item = match item_storage.get_item(&existing_item_id).await {
+                Ok(Some(item)) => item,
+                Ok(None) => {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(json!({"error": format!("Referenced item '{}' not found", ref_id)})),
+                    )
+                        .into_response();
+                }
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": format!("Failed to get referenced item: {}", e)})),
+                    )
+                        .into_response();
+                }
+            };
+
+            // Link existing item to this conversation
+            if let Err(e) = item_storage
+                .link_item(&conversation_id, &existing_item.id, added_at)
+                .await
+            {
+                warn!("Failed to link item {}: {}", existing_item.id.0, e);
+            }
+
+            created_items.push(item_to_json(&existing_item));
+            continue;
+        }
+
+        // For non-reference items, parse and create normally
         let (new_item, warning) = match parse_item_from_value(item_val) {
             Ok((item, warn)) => (item, warn),
             Err(e) => {
@@ -656,32 +707,11 @@ fn parse_item_from_value(
         None
     };
 
-    // Handle item_reference specially
-    if item_type == "item_reference" {
-        let ref_id = item_val
-            .get("id")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "item_reference requires 'id' field".to_string())?;
-
-        return Ok((
-            NewConversationItem {
-                id: None,
-                response_id: None,
-                item_type: "item_reference".to_string(),
-                role: None,
-                content: json!({"id": ref_id}),
-                status: Some("completed".to_string()),
-            },
-            warning,
-        ));
-    }
-
     // Parse common fields
     let role = item_val
         .get("role")
         .and_then(|v| v.as_str())
         .map(String::from);
-    let content = item_val.get("content").cloned().unwrap_or(json!([]));
     let status = item_val
         .get("status")
         .and_then(|v| v.as_str())
@@ -692,6 +722,15 @@ fn parse_item_from_value(
     if item_type == "message" && role.is_none() {
         return Err("Message items require 'role' field".to_string());
     }
+
+    // For special types (mcp_call, function_tool_call, etc.), store the entire item_val as content
+    // For message types, use the content field directly
+    let content = if item_type == "message" || item_type == "reasoning" {
+        item_val.get("content").cloned().unwrap_or(json!([]))
+    } else {
+        // Store entire item for extraction later
+        item_val.clone()
+    };
 
     Ok((
         NewConversationItem {
@@ -707,6 +746,7 @@ fn parse_item_from_value(
 }
 
 /// Convert ConversationItem to JSON response format
+/// Extracts fields from content for special types (mcp_call, mcp_list_tools, etc.)
 fn item_to_json(item: &crate::data_connector::conversation_items::ConversationItem) -> Value {
     let mut obj = serde_json::Map::new();
     obj.insert("id".to_string(), json!(item.id.0));
@@ -716,7 +756,72 @@ fn item_to_json(item: &crate::data_connector::conversation_items::ConversationIt
         obj.insert("role".to_string(), json!(role));
     }
 
-    obj.insert("content".to_string(), item.content.clone());
+    // Handle special item types that need field extraction from content
+    match item.item_type.as_str() {
+        "mcp_call" => {
+            // Extract mcp_call fields: name, arguments, output, server_label, approval_request_id, error
+            if let Some(content_obj) = item.content.as_object() {
+                if let Some(name) = content_obj.get("name") {
+                    obj.insert("name".to_string(), name.clone());
+                }
+                if let Some(arguments) = content_obj.get("arguments") {
+                    obj.insert("arguments".to_string(), arguments.clone());
+                }
+                if let Some(output) = content_obj.get("output") {
+                    obj.insert("output".to_string(), output.clone());
+                }
+                if let Some(server_label) = content_obj.get("server_label") {
+                    obj.insert("server_label".to_string(), server_label.clone());
+                }
+                if let Some(approval_request_id) = content_obj.get("approval_request_id") {
+                    obj.insert("approval_request_id".to_string(), approval_request_id.clone());
+                }
+                if let Some(error) = content_obj.get("error") {
+                    obj.insert("error".to_string(), error.clone());
+                }
+            }
+        }
+        "mcp_list_tools" => {
+            // Extract mcp_list_tools fields: tools, server_label
+            if let Some(content_obj) = item.content.as_object() {
+                if let Some(tools) = content_obj.get("tools") {
+                    obj.insert("tools".to_string(), tools.clone());
+                }
+                if let Some(server_label) = content_obj.get("server_label") {
+                    obj.insert("server_label".to_string(), server_label.clone());
+                }
+            }
+        }
+        "function_tool_call" => {
+            // Extract function_tool_call fields: name, call_id, arguments
+            if let Some(content_obj) = item.content.as_object() {
+                if let Some(name) = content_obj.get("name") {
+                    obj.insert("name".to_string(), name.clone());
+                }
+                if let Some(call_id) = content_obj.get("call_id") {
+                    obj.insert("call_id".to_string(), call_id.clone());
+                }
+                if let Some(arguments) = content_obj.get("arguments") {
+                    obj.insert("arguments".to_string(), arguments.clone());
+                }
+            }
+        }
+        "function_call_output" => {
+            // Extract function_call_output fields: call_id, output
+            if let Some(content_obj) = item.content.as_object() {
+                if let Some(call_id) = content_obj.get("call_id") {
+                    obj.insert("call_id".to_string(), call_id.clone());
+                }
+                if let Some(output) = content_obj.get("output") {
+                    obj.insert("output".to_string(), output.clone());
+                }
+            }
+        }
+        _ => {
+            // For all other types (message, reasoning, etc.), keep content as-is
+            obj.insert("content".to_string(), item.content.clone());
+        }
+    }
 
     if let Some(status) = &item.status {
         obj.insert("status".to_string(), json!(status));
