@@ -387,7 +387,7 @@ void transfer_kv_per_layer_phf_lf(
     int64_t block_quota,
     int64_t num_warps_per_block) {
   at::Tensor empty;
-  transfer_kv_launcher<get_global_offset_phf<char>, get_global_offset_lf_hfrg<char>, false, true>(
+  transfer_kv_launcher<get_global_offset_phf<char>, get_global_offset_lf_hfrg<const char>, false, true>(
       src_k,
       dst_k,
       src_v,
