@@ -440,6 +440,47 @@ async fn v1_conversations_list_items(
         .await
 }
 
+#[derive(Deserialize, Default)]
+struct GetItemQuery {
+    /// Additional fields to include in response (not yet implemented)
+    include: Option<Vec<String>>,
+}
+
+async fn v1_conversations_create_items(
+    State(state): State<Arc<AppState>>,
+    Path(conversation_id): Path<String>,
+    headers: http::HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    state
+        .router
+        .create_conversation_items(Some(&headers), &conversation_id, &body)
+        .await
+}
+
+async fn v1_conversations_get_item(
+    State(state): State<Arc<AppState>>,
+    Path((conversation_id, item_id)): Path<(String, String)>,
+    Query(query): Query<GetItemQuery>,
+    headers: http::HeaderMap,
+) -> Response {
+    state
+        .router
+        .get_conversation_item(Some(&headers), &conversation_id, &item_id, query.include)
+        .await
+}
+
+async fn v1_conversations_delete_item(
+    State(state): State<Arc<AppState>>,
+    Path((conversation_id, item_id)): Path<(String, String)>,
+    headers: http::HeaderMap,
+) -> Response {
+    state
+        .router
+        .delete_conversation_item(Some(&headers), &conversation_id, &item_id)
+        .await
+}
+
 #[derive(Deserialize)]
 struct AddWorkerQuery {
     url: String,
@@ -716,7 +757,11 @@ pub fn build_app(
         )
         .route(
             "/v1/conversations/{conversation_id}/items",
-            get(v1_conversations_list_items),
+            get(v1_conversations_list_items).post(v1_conversations_create_items),
+        )
+        .route(
+            "/v1/conversations/{conversation_id}/items/{item_id}",
+            get(v1_conversations_get_item).delete(v1_conversations_delete_item),
         )
         .route_layer(axum::middleware::from_fn_with_state(
             app_state.clone(),
