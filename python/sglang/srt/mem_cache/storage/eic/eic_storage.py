@@ -408,7 +408,9 @@ class EICStorage(HiCacheStorage):
         exist_num = self.batch_exists([key])
         return exist_num == 1
 
-    def batch_exists(self, keys) -> int:
+    def batch_exists(
+        self, keys, extra_info: Optional[HiCacheStorageExtraInfo] = None
+    ) -> int:
         if len(keys) == 0:
             return 0
         if self.use_zero_copy and not self.is_mla_model:
