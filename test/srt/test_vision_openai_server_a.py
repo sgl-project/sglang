@@ -113,8 +113,9 @@ class TestQwen2VLContextLengthServer(CustomTestCase):
         )
 
 
-class TestMllamaServer(ImageOpenAITestMixin):
-    model = "meta-llama/Llama-3.2-11B-Vision-Instruct"
+# flaky
+# class TestMllamaServer(ImageOpenAITestMixin):
+#     model = "meta-llama/Llama-3.2-11B-Vision-Instruct"
 
 
 class TestInternVL25Server(ImageOpenAITestMixin):

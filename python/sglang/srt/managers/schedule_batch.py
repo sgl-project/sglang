@@ -36,6 +36,7 @@ TODO(lmzheng): ModelWorkerBatch seems a bit redundant and we consider removing i
 import copy
 import dataclasses
 import logging
+import threading
 import time
 from enum import Enum, auto
 from http import HTTPStatus
@@ -1830,28 +1831,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.spec_info:
             self.spec_info.merge_batch(other.spec_info)
 
-    def _get_seq_len_cpu(self, seq_lens_cpu_cache) -> torch.Tensor:
-        if self.forward_mode.is_decode_or_idle():
-            attention_backend_str = global_server_args_dict["decode_attention_backend"]
-        else:
-            attention_backend_str = global_server_args_dict["prefill_attention_backend"]
-
-        # Create seq_lens_cpu when needed
-        if (
-            not global_server_args_dict["use_mla_backend"]
-            and attention_backend_str == "flashinfer"
-        ):
-            # for meta-llama/Llama-3.2-11B-Vision-Instruct
-            seq_lens_cpu = None
-        else:
-            seq_lens_cpu = (
-                seq_lens_cpu_cache
-                if seq_lens_cpu_cache is not None
-                else self.seq_lens_cpu
-            )
-
-        return seq_lens_cpu
-
     def get_model_worker_batch(
         self, seq_lens_cpu_cache: Optional[torch.Tensor] = None
     ) -> ModelWorkerBatch:
@@ -1868,7 +1847,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             else:
                 self.sampling_info.grammars = None
 
-        seq_lens_cpu = self._get_seq_len_cpu(seq_lens_cpu_cache=seq_lens_cpu_cache)
+        seq_lens_cpu = (
+            seq_lens_cpu_cache if seq_lens_cpu_cache is not None else self.seq_lens_cpu
+        )
 
         return ModelWorkerBatch(
             forward_mode=self.forward_mode,
