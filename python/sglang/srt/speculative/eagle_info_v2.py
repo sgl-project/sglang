@@ -77,7 +77,7 @@ def assign_draft_cache_locs_page_size_1(
 class EagleDraftInputV2Mixin:
     def prepare_for_v2_draft(
         self: EagleDraftInput,
-        req_to_token_pool: "ReqToTokenPool",
+        req_to_token_pool: ReqToTokenPool,
         batch: ModelWorkerBatch,
         cuda_graph_runner: EAGLEDraftCudaGraphRunner,
         draft_model_runner: ModelRunner,
@@ -113,8 +113,9 @@ class EagleDraftInputV2Mixin:
 
 @dataclass
 class EagleVerifyInputV2Mixin:
-    def prepare_for_verify(
+    def prepare_for_v2_verify(
         self: EagleVerifyInput,
+        req_to_token_pool: ReqToTokenPool,
         batch: ModelWorkerBatch,
         target_worker: TpModelWorker,
     ):
@@ -130,16 +131,15 @@ class EagleVerifyInputV2Mixin:
 
         assign_extend_cache_locs[(bs,)](
             batch.req_pool_indices,
-            batch.req_to_token_pool.req_to_token,
+            req_to_token_pool.req_to_token,
             batch.seq_lens,
-            batch.seq_lens + self.num_draft_tokens,
+            batch.seq_lens + self.draft_token_num,
             batch.out_cache_loc,
-            batch.req_to_token_pool.req_to_token.shape[1],
+            req_to_token_pool.req_to_token.shape[1],
             next_power_of_2(bs),
         )
 
         # Get a forward batch
-        batch.spec_info = self
         batch.forward_mode = ForwardMode.TARGET_VERIFY
         batch.capture_hidden_mode = CaptureHiddenMode.FULL
         verify_forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)

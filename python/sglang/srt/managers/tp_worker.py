@@ -232,7 +232,11 @@ class TpModelWorker:
         self,
         model_worker_batch: ModelWorkerBatch,
         is_verify: bool = False,
+        skip_attn_backend_init=False,
     ) -> GenerationBatchResult:
+        # FIXME(lsyin): maybe remove skip_attn_backend_init in forward_batch_generation,
+        #               which requires preparing replay to always be in this function
+
         # update the consumer index of hicache to the running batch
         self.set_hicache_consumer(model_worker_batch.hicache_consumer_index)
 
@@ -248,7 +252,9 @@ class TpModelWorker:
 
         if self.pp_group.is_last_rank:
             logits_output, can_run_cuda_graph = self.model_runner.forward(
-                forward_batch, pp_proxy_tensors=pp_proxy_tensors
+                forward_batch,
+                pp_proxy_tensors=pp_proxy_tensors,
+                skip_attn_backend_init=skip_attn_backend_init,
             )
             batch_result = GenerationBatchResult(
                 logits_output=logits_output,
@@ -290,6 +296,7 @@ class TpModelWorker:
             pp_proxy_tensors, can_run_cuda_graph = self.model_runner.forward(
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
+                skip_attn_backend_init=skip_attn_backend_init,
             )
             return GenerationBatchResult(
                 pp_hidden_states_proxy_tensors=pp_proxy_tensors,

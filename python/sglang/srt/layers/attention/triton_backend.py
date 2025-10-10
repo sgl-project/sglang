@@ -162,6 +162,8 @@ class TritonAttnBackend(AttentionBackend):
         # Initialize forward metadata
         self.forward_metadata: ForwardMetadata = None
 
+        self.cuda_graph_custom_mask = None
+
     def get_num_kv_splits(
         self,
         num_kv_splits: torch.Tensor,

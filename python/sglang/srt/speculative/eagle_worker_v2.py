@@ -230,16 +230,19 @@ class EAGLEWorkerV2(EAGLEWorker):
         pre_draft_allocate_lens: torch.Tensor,
     ):
         # Parse args
-        spec_info: EagleVerifyInput = batch.spec_info
+        verify_input: EagleVerifyInput = batch.spec_info
         seq_lens_backup = batch.seq_lens
         bs = len(batch.seq_lens)
 
         # Batch 1: Target verify
         # Prepare for target verify in a separate stream
         with self.plan_stream_ctx:
-            verify_forward_batch, can_run_cuda_graph = spec_info.prepare_for_verify(
-                batch,
-                self.target_worker,
+            verify_forward_batch, can_run_cuda_graph = (
+                verify_input.prepare_for_v2_verify(
+                    self.req_to_token_pool,
+                    batch,
+                    self.target_worker,
+                )
             )
 
         # Correct some buffers due to the overlap plan
@@ -250,7 +253,7 @@ class EAGLEWorkerV2(EAGLEWorker):
             # so the previous plan step used the wrong values. Here, we need to run the related
             # computation again to update them to the correct values.
             self.target_worker.model_runner.attn_backend.update_verify_buffers_to_fill_after_draft(
-                spec_info,
+                verify_input,
                 (
                     self.target_worker.model_runner.graph_runner.bs
                     if can_run_cuda_graph
@@ -260,7 +263,7 @@ class EAGLEWorkerV2(EAGLEWorker):
 
         # Run target verify batch in the main compute stream
         forward_batch_output = self.target_worker.forward_batch_generation(
-            verify_forward_batch, skip_sample=True, skip_attn_backend_init=True
+            verify_forward_batch, is_verify=True, skip_attn_backend_init=True
         )
         logits_output = forward_batch_output.logits_output
 
@@ -270,7 +273,7 @@ class EAGLEWorkerV2(EAGLEWorker):
             predict,
             accept_length,
             accept_index,
-        ) = spec_info.sample(batch, logits_output)
+        ) = verify_input.sample(batch, logits_output)
         new_seq_lens = seq_lens_backup + accept_length
         verify_done = torch.cuda.Event()
 
