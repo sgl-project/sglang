@@ -85,8 +85,11 @@ class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
         if input_embeds is None:
             input_embeds = self.model.embed_tokens(input_ids)
 
-        input_embeds = self.pre_fc_norm_embedding(input_embeds)
-        hidden_states = self.pre_fc_norm_hidden(forward_batch.spec_info.hidden_states)
+        hidden_states = forward_batch.spec_info.hidden_states
+        # Some idle batch has 0 batch size. GemmaRMSNorm.forward would fail due to bs=0.
+        if not forward_batch.forward_mode.is_idle():
+            input_embeds = self.pre_fc_norm_embedding(input_embeds)
+            hidden_states = self.pre_fc_norm_hidden(hidden_states)
         hidden_states = self.fc(torch.cat((input_embeds, hidden_states), dim=-1))
 
         hidden_states = self.model(

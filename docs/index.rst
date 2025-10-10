@@ -28,6 +28,7 @@ The core features include:
    basic_usage/deepseek.md
    basic_usage/gpt_oss.md
    basic_usage/llama4.md
+   basic_usage/qwen3.md
 
 .. toctree::
    :maxdepth: 1
@@ -47,6 +48,7 @@ The core features include:
    advanced_features/router.md
    advanced_features/observability.md
    advanced_features/attention_backend.md
+   advanced_features/hicache.rst
 
 .. toctree::
    :maxdepth: 1

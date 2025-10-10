@@ -1,37 +1,30 @@
 from __future__ import annotations
 
-import asyncio
 import dataclasses
 import logging
-import queue
-import socket
+import os
 import struct
 import threading
+import time
 import uuid
 from collections import defaultdict
-from functools import cache
-from typing import Dict, List, Optional, Set, Tuple, TypeAlias, Union
+from typing import Dict, List, Optional, Set
 
 import numpy as np
 import numpy.typing as npt
 import requests
-import zmq
-from aiohttp import web
 
-from sglang.srt.disaggregation.base.conn import BaseKVSender, KVArgs, KVPoll
+from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll
 from sglang.srt.disaggregation.common.conn import (
     CommonKVBootstrapServer,
     CommonKVManager,
     CommonKVReceiver,
+    CommonKVSender,
 )
 from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import (
-    format_tcp_address,
-    get_local_ip_auto,
-    is_valid_ipv6_address,
-)
+from sglang.srt.utils import get_int_env_var
 
 logger = logging.getLogger(__name__)
 
@@ -113,7 +106,13 @@ class TransferStatus:
     def is_done(self):
         if self.num_kvs_expected is None:
             return False
+        # Check for failure state
+        if self.num_kvs_expected == -1:
+            return True  # Failed transfers are considered "done"
         return self.num_kvs_expected == len(self.received_kvs) and self.received_aux
+
+    def is_failed(self):
+        return self.num_kvs_expected == -1
 
 
 class NixlKVManager(CommonKVManager):
@@ -134,25 +133,132 @@ class NixlKVManager(CommonKVManager):
                 "to run SGLang with NixlTransferEngine."
             ) from e
         self.agent = nixl_agent(str(uuid.uuid4()))
-        self.local_ip = get_local_ip_auto()
-        self.server_socket = zmq.Context().socket(zmq.PULL)
-        if is_valid_ipv6_address(self.local_ip):
-            self.server_socket.setsockopt(zmq.IPV6, 1)
         self.register_buffer_to_engine()
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self.request_status: Dict[int, KVPoll] = {}
-            self.transfer_infos: Dict[int, Dict[str, TransferInfo]] = {}
-            self.decode_kv_args_table: Dict[str, KVArgsRegisterInfo] = {}
             self._start_bootstrap_thread()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.transfer_statuses: Dict[int, TransferStatus] = defaultdict(
                 TransferStatus
             )
+            self.heartbeat_failures = {}
+            self.session_pool = defaultdict(requests.Session)
+            self.session_pool_lock = threading.Lock()
+            self.addr_to_rooms_tracker = defaultdict(set)
+            self.connection_lock = threading.Lock()
+
+            # Heartbeat interval should be at least 2 seconds
+            self.heartbeat_interval = max(
+                float(os.getenv("SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL", 5.0)), 2.0
+            )
+            # Heartbeat failure should be at least 1
+            self.max_failures = max(
+                get_int_env_var("SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE", 2), 1
+            )
+            self._start_heartbeat_checker_thread()
         else:
             raise ValueError(
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
             )
+
+    def _start_heartbeat_checker_thread(self):
+        """
+        Start the heartbeat checker thread for Decode worker.
+        TODO (smor): unite nixl heartbeat checker with mooncake's.
+        """
+
+        def heartbeat_checker():
+            while True:
+                time.sleep(self.heartbeat_interval)
+                with self.connection_lock:
+                    addresses = list(self.prefill_dp_size_table.keys())
+
+                for bootstrap_addr in addresses:
+                    session = None
+                    try:
+                        with self.session_pool_lock:
+                            session = self.session_pool[bootstrap_addr]
+                        response = session.get(
+                            f"http://{bootstrap_addr}/health",
+                            timeout=(2, 3),
+                            headers={"Connection": "keep-alive"},
+                        )
+                        if response.status_code == 200:
+                            self.heartbeat_failures[bootstrap_addr] = 0
+
+                            current_rooms = self.addr_to_rooms_tracker[
+                                bootstrap_addr
+                            ].copy()
+
+                            for bootstrap_room in current_rooms:
+                                # Remove successful transfers from the tracker
+                                if bootstrap_room not in self.transfer_statuses:
+                                    self.addr_to_rooms_tracker[bootstrap_addr].discard(
+                                        bootstrap_room
+                                    )
+                        else:
+                            logger.info(
+                                f"Attempting to reconnect to {bootstrap_addr}..."
+                            )
+                            self.heartbeat_failures[bootstrap_addr] = (
+                                self.heartbeat_failures.get(bootstrap_addr, 0) + 1
+                            )
+                            with self.session_pool_lock:
+                                if bootstrap_addr in self.session_pool:
+                                    del self.session_pool[bootstrap_addr]
+                    except Exception:
+                        logger.info(f"Attempting to reconnect to {bootstrap_addr}...")
+                        self.heartbeat_failures[bootstrap_addr] = (
+                            self.heartbeat_failures.get(bootstrap_addr, 0) + 1
+                        )
+
+                    if (
+                        self.heartbeat_failures.get(bootstrap_addr, 0)
+                        >= self.max_failures
+                    ):
+                        self._handle_node_failure(bootstrap_addr)
+                        with self.session_pool_lock:
+                            if bootstrap_addr in self.session_pool:
+                                del self.session_pool[bootstrap_addr]
+
+        threading.Thread(target=heartbeat_checker, daemon=True).start()
+
+    def _handle_node_failure(self, failed_bootstrap_addr):
+        """Handle failure of a prefill node."""
+        with self.connection_lock:
+            keys_to_remove = [
+                k for k in self.connection_pool if k.startswith(failed_bootstrap_addr)
+            ]
+            for k in keys_to_remove:
+                del self.connection_pool[k]
+            if failed_bootstrap_addr in self.prefill_tp_size_table:
+                del self.prefill_tp_size_table[failed_bootstrap_addr]
+            if failed_bootstrap_addr in self.prefill_dp_size_table:
+                del self.prefill_dp_size_table[failed_bootstrap_addr]
+            if failed_bootstrap_addr in self.prefill_pp_size_table:
+                del self.prefill_pp_size_table[failed_bootstrap_addr]
+
+            possible_affected_rooms = self.addr_to_rooms_tracker.get(
+                failed_bootstrap_addr, []
+            )
+            if failed_bootstrap_addr in self.addr_to_rooms_tracker:
+                del self.addr_to_rooms_tracker[failed_bootstrap_addr]
+
+        # Mark all pending transfers associated with the failed node as failed
+        affected_rooms = []
+        for room in possible_affected_rooms:
+            if (
+                room in self.transfer_statuses
+                and not self.transfer_statuses[room].is_done()
+            ):
+                # Mark the transfer as failed by setting a special state
+                self.transfer_statuses[room].num_kvs_expected = -1  # Indicates failure
+                affected_rooms.append(room)
+
+        logger.error(
+            f"Lost connection with prefill instance (bootstrap_addr: {failed_bootstrap_addr}), "
+            f"{len(affected_rooms)} transfers affected"
+        )
 
     def check_status(self, bootstrap_room: int):
         return self.request_status[bootstrap_room]
@@ -165,6 +271,9 @@ class NixlKVManager(CommonKVManager):
             self.request_status[bootstrap_room] = max(
                 self.request_status[bootstrap_room], status
             )
+
+    def record_failure(self, bootstrap_room: int, failure_reason: str):
+        pass
 
     def register_buffer_to_engine(self):
         kv_addrs = []
@@ -210,14 +319,44 @@ class NixlKVManager(CommonKVManager):
 
         logger.debug(f"sending kvcache to {peer_name} with notif {notif}")
         # Make descs
-        num_layers = len(self.kv_args.kv_data_ptrs)
+        if self.is_mla_backend:
+            src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
+                self.get_mla_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
+            )
+            kv_item_len = self.kv_args.kv_item_lens[0]
+            layers_params = [
+                (
+                    src_kv_ptrs[layer_id],
+                    dst_kv_ptrs[layer_id],
+                    kv_item_len,
+                )
+                for layer_id in range(layers_current_pp_stage)
+            ]
+        else:
+            src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
+                self.get_mha_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
+            )
+
+            kv_item_len = self.kv_args.kv_item_lens[0]
+            layers_params = [
+                (
+                    src_k_ptrs[layer_id],
+                    dst_k_ptrs[layer_id],
+                    kv_item_len,
+                )
+                for layer_id in range(layers_current_pp_stage)
+            ] + [
+                (
+                    src_v_ptrs[layer_id],
+                    dst_v_ptrs[layer_id],
+                    kv_item_len,
+                )
+                for layer_id in range(layers_current_pp_stage)
+            ]
+
         src_addrs = []
         dst_addrs = []
-        for layer_id in range(num_layers):
-            src_ptr = self.kv_args.kv_data_ptrs[layer_id]
-            dst_ptr = dst_kv_ptrs[layer_id]
-            item_len = self.kv_args.kv_item_lens[layer_id]
-
+        for src_ptr, dst_ptr, item_len in layers_params:
             for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
                 src_addr = src_ptr + int(prefill_index[0]) * item_len
                 dst_addr = dst_ptr + int(decode_index[0]) * item_len
@@ -288,18 +427,15 @@ class NixlKVManager(CommonKVManager):
             num_heads_to_send = dst_heads_per_rank
             dst_head_start_offset = 0
 
+        src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
+            self.get_mha_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
+        )
         # Create transfer descriptors
         src_addrs = []
         dst_addrs = []
 
         bytes_per_token_on_prefill = src_kv_item_len // page_size
         bytes_per_token_on_decode = dst_kv_item_len // page_size
-
-        num_kv_layers = len(self.kv_args.kv_data_ptrs) // 2
-        src_k_ptrs = self.kv_args.kv_data_ptrs[:num_kv_layers]
-        src_v_ptrs = self.kv_args.kv_data_ptrs[num_kv_layers:]
-        dst_k_ptrs = dst_kv_ptrs[0 : len(src_k_ptrs)]
-        dst_v_ptrs = dst_kv_ptrs[num_kv_layers : num_kv_layers + len(src_v_ptrs)]
 
         # Calculate precise byte offset and length for the sub-slice within the token
         src_head_slice_offset = src_head_start_offset * bytes_per_head_slice_to_send
@@ -311,13 +447,13 @@ class NixlKVManager(CommonKVManager):
                 src_k_ptrs[layer_id],
                 dst_k_ptrs[layer_id],
             )
-            for layer_id in range(len(src_k_ptrs))
+            for layer_id in range(layers_current_pp_stage)
         ] + [
             (
                 src_v_ptrs[layer_id],
                 dst_v_ptrs[layer_id],
             )
-            for layer_id in range(len(src_v_ptrs))
+            for layer_id in range(layers_current_pp_stage)
         ]
 
         src_addrs = []
@@ -387,14 +523,19 @@ class NixlKVManager(CommonKVManager):
         dst_aux_index: int,
         notif: str,
     ):
-        # Make descs
-        aux_item_len = self.kv_args.aux_item_lens[0]
-        prefill_aux_addr = (
-            self.kv_args.aux_data_ptrs[0] + prefill_aux_index * aux_item_len
-        )
-        decode_aux_addr = dst_aux_ptrs[0] + dst_aux_index * aux_item_len
-        src_addrs = [(prefill_aux_addr, aux_item_len, 0)]
-        dst_addrs = [(decode_aux_addr, aux_item_len, 0)]
+        src_addrs = []
+        dst_addrs = []
+
+        prefill_aux_ptrs = self.kv_args.aux_data_ptrs
+        prefill_aux_item_lens = self.kv_args.aux_item_lens
+
+        for i, _ in enumerate(dst_aux_ptrs):
+            length = prefill_aux_item_lens[i]
+            src_addr = prefill_aux_ptrs[i] + length * prefill_aux_index
+            dst_addr = dst_aux_ptrs[i] + length * dst_aux_index
+            src_addrs.append((src_addr, length, 0))
+            dst_addrs.append((dst_addr, length, 0))
+
         src_descs = self.agent.get_xfer_descs(src_addrs, "DRAM")
         dst_descs = self.agent.get_xfer_descs(dst_addrs, "DRAM")
         # Transfer data
@@ -438,7 +579,7 @@ class NixlKVManager(CommonKVManager):
             notif = "_".join([str(req.room), "kv", str(chunk_id), str(int(is_last))])
             decode_tp_size = self.decode_kv_args_table[req.agent_name].decode_tp_size
 
-            if decode_tp_size == self.tp_size:
+            if self.is_mla_backend or (decode_tp_size == self.attn_tp_size):
                 kv_xfer_handle = self.send_kvcache(
                     req.agent_name,
                     kv_indices,
@@ -455,7 +596,7 @@ class NixlKVManager(CommonKVManager):
                     chunked_dst_kv_indice,
                     self.decode_kv_args_table[req.agent_name].gpu_id,
                     notif,
-                    prefill_tp_size=self.tp_size,
+                    prefill_tp_size=self.attn_tp_size,
                     decode_tp_size=decode_tp_size,
                     decode_tp_rank=self.decode_kv_args_table[
                         req.agent_name
@@ -467,7 +608,7 @@ class NixlKVManager(CommonKVManager):
 
             handles.append(kv_xfer_handle)
             # Only the last chunk we need to send the aux data.
-            if is_last:
+            if is_last and self.pp_group.is_last_rank:
                 assert aux_index is not None
                 aux_xfer_handle = self.send_aux(
                     req.agent_name,
@@ -504,9 +645,6 @@ class NixlKVManager(CommonKVManager):
         if room not in self.transfer_statuses:
             return False
         return self.transfer_statuses[room].is_done()
-
-    def _bind_server_socket(self):
-        self.server_socket.bind(format_tcp_address(self.local_ip, self.rank_port))
 
     def _start_bootstrap_thread(self):
         self._bind_server_socket()
@@ -548,7 +686,7 @@ class NixlKVManager(CommonKVManager):
         threading.Thread(target=bootstrap_thread).start()
 
 
-class NixlKVSender(BaseKVSender):
+class NixlKVSender(CommonKVSender):
 
     def __init__(
         self,
@@ -558,20 +696,10 @@ class NixlKVSender(BaseKVSender):
         dest_tp_ranks: List[int],
         pp_rank: int,
     ):
-        self.kv_mgr = mgr
-        self.bootstrap_room = bootstrap_room
-        self.aux_index = None
-        self.bootstrap_server_url = bootstrap_addr
+        super().__init__(mgr, bootstrap_addr, bootstrap_room, dest_tp_ranks, pp_rank)
         self.xfer_handles = []
         self.has_sent = False
         self.chunk_id = 0
-        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
-        # inner state
-        self.curr_idx = 0
-
-    def init(self, num_kv_indices: int, aux_index: Optional[int] = None):
-        self.num_kv_indices = num_kv_indices
-        self.aux_index = aux_index
 
     def send(
         self,
@@ -621,6 +749,12 @@ class NixlKVReceiver(CommonKVReceiver):
         self.conclude_state = None
         super().__init__(mgr, bootstrap_addr, bootstrap_room, prefill_dp_rank)
 
+        # Track this room with its bootstrap address for heartbeat monitoring
+        if hasattr(self.kv_mgr, "addr_to_rooms_tracker"):
+            self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(
+                self.bootstrap_room
+            )
+
     def init(self, kv_indices: npt.NDArray[np.int32], aux_index: Optional[int] = None):
         for bootstrap_info in self.bootstrap_infos:
             logger.debug(
@@ -655,9 +789,16 @@ class NixlKVReceiver(CommonKVReceiver):
 
         self.kv_mgr.update_transfer_status()
         if self.kv_mgr.check_transfer_done(self.bootstrap_room):  # type: ignore
-            self.conclude_state = KVPoll.Success
+            # Check if the transfer failed
+            if self.kv_mgr.transfer_statuses[self.bootstrap_room].is_failed():
+                self.conclude_state = KVPoll.Failed
+                logger.error(
+                    f"Transfer for room {self.bootstrap_room} failed due to node failure"
+                )
+            else:
+                self.conclude_state = KVPoll.Success
             del self.kv_mgr.transfer_statuses[self.bootstrap_room]
-            return KVPoll.Success  # type: ignore
+            return self.conclude_state  # type: ignore
         return KVPoll.WaitingForInput  # type: ignore
 
     def _register_kv_args(self):

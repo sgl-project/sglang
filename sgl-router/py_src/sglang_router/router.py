@@ -30,7 +30,7 @@ class Router:
             - PolicyType.RoundRobin: Distribute requests in round-robin fashion
             - PolicyType.CacheAware: Distribute requests based on cache state and load balance
             - PolicyType.PowerOfTwo: Select best of two random workers based on load (PD mode only)
-        host: Host address to bind the router server. Default: '127.0.0.1'
+        host: Host address to bind the router server. Supports IPv4, IPv6 (e.g., ::, ::1), or 0.0.0.0 for all interfaces. Default: '0.0.0.0'
         port: Port number to bind the router server. Default: 3001
         worker_startup_timeout_secs: Timeout in seconds for worker startup. Default: 300
         worker_startup_check_interval: Interval in seconds between checks for worker initialization. Default: 10
@@ -46,11 +46,14 @@ class Router:
         max_payload_size: Maximum payload size in bytes. Default: 256MB
         max_tree_size: Maximum size of the approximation tree for cache-aware routing. Default: 2^24
         dp_aware: Enable data parallelism aware schedule. Default: False
+        enable_igw: Enable IGW (Inference-Gateway) mode for multi-model support. When enabled,
+            the router can manage multiple models simultaneously with per-model load balancing
+            policies. Default: False
         api_key: The api key used for the authorization with the worker.
             Useful when the dp aware scheduling strategy is enabled.
             Default: None
         log_dir: Directory to store log files. If None, logs are only output to console. Default: None
-        log_level: Logging level. Options: 'debug', 'info', 'warning', 'error', 'critical'.
+        log_level: Logging level. Options: 'debug', 'info', 'warn', 'error'.
         service_discovery: Enable Kubernetes service discovery. When enabled, the router will
             automatically discover worker pods based on the selector. Default: False
         selector: Dictionary mapping of label keys to values for Kubernetes pod selection.
@@ -116,7 +119,7 @@ class Router:
         args_dict["prefill_policy"] = policy_from_str(args_dict["prefill_policy"])
         args_dict["decode_policy"] = policy_from_str(args_dict["decode_policy"])
 
-        # remoge mini_lb parameter
+        # remove mini_lb parameter
         args_dict.pop("mini_lb")
 
         return Router(_Router(**args_dict))
