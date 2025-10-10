@@ -1113,7 +1113,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         else:
             return out_cache_loc
 
-    def allocate_for_eagle(self):
+    def allocate_for_eagle_v2(self):
         from sglang.srt.speculative.eagle_info import EagleDraftInput
         from sglang.srt.speculative.spec_utils import assign_req_to_token_pool
 
@@ -1125,6 +1125,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             draft_input.verify_done.synchronize()
 
         # FIXME(lsyin): now implementation does not enable over-allocation
+        # Now new_seq_lens and allocate_lens are correct
+        self.seq_lens = draft_input.new_seq_lens
         new_allocate_lens = self.seq_lens + EagleDraftInput.ALLOC_LEN_PER_DECODE
         num_needed_tokens = (new_allocate_lens - draft_input.allocate_lens).sum().item()
         out_cache_loc = self.alloc_token_slots(num_needed_tokens)
@@ -1682,7 +1684,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         if self.is_v2_eagle:
             # FIXME(lsyin): make this sync optional
-            self.allocate_for_eagle()
+            self.allocate_for_eagle_v2()
 
         if not self.spec_algorithm.is_none():
             # if spec decoding is used, the decode batch is prepared inside
