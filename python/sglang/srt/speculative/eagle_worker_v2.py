@@ -394,6 +394,7 @@ class EAGLEWorkerV2(EAGLEWorker):
             new_seq_lens=batch.seq_lens,
             allocate_lens=batch.seq_lens,
         )
+        batch.spec_info = next_draft_input
 
         # Run forward
         forward_batch = ForwardBatch.init_new(batch, self.draft_model_runner)
