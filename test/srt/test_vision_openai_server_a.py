@@ -211,7 +211,7 @@ class TestGLM41VServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
 
 if __name__ == "__main__":
     del (
-        TestOpenAIOmniServerBase,
+        TestOpenAIMLLMServerBase,
         ImageOpenAITestMixin,
         VideoOpenAITestMixin,
         AudioOpenAITestMixin,
