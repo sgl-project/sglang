@@ -831,9 +831,8 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         - Respect explicit server flag `enable_tokenizer_batch_encode`.
         - Or, if every request only carries `input_ids` (no raw text/embeds), we still batch.
         """
-        return (
-            self.server_args.enable_tokenizer_batch_encode
-            or not _batch_has_text(batch_size, requests)
+        return self.server_args.enable_tokenizer_batch_encode or not _batch_has_text(
+            batch_size, requests
         )
 
     def _send_one_request(
