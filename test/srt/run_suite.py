@@ -138,7 +138,6 @@ suites = {
         TestFile("lora/test_lora_tp.py", 116),
         TestFile("rl/test_update_weights_from_distributed.py", 103),
         TestFile("test_data_parallelism.py", 73),
-        TestFile("test_disaggregation.py", 499),
         TestFile("test_dp_attention.py", 594),
         TestFile("test_load_weights_from_remote_instance.py", 72),
         TestFile("test_patch_torch.py", 19),
@@ -158,9 +157,6 @@ suites = {
     ],
     "per-commit-8-gpu": [
         TestFile("lora/test_lora_llama4.py", 400),
-        TestFile("test_disaggregation_dp_attention.py", 155),
-        TestFile("test_disaggregation_different_tp.py", 600),
-        TestFile("test_disaggregation_pp.py", 140),
         TestFile("test_deepseek_v3_basic.py", 275),
         TestFile("test_deepseek_v3_mtp.py", 275),
     ],
@@ -173,6 +169,16 @@ suites = {
     ],
     "per-commit-8-gpu-deepep": [
         TestFile("ep/test_deepep_large.py", 338),
+    ],
+    "per-commit-2-gpu-disaggregation": [
+        TestFile("test_disaggregation_basic.py", 400),
+    ],
+    "per-commit-4-gpu-disaggregation": [
+        TestFile("test_disaggregation_dp_attention.py", 155),
+    ],
+    "per-commit-8-gpu-disaggregation": [
+        TestFile("test_disaggregation_different_tp.py", 600),
+        TestFile("test_disaggregation_pp.py", 140),
     ],
     "per-commit-8-gpu-h20": [
         TestFile("quant/test_w4a8_deepseek_v3.py", 371),
