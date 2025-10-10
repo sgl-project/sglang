@@ -677,13 +677,12 @@ pub fn generate_tool_call_id(
 ///
 /// If a parser name is explicitly configured, use that parser.
 /// Otherwise, auto-detect based on the model name.
+/// Get a pooled reasoning parser (for non-streaming where state doesn't matter)
 pub fn get_reasoning_parser(
-    reasoning_parser_factory: &crate::reasoning_parser::ReasoningParserFactory,
+    reasoning_parser_factory: &crate::reasoning_parser::ParserFactory,
     configured_parser: Option<&String>,
     model: &str,
 ) -> crate::reasoning_parser::PooledParser {
-    use tracing::warn;
-
     if let Some(parser_name) = configured_parser {
         // Use configured parser if specified
         reasoning_parser_factory
@@ -702,17 +701,40 @@ pub fn get_reasoning_parser(
     }
 }
 
+/// Create a fresh reasoning parser instance (for streaming where state isolation is needed)
+pub fn create_reasoning_parser(
+    reasoning_parser_factory: &crate::reasoning_parser::ParserFactory,
+    configured_parser: Option<&String>,
+    model: &str,
+) -> Option<Box<dyn crate::reasoning_parser::ReasoningParser>> {
+    if let Some(parser_name) = configured_parser {
+        // Use configured parser if specified
+        reasoning_parser_factory
+            .registry()
+            .create_parser(parser_name)
+            .or_else(|| {
+                warn!(
+                    "Configured reasoning parser '{}' not found, falling back to model-based selection",
+                    parser_name
+                );
+                reasoning_parser_factory.registry().create_for_model(model)
+            })
+    } else {
+        // Auto-detect based on model
+        reasoning_parser_factory.registry().create_for_model(model)
+    }
+}
+
 /// Get the appropriate tool parser for a model
 ///
 /// If a parser name is explicitly configured, use that parser.
 /// Otherwise, auto-detect based on the model name.
+/// Get a pooled tool parser (for non-streaming where state doesn't matter)
 pub fn get_tool_parser(
-    tool_parser_factory: &crate::tool_parser::ToolParserFactory,
+    tool_parser_factory: &crate::tool_parser::ParserFactory,
     configured_parser: Option<&String>,
     model: &str,
-) -> crate::tool_parser::PooledToolParser {
-    use tracing::warn;
-
+) -> crate::tool_parser::PooledParser {
     if let Some(parser_name) = configured_parser {
         // Use configured parser if specified
         tool_parser_factory
@@ -728,6 +750,30 @@ pub fn get_tool_parser(
     } else {
         // Auto-detect based on model
         tool_parser_factory.get_pooled(model)
+    }
+}
+
+/// Create a fresh tool parser instance (for streaming where state isolation is needed)
+pub fn create_tool_parser(
+    tool_parser_factory: &crate::tool_parser::ParserFactory,
+    configured_parser: Option<&String>,
+    model: &str,
+) -> Option<Box<dyn crate::tool_parser::ToolParser>> {
+    if let Some(parser_name) = configured_parser {
+        // Use configured parser if specified
+        tool_parser_factory
+            .registry()
+            .create_parser(parser_name)
+            .or_else(|| {
+                warn!(
+                    "Configured tool parser '{}' not found, falling back to model-based selection",
+                    parser_name
+                );
+                tool_parser_factory.registry().create_for_model(model)
+            })
+    } else {
+        // Auto-detect based on model
+        tool_parser_factory.registry().create_for_model(model)
     }
 }
 
