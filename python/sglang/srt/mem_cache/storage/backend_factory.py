@@ -161,7 +161,7 @@ class StorageBackendFactory:
         if backend_name == "file":
             return backend_class(storage_config)
         elif backend_name == "nixl":
-            return backend_class()
+            return backend_class(storage_config)
         elif backend_name == "mooncake":
             backend = backend_class(storage_config)
             return backend
