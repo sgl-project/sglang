@@ -175,7 +175,6 @@ class Engine(EngineBase):
             for item in ret:
                 _trim_one(item)
             return ret
-
         return ret
     
     def generate(
