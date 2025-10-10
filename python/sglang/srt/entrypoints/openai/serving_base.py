@@ -244,14 +244,6 @@ class OpenAIServingBase(ABC):
             }
         return custom_labels
 
-    def build_metric_labels(
-        self, endpoint_path: Optional[str] = None, http_status: Optional[str] = None
-    ) -> Dict[str, str]:
-        """Build metric labels based on server configuration flags."""
-        return build_metric_labels(
-            self.tokenizer_manager.server_args, endpoint_path, http_status
-        )
-
     def _label_and_observe_one_received_request(
         self,
         raw_request: Request,
@@ -264,7 +256,8 @@ class OpenAIServingBase(ABC):
             return
 
         # Build metric labels for this request.
-        metric_labels = self.build_metric_labels(
+        metric_labels = build_metric_labels(
+            self.tokenizer_manager.server_args,
             raw_request.url.path,
             http_status,
         )

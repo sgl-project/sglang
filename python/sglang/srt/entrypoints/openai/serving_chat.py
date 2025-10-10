@@ -33,6 +33,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
+    build_metric_labels,
     process_hidden_states_from_ret,
     to_openai_style_logprobs,
 )
@@ -162,7 +163,9 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Extract custom labels from raw request headers and build metric labels
         custom_labels = self.extract_custom_labels(raw_request) or {}
-        metric_labels = self.build_metric_labels("/v1/chat/completions")
+        metric_labels = build_metric_labels(
+            self.tokenizer_manager.server_args, "/v1/chat/completions"
+        )
         custom_labels = {**custom_labels, **metric_labels}
 
         adapted_request = GenerateReqInput(
