@@ -1123,10 +1123,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         draft_input: EagleDraftInput = self.spec_info
 
         # FIXME(lsyin): now implementation does not enable over-allocation
-        # Now new_seq_lens and allocate_lens are correct
+        # Now seq_lens and allocate_lens are correct
         self.maybe_wait_verify_done()
 
-        self.seq_lens = draft_input.new_seq_lens
         new_allocate_lens = self.seq_lens + EagleDraftInput.ALLOC_LEN_PER_DECODE
         num_needed_tokens = (new_allocate_lens - draft_input.allocate_lens).sum().item()
         out_cache_loc = self.alloc_token_slots(num_needed_tokens)
