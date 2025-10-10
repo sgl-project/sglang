@@ -249,7 +249,6 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         if finish_reason and "matched" in finish_reason
                         else None
                     ),
-                    cache_hit_rate=content["meta_info"].get("cache_hit_rate", None),
                 )
                 chunk = CompletionStreamResponse(
                     id=content["meta_info"]["id"],
@@ -395,7 +394,6 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     else None
                 ),
                 hidden_states=hidden_states,
-                cache_hit_rate=ret_item["meta_info"].get("cache_hit_rate", None),
             )
             choices.append(choice_data)
 

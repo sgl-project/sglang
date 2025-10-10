@@ -613,12 +613,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     if delta:
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=index,
-                            delta=DeltaMessage(
-                                content=delta,
-                                cache_hit_rate=content["meta_info"].get(
-                                    "cache_hit_rate", None
-                                ),
-                            ),
+                            delta=DeltaMessage(content=delta),
                             finish_reason=None,
                             matched_stop=None,
                             logprobs=choice_logprobs,
@@ -803,7 +798,6 @@ class OpenAIServingChat(OpenAIServingBase):
                     content=text if text else None,
                     tool_calls=tool_calls,
                     reasoning_content=reasoning_text if reasoning_text else None,
-                    cache_hit_rate=ret_item["meta_info"].get("cache_hit_rate", None),
                 ),
                 logprobs=choice_logprobs,
                 finish_reason=finish_reason["type"] if finish_reason else None,

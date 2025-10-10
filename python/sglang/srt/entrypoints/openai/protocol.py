@@ -255,15 +255,12 @@ class CompletionResponseChoice(BaseModel):
     finish_reason: Optional[Literal["stop", "length", "content_filter", "abort"]] = None
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
-    cache_hit_rate: Optional[float] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
         if self.hidden_states is None:
             data.pop("hidden_states", None)
-        if self.cache_hit_rate is None:
-            data.pop("cache_hit_rate", None)
         return data
 
 
@@ -284,15 +281,12 @@ class CompletionResponseStreamChoice(BaseModel):
     finish_reason: Optional[Literal["stop", "length", "content_filter", "abort"]] = None
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
-    cache_hit_rate: Optional[float] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
         if self.hidden_states is None:
             data.pop("hidden_states", None)
-        if self.cache_hit_rate is None:
-            data.pop("cache_hit_rate", None)
         return data
 
 
@@ -575,14 +569,6 @@ class ChatMessage(BaseModel):
     content: Optional[str] = None
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
-    cache_hit_rate: Optional[float] = None
-
-    @model_serializer(mode="wrap")
-    def _serialize(self, handler):
-        data = handler(self)
-        if self.cache_hit_rate is None:
-            data.pop("cache_hit_rate", None)
-        return data
 
 
 class ChatCompletionResponseChoice(BaseModel):
@@ -621,15 +607,12 @@ class DeltaMessage(BaseModel):
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
     hidden_states: Optional[object] = None
-    cache_hit_rate: Optional[float] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
         if self.hidden_states is None:
             data.pop("hidden_states", None)
-        if self.cache_hit_rate is None:
-            data.pop("cache_hit_rate", None)
         return data
 
 
@@ -683,14 +666,6 @@ class EmbeddingObject(BaseModel):
     embedding: List[float]
     index: int
     object: str = "embedding"
-    cache_hit_rate: Optional[float] = None
-
-    @model_serializer(mode="wrap")
-    def _serialize(self, handler):
-        data = handler(self)
-        if self.cache_hit_rate is None:
-            data.pop("cache_hit_rate", None)
-        return data
 
 
 class EmbeddingResponse(BaseModel):

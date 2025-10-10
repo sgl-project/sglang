@@ -144,8 +144,6 @@ class ReqState:
 
     # Prefix cache hit rate
     cache_hit_rate: Optional[float] = None
-    # Whether the cache hit rate was sent in the response for streaming requests.
-    cache_hit_rate_sent: bool = False
 
 
 class TokenizerManager(TokenizerCommunicatorMixin):
