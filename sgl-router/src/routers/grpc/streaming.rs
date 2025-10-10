@@ -17,22 +17,25 @@ use tokio_stream::StreamExt;
 use tonic::codec::Streaming;
 use tracing::{debug, error, warn};
 
+use super::context;
+use super::utils;
 use crate::grpc_client::proto;
 use crate::protocols::spec::*;
 use crate::reasoning_parser::ReasoningParser;
 use crate::tokenizer::stop::{SequenceDecoderOutput, StopSequenceDecoder};
 use crate::tokenizer::traits::Tokenizer;
 use crate::tool_parser::ToolParser;
-
-use super::context;
-use super::utils;
+use proto::generate_complete::MatchedStop::{MatchedStopStr, MatchedTokenId};
+use proto::generate_response::Response::{Chunk, Complete, Error};
+use std::time::Instant;
+use tokio::sync::mpsc;
 
 /// Shared streaming processor for both single and dual dispatch modes
 #[derive(Clone)]
 pub struct StreamingProcessor {
     tokenizer: Arc<dyn Tokenizer>,
-    tool_parser_factory: crate::tool_parser::ToolParserFactory,
-    reasoning_parser_factory: crate::reasoning_parser::ReasoningParserFactory,
+    tool_parser_factory: crate::tool_parser::ParserFactory,
+    reasoning_parser_factory: crate::reasoning_parser::ParserFactory,
     configured_tool_parser: Option<String>,
     configured_reasoning_parser: Option<String>,
 }
@@ -40,8 +43,8 @@ pub struct StreamingProcessor {
 impl StreamingProcessor {
     pub fn new(
         tokenizer: Arc<dyn Tokenizer>,
-        tool_parser_factory: crate::tool_parser::ToolParserFactory,
-        reasoning_parser_factory: crate::reasoning_parser::ReasoningParserFactory,
+        tool_parser_factory: crate::tool_parser::ParserFactory,
+        reasoning_parser_factory: crate::reasoning_parser::ParserFactory,
         configured_tool_parser: Option<String>,
         configured_reasoning_parser: Option<String>,
     ) -> Self {
@@ -63,9 +66,9 @@ impl StreamingProcessor {
     pub fn process_streaming_response(
         self: Arc<Self>,
         execution_result: context::ExecutionResult,
-        chat_request: ChatCompletionRequest,
+        chat_request: Arc<ChatCompletionRequest>,
         dispatch: context::DispatchMetadata,
-    ) -> axum::response::Response {
+    ) -> Response {
         use bytes::Bytes;
         use tokio::sync::mpsc;
 
@@ -153,7 +156,7 @@ impl StreamingProcessor {
         mut grpc_stream: Streaming<proto::GenerateResponse>,
         dispatch: context::DispatchMetadata,
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool),
-        original_request: ChatCompletionRequest,
+        original_request: Arc<ChatCompletionRequest>,
         tx: &UnboundedSender<Result<Bytes, io::Error>>,
     ) -> Result<(), String> {
         // Extract request parameters
@@ -173,7 +176,7 @@ impl StreamingProcessor {
         let mut cached_tokens: HashMap<u32, u32> = HashMap::new();
 
         // Parser state (lazy initialization per index)
-        type PooledReasoningParser = Arc<std::sync::Mutex<Box<dyn ReasoningParser>>>;
+        type PooledReasoningParser = Arc<tokio::sync::Mutex<Box<dyn ReasoningParser>>>;
         let mut reasoning_parsers: HashMap<u32, PooledReasoningParser> = HashMap::new();
 
         type PooledToolParser = Arc<tokio::sync::Mutex<Box<dyn ToolParser>>>;
@@ -183,18 +186,62 @@ impl StreamingProcessor {
         // Per-index stop decoders (each index needs its own state for n>1 support)
         let mut stop_decoders: HashMap<u32, StopSequenceDecoder> = HashMap::new();
 
+        // Reusable SSE formatting buffer to avoid allocations per chunk
+        let mut sse_buffer = Vec::with_capacity(512);
+
         // Use dispatch metadata for consistent response fields
         let request_id = &dispatch.request_id;
         let model = &dispatch.model;
         let created = dispatch.created;
         let system_fingerprint = dispatch.weight_version.as_deref();
 
+        // Check parser availability once upfront (log warning only once per request)
+        let reasoning_parser_available = if separate_reasoning {
+            if let Some(parser_name) = self.configured_reasoning_parser.as_ref() {
+                self.reasoning_parser_factory
+                    .registry()
+                    .has_parser(parser_name)
+            } else {
+                self.reasoning_parser_factory
+                    .registry()
+                    .has_parser_for_model(model)
+            }
+        } else {
+            false
+        };
+
+        let tool_parser_available = if tools.is_some() {
+            if let Some(parser_name) = self.configured_tool_parser.as_ref() {
+                self.tool_parser_factory.registry().has_parser(parser_name)
+            } else {
+                self.tool_parser_factory
+                    .registry()
+                    .has_parser_for_model(model)
+            }
+        } else {
+            false
+        };
+
+        if separate_reasoning && !reasoning_parser_available {
+            warn!(
+                "No reasoning parser found for model '{}', skipping reasoning parsing",
+                model
+            );
+        }
+
+        if tools.is_some() && !tool_parser_available {
+            warn!(
+                "No tool parser found for model '{}', skipping tool call parsing",
+                model
+            );
+        }
+
         // Phase 2: Main streaming loop
         while let Some(response) = grpc_stream.next().await {
             let gen_response = response.map_err(|e| format!("Stream error: {}", e))?;
 
             match gen_response.response {
-                Some(proto::generate_response::Response::Chunk(chunk)) => {
+                Some(Chunk(chunk)) => {
                     let index = chunk.index;
 
                     // Get or create stop decoder for this index
@@ -259,7 +306,8 @@ impl StreamingProcessor {
                             }],
                             usage: None,
                         };
-                        tx.send(Ok(Bytes::from(Self::format_sse_chunk(&first_chunk))))
+                        Self::format_sse_chunk_into(&mut sse_buffer, &first_chunk);
+                        tx.send(Ok(Bytes::from(sse_buffer.clone())))
                             .map_err(|_| "Failed to send first chunk".to_string())?;
                         is_firsts.insert(index, false);
                     }
@@ -269,7 +317,7 @@ impl StreamingProcessor {
                     stream_buffer.push_str(&delta);
 
                     // Reasoning content handling
-                    let in_reasoning = if separate_reasoning {
+                    let in_reasoning = if separate_reasoning && reasoning_parser_available {
                         let (normal_text, reasoning_chunk, in_reasoning) = self
                             .process_reasoning_stream(
                                 &delta,
@@ -279,9 +327,11 @@ impl StreamingProcessor {
                                 model,
                                 created,
                                 system_fingerprint,
-                            );
+                            )
+                            .await;
                         if let Some(chunk) = reasoning_chunk {
-                            tx.send(Ok(Bytes::from(Self::format_sse_chunk(&chunk))))
+                            Self::format_sse_chunk_into(&mut sse_buffer, &chunk);
+                            tx.send(Ok(Bytes::from(sse_buffer.clone())))
                                 .map_err(|_| "Failed to send reasoning chunk".to_string())?;
                         }
                         delta = normal_text;
@@ -294,8 +344,12 @@ impl StreamingProcessor {
                     let tool_choice_enabled =
                         !matches!(tool_choice, Some(ToolChoice::Value(ToolChoiceValue::None)));
 
-                    if !in_reasoning && tool_choice_enabled && tools.is_some() {
-                        let (should_skip, tool_chunks) = self
+                    if !in_reasoning
+                        && tool_choice_enabled
+                        && tools.is_some()
+                        && tool_parser_available
+                    {
+                        let tool_chunks = self
                             .process_tool_calls_stream(
                                 &delta,
                                 index,
@@ -311,14 +365,14 @@ impl StreamingProcessor {
                             .await;
 
                         for chunk in tool_chunks {
-                            tx.send(Ok(Bytes::from(Self::format_sse_chunk(&chunk))))
+                            Self::format_sse_chunk_into(&mut sse_buffer, &chunk);
+                            tx.send(Ok(Bytes::from(sse_buffer.clone())))
                                 .map_err(|_| "Failed to send tool call chunk".to_string())?;
                         }
 
-                        // Continue to process the next chunk as we have tool chunks
-                        if should_skip {
-                            continue;
-                        }
+                        // Always skip regular content when tool parsing is active
+                        // Parser either emitted chunks or buffered content
+                        continue;
                     }
 
                     // Regular content emission
@@ -332,11 +386,12 @@ impl StreamingProcessor {
                             system_fingerprint,
                             choice_logprobs,
                         );
-                        tx.send(Ok(Bytes::from(Self::format_sse_chunk(&content_chunk))))
+                        Self::format_sse_chunk_into(&mut sse_buffer, &content_chunk);
+                        tx.send(Ok(Bytes::from(sse_buffer.clone())))
                             .map_err(|_| "Failed to send content chunk".to_string())?;
                     }
                 }
-                Some(proto::generate_response::Response::Complete(complete)) => {
+                Some(Complete(complete)) => {
                     let index = complete.index;
 
                     // Flush any remaining text for this index's stop_decoder
@@ -385,19 +440,17 @@ impl StreamingProcessor {
 
                     // Extract matched_stop
                     let matched_stop_value = match &complete.matched_stop {
-                        Some(proto::generate_complete::MatchedStop::MatchedTokenId(token_id)) => {
+                        Some(MatchedTokenId(token_id)) => {
                             Some(Value::Number(serde_json::Number::from(*token_id)))
                         }
-                        Some(proto::generate_complete::MatchedStop::MatchedStopStr(stop_str)) => {
-                            Some(Value::String(stop_str.clone()))
-                        }
+                        Some(MatchedStopStr(stop_str)) => Some(Value::String(stop_str.clone())),
                         None => None,
                     };
                     matched_stops.insert(index, matched_stop_value);
 
                     // Don't break - continue reading all Complete messages for n>1
                 }
-                Some(proto::generate_response::Response::Error(error)) => {
+                Some(Error(error)) => {
                     return Err(error.message);
                 }
                 None => continue,
@@ -528,7 +581,7 @@ impl StreamingProcessor {
         decode_stream: Streaming<proto::GenerateResponse>,
         dispatch: context::DispatchMetadata,
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool),
-        original_request: ChatCompletionRequest,
+        original_request: Arc<ChatCompletionRequest>,
         tx: &UnboundedSender<Result<Bytes, io::Error>>,
     ) -> Result<(), String> {
         // Phase 1.5: Collect input_logprobs from prefill stream if requested
@@ -536,12 +589,12 @@ impl StreamingProcessor {
             while let Some(response) = prefill_stream.next().await {
                 let gen_response = response.map_err(|e| format!("Prefill stream error: {}", e))?;
                 match gen_response.response {
-                    Some(proto::generate_response::Response::Complete(_complete)) => {
+                    Some(Complete(_complete)) => {
                         // Input logprobs collected but not yet used in streaming
                         // (OpenAI spec doesn't require prompt logprobs in streaming responses)
                         break;
                     }
-                    Some(proto::generate_response::Response::Error(error)) => {
+                    Some(Error(error)) => {
                         return Err(format!("Prefill error: {}", error.message));
                     }
                     _ => continue,
@@ -554,23 +607,358 @@ impl StreamingProcessor {
             .await
     }
 
-    // TODO(generate): Add streaming generate handler
-    //
-    // pub async fn process_streaming_generate(
-    //     self: Arc<Self>,
-    //     execution_result: context::ExecutionResult,
-    //     generate_request: GenerateRequest,
-    //     dispatch: context::DispatchMetadata,
-    // ) -> axum::response::Response {
-    //     // Similar to process_streaming_response but:
-    //     // - No tool parsing
-    //     // - No reasoning parsing
-    //     // - Simpler chunk format (just text + finish_reason + logprobs)
-    //     // - Extract stop params from generate_request.sampling_params
-    //     // - Use same per-index stop decoder logic
-    //     // - Emit SSE chunks with format similar to chat but without delta.tool_calls
-    //     // Reference: router.rs:422-595
-    // }
+    /// Process streaming generate response and return SSE response
+    ///
+    /// Simpler than chat - no tool/reasoning parsing, just text accumulation
+    pub fn process_streaming_generate(
+        self: Arc<Self>,
+        execution_result: context::ExecutionResult,
+        generate_request: Arc<GenerateRequest>,
+        dispatch: context::DispatchMetadata,
+    ) -> Response {
+        let return_logprob = generate_request.return_logprob;
+
+        // Create SSE channel
+        let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, io::Error>>();
+
+        // Spawn background task based on execution mode
+        match execution_result {
+            context::ExecutionResult::Single { stream } => {
+                let tokenizer = self.tokenizer.clone();
+                let request_id = dispatch.request_id.clone();
+                let weight_version = dispatch
+                    .weight_version
+                    .clone()
+                    .unwrap_or_else(|| "default".to_string());
+                tokio::spawn(async move {
+                    let result = Self::process_generate_streaming(
+                        tokenizer,
+                        stream,
+                        request_id,
+                        weight_version,
+                        return_logprob,
+                        &tx,
+                    )
+                    .await;
+
+                    if let Err(e) = result {
+                        let error_chunk = format!("data: {{\"error\": \"{}\"}}\n\n", e);
+                        let _ = tx.send(Ok(Bytes::from(error_chunk)));
+                    }
+
+                    let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
+                });
+            }
+            context::ExecutionResult::Dual { prefill, decode } => {
+                // For PD mode, need to handle prefill stream for input_logprobs
+                let tokenizer = self.tokenizer.clone();
+                let request_id = dispatch.request_id.clone();
+                let weight_version = dispatch
+                    .weight_version
+                    .clone()
+                    .unwrap_or_else(|| "default".to_string());
+                tokio::spawn(async move {
+                    let result = Self::process_generate_streaming_dual(
+                        tokenizer,
+                        prefill,
+                        *decode,
+                        request_id,
+                        weight_version,
+                        return_logprob,
+                        &tx,
+                    )
+                    .await;
+
+                    if let Err(e) = result {
+                        let error_chunk = format!("data: {{\"error\": \"{}\"}}\n\n", e);
+                        let _ = tx.send(Ok(Bytes::from(error_chunk)));
+                    }
+
+                    let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
+                });
+            }
+        }
+
+        // Return SSE response
+        build_sse_response(rx)
+    }
+
+    //TODO add streaming logprob support
+    /// Process streaming chunks for generate endpoint (no tool/reasoning parsing)
+    async fn process_generate_streaming(
+        tokenizer: Arc<dyn Tokenizer>,
+        mut stream: Streaming<proto::GenerateResponse>,
+        request_id: String,
+        weight_version: String,
+        _include_logprobs: bool,
+        tx: &UnboundedSender<Result<Bytes, io::Error>>,
+    ) -> Result<(), String> {
+        let start_time = Instant::now();
+
+        // Track state per index for n>1 case
+        let mut accumulated_texts: HashMap<u32, String> = HashMap::new();
+        let mut completion_tokens_map: HashMap<u32, u32> = HashMap::new();
+
+        while let Some(response) = stream.next().await {
+            let gen_response = response.map_err(|e| format!("Stream error: {}", e))?;
+
+            match gen_response.response {
+                Some(Chunk(chunk)) => {
+                    let index = chunk.index;
+
+                    // Update completion tokens for this index
+                    let completion_tokens = completion_tokens_map.entry(index).or_insert(0);
+                    *completion_tokens += chunk.token_ids.len() as u32;
+
+                    // Decode tokens to text (skip_special_tokens=true to handle newlines correctly)
+                    let chunk_text = tokenizer.decode(&chunk.token_ids, true).unwrap_or_default();
+
+                    // Accumulate text for this index
+                    let accumulated_text = accumulated_texts.entry(index).or_default();
+                    accumulated_text.push_str(&chunk_text);
+
+                    // Generate unique ID per index
+                    let index_id = format!("{}-{}", request_id, index);
+
+                    // Build streaming response chunk (SGLang format)
+                    let chunk_response = serde_json::json!({
+                        "text": accumulated_text.clone(),
+                        "output_ids": chunk.token_ids,
+                        "meta_info": {
+                            "id": index_id,
+                            "finish_reason": null,
+                            "prompt_tokens": chunk.prompt_tokens,
+                            "weight_version": &weight_version,
+                            "completion_tokens": *completion_tokens,
+                            "cached_tokens": chunk.cached_tokens
+                        },
+                        "index": index
+                    });
+
+                    let sse_chunk = format!(
+                        "data: {}\n\n",
+                        serde_json::to_string(&chunk_response).unwrap()
+                    );
+                    tx.send(Ok(Bytes::from(sse_chunk)))
+                        .map_err(|_| "Failed to send chunk".to_string())?;
+                }
+                Some(Complete(complete)) => {
+                    let index = complete.index;
+                    let accumulated_text =
+                        accumulated_texts.get(&index).cloned().unwrap_or_default();
+                    let completion_tokens = *completion_tokens_map.get(&index).unwrap_or(&0);
+                    let index_id = format!("{}-{}", request_id, index);
+                    let e2e_latency = start_time.elapsed().as_secs_f64();
+
+                    // Send final chunk with finish_reason
+                    let finish_response = serde_json::json!({
+                        "text": accumulated_text,
+                        "output_ids": complete.output_ids[complete.output_ids.len().saturating_sub(1)..].to_vec(),
+                        "meta_info": {
+                            "id": index_id,
+                            "finish_reason": complete.finish_reason,
+                            "prompt_tokens": complete.prompt_tokens,
+                            "weight_version": &weight_version,
+                            "completion_tokens": completion_tokens,
+                            "cached_tokens": complete.cached_tokens,
+                            "e2e_latency": e2e_latency
+                        },
+                        "index": index
+                    });
+
+                    let sse_chunk = format!(
+                        "data: {}\n\n",
+                        serde_json::to_string(&finish_response).unwrap()
+                    );
+                    tx.send(Ok(Bytes::from(sse_chunk)))
+                        .map_err(|_| "Failed to send finish chunk".to_string())?;
+
+                    // Continue to process all completions if n>1
+                }
+                Some(Error(error)) => {
+                    return Err(error.message);
+                }
+                None => continue,
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Process dual streaming for generate endpoint (PD mode with logprobs support)
+    async fn process_generate_streaming_dual(
+        tokenizer: Arc<dyn Tokenizer>,
+        mut prefill_stream: Streaming<proto::GenerateResponse>,
+        decode_stream: Streaming<proto::GenerateResponse>,
+        request_id: String,
+        weight_version: String,
+        return_logprob: bool,
+        tx: &UnboundedSender<Result<Bytes, io::Error>>,
+    ) -> Result<(), String> {
+        // Collect input_logprobs from prefill stream if requested
+        let input_token_logprobs = if return_logprob {
+            let mut input_logprobs = None;
+            while let Some(response) = prefill_stream.next().await {
+                let gen_response = response.map_err(|e| format!("Prefill stream error: {}", e))?;
+                match gen_response.response {
+                    Some(Complete(complete)) => {
+                        // Extract input_logprobs from prefill Complete message (convert proto to SGLang format)
+                        input_logprobs = complete
+                            .input_logprobs
+                            .as_ref()
+                            .map(utils::convert_generate_input_logprobs);
+                        break;
+                    }
+                    Some(Error(error)) => {
+                        return Err(format!("Prefill error: {}", error.message));
+                    }
+                    _ => continue,
+                }
+            }
+            input_logprobs
+        } else {
+            None
+        };
+
+        // Process decode stream with input_logprobs prepended
+        Self::process_generate_streaming_with_input_logprobs(
+            tokenizer,
+            decode_stream,
+            request_id,
+            weight_version,
+            return_logprob,
+            input_token_logprobs,
+            tx,
+        )
+        .await
+    }
+
+    /// Process generate streaming with optional input_logprobs
+    async fn process_generate_streaming_with_input_logprobs(
+        tokenizer: Arc<dyn Tokenizer>,
+        mut stream: Streaming<proto::GenerateResponse>,
+        request_id: String,
+        weight_version: String,
+        _include_logprobs: bool,
+        input_token_logprobs: Option<Vec<Vec<Option<f64>>>>,
+        tx: &UnboundedSender<Result<Bytes, io::Error>>,
+    ) -> Result<(), String> {
+        let start_time = Instant::now();
+
+        // Track state per index for n>1 case
+        let mut accumulated_texts: HashMap<u32, String> = HashMap::new();
+        let mut accumulated_output_logprobs: HashMap<u32, Option<Vec<Vec<Option<f64>>>>> =
+            HashMap::new();
+        let mut completion_tokens_map: HashMap<u32, u32> = HashMap::new();
+
+        while let Some(response) = stream.next().await {
+            let gen_response = response.map_err(|e| format!("Stream error: {}", e))?;
+
+            match gen_response.response {
+                Some(Chunk(chunk)) => {
+                    let index = chunk.index;
+
+                    // Update completion tokens for this index
+                    let completion_tokens = completion_tokens_map.entry(index).or_insert(0);
+                    *completion_tokens += chunk.token_ids.len() as u32;
+
+                    // Decode tokens to text
+                    let chunk_text = tokenizer.decode(&chunk.token_ids, true).unwrap_or_default();
+
+                    // Accumulate text for this index
+                    let accumulated_text = accumulated_texts.entry(index).or_default();
+                    accumulated_text.push_str(&chunk_text);
+
+                    // Store latest output logprobs (cumulative from proto, convert to SGLang format)
+                    if let Some(ref output_logprobs) = chunk.output_logprobs {
+                        let converted = utils::convert_generate_output_logprobs(output_logprobs);
+                        accumulated_output_logprobs.insert(index, Some(converted));
+                    }
+
+                    // Generate unique ID per index
+                    let index_id = format!("{}-{}", request_id, index);
+
+                    // Build streaming response chunk with cumulative logprobs
+                    let current_output_logprobs = accumulated_output_logprobs
+                        .get(&index)
+                        .and_then(|o| o.as_ref());
+
+                    let chunk_response = serde_json::json!({
+                        "text": accumulated_text.clone(),
+                        "output_ids": chunk.token_ids,
+                        "meta_info": {
+                            "id": index_id,
+                            "finish_reason": null,
+                            "prompt_tokens": chunk.prompt_tokens,
+                            "weight_version": &weight_version,
+                            "input_token_logprobs": input_token_logprobs.as_ref(),
+                            "output_token_logprobs": current_output_logprobs,
+                            "completion_tokens": *completion_tokens,
+                            "cached_tokens": chunk.cached_tokens
+                        },
+                        "index": index
+                    });
+
+                    let sse_chunk = format!(
+                        "data: {}\n\n",
+                        serde_json::to_string(&chunk_response).unwrap()
+                    );
+                    tx.send(Ok(Bytes::from(sse_chunk)))
+                        .map_err(|_| "Failed to send chunk".to_string())?;
+                }
+                Some(Complete(complete)) => {
+                    let index = complete.index;
+                    let accumulated_text =
+                        accumulated_texts.get(&index).cloned().unwrap_or_default();
+                    let completion_tokens = *completion_tokens_map.get(&index).unwrap_or(&0);
+                    let final_output_logprobs = accumulated_output_logprobs
+                        .get(&index)
+                        .and_then(|o| o.as_ref());
+                    let index_id = format!("{}-{}", request_id, index);
+                    let e2e_latency = start_time.elapsed().as_secs_f64();
+
+                    // Parse finish_reason
+                    let finish_reason = utils::parse_finish_reason(
+                        &complete.finish_reason,
+                        complete.completion_tokens,
+                    );
+
+                    // Send final chunk with finish_reason
+                    let finish_response = serde_json::json!({
+                        "text": accumulated_text,
+                        "output_ids": complete.output_ids[complete.output_ids.len().saturating_sub(1)..].to_vec(),
+                        "meta_info": {
+                            "id": index_id,
+                            "finish_reason": finish_reason,
+                            "prompt_tokens": complete.prompt_tokens,
+                            "weight_version": &weight_version,
+                            "input_token_logprobs": input_token_logprobs.as_ref(),
+                            "output_token_logprobs": final_output_logprobs,
+                            "completion_tokens": completion_tokens,
+                            "cached_tokens": complete.cached_tokens,
+                            "e2e_latency": e2e_latency
+                        },
+                        "index": index
+                    });
+
+                    let sse_chunk = format!(
+                        "data: {}\n\n",
+                        serde_json::to_string(&finish_response).unwrap()
+                    );
+                    tx.send(Ok(Bytes::from(sse_chunk)))
+                        .map_err(|_| "Failed to send finish chunk".to_string())?;
+
+                    // Continue to process all completions if n>1
+                }
+                Some(Error(error)) => {
+                    return Err(error.message);
+                }
+                None => continue,
+            }
+        }
+
+        Ok(())
+    }
 
     // ========================================================================
     // Helper Methods
@@ -609,28 +997,30 @@ impl StreamingProcessor {
 
     /// Helper: Process reasoning content in streaming mode
     #[allow(clippy::too_many_arguments)]
-    fn process_reasoning_stream(
+    async fn process_reasoning_stream(
         &self,
         delta: &str,
         index: u32,
-        reasoning_parsers: &mut HashMap<u32, Arc<std::sync::Mutex<Box<dyn ReasoningParser>>>>,
+        reasoning_parsers: &mut HashMap<u32, Arc<tokio::sync::Mutex<Box<dyn ReasoningParser>>>>,
         request_id: &str,
         model: &str,
         created: u64,
         system_fingerprint: Option<&str>,
     ) -> (String, Option<ChatCompletionStreamResponse>, bool) {
-        // Get or create parser for this index
+        // Create fresh parser for this index (not pooled, to avoid state pollution)
         reasoning_parsers.entry(index).or_insert_with(|| {
-            utils::get_reasoning_parser(
+            let parser = utils::create_reasoning_parser(
                 &self.reasoning_parser_factory,
                 self.configured_reasoning_parser.as_ref(),
                 model,
             )
+            .expect("Parser should be available - checked upfront");
+            Arc::new(tokio::sync::Mutex::new(parser))
         });
 
         if let Some(pooled_parser) = reasoning_parsers.get(&index) {
             let (parse_result, in_reasoning) = {
-                let mut parser = pooled_parser.lock().unwrap();
+                let mut parser = pooled_parser.lock().await;
                 let result = parser.parse_reasoning_streaming_incremental(delta);
                 let in_reasoning = parser.is_in_reasoning();
                 (result, in_reasoning)
@@ -690,20 +1080,23 @@ impl StreamingProcessor {
         created: u64,
         system_fingerprint: Option<&str>,
         history_tool_calls_count: usize,
-    ) -> (bool, Vec<ChatCompletionStreamResponse>) {
+    ) -> Vec<ChatCompletionStreamResponse> {
         let mut chunks = Vec::new();
 
-        // Get or create parser for this index
+        // Create fresh parser for this index (not pooled, to avoid state pollution)
         tool_parsers.entry(index).or_insert_with(|| {
-            utils::get_tool_parser(
+            let parser = utils::create_tool_parser(
                 &self.tool_parser_factory,
                 self.configured_tool_parser.as_ref(),
                 model,
             )
+            .expect("Parser should be available - checked upfront");
+            Arc::new(tokio::sync::Mutex::new(parser))
         });
 
         if let Some(pooled_parser) = tool_parsers.get(&index) {
             let mut parser = pooled_parser.lock().await;
+
             match parser.parse_incremental(delta, tools).await {
                 Ok(crate::tool_parser::StreamingParseResult { normal_text, calls }) => {
                     // Emit normal text if present
@@ -785,8 +1178,7 @@ impl StreamingProcessor {
                         });
                     }
 
-                    // If we emitted chunks, skip regular content
-                    return (!chunks.is_empty(), chunks);
+                    return chunks;
                 }
                 Err(e) => {
                     error!("Tool call parsing error: {}", e);
@@ -794,18 +1186,23 @@ impl StreamingProcessor {
             }
         }
 
-        (false, chunks)
+        chunks
     }
 
-    /// Format a response as SSE chunk
-    fn format_sse_chunk(chunk: &ChatCompletionStreamResponse) -> String {
-        match serde_json::to_string(chunk) {
-            Ok(json) => format!("data: {}\n\n", json),
-            Err(e) => {
-                error!("Failed to serialize SSE chunk: {}", e);
-                format!("data: {}\n\n", json!({"error": "serialization_failed"}))
-            }
+    /// Format a response as SSE chunk into a reusable buffer
+    /// This avoids allocations by reusing the same buffer across multiple chunks
+    #[inline]
+    fn format_sse_chunk_into(buffer: &mut Vec<u8>, chunk: &ChatCompletionStreamResponse) {
+        buffer.clear();
+        buffer.extend_from_slice(b"data: ");
+        if let Err(e) = serde_json::to_writer(&mut *buffer, chunk) {
+            error!("Failed to serialize SSE chunk: {}", e);
+            buffer.clear();
+            buffer.extend_from_slice(b"data: ");
+            let error_msg = json!({"error": "serialization_failed"}).to_string();
+            buffer.extend_from_slice(error_msg.as_bytes());
         }
+        buffer.extend_from_slice(b"\n\n");
     }
 
     /// Create a content chunk response
@@ -842,9 +1239,7 @@ impl StreamingProcessor {
 }
 
 /// Build SSE response with proper headers
-pub fn build_sse_response(
-    rx: tokio::sync::mpsc::UnboundedReceiver<Result<Bytes, io::Error>>,
-) -> Response {
+pub fn build_sse_response(rx: mpsc::UnboundedReceiver<Result<Bytes, io::Error>>) -> Response {
     let stream = UnboundedReceiverStream::new(rx);
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = StatusCode::OK;
