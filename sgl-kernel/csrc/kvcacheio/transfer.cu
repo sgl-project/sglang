@@ -182,7 +182,7 @@ __global__ void transfer_kernel_impl(
   }
 }
 
-template <auto SrcOffsetFn, auto DstOffsetFn, bool IsMLA>
+template <auto SrcOffsetFn, auto DstOffsetFn, bool IsMLA, int HeadFragmentNum = 1>
 void transfer_kv_launcher(
     const at::Tensor& src_k,
     at::Tensor& dst_k,
