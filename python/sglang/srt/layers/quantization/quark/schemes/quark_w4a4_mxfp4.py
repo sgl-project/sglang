@@ -28,12 +28,23 @@ class QuarkW4A4MXFP4(QuarkScheme):
         self,
         weight_quant_spec: dict[str, Any],
         input_quant_spec: dict[str, Any],
+        online: bool,
         layer_name: Optional[str] = None,
     ):
+        """
+        Initializes the quantization scheme for the layer.
+
+        Args:
+            weight_quant_spec (dict[str, Any]): Specification for weight quantization.
+            input_quant_spec (dict[str, Any]): Specification for input quantization.
+            online (bool): Whether to use online quantization, which loads full/half precision weight and quantize post loading.
+            layer_name (Optional[str], optional): Name of the layer for debugging purpose. Defaults to None.
+        """
         self.out_dtype = torch.get_default_dtype()
         self.qscheme = "per_group"
         self.weight_quant_spec = weight_quant_spec
         self.input_quant_spec = input_quant_spec
+        self.online = online
         self.layer_name = layer_name
 
     @classmethod
@@ -58,10 +69,11 @@ class QuarkW4A4MXFP4(QuarkScheme):
         return w, mx_scales
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if self.weight_quant_spec.get("is_dynamic") is True:
+        if self.online:
             # NOTE: This step happens after `post_load_weights` for deepseek models.
             # So it is safe for kv_b_proj quantization of w_kc and w_vc in `quark_post_load_weights`
             # since kv_b_proj.weight at that point is still bfloat16.
+            assert layer.weight.dtype in {torch.bfloat16, torch.float16}
             w, mx_scales = self.mxfp4_quantize(layer.weight.data)
             weight = PackedvLLMParameter(
                 data=w,
@@ -87,7 +99,7 @@ class QuarkW4A4MXFP4(QuarkScheme):
         layer.logical_widths = output_partition_sizes
 
         # WEIGHT
-        if self.weight_quant_spec.get("is_dynamic") is True:
+        if self.online:
             # Create and load bfloat16 weight
             # quantize to mxfp4 during `process_weights_after_loading`
             pack_factor = 1

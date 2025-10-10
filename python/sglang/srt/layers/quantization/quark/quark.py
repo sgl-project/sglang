@@ -202,6 +202,11 @@ class QuarkConfig(QuantizationConfig):
             logger.debug("Quark model is not in MX-FP4 format: not group_size=32")
             return False
 
+        # Weights need to use static quantization.
+        if weight_quant.get("is_dynamic") is True:
+            logger.debug("Quark model is not in MX-FP4 format: not weight static")
+            return False
+
         # Activations need to use dynamic quantization.
         if input_quant.get("is_dynamic") is False:
             logger.debug("Quark model is not in MX-FP4 format: not activation dynamic")
@@ -273,14 +278,16 @@ class QuarkConfig(QuantizationConfig):
             )
         weight_config = cast(dict[str, Any], config.get("weight"))
         input_config = cast(dict[str, Any], config.get("input_tensors"))
+        online = cast(bool, config.get("online", False))
 
         if self._is_mx_fp4(weight_config, input_config):
-            return QuarkW4A4MXFP4(weight_config, input_config, layer_name)
+            return QuarkW4A4MXFP4(weight_config, input_config, online, layer_name)
 
         raise NotImplementedError(
             "No quark compatible scheme was found. "
             f"Weight config: {weight_config}, "
-            f"Input config: {input_config}"
+            f"Input config: {input_config}, "
+            f"online: {online}"
         )
 
     def get_scheme(self, layer: torch.nn.Module, layer_name: str) -> "QuarkScheme":
