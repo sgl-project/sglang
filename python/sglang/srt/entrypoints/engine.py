@@ -158,9 +158,11 @@ class Engine(EngineBase):
         def _trim_one(item):
             if not isinstance(item, dict):
                 return item
-            output_ids = item.get("output_ids", [])
-            meta_info = item.get("meta_info", {})
-            completion_tokens = meta_info.get("completion_tokens", 0)
+            output_ids = item.get("output_ids")
+            meta_info = item.get("meta_info")
+            if not isinstance(meta_info, dict):
+                meta_info = {}
+            completion_tokens = meta_info.get("completion_tokens")
             if isinstance(output_ids, list) and isinstance(completion_tokens, int) and completion_tokens > 0 and len(output_ids) > completion_tokens:
                 item["output_ids"] = output_ids[-completion_tokens:]
             return item
