@@ -243,6 +243,92 @@ impl ConversationItemStorage for OracleConversationItemStorage {
             )
             .collect()
     }
+
+    async fn get_item(&self, item_id: &ConversationItemId) -> ItemResult<Option<ConversationItem>> {
+        let iid = item_id.0.clone();
+
+        self.with_connection(move |conn| {
+            let mut stmt = conn
+                .statement(
+                    "SELECT id, response_id, item_type, role, content, status, created_at \
+                     FROM conversation_items WHERE id = :1",
+                )
+                .build()
+                .map_err(map_oracle_error)?;
+
+            let mut rows = stmt.query(&[&iid]).map_err(map_oracle_error)?;
+
+            if let Some(row_res) = rows.next() {
+                let row = row_res.map_err(map_oracle_error)?;
+                let id: String = row.get(0).map_err(map_oracle_error)?;
+                let response_id: Option<String> = row.get(1).map_err(map_oracle_error)?;
+                let item_type: String = row.get(2).map_err(map_oracle_error)?;
+                let role: Option<String> = row.get(3).map_err(map_oracle_error)?;
+                let content_raw: Option<String> = row.get(4).map_err(map_oracle_error)?;
+                let status: Option<String> = row.get(5).map_err(map_oracle_error)?;
+                let created_at: DateTime<Utc> = row.get(6).map_err(map_oracle_error)?;
+
+                let content = match content_raw {
+                    Some(s) => serde_json::from_str(&s)?,
+                    None => Value::Null,
+                };
+
+                Ok(Some(ConversationItem {
+                    id: ConversationItemId(id),
+                    response_id,
+                    item_type,
+                    role,
+                    content,
+                    status,
+                    created_at,
+                }))
+            } else {
+                Ok(None)
+            }
+        })
+        .await
+    }
+
+    async fn is_item_linked(
+        &self,
+        conversation_id: &ConversationId,
+        item_id: &ConversationItemId,
+    ) -> ItemResult<bool> {
+        let cid = conversation_id.0.clone();
+        let iid = item_id.0.clone();
+
+        self.with_connection(move |conn| {
+            let count: i64 = conn
+                .query_row_as(
+                    "SELECT COUNT(*) FROM conversation_item_links WHERE conversation_id = :1 AND item_id = :2",
+                    &[&cid, &iid],
+                )
+                .map_err(map_oracle_error)?;
+            Ok(count > 0)
+        })
+        .await
+    }
+
+    async fn delete_item(
+        &self,
+        conversation_id: &ConversationId,
+        item_id: &ConversationItemId,
+    ) -> ItemResult<()> {
+        let cid = conversation_id.0.clone();
+        let iid = item_id.0.clone();
+
+        self.with_connection(move |conn| {
+            // Delete ONLY the link (do not delete the item itself)
+            conn.execute(
+                "DELETE FROM conversation_item_links WHERE conversation_id = :1 AND item_id = :2",
+                &[&cid, &iid],
+            )
+            .map_err(map_oracle_error)?;
+
+            Ok(())
+        })
+        .await
+    }
 }
 
 #[derive(Clone)]

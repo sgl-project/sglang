@@ -829,7 +829,8 @@ pub(super) fn build_incomplete_response(
 pub(super) fn generate_mcp_id(prefix: &str) -> String {
     use rand::RngCore;
     let mut rng = rand::rng();
-    let mut bytes = [0u8; 30];
+    // Generate exactly 50 hex characters (25 bytes) for the part after the underscore
+    let mut bytes = [0u8; 25];
     rng.fill_bytes(&mut bytes);
     let hex_string: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
     format!("{}_{}", prefix, hex_string)

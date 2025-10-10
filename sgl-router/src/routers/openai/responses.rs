@@ -1,35 +1,16 @@
 //! Response storage, patching, and extraction utilities
 
-use crate::data_connector::{ResponseId, SharedResponseStorage, StoredResponse};
+use crate::data_connector::{ResponseId, StoredResponse};
 use crate::protocols::spec::{ResponseInput, ResponseToolType, ResponsesRequest};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use tracing::{info, warn};
+use tracing::warn;
 
 use super::utils::event_types;
 
 // ============================================================================
 // Response Storage Operations
 // ============================================================================
-
-/// Store a response internally (checks if storage is enabled)
-pub(super) async fn store_response_internal(
-    response_storage: &SharedResponseStorage,
-    response_json: &Value,
-    original_body: &ResponsesRequest,
-) -> Result<(), String> {
-    if !original_body.store {
-        return Ok(());
-    }
-
-    match store_response_impl(response_storage, response_json, original_body).await {
-        Ok(response_id) => {
-            info!(response_id = %response_id.0, "Stored response locally");
-            Ok(())
-        }
-        Err(e) => Err(e),
-    }
-}
 
 /// Build a StoredResponse from response JSON and original request
 pub(super) fn build_stored_response(
@@ -96,20 +77,6 @@ pub(super) fn build_stored_response(
     stored_response.raw_response = response_json.clone();
 
     stored_response
-}
-
-/// Store response implementation (public for use across modules)
-pub(super) async fn store_response_impl(
-    response_storage: &SharedResponseStorage,
-    response_json: &Value,
-    original_body: &ResponsesRequest,
-) -> Result<ResponseId, String> {
-    let stored_response = build_stored_response(response_json, original_body);
-
-    response_storage
-        .store_response(stored_response)
-        .await
-        .map_err(|e| format!("Failed to store response: {}", e))
 }
 
 // ============================================================================
