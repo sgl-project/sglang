@@ -4,6 +4,7 @@ set -euxo pipefail
 
 IS_BLACKWELL=${IS_BLACKWELL:-0}
 CU_VERSION="cu128"
+
 # Kill existing processes
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 bash "${SCRIPT_DIR}/../killall_sglang.sh"
