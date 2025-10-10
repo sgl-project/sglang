@@ -103,9 +103,10 @@ class ModelOptFp8Config(QuantizationConfig):
         Args:
             is_checkpoint_fp8_serialized (bool): Indicates if the checkpoint uses serialized FP8 format.
         """
+        super().__init__()
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
         self.kv_cache_quant_method = kv_cache_quant_method
-        self.exclude_modules = exclude_modules
+        self.exclude_modules = exclude_modules or []
         if is_checkpoint_fp8_serialized:
             logger.warning(
                 "Detected ModelOpt FP8 checkpoint. The format is experimental and subject to change."
@@ -177,10 +178,26 @@ class ModelOptFp8Config(QuantizationConfig):
                 "Check the quantization config for your model's configuration."
             )
 
-        return cls(
+        cfg = cls(
             is_checkpoint_fp8_serialized=True,
             kv_cache_quant_method=kv_cache_quant_method,
             exclude_modules=exclude_modules,
+        )
+        cfg.packed_modules_mapping = config.get(
+            "packed_modules_mapping", None
+        )  # TODO: replicate/reuse logic in ModelOptFp4Config.from_config below to prepare for FP4
+        return cfg
+
+    def is_layer_excluded(self, prefix: str) -> bool:
+        if len(self.exclude_modules) == 0:
+            return False
+        return any(
+            module in prefix
+            or (
+                prefix.startswith("language_model.")
+                and module in prefix.removeprefix("language_model.")
+            )
+            for module in self.exclude_modules
         )
 
     def get_quant_method(
@@ -190,16 +207,10 @@ class ModelOptFp8Config(QuantizationConfig):
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
-        if self.exclude_modules and any(
-            module in prefix
-            or (
-                prefix.startswith("language_model.")
-                and module in prefix.removeprefix("language_model.")
-            )
-            for module in self.exclude_modules
-        ):
-            return None
-
+        if is_layer_skipped(
+            prefix, self.exclude_modules, self.packed_modules_mapping
+        ) or self.is_layer_excluded(prefix):
+            return UnquantizedLinearMethod()
         if isinstance(layer, LinearBase):
             return ModelOptFp8LinearMethod(self)
         if self.kv_cache_quant_method and isinstance(layer, RadixAttention):
