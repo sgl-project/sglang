@@ -16,11 +16,17 @@ from sglang.test.test_utils import (
 
 class TestIntelAMXAttnBackendQuant(CustomTestCase):
 
-    @intel_amx_benchmark(extra_args=["--batch-size", "4"], min_throughput=150)
+    @intel_amx_benchmark(
+        extra_args=["--batch-size", "4", "--mem-fraction-static", "0.1"],
+        min_throughput=150,
+    )
     def test_latency_fp8_qwen(self):
         return DEFAULT_MODEL_NAME_FOR_TEST_QWEN_FP8
 
-    @intel_amx_benchmark(extra_args=["--batch-size", "4"], min_throughput=50)
+    @intel_amx_benchmark(
+        extra_args=["--batch-size", "4", "--mem-fraction-static", "0.1"],
+        min_throughput=50,
+    )
     def test_latency_fp8_moe_model(self):
         return DEFAULT_MODEL_NAME_FOR_TEST_FP8_WITH_MOE
 

@@ -17,7 +17,14 @@ from sglang.test.test_utils import (
 class TestIntelAMXAttnBackendQuant(CustomTestCase):
 
     @intel_amx_benchmark(
-        extra_args=["--batch-size", "4", "--quantization", "w8a8_int8"],
+        extra_args=[
+            "--batch-size",
+            "4",
+            "--quantization",
+            "w8a8_int8",
+            "--mem-fraction-static",
+            "0.1",
+        ],
         min_throughput=100,
     )
     def test_latency_w8a8_default_model(self):

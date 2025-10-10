@@ -22,11 +22,17 @@ from sglang.test.test_utils import (
 
 class TestIntelAMXAttnBackend(CustomTestCase):
 
-    @intel_amx_benchmark(extra_args=["--batch-size", "4"], min_throughput=10)
+    @intel_amx_benchmark(
+        extra_args=["--batch-size", "4", "--mem-fraction-static", "0.3"],
+        min_throughput=10,
+    )
     def test_latency_mla_model(self):
         return DEFAULT_MLA_MODEL_NAME_FOR_TEST
 
-    @intel_amx_benchmark(extra_args=["--batch-size", "4"], min_throughput=40)
+    @intel_amx_benchmark(
+        extra_args=["--batch-size", "4", "--mem-fraction-static", "0.1"],
+        min_throughput=40,
+    )
     def test_latency_default_model(self):
         return DEFAULT_MODEL_NAME_FOR_TEST
 
