@@ -61,6 +61,36 @@ def transfer_kv_per_layer_pf_lf(
         num_warps_per_block,
     )
 
+def transfer_kv_per_layer_phf_lf(
+    src_k: torch.Tensor,
+    dst_k: torch.Tensor,
+    src_v: torch.Tensor,
+    dst_v: torch.Tensor,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    layer_id: int,
+    item_size: int,
+    src_layout_dim: int,
+    page_size: int,
+    head_num: int,
+    block_quota: int = 2,
+    num_warps_per_block: int = 16 if _is_hip else 32,
+):
+    torch.ops.sgl_kernel.transfer_kv_per_layer_phf_lf(
+        src_k,
+        dst_k,
+        src_v,
+        dst_v,
+        src_indices,
+        dst_indices,
+        layer_id,
+        item_size,
+        src_layout_dim,
+        page_size,
+        head_num,
+        block_quota,
+        num_warps_per_block,
+    )
 
 def transfer_kv_all_layer(
     src_k_layers: torch.Tensor,
@@ -115,6 +145,36 @@ def transfer_kv_all_layer_lf_pf(
         num_warps_per_block,
     )
 
+def transfer_kv_all_layer_lf_phf(
+    src_k_layers: torch.Tensor,
+    dst_k: torch.Tensor,
+    src_v_layers: torch.Tensor,
+    dst_v: torch.Tensor,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    item_size: int,
+    dst_layout_dim: int,
+    num_layers: int,
+    page_size: int,
+    head_num: int,
+    block_quota: int = 2,
+    num_warps_per_block: int = 16 if _is_hip else 32,
+):
+    torch.ops.sgl_kernel.transfer_kv_all_layer_lf_phf(
+        src_k_layers,
+        dst_k,
+        src_v_layers,
+        dst_v,
+        src_indices,
+        dst_indices,
+        item_size,
+        dst_layout_dim,
+        num_layers,
+        page_size,
+        head_num,
+        block_quota,
+        num_warps_per_block,
+    )
 
 def transfer_kv_direct(
     src_layers: List[torch.Tensor],

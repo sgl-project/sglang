@@ -68,7 +68,54 @@ __device__ __forceinline__ T* get_global_offset_lf_tbl(
   return reinterpret_cast<T*>(layer_base_tbl[layer_id]) + page_id * item_size_bytes;
 }
 
-template <auto SrcOffsetFn, auto DstOffsetFn, bool IsMLA>
+template <typename T>
+__device__ __forceinline__ T* get_global_offset_lf_hfrg(
+    T* base,
+    const uintptr_t* __restrict__ /*unused*/,
+    int64_t layer_id,
+    int64_t layer_dim,
+    int64_t page_id,
+    int64_t item_size_bytes,
+    int64_t head_fragment_num,
+    int64_t head_fragment_id) {
+  // layer first
+  return base + layer_id * layer_dim
+        + page_id * item_size_bytes
+        + item_size_bytes / head_fragment_num * head_fragment_id;
+}
+
+template <typename T>
+__device__ __forceinline__ T* get_global_offset_lf_tbl_hfrg(
+    T* /*unused*/,
+    const uintptr_t* __restrict__ layer_base_tbl,
+    int64_t layer_id,
+    int64_t /*unused*/,
+    int64_t page_id,
+    int64_t item_size_bytes,
+    int64_t head_fragment_num,
+    int64_t head_fragment_id) {
+  return reinterpret_cast<T*>(layer_base_tbl[layer_id]) + page_id * item_size_bytes
+        + item_size_bytes / head_fragment_num * head_fragment_id;
+}
+
+template <typename T, int PageSize>
+__device__ __forceinline__ T* get_global_offset_phf(
+    T* base,
+    const uintptr_t* __restrict__ /*unused*/,
+    int64_t layer_id,
+    int64_t page_dim,
+    int64_t page_id,
+    int64_t item_size_bytes,
+    int64_t head_fragment_num,
+    int64_t head_fragment_id) {
+  // page head first
+  return base + page_id / PageSize * PageSize * page_dim
+         + page_dim / head_fragment_num * head_fragment_id * PageSize
+         + page_id % PageSize * page_dim / head_fragment_num
+         + layer_id * item_size_bytes / head_fragment_num
+}
+
+template <auto SrcOffsetFn, auto DstOffsetFn, bool IsMLA, int HeadFragmentNum>
 __global__ void transfer_kernel_impl(
     const void* __restrict__ src_k,
     void* __restrict__ dst_k,
@@ -101,19 +148,36 @@ __global__ void transfer_kernel_impl(
 
     // Loop over layers if necessary
     for (int64_t layer_id = start_layer_id; layer_id < start_layer_id + num_layers_to_process; ++layer_id) {
-      const char* src_ptr = SrcOffsetFn(
-          static_cast<const char*>(src_k), src_k_layer_tbl, layer_id, src_layout_dim, src_page_id, item_size_bytes);
-      char* dst_ptr = DstOffsetFn(
-          static_cast<char*>(dst_k), dst_k_layer_tbl, layer_id, dst_layout_dim, dst_page_id, item_size_bytes);
-      transfer_item_warp(lane_id, src_ptr, dst_ptr, item_size_bytes);
 
-      if constexpr (!IsMLA) {
-        const char* src_v_ptr = SrcOffsetFn(
-            static_cast<const char*>(src_v), src_v_layer_tbl, layer_id, src_layout_dim, src_page_id, item_size_bytes);
-        char* dst_v_ptr = DstOffsetFn(
-            static_cast<char*>(dst_v), dst_v_layer_tbl, layer_id, dst_layout_dim, dst_page_id, item_size_bytes);
-        transfer_item_warp(lane_id, src_v_ptr, dst_v_ptr, item_size_bytes);
+      if (HeadFragmentNum > 1) {
+        for (int64_t head_fragment_id = 0; head_fragment_id < HeadFragmentNum; ++head_fragment_id) {
+          const char* src_ptr = SrcOffsetFn(
+              static_cast<const char*>(src_k), src_k_layer_tbl, layer_id, src_layout_dim, src_page_id, item_size_bytes, HeadFragmentNum, head_fragment_id);
+          char* dst_ptr = DstOffsetFn(
+              static_cast<char*>(dst_k), dst_k_layer_tbl, layer_id, dst_layout_dim, dst_page_id, item_size_bytes, HeadFragmentNum, head_fragment_id);
+          transfer_item_warp(lane_id, src_ptr, dst_ptr, item_size_bytes / HeadFragmentNum);
+          const char* src_v_ptr = SrcOffsetFn(
+              static_cast<const char*>(src_v), src_v_layer_tbl, layer_id, src_layout_dim, src_page_id, item_size_bytes, HeadFragmentNum, head_fragment_id);
+          char* dst_v_ptr = DstOffsetFn(
+              static_cast<char*>(dst_v), dst_v_layer_tbl, layer_id, dst_layout_dim, dst_page_id, item_size_bytes, HeadFragmentNum, head_fragment_id);
+          transfer_item_warp(lane_id, src_v_ptr, dst_v_ptr, item_size_bytes / HeadFragmentNum);
+        }
+      } else {
+        const char* src_ptr = SrcOffsetFn(
+            static_cast<const char*>(src_k), src_k_layer_tbl, layer_id, src_layout_dim, src_page_id, item_size_bytes);
+        char* dst_ptr = DstOffsetFn(
+            static_cast<char*>(dst_k), dst_k_layer_tbl, layer_id, dst_layout_dim, dst_page_id, item_size_bytes);
+        transfer_item_warp(lane_id, src_ptr, dst_ptr, item_size_bytes);
+
+        if constexpr (!IsMLA) {
+          const char* src_v_ptr = SrcOffsetFn(
+              static_cast<const char*>(src_v), src_v_layer_tbl, layer_id, src_layout_dim, src_page_id, item_size_bytes);
+          char* dst_v_ptr = DstOffsetFn(
+              static_cast<char*>(dst_v), dst_v_layer_tbl, layer_id, dst_layout_dim, dst_page_id, item_size_bytes);
+          transfer_item_warp(lane_id, src_v_ptr, dst_v_ptr, item_size_bytes);
+        }
       }
+
     }
   }
 }
@@ -246,6 +310,41 @@ void transfer_kv_per_layer_pf_lf(
       num_warps_per_block);
 }
 
+void transfer_kv_per_layer_phf_lf(
+    const at::Tensor src_k,
+    at::Tensor dst_k,
+    const at::Tensor src_v,
+    at::Tensor dst_v,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t layer_id,
+    int64_t item_size,
+    int64_t src_layout_dim,
+    int64_t page_size,
+    int64_t head_num,
+    int64_t block_quota,
+    int64_t num_warps_per_block) {
+  at::Tensor empty;
+  transfer_kv_launcher<get_global_offset_phf<char, page_size>, get_global_offset_lf_tbl_hfrg<char>, false, head_num>(
+      src_k,
+      dst_k,
+      src_v,
+      dst_v,
+      src_indices,
+      dst_indices,
+      layer_id,
+      1,
+      item_size,
+      src_layout_dim,
+      0,
+      empty,
+      empty,
+      empty,
+      empty,
+      block_quota,
+      num_warps_per_block);
+}
+
 void transfer_kv_all_layer(
     const at::Tensor src_k_layers,
     const at::Tensor dst_k_layers,
@@ -294,6 +393,42 @@ void transfer_kv_all_layer_lf_pf(
   TORCH_CHECK(num_layers == src_k_layers.size(0), "Number of layers in source k tensor does not match num_layers");
   at::Tensor empty;
   transfer_kv_launcher<get_global_offset_lf_tbl<const char>, get_global_offset_pf<char>, false>(
+      empty,
+      dst_k,
+      empty,
+      dst_v,
+      src_indices,
+      dst_indices,
+      0,
+      num_layers,
+      item_size,
+      0,
+      dst_layout_dim,
+      src_k_layers,
+      empty,
+      src_v_layers,
+      empty,
+      block_quota,
+      num_warps_per_block);
+}
+
+void transfer_kv_all_layer_lf_phf(
+    const at::Tensor src_k_layers,
+    at::Tensor dst_k,
+    const at::Tensor src_v_layers,
+    at::Tensor dst_v,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t item_size,
+    int64_t dst_layout_dim,
+    int64_t num_layers,
+    int64_t page_size,
+    int64_t head_num,
+    int64_t block_quota,
+    int64_t num_warps_per_block) {
+  TORCH_CHECK(num_layers == src_k_layers.size(0), "Number of layers in source k tensor does not match num_layers");
+  at::Tensor empty;
+  transfer_kv_launcher<get_global_offset_lf_tbl_hfrg<const char>, get_global_offset_phf<char, page_size>, false, head_num>(
       empty,
       dst_k,
       empty,
