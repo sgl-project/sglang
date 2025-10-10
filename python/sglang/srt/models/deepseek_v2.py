@@ -18,7 +18,6 @@
 from __future__ import annotations
 
 import concurrent.futures
-import importlib.metadata
 import logging
 import os
 from enum import IntEnum, auto
@@ -26,7 +25,6 @@ from typing import Any, Dict, Iterable, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
-from packaging import version
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -134,6 +132,7 @@ from sglang.srt.utils import (
     is_hip,
     is_non_idle_and_non_empty,
     is_npu,
+    is_nvidia_cublas_cu12_version_ge_12_9,
     is_sm100_supported,
     log_info_on_rank0,
     make_layers,
@@ -192,17 +191,6 @@ else:
 
 _is_flashinfer_available = is_flashinfer_available()
 _is_sm100_supported = is_cuda() and is_sm100_supported()
-
-
-# temporary fix for issue #11272
-def is_nvidia_cublas_cu12_version_ge_12_9():
-    try:
-        installed_version = importlib.metadata.version("nvidia-cublas-cu12")
-    except importlib.metadata.PackageNotFoundError:
-        return False
-    return version.parse(installed_version) >= version.parse("12.9")
-
-
 _is_cublas_ge_129 = is_nvidia_cublas_cu12_version_ge_12_9()
 
 
