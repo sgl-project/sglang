@@ -66,6 +66,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.utils import (
+    create_fused_set_kv_buffer_arg,
+    enable_fused_set_kv_buffer,
+)
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
@@ -193,33 +197,6 @@ class GptOssSparseMoeBlock(nn.Module):
         return ans
 
 
-def _enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
-    """Enable fused set_kv_buffer only on CUDA with bfloat16 KV cache."""
-    return _is_cuda and forward_batch.token_to_kv_pool.dtype == torch.bfloat16
-
-
-# TODO maybe move to a model-common utils
-def _create_fused_set_kv_buffer_arg(
-    value: torch.Tensor,
-    layer: RadixAttention,
-    forward_batch: ForwardBatch,
-):
-    layer_id = layer.layer_id
-    token_to_kv_pool = forward_batch.token_to_kv_pool
-
-    k_buffer = token_to_kv_pool.get_key_buffer(layer_id)
-    v_buffer = token_to_kv_pool.get_value_buffer(layer_id)
-
-    return FusedSetKVBufferArg(
-        value=value,
-        k_buffer=k_buffer.view(k_buffer.shape[0], -1),
-        v_buffer=v_buffer.view(v_buffer.shape[0], -1),
-        k_scale=layer.k_scale,
-        v_scale=layer.v_scale,
-        cache_loc=forward_batch.out_cache_loc,
-    )
-
-
 class GptOssAttention(nn.Module):
     def __init__(
         self,
@@ -337,12 +314,12 @@ class GptOssAttention(nn.Module):
             q,
             k,
             fused_set_kv_buffer_arg=(
-                _create_fused_set_kv_buffer_arg(
+                create_fused_set_kv_buffer_arg(
                     value=v,
                     layer=self.attn,
                     forward_batch=forward_batch,
                 )
-                if _enable_fused_set_kv_buffer(forward_batch)
+                if enable_fused_set_kv_buffer(forward_batch)
                 else None
             ),
         )
@@ -356,7 +333,7 @@ class GptOssAttention(nn.Module):
         attn_output = self.attn(
             *inner_state,
             sinks=self.sinks,
-            save_kv_cache=not _enable_fused_set_kv_buffer(forward_batch),
+            save_kv_cache=not enable_fused_set_kv_buffer(forward_batch),
         )
         output, _ = self.o_proj(attn_output)
         return output
