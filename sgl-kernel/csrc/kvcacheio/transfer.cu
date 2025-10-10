@@ -219,7 +219,7 @@ __global__ void transfer_kernel_impl(
   }
 }
 
-template <auto SrcOffsetFn, auto DstOffsetFn, bool IsMLA>
+template <auto SrcOffsetFn, auto DstOffsetFn, bool IsMLA, bool HeadFragment=false>
 void transfer_kv_launcher(
     const at::Tensor& src_k,
     at::Tensor& dst_k,
@@ -264,7 +264,7 @@ void transfer_kv_launcher(
   const uintptr_t* dst_v_tbl_ptr = IsMLA || !dst_v_layers.defined() ? nullptr : dst_v_layers.data_ptr<uintptr_t>();
 
   cudaStream_t torch_current_stream = at::cuda::getCurrentCUDAStream();
-  if (head_fragment_num > 1) {
+  if constexpr (HeadFragment) {
     transfer_flex_tp_kernel_impl<SrcOffsetFn, DstOffsetFn><<<grid_dim, threads_per_block, 0, torch_current_stream>>>(
       src_k_ptr,
       dst_k_ptr,
@@ -387,7 +387,7 @@ void transfer_kv_per_layer_phf_lf(
     int64_t block_quota,
     int64_t num_warps_per_block) {
   at::Tensor empty;
-  transfer_kv_launcher<get_global_offset_phf<char>, get_global_offset_lf_hfrg<char>, false>(
+  transfer_kv_launcher<get_global_offset_phf<char>, get_global_offset_lf_hfrg<char>, false, true>(
       src_k,
       dst_k,
       src_v,
@@ -492,7 +492,7 @@ void transfer_kv_all_layer_lf_phf(
     int64_t num_warps_per_block) {
   TORCH_CHECK(num_layers == src_k_layers.size(0), "Number of layers in source k tensor does not match num_layers");
   at::Tensor empty;
-  transfer_kv_launcher<get_global_offset_lf_tbl_hfrg<const char>, get_global_offset_phf<char>, false>(
+  transfer_kv_launcher<get_global_offset_lf_tbl_hfrg<const char>, get_global_offset_phf<char>, false, true>(
       empty,
       dst_k,
       empty,
