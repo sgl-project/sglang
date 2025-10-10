@@ -1294,7 +1294,15 @@ class ModelRunner:
         server_args = self.server_args
         assert config is not None
 
-        if server_args.disable_radix_cache:
+        speculativa_ratio = (
+            0
+            if server_args.speculative_num_draft_tokens is None
+            else server_args.speculative_num_draft_tokens
+        )
+        if (
+            server_args.disable_radix_cache
+            or config.mamba2_cache_params.mamba_cache_per_req == 0
+        ):
             # with disable radix cache, sets the max_mamba_cache_size based on the max_running_requests
             if server_args.max_mamba_cache_size is None:
                 if server_args.max_running_requests is not None:
@@ -1315,6 +1323,7 @@ class ModelRunner:
             server_args.max_mamba_cache_size = int(
                 (mamba_state_memory_raw * (1 << 30))
                 // config.mamba2_cache_params.mamba_cache_per_req
+                // (1 + speculativa_ratio)
             )
 
         if self.hybrid_gdn_config is not None:
@@ -1324,6 +1333,7 @@ class ModelRunner:
         mamba_state_memory = (
             server_args.max_mamba_cache_size
             * config.mamba2_cache_params.mamba_cache_per_req
+            * (1 + speculativa_ratio)
             / (1 << 30)
         )
         return total_rest_memory - mamba_state_memory
