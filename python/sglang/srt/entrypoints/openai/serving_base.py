@@ -49,9 +49,8 @@ class OpenAIServingBase(ABC):
 
             # Convert to internal format
             adapted_request, processed_request = self._convert_to_internal_request(
-                request, raw_request
+                request, raw_request, validation_time
             )
-            adapted_request.validation_time = validation_time
 
             # Note(Xinyuan): raw_request below is only used for detecting the connection of the client
             if hasattr(request, "stream") and request.stream:
@@ -114,6 +113,7 @@ class OpenAIServingBase(ABC):
         self,
         request: OpenAIServingRequest,
         raw_request: Request = None,
+        validation_time: float = None,
     ) -> tuple[GenerateReqInput, OpenAIServingRequest]:
         """Convert OpenAI request to internal format"""
         pass

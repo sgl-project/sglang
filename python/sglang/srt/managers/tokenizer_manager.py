@@ -1438,7 +1438,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 if state.request_scheduled_ts > 0:
                     meta_info["request_scheduled_ts"] = state.request_scheduled_ts
                 # For embeddings, there's no separate prefill phase, so omit prefill_finished_ts.
-                if not isinstance(recv_obj, BatchEmbeddingOut):
+                if not isinstance(recv_obj, BatchEmbeddingOutput):
                     if state.first_token_time > 0:
                         meta_info["prefill_finished_ts"] = state.first_token_time
                 if state.response_sent_ts > 0:
@@ -1461,7 +1461,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 if (
                     state.first_token_time_perf > 0.0
                     and state.finished_time_perf > 0.0
-                    and not isinstance(recv_obj, BatchEmbeddingOut)
+                    and not isinstance(recv_obj, BatchEmbeddingOutput)
                     and recv_obj.completion_tokens[i] > 0
                 ):
                     decode_time = state.finished_time_perf - state.first_token_time_perf

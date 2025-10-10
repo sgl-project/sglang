@@ -689,9 +689,6 @@ class ScoringRequest(BaseModel):
     item_first: bool = False
     model: str = DEFAULT_MODEL_NAME
 
-    # Validation step duration
-    validation_time: Optional[float] = None
-
 
 class ScoringResponse(BaseModel):
     scores: List[

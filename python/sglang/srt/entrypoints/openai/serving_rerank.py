@@ -48,6 +48,7 @@ class OpenAIServingRerank(OpenAIServingBase):
         self,
         request: V1RerankReqInput,
         raw_request: Request = None,
+        validation_time: float = 0.0,
     ) -> tuple[EmbeddingReqInput, V1RerankReqInput]:
         """Convert OpenAI rerank request to internal embedding format"""
         # Create pairs of [query, document] for each document
@@ -58,6 +59,7 @@ class OpenAIServingRerank(OpenAIServingBase):
         adapted_request = EmbeddingReqInput(
             text=pairs,
             is_cross_encoder_request=True,
+            validation_time=validation_time,
         )
 
         return adapted_request, request
