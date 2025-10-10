@@ -344,11 +344,17 @@ def get_embedding_chunk(
 
 def _get_precomputed_embedding(
     items: List[MultimodalDataItem],
+    prefix_length: List[int],
+    extend_length: List[int],
+    items_offset_list: List[List[Tuple[int, int]]],
 ) -> Optional[torch.Tensor]:
     """
     If all items have precomputed_embeddings, return their concatenation.
     If some but not all have precomputed_embeddings, raise NotImplementedError.
     If none have precomputed_embeddings, return None.
+
+    When prefix caching is enabled, only return the portion of embeddings
+    that corresponds to the extend (non-cached) tokens.
     """
     precomputed_embeddings = [item.precomputed_embeddings for item in items]
     if any(feature is not None for feature in precomputed_embeddings):
@@ -359,6 +365,41 @@ def _get_precomputed_embedding(
         result = torch.concat(precomputed_embeddings)
         # some models embedding is 3-dim, reshape it to 2-dim (similar to get_embedding_chunk)
         result = result.reshape(-1, result.shape[-1])
+
+        # Handle prefix caching: extract only the portion for extend tokens
+        if prefix_length and extend_length and items_offset_list:
+            embedding_list = []
+            max_iterations = min(len(items_offset_list), len(prefix_length))
+
+            for i in range(max_iterations):
+                if not items_offset_list[i]:  # Empty offsets
+                    continue
+
+                items_offset = items_offset_list[i]
+                req_prefix_len = prefix_length[i]
+                req_extend_len = extend_length[i] if i < len(extend_length) else 0
+
+                # Check if all multimodal tokens are in cached prefix
+                if all([offset_end < req_prefix_len for _, offset_end in items_offset]):
+                    # All multimodal tokens are in cached prefix, skipping
+                    continue
+
+                # Extract the chunk for this request using get_embedding_chunk
+                embedding_chunk, _, _ = get_embedding_chunk(
+                    embedding=result,
+                    extend_prefix_len=req_prefix_len,
+                    extend_seq_len=req_extend_len,
+                    items_offset=items_offset,
+                )
+                if embedding_chunk.shape[0] > 0:
+                    embedding_list.append(embedding_chunk)
+
+            if len(embedding_list) == 0:
+                # All precomputed embeddings are in cached prefix, returning None
+                return None
+
+            result = torch.concat(embedding_list, dim=0)
+
         return result
     return None
 
@@ -475,7 +516,9 @@ def get_embedding_and_mask(
         - A boolean mask tensor indicating where these embeddings should be placed
     """
     # 1. Get embedding
-    embedding = _get_precomputed_embedding(embedding_items)
+    embedding = _get_precomputed_embedding(
+        embedding_items, prefix_length, extend_length, items_offset_list
+    )
     if embedding is None:
         embedding = _get_chunked_prefill_embedding(
             data_embedding_func,
