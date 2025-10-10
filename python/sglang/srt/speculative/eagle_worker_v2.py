@@ -388,13 +388,12 @@ class EAGLEWorkerV2(EAGLEWorker):
             pt += extend_len
 
         # Construct spec_info
-        draft_input = EagleDraftInput(
+        next_draft_input = EagleDraftInput(
             hidden_states=target_hidden_states,
             verified_id=next_token_ids,
             new_seq_lens=batch.seq_lens,
             allocate_lens=batch.seq_lens,
         )
-        batch.spec_info = draft_input
 
         # Run forward
         forward_batch = ForwardBatch.init_new(batch, self.draft_model_runner)
@@ -402,9 +401,11 @@ class EAGLEWorkerV2(EAGLEWorker):
 
         # Update spec_info for the next draft step
         probs = torch.softmax(logits_output.next_token_logits, dim=-1)
-        draft_input.topk_p, draft_input.topk_index = fast_topk(probs, self.topk, dim=-1)
-        draft_input.hidden_states = logits_output.hidden_states
-        return draft_input
+        next_draft_input.topk_p, next_draft_input.topk_index = fast_topk(
+            probs, self.topk, dim=-1
+        )
+        next_draft_input.hidden_states = logits_output.hidden_states
+        return next_draft_input
 
     def move_accepted_tokens_to_target_kvcache(
         self,
