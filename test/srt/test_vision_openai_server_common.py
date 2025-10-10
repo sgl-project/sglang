@@ -30,7 +30,7 @@ AUDIO_BIRD_SONG_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-fi
 
 class TestOpenAIMLLMServerBase(CustomTestCase):
     model: str
-    other_args: list = []
+    extra_args: list = []
     fixed_args: list = [
         "--trust-remote-code",
     ]
@@ -44,7 +44,7 @@ class TestOpenAIMLLMServerBase(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             api_key=cls.api_key,
-            other_args=cls.other_args + cls.fixed_args,
+            other_args=cls.extra_args + cls.fixed_args,
         )
         cls.base_url += "/v1"
 
@@ -496,7 +496,7 @@ class ImageOpenAITestMixin(TestOpenAIMLLMServerBase):
             or "device" in video_response
             or "microphone" in video_response
         ), f"""
-        ====================== video_response =====================
+        ====================== video_images response =====================
         {video_response}
         ===========================================================
         should contain 'iPod' or 'device' or 'microphone'
@@ -510,7 +510,7 @@ class ImageOpenAITestMixin(TestOpenAIMLLMServerBase):
             or "Steve" in video_response
             or "hand" in video_response
         ), f"""
-        ====================== video_response =====================
+        ====================== video_images response =====================
         {video_response}
         ===========================================================
         should contain 'man' or 'person' or 'individual' or 'speaker' or 'presenter' or 'Steve' or 'hand'
@@ -521,7 +521,7 @@ class ImageOpenAITestMixin(TestOpenAIMLLMServerBase):
             or "display" in video_response
             or "hold" in video_response
         ), f"""
-        ====================== video_response =====================
+        ====================== video_images response =====================
         {video_response}
         ===========================================================
         should contain 'present' or 'examine' or 'display' or 'hold'

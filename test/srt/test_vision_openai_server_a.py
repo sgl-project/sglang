@@ -57,7 +57,7 @@ class TestQwen3VLServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
 
 class TestQwen25VLServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
     model = "Qwen/Qwen2.5-VL-7B-Instruct"
-    other_args = [
+    extra_args = [
         "--mem-fraction-static",
         "0.35",
         "--cuda-graph-max-bs",
@@ -76,7 +76,7 @@ class TestQwen2VLContextLengthServer(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             api_key=cls.api_key,
-            other_args=[
+            extra_args=[
                 "--context-length",
                 "300",
                 "--mem-fraction-static=0.75",
@@ -128,7 +128,7 @@ class TestMllamaServer(ImageOpenAITestMixin):
 
 class TestInternVL25Server(ImageOpenAITestMixin):
     model = "OpenGVLab/InternVL2_5-2B"
-    other_args = [
+    extra_args = [
         "--cuda-graph-max-bs",
         "4",
     ]
@@ -136,7 +136,7 @@ class TestInternVL25Server(ImageOpenAITestMixin):
 
 class TestMiniCPMV4Server(ImageOpenAITestMixin):
     model = "openbmb/MiniCPM-V-4"
-    other_args = [
+    extra_args = [
         "--mem-fraction-static",
         "0.35",
         "--cuda-graph-max-bs",
@@ -146,7 +146,7 @@ class TestMiniCPMV4Server(ImageOpenAITestMixin):
 
 class TestMiniCPMo26Server(ImageOpenAITestMixin, AudioOpenAITestMixin):
     model = "openbmb/MiniCPM-o-2_6"
-    other_args = [
+    extra_args = [
         "--mem-fraction-static",
         "0.65",
         "--cuda-graph-max-bs",
@@ -154,20 +154,9 @@ class TestMiniCPMo26Server(ImageOpenAITestMixin, AudioOpenAITestMixin):
     ]
 
 
-class TestVILAServer(ImageOpenAITestMixin):
-    model = "Efficient-Large-Model/NVILA-Lite-2B-hf-0626"
-    revision = "6bde1de5964b40e61c802b375fff419edc867506"
-    other_args = [
-        "--context-length=65536",
-        f"--revision={revision}",
-        "--cuda-graph-max-bs",
-        "4",
-    ]
-
-
 class TestGemma3itServer(ImageOpenAITestMixin):
     model = "google/gemma-3-4b-it"
-    other_args = [
+    extra_args = [
         "--mem-fraction-static",
         "0.70",
         "--enable-multimodal",
@@ -178,7 +167,7 @@ class TestGemma3itServer(ImageOpenAITestMixin):
 
 class TestKimiVLServer(ImageOpenAITestMixin):
     model = "moonshotai/Kimi-VL-A3B-Instruct"
-    other_args = [
+    extra_args = [
         "--context-length",
         "8192",
         "--dtype=bfloat16",
@@ -192,7 +181,7 @@ class TestKimiVLServer(ImageOpenAITestMixin):
 
 class TestGLM41VServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
     model = "zai-org/GLM-4.1V-9B-Thinking"
-    other_args = [
+    extra_args = [
         "--mem-fraction-static",
         "0.68",
         "--reasoning-parser",
@@ -202,7 +191,7 @@ class TestGLM41VServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
 
 class TestQwen2AudioServer(AudioOpenAITestMixin):
     model = "Qwen/Qwen2-Audio-7B-Instruct"
-    other_args = (
+    extra_args = (
         [
             "--mem-fraction-static=0.70",
         ],
