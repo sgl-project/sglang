@@ -44,7 +44,7 @@ class HiRadixCache(RadixCache):
         hicache_storage_prefetch_policy: Optional[str] = "best_effort",
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[str] = None,
-        enable_backup_priority: bool = False
+        enable_backup_priority: bool = False,
     ):
 
         if hicache_io_backend == "direct":
