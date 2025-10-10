@@ -238,6 +238,7 @@ class ServerArgs:
     log_requests: bool = False
     log_requests_level: int = 2
     crash_dump_folder: Optional[str] = None
+    crash_on_nan: bool = False
     show_time_cost: bool = False
     enable_metrics: bool = False
     enable_metrics_for_all_schedulers: bool = False
@@ -381,6 +382,12 @@ class ServerArgs:
     offload_num_in_group: int = 1
     offload_prefetch_step: int = 1
     offload_mode: str = "cpu"
+
+    # Scoring configuration
+    # Delimiter token ID used to combine Query and Items into a single sequence for multi-item scoring.
+    # Format: Query<delimiter>Item1<delimiter>Item2<delimiter>...
+    # This enables efficient batch processing of multiple items against a single query.
+    multi_item_scoring_delimiter: Optional[Union[int]] = None
 
     # Optimization/debug options
     disable_radix_cache: bool = False
@@ -856,9 +863,6 @@ class ServerArgs:
 
                 self.page_size = 64
                 logger.warning("Setting page size to 64 for DeepSeek NSA.")
-
-                self.mem_fraction_static = 0.8
-                logger.warning("Setting mem fraction static to 0.8 for DeepSeek NSA.")
 
                 # For Hopper, we support both bf16 and fp8 kv cache; for Blackwell, we support fp8 only currently
                 import torch
@@ -1740,6 +1744,12 @@ class ServerArgs:
             help="Folder path to dump requests from the last 5 min before a crash (if any). If not specified, crash dumping is disabled.",
         )
         parser.add_argument(
+            "--crash-on-nan",
+            type=str,
+            default=ServerArgs.crash_on_nan,
+            help="Crash the server on nan logprobs.",
+        )
+        parser.add_argument(
             "--show-time-cost",
             action="store_true",
             help="Show time cost of custom marks.",
@@ -2343,7 +2353,13 @@ class ServerArgs:
             choices=["float32", "bfloat16"],
             help="The data type of the SSM states in mamba cache.",
         )
-
+        # Args for multi-item-scoring
+        parser.add_argument(
+            "--multi-item-scoring-delimiter",
+            type=int,
+            default=ServerArgs.multi_item_scoring_delimiter,
+            help="Delimiter token ID for multi-item scoring. Used to combine Query and Items into a single sequence: Query<delimiter>Item1<delimiter>Item2<delimiter>... This enables efficient batch processing of multiple items against a single query.",
+        )
         # Hierarchical cache
         parser.add_argument(
             "--enable-hierarchical-cache",
@@ -3012,6 +3028,17 @@ class ServerArgs:
                 "fcfs",
                 "lof",
             ], f"To use priority scheduling, schedule_policy must be 'fcfs' or 'lof'. '{self.schedule_policy}' is not supported."
+
+        # Check multi-item scoring
+        if self.multi_item_scoring_delimiter is not None:
+            assert self.disable_radix_cache, (
+                "Multi-item scoring requires radix cache to be disabled. "
+                "Please set --disable-radix-cache when using --multi-item-scoring-delimiter."
+            )
+            assert self.chunked_prefill_size == -1, (
+                "Multi-item scoring requires chunked prefill to be disabled. "
+                "Please set --chunked-prefill-size -1 when using --multi-item-scoring-delimiter."
+            )
 
     def check_lora_server_args(self):
         assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"

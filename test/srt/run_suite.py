@@ -127,6 +127,10 @@ suites = {
         TestFile("test_vlm_input_format.py", 300),
         TestFile("test_vision_openai_server_a.py", 724),
         TestFile("test_vision_openai_server_b.py", 446),
+        TestFile("layers/attention/mamba/test_causal_conv1d.py", 85),
+        TestFile("layers/attention/mamba/test_mamba_ssm.py", 85),
+        TestFile("layers/attention/mamba/test_mamba_ssm_ssd.py", 220),
+        TestFile("models/test_nvidia_nemotron_nano_v2.py", 180),
         TestFile("test_modelopt_loader.py", 30),
     ],
     "per-commit-2-gpu": [
@@ -134,7 +138,6 @@ suites = {
         TestFile("lora/test_lora_tp.py", 116),
         TestFile("rl/test_update_weights_from_distributed.py", 103),
         TestFile("test_data_parallelism.py", 73),
-        TestFile("test_disaggregation.py", 499),
         TestFile("test_dp_attention.py", 594),
         TestFile("test_load_weights_from_remote_instance.py", 72),
         TestFile("test_patch_torch.py", 19),
@@ -142,6 +145,7 @@ suites = {
         TestFile("hicache/test_hicache_storage_file_backend.py", 200),
         TestFile("hicache/test_hicache_storage_mooncake_backend.py", 400),
         TestFile("hicache/test_hicache_storage_3fs_backend.py", 200),
+        TestFile("layers/attention/mamba/test_mamba2_mixer.py", 110),
     ],
     "per-commit-4-gpu": [
         TestFile("test_gpt_oss_4gpu.py", 300),
@@ -152,9 +156,6 @@ suites = {
     ],
     "per-commit-8-gpu": [
         TestFile("lora/test_lora_llama4.py", 400),
-        TestFile("test_disaggregation_dp_attention.py", 155),
-        TestFile("test_disaggregation_different_tp.py", 600),
-        TestFile("test_disaggregation_pp.py", 140),
         TestFile("test_deepseek_v3_basic.py", 275),
         TestFile("test_deepseek_v3_mtp.py", 275),
     ],
@@ -167,6 +168,16 @@ suites = {
     ],
     "per-commit-8-gpu-deepep": [
         TestFile("ep/test_deepep_large.py", 338),
+    ],
+    "per-commit-2-gpu-disaggregation": [
+        TestFile("test_disaggregation_basic.py", 400),
+    ],
+    "per-commit-4-gpu-disaggregation": [
+        TestFile("test_disaggregation_dp_attention.py", 155),
+    ],
+    "per-commit-8-gpu-disaggregation": [
+        TestFile("test_disaggregation_different_tp.py", 600),
+        TestFile("test_disaggregation_pp.py", 140),
     ],
     "per-commit-8-gpu-h20": [
         TestFile("quant/test_w4a8_deepseek_v3.py", 371),

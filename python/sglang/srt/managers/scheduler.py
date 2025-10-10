@@ -153,7 +153,6 @@ from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.tracing.trace import (
     process_tracing_init,
     trace_set_proc_propagate_context,
@@ -189,6 +188,7 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_tokenizer,
     get_tokenizer_from_processor,
 )
+from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -426,47 +426,10 @@ class Scheduler(
         )
 
         # Launch a draft worker for speculative decoding
-        if self.spec_algorithm.is_eagle():
-            from sglang.srt.speculative.eagle_worker import EAGLEWorker
-            from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
 
-            WorkerClass = EAGLEWorkerV2 if self.enable_overlap else EAGLEWorker
-
-            self.draft_worker = WorkerClass(
-                gpu_id=gpu_id,
-                tp_rank=tp_rank,
-                moe_ep_rank=moe_ep_rank,
-                server_args=server_args,
-                nccl_port=port_args.nccl_port,
-                target_worker=self.tp_worker,
-                dp_rank=dp_rank,
-            )
-        elif self.spec_algorithm.is_standalone():
-            from sglang.srt.speculative.standalone_worker import StandaloneWorker
-
-            self.draft_worker = StandaloneWorker(
-                gpu_id=gpu_id,
-                tp_rank=tp_rank,
-                moe_ep_rank=moe_ep_rank,
-                server_args=server_args,
-                nccl_port=port_args.nccl_port,
-                target_worker=self.tp_worker,
-                dp_rank=dp_rank,
-            )
-        elif self.spec_algorithm.is_ngram():
-            from sglang.srt.speculative.ngram_worker import NGRAMWorker
-
-            self.draft_worker = NGRAMWorker(
-                gpu_id=gpu_id,
-                tp_rank=tp_rank,
-                moe_ep_rank=moe_ep_rank,
-                server_args=server_args,
-                nccl_port=port_args.nccl_port,
-                target_worker=self.tp_worker,
-                dp_rank=dp_rank,
-            )
-        else:
-            self.draft_worker = None
+        self.launch_draft_worker(
+            gpu_id, tp_rank, moe_ep_rank, server_args, port_args, dp_rank
+        )
 
         # Dispatch the model worker
         if self.spec_algorithm.is_none():
@@ -692,6 +655,51 @@ class Scheduler(
                 (GetLoadReqInput, self.get_load),
             ]
         )
+
+    def launch_draft_worker(
+        self, gpu_id, tp_rank, moe_ep_rank, server_args, port_args, dp_rank
+    ):
+        if self.spec_algorithm.is_eagle():
+            from sglang.srt.speculative.eagle_worker import EAGLEWorker
+            from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
+
+            WorkerClass = EAGLEWorkerV2 if self.enable_overlap else EAGLEWorker
+
+            self.draft_worker = WorkerClass(
+                gpu_id=gpu_id,
+                tp_rank=tp_rank,
+                moe_ep_rank=moe_ep_rank,
+                server_args=server_args,
+                nccl_port=port_args.nccl_port,
+                target_worker=self.tp_worker,
+                dp_rank=dp_rank,
+            )
+        elif self.spec_algorithm.is_standalone():
+            from sglang.srt.speculative.standalone_worker import StandaloneWorker
+
+            self.draft_worker = StandaloneWorker(
+                gpu_id=gpu_id,
+                tp_rank=tp_rank,
+                moe_ep_rank=moe_ep_rank,
+                server_args=server_args,
+                nccl_port=port_args.nccl_port,
+                target_worker=self.tp_worker,
+                dp_rank=dp_rank,
+            )
+        elif self.spec_algorithm.is_ngram():
+            from sglang.srt.speculative.ngram_worker import NGRAMWorker
+
+            self.draft_worker = NGRAMWorker(
+                gpu_id=gpu_id,
+                tp_rank=tp_rank,
+                moe_ep_rank=moe_ep_rank,
+                server_args=server_args,
+                nccl_port=port_args.nccl_port,
+                target_worker=self.tp_worker,
+                dp_rank=dp_rank,
+            )
+        else:
+            self.draft_worker = None
 
     def init_deterministic_inference_config(self):
         """Initialize deterministic inference configuration for different attention backends."""
@@ -1454,26 +1462,29 @@ class Scheduler(
             or req.sampling_params.ebnf is not None
             or req.sampling_params.structural_tag is not None
         ):
-            assert self.grammar_backend is not None
-            if req.sampling_params.json_schema is not None:
-                key = ("json", req.sampling_params.json_schema)
-            elif req.sampling_params.regex is not None:
-                key = ("regex", req.sampling_params.regex)
-            elif req.sampling_params.ebnf is not None:
-                key = ("ebnf", req.sampling_params.ebnf)
-            elif req.sampling_params.structural_tag:
-                key = ("structural_tag", req.sampling_params.structural_tag)
-
-            value, cache_hit = self.grammar_backend.get_cached_or_future_value(key)
-            req.grammar = value
-
-            if not cache_hit:
-                req.grammar_key = key
-                add_to_grammar_queue = True
+            if self.grammar_backend is None:
+                error_msg = "Grammar-based generation (json_schema, regex, ebnf, structural_tag) is not supported when the server is launched with --grammar-backend none"
+                req.set_finish_with_abort(error_msg)
             else:
-                if value is INVALID_GRAMMAR_OBJ:  # We hit a cached invalid grammar.
-                    error_msg = f"Invalid grammar request with cache hit: {key=}"
-                    req.set_finish_with_abort(error_msg)
+                if req.sampling_params.json_schema is not None:
+                    key = ("json", req.sampling_params.json_schema)
+                elif req.sampling_params.regex is not None:
+                    key = ("regex", req.sampling_params.regex)
+                elif req.sampling_params.ebnf is not None:
+                    key = ("ebnf", req.sampling_params.ebnf)
+                elif req.sampling_params.structural_tag:
+                    key = ("structural_tag", req.sampling_params.structural_tag)
+
+                value, cache_hit = self.grammar_backend.get_cached_or_future_value(key)
+                req.grammar = value
+
+                if not cache_hit:
+                    req.grammar_key = key
+                    add_to_grammar_queue = True
+                else:
+                    if value is INVALID_GRAMMAR_OBJ:  # We hit a cached invalid grammar.
+                        error_msg = f"Invalid grammar request with cache hit: {key=}"
+                        req.set_finish_with_abort(error_msg)
 
         if add_to_grammar_queue:
             self.grammar_queue.append(req)
@@ -1789,7 +1800,7 @@ class Scheduler(
             chunked_req_to_exclude.add(self.chunked_req)
             self.tree_cache.cache_unfinished_req(self.chunked_req, chunked=True)
             # chunked request keeps its rid but will get a new req_pool_idx
-            if self.tp_worker.worker.model_runner.is_hybrid_gdn:
+            if self.tp_worker.worker.model_runner.mambaish_config is not None:
                 self.req_to_token_pool.free(
                     self.chunked_req.req_pool_idx, free_mamba_cache=False
                 )
@@ -2927,7 +2938,9 @@ def run_scheduler_process(
 
     # Set cpu affinity to this gpu process
     if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
-        set_gpu_proc_affinity(server_args.tp_size, server_args.nnodes, gpu_id)
+        set_gpu_proc_affinity(
+            server_args.pp_size, server_args.tp_size, server_args.nnodes, gpu_id
+        )
     if (numa_node := server_args.numa_node) is not None:
         numa_bind_to_node(numa_node[gpu_id])
 

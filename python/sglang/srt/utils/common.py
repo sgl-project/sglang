@@ -487,7 +487,7 @@ def make_layers(
     # circula imports
     from sglang.srt.distributed import get_pp_indices
     from sglang.srt.layers.utils import PPMissingLayer
-    from sglang.srt.offloader import get_offloader
+    from sglang.srt.utils.offloader import get_offloader
 
     assert not pp_size or num_hidden_layers >= pp_size
     start_layer, end_layer = (
@@ -516,6 +516,24 @@ def make_layers(
     if pp_rank is None or pp_size is None:
         return modules
     return modules, start_layer, end_layer
+
+
+def make_layers_non_pp(
+    num_hidden_layers: int,
+    layer_fn: LayerFn,
+    prefix: str = "",
+) -> torch.nn.ModuleList:
+    from sglang.srt.offloader import get_offloader
+
+    layers = torch.nn.ModuleList(
+        get_offloader().wrap_modules(
+            (
+                layer_fn(idx=idx, prefix=add_prefix(idx, prefix))
+                for idx in range(num_hidden_layers)
+            )
+        )
+    )
+    return layers
 
 
 cmo_stream = None
@@ -1873,6 +1891,7 @@ def direct_register_custom_op(
 
 
 def set_gpu_proc_affinity(
+    pp_size: int,
     tp_size: int,
     nnodes: int,
     gpu_id: int,
@@ -1881,7 +1900,8 @@ def set_gpu_proc_affinity(
     pid = os.getpid()
     p = psutil.Process(pid)
 
-    tp_size_per_node = tp_size // nnodes
+    nnodes_per_tp_group = max(nnodes // pp_size, 1)
+    tp_size_per_node = tp_size // nnodes_per_tp_group
 
     # total physical cores
     total_pcores = psutil.cpu_count(logical=False)

@@ -388,7 +388,7 @@ impl WorkerRegistry {
                 }
 
                 // Get all workers from registry
-                let workers: Vec<Arc<dyn crate::core::Worker>> = workers_ref
+                let workers: Vec<Arc<dyn Worker>> = workers_ref
                     .iter()
                     .map(|entry| entry.value().clone())
                     .collect();

@@ -115,6 +115,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "enable_deterministic_inference",
     "nsa_prefill",
     "nsa_decode",
+    "multi_item_scoring_delimiter",
 ]
 
 # Put some global args for easy access
@@ -667,9 +668,11 @@ class Req:
     def is_prefill_only(self) -> bool:
         """Check if this request is prefill-only (no token generation needed)."""
         # NOTE: when spec is enabled, prefill_only optimizations are disabled
-        return (
-            self.sampling_params.max_new_tokens == 0
-            and global_server_args_dict["speculative_algorithm"] is None
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        spec_alg = global_server_args_dict["speculative_algorithm"]
+        return self.sampling_params.max_new_tokens == 0 and (
+            spec_alg is None or spec_alg == SpeculativeAlgorithm.NONE
         )
 
     def add_latency(self, stage: RequestStage):
