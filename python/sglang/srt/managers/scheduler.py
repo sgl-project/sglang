@@ -2149,6 +2149,9 @@ class Scheduler(
                     # FIXME(lsyin): tmp code for eagle v2
                     batch.spec_info = batch_result.next_draft_input
                     batch.spec_info.future_indices = future_indices
+
+                    # The future value, usually for next batch preparation
+                    batch.seq_lens = batch_result.next_draft_input.new_seq_lens
             else:
                 batch_result = self.model_worker.forward_batch_generation(
                     batch_or_worker_batch

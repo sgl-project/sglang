@@ -1121,11 +1121,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         assert self.spec_info.is_draft_input()
         draft_input: EagleDraftInput = self.spec_info
-        if draft_input.verify_done is not None:
-            draft_input.verify_done.synchronize()
 
         # FIXME(lsyin): now implementation does not enable over-allocation
         # Now new_seq_lens and allocate_lens are correct
+        self.maybe_wait_verify_done()
+
         self.seq_lens = draft_input.new_seq_lens
         new_allocate_lens = self.seq_lens + EagleDraftInput.ALLOC_LEN_PER_DECODE
         num_needed_tokens = (new_allocate_lens - draft_input.allocate_lens).sum().item()
@@ -1758,11 +1758,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             (self.req_pool_indices, locs), self.out_cache_loc.to(torch.int32)
         )
 
+    def maybe_wait_verify_done(self):
+        if self.spec_info is not None:
+            from sglang.srt.speculative.eagle_info import EagleDraftInput
+
+            draft_input: EagleDraftInput = self.spec_info
+            if draft_input.verify_done is not None:
+                draft_input.verify_done.synchronize()
+
     def filter_batch(
         self,
         chunked_req_to_exclude: Optional[Union[Req, List[Req]]] = None,
         keep_indices: Optional[List[int]] = None,
     ):
+        # FIXME(lsyin): used here to get the correct seq_lens
+        # The batch has been launched but we need it verified to get correct next batch info
+        self.maybe_wait_verify_done()
+
         if keep_indices is None:
             if isinstance(chunked_req_to_exclude, Req):
                 chunked_req_to_exclude = [chunked_req_to_exclude]
