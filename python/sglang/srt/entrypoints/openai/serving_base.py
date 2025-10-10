@@ -62,6 +62,12 @@ class OpenAIServingBase(ABC):
             return self.create_error_response(
                 message=e.detail, err_type=str(e.status_code), status_code=e.status_code
             )
+        except ValueError as e:
+            return self.create_error_response(
+                message=str(e),
+                err_type="BadRequest",
+                status_code=400,
+            )
         except Exception as e:
             logger.exception(f"Error in request: {e}")
             return self.create_error_response(

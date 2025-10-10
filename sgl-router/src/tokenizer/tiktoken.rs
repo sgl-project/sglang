@@ -246,7 +246,6 @@ mod tests {
 
     #[test]
     fn test_unrecognized_model_name_returns_error() {
-        // Test that unrecognized model names return an error
         let result = TiktokenTokenizer::from_model_name("distilgpt-2");
         assert!(result.is_err());
         if let Err(e) = result {
@@ -268,7 +267,6 @@ mod tests {
 
     #[test]
     fn test_recognized_model_names() {
-        // Test that recognized model names work correctly
         assert!(TiktokenTokenizer::from_model_name("gpt-4").is_ok());
         assert!(TiktokenTokenizer::from_model_name("gpt-3.5-turbo").is_ok());
         assert!(TiktokenTokenizer::from_model_name("text-davinci-003").is_ok());
