@@ -143,7 +143,7 @@ class TestDPAttentionDP2TP2PortPicking(CustomTestCase):
                 "--enable-torch-compile",
                 "--torch-compile-max-bs",
                 "2",
-                "--pick-free-dp-port",
+                "--enable-dp-attention-port-picking",
             ],
         )
 
