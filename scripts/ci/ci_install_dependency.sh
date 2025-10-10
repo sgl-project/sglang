@@ -84,7 +84,7 @@ if [ "$RUN_DEEPSEEK_V32" = "1" ]; then
     cd flash-mla
     git checkout ${FLASHMLA_COMMIT}
     git submodule update --init --recursive
-    FLASH_MLA_DISABLE_SM100=${FLASH_MLA_DISABLE_SM100} $PIP_CMD install -v . $PIP_INSTALL_SUFFIX --no-build-isolation
+    FLASH_MLA_DISABLE_SM100=${FLASH_MLA_DISABLE_SM100} $PIP_CMD install -v . $PIP_INSTALL_SUFFIX
     cd ..
 
     # Install fast-hadamard-transform
@@ -92,7 +92,7 @@ if [ "$RUN_DEEPSEEK_V32" = "1" ]; then
     git clone https://github.com/Dao-AILab/fast-hadamard-transform
     cd fast-hadamard-transform
     git checkout ${FAST_HADAMARD_TRANSFORM_COMMIT}
-    $PIP_CMD install . $PIP_INSTALL_SUFFIX --no-build-isolation
+    $PIP_CMD install . $PIP_INSTALL_SUFFIX
     cd ..
 
     # Install tilelang
