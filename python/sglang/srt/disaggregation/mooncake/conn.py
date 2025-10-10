@@ -829,7 +829,7 @@ class MooncakeKVManager(CommonKVManager):
                             break
 
                         if kv_chunk.is_last:
-                            if kv_chunk.extra_pool_indices:
+                            if kv_chunk.extra_pool_indices is not None:
                                 self.send_extra(
                                     req,
                                     kv_chunk.extra_pool_indices,
@@ -1296,15 +1296,11 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         kv_indices.tobytes() if not is_dummy else b"",
                         str(aux_index).encode("ascii") if not is_dummy else b"",
                         (
-                            (
-                                np.array(
-                                    extra_pool_indices,
-                                    dtype=np.int32,
-                                ).tobytes()
-                                if not is_dummy
-                                else b""
-                            )
-                            if extra_pool_indices
+                            np.array(
+                                extra_pool_indices,
+                                dtype=np.int32,
+                            ).tobytes()
+                            if not is_dummy and extra_pool_indices is not None
                             else b""
                         ),
                         str(self.required_dst_info_num).encode("ascii"),
