@@ -318,6 +318,7 @@ class ServerArgs:
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
     speculative_attention_mode: str = "prefill"
+    speculative_request_metrics: bool = False
     # For ngram only
     speculative_ngram_min_match_window_size: int = 1
     speculative_ngram_max_match_window_size: int = 12
@@ -2158,6 +2159,12 @@ class ServerArgs:
             choices=["prefill", "decode"],
             help="Attention backend for speculative decoding operations (both target verify and draft extend). Can be one of 'prefill' (default) or 'decode'.",
             default=ServerArgs.speculative_attention_mode,
+        )
+        parser.add_argument(
+            "--speculative-request-metrics",
+            action="store_true",
+            help="Enable per-request speculative decoding metrics collection (spec_accept_rate and spec_accept_length). This incurs additional device transfers on every verification pass.",
+            default=ServerArgs.speculative_request_metrics,
         )
         # Ngram speculative decoding
         parser.add_argument(

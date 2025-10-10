@@ -726,7 +726,10 @@ class SchedulerOutputProcessorMixin:
 
                 if not self.spec_algorithm.is_none():
                     spec_verify_ct.append(req.spec_verify_ct)
-                    spec_accepted_tokens.append(req.spec_accepted_tokens)
+                    if self.server_args.speculative_request_metrics:
+                        spec_accepted_tokens.append(req.spec_accepted_tokens)
+                    else:
+                        spec_accepted_tokens.append(0)
 
                 if return_logprob:
                     if (

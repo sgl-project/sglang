@@ -378,12 +378,13 @@ class EagleVerifyInput(SpecInput):
                     unfinished_accept_index.append(accept_index[i])
             req.spec_verify_ct += 1
 
-        # For each request, accumulate # of accepted tokens for this verify pass.
-        accept_length_this_pass = (accept_index != -1).sum(dim=1) - 1
-        for i, (req, accepted_count) in enumerate(
-            zip(batch.reqs, accept_length_this_pass.tolist())
-        ):
-            req.spec_accepted_tokens += accepted_count
+        # Only collect per-request metrics if enabled (incurs device sync overhead)
+        if global_server_args_dict["speculative_request_metrics"]:
+            accept_length_this_pass = (accept_index != -1).sum(dim=1) - 1
+            # Accumulate accepted tokens for each request
+            accept_length_cpu = accept_length_this_pass.cpu()
+            for i, req in enumerate(batch.reqs):
+                req.spec_accepted_tokens += accept_length_cpu[i].item()
 
         if has_finished:
             accept_length = (accept_index != -1).sum(dim=1) - 1
