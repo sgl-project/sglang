@@ -3034,9 +3034,9 @@ class ServerArgs:
             minor = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
             if (major, minor) > (2, 6):
                 logger.warning(
-                    "WARNING: PD-Multiplexing may experience performance degradation with torch versions > 2.6.x \n"
-                    f"  current torch version is {torch.__version__}. \n"
-                    "  Please manually install torch 2.6.x"
+                    "WARNING: PD-Multiplexing may experience performance degradation with torch versions > 2.6.x.\n"
+                    f"  Current torch version is {torch.__version__}.\n"
+                    "  Please manually install torch 2.6.x."
                 )
 
         # Check multi tokenizer

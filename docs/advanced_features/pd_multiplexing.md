@@ -11,7 +11,7 @@
 
 ### YAML Configuration
 
-example configuration of H200 (132 SMs)
+Example configuration for an H200 (132 SMs)
 
 ```yaml
 # Number of SM groups to divide the GPU into.
@@ -27,7 +27,7 @@ sm_group_num: 8
 #   - decode_sm: number of SMs allocated for decode
 #   - decode_bs_threshold: minimum decode batch size to select this group
 #
-# prefill_sm + decode_sm must equal total SMs
+# The sum of `prefill_sm` and `decode_sm` must equal the total number of SMs.
 # If provided, the number of entries must equal (sm_group_num - 2).
 manual_divisions:
   - [112, 20, 1]
