@@ -25,7 +25,10 @@ OCP_MX_BLOCK_SIZE = 32
 class QuarkW4A4MXFP4(QuarkScheme):
 
     def __init__(
-        self, weight_quant_spec: dict[str, Any], input_quant_spec: dict[str, Any], layer_name: Optional[str] = None
+        self,
+        weight_quant_spec: dict[str, Any],
+        input_quant_spec: dict[str, Any],
+        layer_name: Optional[str] = None,
     ):
         self.out_dtype = torch.get_default_dtype()
         self.qscheme = "per_group"

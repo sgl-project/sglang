@@ -202,7 +202,6 @@ class QuarkConfig(QuantizationConfig):
             logger.debug("Quark model is not in MX-FP4 format: not group_size=32")
             return False
 
-
         # Activations need to use dynamic quantization.
         if input_quant.get("is_dynamic") is False:
             logger.debug("Quark model is not in MX-FP4 format: not activation dynamic")
@@ -264,7 +263,9 @@ class QuarkConfig(QuantizationConfig):
             )
             return global_quant_config
 
-    def _get_scheme_from_config(self, config: dict[str, Any], layer_name: str) -> "QuarkScheme":
+    def _get_scheme_from_config(
+        self, config: dict[str, Any], layer_name: str
+    ) -> "QuarkScheme":
         if config.get("output_tensors") or config.get("bias"):
             raise NotImplementedError(
                 "Currently, Quark models with output_tensors "
