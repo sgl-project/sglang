@@ -124,15 +124,9 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
 )
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.offloader import (
-    create_offloader_from_server_args,
-    get_offloader,
-    set_offloader,
-)
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     cpu_has_amx_support,
@@ -155,7 +149,13 @@ from sglang.srt.utils import (
     set_cuda_arch,
     slow_rank_detector,
 )
+from sglang.srt.utils.offloader import (
+    create_offloader_from_server_args,
+    get_offloader,
+    set_offloader,
+)
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
+from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorBucket,
     FlattenedTensorMetadata,
@@ -192,7 +192,6 @@ SGLANG_CI_SMALL_KV_SIZE = os.getenv("SGLANG_CI_SMALL_KV_SIZE", None)
 UNBALANCED_MODEL_LOADING_TIMEOUT_S = 300
 
 logger = logging.getLogger(__name__)
-
 
 if _is_npu:
     import torch_npu
@@ -639,6 +638,22 @@ class ModelRunner:
                     "FlashAttention3 decode backend is not compatible with hierarchical cache. "
                     "Setting hicache_io_backend to vanilla I/O, which may lead to suboptimal performance with small page sizes."
                 )
+
+        if self.model_config.hf_config.model_type == "qwen3_vl_moe":
+            if (
+                quantization_config := getattr(
+                    self.model_config.hf_config, "quantization_config"
+                )
+            ) is not None:
+                text_config = self.model_config.hf_text_config
+                weight_block_size_n = quantization_config["weight_block_size"][0]
+                if (
+                    text_config.moe_intermediate_size
+                    // (self.tp_size // self.moe_ep_size)
+                ) % weight_block_size_n != 0:
+                    raise ValueError(
+                        f"For qwen3-vl-fp8 models, please make sure ({text_config.moe_intermediate_size=} // ({self.tp_size=} // {self.moe_ep_size=})) % {weight_block_size_n=} == 0"
+                    )
 
     def init_torch_distributed(self):
         logger.info("Init torch distributed begin.")
