@@ -300,7 +300,7 @@ class GenerateReqInput(BaseReq):
         self._expand_inputs(num)
         self._normalize_rid(num)
         self._normalize_external_request_id(num)
-        self._normalize_user(num)
+        self._normalize_user_id(num)
         self._normalize_lora_paths(num)
         self._normalize_image_data(num)
         self._normalize_video_data(num)
@@ -444,8 +444,8 @@ class GenerateReqInput(BaseReq):
                 "The external_request_id should be a string or a list of strings."
             )
 
-    def _normalize_user(self, num):
-        """Normalize user for batch processing."""
+    def _normalize_user_id(self, num):
+        """Normalize user_id for batch processing."""
         if self.user_id is None:
             self.user_id = [None] * num
         elif isinstance(self.user_id, str):
