@@ -37,7 +37,6 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import (
     bind_port,
     configure_logger,
@@ -46,6 +45,7 @@ from sglang.srt.utils import (
     get_zmq_socket,
     kill_itself_when_parent_died,
 )
+from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -158,7 +158,10 @@ class DataParallelController:
             dp_port_args = self.launch_dp_schedulers(server_args, port_args)
             self.control_message_step = 1
 
-        if server_args.node_rank == 0 and not server_args.enable_dp_attention_port_picking:
+        if (
+            server_args.node_rank == 0
+            and not server_args.enable_dp_attention_port_picking
+        ):
             for dp_rank in range(server_args.dp_size):
                 self.workers[dp_rank] = get_zmq_socket(
                     self.context,
