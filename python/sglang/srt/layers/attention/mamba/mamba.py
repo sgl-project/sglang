@@ -436,7 +436,6 @@ class MambaMixer2(torch.nn.Module):
             dim=0,
         )
 
-        # Choose Triton on HIP (ROCm) or if explicitly requested.
         use_triton = use_triton_causal_conv or is_hip()
 
         # Process prefill requests
