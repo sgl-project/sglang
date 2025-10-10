@@ -231,16 +231,21 @@ class TpModelWorker:
     def forward_batch_generation(
         self,
         model_worker_batch: ModelWorkerBatch,
+        forward_batch: Optional[ForwardBatch] = None,
         is_verify: bool = False,
         skip_attn_backend_init=False,
     ) -> GenerationBatchResult:
         # FIXME(lsyin): maybe remove skip_attn_backend_init in forward_batch_generation,
         #               which requires preparing replay to always be in this function
 
-        # update the consumer index of hicache to the running batch
-        self.set_hicache_consumer(model_worker_batch.hicache_consumer_index)
+        if model_worker_batch is not None:
+            # update the consumer index of hicache to the running batch
+            self.set_hicache_consumer(model_worker_batch.hicache_consumer_index)
 
-        forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+            forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+        else:
+            # FIXME(lsyin): unify the interface of forward_batch
+            assert forward_batch is not None
 
         pp_proxy_tensors = None
         if not self.pp_group.is_first_rank:

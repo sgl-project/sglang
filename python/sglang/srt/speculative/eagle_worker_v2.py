@@ -52,6 +52,7 @@ class EAGLEWorkerV2(EAGLEWorker):
         )
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
         self.plan_stream: CudaStream = torch.get_device_module(self.device).Stream()
+        # TODO(lsyin): potential bugs with a separate plan stream
         self.plan_stream_ctx = torch.cuda.stream(self.plan_stream)
 
     def forward_batch_generation(self, model_worker_batch: ModelWorkerBatch):
@@ -263,7 +264,10 @@ class EAGLEWorkerV2(EAGLEWorker):
 
         # Run target verify batch in the main compute stream
         forward_batch_output = self.target_worker.forward_batch_generation(
-            verify_forward_batch, is_verify=True, skip_attn_backend_init=True
+            model_worker_batch=None,
+            forward_batch=verify_forward_batch,
+            is_verify=True,
+            skip_attn_backend_init=True,
         )
         logits_output = forward_batch_output.logits_output
 
