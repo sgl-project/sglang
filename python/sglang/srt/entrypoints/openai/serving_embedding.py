@@ -162,6 +162,8 @@ class OpenAIServingEmbedding(OpenAIServingBase):
                     index=idx,
                 )
             )
+            # Handle missing prompt_tokens gracefully
+            meta_info = ret_item.get("meta_info", {})
             prompt_tokens += meta_info.get("prompt_tokens", 0)
 
         return EmbeddingResponse(
