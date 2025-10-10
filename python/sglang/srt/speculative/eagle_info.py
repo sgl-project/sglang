@@ -377,14 +377,9 @@ class EagleVerifyInput(SpecInput):
                 else:
                     unfinished_accept_index.append(accept_index[i])
             req.spec_verify_ct += 1
-
-        # Only collect per-request metrics if enabled (incurs device sync overhead)
-        if global_server_args_dict["speculative_request_metrics"]:
-            accept_length_this_pass = (accept_index != -1).sum(dim=1) - 1
-            # Accumulate accepted tokens for each request
-            accept_length_cpu = accept_length_this_pass.cpu()
-            for i, req in enumerate(batch.reqs):
-                req.spec_accepted_tokens += accept_length_cpu[i].item()
+            req.spec_accepted_tokens += (
+                sum(1 for idx in accept_index_row if idx != -1) - 1
+            )
 
         if has_finished:
             accept_length = (accept_index != -1).sum(dim=1) - 1
