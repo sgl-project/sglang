@@ -14,7 +14,7 @@ jobs:
     strategy:
       matrix:
         variant:
-          - cuda_version: "13.0.1"
+          - cuda_version: "12.9.1"
             build_type: "all"
     runs-on: x64-docker-build-node
     steps:
@@ -65,7 +65,7 @@ jobs:
     strategy:
       matrix:
         variant:
-          - cuda_version: "13.0.1"
+          - cuda_version: "12.9.1"
             build_type: "all_aarch64"
     runs-on: arm-docker-build-node
     steps:
