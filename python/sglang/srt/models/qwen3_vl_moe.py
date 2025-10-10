@@ -35,11 +35,7 @@ from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3_moe import Qwen3MoeModel
-from sglang.srt.models.qwen3_vl import (
-    Qwen3VLForConditionalGeneration,
-    Qwen3VLMoeVisionModel,
-)
-from sglang.srt.utils import add_prefix
+from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
