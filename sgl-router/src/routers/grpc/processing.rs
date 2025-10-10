@@ -85,12 +85,47 @@ impl ResponseProcessor {
             final_text.push_str(&t);
         }
 
+        // Check parser availability upfront (log warning only once per choice)
+        let reasoning_parser_available = original_request.separate_reasoning
+            && utils::check_reasoning_parser_availability(
+                &self.reasoning_parser_factory,
+                self.configured_reasoning_parser.as_ref(),
+                &original_request.model,
+            );
+
+        let tool_choice_enabled = !matches!(
+            &original_request.tool_choice,
+            Some(ToolChoice::Value(ToolChoiceValue::None))
+        );
+
+        let tool_parser_available = tool_choice_enabled
+            && original_request.tools.is_some()
+            && utils::check_tool_parser_availability(
+                &self.tool_parser_factory,
+                self.configured_tool_parser.as_ref(),
+                &original_request.model,
+            );
+
+        if original_request.separate_reasoning && !reasoning_parser_available {
+            tracing::warn!(
+                "No reasoning parser found for model '{}', skipping reasoning parsing",
+                original_request.model
+            );
+        }
+
+        if original_request.tools.is_some() && tool_choice_enabled && !tool_parser_available {
+            tracing::warn!(
+                "No tool parser found for model '{}', skipping tool call parsing",
+                original_request.model
+            );
+        }
+
         // Step 1: Handle reasoning content parsing
         let mut reasoning_text: Option<String> = None;
         let mut processed_text = final_text;
 
-        // Check if reasoning parsing is enabled and separate_reasoning is requested
-        if original_request.separate_reasoning {
+        // Check if reasoning parsing is enabled and parser is available
+        if original_request.separate_reasoning && reasoning_parser_available {
             let pooled_parser = utils::get_reasoning_parser(
                 &self.reasoning_parser_factory,
                 self.configured_reasoning_parser.as_ref(),
@@ -114,13 +149,8 @@ impl ResponseProcessor {
         // Step 2: Handle tool call parsing
         let mut tool_calls: Option<Vec<ToolCall>> = None;
 
-        // Check if tool calls should be processed
-        let tool_choice_enabled = !matches!(
-            &original_request.tool_choice,
-            Some(ToolChoice::Value(ToolChoiceValue::None))
-        );
-
-        if tool_choice_enabled && original_request.tools.is_some() {
+        // Check if tool calls should be processed (tool_choice_enabled already computed above)
+        if tool_choice_enabled && original_request.tools.is_some() && tool_parser_available {
             // Check if JSON schema constraint was used (specific function or required mode)
             let used_json_schema = match &original_request.tool_choice {
                 Some(ToolChoice::Function { .. }) => true,
