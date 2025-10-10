@@ -186,6 +186,7 @@ UNBALANCED_MODEL_LOADING_TIMEOUT_S = 300
 
 logger = logging.getLogger(__name__)
 
+
 if _is_npu:
     import torch_npu
 
@@ -623,22 +624,6 @@ class ModelRunner:
                     "FlashAttention3 decode backend is not compatible with hierarchical cache. "
                     "Setting hicache_io_backend to vanilla I/O, which may lead to suboptimal performance with small page sizes."
                 )
-
-        if self.model_config.hf_config.model_type == "qwen3_vl_moe":
-            if (
-                quantization_config := getattr(
-                    self.model_config.hf_config, "quantization_config"
-                )
-            ) is not None:
-                text_config = self.model_config.hf_text_config
-                weight_block_size_n = quantization_config["weight_block_size"][0]
-                if (
-                    text_config.moe_intermediate_size
-                    // (self.tp_size // self.moe_ep_size)
-                ) % weight_block_size_n != 0:
-                    raise ValueError(
-                        f"For qwen3-vl-fp8 models, please make sure ({text_config.moe_intermediate_size=} // ({self.tp_size=} // {self.moe_ep_size=})) % {weight_block_size_n=} == 0"
-                    )
 
     def init_torch_distributed(self):
         logger.info("Init torch distributed begin.")
