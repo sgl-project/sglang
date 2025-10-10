@@ -237,8 +237,10 @@ class BaseMultimodalProcessor(ABC):
             if not _is_npu:
                 kwargs["device"] = "cuda"
             elif processor.__class__.__name__ not in {
+                "Qwen2VLProcessor",
                 "Qwen2_5_VLProcessor",
                 "Qwen3VLProcessor",
+                "Glm4vProcessor",
             }:
                 # Note: for qwen-vl, processor has some reshape issue because of dims restriction on Ascend.
                 kwargs["device"] = "npu"
