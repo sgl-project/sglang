@@ -58,6 +58,10 @@ class LoadConfig:
     ignore_patterns: Optional[Union[List[str], str]] = None
     decryption_key_file: Optional[str] = None
     decrypt_max_concurrency: int = -1
+    tp_rank: Optional[int] = None
+    remote_instance_weight_loader_seed_instance_ip: Optional[str] = None
+    remote_instance_weight_loader_seed_instance_service_port: Optional[int] = None
+    remote_instance_weight_loader_send_weights_group_ports: Optional[List[int]] = None
 
     def __post_init__(self):
         model_loader_extra_config = self.model_loader_extra_config or {}

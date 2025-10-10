@@ -4,9 +4,12 @@
 pub mod mock_mcp_server;
 pub mod mock_openai_server;
 pub mod mock_worker;
+pub mod streaming_helpers;
 pub mod test_app;
 
+use serde_json::json;
 use sglang_router_rs::config::RouterConfig;
+use sglang_router_rs::protocols::spec::{Function, Tool};
 use sglang_router_rs::server::AppContext;
 use std::fs;
 use std::path::PathBuf;
@@ -71,7 +74,6 @@ pub fn ensure_tokenizer_cached() -> PathBuf {
 
         let content = response.bytes().expect("Failed to read tokenizer content");
 
-        // Verify we got actual JSON content
         if content.len() < 100 {
             panic!("Downloaded content too small: {} bytes", content.len());
         }
@@ -101,3 +103,284 @@ pub const EXPECTED_HASHES: [u64; 4] = [
     6245658446118930933,
     5097285695902185237,
 ];
+
+/// Create a comprehensive set of test tools covering all parser test scenarios
+#[allow(dead_code)]
+pub fn create_test_tools() -> Vec<Tool> {
+    vec![
+        Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "search".to_string(),
+                description: Some("Search for information".to_string()),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"}
+                    }
+                }),
+            },
+        },
+        Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "get_weather".to_string(),
+                description: Some("Get weather information".to_string()),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "city": {"type": "string"},
+                        "location": {"type": "string"},
+                        "date": {"type": "string"},
+                        "units": {"type": "string"}
+                    }
+                }),
+            },
+        },
+        Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "calculate".to_string(),
+                description: Some("Perform calculations".to_string()),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "x": {"type": "number"},
+                        "y": {"type": "number"}
+                    }
+                }),
+            },
+        },
+        Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "translate".to_string(),
+                description: Some("Translate text".to_string()),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "text": {"type": "string"},
+                        "to": {"type": "string"},
+                        "target_lang": {"type": "string"}
+                    }
+                }),
+            },
+        },
+        Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "get_time".to_string(),
+                description: Some("Get current time".to_string()),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "timezone": {"type": "string"},
+                        "format": {"type": "string"}
+                    }
+                }),
+            },
+        },
+        Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "get_current_time".to_string(),
+                description: Some("Get current time".to_string()),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "timezone": {"type": "string"},
+                        "format": {"type": "string"}
+                    }
+                }),
+            },
+        },
+        Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "update_settings".to_string(),
+                description: Some("Update settings".to_string()),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "preferences": {"type": "object"},
+                        "notifications": {"type": "boolean"}
+                    }
+                }),
+            },
+        },
+        Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "ping".to_string(),
+                description: Some("Ping service".to_string()),
+                parameters: json!({"type": "object", "properties": {}}),
+            },
+        },
+        Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "test".to_string(),
+                description: Some("Test function".to_string()),
+                parameters: json!({"type": "object", "properties": {}}),
+            },
+        },
+        Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "process".to_string(),
+                description: Some("Process data".to_string()),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "count": {"type": "number"},
+                        "rate": {"type": "number"},
+                        "enabled": {"type": "boolean"},
+                        "data": {"type": "object"},
+                        "text": {"type": "string"}
+                    }
+                }),
+            },
+        },
+        Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "web_search".to_string(),
+                description: Some("Search the web".to_string()),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "num_results": {"type": "number"},
+                        "search_type": {"type": "string"}
+                    }
+                }),
+            },
+        },
+        Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "get_tourist_attractions".to_string(),
+                description: Some("Get tourist attractions".to_string()),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "city": {"type": "string"}
+                    }
+                }),
+            },
+        },
+        Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "config".to_string(),
+                description: Some("Configuration function".to_string()),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "debug": {"type": "boolean"},
+                        "verbose": {"type": "boolean"},
+                        "optional": {"type": "null"}
+                    }
+                }),
+            },
+        },
+        Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "test_func".to_string(),
+                description: Some("Test function".to_string()),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "bool_true": {"type": "boolean"},
+                        "bool_false": {"type": "boolean"},
+                        "none_val": {"type": "null"}
+                    }
+                }),
+            },
+        },
+        Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "create".to_string(),
+                description: Some("Create resource".to_string()),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "email": {"type": "string"}
+                    }
+                }),
+            },
+        },
+        Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "add".to_string(),
+                description: Some("Add operation".to_string()),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "x": {"type": "number"},
+                        "y": {"type": "number"}
+                    }
+                }),
+            },
+        },
+        Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "calc".to_string(),
+                description: Some("Calculate".to_string()),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "x": {"type": "number"}
+                    }
+                }),
+            },
+        },
+        Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "func1".to_string(),
+                description: Some("Function 1".to_string()),
+                parameters: json!({"type": "object", "properties": {}}),
+            },
+        },
+        Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "func2".to_string(),
+                description: Some("Function 2".to_string()),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "y": {"type": "number"}
+                    }
+                }),
+            },
+        },
+        Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "tool1".to_string(),
+                description: Some("Tool 1".to_string()),
+                parameters: json!({"type": "object", "properties": {}}),
+            },
+        },
+        Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "tool2".to_string(),
+                description: Some("Tool 2".to_string()),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "y": {"type": "number"}
+                    }
+                }),
+            },
+        },
+    ]
+}

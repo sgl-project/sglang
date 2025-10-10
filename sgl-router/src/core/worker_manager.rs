@@ -181,29 +181,55 @@ impl WorkerManager {
     ) -> Result<(), String> {
         info!("Starting worker initialization");
 
+        // Determine connection mode from config
+        let connection_mode = &config.connection_mode;
+
         match &config.mode {
-            RoutingMode::Regular { worker_urls } => {
-                Self::initialize_regular_workers(worker_urls, config, registry, policy_registry)
+            RoutingMode::Regular { worker_urls } => match connection_mode {
+                ConfigConnectionMode::Http => {
+                    Self::initialize_regular_workers(
+                        worker_urls,
+                        config,
+                        registry,
+                        policy_registry,
+                    )
                     .await?;
-            }
+                }
+                ConfigConnectionMode::Grpc => {
+                    Self::initialize_grpc_workers(worker_urls, config, registry, policy_registry)
+                        .await?;
+                }
+            },
             RoutingMode::PrefillDecode {
                 prefill_urls,
                 decode_urls,
                 ..
-            } => {
-                let prefill_entries: Vec<(&String, &Option<u16>)> =
-                    prefill_urls.iter().map(|(url, port)| (url, port)).collect();
+            } => match connection_mode {
+                ConfigConnectionMode::Http => {
+                    let prefill_entries: Vec<(&String, &Option<u16>)> =
+                        prefill_urls.iter().map(|(url, port)| (url, port)).collect();
 
-                Self::initialize_prefill_workers(
-                    &prefill_entries,
-                    config,
-                    registry,
-                    policy_registry,
-                )
-                .await?;
-                Self::initialize_decode_workers(decode_urls, config, registry, policy_registry)
+                    Self::initialize_prefill_workers(
+                        &prefill_entries,
+                        config,
+                        registry,
+                        policy_registry,
+                    )
                     .await?;
-            }
+                    Self::initialize_decode_workers(decode_urls, config, registry, policy_registry)
+                        .await?;
+                }
+                ConfigConnectionMode::Grpc => {
+                    Self::initialize_grpc_pd_workers(
+                        prefill_urls,
+                        decode_urls,
+                        config,
+                        registry,
+                        policy_registry,
+                    )
+                    .await?;
+                }
+            },
             RoutingMode::OpenAI { .. } => {
                 info!("OpenAI routing mode - no workers to initialize");
             }
@@ -392,6 +418,133 @@ impl WorkerManager {
                 .flat_map(|workers| workers.iter().cloned())
                 .collect();
             policy_reg.init_pd_cache_aware_policies(&[], &all_decode_workers);
+        }
+
+        Ok(())
+    }
+
+    /// Initialize gRPC workers for regular mode
+    async fn initialize_grpc_workers(
+        urls: &[String],
+        config: &RouterConfig,
+        registry: &Arc<WorkerRegistry>,
+        policy_registry: Option<&Arc<PolicyRegistry>>,
+    ) -> Result<(), String> {
+        info!("Creating {} gRPC regular workers", urls.len());
+
+        let circuit_breaker_config =
+            Self::convert_circuit_breaker_config(&config.effective_circuit_breaker_config());
+        let health_config = Self::convert_health_config(&config.health_check);
+        let connection_mode = ConnectionMode::Grpc { port: None };
+
+        let mut registered_workers: HashMap<String, Vec<Arc<dyn Worker>>> = HashMap::new();
+
+        for url in urls {
+            let worker = Self::create_basic_worker(
+                url.clone(),
+                WorkerType::Regular,
+                connection_mode.clone(),
+                config.api_key.clone(),
+                None,
+                circuit_breaker_config.clone(),
+                health_config.clone(),
+            );
+            Self::register_worker(worker, registry, &mut registered_workers, policy_registry);
+            info!(
+                "Registered gRPC worker at {} (will connect on first use)",
+                url
+            );
+        }
+
+        Self::initialize_cache_policies(&registered_workers, registry, policy_registry);
+        Ok(())
+    }
+
+    /// Initialize gRPC PD (Prefill-Decode) workers
+    async fn initialize_grpc_pd_workers(
+        prefill_urls: &[(String, Option<u16>)],
+        decode_urls: &[String],
+        config: &RouterConfig,
+        registry: &Arc<WorkerRegistry>,
+        policy_registry: Option<&Arc<PolicyRegistry>>,
+    ) -> Result<(), String> {
+        info!(
+            "Creating {} gRPC prefill workers and {} gRPC decode workers",
+            prefill_urls.len(),
+            decode_urls.len()
+        );
+
+        let circuit_breaker_config =
+            Self::convert_circuit_breaker_config(&config.effective_circuit_breaker_config());
+        let health_config = Self::convert_health_config(&config.health_check);
+
+        let mut registered_prefill_workers: HashMap<String, Vec<Arc<dyn Worker>>> = HashMap::new();
+        let mut registered_decode_workers: HashMap<String, Vec<Arc<dyn Worker>>> = HashMap::new();
+
+        for (url, bootstrap_port) in prefill_urls {
+            let worker_type = WorkerType::Prefill {
+                bootstrap_port: *bootstrap_port,
+            };
+            let connection_mode = ConnectionMode::Grpc {
+                port: *bootstrap_port,
+            };
+
+            let worker = Self::create_basic_worker(
+                url.clone(),
+                worker_type,
+                connection_mode,
+                config.api_key.clone(),
+                None,
+                circuit_breaker_config.clone(),
+                health_config.clone(),
+            );
+            Self::register_worker(
+                worker,
+                registry,
+                &mut registered_prefill_workers,
+                policy_registry,
+            );
+            info!(
+                "Registered gRPC prefill worker at {} (will connect on first use)",
+                url
+            );
+        }
+
+        // Create decode workers
+        for url in decode_urls {
+            let connection_mode = ConnectionMode::Grpc { port: None };
+
+            let worker = Self::create_basic_worker(
+                url.clone(),
+                WorkerType::Decode,
+                connection_mode,
+                config.api_key.clone(),
+                None,
+                circuit_breaker_config.clone(),
+                health_config.clone(),
+            );
+            Self::register_worker(
+                worker,
+                registry,
+                &mut registered_decode_workers,
+                policy_registry,
+            );
+            info!(
+                "Registered gRPC decode worker at {} (will connect on first use)",
+                url
+            );
+        }
+
+        if let Some(policy_reg) = policy_registry {
+            let all_prefill_workers: Vec<Arc<dyn Worker>> = registered_prefill_workers
+                .values()
+                .flat_map(|workers| workers.iter().cloned())
+                .collect();
+            let all_decode_workers: Vec<Arc<dyn Worker>> = registered_decode_workers
+                .values()
+                .flat_map(|workers| workers.iter().cloned())
+                .collect();
+            policy_reg.init_pd_cache_aware_policies(&all_prefill_workers, &all_decode_workers);
         }
 
         Ok(())
@@ -800,113 +953,105 @@ impl WorkerManager {
             return Ok(());
         }
 
+        // Mark all workers as unhealthy initially
         info!(
-            "Marking {} workers as unhealthy before initial health checks",
+            "Marking {} workers as unhealthy before health checks",
             workers.len()
         );
         for worker in &workers {
             worker.set_healthy(false);
         }
 
-        info!(
-            "Performing initial health checks for {} workers",
-            workers.len()
-        );
-        let health_check_futures: Vec<_> = workers
-            .iter()
-            .map(|worker| {
-                let w = worker.clone();
-                let url = worker.url().to_string();
-                async move {
-                    match w.check_health_async().await {
-                        Ok(_) => {
-                            w.set_healthy(true);
-                            debug!(
-                                "Worker {} passed initial health check and marked healthy",
-                                url
-                            );
-                            Ok(url)
-                        }
-                        Err(e) => {
-                            warn!("Worker {} failed initial health check: {}", url, e);
-                            Err(url)
-                        }
-                    }
-                }
-            })
-            .collect();
-
-        let health_results = future::join_all(health_check_futures).await;
-        let failed_checks: Vec<_> = health_results.into_iter().filter_map(|r| r.err()).collect();
-
-        if !failed_checks.is_empty() {
-            info!(
-                "Initial health check: {} workers failed: {:?}",
-                failed_checks.len(),
-                failed_checks
-            );
-        }
-
         loop {
+            // 1. Filter unhealthy workers
             let workers = registry.get_all();
-            let healthy_workers: Vec<_> = workers
-                .iter()
-                .filter(|w| w.is_healthy())
-                .map(|w| w.url().to_string())
-                .collect();
             let unhealthy_workers: Vec<_> = workers
                 .iter()
                 .filter(|w| !w.is_healthy())
-                .map(|w| w.url().to_string())
+                .cloned()
                 .collect();
 
+            // 2. If all workers are healthy, return immediately
             if unhealthy_workers.is_empty() {
+                let healthy_urls: Vec<_> = workers.iter().map(|w| w.url().to_string()).collect();
                 info!(
                     "All {} workers are healthy: {:?}",
                     workers.len(),
-                    healthy_workers
+                    healthy_urls
                 );
                 return Ok(());
             }
 
+            // Check timeout
             if start_time.elapsed() > timeout {
+                let healthy_workers: Vec<_> = workers
+                    .iter()
+                    .filter(|w| w.is_healthy())
+                    .map(|w| w.url().to_string())
+                    .collect();
+                let unhealthy_urls: Vec<_> = unhealthy_workers
+                    .iter()
+                    .map(|w| w.url().to_string())
+                    .collect();
+
                 error!(
                     "Workers failed to become healthy after {}s. Unhealthy: {:?}, Healthy: {:?}",
-                    timeout_secs, unhealthy_workers, healthy_workers
+                    timeout_secs, unhealthy_urls, healthy_workers
                 );
                 return Err(format!(
                     "Workers failed to become healthy after {}s. Unhealthy: {:?}",
-                    timeout_secs, unhealthy_workers
+                    timeout_secs, unhealthy_urls
                 ));
             }
+
+            let unhealthy_urls: Vec<_> = unhealthy_workers
+                .iter()
+                .map(|w| w.url().to_string())
+                .collect();
 
             info!(
                 "Waiting for {} workers to become healthy. Unhealthy: {:?}",
                 unhealthy_workers.len(),
-                unhealthy_workers
+                unhealthy_urls
             );
 
-            let unhealthy_workers_to_check = workers
+            // 3. Check health of all unhealthy workers in parallel
+            let health_check_futures: Vec<_> = unhealthy_workers
                 .iter()
-                .filter(|w| !w.is_healthy())
-                .cloned()
-                .collect::<Vec<_>>();
-
-            for worker in unhealthy_workers_to_check {
-                let url = worker.url().to_string();
-                match worker.check_health_async().await {
-                    Ok(_) => {
-                        if !worker.is_healthy() {
-                            worker.set_healthy(true);
-                            debug!("Worker {} now healthy after health check", url);
+                .map(|worker| {
+                    let w = worker.clone();
+                    let url = worker.url().to_string();
+                    async move {
+                        match w.check_health_async().await {
+                            Ok(_) => {
+                                w.set_healthy(true);
+                                debug!("Worker {} now healthy", url);
+                            }
+                            Err(e) => {
+                                debug!("Worker {} health check failed: {}", url, e);
+                            }
                         }
                     }
-                    Err(e) => {
-                        debug!("Worker {} health check failed: {}", url, e);
-                    }
-                }
+                })
+                .collect();
+
+            future::join_all(health_check_futures).await;
+
+            // 4. Check if all workers are now healthy after health checks
+            let still_unhealthy: Vec<_> = workers.iter().filter(|w| !w.is_healthy()).collect();
+
+            // 5. If all workers are now healthy, return immediately without sleeping
+            if still_unhealthy.is_empty() {
+                let healthy_urls: Vec<_> = workers.iter().map(|w| w.url().to_string()).collect();
+                info!(
+                    "All {} workers are healthy: {:?}",
+                    workers.len(),
+                    healthy_urls
+                );
+                return Ok(());
             }
 
+            // 6. Otherwise, sleep before next iteration
             tokio::time::sleep(check_interval).await;
         }
     }
@@ -1035,7 +1180,7 @@ impl WorkerManager {
             });
         }
 
-        let results = futures::future::join_all(tasks).await;
+        let results = future::join_all(tasks).await;
 
         let mut successful = Vec::new();
         let mut failed = Vec::new();
@@ -1099,11 +1244,22 @@ impl WorkerManager {
             Ok(response) if response.status().is_success() => {
                 match response.json::<Value>().await {
                     Ok(json) => {
-                        if let Some(load) = json.get("load").and_then(|v| v.as_i64()) {
-                            debug!("Worker {} load: {}", url, load);
-                            Some(load as isize)
+                        // The /get_load endpoint returns an array of load info objects (one per DP rank)
+                        // Each object has: {dp_rank, num_reqs, num_waiting_reqs, num_tokens}
+                        if let Some(array) = json.as_array() {
+                            let total_tokens: i64 = array
+                                .iter()
+                                .filter_map(|entry| {
+                                    entry.get("num_tokens").and_then(|v| v.as_i64())
+                                })
+                                .sum();
+                            debug!("Worker {} load (total tokens): {}", url, total_tokens);
+                            Some(total_tokens as isize)
                         } else {
-                            warn!("Invalid load response from {}: {:?}", url, json);
+                            warn!(
+                                "Invalid load response from {}: expected array, got {:?}",
+                                url, json
+                            );
                             None
                         }
                     }
@@ -1165,7 +1321,7 @@ impl WorkerManager {
             });
         }
 
-        let loads = futures::future::join_all(tasks).await;
+        let loads = future::join_all(tasks).await;
 
         let successful = loads.iter().filter(|l| l.load >= 0).count();
         let failed = loads.iter().filter(|l| l.load < 0).count();
@@ -1332,7 +1488,6 @@ mod tests {
 
     #[test]
     fn test_parse_server_info_with_fallback() {
-        // Test with "model" instead of "model_id"
         let json = serde_json::json!({
             "model": "gpt-4",
             "dp_size": 2

@@ -30,7 +30,7 @@ from sglang.srt.layers.attention.flashinfer_backend import (
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
+from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import (
     is_flashinfer_available,
     is_sm100_supported,
@@ -40,7 +40,7 @@ from sglang.srt.utils import (
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
-    from sglang.srt.speculative.spec_info import SpecInfo
+    from sglang.srt.speculative.spec_info import SpecInput
 
 if is_flashinfer_available():
     from flashinfer import (
@@ -361,7 +361,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         seq_lens: torch.Tensor,
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
-        spec_info: Optional[SpecInfo],
+        spec_info: Optional[SpecInput],
     ):
         if forward_mode.is_decode_or_idle():
             decode_wrapper = BatchMLAPagedAttentionWrapper(
@@ -441,7 +441,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         seq_lens_sum: int,
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
-        spec_info: Optional[SpecInfo],
+        spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
         if forward_mode.is_decode_or_idle():
@@ -663,7 +663,7 @@ class FlashInferMLAIndicesUpdaterDecode:
         seq_lens_sum: int,
         decode_wrapper: BatchMLAPagedAttentionWrapper,
         init_metadata_replay: bool = False,
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]] = None,
+        spec_info: Optional[SpecInput] = None,
         **fast_decode_kwargs,
     ):
         decode_wrapper = decode_wrapper or self.decode_wrapper
@@ -688,7 +688,7 @@ class FlashInferMLAIndicesUpdaterDecode:
         q_indptr: torch.Tensor,
         kv_indptr: torch.Tensor,
         init_metadata_replay: bool = False,
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]] = None,
+        spec_info: Optional[SpecInput] = None,
         **fast_decode_kwargs,
     ):
         bs = len(req_pool_indices)
@@ -776,7 +776,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
         prefix_lens: torch.Tensor,
         prefill_wrapper_paged: BatchMLAPagedAttentionWrapper,
         use_ragged: bool,
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]] = None,
+        spec_info: Optional[SpecInput] = None,
     ):
         if use_ragged:
             paged_kernel_lens = prefix_lens
@@ -811,7 +811,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
         kv_indptr: torch.Tensor,
         qo_indptr: torch.Tensor,
         use_ragged: bool,
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]] = None,
+        spec_info: Optional[SpecInput] = None,
     ):
         bs = len(seq_lens)
         sm_scale = self.scaling
@@ -838,9 +838,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
             qo_indptr = qo_indptr[: bs + 1]
             custom_mask = None
         else:
-            assert isinstance(spec_info, EagleDraftInput) or isinstance(
-                spec_info, EagleVerifyInput
-            )
+            assert isinstance(spec_info, SpecInput)
             # TODO: Support topk > 1 with custom mask
             kv_indices, kv_indptr, qo_indptr, custom_mask = (
                 spec_info.generate_attn_arg_prefill(
@@ -894,7 +892,7 @@ class FlashInferMLAMultiStepDraftBackend:
         topk: int,
         speculative_num_steps: int,
     ):
-        from sglang.srt.speculative.eagle_utils import generate_draft_decode_kv_indices
+        from sglang.srt.speculative.spec_utils import generate_draft_decode_kv_indices
 
         if topk > 1:
             raise ValueError(
@@ -963,7 +961,7 @@ class FlashInferMLAMultiStepDraftBackend:
         )
 
         assert forward_batch.spec_info is not None
-        assert isinstance(forward_batch.spec_info, EagleDraftInput)
+        assert forward_batch.spec_info.is_draft_input()
 
         for i in range(self.speculative_num_steps - 1):
             forward_batch.spec_info.kv_indptr = self.kv_indptr[i, : bs + 1]
@@ -983,8 +981,6 @@ class FlashInferMLAMultiStepDraftBackend:
         )
 
         def call_fn(i, forward_batch):
-            assert forward_batch.spec_info is not None
-            assert isinstance(forward_batch.spec_info, EagleDraftInput)
             forward_batch.spec_info.kv_indptr = (
                 forward_batch.spec_info.kv_indptr.clone()
             )
@@ -1064,7 +1060,7 @@ def fast_mla_decode_plan(
 
     try:
         # Standard version with just the required arguments (no use_profiler)
-        self._cached_module.plan.default(
+        self._cached_module.plan(
             self._float_workspace_buffer,
             self._int_workspace_buffer,
             self._pin_memory_int_workspace_buffer,
