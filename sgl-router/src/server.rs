@@ -18,11 +18,11 @@ use crate::{
         },
         worker_spec::{WorkerApiResponse, WorkerConfigRequest, WorkerErrorResponse},
     },
-    reasoning_parser::ReasoningParserFactory,
+    reasoning_parser::ParserFactory as ReasoningParserFactory,
     routers::{router_manager::RouterManager, RouterTrait},
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
     tokenizer::{factory as tokenizer_factory, traits::Tokenizer},
-    tool_parser::ToolParserFactory,
+    tool_parser::ParserFactory as ToolParserFactory,
 };
 use axum::{
     extract::{Path, Query, Request, State},
@@ -88,8 +88,8 @@ impl AppContext {
                     tokenizer_factory::create_tokenizer(&tokenizer_path)
                         .map_err(|e| format!("Failed to create tokenizer: {e}"))?,
                 );
-                let reasoning_parser_factory = Some(ReasoningParserFactory::new());
-                let tool_parser_factory = Some(ToolParserFactory::new());
+                let reasoning_parser_factory = Some(crate::reasoning_parser::ParserFactory::new());
+                let tool_parser_factory = Some(crate::tool_parser::ParserFactory::new());
 
                 (tokenizer, reasoning_parser_factory, tool_parser_factory)
             } else {
@@ -440,6 +440,47 @@ async fn v1_conversations_list_items(
         .await
 }
 
+#[derive(Deserialize, Default)]
+struct GetItemQuery {
+    /// Additional fields to include in response (not yet implemented)
+    include: Option<Vec<String>>,
+}
+
+async fn v1_conversations_create_items(
+    State(state): State<Arc<AppState>>,
+    Path(conversation_id): Path<String>,
+    headers: http::HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    state
+        .router
+        .create_conversation_items(Some(&headers), &conversation_id, &body)
+        .await
+}
+
+async fn v1_conversations_get_item(
+    State(state): State<Arc<AppState>>,
+    Path((conversation_id, item_id)): Path<(String, String)>,
+    Query(query): Query<GetItemQuery>,
+    headers: http::HeaderMap,
+) -> Response {
+    state
+        .router
+        .get_conversation_item(Some(&headers), &conversation_id, &item_id, query.include)
+        .await
+}
+
+async fn v1_conversations_delete_item(
+    State(state): State<Arc<AppState>>,
+    Path((conversation_id, item_id)): Path<(String, String)>,
+    headers: http::HeaderMap,
+) -> Response {
+    state
+        .router
+        .delete_conversation_item(Some(&headers), &conversation_id, &item_id)
+        .await
+}
+
 #[derive(Deserialize)]
 struct AddWorkerQuery {
     url: String,
@@ -716,7 +757,11 @@ pub fn build_app(
         )
         .route(
             "/v1/conversations/{conversation_id}/items",
-            get(v1_conversations_list_items),
+            get(v1_conversations_list_items).post(v1_conversations_create_items),
+        )
+        .route(
+            "/v1/conversations/{conversation_id}/items/{item_id}",
+            get(v1_conversations_get_item).delete(v1_conversations_delete_item),
         )
         .route_layer(axum::middleware::from_fn_with_state(
             app_state.clone(),

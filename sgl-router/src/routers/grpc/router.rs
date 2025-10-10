@@ -18,11 +18,11 @@ use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest,
     ResponsesGetParams, ResponsesRequest,
 };
-use crate::reasoning_parser::ReasoningParserFactory;
+use crate::reasoning_parser::ParserFactory as ReasoningParserFactory;
 use crate::routers::RouterTrait;
 use crate::server::AppContext;
 use crate::tokenizer::traits::Tokenizer;
-use crate::tool_parser::ToolParserFactory;
+use crate::tool_parser::ParserFactory as ToolParserFactory;
 
 /// gRPC router implementation for SGLang
 #[derive(Clone)]
