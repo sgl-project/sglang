@@ -238,6 +238,7 @@ class ServerArgs:
     log_requests: bool = False
     log_requests_level: int = 2
     crash_dump_folder: Optional[str] = None
+    crash_on_nan: bool = False
     show_time_cost: bool = False
     enable_metrics: bool = False
     enable_metrics_for_all_schedulers: bool = False
@@ -1733,6 +1734,12 @@ class ServerArgs:
             type=str,
             default=ServerArgs.crash_dump_folder,
             help="Folder path to dump requests from the last 5 min before a crash (if any). If not specified, crash dumping is disabled.",
+        )
+        parser.add_argument(
+            "--crash-on-nan",
+            type=str,
+            default=ServerArgs.crash_on_nan,
+            help="Crash the server on nan logprobs.",
         )
         parser.add_argument(
             "--show-time-cost",
