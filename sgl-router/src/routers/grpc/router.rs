@@ -75,30 +75,15 @@ impl GrpcRouter {
             reasoning_parser_factory: reasoning_parser_factory.clone(),
         });
 
-        // Create response processor
-        let processor = super::processing::ResponseProcessor::new(
-            tokenizer.clone(),
-            tool_parser_factory.clone(),
-            reasoning_parser_factory.clone(),
-            ctx.configured_tool_parser.clone(),
-            ctx.configured_reasoning_parser.clone(),
-        );
-
-        // Create streaming processor
-        let streaming_processor = Arc::new(super::streaming::StreamingProcessor::new(
-            tokenizer.clone(),
-            tool_parser_factory.clone(),
-            reasoning_parser_factory.clone(),
-            ctx.configured_tool_parser.clone(),
-            ctx.configured_reasoning_parser.clone(),
-        ));
-
         // Create pipeline
         let pipeline = RequestPipeline::new_regular(
             worker_registry.clone(),
             policy_registry.clone(),
-            processor,
-            streaming_processor,
+            tokenizer.clone(),
+            tool_parser_factory.clone(),
+            reasoning_parser_factory.clone(),
+            ctx.configured_tool_parser.clone(),
+            ctx.configured_reasoning_parser.clone(),
         );
 
         Ok(GrpcRouter {

@@ -15,7 +15,9 @@ use crate::core::{ConnectionMode, Worker, WorkerRegistry, WorkerType};
 use crate::grpc_client::proto;
 use crate::policies::PolicyRegistry;
 use crate::protocols::spec::{ChatCompletionRequest, GenerateRequest, InputIds};
+use crate::reasoning_parser::ParserFactory as ReasoningParserFactory;
 use crate::tokenizer::traits::Tokenizer;
+use crate::tool_parser::ParserFactory as ToolParserFactory;
 use proto::DisaggregatedParams;
 use rand::Rng;
 use std::sync::Arc;
@@ -918,9 +920,30 @@ impl RequestPipeline {
     pub fn new_regular(
         worker_registry: Arc<WorkerRegistry>,
         policy_registry: Arc<PolicyRegistry>,
-        processor: processing::ResponseProcessor,
-        streaming_processor: Arc<streaming::StreamingProcessor>,
+        tokenizer: Arc<dyn Tokenizer>,
+        tool_parser_factory: ToolParserFactory,
+        reasoning_parser_factory: ReasoningParserFactory,
+        configured_tool_parser: Option<String>,
+        configured_reasoning_parser: Option<String>,
     ) -> Self {
+        // Create response processor
+        let processor = processing::ResponseProcessor::new(
+            tokenizer.clone(),
+            tool_parser_factory.clone(),
+            reasoning_parser_factory.clone(),
+            configured_tool_parser.clone(),
+            configured_reasoning_parser.clone(),
+        );
+
+        // Create streaming processor
+        let streaming_processor = Arc::new(streaming::StreamingProcessor::new(
+            tokenizer,
+            tool_parser_factory,
+            reasoning_parser_factory,
+            configured_tool_parser,
+            configured_reasoning_parser,
+        ));
+
         let stages: Vec<Box<dyn PipelineStage>> = vec![
             Box::new(PreparationStage),
             Box::new(WorkerSelectionStage::new(
@@ -932,10 +955,7 @@ impl RequestPipeline {
             Box::new(RequestBuildingStage::new(false)), // No PD metadata
             Box::new(DispatchMetadataStage),
             Box::new(RequestExecutionStage::new(ExecutionMode::Single)),
-            Box::new(ResponseProcessingStage::new(
-                processor,
-                streaming_processor.clone(),
-            )),
+            Box::new(ResponseProcessingStage::new(processor, streaming_processor)),
         ];
 
         Self {
@@ -947,9 +967,30 @@ impl RequestPipeline {
     pub fn new_pd(
         worker_registry: Arc<WorkerRegistry>,
         policy_registry: Arc<PolicyRegistry>,
-        processor: processing::ResponseProcessor,
-        streaming_processor: Arc<streaming::StreamingProcessor>,
+        tokenizer: Arc<dyn Tokenizer>,
+        tool_parser_factory: ToolParserFactory,
+        reasoning_parser_factory: ReasoningParserFactory,
+        configured_tool_parser: Option<String>,
+        configured_reasoning_parser: Option<String>,
     ) -> Self {
+        // Create response processor
+        let processor = processing::ResponseProcessor::new(
+            tokenizer.clone(),
+            tool_parser_factory.clone(),
+            reasoning_parser_factory.clone(),
+            configured_tool_parser.clone(),
+            configured_reasoning_parser.clone(),
+        );
+
+        // Create streaming processor
+        let streaming_processor = Arc::new(streaming::StreamingProcessor::new(
+            tokenizer,
+            tool_parser_factory,
+            reasoning_parser_factory,
+            configured_tool_parser,
+            configured_reasoning_parser,
+        ));
+
         let stages: Vec<Box<dyn PipelineStage>> = vec![
             Box::new(PreparationStage),
             Box::new(WorkerSelectionStage::new(
@@ -961,10 +1002,7 @@ impl RequestPipeline {
             Box::new(RequestBuildingStage::new(true)), // Inject PD metadata
             Box::new(DispatchMetadataStage),
             Box::new(RequestExecutionStage::new(ExecutionMode::DualDispatch)),
-            Box::new(ResponseProcessingStage::new(
-                processor,
-                streaming_processor.clone(),
-            )),
+            Box::new(ResponseProcessingStage::new(processor, streaming_processor)),
         ];
 
         Self {
