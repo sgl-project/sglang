@@ -334,7 +334,7 @@ void transfer_kv_per_layer_phf_lf(
     int64_t block_quota,
     int64_t num_warps_per_block) {
   at::Tensor empty;
-  transfer_kv_launcher<get_global_offset_phf<char, page_size>, get_global_offset_lf_hfrg<char>, false, head_num>(
+  transfer_kv_launcher<get_global_offset_phf<char>, get_global_offset_lf_hfrg<char>, false>(
       src_k,
       dst_k,
       src_v,
@@ -439,7 +439,7 @@ void transfer_kv_all_layer_lf_phf(
     int64_t num_warps_per_block) {
   TORCH_CHECK(num_layers == src_k_layers.size(0), "Number of layers in source k tensor does not match num_layers");
   at::Tensor empty;
-  transfer_kv_launcher<get_global_offset_lf_tbl_hfrg<const char>, get_global_offset_phf<char, page_size>, false, head_num>(
+  transfer_kv_launcher<get_global_offset_lf_tbl_hfrg<const char>, get_global_offset_phf<char>, false>(
       empty,
       dst_k,
       empty,
