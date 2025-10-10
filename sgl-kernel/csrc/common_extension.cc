@@ -107,6 +107,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("concat_mla_absorb_q(Tensor a, Tensor b, Tensor! out) -> ()");
   m.impl("concat_mla_absorb_q", torch::kCUDA, &concat_mla_absorb_q);
 
+  m.def("fast_topk(Tensor score, Tensor indices, Tensor lengths) -> ()");
+  m.impl("fast_topk", torch::kCUDA, &fast_topk_interface);
+  m.def(
+      "fast_topk_transform_fused(Tensor score, Tensor lengths, Tensor dst_page_table, Tensor src_page_table, Tensor "
+      "cu_seqlens_q) -> ()");
+  m.impl("fast_topk_transform_fused", torch::kCUDA, &fast_topk_transform_interface);
+
   /*
    * From csrc/gemm
    */
@@ -217,6 +224,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("topk_softmax(Tensor! topk_weights, Tensor! topk_indices, Tensor gating_output, bool renormalize) -> ()");
   m.impl("topk_softmax", torch::kCUDA, &topk_softmax);
 
+  m.def("moe_sum_reduce(Tensor input, Tensor output, float routed_scaling_factor) -> ()");
+  m.impl("moe_sum_reduce", torch::kCUDA, &moe_sum_reduce);
   m.def(
       "moe_fused_gate(Tensor input, Tensor bias, int num_expert_group, int topk_group, int topk, int "
       "num_fused_shared_experts, float routed_scaling_factor, bool apply_routed_scaling_factor_on_output) -> "

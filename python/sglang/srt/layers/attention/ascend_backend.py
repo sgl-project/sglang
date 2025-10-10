@@ -5,14 +5,15 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 import torch_npu
-from torch.nn.functional import scaled_dot_product_attention
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.npu_ops.mla_preprocess import is_mla_preprocess_enabled
 from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import get_bool_env_var
 
 if TYPE_CHECKING:
@@ -35,6 +36,8 @@ class ForwardMetadata:
     seq_lens_cpu_int: Optional[torch.Tensor] = None
     seq_lens_cpu_list: Optional[List[int]] = None
     seq_lens_list_cumsum: Optional[List[int]] = None
+    seq_lens: Optional[torch.Tensor] = None
+    actual_seq_lengths_q: Optional[torch.Tensor] = None
 
 
 class AscendAttnBackend(AttentionBackend):
@@ -66,6 +69,9 @@ class AscendAttnBackend(AttentionBackend):
         if self.use_mla:
             self.kv_lora_rank = model_runner.model_config.kv_lora_rank
             self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
+            self.q_head_dim = (
+                self.qk_rope_head_dim + model_runner.model_config.qk_nope_head_dim
+            )
         self.native_attn = TorchNativeAttnBackend(model_runner)
         self.graph_metadata = {}
         self.max_context_len = model_runner.model_config.context_len
@@ -101,10 +107,6 @@ class AscendAttnBackend(AttentionBackend):
         self.forward_metadata.seq_lens_cpu_int = forward_batch.seq_lens_cpu.int()
 
         seq_lens_list_cumsum = np.cumsum(forward_batch.extend_seq_lens_cpu)
-        if forward_batch.is_extend_in_batch:
-            seq_lens_list_cumsum[-1] = (
-                (seq_lens_list_cumsum[-1] - 1) // tp_size + 1
-            ) * tp_size
         self.forward_metadata.seq_lens_list_cumsum = seq_lens_list_cumsum
 
         self.graph_mode = False
@@ -126,12 +128,16 @@ class AscendAttnBackend(AttentionBackend):
         seq_lens: torch.Tensor,
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        spec_info: Optional[SpecInput],
     ):
         metadata = ForwardMetadata()
 
         metadata.block_tables = self.graph_metadata["block_tables"][:bs, :]
         metadata.seq_lens_cpu_list = seq_lens.cpu().int().tolist()
+        metadata.seq_lens = seq_lens
+        metadata.actual_seq_lengths_q = torch.tensor(
+            [1 + i * 1 for i in range(bs)], dtype=torch.int32, device=seq_lens.device
+        )
 
         self.graph_metadata[bs] = metadata
         self.forward_metadata = metadata
@@ -146,7 +152,7 @@ class AscendAttnBackend(AttentionBackend):
         seq_lens_sum: int,
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
         metadata = self.graph_metadata[bs]
@@ -160,12 +166,72 @@ class AscendAttnBackend(AttentionBackend):
         metadata.block_tables[:bs, max_seq_pages:].fill_(0)
         metadata.block_tables[bs:, :].fill_(0)
 
+        metadata.seq_lens[:bs].copy_(seq_lens[:bs])
+
         self.forward_metadata = metadata
 
         self.graph_mode = True
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 0
+
+    def forward_sparse(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
+        # For multi_head latent attention
+        q_rope: Optional[torch.Tensor] = None,
+        k_rope: Optional[torch.Tensor] = None,
+        topk_indices: torch.Tensor = None,
+    ):
+
+        is_prefill = forward_batch.forward_mode.is_extend()
+
+        if save_kv_cache:
+            k = k.view(-1, layer.tp_k_head_num, self.kv_lora_rank)
+            k_rope = k_rope.view(-1, layer.tp_k_head_num, self.qk_rope_head_dim)
+            forward_batch.token_to_kv_pool.set_kv_buffer(
+                layer, forward_batch.out_cache_loc, k, k_rope
+            )
+        q_nope, q_pe = q, q_rope
+        k_nope, k_pe = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        block_table = self.forward_metadata.block_tables
+        if is_prefill:
+            actual_seq_qlen = torch.cumsum(forward_batch.seq_lens, dim=0)
+        else:
+            if self.forward_metadata.actual_seq_lengths_q is None:
+                actual_seq_qlen = (
+                    torch.arange(1, q.shape[0] + 1).to(q.device).to(torch.int32)
+                )
+            else:
+                actual_seq_qlen = self.forward_metadata.actual_seq_lengths_q
+        if self.forward_metadata.seq_lens_cpu_int is None:
+            actual_seq_lengths_kv = self.forward_metadata.seq_lens
+        else:
+            actual_seq_lengths_kv = self.forward_metadata.seq_lens_cpu_int
+
+        attn_out = torch.ops.custom.npu_sparse_flash_attention(
+            query=q_nope,
+            key=k_nope,
+            value=k_nope,
+            query_rope=q_pe,
+            key_rope=k_pe,
+            sparse_indices=topk_indices,
+            scale_value=layer.scaling,
+            actual_seq_lengths_query=actual_seq_qlen.to(torch.int32),
+            actual_seq_lengths_kv=actual_seq_lengths_kv.to(q.device),
+            block_table=block_table,
+            sparse_block_size=1,
+            layout_query="TND",
+            layout_kv="PA_BSND",
+            sparse_mode=3,
+        )
+
+        return attn_out
 
     def forward_extend(
         self,
@@ -175,7 +241,23 @@ class AscendAttnBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
+        # For multi_head latent attention
+        q_rope: Optional[torch.Tensor] = None,
+        k_rope: Optional[torch.Tensor] = None,
+        topk_indices: Optional[torch.Tensor] = None,
     ):
+        if topk_indices is not None:
+            return self.forward_sparse(
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                save_kv_cache,
+                q_rope,
+                k_rope,
+                topk_indices,
+            )
         if not self.use_mla:
             if save_kv_cache:
                 forward_batch.token_to_kv_pool.set_kv_buffer(
@@ -401,7 +483,7 @@ class AscendAttnBackend(AttentionBackend):
                 antiquant_scale=None,
                 sparse_mode=0,
             )
-            output = torch.zeros_like(q_nope, dtype=q.dtype, device=q.device)
+            output = torch.empty_like(q_nope, dtype=q.dtype, device=q.device)
             softmax_lse = torch.empty(1, dtype=q.dtype, device=q.device)
 
             torch_npu.npu_fused_infer_attention_score.out(
@@ -436,7 +518,24 @@ class AscendAttnBackend(AttentionBackend):
         # For multi-head latent attention
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
+        topk_indices: Optional[torch.Tensor] = None,
     ):
+        if is_mla_preprocess_enabled():
+            # MLAPO does saving kv_cache
+            save_kv_cache = False
+        if topk_indices is not None:
+            return self.forward_sparse(
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                save_kv_cache,
+                q_rope,
+                k_rope,
+                topk_indices,
+            )
+
         if self.graph_mode:
             return self.forward_decode_graph(
                 q,

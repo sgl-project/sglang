@@ -80,6 +80,8 @@ class RMSNorm(CustomOp):
         )
         if _use_aiter:
             self._forward_method = self.forward_aiter
+        if get_bool_env_var("SGLANG_ENABLE_DETERMINISTIC_INFERENCE"):
+            self._forward_method = self.forward_native
 
     def forward_cuda(
         self,

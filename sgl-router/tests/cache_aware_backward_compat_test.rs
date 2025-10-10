@@ -1,4 +1,4 @@
-use sglang_router_rs::core::{BasicWorker, Worker, WorkerType};
+use sglang_router_rs::core::{BasicWorkerBuilder, Worker, WorkerType};
 use sglang_router_rs::policies::{CacheAwareConfig, CacheAwarePolicy, LoadBalancingPolicy};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -16,13 +16,19 @@ fn test_backward_compatibility_with_empty_model_id() {
     let policy = CacheAwarePolicy::with_config(config);
 
     // Create workers with empty model_id (simulating existing routers)
-    let worker1 = BasicWorker::new("http://worker1:8080".to_string(), WorkerType::Regular);
+    let worker1 = BasicWorkerBuilder::new("http://worker1:8080")
+        .worker_type(WorkerType::Regular)
+        .api_key("test_api_key")
+        .build();
     // No model_id label - should default to "unknown"
 
     let mut labels2 = HashMap::new();
     labels2.insert("model_id".to_string(), "unknown".to_string());
-    let worker2 = BasicWorker::new("http://worker2:8080".to_string(), WorkerType::Regular)
-        .with_labels(labels2);
+    let worker2 = BasicWorkerBuilder::new("http://worker2:8080")
+        .worker_type(WorkerType::Regular)
+        .api_key("test_api_key")
+        .labels(labels2)
+        .build();
 
     // Add workers - should both go to "default" tree
     policy.add_worker(&worker1);
@@ -53,23 +59,33 @@ fn test_mixed_model_ids() {
     let policy = CacheAwarePolicy::with_config(config);
 
     // Create workers with different model_id scenarios
-    let worker1 = BasicWorker::new("http://worker1:8080".to_string(), WorkerType::Regular);
+    let worker1 = BasicWorkerBuilder::new("http://worker1:8080")
+        .worker_type(WorkerType::Regular)
+        .api_key("test_api_key")
+        .build();
     // No model_id label - defaults to "unknown" which goes to "default" tree
 
     let mut labels2 = HashMap::new();
     labels2.insert("model_id".to_string(), "llama-3".to_string());
-    let worker2 = BasicWorker::new("http://worker2:8080".to_string(), WorkerType::Regular)
-        .with_labels(labels2);
+    let worker2 = BasicWorkerBuilder::new("http://worker2:8080")
+        .worker_type(WorkerType::Regular)
+        .labels(labels2)
+        .api_key("test_api_key")
+        .build();
 
     let mut labels3 = HashMap::new();
     labels3.insert("model_id".to_string(), "unknown".to_string());
-    let worker3 = BasicWorker::new("http://worker3:8080".to_string(), WorkerType::Regular)
-        .with_labels(labels3);
+    let worker3 = BasicWorkerBuilder::new("http://worker3:8080")
+        .worker_type(WorkerType::Regular)
+        .labels(labels3)
+        .build();
 
     let mut labels4 = HashMap::new();
     labels4.insert("model_id".to_string(), "llama-3".to_string());
-    let worker4 = BasicWorker::new("http://worker4:8080".to_string(), WorkerType::Regular)
-        .with_labels(labels4);
+    let worker4 = BasicWorkerBuilder::new("http://worker4:8080")
+        .worker_type(WorkerType::Regular)
+        .labels(labels4)
+        .build();
 
     // Add all workers
     policy.add_worker(&worker1);
@@ -77,19 +93,16 @@ fn test_mixed_model_ids() {
     policy.add_worker(&worker3);
     policy.add_worker(&worker4);
 
-    // Test selection with default workers only
     let default_workers: Vec<Arc<dyn Worker>> =
         vec![Arc::new(worker1.clone()), Arc::new(worker3.clone())];
     let selected = policy.select_worker(&default_workers, Some("test request"));
     assert!(selected.is_some(), "Should select from default workers");
 
-    // Test selection with specific model workers only
     let llama_workers: Vec<Arc<dyn Worker>> =
         vec![Arc::new(worker2.clone()), Arc::new(worker4.clone())];
     let selected = policy.select_worker(&llama_workers, Some("test request"));
     assert!(selected.is_some(), "Should select from llama-3 workers");
 
-    // Test selection with mixed workers
     let all_workers: Vec<Arc<dyn Worker>> = vec![
         Arc::new(worker1.clone()),
         Arc::new(worker2.clone()),
@@ -108,10 +121,16 @@ fn test_remove_worker_by_url_backward_compat() {
     // Create workers with different model_ids
     let mut labels1 = HashMap::new();
     labels1.insert("model_id".to_string(), "llama-3".to_string());
-    let worker1 = BasicWorker::new("http://worker1:8080".to_string(), WorkerType::Regular)
-        .with_labels(labels1);
+    let worker1 = BasicWorkerBuilder::new("http://worker1:8080")
+        .worker_type(WorkerType::Regular)
+        .labels(labels1)
+        .api_key("test_api_key")
+        .build();
 
-    let worker2 = BasicWorker::new("http://worker2:8080".to_string(), WorkerType::Regular);
+    let worker2 = BasicWorkerBuilder::new("http://worker2:8080")
+        .worker_type(WorkerType::Regular)
+        .api_key("test_api_key")
+        .build();
     // No model_id label - defaults to "unknown"
 
     // Add workers
@@ -122,7 +141,6 @@ fn test_remove_worker_by_url_backward_compat() {
     // Should remove from all trees since we don't know the model
     policy.remove_worker_by_url("http://worker1:8080");
 
-    // Verify removal worked
     let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(worker2.clone())];
     let selected = policy.select_worker(&workers, Some("test"));
     assert_eq!(selected, Some(0), "Should only have worker2 left");

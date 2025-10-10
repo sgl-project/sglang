@@ -1,5 +1,5 @@
 import logging
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -65,6 +65,7 @@ class Sampler(nn.Module):
         return_logprob: bool,
         top_logprobs_nums: List[int],
         token_ids_logprobs: List[List[int]],
+        positions: torch.Tensor,
     ):
         """Run a sampler & compute logprobs and update logits_output accordingly.
 
@@ -77,6 +78,8 @@ class Sampler(nn.Module):
             batch_next_token_ids: next token IDs. If set, skip sampling and only
                 compute output logprobs It is used for speculative decoding which
                 performs sampling in draft workers.
+            positions: The positions of the tokens in the sequence. Used for deterministic sampling
+                to get the unique seed for each position.
         """
         logits = logits_output.next_token_logits
 
@@ -124,6 +127,8 @@ class Sampler(nn.Module):
                         sampling_info.top_ps,
                         sampling_info.min_ps,
                         sampling_info.need_min_p_sampling,
+                        sampling_info.sampling_seed,
+                        positions,
                     )
                 else:
                     raise ValueError(
@@ -189,6 +194,7 @@ class Sampler(nn.Module):
         Optimized for prefill-only scoring requests that need token probabilities
         but don't require next token generation.
         """
+
         if logits_output.next_token_logits is None:
             logger.warning("No logits available for logprob computation")
             return
@@ -230,8 +236,14 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
     top_ps: torch.Tensor,
     min_ps: torch.Tensor,
     need_min_p_sampling: bool,
+    sampling_seed: Optional[torch.Tensor],
+    positions: torch.Tensor,
 ):
-    """A top-k, top-p and min-p sampling implementation with native pytorch operations."""
+    """
+    A top-k, top-p and min-p sampling implementation with native pytorch operations.
+    When sampling_seed is not None, deterministic inference will be enabled, it will sample
+    with the sampling_seed of each request.
+    """
     probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
     probs_sum = torch.cumsum(probs_sort, dim=-1)
     probs_sort[
@@ -243,12 +255,48 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
     if need_min_p_sampling:
         min_p_thresholds = probs_sort[:, 0] * min_ps
         probs_sort[probs_sort < min_p_thresholds.view(-1, 1)] = 0.0
-
-    sampled_index = torch.multinomial(probs_sort, num_samples=1)
+    if sampling_seed is not None:
+        sampled_index = multinomial_with_seed(probs_sort, sampling_seed, positions)
+    else:
+        sampled_index = torch.multinomial(probs_sort, num_samples=1)
     # int32 range is enough to represent the token ids
     probs_idx = probs_idx.to(torch.int32)
     batch_next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index).view(-1)
     return batch_next_token_ids
+
+
+def multinomial_with_seed(
+    inputs: torch.Tensor, seed: torch.Tensor, positions: torch.Tensor
+) -> torch.Tensor:
+    """
+    Samples n elements from an input tensor `inputs` of shape (n, m) using
+    a unique random seed for each row. This is a deterministic batched alternative to
+    `torch.multinomial`.
+
+    Args:
+        inputs: A float tensor of shape (n, m) representing n categorical
+                distributions with m categories each. The values are treated
+                as weights and do not need to sum to 1.
+        seed:   An integer tensor of shape (n,) containing the random seed
+                for each corresponding row in `inputs`.
+        positions: The positions of the tokens in the sequence. Used for deterministic sampling
+                to get the unique seed for each position.
+
+    Returns:
+        A tensor of shape (n,) where the i-th element is an index sampled
+        from the distribution in `inputs[i]` using `seed[i]`.
+    """
+    n, m = inputs.shape
+    col_indices = torch.arange(m, device=inputs.device).unsqueeze(0)
+    step_seed = seed * 19349663 ^ positions * 73856093
+    seed_expanded = step_seed.unsqueeze(-1)
+    hashed = seed_expanded * 8589934591 ^ col_indices * 479001599
+    uniform_samples = (hashed % (2**24)).float() / (2**24)
+    epsilon = 1e-9
+    gumbel_noise = -torch.log(-torch.log(uniform_samples + epsilon) + epsilon)
+    log_probs = torch.log(inputs + epsilon)
+    perturbed_log_probs = log_probs + gumbel_noise
+    return torch.argmax(perturbed_log_probs, dim=1, keepdim=True)
 
 
 def sampling_from_probs_torch(probs: torch.Tensor):

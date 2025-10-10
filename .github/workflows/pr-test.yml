@@ -62,14 +62,10 @@ jobs:
   sgl-kernel-build-wheels:
     needs: [check-changes]
     if: needs.check-changes.outputs.sgl_kernel == 'true'
-    runs-on: sgl-kernel-build-node
+    runs-on: x64-kernel-build-node
     strategy:
       matrix:
         include:
-          - python-version: "3.10"
-            cuda-version: "12.4"
-          - python-version: "3.10"
-            cuda-version: "12.8"
           - python-version: "3.10"
             cuda-version: "12.9"
     name: Build Wheel (CUDA ${{ matrix.cuda-version }})
@@ -157,6 +153,50 @@ jobs:
           cd test/srt
           python3 test_mla_deepseek_v3.py
 
+  sgl-kernel-benchmark-test:
+    needs: [check-changes, sgl-kernel-build-wheels]
+    if: needs.check-changes.outputs.sgl_kernel == 'true'
+    runs-on: 1-gpu-runner
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      CI: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cleanup
+        run: |
+          ls -alh sgl-kernel/dist || true
+          rm -rf sgl-kernel/dist/* || true
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda12.9
+
+      - name: Install dependencies
+        run: |
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
+
+      - name: Run benchmark tests
+        timeout-minutes: 45
+        run: |
+          cd sgl-kernel/benchmark
+          echo "Running sgl-kernel benchmark tests in CI mode..."
+
+          echo "CI environment variable: $CI"
+          echo "GITHUB_ACTIONS environment variable: $GITHUB_ACTIONS"
+
+          for bench_file in bench_*.py; do
+            echo "Testing $bench_file..."
+            timeout 60 python3 "$bench_file" || echo "Warning: $bench_file timed out or failed, continuing..."
+            echo "Completed $bench_file"
+            echo "---"
+          done
+
+          echo "All benchmark tests completed!"
+
   # =============================================== primary ====================================================
 
   unit-test-frontend:
@@ -174,7 +214,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda12.4
+          pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
         run: |
@@ -194,7 +234,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+        part: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -205,7 +245,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda12.4
+          pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
         run: |
@@ -215,7 +255,7 @@ jobs:
         timeout-minutes: 30
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit --auto-partition-id ${{ matrix.part }} --auto-partition-size 10
+          python3 run_suite.py --suite per-commit --auto-partition-id ${{ matrix.part }} --auto-partition-size 11
 
   unit-test-backend-2-gpu:
     needs: [check-changes, sgl-kernel-build-wheels]
@@ -236,7 +276,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda12.4
+          pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
         run: |
@@ -252,7 +292,7 @@ jobs:
     needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
     if: always() && !failure() && !cancelled() &&
         ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-    runs-on: 4-gpu-runner
+    runs-on: 4-gpu-h100
     strategy:
       fail-fast: false
       matrix:
@@ -267,7 +307,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda12.4
+          pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
         run: |
@@ -283,11 +323,11 @@ jobs:
     needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
     if: always() && !failure() && !cancelled() &&
         ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-    runs-on: 8-gpu-runner
+    runs-on: 8-gpu-h200
     strategy:
       fail-fast: false
       matrix:
-        part: [0, 1]
+        part: [0, 1, 2]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -298,7 +338,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda12.4
+          pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
         run: |
@@ -308,7 +348,7 @@ jobs:
         timeout-minutes: 20
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-8-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
+          python3 run_suite.py --suite per-commit-8-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 3
 
   performance-test-1-gpu-part-1:
     needs: [check-changes, sgl-kernel-build-wheels]
@@ -325,7 +365,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda12.4
+          pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
         run: |
@@ -384,7 +424,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda12.4
+          pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
         run: |
@@ -420,6 +460,39 @@ jobs:
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_vlm_online_latency
 
+  performance-test-1-gpu-part-3:
+    needs: [check-changes, sgl-kernel-build-wheels]
+    if: always() && !failure() && !cancelled() &&
+        ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    runs-on: 1-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download artifacts
+        if: needs.check-changes.outputs.sgl_kernel == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda12.9
+
+      - name: Install dependencies
+        run: |
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
+
+      - name: Benchmark Scores online latency and throughput
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_score_api_latency_throughput
+
+      - name: Benchmark Scores online latency and throughput (batch size scaling)
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 -m unittest test_bench_serving.TestBenchServing.test_score_api_batch_scaling
+
   performance-test-2-gpu:
     needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
     if: always() && !failure() && !cancelled() &&
@@ -435,7 +508,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda12.4
+          pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
         run: |
@@ -492,7 +565,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda12.4
+          pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
         run: |
@@ -522,7 +595,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda12.4
+          pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
         run: |
@@ -541,7 +614,7 @@ jobs:
     needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
     if: always() && !failure() && !cancelled() &&
         ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-    runs-on: 4-gpu-runner
+    runs-on: 4-gpu-h100
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -552,7 +625,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda12.4
+          pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
         run: |
@@ -568,7 +641,7 @@ jobs:
     needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
     if: always() && !failure() && !cancelled() &&
         ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-    runs-on: 8-gpu-runner
+    runs-on: 8-gpu-h200
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -579,7 +652,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda12.4
+          pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
         run: |
@@ -591,11 +664,11 @@ jobs:
           cd test/srt
           python3 run_suite.py --suite per-commit-8-gpu-deepep
 
-  unit-test-backend-8-gpu-b200:
+  unit-test-backend-4-gpu-b200:
     needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
     if: always() && !failure() && !cancelled() &&
         ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-    runs-on: b200-runner
+    runs-on: 4-gpu-b200
     strategy:
       fail-fast: false
     steps:
@@ -608,31 +681,114 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda12.8
+          pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 60
+        timeout-minutes: 45
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-8-gpu-b200 --auto-partition-id 0 --auto-partition-size 1
+          python3 run_suite.py --suite per-commit-4-gpu-b200 --auto-partition-id 0 --auto-partition-size 1 --timeout-per-file 3600
+
+  unit-test-disaggregation-2-gpu:
+    needs: [check-changes, sgl-kernel-build-wheels]
+    if: always() && !failure() && !cancelled() &&
+        ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    runs-on: 2-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download artifacts
+        if: needs.check-changes.outputs.sgl_kernel == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda12.9
+
+      - name: Install dependencies
+        run: |
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 20
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite per-commit-2-gpu-disaggregation
+
+  unit-test-disaggregation-4-gpu:
+    needs: [check-changes, unit-test-disaggregation-2-gpu, sgl-kernel-build-wheels]
+    if: always() && !failure() && !cancelled() &&
+        ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    runs-on: 4-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download artifacts
+        if: needs.check-changes.outputs.sgl_kernel == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda12.9
+
+      - name: Install dependencies
+        run: |
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 20
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite per-commit-4-gpu-disaggregation
+
+  unit-test-disaggregation-8-gpu:
+    needs: [check-changes, unit-test-disaggregation-2-gpu, sgl-kernel-build-wheels]
+    if: always() && !failure() && !cancelled() &&
+        ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    runs-on: 8-gpu-h200
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download artifacts
+        if: needs.check-changes.outputs.sgl_kernel == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda12.9
+
+      - name: Install dependencies
+        run: |
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 20
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite per-commit-8-gpu-disaggregation
 
   pr-test-finish:
     needs: [
       check-changes,
 
       sgl-kernel-build-wheels,
-      sgl-kernel-unit-test, sgl-kernel-mla-test,
+      sgl-kernel-unit-test, sgl-kernel-mla-test, sgl-kernel-benchmark-test,
 
       unit-test-frontend, unit-test-backend-1-gpu,
       unit-test-backend-2-gpu, unit-test-backend-4-gpu, unit-test-backend-8-gpu,
-      performance-test-1-gpu-part-1, performance-test-1-gpu-part-2, performance-test-2-gpu,
+      performance-test-1-gpu-part-1, performance-test-1-gpu-part-2, performance-test-1-gpu-part-3,
+      performance-test-2-gpu,
       accuracy-test-1-gpu, accuracy-test-2-gpu,
       unit-test-deepep-4-gpu, unit-test-deepep-8-gpu,
-      unit-test-backend-8-gpu-b200,
+      unit-test-backend-4-gpu-b200,
+      unit-test-disaggregation-2-gpu, unit-test-disaggregation-4-gpu, unit-test-disaggregation-8-gpu,
     ]
     if: always()
     runs-on: ubuntu-latest

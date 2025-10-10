@@ -174,6 +174,14 @@ void copy_to_gpu_no_ce(const at::Tensor& input, at::Tensor& output);
 void concat_mla_k(torch::Tensor k, torch::Tensor k_nope, torch::Tensor k_rope);
 void concat_mla_absorb_q(at::Tensor a, at::Tensor b, at::Tensor out);
 
+void fast_topk_interface(at::Tensor score, at::Tensor indices, at::Tensor lengths);
+void fast_topk_transform_interface(
+    at::Tensor score,
+    at::Tensor lengths,
+    at::Tensor dst_page_table,
+    at::Tensor src_page_table,
+    at::Tensor cu_seqlens_q);
+
 #ifdef USE_ROCM
 void gelu_quick(at::Tensor& out, const at::Tensor& input);
 #endif
@@ -292,6 +300,8 @@ void moe_align_block_size(
 
 void topk_softmax(
     torch::Tensor& topk_weights, torch::Tensor& topk_indices, torch::Tensor& gating_output, bool renormalize);
+
+void moe_sum_reduce(at::Tensor& input, at::Tensor& output, double routed_scaling_factor);
 
 std::vector<at::Tensor> moe_fused_gate(
     at::Tensor& input,
