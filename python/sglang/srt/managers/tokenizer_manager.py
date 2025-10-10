@@ -755,7 +755,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         """Handle batch tokenization for text inputs only."""
         logger.debug(f"Starting batch tokenization for {batch_size} text requests")
 
-        if self._batch_has_only_tokenized_request(batch_size, obj):
+        # If batch does not have text nothing to tokenize
+        # so lets construct the return object
+        if not self._batch_has_text(batch_size, obj):
             # All requests already have input_ids, no need to tokenize
             return [await self._tokenize_one_request(obj[i]) for i in range(batch_size)]
 
@@ -810,19 +812,17 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     "Batch tokenization is not needed for input_embeds. Do not set `enable_tokenizer_batch_encode`."
                 )
 
-    def _batch_has_only_tokenized_request(
+    def _batch_has_text(
         self, batch_size: int, obj: Union[GenerateReqInput, EmbeddingReqInput]
     ) -> bool:
-        """Check if all requests in the batch provide input_ids only."""
+        """Check if any request in the batch contains text input."""
         for i in range(batch_size):
-            if obj[i].input_ids is None and obj[i].input_embeds is None:
-                return False
-            elif obj[i].text:
-                return False
+            if obj[i].text:
+                return True
             elif self.is_generation and obj[i].contains_mm_input():
-                return False
+                return True
 
-        return True
+        return False
 
     def _should_use_batch_tokenization(self, batch_size, requests) -> bool:
         """Return True if we should run the tokenizer in batch mode.
@@ -833,7 +833,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         """
         return (
             self.server_args.enable_tokenizer_batch_encode
-            or self._batch_has_only_tokenized_request(batch_size, requests)
+            or not _batch_has_text(batch_size, requests)
         )
 
     def _send_one_request(
