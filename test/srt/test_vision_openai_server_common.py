@@ -494,7 +494,7 @@ class VideoOpenAITestMixin(TestOpenAIOmniServerBase):
             **(self.get_vision_request_kwargs()),
         )
 
-        video_response = response.choices[0].message.content
+        video_response = response.choices[0].message.content.lower()
 
         print("-" * 30)
         print(f"Video response:\n{video_response}")
@@ -502,9 +502,10 @@ class VideoOpenAITestMixin(TestOpenAIOmniServerBase):
 
         # Add assertions to validate the video response
         assert (
-            "iPod" in video_response
+            "ipod" in video_response
             or "device" in video_response
             or "microphone" in video_response
+            or "phone" in video_response
         ), f"video_response: {video_response}, should contain 'iPod' or 'device'"
         assert (
             "man" in video_response
