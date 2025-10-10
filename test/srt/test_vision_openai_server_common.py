@@ -30,7 +30,9 @@ AUDIO_BIRD_SONG_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-fi
 
 class TestOpenAIMLLMServerBase(CustomTestCase):
     model: str
-    other_args: list = []
+    other_args: list = [
+        "--trust-remote-code",
+    ]
 
     @classmethod
     def setUpClass(cls):

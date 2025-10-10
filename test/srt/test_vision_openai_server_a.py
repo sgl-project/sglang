@@ -129,7 +129,6 @@ class TestMllamaServer(ImageOpenAITestMixin):
 class TestInternVL25Server(ImageOpenAITestMixin):
     model = "OpenGVLab/InternVL2_5-2B"
     other_args = [
-        "--trust-remote-code",
         "--cuda-graph-max-bs",
         "4",
     ]
@@ -138,7 +137,6 @@ class TestInternVL25Server(ImageOpenAITestMixin):
 class TestMiniCPMV4Server(ImageOpenAITestMixin):
     model = "openbmb/MiniCPM-V-4"
     other_args = [
-        "--trust-remote-code",
         "--mem-fraction-static",
         "0.35",
         "--cuda-graph-max-bs",
@@ -149,7 +147,6 @@ class TestMiniCPMV4Server(ImageOpenAITestMixin):
 class TestMiniCPMo26Server(ImageOpenAITestMixin, AudioOpenAITestMixin):
     model = "openbmb/MiniCPM-o-2_6"
     other_args = [
-        "--trust-remote-code",
         "--mem-fraction-static",
         "0.65",
         "--cuda-graph-max-bs",
@@ -161,7 +158,6 @@ class TestVILAServer(ImageOpenAITestMixin):
     model = "Efficient-Large-Model/NVILA-Lite-2B-hf-0626"
     revision = "6bde1de5964b40e61c802b375fff419edc867506"
     other_args = [
-        "--trust-remote-code",
         "--context-length=65536",
         f"--revision={revision}",
         "--cuda-graph-max-bs",
@@ -172,7 +168,6 @@ class TestVILAServer(ImageOpenAITestMixin):
 class TestGemma3itServer(ImageOpenAITestMixin):
     model = "google/gemma-3-4b-it"
     other_args = [
-        "--trust-remote-code",
         "--mem-fraction-static",
         "0.70",
         "--enable-multimodal",
@@ -184,7 +179,6 @@ class TestGemma3itServer(ImageOpenAITestMixin):
 class TestKimiVLServer(ImageOpenAITestMixin):
     model = "moonshotai/Kimi-VL-A3B-Instruct"
     other_args = [
-        "--trust-remote-code",
         "--context-length",
         "8192",
         "--dtype=bfloat16",
@@ -199,11 +193,8 @@ class TestKimiVLServer(ImageOpenAITestMixin):
 class TestGLM41VServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
     model = "zai-org/GLM-4.1V-9B-Thinking"
     other_args = [
-        "--trust-remote-code",
         "--mem-fraction-static",
         "0.68",
-        "--cuda-graph-max-bs",
-        "4",
         "--reasoning-parser",
         "glm45",
     ]
@@ -213,7 +204,6 @@ class TestQwen2AudioServer(AudioOpenAITestMixin):
     model = "Qwen/Qwen2-Audio-7B-Instruct"
     other_args = (
         [
-            "--trust-remote-code",
             "--mem-fraction-static=0.70",
         ],
     )
