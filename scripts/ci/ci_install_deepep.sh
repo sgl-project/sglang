@@ -42,8 +42,8 @@ apt-get update && apt-get install -y libfabric-dev
 
 # Install NVSHMEM
 cd /opt/nvshmem
-wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.4.5/source/nvshmem_src_cuda12-all-all-3.4.5.tar.gz
-tar -xf nvshmem_src_cuda12-all-all-3.4.5.tar.gz
+wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.4.5/source/nvshmem_src_cuda13-all-all-3.4.5.tar.gz
+tar -xf nvshmem_src_cuda13-all-all-3.4.5.tar.gz
 mv nvshmem_src nvshmem && cd nvshmem
 NVSHMEM_SHMEM_SUPPORT=0 \
 NVSHMEM_UCX_SUPPORT=0 \
@@ -53,7 +53,7 @@ NVSHMEM_IBGDA_SUPPORT=1 \
 NVSHMEM_PMIX_SUPPORT=0 \
 NVSHMEM_TIMEOUT_DEVICE_POLLING=0 \
 NVSHMEM_USE_GDRCOPY=1 \
-cmake -S . -B build/ -DCMAKE_INSTALL_PREFIX=/opt/nvshmem/install -DCMAKE_CUDA_ARCHITECTURES="90;100"
+cmake -S . -B build/ -DCMAKE_INSTALL_PREFIX=/opt/nvshmem/install -DCMAKE_CUDA_ARCHITECTURES="90;100;103;110;121"
 cd build
 make -j$(nproc) install
 
