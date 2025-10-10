@@ -156,7 +156,6 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.tracing.trace import (
     process_tracing_init,
     trace_set_proc_propagate_context,
@@ -192,6 +191,7 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_tokenizer,
     get_tokenizer_from_processor,
 )
+from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
