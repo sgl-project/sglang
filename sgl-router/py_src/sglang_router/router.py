@@ -36,12 +36,16 @@ def history_backend_from_str(backend_str: Optional[str]) -> HistoryBackendType:
     """Convert history backend string to HistoryBackendType enum."""
     if backend_str is None:
         return HistoryBackendType.Memory
-    backend_map = {
-        "memory": HistoryBackendType.Memory,
-        "none": HistoryBackendType.None,
-        "oracle": HistoryBackendType.Oracle,
-    }
-    return backend_map.get(backend_str.lower(), HistoryBackendType.Memory)
+    backend_lower = backend_str.lower()
+    if backend_lower == "memory":
+        return HistoryBackendType.Memory
+    elif backend_lower == "none":
+        # Use getattr to access 'None' which is a Python keyword
+        return getattr(HistoryBackendType, "None")
+    elif backend_lower == "oracle":
+        return HistoryBackendType.Oracle
+    else:
+        return HistoryBackendType.Memory
 
 
 class Router:
@@ -165,8 +169,20 @@ class Router:
             )
         args_dict["oracle_config"] = oracle_config
 
-        # remove mini_lb parameter
-        args_dict.pop("mini_lb")
+        # Remove fields that shouldn't be passed to Rust Router constructor
+        # These are either handled separately or are Python-only
+        fields_to_remove = [
+            "mini_lb",
+            "oracle_wallet_path",
+            "oracle_connect_descriptor",
+            "oracle_username",
+            "oracle_password",
+            "oracle_pool_min",
+            "oracle_pool_max",
+            "oracle_pool_timeout_secs",
+        ]
+        for field in fields_to_remove:
+            args_dict.pop(field, None)
 
         return Router(_Router(**args_dict))
 
