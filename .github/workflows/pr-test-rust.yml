@@ -90,8 +90,6 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install rust dependencies
-        env:
-          CUDA_HOME: /usr/local/cuda
         run: |
           bash scripts/ci/ci_install_rust.sh
 
@@ -137,13 +135,12 @@ jobs:
           pytest -q -m integration
 
       - name: Run Python E2E tests
-        env:
-          CUDA_HOME: /usr/local/cuda
         run: |
           bash scripts/killall_sglang.sh "nuk_gpus"
           cd sgl-router
           python3 -m pip --no-cache-dir install --upgrade --ignore-installed blinker
           python3 -m pip --no-cache-dir install --upgrade --break-system-packages genai-bench==0.0.2
+          export PATH=/usr/local/cuda/bin:$PATH
           pytest -m e2e -s  -vv -o log_cli=true --log-cli-level=INFO
 
       - name: Upload benchmark results
