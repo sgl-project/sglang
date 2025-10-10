@@ -40,9 +40,10 @@ class QuarkW4A4MXFP4(QuarkScheme):
     def get_min_capability(cls) -> int:
         return 70
 
-    def mxfp4_quantize(self, w):
+    @staticmethod
+    def mxfp4_quantize(w):
         w_shape = w.shape
-        w_need_reshape = True if w.dim() != 2 else False
+        w_need_reshape = w.dim() != 2
 
         if w_need_reshape:
             w_last_dim_size = w_shape[-1]
