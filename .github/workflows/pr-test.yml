@@ -665,7 +665,7 @@ jobs:
           python3 run_suite.py --suite per-commit-8-gpu-deepep
 
   unit-test-backend-8-gpu-deepseek-v32:
-    needs: [check-changes, unit-test-backend-8-gpu, sgl-kernel-build-wheels]
+    needs: [check-changes, sgl-kernel-build-wheels]
     if: always() && !failure() && !cancelled() &&
         ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 8-gpu-h200
