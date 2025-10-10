@@ -345,16 +345,16 @@ class FlashAttentionBackend(AttentionBackend):
                 max_bs=32,
                 page_size=self.page_size,
                 top_k=26,
-                retrive_budget_per_seq=2048,
+                retrive_budget_per_seq=1024,
                 device=model_runner.device,
                 async_retrive=True,
                 req_to_token=model_runner.req_to_token_pool.req_to_token,
                 max_seq_len=self.max_context_len,
-                stream_budget=(128, 256)
+                stream_budget=(128, 256),
+                is_cuda_graph=not model_runner.server_args.disable_cuda_graph,
             )
         
             self.sparse_cache_updater = LServerUpdaterFlashAttentionBackend(manager_config)
-            self.sparse_cache_updater.cache_manager.start_retrive_loop()
 
         # Local attention settings
         self.attention_chunk_size = (
@@ -1443,6 +1443,8 @@ class FlashAttentionBackend(AttentionBackend):
                 max_bs + 1, dtype=torch.int32, device=self.device
             ),
         }
+        if self.sparse_attn:
+            self.sparse_cache_updater.cache_manager.config.decode_cuda_graph_metadata = self.decode_cuda_graph_metadata
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -1528,22 +1530,24 @@ class FlashAttentionBackend(AttentionBackend):
             else:
                 # Normal Decode
                 # Get sequence information
-                metadata.cache_seqlens_int32 = seq_lens.to(torch.int32)
-                batch_size = len(seq_lens)
-                device = seq_lens.device
-                metadata.cu_seqlens_k = torch.nn.functional.pad(
-                    torch.cumsum(seq_lens, dim=0, dtype=torch.int32), (1, 0)
-                )
-                # Precompute maximum sequence length
-                metadata.max_seq_len_k = seq_lens.max().item()
-                # Precompute page table
-                metadata.page_table = self.decode_cuda_graph_metadata["page_table"][
-                    :bs, :
-                ]
-                # Precompute cumulative sequence lengths
-                metadata.cu_seqlens_q = torch.arange(
-                    0, batch_size + 1, dtype=torch.int32, device=device
-                )
+                if not self.sparse_attn:
+                    metadata.cache_seqlens_int32 = seq_lens.to(torch.int32)
+                    batch_size = len(seq_lens)
+                    device = seq_lens.device
+                    metadata.cu_seqlens_k = torch.nn.functional.pad(
+                        torch.cumsum(seq_lens, dim=0, dtype=torch.int32), (1, 0)
+                    )
+                    # Precompute maximum sequence length
+                    metadata.max_seq_len_k = seq_lens.max().item()
+                    # Precompute page table
+                    metadata.page_table = self.decode_cuda_graph_metadata["page_table"][
+                        :bs, :
+                    ]
+                    # Precompute cumulative sequence lengths
+                    metadata.cu_seqlens_q = torch.arange(
+                        0, batch_size + 1, dtype=torch.int32, device=device
+                    )
+                
                 self.decode_cuda_graph_metadata[bs] = metadata
 
                 if self.attention_chunk_size is not None:
@@ -1735,22 +1739,23 @@ class FlashAttentionBackend(AttentionBackend):
             else:
                 # Normal Decode
                 metadata = self.decode_cuda_graph_metadata[bs]
-                max_len = seq_lens_cpu.max().item()
-                max_seq_pages = (max_len + self.page_size - 1) // self.page_size
-                metadata.max_seq_len_k = max_len
+                if not self.sparse_attn:
+                    max_len = seq_lens_cpu.max().item()
+                    max_seq_pages = (max_len + self.page_size - 1) // self.page_size
+                    metadata.max_seq_len_k = max_len
 
-                normal_decode_set_metadata(
-                    metadata.cache_seqlens_int32,
-                    metadata.cu_seqlens_k,
-                    metadata.page_table,
-                    self.req_to_token,
-                    req_pool_indices,
-                    self.decode_cuda_graph_metadata["strided_indices"],
-                    max_seq_pages,
-                    seq_lens,
-                    0,
-                    self.page_size,
-                )
+                    normal_decode_set_metadata(
+                        metadata.cache_seqlens_int32,
+                        metadata.cu_seqlens_k,
+                        metadata.page_table,
+                        self.req_to_token,
+                        req_pool_indices,
+                        self.decode_cuda_graph_metadata["strided_indices"],
+                        max_seq_pages,
+                        seq_lens,
+                        0,
+                        self.page_size,
+                    )
 
                 self._update_local_attn_metadata_for_replay(
                     metadata,
@@ -1909,7 +1914,7 @@ class FlashAttentionBackend(AttentionBackend):
 
     def get_cuda_graph_seq_len_fill_value(self):
         """Get the fill value for sequence length in CUDA graph."""
-        return 1
+        return 4096
 
     def _init_local_attn_metadata(
         self, forwardbatch: ForwardBatch, metadata: FlashAttentionMetadata, device

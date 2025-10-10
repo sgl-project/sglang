@@ -350,6 +350,8 @@ class ModelRunner:
             self.graph_runner = None
             self.cuda_graph_mem_usage = 0
             self.init_attention_backend()
+        if hasattr(self.attn_backend, "sparse_cache_updater"):
+            self.attn_backend.sparse_cache_updater.cache_manager.start_retrive_loop()
 
         # auxiliary hidden capture mode. TODO: expose this to server args?
         if self.spec_algorithm.is_eagle3() and not self.is_draft_worker:

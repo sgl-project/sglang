@@ -11,10 +11,8 @@ def combine_indices_kernel(
     pre_req_pool_indices_ptr,
     req_to_token_ptr,
     seq_lens_ptr,
-    
     new_seq_lens_ptr,
     page_table_ptr,
-    
     cur_bs,
     pre_bs,
     cache_len,

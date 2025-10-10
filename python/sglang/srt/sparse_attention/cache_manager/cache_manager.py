@@ -1,7 +1,7 @@
 import torch
 import time
 import threading
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 from dataclasses import dataclass
 
 @dataclass
@@ -23,6 +23,10 @@ class ManagerConfig:
     num_layers: int
     top_k: int
     stream_budget: Tuple[int, int]
+    
+    # cuda graph
+    is_cuda_graph: bool
+    decode_cuda_graph_metadata: Optional[dict] = None
     
 class RetriveQuery:
     def __init__(self, config: ManagerConfig):
@@ -90,7 +94,7 @@ class RetriveResult:
         )
         self.req_pool_indices = torch.full(
             size=(config.max_bs,),
-            fill_value=-1,
+            fill_value=0,
             dtype=torch.int32,
             device=config.device,
         )
@@ -185,5 +189,4 @@ class CacheManager:
                             retrived_cache_indices_page=query.selected_page_indices,
                         )
                         self.retrived_query[layer_id].updated = False
-                time.sleep(0.001)
-    
+                    time.sleep(0.001)

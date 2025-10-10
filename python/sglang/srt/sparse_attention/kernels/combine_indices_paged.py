@@ -13,7 +13,6 @@ def combine_indices_paged_kernel(
     diff_ptr,
     new_seq_lens_ptr,
     page_table_ptr,
-    
     cur_bs,
     pre_bs,
     max_bs,

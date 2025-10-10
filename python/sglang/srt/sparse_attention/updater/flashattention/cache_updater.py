@@ -21,10 +21,10 @@ class SparseCacheUpdaterFlashAttentionBackend:
     def __init__(self, manager_config: ManagerConfig):
         self.cache_manager = CacheManager(manager_config)
 
-    def update_decode(self, forward_batch: "ForwardBatch", metadata: "FlashAttentionMetadata") -> "FlashAttentionMetadata":
+    def update_decode(self, forward_batch: "ForwardBatch", metadata: "FlashAttentionMetadata"):
         raise NotImplementedError()
     
-    def update_extend(self, forward_batch: "ForwardBatch", metadata: "FlashAttentionMetadata") -> "FlashAttentionMetadata":
+    def update_extend(self, forward_batch: "ForwardBatch", metadata: "FlashAttentionMetadata"):
         raise NotImplementedError()
     
     def update_query(self, query: torch.Tensor, forward_batch: "ForwardBatch", layer_id: int):
@@ -43,12 +43,11 @@ class LServerUpdaterFlashAttentionBackend(SparseCacheUpdaterFlashAttentionBacken
         self.dense_retriver = DenseRetriver(self.cache_manager)
         self.naive_decode_sparse_retriver = NaiveDecodeSparseRetriver(self.cache_manager)
         
-    def update_decode(self, forward_batch: "ForwardBatch", metadata: "FlashAttentionMetadata") -> "FlashAttentionMetadata":
-        #return self.dense_retriver.retrive_decode(forward_batch, metadata)
-        return self.naive_decode_sparse_retriver.build_stream(forward_batch, metadata)
+    def update_decode(self, forward_batch: "ForwardBatch", metadata: "FlashAttentionMetadata"):
+        self.naive_decode_sparse_retriver.build_stream(forward_batch, metadata)
     
-    def update_extend(self, forward_batch: "ForwardBatch", metadata: "FlashAttentionMetadata") -> "FlashAttentionMetadata":
-        return self.dense_retriver.retrive_extend(forward_batch, metadata)
+    def update_extend(self, forward_batch: "ForwardBatch", metadata: "FlashAttentionMetadata"):
+        self.dense_retriver.retrive_extend(forward_batch, metadata)
     
     def update_extend_proxy_k_tensor(self, forward_batch: "ForwardBatch"):
         self.naive_decode_sparse_retriver.update_extend(forward_batch)
