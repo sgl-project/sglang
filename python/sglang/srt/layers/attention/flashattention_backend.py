@@ -857,12 +857,12 @@ class FlashAttentionBackend(AttentionBackend):
                     # MHA for extend part of sequence without attending prefix kv cache
                     cu_seqlens_k = (
                         metadata.cu_seqlens_q
-                        if not forward_batch.mha_one_hot
+                        if not forward_batch.mha_one_shot
                         else metadata.cu_seqlens_k
                     )
                     max_seqlen_k = (
                         metadata.max_seq_len_q
-                        if not forward_batch.mha_one_hot
+                        if not forward_batch.mha_one_shot
                         else metadata.max_seq_len_k
                     )
                     output = flash_attn_varlen_func(
