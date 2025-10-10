@@ -77,7 +77,8 @@ __device__ __forceinline__ T* get_global_offset_lf_hfrg(
     int64_t page_id,
     int64_t item_size_bytes,
     int64_t head_fragment_num,
-    int64_t head_fragment_id) {
+    int64_t head_fragment_id,
+    int64_t /*unused*/) {
   // layer first
   return base + layer_id * layer_dim
         + page_id * item_size_bytes
@@ -93,12 +94,13 @@ __device__ __forceinline__ T* get_global_offset_lf_tbl_hfrg(
     int64_t page_id,
     int64_t item_size_bytes,
     int64_t head_fragment_num,
-    int64_t head_fragment_id) {
+    int64_t head_fragment_id,
+    int64_t /*unused*/) {
   return reinterpret_cast<T*>(layer_base_tbl[layer_id]) + page_id * item_size_bytes
         + item_size_bytes / head_fragment_num * head_fragment_id;
 }
 
-template <typename T, int PageSize>
+template <typename T>
 __device__ __forceinline__ T* get_global_offset_phf(
     T* base,
     const uintptr_t* __restrict__ /*unused*/,
@@ -107,15 +109,16 @@ __device__ __forceinline__ T* get_global_offset_phf(
     int64_t page_id,
     int64_t item_size_bytes,
     int64_t head_fragment_num,
-    int64_t head_fragment_id) {
+    int64_t head_fragment_id,
+    int64_t page_size) {
   // page head first
-  return base + page_id / PageSize * PageSize * page_dim
-         + page_dim / head_fragment_num * head_fragment_id * PageSize
-         + page_id % PageSize * page_dim / head_fragment_num
+  return base + page_id / page_size * page_size * page_dim
+         + page_dim / head_fragment_num * head_fragment_id * page_size
+         + page_id % page_size * page_dim / head_fragment_num
          + layer_id * item_size_bytes / head_fragment_num;
 }
 
-template <auto SrcOffsetFn, auto DstOffsetFn, bool IsMLA, int HeadFragmentNum>
+template <auto SrcOffsetFn, auto DstOffsetFn, bool IsMLA>
 __global__ void transfer_kernel_impl(
     const void* __restrict__ src_k,
     void* __restrict__ dst_k,
@@ -133,7 +136,9 @@ __global__ void transfer_kernel_impl(
     const uintptr_t* __restrict__ src_k_layer_tbl,
     const uintptr_t* __restrict__ dst_k_layer_tbl,
     const uintptr_t* __restrict__ src_v_layer_tbl,
-    const uintptr_t* __restrict__ dst_v_layer_tbl) {
+    const uintptr_t* __restrict__ dst_v_layer_tbl,
+    const int64_t page_size,
+    const int64_t head_fragment_num) {
   int32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
   int32_t lane_id = tid % WARP_SIZE;
   int32_t warp_id = tid / WARP_SIZE;
@@ -149,18 +154,18 @@ __global__ void transfer_kernel_impl(
     // Loop over layers if necessary
     for (int64_t layer_id = start_layer_id; layer_id < start_layer_id + num_layers_to_process; ++layer_id) {
 
-      if (HeadFragmentNum > 1) {
-        for (int64_t head_fragment_id = 0; head_fragment_id < HeadFragmentNum; ++head_fragment_id) {
+      if (head_fragment_num > 1) {
+        for (int64_t head_fragment_id = 0; head_fragment_id < head_fragment_num; ++head_fragment_id) {
           const char* src_ptr = SrcOffsetFn(
-              static_cast<const char*>(src_k), src_k_layer_tbl, layer_id, src_layout_dim, src_page_id, item_size_bytes, HeadFragmentNum, head_fragment_id);
+              static_cast<const char*>(src_k), src_k_layer_tbl, layer_id, src_layout_dim, src_page_id, item_size_bytes, head_fragment_num, head_fragment_id, page_size);
           char* dst_ptr = DstOffsetFn(
-              static_cast<char*>(dst_k), dst_k_layer_tbl, layer_id, dst_layout_dim, dst_page_id, item_size_bytes, HeadFragmentNum, head_fragment_id);
-          transfer_item_warp(lane_id, src_ptr, dst_ptr, item_size_bytes / HeadFragmentNum);
+              static_cast<char*>(dst_k), dst_k_layer_tbl, layer_id, dst_layout_dim, dst_page_id, item_size_bytes, head_fragment_num, head_fragment_id, page_size);
+          transfer_item_warp(lane_id, src_ptr, dst_ptr, item_size_bytes / head_fragment_num);
           const char* src_v_ptr = SrcOffsetFn(
-              static_cast<const char*>(src_v), src_v_layer_tbl, layer_id, src_layout_dim, src_page_id, item_size_bytes, HeadFragmentNum, head_fragment_id);
+              static_cast<const char*>(src_v), src_v_layer_tbl, layer_id, src_layout_dim, src_page_id, item_size_bytes, head_fragment_num, head_fragment_id, page_size);
           char* dst_v_ptr = DstOffsetFn(
-              static_cast<char*>(dst_v), dst_v_layer_tbl, layer_id, dst_layout_dim, dst_page_id, item_size_bytes, HeadFragmentNum, head_fragment_id);
-          transfer_item_warp(lane_id, src_v_ptr, dst_v_ptr, item_size_bytes / HeadFragmentNum);
+              static_cast<char*>(dst_v), dst_v_layer_tbl, layer_id, dst_layout_dim, dst_page_id, item_size_bytes, head_fragment_num, head_fragment_id, page_size);
+          transfer_item_warp(lane_id, src_v_ptr, dst_v_ptr, item_size_bytes / head_fragment_num);
         }
       } else {
         const char* src_ptr = SrcOffsetFn(
@@ -182,7 +187,7 @@ __global__ void transfer_kernel_impl(
   }
 }
 
-template <auto SrcOffsetFn, auto DstOffsetFn, bool IsMLA, int HeadFragmentNum = 1>
+template <auto SrcOffsetFn, auto DstOffsetFn, bool IsMLA>
 void transfer_kv_launcher(
     const at::Tensor& src_k,
     at::Tensor& dst_k,
@@ -200,7 +205,9 @@ void transfer_kv_launcher(
     const at::Tensor& src_v_layers,
     const at::Tensor& dst_v_layers,
     int64_t block_quota,
-    int64_t num_warps_per_block) {
+    int64_t num_warps_per_block,
+    const int64_t page_size = 16,
+    const int64_t head_fragment_num = 1) {
   TORCH_CHECK(src_indices.is_cuda(), "Source indices must be a CUDA tensor");
   TORCH_CHECK(dst_indices.is_cuda(), "Destination indices must be a CUDA tensor");
   TORCH_CHECK(src_indices.scalar_type() == at::kLong, "Source indices must be of type long");
@@ -242,7 +249,9 @@ void transfer_kv_launcher(
       src_k_tbl_ptr,
       dst_k_tbl_ptr,
       src_v_tbl_ptr,
-      dst_v_tbl_ptr);
+      dst_v_tbl_ptr,
+      page_size,
+      head_fragment_num);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -325,7 +334,7 @@ void transfer_kv_per_layer_phf_lf(
     int64_t block_quota,
     int64_t num_warps_per_block) {
   at::Tensor empty;
-  transfer_kv_launcher<get_global_offset_phf<char, page_size>, get_global_offset_lf_tbl_hfrg<char>, false, head_num>(
+  transfer_kv_launcher<get_global_offset_phf<char, page_size>, get_global_offset_lf_hfrg<char>, false, head_num>(
       src_k,
       dst_k,
       src_v,
@@ -342,7 +351,9 @@ void transfer_kv_per_layer_phf_lf(
       empty,
       empty,
       block_quota,
-      num_warps_per_block);
+      num_warps_per_block,
+      page_size,
+      head_num);
 }
 
 void transfer_kv_all_layer(
@@ -445,7 +456,9 @@ void transfer_kv_all_layer_lf_phf(
       src_v_layers,
       empty,
       block_quota,
-      num_warps_per_block);
+      num_warps_per_block,
+      page_size,
+      head_num);
 }
 
 void transfer_kv_per_layer_mla(
