@@ -533,6 +533,274 @@ class TestProfileMergerEdgeCases(unittest.TestCase):
         merged_path = self.merger.merge_chrome_traces()
         self.assertTrue(os.path.exists(merged_path))
 
+    def test_extract_rank_info_with_none_values(self):
+        """Test rank extraction when some rank values are None."""
+        # Test with filename that has missing rank information
+        filename = f"{self.profile_id}-TP-0.trace.json.gz"
+        rank_info = self.merger._extract_rank_info(filename)
+
+        # Should only have tp_rank, others should be missing (not None)
+        expected = {"tp_rank": 0}
+        self.assertEqual(rank_info, expected)
+
+        # Test with partial rank information
+        filename = f"{self.profile_id}-TP-1-DP-2.trace.json.gz"
+        rank_info = self.merger._extract_rank_info(filename)
+
+        expected = {"tp_rank": 1, "dp_rank": 2}
+        self.assertEqual(rank_info, expected)
+
+    def test_create_rank_label_with_missing_ranks(self):
+        """Test rank label creation when some ranks are missing."""
+        # Test with only TP rank
+        rank_info = {"tp_rank": 0}
+        label = self.merger._create_rank_label(rank_info)
+        self.assertEqual(label, "[TP00]")
+
+        # Test with TP and DP only
+        rank_info = {"tp_rank": 1, "dp_rank": 2}
+        label = self.merger._create_rank_label(rank_info)
+        self.assertEqual(label, "[TP01-DP02]")
+
+        # Test with empty rank info
+        rank_info = {}
+        label = self.merger._create_rank_label(rank_info)
+        self.assertEqual(label, "[Unknown]")
+
+    def test_calculate_sort_index_with_missing_ranks(self):
+        """Test sort index calculation when some ranks are missing."""
+        # Test with only TP rank
+        rank_info = {"tp_rank": 0}
+        sort_idx = self.merger._calculate_sort_index(rank_info, 83)
+        self.assertGreater(sort_idx, 0)
+
+        # Test with TP and DP only
+        rank_info = {"tp_rank": 1, "dp_rank": 2}
+        sort_idx = self.merger._calculate_sort_index(rank_info, 83)
+        self.assertGreater(sort_idx, 0)
+
+        # Test with empty rank info
+        rank_info = {}
+        sort_idx = self.merger._calculate_sort_index(rank_info, 83)
+        self.assertEqual(sort_idx, 83)  # Should just be the PID
+
+    def test_get_rank_sort_key_with_missing_ranks(self):
+        """Test rank sort key generation when some ranks are missing."""
+        # Test with only TP rank
+        filename = f"{self.profile_id}-TP-1.trace.json.gz"
+        sort_key = self.merger._get_rank_sort_key(filename)
+        expected = (1, 0, 0, 0)  # Missing ranks default to 0
+        self.assertEqual(sort_key, expected)
+
+        # Test with TP and DP only
+        filename = f"{self.profile_id}-TP-1-DP-2.trace.json.gz"
+        sort_key = self.merger._get_rank_sort_key(filename)
+        expected = (1, 2, 0, 0)  # Missing PP and EP default to 0
+        self.assertEqual(sort_key, expected)
+
+        # Test with no rank information
+        filename = f"{self.profile_id}.trace.json.gz"
+        sort_key = self.merger._get_rank_sort_key(filename)
+        expected = (0, 0, 0, 0)  # All default to 0
+        self.assertEqual(sort_key, expected)
+
+    def test_process_events_with_missing_ranks(self):
+        """Test event processing when rank information is incomplete."""
+        # Test with only TP rank
+        rank_info = {"tp_rank": 0}
+        events = [
+            {
+                "ph": "X",
+                "cat": "cpu_op",
+                "name": "test_op",
+                "pid": 83,
+                "tid": 83,
+                "ts": 1000.0,
+                "dur": 10.0,
+            }
+        ]
+
+        processed = self.merger._process_events(events, rank_info)
+
+        # Should have rank label with only TP
+        self.assertEqual(processed[0]["pid"], "[TP00] 83")
+
+        # Test with empty rank info - create fresh events to avoid modification
+        rank_info = {}
+        fresh_events = [
+            {
+                "ph": "X",
+                "cat": "cpu_op",
+                "name": "test_op2",
+                "pid": 84,
+                "tid": 84,
+                "ts": 2000.0,
+                "dur": 15.0,
+            }
+        ]
+        processed = self.merger._process_events(fresh_events, rank_info)
+
+        # Should have Unknown rank label
+        self.assertEqual(processed[0]["pid"], "[Unknown] 84")
+
+    def test_handle_file_with_missing_ranks(self):
+        """Test file handling when rank information is incomplete."""
+        # Create trace file with minimal rank info
+        trace_data = {
+            "schemaVersion": 1,
+            "deviceProperties": [{"device_id": 0, "name": "GPU-0"}],
+            "traceEvents": [
+                {
+                    "ph": "X",
+                    "cat": "cpu_op",
+                    "name": "test_op",
+                    "pid": 83,
+                    "tid": 83,
+                    "ts": 1000.0,
+                    "dur": 10.0,
+                }
+            ],
+        }
+
+        filename = f"{self.profile_id}-TP-0.trace.json.gz"
+        filepath = os.path.join(self.temp_dir, filename)
+        with gzip.open(filepath, "wt") as f:
+            json.dump(trace_data, f)
+
+        # Extract rank info (should only have TP)
+        rank_info = self.merger._extract_rank_info(filepath)
+        self.assertEqual(rank_info, {"tp_rank": 0})
+
+        # Handle file should work
+        output = self.merger._handle_file(filepath, rank_info)
+        self.assertIn("traceEvents", output)
+        self.assertEqual(len(output["traceEvents"]), 1)
+
+        # Check that pid was modified correctly
+        event = output["traceEvents"][0]
+        self.assertEqual(event["pid"], "[TP00] 83")
+
+    def test_merge_with_mixed_rank_scenarios(self):
+        """Test merging files with different rank scenarios."""
+        # Create files with different rank scenarios
+        trace_scenarios = [
+            {
+                "filename": f"{self.profile_id}-TP-0.trace.json.gz",
+                "rank_info": {"tp_rank": 0},
+                "events": [
+                    {"ph": "X", "name": "op1", "pid": 83, "ts": 1000.0, "dur": 10.0}
+                ],
+            },
+            {
+                "filename": f"{self.profile_id}-TP-1-DP-0.trace.json.gz",
+                "rank_info": {"tp_rank": 1, "dp_rank": 0},
+                "events": [
+                    {"ph": "X", "name": "op2", "pid": 84, "ts": 2000.0, "dur": 15.0}
+                ],
+            },
+            {
+                "filename": f"{self.profile_id}-TP-0-DP-1-PP-0.trace.json.gz",
+                "rank_info": {"tp_rank": 0, "dp_rank": 1, "pp_rank": 0},
+                "events": [
+                    {"ph": "X", "name": "op3", "pid": 85, "ts": 3000.0, "dur": 20.0}
+                ],
+            },
+        ]
+
+        for scenario in trace_scenarios:
+            filepath = os.path.join(self.temp_dir, scenario["filename"])
+            trace_data = {
+                "schemaVersion": 1,
+                "deviceProperties": [{"device_id": 0, "name": "GPU-0"}],
+                "traceEvents": scenario["events"],
+            }
+            with gzip.open(filepath, "wt") as f:
+                json.dump(trace_data, f)
+
+        # Merge should work with mixed rank scenarios
+        merged_path = self.merger.merge_chrome_traces()
+        self.assertTrue(os.path.exists(merged_path))
+
+        # Verify merged content
+        with gzip.open(merged_path, "rt") as f:
+            merged_data = json.load(f)
+
+        # Should have 3 events
+        self.assertEqual(len(merged_data["traceEvents"]), 3)
+
+        # Check that all events have correct rank labels
+        events = merged_data["traceEvents"]
+        pids = [event["pid"] for event in events]
+
+        # Should have different rank labels
+        self.assertIn("[TP00] 83", pids)
+        self.assertIn("[TP01-DP00] 84", pids)
+        self.assertIn("[TP00-DP01-PP00] 85", pids)
+
+    def test_maybe_cast_int_with_none_values(self):
+        """Test _maybe_cast_int with None and invalid values."""
+        # Test with None
+        result = self.merger._maybe_cast_int(None)
+        self.assertIsNone(result)
+
+        # Test with string that can't be cast to int
+        result = self.merger._maybe_cast_int("invalid")
+        self.assertIsNone(result)
+
+        # Test with valid integer string
+        result = self.merger._maybe_cast_int("123")
+        self.assertEqual(result, 123)
+
+        # Test with valid integer
+        result = self.merger._maybe_cast_int(456)
+        self.assertEqual(result, 456)
+
+        # Test with float
+        result = self.merger._maybe_cast_int(789.0)
+        self.assertEqual(result, 789)
+
+    def test_edge_case_empty_rank_info(self):
+        """Test handling of completely empty rank information."""
+        # Create trace file with no rank information in filename
+        trace_data = {
+            "schemaVersion": 1,
+            "deviceProperties": [{"device_id": 0, "name": "GPU-0"}],
+            "traceEvents": [
+                {
+                    "ph": "X",
+                    "cat": "cpu_op",
+                    "name": "test_op",
+                    "pid": 83,
+                    "tid": 83,
+                    "ts": 1000.0,
+                    "dur": 10.0,
+                }
+            ],
+        }
+
+        # Create file without rank info (this shouldn't be discovered by _discover_trace_files
+        # but let's test the methods directly)
+        filename = f"{self.profile_id}.trace.json.gz"
+        filepath = os.path.join(self.temp_dir, filename)
+        with gzip.open(filepath, "wt") as f:
+            json.dump(trace_data, f)
+
+        # Extract rank info should return empty dict
+        rank_info = self.merger._extract_rank_info(filepath)
+        self.assertEqual(rank_info, {})
+
+        # Create rank label should return [Unknown]
+        label = self.merger._create_rank_label(rank_info)
+        self.assertEqual(label, "[Unknown]")
+
+        # Calculate sort index should just return pid
+        sort_idx = self.merger._calculate_sort_index(rank_info, 83)
+        self.assertEqual(sort_idx, 83)
+
+        # Get rank sort key should return all zeros
+        sort_key = self.merger._get_rank_sort_key(filepath)
+        self.assertEqual(sort_key, (0, 0, 0, 0))
+
 
 if __name__ == "__main__":
     unittest.main()
