@@ -1,5 +1,3 @@
-# NOTE: Please run this file to make sure the test cases are correct.
-
 import math
 from enum import IntEnum
 from typing import List, Optional
