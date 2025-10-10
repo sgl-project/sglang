@@ -1,9 +1,5 @@
-from typing import Optional, Union
-
 from transformers import PretrainedConfig
 from transformers.modeling_rope_utils import rope_config_validation
-
-from sglang.srt.configs.utils import register_processor
 
 
 class Qwen3VLVisionConfig(PretrainedConfig):
@@ -578,6 +574,3 @@ class Qwen3VLMoeConfig(PretrainedConfig):
         self.vision_start_token_id = vision_start_token_id
         self.vision_end_token_id = vision_end_token_id
         super().__init__(**kwargs, tie_word_embeddings=tie_word_embeddings)
-
-
-# register_processor(Qwen3VLMoeConfig, )
