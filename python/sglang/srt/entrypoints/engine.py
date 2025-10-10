@@ -336,7 +336,7 @@ class Engine(EngineBase):
         else:
             ret = await generator.__anext__()
             ret = self._remove_output_ids_prefix_overlap(ret)
-            return await generator.__anext__()
+            return ret
 
     def encode(
         self,
