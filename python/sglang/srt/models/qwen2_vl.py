@@ -407,7 +407,7 @@ class Qwen2VisionTransformer(nn.Module):
         cu_seqlens = torch.repeat_interleave(
             grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
         ).cumsum(dim=0, dtype=torch.int32)
-        cu_seqlens = F.pad(cu_seqlens, (1, 0), "constant", 0)
+        cu_seqlens = torch.cat([cu_seqlens.new_zeros(1), cu_seqlens])
 
         # transformers
         x = x.unsqueeze(1)
