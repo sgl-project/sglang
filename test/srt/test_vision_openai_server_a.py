@@ -209,6 +209,16 @@ class TestGLM41VServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
     ]
 
 
+class TestQwen2AudioServer(AudioOpenAITestMixin):
+    model = "Qwen/Qwen2-Audio-7B-Instruct"
+    other_args = (
+        [
+            "--trust-remote-code",
+            "--mem-fraction-static=0.70",
+        ],
+    )
+
+
 if __name__ == "__main__":
     del (
         TestOpenAIMLLMServerBase,
