@@ -60,6 +60,8 @@ class OpenAIServingCompletion(OpenAIServingBase):
         self,
         request: CompletionRequest,
         raw_request: Request = None,
+        user_id: Optional[str] = None,
+        external_request_id: Optional[str] = None,
     ) -> tuple[GenerateReqInput, CompletionRequest]:
         """Convert OpenAI completion request to internal format"""
         # NOTE: with openai API, the prompt's logprobs are always not computed
@@ -107,8 +109,8 @@ class OpenAIServingCompletion(OpenAIServingBase):
             bootstrap_room=request.bootstrap_room,
             return_hidden_states=request.return_hidden_states,
             rid=request.rid,
-            user_id=request.user_id,
-            external_request_id=request.external_request_id,
+            user_id=user_id,
+            external_request_id=external_request_id,
             extra_key=self._compute_extra_key(request),
             priority=request.priority,
             custom_labels=custom_labels,

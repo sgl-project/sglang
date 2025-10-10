@@ -245,10 +245,6 @@ class CompletionRequest(BaseModel):
     # For custom metric labels
     custom_labels: Optional[Dict[str, str]] = None
 
-    # Identifier fields for requests from external caller
-    user_id: Optional[str] = None
-    external_request_id: Optional[str] = None
-
     @field_validator("max_tokens")
     @classmethod
     def validate_max_tokens_positive(cls, v):
@@ -657,10 +653,6 @@ class ChatCompletionRequest(BaseModel):
 
         return sampling_params
 
-    # Identifier fields for requests from external caller
-    user_id: Optional[str] = None
-    external_request_id: Optional[str] = None
-
 
 class ChatMessage(BaseModel):
     role: Optional[str] = None
@@ -758,10 +750,6 @@ class EmbeddingRequest(BaseModel):
     rid: Optional[Union[List[str], str]] = None
     # Priority for the request
     priority: Optional[int] = None
-
-    # Identifier fields for requests from external caller
-    user_id: Optional[str] = None
-    external_request_id: Optional[str] = None
 
 
 class EmbeddingObject(BaseModel):
