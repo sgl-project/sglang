@@ -304,6 +304,7 @@ class ServerArgs:
     prefill_attention_backend: Optional[str] = None
     sampling_backend: Optional[str] = None
     grammar_backend: Optional[str] = None
+    mm_attention_backend: Optional[str] = None
     nsa_prefill: str = "flashmla_prefill"
     nsa_decode: str = "fa3"
 

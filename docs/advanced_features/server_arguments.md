@@ -291,6 +291,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--disable-overlap-schedule` | Disable the overlap scheduler, which overlaps the CPU scheduler with GPU model worker. | False |
 | `--enable-mixed-chunk` | Enabling mixing prefill and decode in a batch when using chunked prefill. | False |
 | `--enable-dp-attention` | Enabling data parallelism for attention and tensor parallelism for FFN. The dp size should be equal to the tp size. Currently DeepSeek-V2 and Qwen 2/3 MoE models are supported. | False |
+| `--enable-dp-attention-port-picking` | Whether to picks dp ports from free ports, or use fixed dp port as default. Useful when get frequent port conflict under huge DP cases. | False |
 | `--enable-dp-lm-head` | Enable vocabulary parallel across the attention TP group to avoid all-gather across DP groups, optimizing performance under DP attention. | False |
 | `--enable-two-batch-overlap` | Enabling two micro batches to overlap. | False |
 | `--tbo-token-distribution-threshold` | The threshold of token distribution between two batches in micro-batch-overlap, determines whether to two-batch-overlap or two-chunk-overlap. Set to 0 denote disable two-chunk-overlap. | 0.48 |
