@@ -148,7 +148,6 @@ suites = {
         TestFile("layers/attention/mamba/test_mamba2_mixer.py", 110),
     ],
     "per-commit-4-gpu": [
-        TestFile("ep/test_mooncake_ep_small.py", 450),
         TestFile("test_gpt_oss_4gpu.py", 300),
         TestFile("test_local_attn.py", 411),
         TestFile("test_pp_single_node.py", 481),
@@ -166,6 +165,7 @@ suites = {
     ],
     "per-commit-4-gpu-deepep": [
         TestFile("ep/test_deepep_small.py", 531),
+        TestFile("ep/test_mooncake_ep_small.py", 450),
     ],
     "per-commit-8-gpu-deepep": [
         TestFile("ep/test_deepep_large.py", 338),
