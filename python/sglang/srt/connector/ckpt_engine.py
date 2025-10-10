@@ -17,16 +17,58 @@ from sglang.srt.connector import BaseConnector
 logger = logging.getLogger(__name__)
 
 
-def _get_physical_gpu_id(rank: int) -> str:
-    result = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True)
-    if result.returncode != 0:
-        raise ValueError(result.stdout)
-    lines = result.stdout.strip().split("\n")
-    for line in lines:
-        if f"GPU {rank}" in line:
-            uuid = line.split("UUID: ")[1].strip(")")
-            return uuid
-    raise ValueError(f"not found gpu{rank} uuid")
+def _get_physical_gpu_id(device_index: int | None = None) -> str:
+    try:
+        return f"GPU-{torch.cuda.get_device_properties(device_index).uuid!s}"
+    except AssertionError as e:
+        raise ValueError(f"fail to get physical gpu id {device_index}") from e
+
+
+def _resolve_zmq_handle(
+    device_uuid: str,
+    all_device_uuids: List[str],
+    received_handles: Dict[str, str],
+) -> str:
+    if device_uuid in received_handles:
+        logger.info(f"Rank for UUID {device_uuid}: Found direct ZMQ handle match.")
+        return received_handles[device_uuid]
+
+    logger.warning(
+        f"Rank for UUID {device_uuid}: Direct match failed. Attempting fallback mapping for unshared GPUs."
+    )
+
+    device_uuids_set = set(all_device_uuids)
+    sender_uuids_set = set(received_handles.keys())
+
+    unmatched_my_uuids = sorted(list(device_uuids_set - sender_uuids_set))
+    unmatched_sender_uuids = sorted(list(sender_uuids_set - device_uuids_set))
+
+    if len(unmatched_my_uuids) != len(unmatched_sender_uuids):
+        raise RuntimeError(
+            f"Unmatched GPU count mismatch. My unmatched: {len(unmatched_my_uuids)} "
+            f"({unmatched_my_uuids}), Sender's unmatched: {len(unmatched_sender_uuids)} "
+            f"({unmatched_sender_uuids}). Cannot establish a 1-to-1 mapping."
+        )
+
+    if not unmatched_my_uuids:
+        raise RuntimeError(
+            f"UUID {device_uuid} not found in received handles, but there are no "
+            "unmatched GPUs to perform fallback mapping. This indicates a logic error."
+        )
+
+    mapping = dict(zip(unmatched_my_uuids, unmatched_sender_uuids))
+
+    target_sender_uuid = mapping.get(device_uuid)
+    if not target_sender_uuid:
+        raise RuntimeError(
+            f"Failed to find UUID {device_uuid} in the fallback mapping. Mapping: {mapping}"
+        )
+
+    handle = received_handles[target_sender_uuid]
+    logger.info(
+        f"Rank for UUID {device_uuid}: Mapped to sender's UUID {target_sender_uuid} via fallback."
+    )
+    return handle
 
 
 def _rebuild_ipc(
@@ -67,8 +109,6 @@ class CkptEngineConnector(BaseConnector):
         self.socket = None
         self.buffer: Optional[torch.Tensor] = None
         self.local_rank = None
-        self.final_state_dict = OrderedDict()
-        self.pending_weights: Dict[str, torch.Tensor] = {}
 
     def get_zmq_handle(self, tp_rank: int):
         # FIXME: There needs a local rank
@@ -107,7 +147,12 @@ class CkptEngineConnector(BaseConnector):
 
         dist.broadcast_object_list(data_container, src=0)
         received_data = data_container[0]
-        self.zmq_handle = received_data.get(self.device_uuid)
+        world_size = dist.get_world_size()
+        all_device_uuids = [None] * world_size
+        dist.all_gather_object(all_device_uuids, self.device_uuid)
+        self.zmq_handle = _resolve_zmq_handle(
+            self.device_uuid, all_device_uuids, received_data
+        )
 
     def get_socket_handle(self, tp_rank: int):
         # FIXME: local_rank is not tp_rank
