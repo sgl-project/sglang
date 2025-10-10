@@ -11,17 +11,12 @@ use crate::tool_parser::types::{StreamingParseResult, ToolCall, ToolCallItem};
 use async_trait::async_trait;
 
 /// Passthrough parser that returns text unchanged with no tool calls
+#[derive(Default)]
 pub struct PassthroughParser;
 
 impl PassthroughParser {
     pub fn new() -> Self {
         Self
-    }
-}
-
-impl Default for PassthroughParser {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
