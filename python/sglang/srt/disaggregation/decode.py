@@ -503,7 +503,7 @@ class DecodePreallocQueue:
                         window_kv_indices_full
                     )
                 )
-                extra_pool_indices = window_kv_indices_swa.cpu().numpy().tolist()
+                extra_pool_indices = window_kv_indices_swa.cpu().numpy()
                 extra_pool_indices = kv_to_page_indices(extra_pool_indices, page_size)
                 logger.info(f"Extra pool indices: {len(extra_pool_indices)}")
             elif isinstance(self.token_to_kv_pool, NSATokenToKVPool):
@@ -511,7 +511,7 @@ class DecodePreallocQueue:
                 kv_indices_full = self.req_to_token_pool.req_to_token[
                     decode_req.req.req_pool_idx, :seq_len
                 ]
-                extra_pool_indices = kv_indices_full.cpu().numpy().tolist()
+                extra_pool_indices = kv_indices_full.cpu().numpy()
                 extra_pool_indices = kv_to_page_indices(extra_pool_indices, page_size)
             else:
                 extra_pool_indices = None
