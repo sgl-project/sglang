@@ -1142,7 +1142,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         draft_input.allocate_lens = new_allocate_lens
 
         # FIXME(lsyin): remove seq_lens_sum calculation
-        self.seq_lens_sum = self.seq_lens.sum().item()
+        self.seq_lens_cpu = self.seq_lens.cpu()
+        self.seq_lens_sum = self.seq_lens_cpu.sum().item()
 
     def write_cache_indices(
         self,
@@ -1964,6 +1965,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
             is_extend_in_batch=self.is_extend_in_batch,
             is_prefill_only=self.is_prefill_only,
+            seq_lens_cpu=self.seq_lens_cpu,
             enable_overlap=self.enable_overlap,
         )
 
