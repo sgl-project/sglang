@@ -5,7 +5,8 @@ Common utilities for torchao.
 import logging
 import os
 import pwd
-from typing import Callable, Optional
+import re
+from typing import Callable, List, Optional
 
 import torch
 
@@ -31,8 +32,19 @@ def save_gemlite_cache(print_error: bool = False) -> bool:
 def proj_filter(
     module: torch.nn.Module,
     fqn: str,
-):
-    """Filter function for quantizing projection layers."""
+    masked_names: List[str] = [
+        "projector",
+    ],
+) -> bool:
+    """
+    Filter function for quantizing projection layers.
+
+    Args:
+        module: the module to be filtered
+        fqn: the fully qualified name of the module
+        masked_names: keywords to be redacted in the fqn to avoid false positives
+    """
+    fqn = re.sub(r"|".join(masked_names), "_", fqn)
     return "proj" in fqn
 
 
