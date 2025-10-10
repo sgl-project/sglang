@@ -15,8 +15,7 @@ use crate::core::{ConnectionMode, Worker, WorkerRegistry, WorkerType};
 use crate::grpc_client::proto;
 use crate::policies::PolicyRegistry;
 use crate::protocols::spec::{
-    ChatCompletionRequest, ChatCompletionResponse, GenerateMetaInfo, GenerateRequest,
-    GenerateResponse, InputIds, Usage,
+    ChatCompletionRequest, GenerateMetaInfo, GenerateRequest, GenerateResponse, InputIds,
 };
 use crate::tokenizer::stop::SequenceDecoderOutput;
 use crate::tokenizer::traits::Tokenizer;
@@ -790,114 +789,32 @@ impl ResponseProcessingStage {
             .take()
             .ok_or_else(|| utils::internal_error_static("No execution result"))?;
 
-        if is_streaming {
-            // Get dispatch metadata for consistent response fields
-            let dispatch = ctx
-                .state
-                .dispatch
-                .as_ref()
-                .ok_or_else(|| utils::internal_error_static("Dispatch metadata not set"))?;
+        // Get dispatch metadata (needed by both streaming and non-streaming)
+        let dispatch = ctx
+            .state
+            .dispatch
+            .as_ref()
+            .ok_or_else(|| utils::internal_error_static("Dispatch metadata not set"))?
+            .clone();
 
+        if is_streaming {
             // Streaming: Use StreamingProcessor and return SSE response (done)
             return Ok(Some(
                 self.streaming_processor.clone().process_streaming_response(
                     execution_result,
                     ctx.chat_request_arc(), // Cheap Arc clone (8 bytes)
-                    dispatch.clone(),
+                    dispatch,
                 ),
             ));
         }
 
-        // Non-streaming: Extract chat request details before mutable borrows
+        // Non-streaming: Delegate to ResponseProcessor
         let request_logprobs = match &ctx.input.request_type {
             RequestType::Chat(req) => req.logprobs,
             _ => false,
         };
 
-        // Collect all responses from the execution result
-        let all_responses = match execution_result {
-            ExecutionResult::Single { mut stream } => {
-                let responses = utils::collect_stream_responses(&mut stream, "Single").await?;
-                stream.mark_completed();
-                responses
-            }
-            ExecutionResult::Dual {
-                mut prefill,
-                decode,
-            } => {
-                // Collect prefill for input_logprobs (don't mark completed yet)
-                let prefill_responses =
-                    utils::collect_stream_responses(&mut prefill, "Prefill").await?;
-
-                // Collect decode for actual output (don't mark completed yet)
-                let mut decode_stream = *decode;
-                let mut decode_responses =
-                    utils::collect_stream_responses(&mut decode_stream, "Decode").await?;
-
-                // Mark both streams as completed now that both succeeded
-                prefill.mark_completed();
-                decode_stream.mark_completed();
-
-                // Merge prefill input_logprobs if requested
-                if request_logprobs {
-                    if let Some(prefill_input_logprobs) = prefill_responses
-                        .first()
-                        .and_then(|r| r.input_logprobs.clone())
-                    {
-                        for response in &mut decode_responses {
-                            response.input_logprobs = Some(prefill_input_logprobs.clone());
-                        }
-                    }
-                }
-
-                decode_responses
-            }
-        };
-
-        if all_responses.is_empty() {
-            return Err(utils::internal_error_static("No responses from server"));
-        }
-
         let chat_request = ctx.chat_request_arc();
-        let history_tool_calls_count = utils::get_history_tool_calls_count(&chat_request);
-
-        // Check parser availability once upfront (not per choice)
-        let reasoning_parser_available = chat_request.separate_reasoning
-            && utils::check_reasoning_parser_availability(
-                &self.processor.reasoning_parser_factory,
-                self.processor.configured_reasoning_parser.as_ref(),
-                &chat_request.model,
-            );
-
-        let tool_choice_enabled = !matches!(
-            &chat_request.tool_choice,
-            Some(crate::protocols::spec::ToolChoice::Value(
-                crate::protocols::spec::ToolChoiceValue::None
-            ))
-        );
-
-        let tool_parser_available = tool_choice_enabled
-            && chat_request.tools.is_some()
-            && utils::check_tool_parser_availability(
-                &self.processor.tool_parser_factory,
-                self.processor.configured_tool_parser.as_ref(),
-                &chat_request.model,
-            );
-
-        // Log once per request (not per choice)
-        if chat_request.separate_reasoning && !reasoning_parser_available {
-            debug!(
-                "No reasoning parser found for model '{}', skipping reasoning parsing",
-                chat_request.model
-            );
-        }
-
-        if chat_request.tools.is_some() && tool_choice_enabled && !tool_parser_available {
-            debug!(
-                "No tool parser found for model '{}', skipping tool call parsing",
-                chat_request.model
-            );
-        }
 
         let stop_decoder = ctx
             .state
@@ -906,60 +823,16 @@ impl ResponseProcessingStage {
             .as_mut()
             .ok_or_else(|| utils::internal_error_static("Stop decoder not initialized"))?;
 
-        let mut choices = Vec::new();
-        for (index, complete) in all_responses.iter().enumerate() {
-            match self
-                .processor
-                .process_single_choice(
-                    complete,
-                    index,
-                    &chat_request,
-                    stop_decoder,
-                    history_tool_calls_count,
-                    reasoning_parser_available,
-                    tool_parser_available,
-                )
-                .await
-            {
-                Ok(choice) => choices.push(choice),
-                Err(e) => {
-                    return Err(utils::internal_error_message(format!(
-                        "Failed to process choice {}: {}",
-                        index, e
-                    )));
-                }
-            }
-        }
-
-        // Build usage
-        let total_prompt_tokens: u32 = all_responses.iter().map(|r| r.prompt_tokens as u32).sum();
-        let total_completion_tokens: u32 = all_responses
-            .iter()
-            .map(|r| r.completion_tokens as u32)
-            .sum();
-        let usage = Usage {
-            prompt_tokens: total_prompt_tokens,
-            completion_tokens: total_completion_tokens,
-            total_tokens: total_prompt_tokens + total_completion_tokens,
-            completion_tokens_details: None,
-        };
-
-        // Build final ChatCompletionResponse
-        let dispatch = ctx
-            .state
-            .dispatch
-            .as_ref()
-            .ok_or_else(|| utils::internal_error_static("Dispatch metadata not set"))?;
-
-        let response = ChatCompletionResponse {
-            id: dispatch.request_id.clone(),
-            object: "chat.completion".to_string(),
-            created: dispatch.created,
-            model: dispatch.model.clone(),
-            choices,
-            usage: Some(usage),
-            system_fingerprint: dispatch.weight_version.clone(),
-        };
+        let response = self
+            .processor
+            .process_non_streaming_chat_response(
+                execution_result,
+                chat_request,
+                dispatch,
+                stop_decoder,
+                request_logprobs,
+            )
+            .await?;
 
         // Store the final response
         ctx.state.response.final_response = Some(FinalResponse::Chat(response));
@@ -1003,27 +876,16 @@ impl ResponseProcessingStage {
         // Non-streaming: Collect all responses
         let request_logprobs = ctx.generate_request().return_logprob;
         let all_responses = match execution_result {
-            ExecutionResult::Single { mut stream } => {
-                let responses = utils::collect_stream_responses(&mut stream, "Single").await?;
-                stream.mark_completed();
-                responses
+            ExecutionResult::Single { stream } => {
+                utils::collect_stream_responses(stream, "Single").await?
             }
-            ExecutionResult::Dual {
-                mut prefill,
-                decode,
-            } => {
-                // Collect prefill for input_logprobs (don't mark completed yet)
-                let prefill_responses =
-                    utils::collect_stream_responses(&mut prefill, "Prefill").await?;
+            ExecutionResult::Dual { prefill, decode } => {
+                // Collect prefill for input_logprobs
+                let prefill_responses = utils::collect_stream_responses(prefill, "Prefill").await?;
 
-                // Collect decode for actual output (don't mark completed yet)
-                let mut decode_stream = *decode;
+                // Collect decode for actual output
                 let mut decode_responses =
-                    utils::collect_stream_responses(&mut decode_stream, "Decode").await?;
-
-                // Mark both streams as completed now that both succeeded
-                prefill.mark_completed();
-                decode_stream.mark_completed();
+                    utils::collect_stream_responses(*decode, "Decode").await?;
 
                 // Merge prefill input_logprobs if requested
                 if request_logprobs {

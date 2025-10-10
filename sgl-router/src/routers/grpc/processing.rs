@@ -10,14 +10,15 @@ use tracing::error;
 
 use crate::grpc_client::proto;
 use crate::protocols::spec::{
-    ChatChoice, ChatCompletionMessage, ChatCompletionRequest, FunctionCallResponse, ToolCall,
-    ToolChoice, ToolChoiceValue,
+    ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse,
+    FunctionCallResponse, ToolCall, ToolChoice, ToolChoiceValue, Usage,
 };
 use crate::reasoning_parser::ParserFactory as ReasoningParserFactory;
 use crate::tokenizer::stop::{SequenceDecoderOutput, StopSequenceDecoder};
 use crate::tokenizer::traits::Tokenizer;
 use crate::tool_parser::ParserFactory as ToolParserFactory;
 
+use super::context::{DispatchMetadata, ExecutionResult};
 use super::utils;
 
 // ============================================================================
@@ -203,6 +204,138 @@ impl ResponseProcessor {
         };
 
         Ok(choice)
+    }
+
+    /// Process non-streaming chat response (collects all responses and builds final response)
+    pub async fn process_non_streaming_chat_response(
+        &self,
+        execution_result: ExecutionResult,
+        chat_request: Arc<ChatCompletionRequest>,
+        dispatch: DispatchMetadata,
+        stop_decoder: &mut StopSequenceDecoder,
+        request_logprobs: bool,
+    ) -> Result<ChatCompletionResponse, axum::response::Response> {
+        // Collect all responses from the execution result
+        let all_responses = match execution_result {
+            ExecutionResult::Single { stream } => {
+                utils::collect_stream_responses(stream, "Single").await?
+            }
+            ExecutionResult::Dual { prefill, decode } => {
+                // Collect prefill for input_logprobs
+                let prefill_responses = utils::collect_stream_responses(prefill, "Prefill").await?;
+
+                // Collect decode for actual output
+                let mut decode_responses =
+                    utils::collect_stream_responses(*decode, "Decode").await?;
+
+                // Merge prefill input_logprobs if requested
+                if request_logprobs {
+                    if let Some(prefill_input_logprobs) = prefill_responses
+                        .first()
+                        .and_then(|r| r.input_logprobs.clone())
+                    {
+                        for response in &mut decode_responses {
+                            response.input_logprobs = Some(prefill_input_logprobs.clone());
+                        }
+                    }
+                }
+
+                decode_responses
+            }
+        };
+
+        if all_responses.is_empty() {
+            return Err(utils::internal_error_static("No responses from server"));
+        }
+
+        let history_tool_calls_count = utils::get_history_tool_calls_count(&chat_request);
+
+        // Check parser availability once upfront (not per choice)
+        let reasoning_parser_available = chat_request.separate_reasoning
+            && utils::check_reasoning_parser_availability(
+                &self.reasoning_parser_factory,
+                self.configured_reasoning_parser.as_ref(),
+                &chat_request.model,
+            );
+
+        let tool_choice_enabled = !matches!(
+            &chat_request.tool_choice,
+            Some(ToolChoice::Value(ToolChoiceValue::None))
+        );
+
+        let tool_parser_available = tool_choice_enabled
+            && chat_request.tools.is_some()
+            && utils::check_tool_parser_availability(
+                &self.tool_parser_factory,
+                self.configured_tool_parser.as_ref(),
+                &chat_request.model,
+            );
+
+        // Log once per request (not per choice)
+        if chat_request.separate_reasoning && !reasoning_parser_available {
+            tracing::debug!(
+                "No reasoning parser found for model '{}', skipping reasoning parsing",
+                chat_request.model
+            );
+        }
+
+        if chat_request.tools.is_some() && tool_choice_enabled && !tool_parser_available {
+            tracing::debug!(
+                "No tool parser found for model '{}', skipping tool call parsing",
+                chat_request.model
+            );
+        }
+
+        // Process all choices
+        let mut choices = Vec::new();
+        for (index, complete) in all_responses.iter().enumerate() {
+            match self
+                .process_single_choice(
+                    complete,
+                    index,
+                    &chat_request,
+                    stop_decoder,
+                    history_tool_calls_count,
+                    reasoning_parser_available,
+                    tool_parser_available,
+                )
+                .await
+            {
+                Ok(choice) => choices.push(choice),
+                Err(e) => {
+                    return Err(utils::internal_error_message(format!(
+                        "Failed to process choice {}: {}",
+                        index, e
+                    )));
+                }
+            }
+        }
+
+        // Build usage
+        let total_prompt_tokens: u32 = all_responses.iter().map(|r| r.prompt_tokens as u32).sum();
+        let total_completion_tokens: u32 = all_responses
+            .iter()
+            .map(|r| r.completion_tokens as u32)
+            .sum();
+        let usage = Usage {
+            prompt_tokens: total_prompt_tokens,
+            completion_tokens: total_completion_tokens,
+            total_tokens: total_prompt_tokens + total_completion_tokens,
+            completion_tokens_details: None,
+        };
+
+        // Build final ChatCompletionResponse
+        let response = ChatCompletionResponse {
+            id: dispatch.request_id.clone(),
+            object: "chat.completion".to_string(),
+            created: dispatch.created,
+            model: dispatch.model.clone(),
+            choices,
+            usage: Some(usage),
+            system_fingerprint: dispatch.weight_version.clone(),
+        };
+
+        Ok(response)
     }
 
     /// Parse tool calls using model-specific parser (EXACT COPY from router.rs:296-361)
