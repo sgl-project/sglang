@@ -79,6 +79,23 @@ python -m sglang_router.launch_router \
     --worker-urls http://worker1:8000 http://worker2:8000
 ```
 
+#### OpenAI Backend Mode
+Route requests to OpenAI or OpenAI-compatible endpoints:
+
+```bash
+# Route to OpenAI API
+python -m sglang_router.launch_router \
+    --backend openai \
+    --worker-urls https://api.openai.com/v1
+
+# Route to custom OpenAI-compatible endpoint
+./target/release/sglang-router \
+    --backend openai \
+    --worker-urls http://my-openai-compatible-service:8000/v1
+```
+
+**Note**: OpenAI backend mode acts as a simple proxy. Load balancing is not applicable in this mode.
+
 #### Launch Router with Worker URLs in prefill-decode mode
 ```bash
 # Note that the prefill and decode URLs must be provided in the following format:
@@ -192,6 +209,67 @@ python -m sglang_router.launch_router \
 ```
 
 Default headers: `x-request-id`, `x-correlation-id`, `x-trace-id`, `request-id`
+
+### History Backend (Conversation Storage)
+
+Store conversation and response data for tracking, debugging, or analytics.
+
+#### Available Backends
+
+- **Memory** (default): In-memory storage, fast but ephemeral
+- **None**: No storage, minimal overhead
+- **Oracle**: Persistent storage using Oracle ATP
+
+```bash
+# Memory backend (default)
+python -m sglang_router.launch_router \
+    --worker-urls http://worker1:8000 http://worker2:8000 \
+    --history-backend memory
+
+# No storage for maximum performance
+python -m sglang_router.launch_router \
+    --worker-urls http://worker1:8000 http://worker2:8000 \
+    --history-backend none
+
+# Oracle ATP backend with environment variables
+export ATP_DSN="tcps://adb.region.oraclecloud.com:1522/service_name"
+export ATP_USER="admin"
+export ATP_PASSWORD="YourPassword123"
+export ATP_WALLET_PATH="/path/to/wallet"
+
+python -m sglang_router.launch_router \
+    --worker-urls http://worker1:8000 http://worker2:8000 \
+    --history-backend oracle
+```
+
+**Oracle Configuration Parameters:**
+- `--oracle-connect-descriptor`: Connection string or TNS alias (env: `ATP_DSN`)
+- `--oracle-username`: Database username (env: `ATP_USER`)
+- `--oracle-password`: Database password (env: `ATP_PASSWORD`)
+- `--oracle-wallet-path`: Path to wallet directory (env: `ATP_WALLET_PATH`, optional)
+- `--oracle-pool-min`: Minimum connections (default: 1, env: `ATP_POOL_MIN`)
+- `--oracle-pool-max`: Maximum connections (default: 16, env: `ATP_POOL_MAX`)
+
+**Python API Example:**
+```python
+from sglang_router_rs import Router, HistoryBackendType, PyOracleConfig
+
+oracle_config = PyOracleConfig(
+    connect_descriptor="tcps://adb.region.oraclecloud.com:1522/service_name",
+    username="admin",
+    password="YourPassword123",
+    wallet_path="/path/to/wallet",
+    pool_min=2,
+    pool_max=10,
+)
+
+router = Router(
+    worker_urls=["http://worker1:8000", "http://worker2:8000"],
+    history_backend=HistoryBackendType.Oracle,
+    oracle_config=oracle_config,
+)
+router.start()
+```
 
 ## Advanced Features
 
@@ -406,6 +484,26 @@ curl -X POST http://localhost:8080/add_worker?url=http://worker3:8000&api_key=wo
 
 ### Command Line Arguments Reference
 
+#### Backend Selection
+- `--backend`: Backend runtime to use (default: `sglang`)
+  - `sglang`: SGLang workers (default)
+  - `openai`: OpenAI or OpenAI-compatible endpoints
+  - `vllm`: vLLM workers (experimental)
+  - `trtllm`: TensorRT-LLM workers (experimental)
+  - `anthropic`: Anthropic API (experimental)
+
+#### History Backend
+- `--history-backend`: Storage backend for conversations (default: `memory`)
+  - `memory`: In-memory storage (default)
+  - `none`: No storage
+  - `oracle`: Oracle ATP persistent storage
+- `--oracle-connect-descriptor`: Oracle connection string (env: `ATP_DSN`)
+- `--oracle-username`: Oracle username (env: `ATP_USER`)
+- `--oracle-password`: Oracle password (env: `ATP_PASSWORD`)
+- `--oracle-wallet-path`: Oracle wallet directory (env: `ATP_WALLET_PATH`)
+- `--oracle-pool-min`: Min pool connections (default: 1, env: `ATP_POOL_MIN`)
+- `--oracle-pool-max`: Max pool connections (default: 16, env: `ATP_POOL_MAX`)
+
 #### Service Discovery
 - `--service-discovery`: Enable Kubernetes service discovery
 - `--service-discovery-port`: Port for worker URLs (default: 8000)
@@ -473,6 +571,8 @@ The continuous integration pipeline includes comprehensive testing, benchmarking
   - **Random**: Distributes requests randomly across available workers
   - **Round Robin**: Sequential distribution across workers in rotation
 - **Prefill-Decode Disaggregation**: Specialized load balancing for separated prefill and decode servers
+- **Multiple Backend Support**: Route to SGLang, OpenAI, or other OpenAI-compatible services
+- **Conversation Storage**: Track conversations with memory, Oracle ATP, or disable for minimal overhead
 - **Service Discovery**: Automatic Kubernetes worker discovery and health management
 - **Monitoring**: Comprehensive Prometheus metrics and structured logging
 - **Scalability**: Handles thousands of concurrent connections with efficient resource utilization
