@@ -17,6 +17,7 @@ import time
 
 import requests
 
+from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -52,7 +53,9 @@ class CompileArgs:
 
 
 @warmup("compile-deep-gemm")
-async def warm_up_compile(tokenizer_manager: TokenizerManager):
+async def warm_up_compile(
+    disaggregation_mode: str, tokenizer_manager: TokenizerManager
+):
     print("\nGenerate warm up request for compiling DeepGEMM...\n")
     generate_req_input = GenerateReqInput(
         input_ids=[0, 1, 2, 3],
@@ -62,6 +65,10 @@ async def warm_up_compile(tokenizer_manager: TokenizerManager):
             "ignore_eos": True,
         },
     )
+    if disaggregation_mode != "null":
+        generate_req_input.bootstrap_room = 0
+        generate_req_input.bootstrap_host = FAKE_BOOTSTRAP_HOST
+
     await tokenizer_manager.generate_request(generate_req_input, None).__anext__()
 
 
@@ -133,6 +140,9 @@ def refine_server_args(server_args: ServerArgs, compile_args: CompileArgs):
     server_args.disable_cuda_graph = True
     server_args.enable_torch_compile = False
     print(f"Disable CUDA Graph and Torch Compile to save time...")
+
+    server_args.load_format = "dummy"
+    print(f"Set load format to dummy to save time...")
 
     # Set watchdog timeout to compile_args.timeout because compilation will take a long time
     server_args.watchdog_timeout = compile_args.timeout

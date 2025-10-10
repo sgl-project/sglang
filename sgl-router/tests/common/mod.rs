@@ -1,58 +1,386 @@
+// These modules are used by tests and benchmarks
+#![allow(dead_code)]
+
+pub mod mock_mcp_server;
+pub mod mock_openai_server;
 pub mod mock_worker;
+pub mod streaming_helpers;
+pub mod test_app;
 
-use actix_web::web;
-use reqwest::Client;
-use sglang_router_rs::config::{PolicyConfig, RouterConfig, RoutingMode};
-use sglang_router_rs::server::AppState;
+use serde_json::json;
+use sglang_router_rs::config::RouterConfig;
+use sglang_router_rs::protocols::spec::{Function, Tool};
+use sglang_router_rs::server::AppContext;
+use std::fs;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock};
 
-/// Helper function to create test router configuration
-pub fn create_test_config(worker_urls: Vec<String>) -> RouterConfig {
-    RouterConfig {
-        mode: RoutingMode::Regular { worker_urls },
-        policy: PolicyConfig::Random,
-        host: "127.0.0.1".to_string(),
-        port: 3001,
-        max_payload_size: 256 * 1024 * 1024, // 256MB
-        request_timeout_secs: 600,
-        worker_startup_timeout_secs: 300,
-        worker_startup_check_interval_secs: 10,
-        discovery: None,
-        metrics: None,
-        log_dir: None,
-        log_level: None,
-        request_id_headers: None,
-    }
+/// Helper function to create AppContext for tests
+pub fn create_test_context(config: RouterConfig) -> Arc<AppContext> {
+    Arc::new(
+        AppContext::new(
+            config.clone(),
+            reqwest::Client::new(),
+            config.max_concurrent_requests,
+            config.rate_limit_tokens_per_second,
+        )
+        .expect("Failed to create AppContext in test"),
+    )
 }
 
-/// Helper function to create test router configuration with no health check
-pub fn create_test_config_no_workers() -> RouterConfig {
-    RouterConfig {
-        mode: RoutingMode::Regular {
-            worker_urls: vec![],
-        }, // Empty to skip health check
-        policy: PolicyConfig::Random,
-        host: "127.0.0.1".to_string(),
-        port: 3001,
-        max_payload_size: 256 * 1024 * 1024, // 256MB
-        request_timeout_secs: 600,
-        worker_startup_timeout_secs: 0, // No wait
-        worker_startup_check_interval_secs: 10,
-        discovery: None,
-        metrics: None,
-        log_dir: None,
-        log_level: None,
-        request_id_headers: None,
+// Tokenizer download configuration
+const TINYLLAMA_TOKENIZER_URL: &str =
+    "https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0/resolve/main/tokenizer.json";
+const CACHE_DIR: &str = ".tokenizer_cache";
+const TINYLLAMA_TOKENIZER_FILENAME: &str = "tinyllama_tokenizer.json";
+
+// Global mutex to prevent concurrent downloads
+static DOWNLOAD_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+
+/// Downloads the TinyLlama tokenizer from HuggingFace if not already cached.
+/// Returns the path to the cached tokenizer file.
+///
+/// This function is thread-safe and will only download the tokenizer once
+/// even if called from multiple threads concurrently.
+pub fn ensure_tokenizer_cached() -> PathBuf {
+    // Get or initialize the mutex
+    let mutex = DOWNLOAD_MUTEX.get_or_init(|| Mutex::new(()));
+
+    // Lock to ensure only one thread downloads at a time
+    let _guard = mutex.lock().unwrap();
+
+    let cache_dir = PathBuf::from(CACHE_DIR);
+    let tokenizer_path = cache_dir.join(TINYLLAMA_TOKENIZER_FILENAME);
+
+    // Create cache directory if it doesn't exist
+    if !cache_dir.exists() {
+        fs::create_dir_all(&cache_dir).expect("Failed to create cache directory");
     }
+
+    // Download tokenizer if not already cached
+    if !tokenizer_path.exists() {
+        println!("Downloading TinyLlama tokenizer from HuggingFace...");
+
+        // Use blocking reqwest client since we're in tests/benchmarks
+        let client = reqwest::blocking::Client::new();
+        let response = client
+            .get(TINYLLAMA_TOKENIZER_URL)
+            .send()
+            .expect("Failed to download tokenizer");
+
+        if !response.status().is_success() {
+            panic!("Failed to download tokenizer: HTTP {}", response.status());
+        }
+
+        let content = response.bytes().expect("Failed to read tokenizer content");
+
+        if content.len() < 100 {
+            panic!("Downloaded content too small: {} bytes", content.len());
+        }
+
+        fs::write(&tokenizer_path, content).expect("Failed to write tokenizer to cache");
+        println!(
+            "Tokenizer downloaded and cached successfully ({} bytes)",
+            tokenizer_path.metadata().unwrap().len()
+        );
+    }
+
+    tokenizer_path
 }
 
-/// Helper function to create test app state
-pub async fn create_test_app_state(config: RouterConfig) -> Result<web::Data<AppState>, String> {
-    // Create a non-blocking client
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(config.request_timeout_secs))
-        .build()
-        .map_err(|e| e.to_string())?;
+/// Common test prompts for consistency across tests
+pub const TEST_PROMPTS: [&str; 4] = [
+    "deep learning is",
+    "Deep learning is",
+    "has anyone seen nemo lately",
+    "another prompt",
+];
 
-    let app_state = AppState::new(config, client)?;
-    Ok(web::Data::new(app_state))
+/// Pre-computed hashes for verification
+pub const EXPECTED_HASHES: [u64; 4] = [
+    1209591529327510910,
+    4181375434596349981,
+    6245658446118930933,
+    5097285695902185237,
+];
+
+/// Create a comprehensive set of test tools covering all parser test scenarios
+#[allow(dead_code)]
+pub fn create_test_tools() -> Vec<Tool> {
+    vec![
+        Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "search".to_string(),
+                description: Some("Search for information".to_string()),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"}
+                    }
+                }),
+            },
+        },
+        Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "get_weather".to_string(),
+                description: Some("Get weather information".to_string()),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "city": {"type": "string"},
+                        "location": {"type": "string"},
+                        "date": {"type": "string"},
+                        "units": {"type": "string"}
+                    }
+                }),
+            },
+        },
+        Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "calculate".to_string(),
+                description: Some("Perform calculations".to_string()),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "x": {"type": "number"},
+                        "y": {"type": "number"}
+                    }
+                }),
+            },
+        },
+        Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "translate".to_string(),
+                description: Some("Translate text".to_string()),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "text": {"type": "string"},
+                        "to": {"type": "string"},
+                        "target_lang": {"type": "string"}
+                    }
+                }),
+            },
+        },
+        Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "get_time".to_string(),
+                description: Some("Get current time".to_string()),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "timezone": {"type": "string"},
+                        "format": {"type": "string"}
+                    }
+                }),
+            },
+        },
+        Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "get_current_time".to_string(),
+                description: Some("Get current time".to_string()),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "timezone": {"type": "string"},
+                        "format": {"type": "string"}
+                    }
+                }),
+            },
+        },
+        Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "update_settings".to_string(),
+                description: Some("Update settings".to_string()),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "preferences": {"type": "object"},
+                        "notifications": {"type": "boolean"}
+                    }
+                }),
+            },
+        },
+        Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "ping".to_string(),
+                description: Some("Ping service".to_string()),
+                parameters: json!({"type": "object", "properties": {}}),
+            },
+        },
+        Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "test".to_string(),
+                description: Some("Test function".to_string()),
+                parameters: json!({"type": "object", "properties": {}}),
+            },
+        },
+        Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "process".to_string(),
+                description: Some("Process data".to_string()),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "count": {"type": "number"},
+                        "rate": {"type": "number"},
+                        "enabled": {"type": "boolean"},
+                        "data": {"type": "object"},
+                        "text": {"type": "string"}
+                    }
+                }),
+            },
+        },
+        Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "web_search".to_string(),
+                description: Some("Search the web".to_string()),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "num_results": {"type": "number"},
+                        "search_type": {"type": "string"}
+                    }
+                }),
+            },
+        },
+        Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "get_tourist_attractions".to_string(),
+                description: Some("Get tourist attractions".to_string()),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "city": {"type": "string"}
+                    }
+                }),
+            },
+        },
+        Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "config".to_string(),
+                description: Some("Configuration function".to_string()),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "debug": {"type": "boolean"},
+                        "verbose": {"type": "boolean"},
+                        "optional": {"type": "null"}
+                    }
+                }),
+            },
+        },
+        Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "test_func".to_string(),
+                description: Some("Test function".to_string()),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "bool_true": {"type": "boolean"},
+                        "bool_false": {"type": "boolean"},
+                        "none_val": {"type": "null"}
+                    }
+                }),
+            },
+        },
+        Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "create".to_string(),
+                description: Some("Create resource".to_string()),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "email": {"type": "string"}
+                    }
+                }),
+            },
+        },
+        Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "add".to_string(),
+                description: Some("Add operation".to_string()),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "x": {"type": "number"},
+                        "y": {"type": "number"}
+                    }
+                }),
+            },
+        },
+        Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "calc".to_string(),
+                description: Some("Calculate".to_string()),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "x": {"type": "number"}
+                    }
+                }),
+            },
+        },
+        Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "func1".to_string(),
+                description: Some("Function 1".to_string()),
+                parameters: json!({"type": "object", "properties": {}}),
+            },
+        },
+        Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "func2".to_string(),
+                description: Some("Function 2".to_string()),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "y": {"type": "number"}
+                    }
+                }),
+            },
+        },
+        Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "tool1".to_string(),
+                description: Some("Tool 1".to_string()),
+                parameters: json!({"type": "object", "properties": {}}),
+            },
+        },
+        Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "tool2".to_string(),
+                description: Some("Tool 2".to_string()),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "y": {"type": "number"}
+                    }
+                }),
+            },
+        },
+    ]
 }

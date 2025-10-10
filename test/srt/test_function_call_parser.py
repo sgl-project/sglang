@@ -5,15 +5,17 @@ from xgrammar import GrammarCompiler, TokenizerInfo
 
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
+from sglang.srt.function_call.core_types import StreamingParseResult
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
 from sglang.srt.function_call.glm4_moe_detector import Glm4MoeDetector
+from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.kimik2_detector import KimiK2Detector
 from sglang.srt.function_call.llama32_detector import Llama32Detector
 from sglang.srt.function_call.mistral_detector import MistralDetector
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 from sglang.srt.function_call.qwen25_detector import Qwen25Detector
-from sglang.srt.hf_transformers_utils import get_tokenizer
+from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
 
@@ -497,6 +499,17 @@ class TestEBNFGeneration(unittest.TestCase):
                     },
                 ),
             ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="empty_param_func",
+                    description="Function with empty parameters",
+                    parameters={
+                        "properties": {},
+                        "required": [],
+                    },
+                ),
+            ),
         ]
 
         self.tokenizer = get_tokenizer(DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
@@ -538,7 +551,7 @@ class TestEBNFGeneration(unittest.TestCase):
         # Check that the EBNF contains expected patterns
         self.assertIn("<｜tool▁calls▁begin｜>", ebnf)
         self.assertIn("<｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather", ebnf)
-        self.assertIn('\\"location\\"" ":" basic_string ', ebnf)
+        self.assertIn('\\"location\\"" ws ":" ws basic_string ', ebnf)
 
         # Validate that the EBNF can be compiled by GrammarCompiler
         try:
@@ -580,8 +593,8 @@ class TestEBNFGeneration(unittest.TestCase):
         self.assertIsNotNone(ebnf)
 
         # Check that the EBNF contains expected patterns
-        self.assertIn('\\"name\\"" ":" "\\"get_weather\\"', ebnf)
-        self.assertIn('"\\"arguments\\"" ":"', ebnf)
+        self.assertIn('\\"name\\"" ws ":" ws "\\"get_weather\\"', ebnf)
+        self.assertIn('"\\"arguments\\"" ws ":"', ebnf)
 
         # Validate that the EBNF can be compiled by GrammarCompiler
         try:
@@ -598,7 +611,7 @@ class TestEBNFGeneration(unittest.TestCase):
         # Check that the EBNF contains expected patterns
         self.assertIn('"[TOOL_CALLS] ["', ebnf)
         self.assertIn("call_get_weather | call_search", ebnf)
-        self.assertIn('"\\"arguments\\"" ":"', ebnf)
+        self.assertIn('"\\"arguments\\"" ws ":"', ebnf)
 
         # Validate that the EBNF can be compiled by GrammarCompiler
         try:
@@ -614,8 +627,8 @@ class TestEBNFGeneration(unittest.TestCase):
 
         # Check that the EBNF contains expected patterns
         self.assertIn("<tool_call>", ebnf)
-        self.assertIn('\\"name\\"" ":" "\\"get_weather\\"', ebnf)
-        self.assertIn('"\\"arguments\\"" ":"', ebnf)
+        self.assertIn('\\"name\\"" ws ":" ws "\\"get_weather\\"', ebnf)
+        self.assertIn('"\\"arguments\\"" ws ":"', ebnf)
 
         # Validate that the EBNF can be compiled by GrammarCompiler
         try:
@@ -630,16 +643,21 @@ class TestEBNFGeneration(unittest.TestCase):
         self.assertIsNotNone(ebnf)
         # Check that the EBNF contains expected patterns for XML format
         self.assertIn('"<tool_call>" function_call "</tool_call>"', ebnf)
-        self.assertIn('"get_weather" "\\n" arguments_get_weather', ebnf)
+        self.assertIn('"get_weather" "\\n" ( arguments_get_weather "\\n" )?', ebnf)
         self.assertIn(
             '"<arg_key>location</arg_key>" "\\n" "<arg_value>" xml_text "</arg_value>" ( "\\n" ( "<arg_key>unit</arg_key>" "\\n" "<arg_value>" ("celsius" | "fahrenheit") "</arg_value>" ) )?',
             ebnf,
         )
-        self.assertIn('"search" "\\n" arguments_search', ebnf)
+        self.assertIn('"search" "\\n" ( arguments_search "\\n" )?', ebnf)
         self.assertIn(
             '"<arg_key>query</arg_key>" "\\n" "<arg_value>" xml_text "</arg_value>"',
             ebnf,
         )
+        self.assertIn(
+            '"empty_param_func" "\\n" ( arguments_empty_param_func "\\n" )?', ebnf
+        )
+        self.assertIn('arguments_empty_param_func ::= ""', ebnf)
+
         # Validate that the EBNF can be compiled by GrammarCompiler
         try:
             ctx = self.grammar_compiler.compile_grammar(ebnf)
@@ -708,13 +726,13 @@ class TestEBNFGeneration(unittest.TestCase):
                     # Pythonic format: location="Paris" ( , ( unit=("celsius" | "fahrenheit") )?
                     self.assertIn('"location" "=" basic_string', ebnf)
                     # The comma should be inside the optional brackets for unit
-                    self.assertIn('( "," ( "unit" "=" ', ebnf)
+                    self.assertIn('( ws "," ws ( "unit" "=" ', ebnf)
                 else:
                     # JSON format: "location": "Paris" ( , ( "unit": ("celsius" | "fahrenheit") )?
-                    self.assertIn('"location\\"" ":" basic_string', ebnf)
+                    self.assertIn('"location\\"" ws ":" ws basic_string', ebnf)
                     # The comma should be part of the optional group
                     # This pattern ensures no trailing comma when unit is omitted
-                    self.assertIn('( "," ( "\\"unit\\"" ":"', ebnf)
+                    self.assertIn('( ws "," ws ( "\\"unit\\"" ws ":"', ebnf)
 
                 # Validate that the EBNF can be compiled
                 try:
@@ -772,7 +790,7 @@ class TestEBNFGeneration(unittest.TestCase):
                 )
 
                 # Check required field
-                self.assertIn('"required_field\\"" ":" basic_string', ebnf)
+                self.assertIn('"required_field\\"" ws ":" ws basic_string', ebnf)
 
                 # Check the structure for optional parameters
                 # The pattern should be: required_field ( "," ( opt1 ... | opt2 ... | opt3 ... ) )?
@@ -781,16 +799,16 @@ class TestEBNFGeneration(unittest.TestCase):
                 # Check that optional parameters are in a group with comma
                 if args_rule:  # Only check if args_rule was found
                     self.assertIn(
-                        '( ","',
+                        '( ws "," ws (',
                         args_rule,
                         f"{name} should have comma grouped with optional parameters",
                     )
 
                     # Check for the alternation pattern that allows flexible ordering
                     # Should contain patterns like: opt1 ... | opt2 ... | opt3
-                    self.assertIn('"opt1\\"" ":" basic_number', args_rule)
-                    self.assertIn('"opt2\\"" ":" basic_boolean', args_rule)
-                    self.assertIn('"opt3\\"" ":" basic_string', args_rule)
+                    self.assertIn('"opt1\\"" ws ":" ws basic_number', args_rule)
+                    self.assertIn('"opt2\\"" ws ":" ws basic_boolean', args_rule)
+                    self.assertIn('"opt3\\"" ws ":" ws basic_string', args_rule)
 
                     # Check for alternation (|) which allows skipping optional parameters
                     self.assertIn(
@@ -865,9 +883,9 @@ class TestEBNFGeneration(unittest.TestCase):
                     # This allows flexible ordering where any optional can appear first
 
                     # Check the structure
-                    self.assertIn('"opt1\\"" ":" basic_string', args_rule)
-                    self.assertIn('"opt2\\"" ":" basic_number', args_rule)
-                    self.assertIn('"opt3\\"" ":" basic_boolean', args_rule)
+                    self.assertIn('"opt1\\"" ws ":" ws basic_string', args_rule)
+                    self.assertIn('"opt2\\"" ws ":" ws basic_number', args_rule)
+                    self.assertIn('"opt3\\"" ws ":" ws basic_boolean', args_rule)
 
                     # The pattern SHOULD have alternation (|) for flexible ordering
                     self.assertIn(
@@ -1707,17 +1725,37 @@ fahrenheit
 
         accumulated_text = ""
         accumulated_calls = []
+        tool_calls_by_index = {}
 
         for chunk in chunks:
             result = self.detector.parse_streaming_increment(chunk, tools=self.tools)
             accumulated_text += result.normal_text
-            accumulated_calls.extend(result.calls)
+
+            # Track calls by tool_index to handle streaming properly
+            for call in result.calls:
+                if call.tool_index is not None:
+                    if call.tool_index not in tool_calls_by_index:
+                        tool_calls_by_index[call.tool_index] = {
+                            "name": "",
+                            "parameters": "",
+                        }
+
+                    if call.name:
+                        tool_calls_by_index[call.tool_index]["name"] = call.name
+                    if call.parameters:
+                        tool_calls_by_index[call.tool_index][
+                            "parameters"
+                        ] += call.parameters
 
         self.assertEqual(accumulated_text, "Sure! Let me check the weather.")
-        self.assertEqual(len(accumulated_calls), 1)
-        self.assertEqual(accumulated_calls[0].name, "get_current_weather")
+        self.assertEqual(len(tool_calls_by_index), 1)
 
-        params = json.loads(accumulated_calls[0].parameters)
+        # Get the complete tool call
+        tool_call = tool_calls_by_index[0]
+        self.assertEqual(tool_call["name"], "get_current_weather")
+
+        # Parse the accumulated parameters
+        params = json.loads(tool_call["parameters"])
         self.assertEqual(params["city"], "Dallas")
         self.assertEqual(params["state"], "TX")
 
@@ -1735,20 +1773,49 @@ fahrenheit
             # Missing </parameter>, </function>, </tool_call>
         ]
 
-        accumulated_calls = []
+        tool_calls_by_index = {}
         for chunk in chunks:
             result = self.detector.parse_streaming_increment(chunk, tools=self.tools)
-            accumulated_calls.extend(result.calls)
 
-        # Should not have any complete calls yet
-        self.assertEqual(len(accumulated_calls), 0)
+            # Track calls by tool_index to handle streaming properly
+            for call in result.calls:
+                if call.tool_index is not None:
+                    if call.tool_index not in tool_calls_by_index:
+                        tool_calls_by_index[call.tool_index] = {
+                            "name": "",
+                            "parameters": "",
+                        }
+
+                    if call.name:
+                        tool_calls_by_index[call.tool_index]["name"] = call.name
+                    if call.parameters:
+                        tool_calls_by_index[call.tool_index][
+                            "parameters"
+                        ] += call.parameters
+
+        # Should have partial tool call with name but incomplete parameters
+        self.assertGreater(len(tool_calls_by_index), 0)
+        self.assertEqual(tool_calls_by_index[0]["name"], "get_current_weather")
+
+        # Parameters should be incomplete (no closing brace)
+        params_str = tool_calls_by_index[0]["parameters"]
+        self.assertTrue(params_str.startswith('{"city": "Dallas"'))
+        self.assertFalse(params_str.endswith("}"))
 
         # Now complete it
         result = self.detector.parse_streaming_increment(
             "\n</parameter>\n</function>\n</tool_call>", tools=self.tools
         )
-        self.assertEqual(len(result.calls), 1)
-        self.assertEqual(result.calls[0].name, "get_current_weather")
+
+        # Update the accumulated parameters
+        for call in result.calls:
+            if call.tool_index is not None and call.parameters:
+                tool_calls_by_index[call.tool_index]["parameters"] += call.parameters
+
+        # Now should have complete parameters
+        final_params = json.loads(tool_calls_by_index[0]["parameters"])
+        self.assertEqual(final_params["city"], "Dallas")
+        self.assertEqual(final_params["state"], "TX")
 
     def test_edge_case_no_parameters(self):
         """Test tool call without parameters."""
@@ -1845,15 +1912,15 @@ hello world
     def test_parse_streaming_incremental(self):
         """Test that streaming is truly incremental with very small chunks."""
         model_output = """I'll check the weather.<tool_call>
-<function=get_current_weather>
-<parameter=city>
-Dallas
-</parameter>
-<parameter=state>
-TX
-</parameter>
-</function>
-</tool_call>"""
+        <function=get_current_weather>
+        <parameter=city>
+        Dallas
+        </parameter>
+        <parameter=state>
+        TX
+        </parameter>
+        </function>
+        </tool_call>"""
 
         # Simulate more realistic token-based chunks where <tool_call> is a single token
         chunks = [
@@ -1871,49 +1938,59 @@ TX
         ]
 
         accumulated_text = ""
-        accumulated_calls = []
+        tool_calls = []
         chunks_count = 0
 
         for chunk in chunks:
-            result = self.detector.parse_streaming_increment(chunk, tools=self.tools)
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
             accumulated_text += result.normal_text
-            accumulated_calls.extend(result.calls)
             chunks_count += 1
+            for tool_call_chunk in result.calls:
+                if (
+                    hasattr(tool_call_chunk, "tool_index")
+                    and tool_call_chunk.tool_index is not None
+                ):
+                    while len(tool_calls) <= tool_call_chunk.tool_index:
+                        tool_calls.append({"name": "", "parameters": ""})
+                    tc = tool_calls[tool_call_chunk.tool_index]
+                    if tool_call_chunk.name:
+                        tc["name"] = tool_call_chunk.name
+                    if tool_call_chunk.parameters:
+                        tc["parameters"] += tool_call_chunk.parameters
 
         self.assertGreater(chunks_count, 3)
 
         # Verify the accumulated results
         self.assertIn("I'll check the weather.", accumulated_text)
-        self.assertEqual(len(accumulated_calls), 1)
-        self.assertEqual(accumulated_calls[0].name, "get_current_weather")
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "get_current_weather")
 
-        params = json.loads(accumulated_calls[0].parameters)
-        self.assertEqual(params["city"], "Dallas")
-        self.assertEqual(params["state"], "TX")
+        params = json.loads(tool_calls[0]["parameters"])
+        self.assertEqual(params, {"city": "Dallas", "state": "TX"})
 
     def test_parse_streaming_multiple_tools(self):
         """Test streaming with multiple tool calls."""
         model_output = """<tool_call>
-<function=get_current_weather>
-<parameter=city>
-Dallas
-</parameter>
-<parameter=state>
-TX
-</parameter>
-</function>
-</tool_call>
-Some text in between.
-<tool_call>
-<function=calculate_area>
-<parameter=shape>
-circle
-</parameter>
-<parameter=dimensions>
-{"radius": 5}
-</parameter>
-</function>
-</tool_call>"""
+        <function=get_current_weather>
+        <parameter=city>
+        Dallas
+        </parameter>
+        <parameter=state>
+        TX
+        </parameter>
+        </function>
+        </tool_call>
+        Some text in between.
+        <tool_call>
+        <function=calculate_area>
+        <parameter=shape>
+        circle
+        </parameter>
+        <parameter=dimensions>
+        {"radius": 5}
+        </parameter>
+        </function>
+        </tool_call>"""
 
         # Simulate streaming by chunks
         chunk_size = 20
@@ -1923,25 +2000,37 @@ circle
         ]
 
         accumulated_text = ""
-        accumulated_calls = []
+        tool_calls = []
+        chunks_count = 0
 
         for chunk in chunks:
-            result = self.detector.parse_streaming_increment(chunk, tools=self.tools)
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
             accumulated_text += result.normal_text
-            accumulated_calls.extend(result.calls)
+            chunks_count += 1
+            for tool_call_chunk in result.calls:
+                if (
+                    hasattr(tool_call_chunk, "tool_index")
+                    and tool_call_chunk.tool_index is not None
+                ):
+                    while len(tool_calls) <= tool_call_chunk.tool_index:
+                        tool_calls.append({"name": "", "parameters": ""})
+                    tc = tool_calls[tool_call_chunk.tool_index]
+                    if tool_call_chunk.name:
+                        tc["name"] = tool_call_chunk.name
+                    if tool_call_chunk.parameters:
+                        tc["parameters"] += tool_call_chunk.parameters
 
         self.assertIn("Some text in between.", accumulated_text)
-        self.assertEqual(len(accumulated_calls), 2)
-        self.assertEqual(accumulated_calls[0].name, "get_current_weather")
-        self.assertEqual(accumulated_calls[1].name, "calculate_area")
+        self.assertEqual(len(tool_calls), 2)
+        self.assertEqual(tool_calls[0]["name"], "get_current_weather")
+        self.assertEqual(tool_calls[1]["name"], "calculate_area")
 
         # Verify parameters
-        params1 = json.loads(accumulated_calls[0].parameters)
-        self.assertEqual(params1["city"], "Dallas")
+        params1 = json.loads(tool_calls[0]["parameters"])
+        self.assertEqual(params1, {"city": "Dallas", "state": "TX"})
 
-        params2 = json.loads(accumulated_calls[1].parameters)
-        self.assertEqual(params2["shape"], "circle")
-        self.assertEqual(params2["dimensions"], {"radius": 5})
+        params2 = json.loads(tool_calls[1]["parameters"])
+        self.assertEqual(params2, {"shape": "circle", "dimensions": {"radius": 5}})
 
 
 class TestGlm4MoeDetector(unittest.TestCase):
@@ -2101,6 +2190,323 @@ class TestGlm4MoeDetector(unittest.TestCase):
             result2.calls[0].parameters, '{"city": "Beijing", "date": "2024-06-27"}'
         )
         self.assertEqual(self.detector._buffer, "")
+
+
+class TestJsonArrayParser(unittest.TestCase):
+    def setUp(self):
+        # Create sample tools for testing
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    description="Get weather information",
+                    parameters={
+                        "properties": {
+                            "location": {
+                                "type": "string",
+                                "description": "Location to get weather for",
+                            },
+                            "unit": {
+                                "type": "string",
+                                "description": "Temperature unit",
+                                "enum": ["celsius", "fahrenheit"],
+                            },
+                        },
+                        "required": ["location"],
+                    },
+                ),
+            ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="search",
+                    description="Search for information",
+                    parameters={
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "Search query",
+                            },
+                        },
+                        "required": ["query"],
+                    },
+                ),
+            ),
+        ]
+        self.detector = JsonArrayParser()
+
+    def test_json_detector_ebnf(self):
+        """Test that the JsonArrayParser returns NotImplementedError for EBNF."""
+        with self.assertRaises(NotImplementedError) as context:
+            self.detector.build_ebnf(self.tools)
+        self.assertIn(
+            "EBNF generation is not supported for JSON schema constraints",
+            str(context.exception),
+        )
+
+    def test_parse_streaming_increment_malformed_json(self):
+        """Test parsing with malformed JSON"""
+        # Test with malformed JSON
+        text = '[{"name": "get_weather", "parameters": {"location": "Tokyo"'
+        result = self.detector.parse_streaming_increment(text, self.tools)
+
+        # Should not crash and return a valid result
+        self.assertIsInstance(result, StreamingParseResult)
+
+        text = "[{}}}]"
+        result = self.detector.parse_streaming_increment(text, self.tools)
+
+        self.assertIsInstance(result, StreamingParseResult)
+
+    def test_parse_streaming_increment_empty_input(self):
+        """Test parsing with empty input"""
+        result = self.detector.parse_streaming_increment("", self.tools)
+        self.assertEqual(len(result.calls), 0)
+        self.assertEqual(result.normal_text, "")
+
+    def test_parse_streaming_increment_whitespace_handling(self):
+        """Test parsing with various whitespace scenarios"""
+        # Test with leading/trailing whitespace split across chunks
+        chunk1 = '  [{"name": "get_weather", "parameters": '
+        result1 = self.detector.parse_streaming_increment(chunk1, self.tools)
+        self.assertIsInstance(result1, StreamingParseResult)
+        chunk2 = '{"location": "Tokyo"}}]  '
+        result2 = self.detector.parse_streaming_increment(chunk2, self.tools)
+
+        # The base class should handle this
+        self.assertIsInstance(result2, StreamingParseResult)
+
+    def test_parse_streaming_increment_nested_objects(self):
+        """Test parsing with nested JSON objects"""
+        chunk1 = '[{"name": "get_weather", "parameters": {"location": "Tokyo", '
+        result1 = self.detector.parse_streaming_increment(chunk1, self.tools)
+        self.assertIsInstance(result1, StreamingParseResult)
+        chunk2 = '"nested": {"key": "value"}}}]'
+        result2 = self.detector.parse_streaming_increment(chunk2, self.tools)
+
+        # The base class should handle this
+        self.assertIsInstance(result2, StreamingParseResult)
+
+    def test_json_parsing_with_commas(self):
+        """Test that JSON parsing works correctly with comma separators"""
+        # Stream two complete objects, at least 2 chunks per tool call
+        chunk1 = '[{"name": "get_weather", "parameters": {"location": "Tok'
+        result1 = self.detector.parse_streaming_increment(chunk1, self.tools)
+        self.assertIsInstance(result1, StreamingParseResult)
+        chunk2 = 'yo"}},'
+        result2 = self.detector.parse_streaming_increment(chunk2, self.tools)
+        self.assertIsInstance(result2, StreamingParseResult)
+
+        chunk3 = '{"name": "get_weather", "parameters": {"location": "Par'
+        result3 = self.detector.parse_streaming_increment(chunk3, self.tools)
+        self.assertIsInstance(result3, StreamingParseResult)
+        chunk4 = 'is"}}]'
+        result4 = self.detector.parse_streaming_increment(chunk4, self.tools)
+        self.assertIsInstance(result4, StreamingParseResult)
+        self.assertGreater(
+            len(result4.calls), 0, "Should parse tool calls from text with separators"
+        )
+
+    def test_braces_in_strings(self):
+        """Test that JSON with } characters inside strings works correctly"""
+        # Test case: JSON array with } inside string values - streamed across chunks
+        chunk1 = '[{"name": "get_weather", "parameters": {"location": "has } inside"'
+        result1 = self.detector.parse_streaming_increment(chunk1, self.tools)
+        self.assertIsInstance(result1, StreamingParseResult)
+        chunk2 = "}}"
+        result2 = self.detector.parse_streaming_increment(chunk2, self.tools)
+        self.assertIsInstance(result2, StreamingParseResult)
+        self.assertGreater(
+            len(result2.calls), 0, "Should parse tool call with } in string"
+        )
+
+        # Test with separator (streaming in progress)
+        chunk3 = '[{"name": "get_weather", "parameters": {"location": "has } inside"}'
+        result3 = self.detector.parse_streaming_increment(chunk3, self.tools)
+        self.assertIsInstance(result3, StreamingParseResult)
+        chunk4 = "},"
+        result4 = self.detector.parse_streaming_increment(chunk4, self.tools)
+        self.assertIsInstance(result4, StreamingParseResult)
+        chunk5 = '{"name": "get_weather"'
+        result5 = self.detector.parse_streaming_increment(chunk5, self.tools)
+        self.assertIsInstance(result5, StreamingParseResult)
+        self.assertGreater(
+            len(result5.calls),
+            0,
+            "Should parse tool calls with separator and } in string",
+        )
+
+    def test_separator_in_same_chunk(self):
+        """Test that separator already present in chunk works correctly"""
+        # Test case: separator already in the chunk (streaming in progress) with 2+ chunks per tool call
+        chunk1 = '[{"name": "get_weather", "parameters": {"location": "Tokyo"'
+        result1 = self.detector.parse_streaming_increment(chunk1, self.tools)
+        self.assertIsInstance(result1, StreamingParseResult)
+        chunk2 = '}},{"name": "get_weather"'
+        result2 = self.detector.parse_streaming_increment(chunk2, self.tools)
+        self.assertIsInstance(result2, StreamingParseResult)
+        self.assertGreater(
+            len(result2.calls),
+            0,
+            "Should parse tool calls with separator in same chunk",
+        )
+
+    def test_separator_in_separate_chunk(self):
+        """Test that separator in separate chunk works correctly"""
+        # Test case: separator in separate chunk - this tests streaming behavior
+        chunk1 = '[{"name": "get_weather", "parameters": {"location": "Tokyo"}}'
+        chunk2 = ","
+        chunk3 = '{"name": "get_weather", "parameters": {"location": "Paris"}}'
+
+        # Process first chunk
+        result1 = self.detector.parse_streaming_increment(chunk1, self.tools)
+        self.assertIsInstance(result1, StreamingParseResult)
+
+        # Process separator chunk
+        result2 = self.detector.parse_streaming_increment(chunk2, self.tools)
+        self.assertIsInstance(result2, StreamingParseResult)
+
+        # Process second chunk (streaming in progress)
+        result3 = self.detector.parse_streaming_increment(chunk3, self.tools)
+        self.assertIsInstance(result3, StreamingParseResult)
+
+    def test_incomplete_json_across_chunks(self):
+        """Test that incomplete JSON across chunks works correctly"""
+        # Test case: incomplete JSON across chunks - this tests streaming behavior
+        chunk1 = '[{"name": "get_weather", "parameters": {"location": "Tokyo"'
+        chunk2 = '}},{"name": "get_weather"'
+
+        # Process first chunk (incomplete)
+        result1 = self.detector.parse_streaming_increment(chunk1, self.tools)
+        self.assertIsInstance(result1, StreamingParseResult)
+
+        # Process second chunk (completes first object and starts second, streaming in progress)
+        result2 = self.detector.parse_streaming_increment(chunk2, self.tools)
+        self.assertIsInstance(result2, StreamingParseResult)
+
+    def test_malformed_json_recovery(self):
+        """Test that malformed JSON recovers gracefully"""
+        # Test with malformed JSON - should handle gracefully
+        malformed_text = (
+            '[{"name": "get_weather", "parameters": {"location": "unclosed string'
+        )
+
+        result1 = self.detector.parse_streaming_increment(malformed_text, self.tools)
+        self.assertIsInstance(result1, StreamingParseResult)
+
+        # Test valid JSON after malformed - streamed across 2 chunks (streaming in progress)
+        valid_chunk1 = '[{"name": "get_weather", "parameters": {"location": "Tok'
+        result2 = self.detector.parse_streaming_increment(valid_chunk1, self.tools)
+        self.assertIsInstance(result2, StreamingParseResult)
+        valid_chunk2 = 'yo"}}'
+        result3 = self.detector.parse_streaming_increment(valid_chunk2, self.tools)
+        self.assertIsInstance(result3, StreamingParseResult)
+
+    def test_nested_objects_with_commas(self):
+        """Test that nested objects with commas inside work correctly"""
+        # Test with nested objects that have commas - should work with json.loads()
+        chunk1 = '[{"name": "get_weather", "parameters": {"location": "Tok'
+        result1 = self.detector.parse_streaming_increment(chunk1, self.tools)
+        self.assertIsInstance(result1, StreamingParseResult)
+        chunk2 = 'yo", "unit": "celsius"}}'
+        result2 = self.detector.parse_streaming_increment(chunk2, self.tools)
+        self.assertIsInstance(result2, StreamingParseResult)
+        self.assertGreater(
+            len(result2.calls), 0, "Should parse tool call with nested objects"
+        )
+
+    def test_empty_objects(self):
+        """Test that empty objects work correctly"""
+        # Test with empty objects - should work with json.loads()
+        chunk1 = '[{"name": "get_weather", "parameters": '
+        result1 = self.detector.parse_streaming_increment(chunk1, self.tools)
+        self.assertIsInstance(result1, StreamingParseResult)
+        chunk2 = "{}}"
+        result2 = self.detector.parse_streaming_increment(chunk2, self.tools)
+        self.assertIsInstance(result2, StreamingParseResult)
+
+    def test_whitespace_handling(self):
+        """Test that various whitespace scenarios work correctly"""
+        # Test with various whitespace patterns - should work with json.loads()
+        chunk1 = ' \n\n [{"name": "get_weather", "parameters": '
+        result1 = self.detector.parse_streaming_increment(chunk1, self.tools)
+        self.assertIsInstance(result1, StreamingParseResult)
+        chunk2 = '{"location": "Tokyo"}}'
+        result2 = self.detector.parse_streaming_increment(chunk2, self.tools)
+        self.assertIsInstance(result2, StreamingParseResult)
+
+    def test_multiple_commas_in_chunk(self):
+        """Test that multiple commas in a single chunk work correctly"""
+        # Stream multiple tool calls ensuring at least 2 chunks per complete tool call
+        chunk1 = '[{"name": "get_weather", "parameters": {"location": "To'
+        result1 = self.detector.parse_streaming_increment(chunk1, self.tools)
+        self.assertIsInstance(result1, StreamingParseResult)
+        chunk2 = 'kyo"}},'
+        result2 = self.detector.parse_streaming_increment(chunk2, self.tools)
+        self.assertIsInstance(result2, StreamingParseResult)
+
+        chunk3 = '{"name": "get_weather", "parameters": {"location": "Pa'
+        result3 = self.detector.parse_streaming_increment(chunk3, self.tools)
+        self.assertIsInstance(result3, StreamingParseResult)
+        chunk4 = 'ris"}},'
+        result4 = self.detector.parse_streaming_increment(chunk4, self.tools)
+        self.assertIsInstance(result4, StreamingParseResult)
+
+        chunk5 = '{"name": "get_weather"'
+        result5 = self.detector.parse_streaming_increment(chunk5, self.tools)
+        self.assertIsInstance(result5, StreamingParseResult)
+        self.assertGreater(
+            len(result5.calls), 0, "Should parse tool calls with multiple commas"
+        )
+
+    def test_complete_tool_call_with_trailing_comma(self):
+        """Test that complete tool call with trailing comma parses correctly"""
+        # Test case: complete tool call followed by comma at end of chunk (split across 2 chunks)
+        chunk1 = '[{"name": "get_weather", "parameters": {"location": "Tokyo"}'
+        result1 = self.detector.parse_streaming_increment(chunk1, self.tools)
+        self.assertIsInstance(result1, StreamingParseResult)
+        chunk2 = "}, "
+        result2 = self.detector.parse_streaming_increment(chunk2, self.tools)
+        self.assertIsInstance(result2, StreamingParseResult)
+        self.assertGreater(len(result2.calls), 0, "Should parse complete tool call")
+
+        # Test that next chunk with opening brace gets the separator prepended
+        next_chunk = '{"name": "get_weather", "parameters": {"location": "Paris"}}'
+        result_next = self.detector.parse_streaming_increment(next_chunk, self.tools)
+        self.assertIsInstance(result_next, StreamingParseResult)
+        self.assertGreater(
+            len(result_next.calls), 0, "Should parse subsequent tool call"
+        )
+
+    def test_three_tool_calls_separate_chunks_with_commas(self):
+        """Test parsing 3 tool calls in separate chunks with commas at the end"""
+        # First tool call: 2 chunks
+        chunk1_1 = '[{"name": "get_weather", "parameters": '
+        result1_1 = self.detector.parse_streaming_increment(chunk1_1, self.tools)
+        chunk1_2 = '{"location": "Tokyo"}},'
+        result1_2 = self.detector.parse_streaming_increment(chunk1_2, self.tools)
+        self.assertIsInstance(result1_2, StreamingParseResult)
+        self.assertGreater(len(result1_2.calls), 0, "Should parse first tool call")
+
+        # Second tool call: 2 chunks
+        chunk2_1 = '{"name": "search", "parameters": '
+        result2_1 = self.detector.parse_streaming_increment(chunk2_1, self.tools)
+        chunk2_2 = '{"query": "restaurants"}},'
+        result2_2 = self.detector.parse_streaming_increment(chunk2_2, self.tools)
+        self.assertIsInstance(result2_2, StreamingParseResult)
+        self.assertGreater(len(result2_2.calls), 0, "Should parse second tool call")
+
+        # Third tool call: 2 chunks
+        chunk3_1 = '{"name": "get_weather", "parameters": '
+        result3_1 = self.detector.parse_streaming_increment(chunk3_1, self.tools)
+        chunk3_2 = '{"location": "Paris"}}]'
+        result3_2 = self.detector.parse_streaming_increment(chunk3_2, self.tools)
+        self.assertIsInstance(result3_2, StreamingParseResult)
+        self.assertGreater(len(result3_2.calls), 0, "Should parse third tool call")
+        # Verify all tool calls were parsed correctly
+        total_calls = len(result1_2.calls) + len(result2_2.calls) + len(result3_2.calls)
+        self.assertEqual(total_calls, 3, "Should have parsed exactly 3 tool calls")
 
 
 if __name__ == "__main__":

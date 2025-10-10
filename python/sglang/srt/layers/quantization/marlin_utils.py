@@ -19,19 +19,30 @@ from sglang.srt.layers.quantization.base_config import (
     LinearMethodBase,
     QuantizationConfig,
 )
-from sglang.srt.layers.quantization.scalar_type import ScalarType, scalar_types
-from sglang.srt.layers.quantization.utils import pack_cols, unpack_cols
-from sglang.srt.utils import get_device_capability
+from sglang.srt.layers.quantization.utils import (
+    get_scalar_types,
+    pack_cols,
+    unpack_cols,
+)
+from sglang.srt.utils import get_device_capability, is_cuda
 
 if TYPE_CHECKING:
     from sglang.srt.layers.linear import LinearBase
+    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
 try:
     from vllm import _custom_ops as ops
 except ImportError:
     ops = None
 
+_is_cuda = is_cuda()
+
+if _is_cuda:
+    from sgl_kernel import gptq_marlin_gemm
+
 logger = logging.getLogger(__name__)
+
+ScalarType, scalar_types = get_scalar_types()
 
 GPTQ_MARLIN_TILE = 16
 GPTQ_MARLIN_MIN_THREAD_N = 64
@@ -206,13 +217,13 @@ def check_marlin_supports_layer(layer: LinearBase, group_size: int) -> bool:
     )[0]
 
 
-def check_moe_marlin_supports_layer(layer: LinearBase, group_size: int) -> bool:
+def check_moe_marlin_supports_layer(layer: FusedMoE, group_size: int) -> bool:
     hidden_size = layer.hidden_size
     intermediate_size_per_partition = layer.intermediate_size_per_partition
     # apply_router_weight_on_input is not supported for moe marlin
-    supports_router_weight = not layer.apply_router_weight_on_input
+    supports_router_weight = not layer.moe_runner_config.apply_router_weight_on_input
     # moe marlin requires the activation to be silu
-    supports_activation = layer.activation == "silu"
+    supports_activation = layer.moe_runner_config.activation == "silu"
 
     # gate-up: (n, k) = (intermediate_size_per_partition * 2, hidden_size)
     # down: (n, k) = (hidden_size, intermediate_size_per_partition)
@@ -293,6 +304,13 @@ def marlin_permute_scales(
     s = s.reshape((-1, size_n)).contiguous()
 
     return s
+
+
+def marlin_permute_bias(s: torch.Tensor) -> torch.Tensor:
+    origin_shape = s.shape
+    _, scale_perm_single = get_scale_perms()
+    s = s.reshape((-1, len(scale_perm_single)))[:, scale_perm_single]
+    return s.reshape(*origin_shape).contiguous()
 
 
 def marlin_moe_permute_scales(
@@ -453,7 +471,7 @@ def apply_gptq_marlin_linear(
         dtype=input.dtype,
     )
 
-    output = ops.gptq_marlin_gemm(
+    output = gptq_marlin_gemm(
         reshaped_x,
         None,
         weight,
@@ -504,7 +522,7 @@ def apply_awq_marlin_linear(
         dtype=input.dtype,
     )
 
-    output = ops.gptq_marlin_gemm(
+    output = gptq_marlin_gemm(
         reshaped_x,
         None,
         weight,

@@ -1,6 +1,6 @@
 # Production Metrics
 
-SGLang exposes the following metrics via Prometheus. The metrics are namespaced by `$name` (the model name).
+SGLang exposes the following metrics via Prometheus. You can enable it by adding `--enable-metrics` when you launch the server.
 
 An example of the monitoring dashboard is available in [examples/monitoring/grafana.json](https://github.com/sgl-project/sglang/blob/main/examples/monitoring/grafana/dashboards/json/sglang-dashboard.json).
 
@@ -139,7 +139,10 @@ This section describes how to set up the monitoring stack (Prometheus + Grafana)
 1.  **Start your SGLang server with metrics enabled:**
 
     ```bash
-    python -m sglang.launch_server --model-path <your_model_path> --port 30000 --enable-metrics
+    python -m sglang.launch_server \
+      --model-path <your_model_path> \
+      --port 30000 \
+      --enable-metrics
     ```
     Replace `<your_model_path>` with the actual path to your model (e.g., `meta-llama/Meta-Llama-3.1-8B-Instruct`). Ensure the server is accessible from the monitoring stack (you might need `--host 0.0.0.0` if running in Docker). By default, the metrics endpoint will be available at `http://<sglang_server_host>:30000/metrics`.
 
@@ -212,6 +215,17 @@ You can customize the setup by modifying these files. For instance, you might ne
 
 #### Check if the metrics are being collected
 
-Run `python3 -m sglang.bench_serving --backend sglang --dataset-name random --num-prompts 3000 --random-input 1024 --random-output 1024 --random-range-ratio 0.5` to generate some requests.
+Run:
+```
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --dataset-name random \
+  --num-prompts 3000 \
+  --random-input 1024 \
+  --random-output 1024 \
+  --random-range-ratio 0.5
+```
+
+to generate some requests.
 
 Then you should be able to see the metrics in the Grafana dashboard.

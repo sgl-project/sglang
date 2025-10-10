@@ -1,6 +1,7 @@
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
+from sgl_kernel.scalar_type import ScalarType
 from sgl_kernel.utils import _get_cache_buf, get_cuda_stream
 
 
@@ -204,9 +205,15 @@ def scaled_fp4_quant(
     rounded_m = ((m + 128 - 1) // 128) * 128
     scale_n = n // block_size
     rounded_n = ((scale_n + 4 - 1) // 4) * 4
-    output_scale = torch.empty(
-        (rounded_m, rounded_n // 4), device=device, dtype=torch.int32
-    )
+    # padded part should be zeroed out
+    if rounded_n > scale_n:
+        output_scale = torch.zeros(
+            (rounded_m, rounded_n // 4), device=device, dtype=torch.int32
+        )
+    else:
+        output_scale = torch.empty(
+            (rounded_m, rounded_n // 4), device=device, dtype=torch.int32
+        )
 
     torch.ops.sgl_kernel.scaled_fp4_quant.default(
         output, input, output_scale, input_global_scale
@@ -288,6 +295,126 @@ def shuffle_rows(input_tensor, dst2src_map, output_tensor_shape):
     return output_tensor
 
 
+def scaled_fp4_grouped_quant(
+    input_tensor: torch.Tensor,
+    input_global_scale: torch.Tensor,
+    mask: torch.Tensor,
+):
+    """
+    Quantize input tensor to FP4 and return quantized tensor and scale, for
+    grouped gemm inputs (e.g., grouped_gemm_nt_masked for flashinfer).
+    Args:
+        input: The input tensor to be quantized to FP4, with shape (l, m, k)
+            l is number of groups, m is number of tokens per group, k is number of features.
+        input_global_scale: A scalar scaling factor for the entire tensor, with
+            shape (l,).
+    Outputs:
+        output: The quantized tensor in FP4, with shape (m, k // 2, l) but the physical
+            layout is (l, m, k // 2). `// 2` is because two fp4 values are packed into
+            an uint8.
+        output_scales: The blockscale tensor in FP8-E4M3, with shape (32, 4, rm, 4, rk, l)
+            but the physical layout is (l, rm, rk, 32, 4, 4).
+    Note:
+        For the shape of output_scales, `32 * 4 * rm` is a padded m to nearest multiple of 128.
+        `4 * rk` is a padded `k // 16` to nearest multiple of 4. These layout constants are
+        required by the NVIDIA Blackwell MMA operations.
+    """
+    device = input_tensor.device
+    l, m, k = input_tensor.shape
+    sf_vec_size = 16
+    assert k % sf_vec_size == 0, f"k must be multiple of 16, but got {k}."
+
+    scale_k = k // sf_vec_size
+    padded_k = (scale_k + (4 - 1)) // 4 * 4
+    padded_k_int32 = padded_k // 4
+    padded_m = (m + (128 - 1)) // 128 * 128
+    output = torch.empty(l, m, k // 2, device=device, dtype=torch.uint8)
+    output_scales = torch.empty(
+        l, padded_m, padded_k_int32, device=device, dtype=torch.int32
+    )
+
+    torch.ops.sgl_kernel.silu_and_mul_scaled_fp4_experts_quant.default(
+        output.view(l * m, k // 2),
+        output_scales.view(l * padded_m, padded_k_int32),
+        input_tensor.view(l * m, k),
+        input_global_scale,
+        mask,
+        use_silu_and_mul=False,
+    )
+    # The physical layout of the output is (l, m, k // 2), but we want to return a
+    # logical layout (m, k // 2, l) required by the flashinfer masked group gemm.
+    output = output.permute(1, 2, 0)
+    # The physical layout of the output scales is already swizzled as (l, rm, rk, 32, 4, 4), a
+    # requirement for the flashinfer masked group gemm, where rm=m/128 and rk=k/4. The logic
+    # layout is (32, 4, rm, 4, rk, l).
+    output_scales = output_scales.view(torch.float8_e4m3fn).view(
+        l, padded_m // 128, padded_k // 4, 32, 4, 4
+    )
+    output_scales = output_scales.permute(3, 4, 1, 5, 2, 0)
+    return output, output_scales
+
+
+def silu_and_mul_scaled_fp4_grouped_quant(
+    input_tensor: torch.Tensor,
+    input_global_scale: torch.Tensor,
+    mask: torch.Tensor,
+):
+    """
+    Quantize input tensor to FP4 and return quantized tensor and scale, for
+    grouped gemm inputs (e.g., grouped_gemm_nt_masked for flashinfer).
+    Args:
+        input: The input tensor to be quantized to FP4, with shape (l, m, k * 2)
+            l is number of groups, m is number of tokens per group, k is number of features.
+        input_global_scale: A scalar scaling factor for the entire tensor, with
+            shape (l,).
+        mask: The mask tensor, with shape (l,)
+    Outputs:
+        output: The quantized tensor in FP4, with shape (m, k // 2, l) but the physical
+            layout is (l, m, k // 2). `// 2` is because two fp4 values are packed into
+            an uint8.
+        output_scales: The blockscale tensor in FP8-E4M3, with shape (32, 4, rm, 4, rk, l)
+            but the physical layout is (l, rm, rk, 32, 4, 4).
+    Note:
+        For the shape of output_scales, `32 * 4 * rm` is a padded m to nearest multiple of 128.
+        `4 * rk` is a padded `k // 16` to nearest multiple of 4. These layout constants are
+        required by the NVIDIA Blackwell MMA operations.
+    """
+    device = input_tensor.device
+    l, m, k_by_2 = input_tensor.shape
+    k = k_by_2 // 2
+    sf_vec_size = 16
+    assert k % sf_vec_size == 0, f"k must be multiple of 16, but got {k}."
+
+    scale_k = k // sf_vec_size
+    padded_k = (scale_k + (4 - 1)) // 4 * 4
+    padded_k_int32 = padded_k // 4
+    padded_m = (m + (128 - 1)) // 128 * 128
+    output = torch.empty(l, m, k // 2, device=device, dtype=torch.uint8)
+    output_scales = torch.empty(
+        l, padded_m, padded_k_int32, device=device, dtype=torch.int32
+    )
+
+    torch.ops.sgl_kernel.silu_and_mul_scaled_fp4_experts_quant.default(
+        output.view(l * m, k // 2),
+        output_scales.view(l * padded_m, padded_k_int32),
+        input_tensor.view(l * m, k_by_2),
+        input_global_scale,
+        mask,
+        use_silu_and_mul=True,
+    )
+    # The physical layout of the output is (l, m, k // 2), but we want to return a
+    # logical layout (m, k // 2, l) required by the flashinfer masked group gemm.
+    output = output.permute(1, 2, 0)
+    # The physical layout of the output scales is already swizzled as (l, rm, rk, 32, 4, 4), a
+    # requirement for the flashinfer masked group gemm, where rm=m/128 and rk=k/4. The logic
+    # layout is (32, 4, rm, 4, rk, l).
+    output_scales = output_scales.view(torch.float8_e4m3fn).view(
+        l, padded_m // 128, padded_k // 4, 32, 4, 4
+    )
+    output_scales = output_scales.permute(3, 4, 1, 5, 2, 0)
+    return output, output_scales
+
+
 def scaled_fp4_experts_quant(
     input_tensor: torch.Tensor,
     input_global_scale: torch.Tensor,
@@ -337,12 +464,21 @@ def scaled_fp4_experts_quant(
     output = torch.empty(
         m_numtopk, k // 2, device=input_tensor.device, dtype=torch.uint8
     )
-    output_scales = torch.empty(
-        MAX_TOKENS_PER_EXPERT * topk,
-        padded_k,
-        dtype=torch.int32,
-        device=input_tensor.device,
-    )
+    # padded part should be zeroed out
+    if padded_k > scales_k:
+        output_scales = torch.zeros(
+            MAX_TOKENS_PER_EXPERT * topk,
+            padded_k,
+            dtype=torch.int32,
+            device=input_tensor.device,
+        )
+    else:
+        output_scales = torch.empty(
+            MAX_TOKENS_PER_EXPERT * topk,
+            padded_k,
+            dtype=torch.int32,
+            device=input_tensor.device,
+        )
     torch.ops.sgl_kernel.scaled_fp4_experts_quant.default(
         output,
         output_scales,
@@ -353,3 +489,62 @@ def scaled_fp4_experts_quant(
     )
     output_scales = output_scales.view(torch.float8_e4m3fn)
     return output, output_scales
+
+
+# GPTQ kernels
+def gptq_marlin_gemm(
+    a: torch.Tensor,
+    c: Optional[torch.Tensor],
+    b_q_weight: torch.Tensor,
+    b_scales: torch.Tensor,
+    global_scale: Optional[torch.Tensor],
+    b_zeros: Optional[torch.Tensor],
+    g_idx: Optional[torch.Tensor],
+    perm: Optional[torch.Tensor],
+    workspace: torch.Tensor,
+    b_q_type: ScalarType,
+    size_m: int,
+    size_n: int,
+    size_k: int,
+    is_k_full: bool = True,
+    use_atomic_add: bool = False,
+    use_fp32_reduce: bool = False,
+    is_zp_float: bool = False,
+) -> torch.Tensor:
+    return torch.ops.sgl_kernel.gptq_marlin_gemm(
+        a,
+        c,
+        b_q_weight,
+        b_scales,
+        global_scale,
+        b_zeros,
+        g_idx,
+        perm,
+        workspace,
+        b_q_type.id,
+        size_m,
+        size_n,
+        size_k,
+        is_k_full,
+        use_atomic_add,
+        use_fp32_reduce,
+        is_zp_float,
+    )
+
+
+def gptq_gemm(
+    a: torch.Tensor,
+    b_q_weight: torch.Tensor,
+    b_gptq_qzeros: torch.Tensor,
+    b_gptq_scales: torch.Tensor,
+    b_g_idx: torch.Tensor,
+    use_shuffle: bool,
+    bit: int,
+) -> torch.Tensor:
+    return torch.ops.sgl_kernel.gptq_gemm(
+        a, b_q_weight, b_gptq_qzeros, b_gptq_scales, b_g_idx, use_shuffle, bit
+    )
+
+
+def gptq_shuffle(q_weight: torch.Tensor, q_perm: torch.Tensor, bit: int) -> None:
+    torch.torch.ops.sgl_kernel.gptq_shuffle(q_weight, q_perm, bit)

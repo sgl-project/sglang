@@ -13,12 +13,15 @@
 # ==============================================================================
 """A controller that dispatches requests to multiple data parallel workers."""
 
+import faulthandler
 import logging
 import multiprocessing as mp
 import signal
 import threading
 import time
+from collections import deque
 from enum import Enum, auto
+from typing import List
 
 import psutil
 import setproctitle
@@ -29,19 +32,21 @@ from sglang.srt.managers.io_struct import (
     BlockReqInput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+    WatchLoadUpdateReq,
 )
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import (
     bind_port,
     configure_logger,
     get_free_port,
     get_tcp_zmq_socket_binded_to_local_free_port,
     get_zmq_socket,
+    kill_itself_when_parent_died,
 )
-from sglang.utils import get_exception_traceback
+from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +56,7 @@ class LoadBalanceMethod(Enum):
 
     ROUND_ROBIN = auto()
     SHORTEST_QUEUE = auto()
+    MINIMUM_TOKENS = auto()
 
     @classmethod
     def from_str(cls, method: str):
@@ -61,10 +67,49 @@ class LoadBalanceMethod(Enum):
             raise ValueError(f"Invalid load balance method: {method}") from exc
 
 
+class DPBudget:
+    def __init__(self):
+        # TODO: support minimum tokens method
+        self.budget_queue = deque()
+
+    def update_budget(self, load_update: WatchLoadUpdateReq):
+        """Update the budget queue.
+        Use num_reqs instead of num_waiting_reqs to balance decode running batch.
+        """
+        loads = load_update.loads
+        self.budget_queue.clear()
+
+        num_reqs = [load.num_reqs for load in loads]
+        if not num_reqs:
+            return
+
+        max_num_reqs = max(num_reqs)
+        if all(x == max_num_reqs for x in num_reqs):
+            return
+
+        while any(x != num_reqs[0] for x in num_reqs):
+            min_load = min(num_reqs)
+            min_indices = [i for i, x in enumerate(num_reqs) if x == min_load]
+            second_min_load = min(x for x in num_reqs if x > min_load)
+            self.budget_queue.extend(
+                [loads[i].dp_rank for i in min_indices] * (second_min_load - min_load)
+            )
+            for idx in min_indices:
+                num_reqs[idx] = second_min_load
+
+    def dispatch(self):
+        if self.budget_queue:
+            return self.budget_queue.popleft()
+        return None
+
+
 class DataParallelController:
     """A controller that dispatches requests to multiple data parallel workers."""
 
     def __init__(self, server_args: ServerArgs, port_args: PortArgs) -> None:
+        # for dp balance
+        self.global_balance_id = 0
+
         # Parse args
         self.max_total_num_tokens = None
         self.server_args = server_args
@@ -85,12 +130,16 @@ class DataParallelController:
         dispatch_lookup = {
             LoadBalanceMethod.ROUND_ROBIN: self.round_robin_scheduler,
             LoadBalanceMethod.SHORTEST_QUEUE: self.shortest_queue_scheduler,
+            LoadBalanceMethod.MINIMUM_TOKENS: self.minimum_tokens_scheduler,
         }
         self.dispatching = dispatch_lookup[self.load_balance_method]
 
+        # Load balance budget
+        self.dp_budget = DPBudget()
+
         # Launch data parallel workers
         self.scheduler_procs = []
-        self.workers = [None] * server_args.dp_size
+        self.workers: List[zmq.Socket] = [None] * server_args.dp_size
 
         if server_args.node_rank == 0 and server_args.enable_dp_attention_port_picking:
             self.workers_port = {}
@@ -120,6 +169,31 @@ class DataParallelController:
 
         self.max_req_input_len = None
 
+        self.init_dispatcher()
+
+    def send_to_all_workers(self, obj):
+        for worker in self.workers:
+            worker.send_pyobj(obj)
+
+    def send_control_message(self, obj):
+        # Send control messages to first worker of tp group
+        for worker in self.workers[:: self.control_message_step]:
+            worker.send_pyobj(obj)
+
+    def handle_load_update_req(self, obj):
+        self.dp_budget.update_budget(obj)
+
+    def init_dispatcher(self):
+        self._request_dispatcher = TypeBasedDispatcher(
+            [
+                (TokenizedGenerateReqInput, self.dispatching),
+                (TokenizedEmbeddingReqInput, self.dispatching),
+                (BlockReqInput, self.send_to_all_workers),
+                (WatchLoadUpdateReq, self.handle_load_update_req),
+            ]
+        )
+        self._request_dispatcher.add_fallback_fn(self.send_control_message)
+
     def launch_dp_schedulers(self, server_args, port_args):
         base_gpu_id = 0
 
@@ -146,7 +220,9 @@ class DataParallelController:
                 args=(server_args, tmp_port_args, base_gpu_id, dp_rank, ready_event),
             )
             threads.append(thread)
-            base_gpu_id += server_args.tp_size * server_args.gpu_id_step
+            base_gpu_id += (
+                server_args.tp_size * server_args.pp_size * server_args.gpu_id_step
+            )
 
         # Free all sockets before starting the threads to launch TP workers
         for sock in sockets:
@@ -288,6 +364,7 @@ class DataParallelController:
                     + ((pp_rank % pp_size_per_node) * tp_size_per_node)
                     + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
                 )
+                moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
                 proc = mp.Process(
                     target=run_scheduler_process,
                     args=(
@@ -295,6 +372,7 @@ class DataParallelController:
                         rank_port_args,
                         gpu_id,
                         tp_rank,
+                        moe_ep_rank,
                         pp_rank,
                         dp_rank,
                         writer,
@@ -313,25 +391,43 @@ class DataParallelController:
         self.max_total_num_tokens = scheduler_info[0]["max_total_num_tokens"]
         self.max_req_input_len = scheduler_info[0]["max_req_input_len"]
 
-    def round_robin_scheduler(self, req: Req):
-        if self.server_args.disaggregation_mode == "null":
-            if req.data_parallel_rank is not None:
-                logger.debug(f"Direct routing to DP rank {req.data_parallel_rank}")
-                self.workers[req.data_parallel_rank].send_pyobj(req)
-            else:
-                self.workers[self.round_robin_counter].send_pyobj(req)
-                self.round_robin_counter = (self.round_robin_counter + 1) % len(
-                    self.workers
-                )
-        else:
-            if req.data_parallel_rank is not None:
-                logger.debug(f"Direct routing to DP rank {req.data_parallel_rank}")
-                self.workers[req.data_parallel_rank].send_pyobj(req)
-            else:
-                self.workers[req.bootstrap_room % len(self.workers)].send_pyobj(req)
+    def maybe_external_dp_rank_routing(self, req: Req):
+        if req.data_parallel_rank is not None:
+            logger.debug(f"Direct routing to DP rank {req.data_parallel_rank}")
+            self.workers[req.data_parallel_rank].send_pyobj(req)
+            return True
+        return False
 
-    def shortest_queue_scheduler(self, input_requests):
-        raise NotImplementedError()
+    def round_robin_scheduler(self, req: Req):
+        if self.maybe_external_dp_rank_routing(req):
+            return
+
+        if self.server_args.disaggregation_mode == "null":
+            self.workers[self.round_robin_counter].send_pyobj(req)
+            self.round_robin_counter = (self.round_robin_counter + 1) % len(
+                self.workers
+            )
+        else:
+            self.workers[req.bootstrap_room % len(self.workers)].send_pyobj(req)
+
+    def shortest_queue_scheduler(self, req):
+        if self.maybe_external_dp_rank_routing(req):
+            return
+        target_worker = self.dp_budget.dispatch()
+        if target_worker is None:
+            self.round_robin_scheduler(req)
+        else:
+            self.workers[target_worker].send_pyobj(req)
+
+    def minimum_tokens_scheduler(self, req):
+        if self.maybe_external_dp_rank_routing(req):
+            return
+
+        logger.warning(
+            "The 'minimum_tokens' load balancing method is deprecated for now and will introduced later."
+            "Fall back to 'round_robin_scheduler'"
+        )
+        self.round_robin_scheduler(req)
 
     def event_loop(self):
         while True:
@@ -340,22 +436,7 @@ class DataParallelController:
                     recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
                 except zmq.ZMQError:
                     break
-
-                if isinstance(
-                    recv_req,
-                    (
-                        TokenizedGenerateReqInput,
-                        TokenizedEmbeddingReqInput,
-                    ),
-                ):
-                    self.dispatching(recv_req)
-                elif isinstance(recv_req, BlockReqInput):
-                    for worker in self.workers:
-                        worker.send_pyobj(recv_req)
-                else:
-                    # Send other control messages to first worker of tp group
-                    for worker in self.workers[:: self.control_message_step]:
-                        worker.send_pyobj(recv_req)
+                self._request_dispatcher(recv_req)
 
 
 def run_data_parallel_controller_process(
@@ -363,7 +444,9 @@ def run_data_parallel_controller_process(
     port_args: PortArgs,
     pipe_writer,
 ):
+    kill_itself_when_parent_died()
     setproctitle.setproctitle("sglang::data_parallel_controller")
+    faulthandler.enable()
     configure_logger(server_args)
     parent_process = psutil.Process().parent()
 

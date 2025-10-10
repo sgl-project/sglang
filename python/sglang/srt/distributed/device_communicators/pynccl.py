@@ -75,6 +75,7 @@ class PyNcclCommunicator:
         self.available = True
         self.disabled = False
 
+        self.nccl_version = self.nccl.ncclGetRawVersion()
         if self.rank == 0:
             logger.info("sglang is using nccl==%s", self.nccl.ncclGetVersion())
 
@@ -147,7 +148,11 @@ class PyNcclCommunicator:
         )
 
     def all_gather(
-        self, output_tensor: torch.Tensor, input_tensor: torch.Tensor, stream=None
+        self,
+        output_tensor: torch.Tensor,
+        input_tensor: torch.Tensor,
+        stream=None,
+        sizes: Optional[list[int]] = None,
     ):
         if self.disabled:
             return
@@ -160,14 +165,33 @@ class PyNcclCommunicator:
         )
         if stream is None:
             stream = self.stream
-        self.nccl.ncclAllGather(
-            buffer_type(input_tensor.data_ptr()),
-            buffer_type(output_tensor.data_ptr()),
-            input_tensor.numel(),
-            ncclDataTypeEnum.from_torch(input_tensor.dtype),
-            self.comm,
-            cudaStream_t(stream.cuda_stream),
-        )
+
+        if sizes is not None:
+            split_offset = 0
+
+            self.nccl.ncclGroupStart()
+            for root, split_size in enumerate(sizes):
+                dst_slice = output_tensor[split_offset : split_offset + split_size]
+                self.nccl.ncclBroadcast(
+                    buffer_type(input_tensor.data_ptr()),
+                    buffer_type(dst_slice.data_ptr()),
+                    dst_slice.numel(),
+                    ncclDataTypeEnum.from_torch(input_tensor.dtype),
+                    root,
+                    self.comm,
+                    cudaStream_t(stream.cuda_stream),
+                )
+                split_offset += split_size
+            self.nccl.ncclGroupEnd()
+        else:
+            self.nccl.ncclAllGather(
+                buffer_type(input_tensor.data_ptr()),
+                buffer_type(output_tensor.data_ptr()),
+                input_tensor.numel(),
+                ncclDataTypeEnum.from_torch(input_tensor.dtype),
+                self.comm,
+                cudaStream_t(stream.cuda_stream),
+            )
 
     def reduce_scatter(
         self,
@@ -175,6 +199,7 @@ class PyNcclCommunicator:
         input_tensor: torch.Tensor,
         op: ReduceOp = ReduceOp.SUM,
         stream=None,
+        sizes: Optional[list[int]] = None,
     ):
         if self.disabled:
             return
@@ -187,15 +212,35 @@ class PyNcclCommunicator:
         )
         if stream is None:
             stream = self.stream
-        self.nccl.ncclReduceScatter(
-            buffer_type(input_tensor.data_ptr()),
-            buffer_type(output_tensor.data_ptr()),
-            output_tensor.numel(),
-            ncclDataTypeEnum.from_torch(input_tensor.dtype),
-            ncclRedOpTypeEnum.from_torch(op),
-            self.comm,
-            cudaStream_t(stream.cuda_stream),
-        )
+
+        if sizes is not None:
+            split_offset = 0
+            self.nccl.ncclGroupStart()
+            for root, split_size in enumerate(sizes):
+                chunk = input_tensor[split_offset : split_offset + split_size, ...]
+
+                self.nccl.ncclReduce(
+                    buffer_type(chunk.data_ptr()),
+                    buffer_type(output_tensor.data_ptr()),
+                    chunk.numel(),
+                    ncclDataTypeEnum.from_torch(input_tensor.dtype),
+                    ncclRedOpTypeEnum.from_torch(op),
+                    root,
+                    self.comm,
+                    cudaStream_t(stream.cuda_stream),
+                )
+                split_offset += split_size
+            self.nccl.ncclGroupEnd()
+        else:
+            self.nccl.ncclReduceScatter(
+                buffer_type(input_tensor.data_ptr()),
+                buffer_type(output_tensor.data_ptr()),
+                output_tensor.numel(),
+                ncclDataTypeEnum.from_torch(input_tensor.dtype),
+                ncclRedOpTypeEnum.from_torch(op),
+                self.comm,
+                cudaStream_t(stream.cuda_stream),
+            )
 
     def send(self, tensor: torch.Tensor, dst: int, stream=None):
         if self.disabled:
@@ -258,6 +303,18 @@ class PyNcclCommunicator:
             self.comm,
             cudaStream_t(stream.cuda_stream),
         )
+
+    def register_comm_window_raw(self, ptr: int, size: int):
+        return self.nccl.ncclCommWindowRegister(self.comm, buffer_type(ptr), size, 1)
+
+    def deregister_comm_window(self, window):
+        return self.nccl.ncclCommWindowDeregister(self.comm, window)
+
+    def group_start(self):
+        self.nccl.ncclGroupStart()
+
+    def group_end(self):
+        self.nccl.ncclGroupEnd()
 
     @contextmanager
     def change_state(

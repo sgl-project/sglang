@@ -121,8 +121,8 @@ class BenchmarkRunner:
                     results["serialization_time"] = self._extract_time(line)
                 elif "Deserialization (avg):" in line:
                     results["deserialization_time"] = self._extract_time(line)
-                elif "PD Adaptation (avg):" in line:
-                    results["adaptation_time"] = self._extract_time(line)
+                elif "Bootstrap Injection (avg):" in line:
+                    results["bootstrap_injection_time"] = self._extract_time(line)
                 elif "Total Pipeline (avg):" in line:
                     results["total_time"] = self._extract_time(line)
 
@@ -145,7 +145,7 @@ class BenchmarkRunner:
         thresholds = {
             "serialization_time": 2000,  # 2μs max
             "deserialization_time": 2000,  # 2μs max
-            "adaptation_time": 5000,  # 5μs max
+            "bootstrap_injection_time": 5000,  # 5μs max
             "total_time": 10000,  # 10μs max
         }
 

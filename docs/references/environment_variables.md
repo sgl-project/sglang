@@ -40,12 +40,17 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGL_DG_USE_NVRTC` | Use NVRTC (instead of Triton) for JIT compilation (Experimental) | `"0"` |
 | `SGL_USE_DEEPGEMM_BMM` | Use DeepGEMM for Batched Matrix Multiplication (BMM) operations | `"false"` |
 
+## DeepEP Configuration
+
+| Environment Variable | Description | Default Value |
+| `SGLANG_DEEPEP_BF16_DISPATCH` | Use Bfloat16 for dispatch | `"false"` |
+
 ## Memory Management
 
 | Environment Variable | Description | Default Value |
 | --- | --- | --- |
 | `SGLANG_DEBUG_MEMORY_POOL` | Enable memory pool debugging | `false` |
-| `SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION` | Clip max new tokens estimation for memory planning | Not set |
+| `SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION` | Clip max new tokens estimation for memory planning | `4096` |
 | `SGLANG_DETOKENIZER_MAX_STATES` | Maximum states for detokenizer | Default value based on system |
 | `SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK` | Disable checks for memory imbalance across Tensor Parallel ranks | Not set (defaults to enabled check) |
 

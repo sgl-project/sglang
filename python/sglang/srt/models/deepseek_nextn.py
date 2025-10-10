@@ -20,8 +20,9 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
+from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -32,9 +33,12 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV3ForCausalLM
-from sglang.srt.utils import BumpAllocator, add_prefix
+from sglang.srt.utils import BumpAllocator, add_prefix, is_cuda
 
 logger = logging.getLogger(__name__)
+
+
+_is_cuda = is_cuda()
 
 
 class DeepseekModelNextN(nn.Module):
@@ -56,7 +60,7 @@ class DeepseekModelNextN(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
-            enable_tp=not global_server_args_dict["enable_dp_attention"],
+            enable_tp=not is_dp_attention_enabled(),
             prefix=add_prefix("embed_tokens", prefix),
         )
 
@@ -65,12 +69,14 @@ class DeepseekModelNextN(nn.Module):
 
         self.eh_proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
 
+        self.alt_stream = torch.cuda.Stream() if _is_cuda else None
         self.decoder = DeepseekV2DecoderLayer(
             config,
             0,
             quant_config=quant_config,
             is_nextn=True,
             prefix=add_prefix("decoder", prefix),
+            alt_stream=self.alt_stream,
         )
 
         self.shared_head = nn.Module()
@@ -134,6 +140,8 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
+        # if not set, model load will be broken in DeepseekV3ForCausalLM load_weights()
+        self.pp_group = get_pp_group()
         self.determine_num_fused_shared_experts("DeepseekV3ForCausalLMNextN")
 
         self.model = DeepseekModelNextN(

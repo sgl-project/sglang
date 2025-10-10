@@ -1,7 +1,21 @@
-from typing import Dict, List, Optional
+from typing import Optional
 
+from sglang_router.router_args import RouterArgs
 from sglang_router_rs import PolicyType
 from sglang_router_rs import Router as _Router
+
+
+def policy_from_str(policy_str: Optional[str]) -> PolicyType:
+    """Convert policy string to PolicyType enum."""
+    if policy_str is None:
+        return None
+    policy_map = {
+        "random": PolicyType.Random,
+        "round_robin": PolicyType.RoundRobin,
+        "cache_aware": PolicyType.CacheAware,
+        "power_of_two": PolicyType.PowerOfTwo,
+    }
+    return policy_map[policy_str]
 
 
 class Router:
@@ -16,7 +30,7 @@ class Router:
             - PolicyType.RoundRobin: Distribute requests in round-robin fashion
             - PolicyType.CacheAware: Distribute requests based on cache state and load balance
             - PolicyType.PowerOfTwo: Select best of two random workers based on load (PD mode only)
-        host: Host address to bind the router server. Default: '127.0.0.1'
+        host: Host address to bind the router server. Supports IPv4, IPv6 (e.g., ::, ::1), or 0.0.0.0 for all interfaces. Default: '0.0.0.0'
         port: Port number to bind the router server. Default: 3001
         worker_startup_timeout_secs: Timeout in seconds for worker startup. Default: 300
         worker_startup_check_interval: Interval in seconds between checks for worker initialization. Default: 10
@@ -31,8 +45,15 @@ class Router:
             routing. Default: 60
         max_payload_size: Maximum payload size in bytes. Default: 256MB
         max_tree_size: Maximum size of the approximation tree for cache-aware routing. Default: 2^24
+        dp_aware: Enable data parallelism aware schedule. Default: False
+        enable_igw: Enable IGW (Inference-Gateway) mode for multi-model support. When enabled,
+            the router can manage multiple models simultaneously with per-model load balancing
+            policies. Default: False
+        api_key: The api key used for the authorization with the worker.
+            Useful when the dp aware scheduling strategy is enabled.
+            Default: None
         log_dir: Directory to store log files. If None, logs are only output to console. Default: None
-        log_level: Logging level. Options: 'debug', 'info', 'warning', 'error', 'critical'.
+        log_level: Logging level. Options: 'debug', 'info', 'warn', 'error'.
         service_discovery: Enable Kubernetes service discovery. When enabled, the router will
             automatically discover worker pods based on the selector. Default: False
         selector: Dictionary mapping of label keys to values for Kubernetes pod selection.
@@ -57,76 +78,51 @@ class Router:
         request_id_headers: List of HTTP headers to check for request IDs. If not specified,
             uses common defaults: ['x-request-id', 'x-correlation-id', 'x-trace-id', 'request-id'].
             Example: ['x-my-request-id', 'x-custom-trace-id']. Default: None
+        bootstrap_port_annotation: Kubernetes annotation name for bootstrap port (PD mode).
+            Default: 'sglang.ai/bootstrap-port'
+        request_timeout_secs: Request timeout in seconds. Default: 600
+        max_concurrent_requests: Maximum number of concurrent requests allowed for rate limiting. Default: 256
+        queue_size: Queue size for pending requests when max concurrent limit reached (0 = no queue, return 429 immediately). Default: 100
+        queue_timeout_secs: Maximum time (in seconds) a request can wait in queue before timing out. Default: 60
+        rate_limit_tokens_per_second: Token bucket refill rate (tokens per second). If not set, defaults to max_concurrent_requests. Default: None
+        cors_allowed_origins: List of allowed origins for CORS. Empty list allows all origins. Default: []
+        health_failure_threshold: Number of consecutive health check failures before marking worker unhealthy. Default: 3
+        health_success_threshold: Number of consecutive health check successes before marking worker healthy. Default: 2
+        health_check_timeout_secs: Timeout in seconds for health check requests. Default: 5
+        health_check_interval_secs: Interval in seconds between runtime health checks. Default: 60
+        health_check_endpoint: Health check endpoint path. Default: '/health'
+        model_path: Model path for loading tokenizer (HuggingFace model ID or local path). Default: None
+        tokenizer_path: Explicit tokenizer path (overrides model_path tokenizer if provided). Default: None
     """
 
-    def __init__(
-        self,
-        worker_urls: List[str],
-        policy: PolicyType = PolicyType.RoundRobin,
-        host: str = "127.0.0.1",
-        port: int = 3001,
-        worker_startup_timeout_secs: int = 300,
-        worker_startup_check_interval: int = 10,
-        cache_threshold: float = 0.50,
-        balance_abs_threshold: int = 32,
-        balance_rel_threshold: float = 1.0001,
-        eviction_interval_secs: int = 60,
-        max_tree_size: int = 2**24,
-        max_payload_size: int = 256 * 1024 * 1024,  # 256MB
-        log_dir: Optional[str] = None,
-        log_level: Optional[str] = None,
-        service_discovery: bool = False,
-        selector: Dict[str, str] = None,
-        service_discovery_port: int = 80,
-        service_discovery_namespace: Optional[str] = None,
-        prefill_selector: Dict[str, str] = None,
-        decode_selector: Dict[str, str] = None,
-        prometheus_port: Optional[int] = None,
-        prometheus_host: Optional[str] = None,
-        pd_disaggregation: bool = False,
-        prefill_urls: Optional[List[tuple]] = None,
-        decode_urls: Optional[List[str]] = None,
-        prefill_policy: Optional[PolicyType] = None,
-        decode_policy: Optional[PolicyType] = None,
-        request_id_headers: Optional[List[str]] = None,
-    ):
-        if selector is None:
-            selector = {}
-        if prefill_selector is None:
-            prefill_selector = {}
-        if decode_selector is None:
-            decode_selector = {}
+    def __init__(self, router: _Router):
+        self._router = router
 
-        self._router = _Router(
-            worker_urls=worker_urls,
-            policy=policy,
-            host=host,
-            port=port,
-            worker_startup_timeout_secs=worker_startup_timeout_secs,
-            worker_startup_check_interval=worker_startup_check_interval,
-            cache_threshold=cache_threshold,
-            balance_abs_threshold=balance_abs_threshold,
-            balance_rel_threshold=balance_rel_threshold,
-            eviction_interval_secs=eviction_interval_secs,
-            max_tree_size=max_tree_size,
-            max_payload_size=max_payload_size,
-            log_dir=log_dir,
-            log_level=log_level,
-            service_discovery=service_discovery,
-            selector=selector,
-            service_discovery_port=service_discovery_port,
-            service_discovery_namespace=service_discovery_namespace,
-            prefill_selector=prefill_selector,
-            decode_selector=decode_selector,
-            prometheus_port=prometheus_port,
-            prometheus_host=prometheus_host,
-            pd_disaggregation=pd_disaggregation,
-            prefill_urls=prefill_urls,
-            decode_urls=decode_urls,
-            prefill_policy=prefill_policy,
-            decode_policy=decode_policy,
-            request_id_headers=request_id_headers,
+    @staticmethod
+    def from_args(args: RouterArgs) -> "Router":
+        """Create a router from a RouterArgs instance."""
+
+        args_dict = vars(args)
+        # Convert RouterArgs to _Router parameters
+        args_dict["worker_urls"] = (
+            []
+            if args_dict["service_discovery"] or args_dict["pd_disaggregation"]
+            else args_dict["worker_urls"]
         )
+        args_dict["policy"] = policy_from_str(args_dict["policy"])
+        args_dict["prefill_urls"] = (
+            args_dict["prefill_urls"] if args_dict["pd_disaggregation"] else None
+        )
+        args_dict["decode_urls"] = (
+            args_dict["decode_urls"] if args_dict["pd_disaggregation"] else None
+        )
+        args_dict["prefill_policy"] = policy_from_str(args_dict["prefill_policy"])
+        args_dict["decode_policy"] = policy_from_str(args_dict["decode_policy"])
+
+        # remove mini_lb parameter
+        args_dict.pop("mini_lb")
+
+        return Router(_Router(**args_dict))
 
     def start(self) -> None:
         """Start the router server.
