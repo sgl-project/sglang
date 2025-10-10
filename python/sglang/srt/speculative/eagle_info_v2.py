@@ -172,19 +172,19 @@ class EagleVerifyInputV2Mixin:
         next_token_logits = logits_output.next_token_logits
         device = batch.input_ids.device
 
-        candidates = self.draft_token.reshape(bs, self.num_draft_tokens)
+        candidates = self.draft_token.reshape(bs, self.draft_token_num)
         predict = torch.zeros(
-            (bs * (self.num_steps + 1),), dtype=torch.int32, device=device
+            (bs * (self.spec_steps + 1),), dtype=torch.int32, device=device
         )
         accept_index = torch.full(
-            (bs, self.num_steps + 1), -1, dtype=torch.int32, device=device
+            (bs, self.spec_steps + 1), -1, dtype=torch.int32, device=device
         )
         accept_length = torch.empty((bs,), dtype=torch.int32, device=device)
 
         # Sample tokens
         if sampling_info.is_all_greedy:
             target_predict = torch.argmax(next_token_logits, dim=-1)
-            target_predict = target_predict.reshape(bs, self.num_draft_tokens)
+            target_predict = target_predict.reshape(bs, self.draft_token_num)
 
             verify_tree_greedy(
                 predicts=predict,  # mutable
@@ -199,7 +199,7 @@ class EagleVerifyInputV2Mixin:
         else:
             # Apply temperature and get target probs
             expanded_temperature = torch.repeat_interleave(
-                sampling_info.temperatures, self.num_draft_tokens, dim=0
+                sampling_info.temperatures, self.draft_token_num, dim=0
             )  # (bs * num_draft_tokens, 1)
 
             target_probs = F.softmax(
@@ -208,22 +208,22 @@ class EagleVerifyInputV2Mixin:
             target_probs = top_k_renorm_prob(
                 target_probs,
                 torch.repeat_interleave(
-                    sampling_info.top_ks, self.num_draft_tokens, dim=0
+                    sampling_info.top_ks, self.draft_token_num, dim=0
                 ),
             )  # (bs * num_draft_tokens, vocab_size)
             target_probs = top_p_renorm_prob(
                 target_probs,
                 torch.repeat_interleave(
-                    sampling_info.top_ps, self.num_draft_tokens, dim=0
+                    sampling_info.top_ps, self.draft_token_num, dim=0
                 ),
             )
-            target_probs = target_probs.reshape(bs, self.num_draft_tokens, -1)
+            target_probs = target_probs.reshape(bs, self.draft_token_num, -1)
 
             # This is currently not used
             draft_probs = torch.empty_like(target_probs)
 
             all_coins = torch.rand(
-                (bs * self.num_draft_tokens + bs), dtype=torch.float32, device=device
+                (bs * self.draft_token_num + bs), dtype=torch.float32, device=device
             )
             # coins for rejection sampling
             coins = all_coins[:-bs]
@@ -251,7 +251,7 @@ class EagleVerifyInputV2Mixin:
                 deterministic=True,
             )
 
-        if SIMULATE_ACC_LEN:
+        if SIMULATE_ACC_LEN > 0:
             # Do simulation
             accept_index = generate_simulated_accept_index(
                 accept_index=accept_index,
@@ -259,7 +259,7 @@ class EagleVerifyInputV2Mixin:
                 accept_length=accept_length,  # mutable
                 simulate_acc_len=SIMULATE_ACC_LEN,
                 bs=bs,
-                num_steps=self.num_steps,
+                spec_steps=self.draft_token_num,
             )
 
         # Include the bonus token

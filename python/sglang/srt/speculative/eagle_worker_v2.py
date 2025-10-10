@@ -432,11 +432,11 @@ class EAGLEWorkerV2(EAGLEWorker):
         )
         assign_extend_cache_locs[(bs,)](
             batch.req_pool_indices,
-            batch.req_to_token_pool.req_to_token,
+            self.req_to_token_pool.req_to_token,
             batch.seq_lens,
             batch.seq_lens + accept_length,
             tgt_cache_loc,
-            batch.req_to_token_pool.req_to_token.shape[1],
+            self.req_to_token_pool.req_to_token.shape[1],
             next_power_of_2(bs),
         )
         fill_accepted_out_cache_loc[(size,)](
