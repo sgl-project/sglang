@@ -9,6 +9,7 @@ import triton.language as tl
 
 from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import support_triton
@@ -228,9 +229,6 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
     if tree_cache is None:
         return
 
-    # Check if this is ChunkCache or SWAChunkCache - these don't support eviction
-    from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
-
     if isinstance(tree_cache, (SWAChunkCache, ChunkCache)):
         return
 
@@ -326,6 +324,13 @@ def alloc_for_extend(
         req_pool_indices_device: request pool indices at a device tensor
         req_pool_indices: request pool indices as list
     """
+    # free out-of-window swa tokens
+    if isinstance(batch.tree_cache, SWAChunkCache):
+        for req, pre_len in zip(batch.reqs, batch.prefix_lens):
+            batch.tree_cache.evict_swa(
+                req, pre_len, batch.model_config.attention_chunk_size
+            )
+
     bs = len(batch.reqs)
     prefix_tensors = [r.prefix_indices for r in batch.reqs]
 
@@ -417,6 +422,12 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     Returns:
         out_cache_loc: allocated cache locations
     """
+    if isinstance(batch.tree_cache, SWAChunkCache):
+        for req in batch.reqs:
+            batch.tree_cache.evict_swa(
+                req, req.seqlen - 1, batch.model_config.attention_chunk_size
+            )
+
     bs = batch.seq_lens.shape[0]
 
     if batch.tree_cache.page_size == 1:

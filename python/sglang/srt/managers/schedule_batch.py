@@ -1125,12 +1125,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.req_pool_idx = req_pool_indices[i]
             assert seq_len - pre_len == req.extend_input_len
 
-            if pre_len > 0:
-                if isinstance(self.tree_cache, SWAChunkCache):
-                    self.tree_cache.evict_swa(
-                        req, pre_len, self.model_config.attention_chunk_size
-                    )
-
             # If input_embeds are available, store them
             if req.input_embeds is not None:
                 # If req.input_embeds is already a list, append its content directly
@@ -1485,13 +1479,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         if self.model_config.is_encoder_decoder:
             self.prepare_encoder_info_decode()
-
-        # free memory
-        if isinstance(self.tree_cache, SWAChunkCache):
-            for req in self.reqs:
-                self.tree_cache.evict_swa(
-                    req, req.seqlen - 1, self.model_config.attention_chunk_size
-                )
 
         # Allocate memory
         self.out_cache_loc = alloc_for_decode(self, token_per_req=1)
