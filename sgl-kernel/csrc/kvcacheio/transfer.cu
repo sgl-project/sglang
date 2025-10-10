@@ -112,7 +112,7 @@ __device__ __forceinline__ T* get_global_offset_phf(
   return base + page_id / PageSize * PageSize * page_dim
          + page_dim / head_fragment_num * head_fragment_id * PageSize
          + page_id % PageSize * page_dim / head_fragment_num
-         + layer_id * item_size_bytes / head_fragment_num
+         + layer_id * item_size_bytes / head_fragment_num;
 }
 
 template <auto SrcOffsetFn, auto DstOffsetFn, bool IsMLA, int HeadFragmentNum>
