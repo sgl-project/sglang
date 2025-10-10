@@ -1,10 +1,13 @@
 import json
 from abc import ABC, abstractmethod
 from functools import lru_cache
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import dill
 import torch
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req
 
 
 @lru_cache(maxsize=None)
