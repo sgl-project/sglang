@@ -211,14 +211,14 @@ impl StreamingProcessor {
             );
 
         if separate_reasoning && !reasoning_parser_available {
-            warn!(
+            debug!(
                 "No reasoning parser found for model '{}', skipping reasoning parsing",
                 model
             );
         }
 
         if tools.is_some() && !tool_parser_available {
-            warn!(
+            debug!(
                 "No tool parser found for model '{}', skipping tool call parsing",
                 model
             );

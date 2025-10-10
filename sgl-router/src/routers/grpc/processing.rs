@@ -30,8 +30,8 @@ pub struct ResponseProcessor {
     pub tokenizer: Arc<dyn Tokenizer>,
     pub tool_parser_factory: ToolParserFactory,
     pub reasoning_parser_factory: ReasoningParserFactory,
-    configured_tool_parser: Option<String>,
-    configured_reasoning_parser: Option<String>,
+    pub configured_tool_parser: Option<String>,
+    pub configured_reasoning_parser: Option<String>,
 }
 
 impl ResponseProcessor {
@@ -52,6 +52,7 @@ impl ResponseProcessor {
     }
 
     /// Process a single choice from GenerateComplete response (EXACT COPY from router.rs:1573-1725)
+    #[allow(clippy::too_many_arguments)]
     pub async fn process_single_choice(
         &self,
         complete: &proto::GenerateComplete,
@@ -59,6 +60,8 @@ impl ResponseProcessor {
         original_request: &ChatCompletionRequest,
         stop_decoder: &mut StopSequenceDecoder,
         history_tool_calls_count: usize,
+        reasoning_parser_available: bool,
+        tool_parser_available: bool,
     ) -> Result<ChatChoice, String> {
         stop_decoder.reset();
         // Decode tokens
@@ -83,41 +86,6 @@ impl ResponseProcessor {
         // Flush remaining text
         if let SequenceDecoderOutput::Text(t) = stop_decoder.flush() {
             final_text.push_str(&t);
-        }
-
-        // Check parser availability upfront (log warning only once per choice)
-        let reasoning_parser_available = original_request.separate_reasoning
-            && utils::check_reasoning_parser_availability(
-                &self.reasoning_parser_factory,
-                self.configured_reasoning_parser.as_ref(),
-                &original_request.model,
-            );
-
-        let tool_choice_enabled = !matches!(
-            &original_request.tool_choice,
-            Some(ToolChoice::Value(ToolChoiceValue::None))
-        );
-
-        let tool_parser_available = tool_choice_enabled
-            && original_request.tools.is_some()
-            && utils::check_tool_parser_availability(
-                &self.tool_parser_factory,
-                self.configured_tool_parser.as_ref(),
-                &original_request.model,
-            );
-
-        if original_request.separate_reasoning && !reasoning_parser_available {
-            tracing::warn!(
-                "No reasoning parser found for model '{}', skipping reasoning parsing",
-                original_request.model
-            );
-        }
-
-        if original_request.tools.is_some() && tool_choice_enabled && !tool_parser_available {
-            tracing::warn!(
-                "No tool parser found for model '{}', skipping tool call parsing",
-                original_request.model
-            );
         }
 
         // Step 1: Handle reasoning content parsing
@@ -148,8 +116,11 @@ impl ResponseProcessor {
 
         // Step 2: Handle tool call parsing
         let mut tool_calls: Option<Vec<ToolCall>> = None;
+        let tool_choice_enabled = !matches!(
+            &original_request.tool_choice,
+            Some(ToolChoice::Value(ToolChoiceValue::None))
+        );
 
-        // Check if tool calls should be processed
         if tool_choice_enabled && original_request.tools.is_some() {
             // Check if JSON schema constraint was used (specific function or required mode)
             let used_json_schema = match &original_request.tool_choice {
