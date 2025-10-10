@@ -1206,6 +1206,8 @@ class ProfileReqInput(BaseReq):
     profile_by_stage: bool = False
     with_stack: Optional[bool] = None
     record_shapes: Optional[bool] = None
+    # Merge profiles from all ranks into a single trace
+    merge_profiles: bool = False
 
 
 class ProfileReqType(Enum):
@@ -1224,6 +1226,8 @@ class ProfileReq(BaseReq):
     with_stack: Optional[bool] = None
     record_shapes: Optional[bool] = None
     profile_id: Optional[str] = None
+    # Merge profiles from all ranks into a single trace
+    merge_profiles: bool = False
 
 
 @dataclass
