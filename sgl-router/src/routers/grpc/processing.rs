@@ -149,8 +149,8 @@ impl ResponseProcessor {
         // Step 2: Handle tool call parsing
         let mut tool_calls: Option<Vec<ToolCall>> = None;
 
-        // Check if tool calls should be processed (tool_choice_enabled already computed above)
-        if tool_choice_enabled && original_request.tools.is_some() && tool_parser_available {
+        // Check if tool calls should be processed
+        if tool_choice_enabled && original_request.tools.is_some() {
             // Check if JSON schema constraint was used (specific function or required mode)
             let used_json_schema = match &original_request.tool_choice {
                 Some(ToolChoice::Function { .. }) => true,
@@ -164,7 +164,7 @@ impl ResponseProcessor {
                     &processed_text,
                     &original_request.tool_choice,
                 );
-            } else {
+            } else if tool_parser_available {
                 (tool_calls, processed_text) = self
                     .parse_tool_calls(
                         &processed_text,
