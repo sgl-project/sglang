@@ -127,7 +127,6 @@ class SchedulerStats:
 
     # Speculative decoding
     spec_accept_length: float = 0.0
-    spec_accept_rate: float = 0.0
 
     # Retract
     num_retracted_reqs: int = 0
@@ -218,12 +217,6 @@ class SchedulerMetricsCollector:
         self.spec_accept_length = Gauge(
             name="sglang:spec_accept_length",
             documentation="The average acceptance length of speculative decoding.",
-            labelnames=labels.keys(),
-            multiprocess_mode="mostrecent",
-        )
-        self.spec_accept_rate = Gauge(
-            name="sglang:spec_accept_rate",
-            documentation="The average acceptance rate of speculative decoding (`accepted tokens / total draft tokens` in batch).",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -527,7 +520,6 @@ class SchedulerMetricsCollector:
 
         # Speculative decoding
         self._log_gauge(self.spec_accept_length, stats.spec_accept_length)
-        self._log_gauge(self.spec_accept_rate, stats.spec_accept_rate)
 
         # PD disaggregation
         self._log_gauge(
