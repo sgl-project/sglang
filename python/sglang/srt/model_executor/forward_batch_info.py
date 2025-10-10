@@ -75,6 +75,8 @@ class ForwardMode(IntEnum):
     # Used in speculative decoding: extend a batch in the draft model.
     DRAFT_EXTEND = auto()
 
+    DRAFT_EXTEND_V2 = auto()
+
     # Split Prefill for PD multiplexing
     SPLIT_PREFILL = auto()
 

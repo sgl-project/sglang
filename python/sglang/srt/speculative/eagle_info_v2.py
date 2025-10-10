@@ -2,14 +2,13 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional
 
 import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.scheduler import global_server_args_dict
@@ -109,6 +108,31 @@ class EagleDraftInputV2Mixin:
         forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
         return forward_batch, can_cuda_graph
+
+    def prepare_for_extend_to_fill_draft_kvcache(
+        self,
+        batch: ModelWorkerBatch,
+        predict: torch.Tensor,
+        num_draft_tokens: int,
+        draft_model_runner: Any,
+    ):
+        seq_lens_cpu_backup = batch.seq_lens_cpu
+        extend_num_tokens = len(batch.seq_lens) * num_draft_tokens
+
+        batch.spec_info = self
+        batch.input_ids = predict
+        batch.seq_lens = batch.seq_lens + num_draft_tokens
+        batch.seq_lens_cpu = batch.seq_lens_cpu + num_draft_tokens
+        batch.seq_lens_sum += extend_num_tokens
+        batch.extend_seq_lens = [num_draft_tokens for _ in range(len(batch.seq_lens))]
+        batch.extend_prefix_lens = seq_lens_cpu_backup.tolist()
+        batch.extend_prefix_lens_cpu = seq_lens_cpu_backup
+        batch.extend_num_tokens = extend_num_tokens
+        batch.capture_hidden_mode = CaptureHiddenMode.FULL
+        batch.forward_mode = ForwardMode.DRAFT_EXTEND_V2
+        forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
+        draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
+        return forward_batch
 
 
 @dataclass
