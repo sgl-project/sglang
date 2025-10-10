@@ -26,7 +26,6 @@ logger = logging.getLogger(__name__)
 
 
 class SchedulerProfilerMixin:
-
     def init_profiler(self):
         self.torch_profiler = None
         self.torch_profiler_output_dir: Optional[str] = None
@@ -194,11 +193,11 @@ class SchedulerProfilerMixin:
                 filename_parts = [self.profile_id, f"TP-{self.tp_rank}"]
 
                 # Only add other ranks if they are non-zero
-                if self.dp_rank > 0:
+                if self.dp_rank is not None and self.dp_rank > 0:
                     filename_parts.append(f"DP-{self.dp_rank}")
-                if self.pp_rank > 0:
+                if self.pp_rank is not None and self.pp_rank > 0:
                     filename_parts.append(f"PP-{self.pp_rank}")
-                if self.moe_ep_rank > 0:
+                if self.moe_ep_rank is not None and self.moe_ep_rank > 0:
                     filename_parts.append(f"EP-{self.moe_ep_rank}")
 
                 filename = "-".join(filename_parts) + stage_suffix + ".trace.json.gz"
@@ -239,7 +238,6 @@ class SchedulerProfilerMixin:
         merge_message = ""
         if self.merge_profiles and self.tp_rank == 0:
             try:
-
                 logger.info("Starting profile merge...")
                 merger = ProfileMerger(self.torch_profiler_output_dir, self.profile_id)
                 merged_path = merger.merge_chrome_traces()
