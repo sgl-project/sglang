@@ -90,6 +90,9 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install rust dependencies
+        env:
+          CUDA_HOME: /usr/local/cuda
+          PATH: /usr/local/cuda/bin:${{ env.PATH }}
         run: |
           bash scripts/ci/ci_install_rust.sh
 
@@ -135,6 +138,9 @@ jobs:
           pytest -q -m integration
 
       - name: Run Python E2E tests
+        env:
+          CUDA_HOME: /usr/local/cuda
+          PATH: /usr/local/cuda/bin:${{ env.PATH }}
         run: |
           bash scripts/killall_sglang.sh "nuk_gpus"
           cd sgl-router
