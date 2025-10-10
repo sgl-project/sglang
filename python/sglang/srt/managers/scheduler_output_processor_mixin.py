@@ -247,6 +247,7 @@ class SchedulerOutputProcessorMixin:
                 accept_lens_cpu,
                 next_token_ids,
             ) = self.hacky_process_eagle_overlap_result(result, batch)
+            result.num_accepted_tokens = sum(accept_lens_cpu)
 
         # FIXME(lsyin): we suppose we have already got the num_accepted_tokens in result
         if not self.spec_algorithm.is_none():

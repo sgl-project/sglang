@@ -1947,6 +1947,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
             is_extend_in_batch=self.is_extend_in_batch,
             is_prefill_only=self.is_prefill_only,
+            enable_overlap=self.enable_overlap,
         )
 
     def _evict_tree_cache_if_needed(self, num_tokens: int):

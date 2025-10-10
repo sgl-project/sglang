@@ -345,7 +345,7 @@ class EAGLEWorkerV2(EAGLEWorker):
         seq_lens_backup.record_stream(torch.cuda.current_stream())
 
         # Construct the return values
-        draft_input = EagleDraftInput(
+        next_draft_input = EagleDraftInput(
             topk_p=ret_topk_p,
             topk_index=ret_topk_index,
             hidden_states=ret_hidden_states,
@@ -355,12 +355,13 @@ class EAGLEWorkerV2(EAGLEWorker):
             verify_done=verify_done,
         )
 
-        return ForwardBatchOutput(
+        return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=predict,
             can_run_cuda_graph=can_run_cuda_graph,
-            spec_info=draft_input,
-            accept_length=accept_length,
+            next_draft_input=next_draft_input,
+            accept_lens=accept_length,
+            last_batch_allocate_lens=pre_draft_allocate_lens,
         )
 
     def forward_draft_extend(
