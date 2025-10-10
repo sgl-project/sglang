@@ -1442,26 +1442,29 @@ class Scheduler(
             or req.sampling_params.ebnf is not None
             or req.sampling_params.structural_tag is not None
         ):
-            assert self.grammar_backend is not None
-            if req.sampling_params.json_schema is not None:
-                key = ("json", req.sampling_params.json_schema)
-            elif req.sampling_params.regex is not None:
-                key = ("regex", req.sampling_params.regex)
-            elif req.sampling_params.ebnf is not None:
-                key = ("ebnf", req.sampling_params.ebnf)
-            elif req.sampling_params.structural_tag:
-                key = ("structural_tag", req.sampling_params.structural_tag)
-
-            value, cache_hit = self.grammar_backend.get_cached_or_future_value(key)
-            req.grammar = value
-
-            if not cache_hit:
-                req.grammar_key = key
-                add_to_grammar_queue = True
+            if self.grammar_backend is None:
+                error_msg = "Grammar-based generation (json_schema, regex, ebnf, structural_tag) is not supported when the server is launched with --grammar-backend none"
+                req.set_finish_with_abort(error_msg)
             else:
-                if value is INVALID_GRAMMAR_OBJ:  # We hit a cached invalid grammar.
-                    error_msg = f"Invalid grammar request with cache hit: {key=}"
-                    req.set_finish_with_abort(error_msg)
+                if req.sampling_params.json_schema is not None:
+                    key = ("json", req.sampling_params.json_schema)
+                elif req.sampling_params.regex is not None:
+                    key = ("regex", req.sampling_params.regex)
+                elif req.sampling_params.ebnf is not None:
+                    key = ("ebnf", req.sampling_params.ebnf)
+                elif req.sampling_params.structural_tag:
+                    key = ("structural_tag", req.sampling_params.structural_tag)
+
+                value, cache_hit = self.grammar_backend.get_cached_or_future_value(key)
+                req.grammar = value
+
+                if not cache_hit:
+                    req.grammar_key = key
+                    add_to_grammar_queue = True
+                else:
+                    if value is INVALID_GRAMMAR_OBJ:  # We hit a cached invalid grammar.
+                        error_msg = f"Invalid grammar request with cache hit: {key=}"
+                        req.set_finish_with_abort(error_msg)
 
         if add_to_grammar_queue:
             self.grammar_queue.append(req)
