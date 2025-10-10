@@ -45,6 +45,7 @@ python -m build && pip install --force-reinstall dist/*.whl
 #### Option B: Development Mode
 
 ```bash
+# Currently broken
 pip install -e .
 ```
 
@@ -229,6 +230,15 @@ python -m sglang_router.launch_router \
     --prefill-selector app=sglang component=prefill \
     --decode-selector app=sglang component=decode \
     --service-discovery-namespace sglang-system
+
+# in lws case, such as tp16(1 leader pod, 1 worker pod)
+python -m sglang_router.launch_router \
+    --pd-disaggregation \
+    --policy cache_aware \
+    --service-discovery \
+    --prefill-selector app=sglang component=prefill role=leader\
+    --decode-selector app=sglang component=decode role=leader\
+    --service-discovery-namespace sglang-system
 ```
 
 #### Kubernetes Pod Configuration
@@ -321,6 +331,79 @@ python -m sglang_router.launch_router \
     --prometheus-port 9090
 ```
 
+### API Key Authentication
+
+The router supports multi-level API key authentication for both the router itself and individual workers:
+
+#### Router API Key
+Protect access to the router endpoints:
+
+```bash
+python -m sglang_router.launch_router \
+    --api-key "your-router-api-key" \
+    --worker-urls http://worker1:8000 http://worker2:8000
+```
+
+When router API key is set, clients must include the Bearer token:
+```bash
+curl -H "Authorization: Bearer your-router-api-key" http://localhost:8080/v1/chat/completions
+```
+
+#### Worker API Keys
+Workers can have their own API keys for authentication:
+
+```bash
+# Workers specified in --worker-urls automatically inherit the router's API key
+python -m sglang_router.launch_router \
+    --api-key "shared-api-key" \
+    --worker-urls http://worker1:8000 http://worker2:8000
+# Both workers will use "shared-api-key" for authentication
+
+# Adding workers dynamically WITHOUT inheriting router's key
+curl -X POST http://localhost:8080/add_worker?url=http://worker3:8000
+# WARNING: This worker has NO API key even though router has one!
+
+# Adding workers with specific API keys dynamically
+curl -X POST http://localhost:8080/add_worker?url=http://worker3:8000&api_key=worker3-specific-key
+```
+
+#### Security Configurations
+
+1. **No Authentication** (default):
+   - Router and workers accessible without keys
+   - Suitable for trusted environments
+
+2. **Router-only Authentication**:
+   - Clients need key to access router
+   - Router can access workers freely
+
+3. **Worker-only Authentication**:
+   - Router accessible without key
+   - Each worker requires authentication
+   ```bash
+   # Add workers with their API keys
+   curl -X POST http://localhost:8080/add_worker?url=http://worker:8000&api_key=worker-key
+   ```
+
+4. **Full Authentication**:
+   - Router requires key from clients
+   - Each worker requires its own key
+   ```bash
+   # Start router with its key
+   python -m sglang_router.launch_router --api-key "router-key"
+
+   # Add workers with their keys
+   curl -H "Authorization: Bearer router-key" \
+        -X POST http://localhost:8080/add_worker?url=http://worker:8000&api_key=worker-key
+   ```
+
+#### Important Notes
+
+- **Initial Workers**: Workers specified in `--worker-urls` automatically inherit the router's API key
+- **Dynamic Workers**: When adding workers via API, you must explicitly specify their API keys - they do NOT inherit the router's key
+- **Security Warning**: When adding workers without API keys while the router has one configured, a warning will be logged
+- **Common Pitfall**: If router and workers use the same API key, you must still specify the key when adding workers dynamically
+
 ### Command Line Arguments Reference
 
 #### Service Discovery
@@ -338,6 +421,9 @@ python -m sglang_router.launch_router \
 - `--policy`: Routing policy (`cache_aware`, `random`, `power_of_two`, `round_robin`)
 - `--prefill-policy`: Separate routing policy for prefill nodes (optional, overrides `--policy` for prefill)
 - `--decode-policy`: Separate routing policy for decode nodes (optional, overrides `--policy` for decode)
+
+#### Authentication
+- `--api-key`: API key for router authentication (clients must provide this as Bearer token)
 
 ## Development
 
@@ -368,6 +454,7 @@ Set `rust-analyzer.linkedProjects` to the absolute path of `Cargo.toml`:
 The continuous integration pipeline includes comprehensive testing, benchmarking, and publishing:
 
 #### Build & Test
+
 1. **Build Wheels**: Uses `cibuildwheel` for manylinux x86_64 packages
 2. **Build Source Distribution**: Creates source distribution for pip fallback
 3. **Rust HTTP Server Benchmarking**: Performance testing of router overhead
@@ -379,7 +466,6 @@ The continuous integration pipeline includes comprehensive testing, benchmarking
 - **Container Images**: Docker images published using `/docker/Dockerfile.router`
 
 ## Features
-
 - **High Performance**: Rust-based routing with connection pooling and optimized request handling
 - **Advanced Load Balancing**: Multiple algorithms including:
   - **Cache-Aware**: Intelligent routing based on cache locality for optimal performance

@@ -30,8 +30,8 @@ from transformers import (
 )
 
 from sglang.srt.entrypoints.engine import Engine
-from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.utils import load_image
+from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER, calculate_rouge_l
 
 DEFAULT_PROMPTS = [
@@ -491,7 +491,7 @@ class SRTRunner:
         tp_size: int = 1,
         model_impl: str = "auto",
         port: int = DEFAULT_PORT_FOR_SRT_TEST_RUNNER,
-        lora_paths: List[str] = None,
+        lora_paths: Optional[Union[List[str], List[dict[str, str]]]] = None,
         max_loras_per_batch: int = 4,
         attention_backend: Optional[str] = None,
         prefill_attention_backend: Optional[str] = None,
@@ -505,6 +505,7 @@ class SRTRunner:
         mem_fraction_static: float = 0.65,
         trust_remote_code: bool = False,
         speculative_draft_model_path: Optional[str] = None,
+        speculative_draft_model_revision: Optional[str] = None,
         speculative_algorithm: Optional[str] = None,
         speculative_num_steps: Optional[int] = None,
         speculative_eagle_topk: Optional[int] = None,
@@ -526,6 +527,9 @@ class SRTRunner:
         spec_kwargs = {}
         if speculative_draft_model_path:
             spec_kwargs["speculative_draft_model_path"] = speculative_draft_model_path
+            spec_kwargs["speculative_draft_model_revision"] = (
+                speculative_draft_model_revision
+            )
             spec_kwargs["speculative_algorithm"] = speculative_algorithm
             spec_kwargs["speculative_num_steps"] = speculative_num_steps
             spec_kwargs["speculative_eagle_topk"] = speculative_eagle_topk

@@ -16,10 +16,19 @@ classifiers = [
     "Programming Language :: Python :: 3",
 ]
 
+dependencies = [
+    "setproctitle",
+    "aiohttp",
+    "orjson",
+    "uvicorn",
+    "fastapi",
+]
+
 [project.optional-dependencies]
 dev = [
     "requests>=2.25.0",
 ]
+
 
 # https://github.com/PyO3/setuptools-rust?tab=readme-ov-file
 [tool.setuptools.packages]
@@ -28,8 +37,3 @@ find = { where = ["py_src"] }
 # workaround for https://github.com/pypa/twine/issues/1216
 [tool.setuptools]
 license-files = []
-
-[[tool.setuptools-rust.ext-modules]]
-target = "sglang_router_rs"
-path = "Cargo.toml"
-binding = "PyO3"

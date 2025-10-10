@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Optional
+
 import torch
 
 
@@ -24,7 +26,7 @@ class MXFP4QuantizeUtil:
     E2M1_bounds = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5])
 
     @classmethod
-    def quantize(cls, input: torch.Tensor, block_size: int | None) -> tuple:
+    def quantize(cls, input: torch.Tensor, block_size: Optional[int]) -> tuple:
         """Converting a tensor to a quantized format based on MXFP4 quantization. Only E4M3 is supported.
         Args:
             input (torch.Tensor): The input tensor to be quantized.

@@ -10,7 +10,7 @@ from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_tensor_model_parallel_world_size,
 )
-from sglang.srt.hf_transformers_utils import get_processor
+from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.pooler import Pooler, PoolingType
@@ -21,6 +21,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.glm4_moe import Glm4MoeModel
 from sglang.srt.models.glm4v import Glm4vForConditionalGeneration, Glm4vVisionModel
 from sglang.srt.utils import add_prefix, is_cuda, log_info_on_rank0
+from sglang.srt.utils.hf_transformers_utils import get_processor
 
 _is_cuda = is_cuda()
 
@@ -40,6 +41,7 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
 
         config.moe_layer_freq = 1
         self.config = config
+        vision_utils.update_vit_attn_dummy_heads_config(self.config)
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
         self.determine_num_fused_shared_experts("Glm4MoeForCausalLM")
@@ -71,6 +73,9 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
         self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
+
+        # For EAGLE3 support
+        self.capture_aux_hidden_states = False
 
     def determine_num_fused_shared_experts(
         self, architecture: str = "Glm4MoeForCausalLM"
@@ -385,6 +390,10 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
                         )
+                        if "visual" in name:
+                            loaded_weight = vision_utils.pad_vit_attn_dummy_heads(
+                                self.config, name, loaded_weight
+                            )
                         weight_loader(param, loaded_weight)
 
 

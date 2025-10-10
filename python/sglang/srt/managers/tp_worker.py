@@ -12,38 +12,44 @@
 # limitations under the License.
 # ==============================================================================
 """A tensor parallel worker."""
+from __future__ import annotations
 
 import logging
-import threading
-from typing import Optional, Tuple, Union
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import get_pp_group, get_world_group
-from sglang.srt.hf_transformers_utils import (
-    get_processor,
-    get_tokenizer,
-    get_tokenizer_from_processor,
-)
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import (
+    DestroyWeightsUpdateGroupReqInput,
     GetWeightsByNameReqInput,
+    InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterReqInput,
+    SendWeightsToRemoteInstanceReqInput,
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, global_server_args_dict
+from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.patch_torch import monkey_patch_torch_reductions
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
+from sglang.srt.utils.hf_transformers_utils import (
+    get_processor,
+    get_tokenizer,
+    get_tokenizer_from_processor,
+)
+from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.cache_controller import LayerDoneCounter
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +84,11 @@ class TpModelWorker:
                 if not is_draft_worker
                 else server_args.speculative_draft_model_path
             ),
+            model_revision=(
+                server_args.revision
+                if not is_draft_worker
+                else server_args.speculative_draft_model_revision
+            ),
             is_draft_model=is_draft_worker,
         )
 
@@ -92,6 +103,7 @@ class TpModelWorker:
             pp_rank=pp_rank,
             pp_size=server_args.pp_size,
             nccl_port=nccl_port,
+            dp_rank=dp_rank,
             server_args=server_args,
             is_draft_worker=is_draft_worker,
             req_to_token_pool=req_to_token_pool,
@@ -136,8 +148,8 @@ class TpModelWorker:
         assert self.max_running_requests > 0, "max_running_request is zero"
         self.max_queued_requests = server_args.max_queued_requests
         assert (
-            self.max_running_requests > 0
-        ), "max_queued_requests is zero. We need to be at least 1 to schedule a request."
+            self.max_queued_requests is None or self.max_queued_requests >= 1
+        ), "If configured, max_queued_requests must be at least 1 for any work to be scheduled."
         self.max_req_len = min(
             self.model_config.context_len - 1,
             self.max_total_num_tokens - 1,
@@ -161,10 +173,10 @@ class TpModelWorker:
 
         self.hicache_layer_transfer_counter = None
 
-    def register_hicache_layer_transfer_counter(self, counter):
+    def register_hicache_layer_transfer_counter(self, counter: LayerDoneCounter):
         self.hicache_layer_transfer_counter = counter
 
-    def set_hicache_consumer(self, consumer_index):
+    def set_hicache_consumer(self, consumer_index: int):
         if self.hicache_layer_transfer_counter is not None:
             self.hicache_layer_transfer_counter.set_consumer(consumer_index)
 
@@ -219,11 +231,11 @@ class TpModelWorker:
     def forward_batch_generation(
         self,
         model_worker_batch: ModelWorkerBatch,
-        launch_done: Optional[threading.Event] = None,
-        skip_sample: bool = False,
-    ) -> Tuple[
-        Union[LogitsProcessorOutput, torch.Tensor], Optional[torch.Tensor], bool
-    ]:
+        is_verify: bool = False,
+    ) -> GenerationBatchResult:
+        # update the consumer index of hicache to the running batch
+        self.set_hicache_consumer(model_worker_batch.hicache_consumer_index)
+
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
 
         pp_proxy_tensors = None
@@ -238,23 +250,51 @@ class TpModelWorker:
             logits_output, can_run_cuda_graph = self.model_runner.forward(
                 forward_batch, pp_proxy_tensors=pp_proxy_tensors
             )
-            if launch_done is not None:
-                launch_done.set()
+            batch_result = GenerationBatchResult(
+                logits_output=logits_output,
+                can_run_cuda_graph=can_run_cuda_graph,
+            )
 
-            if skip_sample:
-                next_token_ids = None
+            if is_verify:
+                # Skip sampling and return logits for target forward
+                return batch_result
+
+            if model_worker_batch.delay_sample_launch:
+                batch_result.delay_sample_launch = True
+                batch_result.forward_batch = forward_batch
+                return batch_result
+
+            if model_worker_batch.is_prefill_only:
+                # For prefill-only requests, create dummy token IDs on CPU
+                # The size should match the batch size (number of sequences), not total tokens
+                batch_result.next_token_ids = torch.zeros(
+                    len(model_worker_batch.seq_lens),
+                    dtype=torch.long,
+                    device=model_worker_batch.input_ids.device,
+                )
+                if (
+                    model_worker_batch.return_logprob
+                    and logits_output.next_token_logits is not None
+                ):
+                    # NOTE: Compute logprobs without full sampling
+                    self.model_runner.compute_logprobs_only(
+                        logits_output, model_worker_batch
+                    )
             else:
-                next_token_ids = self.model_runner.sample(
-                    logits_output, model_worker_batch
+                batch_result.next_token_ids = self.model_runner.sample(
+                    logits_output, forward_batch
                 )
 
-            return logits_output, next_token_ids, can_run_cuda_graph
+            return batch_result
         else:
             pp_proxy_tensors, can_run_cuda_graph = self.model_runner.forward(
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
-            return pp_proxy_tensors.tensors, None, can_run_cuda_graph
+            return GenerationBatchResult(
+                pp_hidden_states_proxy_tensors=pp_proxy_tensors,
+                can_run_cuda_graph=can_run_cuda_graph,
+            )
 
     def forward_batch_embedding(self, model_worker_batch: ModelWorkerBatch):
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
@@ -276,6 +316,37 @@ class TpModelWorker:
             recv_req.world_size,
             recv_req.group_name,
             recv_req.backend,
+        )
+        return success, message
+
+    def destroy_weights_update_group(self, recv_req: DestroyWeightsUpdateGroupReqInput):
+        success, message = self.model_runner.destroy_weights_update_group(
+            recv_req.group_name,
+        )
+        return success, message
+
+    def init_weights_send_group_for_remote_instance(
+        self, recv_req: InitWeightsSendGroupForRemoteInstanceReqInput
+    ):
+        success, message = (
+            self.model_runner.init_weights_send_group_for_remote_instance(
+                recv_req.master_address,
+                recv_req.ports,
+                recv_req.group_rank,
+                recv_req.world_size,
+                recv_req.group_name,
+                recv_req.backend,
+            )
+        )
+        return success, message
+
+    def send_weights_to_remote_instance(
+        self, recv_req: SendWeightsToRemoteInstanceReqInput
+    ):
+        success, message = self.model_runner.send_weights_to_remote_instance(
+            recv_req.master_address,
+            recv_req.ports,
+            recv_req.group_name,
         )
         return success, message
 

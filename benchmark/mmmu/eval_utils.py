@@ -18,6 +18,7 @@ from data_utils import (
     construct_prompt,
     load_yaml,
     process_single_sample,
+    save_json,
 )
 from datasets import concatenate_datasets, load_dataset
 from tqdm import tqdm
@@ -28,13 +29,14 @@ class EvalArgs:
     seed: int = 42
     split: str = "validation"
     image_pixels_limit: int = -1
-    result_filename: str = ""
+    result_filename: str = f"./val_sglang.json"
     prompt_format_file: str = "prompt_format.yaml"
     dataset_path: str = "MMMU/MMMU"
     extra_request_body: Optional[str] = None
     profile: bool = False
     profile_number: int = 5
     concurrency: int = 1
+    max_new_tokens: int = 30
     response_answer_regex: str = "(.*)"
     lora_path: Optional[str] = None
 
@@ -92,6 +94,12 @@ class EvalArgs:
             type=int,
             default=EvalArgs.concurrency,
             help="Number of concurrent requests to make during evaluation. Default is 1, which means no concurrency.",
+        )
+        parser.add_argument(
+            "--max-new-tokens",
+            type=int,
+            default=EvalArgs.max_new_tokens,
+            help="Maximum number of new tokens to generate per sample.",
         )
         parser.add_argument(
             "--response-answer-regex",
@@ -233,7 +241,7 @@ def prepare_samples(eval_args: EvalArgs):
 
 
 def get_sampling_params(eval_args):
-    max_new_tokens = 30
+    max_new_tokens = eval_args.max_new_tokens
     temperature = 0.001
 
     extra_request_body = {}
@@ -445,6 +453,18 @@ def eval_multi_choice(gold_i, pred_i):
     Evaluate a multiple choice instance.
     """
     correct = False
+    # for case like Answer: A, Answer is A, answer is A, answer: A
+    for _exp in ["Answer:", "Answer is ", "answer is ", "answer: "]:
+        if _exp in pred_i:
+            pred_i = pred_i.split(_exp)[1].strip()
+            break
+    # for case like (A), (B), (C), (D) ......
+    if "(" in pred_i and ")" in pred_i:
+        try:
+            pred_i = re.search(r"\(([A-Z])\)", pred_i).group(1)
+        except:
+            print(f"Error to extract answer from: {pred_i}")
+            pass
     # only they are exactly the same, we consider it as correct
     if isinstance(gold_i, list):
         for answer in gold_i:
@@ -535,7 +555,12 @@ def process_result(response, sample, answer_dict, out_samples):
     else:  # open question
         pred_ans = response
 
-    out_samples[sample["id"]] = pred_ans
+    out_samples[sample["id"]] = {
+        "pred_ans": pred_ans,
+        "original_response": sample["original_response"],
+        "ground_truth": sample["answer"],
+        "question_type": sample["question_type"],
+    }
 
     # set ground truth answer
     answer_dict[sample["id"]] = {
@@ -544,7 +569,9 @@ def process_result(response, sample, answer_dict, out_samples):
     }
 
 
-def eval_result(model_answer_path, answer_dict):
+def eval_result(model_answer_path, answer_dict, eval_output_path=None):
+    if eval_output_path is None:
+        eval_output_path = model_answer_path
     print("Evaluating...")
     output_dict = json.load(open(model_answer_path))
     # answer_dict = json.load(open(answer_path))
@@ -552,6 +579,12 @@ def eval_result(model_answer_path, answer_dict):
     # group by category
     output_dict_w_cat = {}
     for data_id, parsed_pred in output_dict.items():
+        if isinstance(parsed_pred, str):
+            parsed_pred = parsed_pred
+        elif isinstance(parsed_pred, dict):
+            parsed_pred = parsed_pred["pred_ans"]
+        else:
+            raise ValueError(f"Unknown type of parsed_pred: {type(parsed_pred)}")
         category = "_".join(data_id.split("_")[1:-1])
         if category not in output_dict_w_cat:
             output_dict_w_cat.update({category: {}})
@@ -598,9 +631,12 @@ def eval_result(model_answer_path, answer_dict):
 
         judge_dict, metric_dict = evaluate(exampels_to_eval)
         metric_dict.update({"num_example": len(exampels_to_eval)})
+        for key, value in judge_dict.items():
+            output_dict[key]["judge"] = value
 
         evaluation_result[category] = metric_dict
 
+    save_json(model_answer_path, output_dict)
     printable_results = {}
     # pdb.set_trace()
     # add domain Subject
@@ -639,7 +675,7 @@ def eval_result(model_answer_path, answer_dict):
         "acc": overall_acc,
     }
     pprint.pprint(printable_results)
-    out = model_answer_path
+    out = eval_output_path
     with open(out, "w", encoding="utf-8") as outfile:
         json.dump(printable_results, outfile)
         print(f"eval out saved to {out}")

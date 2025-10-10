@@ -31,7 +31,7 @@ __global__ void int4_fp8_get_group_gemm_starts(
   b_offsets[expert_id] = b_base_as_int + expert_id * k * n / 2;
   out_offsets[expert_id] = out_base_as_int + expert_offset * n;
   a_scales_offsets[expert_id] = a_scales_base_as_int + (per_act_token ? expert_offset : 0);
-  b_scales_offsets[expert_id] = b_scales_base_as_int + (per_out_ch ? expert_id * n * 4 * k / 512 : expert_id);
+  b_scales_offsets[expert_id] = b_scales_base_as_int + (per_out_ch ? expert_id * n * k / 128 : expert_id);
 }
 
 #define __CALL_W4A8_GET_STARTS_KERNEL(TENSOR_C_TYPE, C_TYPE)                              \

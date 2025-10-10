@@ -67,7 +67,7 @@ class TestDeepseekV3MTPChannelInt8(CustomTestCase):
                     "1",
                     "--speculative-algorithm",
                     "EAGLE",
-                    "--speculative-draft",
+                    "--speculative-draft-model-path",
                     "sgl-project/sglang-ci-dsv3-channel-int8-test-NextN",
                     "--speculative-num-steps",
                     "2",

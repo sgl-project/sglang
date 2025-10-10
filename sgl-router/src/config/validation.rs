@@ -29,6 +29,12 @@ impl ConfigValidator {
         Self::validate_retry(&retry_cfg)?;
         Self::validate_circuit_breaker(&cb_cfg)?;
 
+        if config.history_backend == HistoryBackend::Oracle && config.oracle.is_none() {
+            return Err(ConfigError::MissingRequired {
+                field: "oracle".to_string(),
+            });
+        }
+
         Ok(())
     }
 
@@ -93,6 +99,20 @@ impl ConfigValidator {
                 }
                 if let Some(d_policy) = decode_policy {
                     Self::validate_policy(d_policy)?;
+                }
+            }
+            RoutingMode::OpenAI { worker_urls } => {
+                // Require exactly one worker URL for OpenAI router
+                if worker_urls.len() != 1 {
+                    return Err(ConfigError::ValidationFailed {
+                        reason: "OpenAI mode requires exactly one --worker-urls entry".to_string(),
+                    });
+                }
+                // Validate URL format
+                if let Err(e) = url::Url::parse(&worker_urls[0]) {
+                    return Err(ConfigError::ValidationFailed {
+                        reason: format!("Invalid OpenAI worker URL '{}': {}", &worker_urls[0], e),
+                    });
                 }
             }
         }
@@ -243,6 +263,12 @@ impl ConfigValidator {
                     });
                 }
             }
+            RoutingMode::OpenAI { .. } => {
+                // OpenAI mode doesn't use service discovery
+                return Err(ConfigError::ValidationFailed {
+                    reason: "OpenAI mode does not support service discovery".to_string(),
+                });
+            }
         }
 
         Ok(())
@@ -344,6 +370,21 @@ impl ConfigValidator {
 
     /// Validate compatibility between different configuration sections
     fn validate_compatibility(config: &RouterConfig) -> ConfigResult<()> {
+        // IGW mode is independent - skip other compatibility checks when enabled
+        if config.enable_igw {
+            return Ok(());
+        }
+
+        // Validate gRPC connection mode requires tokenizer configuration
+        if config.connection_mode == ConnectionMode::Grpc
+            && config.tokenizer_path.is_none()
+            && config.model_path.is_none()
+        {
+            return Err(ConfigError::ValidationFailed {
+                reason: "gRPC connection mode requires either --tokenizer-path or --model-path to be specified".to_string(),
+            });
+        }
+
         // All policies are now supported for both router types thanks to the unified trait design
         // No mode/policy restrictions needed anymore
 
@@ -414,11 +455,14 @@ impl ConfigValidator {
                 });
             }
 
-            if !url.starts_with("http://") && !url.starts_with("https://") {
+            if !url.starts_with("http://")
+                && !url.starts_with("https://")
+                && !url.starts_with("grpc://")
+            {
                 return Err(ConfigError::InvalidValue {
                     field: "worker_url".to_string(),
                     value: url.clone(),
-                    reason: "URL must start with http:// or https://".to_string(),
+                    reason: "URL must start with http://, https://, or grpc://".to_string(),
                 });
             }
 
@@ -626,7 +670,6 @@ mod tests {
 
     #[test]
     fn test_validate_pd_mode_with_separate_policies() {
-        // Test PD mode with different policies for prefill and decode
         let config = RouterConfig::new(
             RoutingMode::PrefillDecode {
                 prefill_urls: vec![
@@ -657,7 +700,6 @@ mod tests {
 
     #[test]
     fn test_validate_pd_mode_power_of_two_insufficient_workers() {
-        // Test that power-of-two policy requires at least 2 workers
         let config = RouterConfig::new(
             RoutingMode::PrefillDecode {
                 prefill_urls: vec![("http://prefill1:8000".to_string(), None)], // Only 1 prefill
@@ -678,5 +720,58 @@ mod tests {
         if let Err(e) = result {
             assert!(e.to_string().contains("prefill requires at least 2"));
         }
+    }
+
+    #[test]
+    fn test_validate_grpc_requires_tokenizer() {
+        let mut config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["grpc://worker:50051".to_string()],
+            },
+            PolicyConfig::Random,
+        );
+
+        // Set connection mode to gRPC without tokenizer config
+        config.connection_mode = ConnectionMode::Grpc;
+        config.tokenizer_path = None;
+        config.model_path = None;
+
+        let result = ConfigValidator::validate(&config);
+        assert!(result.is_err());
+        if let Err(e) = result {
+            assert!(e.to_string().contains("gRPC connection mode requires"));
+        }
+    }
+
+    #[test]
+    fn test_validate_grpc_with_model_path() {
+        let mut config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["grpc://worker:50051".to_string()],
+            },
+            PolicyConfig::Random,
+        );
+
+        config.connection_mode = ConnectionMode::Grpc;
+        config.model_path = Some("meta-llama/Llama-3-8B".to_string());
+
+        let result = ConfigValidator::validate(&config);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_grpc_with_tokenizer_path() {
+        let mut config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["grpc://worker:50051".to_string()],
+            },
+            PolicyConfig::Random,
+        );
+
+        config.connection_mode = ConnectionMode::Grpc;
+        config.tokenizer_path = Some("/path/to/tokenizer.json".to_string());
+
+        let result = ConfigValidator::validate(&config);
+        assert!(result.is_ok());
     }
 }

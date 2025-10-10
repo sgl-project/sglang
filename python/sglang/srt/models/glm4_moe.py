@@ -12,7 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Inference-only GLM-4.5 model compatible with HuggingFace weights"""
+"""Inference-only GLM-4.5, GLM-4.6 model compatible with HuggingFace weights"""
 
 import logging
 from typing import Any, Dict, Iterable, Optional, Tuple
@@ -68,8 +68,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_executor.graph_runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import (
     DeepseekV2DecoderLayer,
@@ -153,7 +153,13 @@ class Glm4MoeMLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
 
-    def forward(self, x, forward_batch=None, should_allreduce_fusion=False):
+    def forward(
+        self,
+        x,
+        forward_batch=None,
+        should_allreduce_fusion=False,
+        gemm_output_zero_allocator: BumpAllocator = None,
+    ):
         if (self.tp_size == 1) and x.shape[0] == 0:
             return x
 
@@ -423,7 +429,7 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
             routed_scaling_factor=self.routed_scaling_factor,
         )
 
-        self.experts = get_moe_impl_class()(
+        self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.n_routed_experts
             + self.num_fused_shared_experts
             + global_server_args_dict["ep_num_redundant_experts"],
@@ -501,6 +507,7 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
         hidden_states: torch.Tensor,
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
+        gemm_output_zero_allocator: BumpAllocator = None,
     ) -> torch.Tensor:
 
         current_stream = torch.cuda.current_stream()
@@ -543,6 +550,7 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
         hidden_states: torch.Tensor,
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
+        gemm_output_zero_allocator: BumpAllocator = None,
     ) -> torch.Tensor:
         if hasattr(self, "shared_experts") and use_intel_amx_backend(
             self.shared_experts.gate_up_proj
@@ -666,6 +674,7 @@ class Glm4MoeDecoderLayer(DeepseekV2DecoderLayer):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
+        gemm_output_zero_allocator: BumpAllocator = None,
     ) -> torch.Tensor:
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
@@ -776,9 +785,9 @@ class Glm4MoeForCausalLM(DeepseekV2ForCausalLM):
             or self.config.architectures[0] != architecture
             or self.config.n_shared_experts != 1
         ):
-            disable_reason = "Only GLM-4.5 on NV-platform with capability >= 80 can use shared experts fusion optimization."
+            disable_reason = "Only GLM-4.5 or GLM-4.6 on NV-platform with capability >= 80 can use shared experts fusion optimization."
         elif get_moe_expert_parallel_world_size() > 1:
-            disable_reason = "Deepseek and GLM-4.5 can not use shared experts fusion optimization under expert parallelism."
+            disable_reason = "Deepseek and GLM-4.5 or GLM-4.6 can not use shared experts fusion optimization under expert parallelism."
 
         if disable_reason is not None:
             global_server_args_dict["disable_shared_experts_fusion"] = True

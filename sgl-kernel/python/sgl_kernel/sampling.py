@@ -1,4 +1,4 @@
-from typing import Optional, Tuple, Union
+from typing import Optional, Union
 
 import torch
 from sgl_kernel.utils import _to_tensor_scalar_tuple
