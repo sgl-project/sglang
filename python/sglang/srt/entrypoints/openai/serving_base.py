@@ -76,7 +76,6 @@ class OpenAIServingBase(ABC):
             error_response = self.create_error_response(
                 message=e.detail, err_type=str(e.status_code), status_code=e.status_code
             )
-            # Increment received requests metric with proper labels
             self._label_and_observe_one_received_request(
                 raw_request,
                 http_status=str(e.status_code),
@@ -89,7 +88,6 @@ class OpenAIServingBase(ABC):
                 err_type="BadRequest",
                 status_code=400,
             )
-            # Increment received requests metric with proper labels
             self._label_and_observe_one_received_request(
                 raw_request, http_status="400", custom_labels=request.custom_labels
             )
@@ -101,7 +99,6 @@ class OpenAIServingBase(ABC):
                 err_type="InternalServerError",
                 status_code=500,
             )
-            # Increment received requests metric with proper labels
             self._label_and_observe_one_received_request(
                 raw_request, http_status="500", custom_labels=request.custom_labels
             )
