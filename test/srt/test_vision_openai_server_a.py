@@ -76,7 +76,7 @@ class TestQwen2VLContextLengthServer(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             api_key=cls.api_key,
-            extra_args=[
+            other_args=[
                 "--context-length",
                 "300",
                 "--mem-fraction-static=0.75",
