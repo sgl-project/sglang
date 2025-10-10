@@ -114,6 +114,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "enable_deterministic_inference",
     "nsa_prefill",
     "nsa_decode",
+    "multi_item_scoring_delimiter",
 ]
 
 # Put some global args for easy access
@@ -630,6 +631,10 @@ class Req:
         # This is used to compute the average acceptance length per request.
         self.spec_verify_ct = 0
 
+        # The number of accepted tokens in speculative decoding for this request.
+        # This is used to compute the acceptance rate and average acceptance length per request.
+        self.spec_accepted_tokens = 0
+
         # For metrics
         self.metrics_collector = metrics_collector
         self.time_stats: TimeStats = TimeStats(disagg_mode=disagg_mode)
@@ -666,9 +671,11 @@ class Req:
     def is_prefill_only(self) -> bool:
         """Check if this request is prefill-only (no token generation needed)."""
         # NOTE: when spec is enabled, prefill_only optimizations are disabled
-        return (
-            self.sampling_params.max_new_tokens == 0
-            and global_server_args_dict["speculative_algorithm"] is None
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        spec_alg = global_server_args_dict["speculative_algorithm"]
+        return self.sampling_params.max_new_tokens == 0 and (
+            spec_alg is None or spec_alg == SpeculativeAlgorithm.NONE
         )
 
     def add_latency(self, stage: RequestStage):
@@ -1759,7 +1766,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_cpu = self.seq_lens_cpu[keep_indices]
         self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
         self.out_cache_loc = None
-        self.seq_lens_sum = self.seq_lens.sum().item()
+        if isinstance(self.seq_lens_cpu, torch.Tensor):
+            # CPU tensor
+            self.seq_lens_sum = int(self.seq_lens_cpu.sum().item())
+        else:
+            self.seq_lens_sum = int(np.asarray(self.seq_lens_cpu).sum())
         self.output_ids = self.output_ids[keep_indices_device]
         self.return_logprob = any(req.return_logprob for req in self.reqs)
         if self.return_logprob:
