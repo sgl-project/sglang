@@ -22,7 +22,7 @@ from sglang.srt.utils import (
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
-    from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
+    from sglang.srt.speculative.spec_info import SpecInput
 
 
 def logit_capping_mod(logit_capping_method, logit_cap):
@@ -85,7 +85,7 @@ class TritonAttnBackend(AttentionBackend):
         self.num_kv_head = model_runner.model_config.get_num_kv_heads(
             get_attention_tp_size()
         )
-        if model_runner.is_hybrid_gdn:
+        if model_runner.hybrid_gdn_config is not None:
             # For hybrid linear models, layer_id = 0 may not be full attention
             self.v_head_dim = model_runner.token_to_kv_pool.get_v_head_dim()
         else:
@@ -482,7 +482,7 @@ class TritonAttnBackend(AttentionBackend):
         seq_lens: torch.Tensor,
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        spec_info: Optional[SpecInput],
     ):
         assert encoder_lens is None, "Not supported"
         window_kv_indptr = self.window_kv_indptr
@@ -638,7 +638,7 @@ class TritonAttnBackend(AttentionBackend):
         seq_lens_sum: int,
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
         # NOTE: encoder_lens expected to be zeros or None
@@ -883,7 +883,7 @@ class TritonMultiStepDraftBackend:
         topk: int,
         speculative_num_steps: int,
     ):
-        from sglang.srt.speculative.eagle_utils import generate_draft_decode_kv_indices
+        from sglang.srt.speculative.spec_utils import generate_draft_decode_kv_indices
 
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps

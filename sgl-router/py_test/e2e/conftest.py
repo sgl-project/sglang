@@ -114,6 +114,8 @@ def _popen_launch_worker(
         port,
         "--base-gpu-id",
         str(base_gpu_id or 0),
+        "--log-level",
+        "warning",
     ]
     if dp_size is not None:
         cmd += ["--dp-size", str(dp_size)]
@@ -156,6 +158,8 @@ def _popen_launch_router_only(
         str(prom_port),
         "--prometheus-host",
         "127.0.0.1",
+        "--log-level",
+        "warn",
     ]
     proc = subprocess.Popen(cmd)
     _wait_router_health(base_url, timeout)
