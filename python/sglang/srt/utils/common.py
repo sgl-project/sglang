@@ -43,8 +43,10 @@ import tempfile
 import threading
 import time
 import traceback
+import types
 import uuid
 import warnings
+from abc import ABC, abstractmethod
 from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -63,6 +65,7 @@ from typing import (
     List,
     Optional,
     Protocol,
+    Sequence,
     Set,
     Tuple,
     TypeVar,
@@ -162,8 +165,12 @@ def _check(cc_major):
     ) >= (12, 3)
 
 
-is_ampere_with_cuda_12_3 = lambda: _check(8)
-is_hopper_with_cuda_12_3 = lambda: _check(9)
+def is_ampere_with_cuda_12_3():
+    return _check(8)
+
+
+def is_hopper_with_cuda_12_3():
+    return _check(9)
 
 
 @lru_cache(maxsize=1)
@@ -1010,6 +1017,33 @@ def monkey_patch_p2p_access_check():
     setattr(CustomAllreduce, "__del__", lambda *args, **kwargs: None)
 
 
+class QuantizeMethodBase(ABC):
+    """Base class for different quantized methods."""
+
+    @abstractmethod
+    def create_weights(
+        self, layer: torch.nn.Module, *weight_args, **extra_weight_attrs
+    ):
+        """Create weights for a layer.
+
+        The weights will be set as attributes of the layer."""
+        raise NotImplementedError()
+
+    @abstractmethod
+    def apply(self, layer: torch.nn.Module, *args, **kwargs) -> torch.Tensor:
+        """Apply the weights in layer to the input tensor.
+
+        Expects create_weights to have been called before on the layer."""
+        raise NotImplementedError()
+
+    def process_weights_after_loading(self, layer: nn.Module) -> None:
+        """Process the weight after loading.
+
+        This can be used for example, to transpose weights for computation.
+        """
+        return
+
+
 def monkey_patch_vllm_gguf_config():
     try:
         from vllm.model_executor.layers.quantization.gguf import (
@@ -1025,7 +1059,7 @@ def monkey_patch_vllm_gguf_config():
 
     def get_quant_method_with_embedding_replaced(
         self, layer: torch.nn.Module, prefix: str
-    ) -> Optional["QuantizeMethodBase"]:
+    ) -> Optional[QuantizeMethodBase]:
         if isinstance(layer, LinearBase):
             return GGUFLinearMethod(self)
         elif isinstance(layer, VocabParallelEmbedding):
@@ -1878,7 +1912,9 @@ def direct_register_custom_op(
         if fake_impl is not None:
             my_lib._register_fake(op_name, fake_impl)
     except RuntimeError as error:
-        if "Tried to register an operator" in str(e) and "multiple times" in str(e):
+        if "Tried to register an operator" in str(error) and "multiple times" in str(
+            error
+        ):
             # Silently ignore duplicate registration errors
             # This can happen in multi-engine scenarios
             pass
@@ -2307,10 +2343,12 @@ def retry(
             return fn()
         except Exception as e:
             if try_index >= max_retry:
-                raise Exception(f"retry() exceed maximum number of retries.")
+                raise Exception(
+                    f"retry() exceed maximum number of retries {max_retry=}."
+                )
 
             if not should_retry(e):
-                raise Exception(f"retry() observe errors that should not be retried.")
+                raise Exception("retry() observe errors that should not be retried.")
 
             delay = min(initial_delay * (2**try_index), max_delay) * (
                 0.75 + 0.25 * random.random()
@@ -2657,7 +2695,9 @@ def dim_is_supported(weight):
 def _process_weight_after_loading(module, weight_names, transpose_dims=None) -> None:
     # Pack weight for get better performance on CPU
     devices = {getattr(module, weight_name).device for weight_name in weight_names}
-    assert len(devices) == 1, f"Expects all weights to be on the same device"
+    assert (
+        len(devices) == 1
+    ), f"Expects all weights to be on the same device {len(devices)=}"
     device = devices.pop()
 
     if transpose_dims:
