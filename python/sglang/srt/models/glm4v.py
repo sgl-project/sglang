@@ -7,7 +7,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers.models.glm4v.configuration_glm4v import Glm4vConfig, Glm4vVisionConfig
 
-from sglang.srt.hf_transformers_utils import get_processor
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.layernorm import RMSNorm
@@ -28,6 +27,7 @@ from sglang.srt.models.qwen2_5_vl import (
     Qwen2_5_VLForConditionalGeneration,
 )
 from sglang.srt.utils import add_prefix
+from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
 
