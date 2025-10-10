@@ -4,7 +4,6 @@ from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
 import torch
 
 from sglang.srt.distributed import divide
-from sglang.srt.hf_transformers_utils import AutoConfig
 from sglang.srt.lora.eviction_policy import get_eviction_policy
 from sglang.srt.lora.layers import BaseLayerWithLoRA
 from sglang.srt.lora.lora import LoRAAdapter
