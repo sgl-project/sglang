@@ -25,7 +25,8 @@ def weak_ref_tensor(tensor: Any) -> Any:
     but will not keep the original tensor alive.
     """
     if isinstance(tensor, torch.Tensor):
-        return torch.ops._C.weak_ref_tensor(tensor)
+        # TODO(yuwei): introduce weak_ref_tensor from sgl_kernel
+        return torch.ops.jit_weak_ref_tensor.weak_ref_tensor(tensor)
     return tensor
 
 

@@ -318,7 +318,19 @@ class ModelRunner:
             self.server_args.enable_piecewise_cuda_graph
             and self.can_run_piecewise_cuda_graph()
         ):
-            self.piecewise_cuda_graph_runner = PiecewiseCudaGraphRunner(self)
+            self.attention_layers = []
+            for layer in self.model.model.layers:
+                if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "attn"):
+                    self.attention_layers.append(layer.self_attn.attn)
+            if len(self.attention_layers) < self.model_config.num_hidden_layers:
+                # TODO(yuwei): support Non-Standard GQA
+                log_info_on_rank0(
+                    logger,
+                    "Disable piecewise CUDA graph because some layers do not apply Standard GQA",
+                )
+                self.piecewise_cuda_graph_runner = None
+            else:
+                self.piecewise_cuda_graph_runner = PiecewiseCudaGraphRunner(self)
         else:
             self.piecewise_cuda_graph_runner = None
 
@@ -871,11 +883,6 @@ class ModelRunner:
             raise ValueError(
                 f"TP rank {self.tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
             ) from None
-
-        self.attention_layers = []
-        for layer in self.model.model.layers:
-            if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "attn"):
-                self.attention_layers.append(layer.self_attn.attn)
 
     def update_expert_location(
         self,
@@ -1449,13 +1456,6 @@ class ModelRunner:
             log_info_on_rank0(
                 logger,
                 "Disable piecewise CUDA graph because piecewise_cuda_graph does not support PP",
-            )
-            return False
-        if len(self.attention_layers) < self.model_config.num_hidden_layers:
-            # TODO(yuwei): support Non-Standard GQA
-            log_info_on_rank0(
-                logger,
-                "Disable piecewise CUDA graph because some layers do not apply Standard GQA",
             )
             return False
         return True

@@ -17,9 +17,11 @@ static at::Tensor weak_ref_tensor(at::Tensor &tensor) {
   return new_tensor;
 }
 
-TORCH_LIBRARY(_C, ops) { ops.def("weak_ref_tensor(Tensor input) -> Tensor"); }
+TORCH_LIBRARY(jit_weak_ref_tensor, ops) {
+  ops.def("weak_ref_tensor(Tensor input) -> Tensor");
+}
 
-TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
+TORCH_LIBRARY_IMPL(jit_weak_ref_tensor, CUDA, ops) {
   ops.impl("weak_ref_tensor", weak_ref_tensor);
 }
 

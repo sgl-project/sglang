@@ -12,5 +12,5 @@ load(
 )
 
 x = torch.arange(12, device="cuda").reshape(3, 4)
-y = torch.ops._C.weak_ref_tensor(x)
+y = torch.ops.jit_weak_ref_tensor.weak_ref_tensor(x)
 print("alias:", x.data_ptr() == y.data_ptr())
