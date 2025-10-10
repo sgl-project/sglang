@@ -44,7 +44,7 @@ graph TB
     end
 
     subgraph Factory Layer
-        MID --> PF[ParserFactory]
+        MID --> PF[ReasoningParserFactory]
         PF --> REG[ParserRegistry]
         REG --> PM[Pattern Matching]
         PM --> PP[Parser Pool]
@@ -93,7 +93,7 @@ graph TB
 ```mermaid
 sequenceDiagram
     participant C as Client
-    participant F as ParserFactory
+    participant F as ReasoningParserFactory
     participant R as Registry
     participant P as Parser Pool
     participant BP as BaseParser
@@ -206,7 +206,7 @@ classDiagram
         +new() Self
     }
 
-    class ParserFactory {
+    class ReasoningParserFactory {
         -registry: ParserRegistry
         +new() Self
         +get_pooled(model_id: &str) PooledParser
@@ -240,7 +240,7 @@ classDiagram
     Step3Parser o-- BaseReasoningParser
 
     BaseReasoningParser o-- ParserConfig
-    ParserFactory o-- ParserRegistry
+    ReasoningParserFactory o-- ParserRegistry
     ParserRegistry o-- ReasoningParser
 ```
 
@@ -302,7 +302,7 @@ classDiagram
    - Delegate to get_pooled_parser
    - Case-insensitive comparison
 
-**ParserFactory Methods**:
+**ReasoningParserFactory Methods**:
 
 1. **`new()`**:
    - Register all built-in parsers
@@ -437,7 +437,7 @@ impl ReasoningParser for MyModelParser {
 **Step 2: Register in Factory**
 
 ```rust
-// In factory.rs ParserFactory::new()
+// In factory.rs ReasoningParserFactory::new()
 registry.register_parser("mymodel", || {
     Box::new(MyModelParser::new())
 });
