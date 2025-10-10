@@ -218,6 +218,8 @@ class ServerArgs:
 
     # Runtime options
     device: Optional[str] = None
+    elastic_ep_backend: Literal[None, "mooncake"] = None
+    mooncake_ib_device: Optional[str] = None
     tp_size: int = 1
     pp_size: int = 1
     pp_max_micro_batch_size: Optional[int] = None
@@ -330,7 +332,7 @@ class ServerArgs:
 
     # Expert parallelism
     ep_size: int = 1
-    moe_a2a_backend: Literal["none", "deepep"] = "none"
+    moe_a2a_backend: Literal["none", "deepep", "mooncake"] = "none"
     moe_runner_backend: str = "auto"
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
     enable_flashinfer_allreduce_fusion: bool = False
@@ -519,7 +521,7 @@ class ServerArgs:
 
         # Handle MoE configurations.
         self._handle_moe_kernel_config()
-        self._handle_deepep_moe()
+        self._handle_a2a_moe()
         self._handle_eplb_and_dispatch()
         self._handle_expert_distribution_metrics()
 
@@ -555,6 +557,9 @@ class ServerArgs:
 
         # Handle any other necessary validations.
         self._handle_other_validations()
+
+        # Handle elastic expert parallelism.
+        self._handle_elastic_ep()
 
     def _handle_deprecated_args(self):
         # handle deprecated tool call parsers
@@ -1024,7 +1029,7 @@ class ServerArgs:
                 "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
             )
 
-    def _handle_deepep_moe(self):
+    def _handle_a2a_moe(self):
         if self.moe_a2a_backend == "deepep":
             if self.deepep_mode == "normal":
                 logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
@@ -1032,6 +1037,12 @@ class ServerArgs:
             self.ep_size = self.tp_size
             logger.warning(
                 f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
+            )
+
+        if self.moe_a2a_backend == "mooncake":
+            self.ep_size = self.tp_size
+            logger.warning(
+                f"Mooncake MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
 
     def _handle_eplb_and_dispatch(self):
@@ -1048,6 +1059,15 @@ class ServerArgs:
 
         if self.enable_eplb:
             assert self.ep_size > 1
+
+
+    def _handle_elastic_ep(self):
+        if self.elastic_ep_backend is not None:
+            assert self.enable_eplb, "Elastic EP requires EPLB to be enabled."
+            assert self.ep_dispatch_algorithm == "dynamic", "Elastic EP requires EPLB dynamic dispatch."
+            if self.eplb_algorithm == "auto" :
+                self.eplb_algorithm = "elasticity_aware"
+            assert  self.eplb_algorithm != "elasticity_aware", "Elastic EP requires eplb_algorithm to be set to 'auto' or 'elasticity_aware'."
 
     def _handle_expert_distribution_metrics(self):
         if self.enable_expert_distribution_metrics and (
@@ -1623,6 +1643,21 @@ class ServerArgs:
             type=str,
             default=ServerArgs.device,
             help="The device to use ('cuda', 'xpu', 'hpu', 'npu', 'cpu'). Defaults to auto-detection if not specified.",
+        )
+        parser.add_argument(
+            "--elastic-ep-backend",
+            type=str,
+            default=ServerArgs.elastic_ep_backend,
+            choices=["none", "mooncake"],
+            help="Specify the collective communication backend for elastic EP. Currently supports 'mooncake'.",
+        )
+        parser.add_argument(
+            "--mooncake-ib-device",
+            type=str,
+            default=ServerArgs.mooncake_ib_device,
+            help="The InfiniBand devices for Mooncake Backend transfer, accepts multiple comma-separated devices "
+            "(e.g., --mooncake-ib-device mlx5_0,mlx5_1). "
+            "Default is None, which triggers automatic device detection when Mooncake Backend is enabled.",
         )
         parser.add_argument(
             "--tensor-parallel-size",
@@ -2223,7 +2258,7 @@ class ServerArgs:
         parser.add_argument(
             "--moe-a2a-backend",
             type=str,
-            choices=["none", "deepep"],
+            choices=["none", "deepep", "mooncake"],
             default=ServerArgs.moe_a2a_backend,
             help="Choose the backend for MoE A2A.",
         )
