@@ -12,7 +12,7 @@ jobs:
     strategy:
       matrix:
         variant:
-          - version: 13.0.1
+          - version: 12.9.1
             type: all
             tag: dev-x86
     steps:
@@ -52,7 +52,7 @@ jobs:
     strategy:
       matrix:
         variant:
-          - version: 13.0.1
+          - version: 12.9.1
             type: all_aarch64
             tag: dev-arm64
     steps:
