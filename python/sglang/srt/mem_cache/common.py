@@ -7,6 +7,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.server_args import ServerArgs
@@ -210,7 +211,15 @@ def alloc_token_slots(
     out_cache_loc = allocator.alloc(num_tokens)
 
     if out_cache_loc is None:
-        return None
+        error_msg = (
+            f"Out of memory. Try to lower your batch size.\n"
+            f"Try to allocate {num_tokens} tokens.\n"
+            f"{available_and_evictable_str(tree_cache)}"
+        )
+        logger.error(error_msg)
+        if tree_cache is not None:
+            tree_cache.pretty_print()
+        raise RuntimeError(error_msg)
 
     return (out_cache_loc, state) if backup_state else out_cache_loc
 
@@ -272,7 +281,15 @@ def alloc_paged_token_slots_extend(
     )
 
     if out_cache_loc is None:
-        return None
+        error_msg = (
+            f"Prefill out of memory. Try to lower your batch size.\n"
+            f"Try to allocate {extend_num_tokens} tokens.\n"
+            f"{available_and_evictable_str(tree_cache)}"
+        )
+        logger.error(error_msg)
+        if tree_cache is not None:
+            tree_cache.pretty_print()
+        raise RuntimeError(error_msg)
 
     return (out_cache_loc, state) if backup_state else out_cache_loc
 
@@ -323,7 +340,7 @@ def alloc_for_extend(
     req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
     req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
 
-    # Allocate KV cache
+    # Allocate KV cache (throws exception on failure)
     if batch.tree_cache.page_size == 1:
         out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
     else:
@@ -364,6 +381,35 @@ def alloc_for_extend(
     return out_cache_loc, req_pool_indices_device, req_pool_indices
 
 
+def alloc_paged_token_slots_decode(
+    tree_cache: BasePrefixCache,
+    seq_lens: torch.Tensor,
+    seq_lens_cpu: torch.Tensor,
+    last_loc: torch.Tensor,
+    token_per_req: int = 1,
+) -> torch.Tensor:
+    """Allocate paged KV cache for decode batch."""
+    allocator = tree_cache.token_to_kv_pool_allocator
+    # Over estimate the number of tokens: assume each request needs a new page.
+    num_tokens = len(seq_lens) * allocator.page_size
+    evict_from_tree_cache(tree_cache, num_tokens)
+
+    out_cache_loc = allocator.alloc_decode(seq_lens, seq_lens_cpu, last_loc)
+
+    if out_cache_loc is None:
+        error_msg = (
+            f"Decode out of memory. Try to lower your batch size.\n"
+            f"Try to allocate {len(seq_lens) * token_per_req} tokens.\n"
+            f"{available_and_evictable_str(tree_cache)}"
+        )
+        logger.error(error_msg)
+        if tree_cache is not None:
+            tree_cache.pretty_print()
+        raise RuntimeError(error_msg)
+
+    return out_cache_loc
+
+
 def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     """
     Allocate KV cache for decode batch and write to req_to_token_pool.
@@ -382,12 +428,12 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
             batch.req_pool_indices, batch.seq_lens - 1
         ]
         seq_lens_next = batch.seq_lens + token_per_req
-        allocator = batch.tree_cache.token_to_kv_pool_allocator
-        # Over estimate the number of tokens: assume each request needs a new page.
-        num_tokens = len(seq_lens_next) * allocator.page_size
-        evict_from_tree_cache(batch.tree_cache, num_tokens)
-        out_cache_loc = allocator.alloc_decode(
-            seq_lens_next, batch.seq_lens_cpu + token_per_req, last_loc
+        out_cache_loc = alloc_paged_token_slots_decode(
+            tree_cache=batch.tree_cache,
+            seq_lens=seq_lens_next,
+            seq_lens_cpu=batch.seq_lens_cpu + token_per_req,
+            last_loc=last_loc,
+            token_per_req=token_per_req,
         )
 
     # Write to req_to_token_pool
@@ -401,3 +447,22 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     )
 
     return out_cache_loc
+
+
+def available_and_evictable_str(tree_cache) -> str:
+    token_to_kv_pool_allocator = tree_cache.token_to_kv_pool_allocator
+    if isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
+        full_available_size = token_to_kv_pool_allocator.full_available_size()
+        swa_available_size = token_to_kv_pool_allocator.swa_available_size()
+        full_evictable_size = tree_cache.full_evictable_size()
+        swa_evictable_size = tree_cache.swa_evictable_size()
+        return (
+            f"Available full tokens: {full_available_size + full_evictable_size} ({full_available_size=} + {full_evictable_size=})\n"
+            f"Available swa tokens: {swa_available_size + swa_evictable_size} ({swa_available_size=} + {swa_evictable_size=})\n"
+            f"Full LRU list evictable size: {tree_cache.full_lru_list_evictable_size()}\n"
+            f"SWA LRU list evictable size: {tree_cache.swa_lru_list_evictable_size()}\n"
+        )
+    else:
+        available_size = token_to_kv_pool_allocator.available_size()
+        evictable_size = tree_cache.evictable_size()
+        return f"Available tokens: {available_size + evictable_size} ({available_size=} + {evictable_size=})\n"
