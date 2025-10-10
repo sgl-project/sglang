@@ -118,8 +118,8 @@ __device__ __forceinline__ T* get_global_offset_phf(
          + layer_id * item_size_bytes / head_fragment_num;
 }
 
-template <auto SrcOffsetFn, auto DstOffsetFn, bool IsMLA>
-__global__ void transfer_kernel_impl(
+template <auto SrcOffsetFn, auto DstOffsetFn>
+__global__ void transfer_flex_tp_kernel_impl(
     const void* __restrict__ src_k,
     void* __restrict__ dst_k,
     const void* __restrict__ src_v,
@@ -153,36 +153,68 @@ __global__ void transfer_kernel_impl(
 
     // Loop over layers if necessary
     for (int64_t layer_id = start_layer_id; layer_id < start_layer_id + num_layers_to_process; ++layer_id) {
-
-      if (head_fragment_num > 1) {
-        for (int64_t head_fragment_id = 0; head_fragment_id < head_fragment_num; ++head_fragment_id) {
-          const char* src_ptr = SrcOffsetFn(
-              static_cast<const char*>(src_k), src_k_layer_tbl, layer_id, src_layout_dim, src_page_id, item_size_bytes, head_fragment_num, head_fragment_id, page_size);
-          char* dst_ptr = DstOffsetFn(
-              static_cast<char*>(dst_k), dst_k_layer_tbl, layer_id, dst_layout_dim, dst_page_id, item_size_bytes, head_fragment_num, head_fragment_id, page_size);
-          transfer_item_warp(lane_id, src_ptr, dst_ptr, item_size_bytes / head_fragment_num);
-          const char* src_v_ptr = SrcOffsetFn(
-              static_cast<const char*>(src_v), src_v_layer_tbl, layer_id, src_layout_dim, src_page_id, item_size_bytes, head_fragment_num, head_fragment_id, page_size);
-          char* dst_v_ptr = DstOffsetFn(
-              static_cast<char*>(dst_v), dst_v_layer_tbl, layer_id, dst_layout_dim, dst_page_id, item_size_bytes, head_fragment_num, head_fragment_id, page_size);
-          transfer_item_warp(lane_id, src_v_ptr, dst_v_ptr, item_size_bytes / head_fragment_num);
-        }
-      } else {
+      for (int64_t head_fragment_id = 0; head_fragment_id < head_fragment_num; ++head_fragment_id) {
         const char* src_ptr = SrcOffsetFn(
-            static_cast<const char*>(src_k), src_k_layer_tbl, layer_id, src_layout_dim, src_page_id, item_size_bytes);
+            static_cast<const char*>(src_k), src_k_layer_tbl, layer_id, src_layout_dim, src_page_id, item_size_bytes, head_fragment_num, head_fragment_id, page_size);
         char* dst_ptr = DstOffsetFn(
-            static_cast<char*>(dst_k), dst_k_layer_tbl, layer_id, dst_layout_dim, dst_page_id, item_size_bytes);
-        transfer_item_warp(lane_id, src_ptr, dst_ptr, item_size_bytes);
-
-        if constexpr (!IsMLA) {
-          const char* src_v_ptr = SrcOffsetFn(
-              static_cast<const char*>(src_v), src_v_layer_tbl, layer_id, src_layout_dim, src_page_id, item_size_bytes);
-          char* dst_v_ptr = DstOffsetFn(
-              static_cast<char*>(dst_v), dst_v_layer_tbl, layer_id, dst_layout_dim, dst_page_id, item_size_bytes);
-          transfer_item_warp(lane_id, src_v_ptr, dst_v_ptr, item_size_bytes);
-        }
+            static_cast<char*>(dst_k), dst_k_layer_tbl, layer_id, dst_layout_dim, dst_page_id, item_size_bytes, head_fragment_num, head_fragment_id, page_size);
+        transfer_item_warp(lane_id, src_ptr, dst_ptr, item_size_bytes / head_fragment_num);
+        const char* src_v_ptr = SrcOffsetFn(
+            static_cast<const char*>(src_v), src_v_layer_tbl, layer_id, src_layout_dim, src_page_id, item_size_bytes, head_fragment_num, head_fragment_id, page_size);
+        char* dst_v_ptr = DstOffsetFn(
+            static_cast<char*>(dst_v), dst_v_layer_tbl, layer_id, dst_layout_dim, dst_page_id, item_size_bytes, head_fragment_num, head_fragment_id, page_size);
+        transfer_item_warp(lane_id, src_v_ptr, dst_v_ptr, item_size_bytes / head_fragment_num);
       }
+    }
+  }
+}
 
+template <auto SrcOffsetFn, auto DstOffsetFn, bool IsMLA>
+__global__ void transfer_kernel_impl(
+    const void* __restrict__ src_k,
+    void* __restrict__ dst_k,
+    const void* __restrict__ src_v,
+    void* __restrict__ dst_v,
+    const int64_t* __restrict__ src_indices,
+    const int64_t* __restrict__ dst_indices,
+    int64_t start_layer_id,
+    int64_t num_layers_to_process,
+    int64_t num_items,
+    int64_t items_per_warp,
+    int64_t item_size_bytes,
+    int64_t src_layout_dim,
+    int64_t dst_layout_dim,
+    const uintptr_t* __restrict__ src_k_layer_tbl,
+    const uintptr_t* __restrict__ dst_k_layer_tbl,
+    const uintptr_t* __restrict__ src_v_layer_tbl,
+    const uintptr_t* __restrict__ dst_v_layer_tbl) {
+  int32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  int32_t lane_id = tid % WARP_SIZE;
+  int32_t warp_id = tid / WARP_SIZE;
+
+  for (int i = 0; i < items_per_warp; ++i) {
+    int64_t item_id = warp_id * items_per_warp + i;
+    if (item_id >= num_items) {
+      break;
+    }
+    const int64_t src_page_id = src_indices[item_id];
+    const int64_t dst_page_id = dst_indices[item_id];
+
+    // Loop over layers if necessary
+    for (int64_t layer_id = start_layer_id; layer_id < start_layer_id + num_layers_to_process; ++layer_id) {
+      const char* src_ptr = SrcOffsetFn(
+          static_cast<const char*>(src_k), src_k_layer_tbl, layer_id, src_layout_dim, src_page_id, item_size_bytes);
+      char* dst_ptr = DstOffsetFn(
+          static_cast<char*>(dst_k), dst_k_layer_tbl, layer_id, dst_layout_dim, dst_page_id, item_size_bytes);
+      transfer_item_warp(lane_id, src_ptr, dst_ptr, item_size_bytes);
+
+      if constexpr (!IsMLA) {
+        const char* src_v_ptr = SrcOffsetFn(
+            static_cast<const char*>(src_v), src_v_layer_tbl, layer_id, src_layout_dim, src_page_id, item_size_bytes);
+        char* dst_v_ptr = DstOffsetFn(
+            static_cast<char*>(dst_v), dst_v_layer_tbl, layer_id, dst_layout_dim, dst_page_id, item_size_bytes);
+        transfer_item_warp(lane_id, src_v_ptr, dst_v_ptr, item_size_bytes);
+      }
     }
   }
 }
@@ -232,7 +264,8 @@ void transfer_kv_launcher(
   const uintptr_t* dst_v_tbl_ptr = IsMLA || !dst_v_layers.defined() ? nullptr : dst_v_layers.data_ptr<uintptr_t>();
 
   cudaStream_t torch_current_stream = at::cuda::getCurrentCUDAStream();
-  transfer_kernel_impl<SrcOffsetFn, DstOffsetFn, IsMLA><<<grid_dim, threads_per_block, 0, torch_current_stream>>>(
+  if (head_fragment_num > 1) {
+    transfer_flex_tp_kernel_impl<SrcOffsetFn, DstOffsetFn><<<grid_dim, threads_per_block, 0, torch_current_stream>>>(
       src_k_ptr,
       dst_k_ptr,
       src_v_ptr,
@@ -252,6 +285,26 @@ void transfer_kv_launcher(
       dst_v_tbl_ptr,
       page_size,
       head_fragment_num);
+  } else {
+    transfer_kernel_impl<SrcOffsetFn, DstOffsetFn, IsMLA><<<grid_dim, threads_per_block, 0, torch_current_stream>>>(
+      src_k_ptr,
+      dst_k_ptr,
+      src_v_ptr,
+      dst_v_ptr,
+      src_indices.data_ptr<int64_t>(),
+      dst_indices.data_ptr<int64_t>(),
+      start_layer_id,
+      num_layers_to_process,
+      num_items,
+      items_per_warp,
+      item_size,
+      src_layout_dim,
+      dst_layout_dim,
+      src_k_tbl_ptr,
+      dst_k_tbl_ptr,
+      src_v_tbl_ptr,
+      dst_v_tbl_ptr);
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
