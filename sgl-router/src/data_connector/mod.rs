@@ -1,4 +1,7 @@
 // Data connector module for response storage and conversation storage
+pub mod conversation_item_memory_store;
+pub mod conversation_item_oracle_store;
+pub mod conversation_items;
 pub mod conversation_memory_store;
 pub mod conversation_noop_store;
 pub mod conversation_oracle_store;
@@ -8,6 +11,14 @@ pub mod response_noop_store;
 pub mod response_oracle_store;
 pub mod responses;
 
+pub use conversation_item_memory_store::MemoryConversationItemStorage;
+pub use conversation_item_oracle_store::OracleConversationItemStorage;
+pub use conversation_items::{
+    ConversationItem, ConversationItemId, ConversationItemStorage, ConversationItemStorageError,
+    ListParams as ConversationItemsListParams, NewConversationItem,
+    Result as ConversationItemsResult, SharedConversationItemStorage,
+    SortOrder as ConversationItemsSortOrder,
+};
 pub use conversation_memory_store::MemoryConversationStorage;
 pub use conversation_noop_store::NoOpConversationStorage;
 pub use conversation_oracle_store::OracleConversationStorage;

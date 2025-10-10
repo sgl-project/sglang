@@ -13,10 +13,10 @@ use crate::protocols::spec::{
     ChatChoice, ChatCompletionMessage, ChatCompletionRequest, FunctionCallResponse, ToolCall,
     ToolChoice, ToolChoiceValue,
 };
-use crate::reasoning_parser::ReasoningParserFactory;
+use crate::reasoning_parser::ParserFactory as ReasoningParserFactory;
 use crate::tokenizer::stop::{SequenceDecoderOutput, StopSequenceDecoder};
 use crate::tokenizer::traits::Tokenizer;
-use crate::tool_parser::ToolParserFactory;
+use crate::tool_parser::ParserFactory as ToolParserFactory;
 
 use super::utils;
 

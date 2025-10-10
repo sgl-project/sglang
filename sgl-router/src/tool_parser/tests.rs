@@ -7,7 +7,7 @@ use crate::tool_parser::traits::ToolParser;
 
 #[tokio::test]
 async fn test_tool_parser_factory() {
-    let factory = ToolParserFactory::new();
+    let factory = ParserFactory::new();
 
     // Test that we can get a pooled parser
     let pooled_parser = factory.get_pooled("gpt-4");
@@ -17,7 +17,7 @@ async fn test_tool_parser_factory() {
 
 #[tokio::test]
 async fn test_tool_parser_factory_model_mapping() {
-    let factory = ToolParserFactory::new();
+    let factory = ParserFactory::new();
 
     // Test model mapping
     factory.registry().map_model("test-model", "json");
@@ -54,22 +54,22 @@ fn test_partial_json_parser() {
     let parser = PartialJson::default();
 
     let input = r#"{"name": "test", "value": 42}"#;
-    let (value, consumed) = parser.parse_value(input).unwrap();
+    let (value, consumed) = parser.parse_value(input, true).unwrap();
     assert_eq!(value["name"], "test");
     assert_eq!(value["value"], 42);
     assert_eq!(consumed, input.len());
 
     let input = r#"{"name": "test", "value": "#;
-    let (value, _consumed) = parser.parse_value(input).unwrap();
+    let (value, _consumed) = parser.parse_value(input, true).unwrap();
     assert_eq!(value["name"], "test");
     assert!(value["value"].is_null());
 
     let input = r#"{"name": "tes"#;
-    let (value, _consumed) = parser.parse_value(input).unwrap();
+    let (value, _consumed) = parser.parse_value(input, true).unwrap();
     assert_eq!(value["name"], "tes");
 
     let input = r#"[1, 2, "#;
-    let (value, _consumed) = parser.parse_value(input).unwrap();
+    let (value, _consumed) = parser.parse_value(input, true).unwrap();
     assert!(value.is_array());
     assert_eq!(value[0], 1);
     assert_eq!(value[1], 2);
@@ -83,17 +83,17 @@ fn test_partial_json_depth_limit() {
 
     // This should work (simple object)
     let input = r#"{"a": 1}"#;
-    let result = parser.parse_value(input);
+    let result = parser.parse_value(input, true);
     assert!(result.is_ok());
 
     // This should work (nested to depth 3)
     let input = r#"{"a": {"b": {"c": 1}}}"#;
-    let result = parser.parse_value(input);
+    let result = parser.parse_value(input, true);
     assert!(result.is_ok());
 
     // This should fail (nested to depth 4, exceeds limit)
     let input = r#"{"a": {"b": {"c": {"d": 1}}}}"#;
-    let result = parser.parse_value(input);
+    let result = parser.parse_value(input, true);
     assert!(result.is_err());
 }
 
@@ -244,7 +244,7 @@ fn test_json_parser_format_detection() {
 
 #[tokio::test]
 async fn test_factory_with_json_parser() {
-    let factory = ToolParserFactory::new();
+    let factory = ParserFactory::new();
 
     // Should get JSON parser for OpenAI models
     let pooled_parser = factory.get_pooled("gpt-4-turbo");

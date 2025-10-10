@@ -21,7 +21,7 @@ use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tonic::codec::Streaming;
-use tracing::{debug, error, warn};
+use tracing::{error, warn};
 use uuid::Uuid;
 
 /// Get gRPC client from worker, returning appropriate error response on failure
@@ -522,7 +522,7 @@ pub fn parse_json_schema_response(
             match serde_json::from_str::<Value>(processed_text) {
                 Ok(params) => {
                     let tool_call = ToolCall {
-                        id: format!("call_{}", uuid::Uuid::new_v4()),
+                        id: format!("call_{}", Uuid::new_v4()),
                         tool_type: "function".to_string(),
                         function: FunctionCallResponse {
                             name: function.name.clone(),
@@ -553,7 +553,7 @@ pub fn parse_json_schema_response(
                             let parameters = obj.get("parameters")?;
 
                             Some(ToolCall {
-                                id: format!("call_{}_{}", i, uuid::Uuid::new_v4()),
+                                id: format!("call_{}_{}", i, Uuid::new_v4()),
                                 tool_type: "function".to_string(),
                                 function: FunctionCallResponse {
                                     name,
@@ -602,10 +602,6 @@ pub async fn collect_stream_responses(
             Ok(gen_response) => {
                 match gen_response.response {
                     Some(Complete(complete)) => {
-                        debug!(
-                        "{} completed: prompt_tokens={}, completion_tokens={}, finish_reason={}",
-                        worker_name, complete.prompt_tokens, complete.completion_tokens, complete.finish_reason
-                    );
                         all_responses.push(complete);
                     }
                     Some(Error(err)) => {
@@ -615,11 +611,11 @@ pub async fn collect_stream_responses(
                             worker_name, err.message
                         )));
                     }
-                    Some(Chunk(chunk)) => {
-                        debug!("{} chunk: {} tokens", worker_name, chunk.token_ids.len());
+                    Some(Chunk(_chunk)) => {
+                        // Streaming chunk - no action needed
                     }
                     None => {
-                        debug!("{}: empty response", worker_name);
+                        // Empty response - no action needed
                     }
                 }
             }
@@ -633,7 +629,6 @@ pub async fn collect_stream_responses(
         }
     }
 
-    debug!("{} stream closed", worker_name);
     Ok(all_responses)
 }
 
@@ -682,13 +677,12 @@ pub fn generate_tool_call_id(
 ///
 /// If a parser name is explicitly configured, use that parser.
 /// Otherwise, auto-detect based on the model name.
+/// Get a pooled reasoning parser (for non-streaming where state doesn't matter)
 pub fn get_reasoning_parser(
-    reasoning_parser_factory: &crate::reasoning_parser::ReasoningParserFactory,
+    reasoning_parser_factory: &crate::reasoning_parser::ParserFactory,
     configured_parser: Option<&String>,
     model: &str,
 ) -> crate::reasoning_parser::PooledParser {
-    use tracing::warn;
-
     if let Some(parser_name) = configured_parser {
         // Use configured parser if specified
         reasoning_parser_factory
@@ -707,17 +701,40 @@ pub fn get_reasoning_parser(
     }
 }
 
+/// Create a fresh reasoning parser instance (for streaming where state isolation is needed)
+pub fn create_reasoning_parser(
+    reasoning_parser_factory: &crate::reasoning_parser::ParserFactory,
+    configured_parser: Option<&String>,
+    model: &str,
+) -> Option<Box<dyn crate::reasoning_parser::ReasoningParser>> {
+    if let Some(parser_name) = configured_parser {
+        // Use configured parser if specified
+        reasoning_parser_factory
+            .registry()
+            .create_parser(parser_name)
+            .or_else(|| {
+                warn!(
+                    "Configured reasoning parser '{}' not found, falling back to model-based selection",
+                    parser_name
+                );
+                reasoning_parser_factory.registry().create_for_model(model)
+            })
+    } else {
+        // Auto-detect based on model
+        reasoning_parser_factory.registry().create_for_model(model)
+    }
+}
+
 /// Get the appropriate tool parser for a model
 ///
 /// If a parser name is explicitly configured, use that parser.
 /// Otherwise, auto-detect based on the model name.
+/// Get a pooled tool parser (for non-streaming where state doesn't matter)
 pub fn get_tool_parser(
-    tool_parser_factory: &crate::tool_parser::ToolParserFactory,
+    tool_parser_factory: &crate::tool_parser::ParserFactory,
     configured_parser: Option<&String>,
     model: &str,
-) -> crate::tool_parser::PooledToolParser {
-    use tracing::warn;
-
+) -> crate::tool_parser::PooledParser {
     if let Some(parser_name) = configured_parser {
         // Use configured parser if specified
         tool_parser_factory
@@ -733,6 +750,30 @@ pub fn get_tool_parser(
     } else {
         // Auto-detect based on model
         tool_parser_factory.get_pooled(model)
+    }
+}
+
+/// Create a fresh tool parser instance (for streaming where state isolation is needed)
+pub fn create_tool_parser(
+    tool_parser_factory: &crate::tool_parser::ParserFactory,
+    configured_parser: Option<&String>,
+    model: &str,
+) -> Option<Box<dyn crate::tool_parser::ToolParser>> {
+    if let Some(parser_name) = configured_parser {
+        // Use configured parser if specified
+        tool_parser_factory
+            .registry()
+            .create_parser(parser_name)
+            .or_else(|| {
+                warn!(
+                    "Configured tool parser '{}' not found, falling back to model-based selection",
+                    parser_name
+                );
+                tool_parser_factory.registry().create_for_model(model)
+            })
+    } else {
+        // Auto-detect based on model
+        tool_parser_factory.registry().create_for_model(model)
     }
 }
 

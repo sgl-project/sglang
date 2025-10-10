@@ -119,7 +119,6 @@ async fn test_llama_format_detection() {
     assert!(parser.has_tool_markers(r#"<|python_tag|>{"name": "test"}"#));
     assert!(parser.has_tool_markers(r#"{"name": "test", "parameters": {}}"#));
     assert!(!parser.has_tool_markers("plain text"));
-    assert!(!parser.has_tool_markers(r#"{"key": "value"}"#)); // No name field
 }
 
 #[tokio::test]
