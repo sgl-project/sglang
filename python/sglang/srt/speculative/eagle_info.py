@@ -712,6 +712,11 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         return kv_indices, cum_kv_seq_len, qo_indptr, None
 
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
+        if self.future_indices is not None:
+            self.future_indices.indices = self.future_indices.indices[new_indices]
+            self.allocate_lens = self.allocate_lens[new_indices]
+            return
+
         if has_been_filtered:
             # in eagle_utils.py:verify, we have already filtered the batch by `unfinished_index`
             # therefore, we don't need to filter the batch again in scheduler
@@ -731,6 +736,18 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             self.verified_id = self.verified_id[new_indices]
 
     def merge_batch(self, spec_info: "EagleDraftInput"):
+        if self.future_indices is not None:
+            assert spec_info.future_indices is not None
+            self.future_indices = FutureIndices(
+                indices=torch.cat(
+                    [self.future_indices.indices, spec_info.future_indices.indices]
+                )
+            )
+            self.allocate_lens = torch.cat(
+                [self.allocate_lens, spec_info.allocate_lens]
+            )
+            return
+
         if self.hidden_states is None:
             self.hidden_states = spec_info.hidden_states
             self.verified_id = spec_info.verified_id

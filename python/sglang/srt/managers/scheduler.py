@@ -2147,10 +2147,15 @@ class Scheduler(
 
                 if batch.is_v2_eagle:
                     # FIXME(lsyin): tmp code for eagle v2
-                    batch.spec_info = batch_result.next_draft_input
-                    batch.spec_info.future_indices = future_indices
+                    # We only keep future indices for next draft input
+                    batch.spec_info = EagleDraftInput(
+                        future_indices=future_indices,
+                        # FIXME(lsyin): remove the allocate_lens in EagleDraftInput
+                        allocate_lens=batch_result.next_draft_input.allocate_lens,
+                    )
 
                     # The future value, usually for next batch preparation
+                    # Current implementation strictly synchronizes the seq_lens
                     batch.seq_lens = batch_result.next_draft_input.new_seq_lens
             else:
                 batch_result = self.model_worker.forward_batch_generation(
