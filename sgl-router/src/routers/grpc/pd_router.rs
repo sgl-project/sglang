@@ -23,6 +23,9 @@ use std::sync::Arc;
 
 use tracing::debug;
 
+use super::context::SharedComponents;
+use super::pipeline::RequestPipeline;
+
 /// gRPC PD (Prefill-Decode) router implementation for SGLang
 #[derive(Clone)]
 #[allow(dead_code)] // Fields will be used once implementation is complete
@@ -37,8 +40,8 @@ pub struct GrpcPDRouter {
     retry_config: RetryConfig,
     configured_reasoning_parser: Option<String>,
     configured_tool_parser: Option<String>,
-    pipeline: super::pipeline::ChatCompletionPipeline,
-    shared_components: Arc<super::context::SharedComponents>,
+    pipeline: RequestPipeline,
+    shared_components: Arc<SharedComponents>,
 }
 
 impl GrpcPDRouter {
@@ -66,7 +69,7 @@ impl GrpcPDRouter {
             .clone();
 
         // Create shared components for pipeline
-        let shared_components = Arc::new(super::context::SharedComponents {
+        let shared_components = Arc::new(SharedComponents {
             tokenizer: tokenizer.clone(),
             tool_parser_factory: tool_parser_factory.clone(),
             reasoning_parser_factory: reasoning_parser_factory.clone(),
@@ -91,7 +94,7 @@ impl GrpcPDRouter {
         ));
 
         // Create PD pipeline
-        let pipeline = super::pipeline::ChatCompletionPipeline::new_pd(
+        let pipeline = RequestPipeline::new_pd(
             worker_registry.clone(),
             policy_registry.clone(),
             processor,

@@ -904,16 +904,16 @@ impl ResponseProcessingStage {
 // Pipeline Orchestrator
 // ============================================================================
 
-/// Complete chat completion pipeline
+/// Generic request pipeline for all request types
 ///
 /// Orchestrates all stages from request preparation to response delivery.
 /// Configured differently for regular vs PD mode.
 #[derive(Clone)]
-pub struct ChatCompletionPipeline {
+pub struct RequestPipeline {
     stages: Arc<Vec<Box<dyn PipelineStage>>>,
 }
 
-impl ChatCompletionPipeline {
+impl RequestPipeline {
     /// Create a regular (single-worker) pipeline
     pub fn new_regular(
         worker_registry: Arc<WorkerRegistry>,
