@@ -1,9 +1,8 @@
 import logging
-from typing import Optional
+from typing import List, Optional
 
 import torch
 from torch.cuda import Stream as CudaStream
-from traitlets import List
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, Req
