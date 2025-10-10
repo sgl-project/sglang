@@ -1,6 +1,9 @@
 //! Kimi K2 Parser Integration Tests
 
-use sglang_router_rs::tool_parser::{KimiK2Parser, ParseState, StreamResult, ToolParser};
+use sglang_router_rs::tool_parser::{KimiK2Parser, ToolParser};
+
+mod common;
+use common::create_test_tools;
 
 #[tokio::test]
 async fn test_kimik2_complete_parsing() {
@@ -12,8 +15,9 @@ async fn test_kimik2_complete_parsing() {
 <|tool_calls_section_end|>
 The weather in Tokyo is..."#;
 
-    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
     assert_eq!(tools.len(), 1);
+    assert_eq!(normal_text, "Let me help you with that.\n");
     assert_eq!(tools[0].function.name, "get_weather");
 
     let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
@@ -30,8 +34,9 @@ async fn test_kimik2_multiple_tools() {
 <|tool_call_begin|>functions.translate:1<|tool_call_argument_begin|>{"text": "Hello", "to": "ja"}<|tool_call_end|>
 <|tool_calls_section_end|>"#;
 
-    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
     assert_eq!(tools.len(), 2);
+    assert_eq!(normal_text, "");
     assert_eq!(tools[0].function.name, "search");
     assert_eq!(tools[1].function.name, "translate");
 }
@@ -44,8 +49,9 @@ async fn test_kimik2_with_whitespace() {
 <|tool_call_begin|> functions.test:0 <|tool_call_argument_begin|> {"key": "value", "num": 42} <|tool_call_end|>
 <|tool_calls_section_end|>"#;
 
-    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
     assert_eq!(tools.len(), 1);
+    assert_eq!(normal_text, "");
     assert_eq!(tools[0].function.name, "test");
 
     let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
@@ -55,8 +61,9 @@ async fn test_kimik2_with_whitespace() {
 
 #[tokio::test]
 async fn test_kimik2_streaming() {
-    let parser = KimiK2Parser::new();
-    let mut state = ParseState::new();
+    let tools = create_test_tools();
+
+    let mut parser = KimiK2Parser::new();
 
     // Simulate streaming chunks
     let chunks = vec![
@@ -71,25 +78,19 @@ async fn test_kimik2_streaming() {
     ];
 
     let mut found_name = false;
-    let mut found_complete = false;
 
     for chunk in chunks {
-        let result = parser.parse_incremental(chunk, &mut state).await.unwrap();
+        let result = parser.parse_incremental(chunk, &tools).await.unwrap();
 
-        match result {
-            StreamResult::ToolName { name, .. } => {
+        for call in result.calls {
+            if let Some(name) = call.name {
                 assert_eq!(name, "calculate");
                 found_name = true;
             }
-            StreamResult::ToolComplete(tool) => {
-                assert_eq!(tool.function.name, "calculate");
-                found_complete = true;
-            }
-            _ => {}
         }
     }
 
-    assert!(found_name || found_complete);
+    assert!(found_name, "Should have found tool name during streaming");
 }
 
 #[test]
@@ -97,14 +98,13 @@ fn test_kimik2_format_detection() {
     let parser = KimiK2Parser::new();
 
     // Should detect Kimi K2 format
-    assert!(parser.detect_format("<|tool_calls_section_begin|>"));
-    assert!(parser.detect_format("<|tool_call_begin|>"));
-    assert!(parser.detect_format("text with <|tool_calls_section_begin|> marker"));
+    assert!(parser.has_tool_markers("<|tool_calls_section_begin|>"));
+    assert!(parser.has_tool_markers("text with <|tool_calls_section_begin|> marker"));
 
     // Should not detect other formats
-    assert!(!parser.detect_format("[TOOL_CALLS]"));
-    assert!(!parser.detect_format("<tool_call>"));
-    assert!(!parser.detect_format("plain text"));
+    assert!(!parser.has_tool_markers("[TOOL_CALLS]"));
+    assert!(!parser.has_tool_markers("<tool_call>"));
+    assert!(!parser.has_tool_markers("plain text"));
 }
 
 #[tokio::test]
@@ -117,8 +117,9 @@ async fn test_kimik2_sequential_indices() {
 <|tool_call_begin|>functions.third:2<|tool_call_argument_begin|>{"param": "c"}<|tool_call_end|>
 <|tool_calls_section_end|>"#;
 
-    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
     assert_eq!(tools.len(), 3);
+    assert_eq!(normal_text, "");
     assert_eq!(tools[0].function.name, "first");
     assert_eq!(tools[1].function.name, "second");
     assert_eq!(tools[2].function.name, "third");
@@ -134,12 +135,12 @@ async fn test_function_index_extraction() {
 <|tool_call_begin|>functions.calc:1<|tool_call_argument_begin|>{"x": 10}<|tool_call_end|>
 <|tool_calls_section_end|>"#;
 
-    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
     assert_eq!(tools.len(), 2);
+    assert_eq!(normal_text, "Text before tool calls.\n");
     assert_eq!(tools[0].function.name, "search");
     assert_eq!(tools[1].function.name, "calc");
     // TODO: Verify indices are preserved: 0 and 1
-    // TODO: Verify normal text = "Text before tool calls."
 }
 
 #[tokio::test]
@@ -152,5 +153,5 @@ async fn test_namespace_extraction() {
 
     let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
     assert_eq!(tools.len(), 1);
-    assert_eq!(tools[0].function.name, "search"); // Should extract after last dot
+    assert_eq!(tools[0].function.name, "api.tools.search"); // Includes full namespace
 }
