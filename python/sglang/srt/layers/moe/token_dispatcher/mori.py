@@ -479,6 +479,7 @@ class MoRIDispatcher(BaseDispatcher):
         max_tokens: int,
         hidden_dim: int,
     ) -> Optional[tuple[int, int]]:
+        # NOTE: Lazy import to avoid circular import
         from sglang.srt.layers.moe.ep_moe.layer import get_mori_quant_config
 
         global _use_fp8_dispatch

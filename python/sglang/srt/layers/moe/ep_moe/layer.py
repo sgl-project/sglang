@@ -68,7 +68,7 @@ if not (_is_npu or _is_hip):
 
 if _use_aiter:
     from aiter import ActivationType, QuantType
-    from aiter import dtype as aiter_dtypes
+    from aiter import dtypes as aiter_dtypes
     from aiter.fused_moe import fused_moe
 
 logger = logging.getLogger(__name__)
