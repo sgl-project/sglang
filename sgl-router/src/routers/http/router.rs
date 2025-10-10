@@ -95,7 +95,7 @@ impl Router {
 
                         match res.bytes().await {
                             Ok(body) => {
-                                let mut response = Response::new(axum::body::Body::from(body));
+                                let mut response = Response::new(Body::from(body));
                                 *response.status_mut() = status;
                                 *response.headers_mut() = response_headers;
                                 response
@@ -315,7 +315,7 @@ impl Router {
                     let response_headers = header_utils::preserve_response_headers(res.headers());
                     match res.bytes().await {
                         Ok(body) => {
-                            let mut response = Response::new(axum::body::Body::from(body));
+                            let mut response = Response::new(Body::from(body));
                             *response.status_mut() = status;
                             *response.headers_mut() = response_headers;
                             if status.is_success() {
@@ -496,7 +496,7 @@ impl Router {
 
             let response = match res.bytes().await {
                 Ok(body) => {
-                    let mut response = Response::new(axum::body::Body::from(body));
+                    let mut response = Response::new(Body::from(body));
                     *response.status_mut() = status;
                     *response.headers_mut() = response_headers;
                     response

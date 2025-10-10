@@ -120,7 +120,7 @@ def test_cutlass_w4a8_moe(M, N, K, E, tp_size, use_ep_moe, topk, group_size, dty
     )
     topk_weights, topk_ids, _ = topk_output
     expert_map = torch.arange(E, dtype=torch.int32, device=device)
-    expert_map[local_e:] = E
+    expert_map[local_e:] = -1
 
     output = cutlass_moe(
         a,
@@ -138,9 +138,7 @@ def test_cutlass_w4a8_moe(M, N, K, E, tp_size, use_ep_moe, topk, group_size, dty
         c_strides2,
         s_strides13,
         s_strides2,
-        0,
-        local_e - 1,
-        E,
+        local_e,
         a1_scale,
         a2_scale,
         expert_map,
@@ -178,7 +176,7 @@ def cutlass_moe(
     w1_scale: torch.Tensor,
     w2_scale: torch.Tensor,
     topk_weights: torch.Tensor,
-    topk_ids_: torch.Tensor,
+    topk_ids: torch.Tensor,
     a_strides1: torch.Tensor,
     b_strides1: torch.Tensor,
     c_strides1: torch.Tensor,
@@ -187,40 +185,32 @@ def cutlass_moe(
     c_strides2: torch.Tensor,
     s_strides13: torch.Tensor,
     s_strides2: torch.Tensor,
-    start_expert_id: int,
-    end_expert_id: int,
-    E: int,
+    num_local_experts: int,
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     expert_map: Optional[torch.Tensor] = None,
     apply_router_weight_on_input: bool = False,
 ):
-    local_topk_ids = topk_ids_
-    local_topk_ids = torch.where(expert_map[topk_ids_] != E, expert_map[topk_ids_], E)
+    topk_ids = expert_map[topk_ids]
     device = a.device
 
-    local_num_experts = end_expert_id - start_expert_id + 1
     expert_offsets = torch.empty(
-        (local_num_experts + 1), dtype=torch.int32, device=device
+        (num_local_experts + 1), dtype=torch.int32, device=device
     )
     problem_sizes1 = torch.empty(
-        (local_num_experts, 3), dtype=torch.int32, device=device
+        (num_local_experts, 3), dtype=torch.int32, device=device
     )
     problem_sizes2 = torch.empty(
-        (local_num_experts, 3), dtype=torch.int32, device=device
+        (num_local_experts, 3), dtype=torch.int32, device=device
     )
     return cutlass_w4a8_moe(
-        start_expert_id,
-        end_expert_id,
-        E,
         a,
         w1_q,
         w2_q,
         w1_scale,
         w2_scale,
         topk_weights,
-        topk_ids_,
-        local_topk_ids,
+        topk_ids,
         a_strides1,
         b_strides1,
         c_strides1,
