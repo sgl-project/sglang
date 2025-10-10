@@ -4,7 +4,6 @@ set -euxo pipefail
 
 IS_BLACKWELL=${IS_BLACKWELL:-0}
 CU_VERSION="cu128"
-echo "PATH=$PATH"
 # Kill existing processes
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 bash "${SCRIPT_DIR}/../killall_sglang.sh"
@@ -39,7 +38,7 @@ else
 fi
 
 # Install the main package
-$PIP_CMD install -e "python[dev]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} $PIP_INSTALL_SUFFIX --force-reinstall
+$PIP_CMD install -e "python[dev]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} $PIP_INSTALL_SUFFIX
 
 # Install router for pd-disagg test
 SGLANG_ROUTER_BUILD_NO_RUST=1 $PIP_CMD install -e "sgl-router" $PIP_INSTALL_SUFFIX
@@ -68,7 +67,7 @@ if [ "$IS_BLACKWELL" != "1" ]; then
     $PIP_CMD install -e lmms-eval/ $PIP_INSTALL_SUFFIX
 
     # Install xformers
-    $PIP_CMD install xformers --index-url https://download.pytorch.org/whl/${CU_VERSION} --no-deps $PIP_INSTALL_SUFFIX --force-reinstall
+    $PIP_CMD install xformers --index-url https://download.pytorch.org/whl/${CU_VERSION} --no-deps $PIP_INSTALL_SUFFIX
 fi
 
 # Show current packages
