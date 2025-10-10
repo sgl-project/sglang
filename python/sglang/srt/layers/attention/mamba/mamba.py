@@ -40,7 +40,7 @@ from sglang.srt.model_loader.weight_utils import (
     composed_weight_loader,
     sharded_weight_loader,
 )
-from sglang.srt.utils import set_weight_attrs
+from sglang.srt.utils import is_hip, set_weight_attrs
 
 LoaderFunction = Callable[[torch.Tensor, torch.Tensor], None]
 
@@ -436,6 +436,9 @@ class MambaMixer2(torch.nn.Module):
             dim=0,
         )
 
+        # Choose Triton on HIP (ROCm) or if explicitly requested.
+        use_triton = use_triton_causal_conv or is_hip()
+
         # Process prefill requests
         if has_prefill:
             mixed_metadata = metadata.mixed_metadata
@@ -449,11 +452,7 @@ class MambaMixer2(torch.nn.Module):
             x = hidden_states_B_C_p.transpose(
                 0, 1
             )  # this is the form that causal-conv see
-            ccfn = (
-                causal_conv1d_fn
-                if not use_triton_causal_conv
-                else causal_conv1d_fn_triton
-            )
+            ccfn = causal_conv1d_fn if not use_triton else causal_conv1d_fn_triton
             hidden_states_B_C_p = ccfn(
                 x,
                 conv_weights,
@@ -513,9 +512,7 @@ class MambaMixer2(torch.nn.Module):
         if has_decode:
             # 2. Convolution sequence transformation
             ccu = (
-                causal_conv1d_update
-                if not use_triton_causal_conv
-                else causal_conv1d_update_triton
+                causal_conv1d_update if not use_triton else causal_conv1d_update_triton
             )
             hidden_states_B_C_d = ccu(
                 hidden_states_B_C_d,
