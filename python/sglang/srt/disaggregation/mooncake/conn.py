@@ -283,7 +283,7 @@ class MooncakeKVManager(CommonKVManager):
         """
         # Group by indices for optimization
         prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
-            prefill_kv_indices, dst_kv_indices
+            prefill_data_indices, dst_data_indices
         )
 
         layers_params = None
