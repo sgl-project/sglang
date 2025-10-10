@@ -87,7 +87,8 @@ class NaiveDecodeSparseRetriver:
             )
 
     def build_stream(self, forward_batch: "ForwardBatch", metadata: "FlashAttentionMetadata") -> "FlashAttentionMetadata":
-        self.stream_indices_page = self._get_stream_indices(forward_batch)
+        if not self.cache_manager.config.async_retrive:
+            self.stream_indices_page = self._get_stream_indices(forward_batch)
         
     def _get_stream_indices(self, forward_batch: "ForwardBatch"):
         token_indices = forward_batch.req_to_token_pool.req_to_token[forward_batch.req_pool_indices, :]
@@ -135,9 +136,10 @@ class NaiveDecodeSparseRetriver:
         compute_score(q=query, 
                       k=proxy_k_tensor, 
                       out=score, 
-                      stream_indices_page=self.stream_indices_page, 
                       kv_pages_per_seq=kv_pages_per_seq, 
-                      kv_pages_num_per_seq=kv_pages_num_per_seq
+                      kv_pages_num_per_seq=kv_pages_num_per_seq,
+                      num_sink_pages=self.stream_budget[0] // self.cache_manager.config.page_size,
+                      num_local_pages=self.stream_budget[1] // self.cache_manager.config.page_size,
                     )
         _, topk_indices = torch.topk(score[:query.shape[0], :, :], k=top_k, dim=2, sorted=False)
         selected_page_indices[:query.shape[0], :, :] = topk_indices
@@ -178,15 +180,19 @@ class NaiveDecodeSparseRetriver:
         return combined_page_indices
         
     def _combine_indices_async(self, retrive_result: RetriveResult, req_pool_indices: torch.Tensor, req_to_token: torch.Tensor, seq_lens: torch.Tensor, diff: torch.Tensor):
+        num_sink_pages = self.stream_budget[0] // self.cache_manager.config.page_size
+        num_local_pages = self.stream_budget[1] // self.cache_manager.config.page_size
+        
         return combine_indices(
-                stream_indices=self.stream_indices_page,
                 retrived_cache_indices=retrive_result.retrived_cache_indices_page,
                 cur_req_pool_indices=req_pool_indices,
                 pre_req_pool_indices=retrive_result.req_pool_indices,
                 req_to_token=req_to_token,
-                seq_lens=seq_lens,
                 page_table=retrive_result.page_table,
+                seq_lens=seq_lens,
                 diff=diff,
+                num_sink_pages=num_sink_pages,
+                num_local_pages=num_local_pages,
                 page_size=self.cache_manager.config.page_size,
         )
         

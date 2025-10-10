@@ -16,7 +16,7 @@ import triton.language as tl
 )
 @triton.jit
 def _compute_average_score_kernel(
-    Q, K, Out, Stream_indices_page,kv_pages_per_seq,kv_pages_num_per_seq,kv_pages_per_seq_max,
+    Q, K, Out, kv_pages_per_seq,kv_pages_num_per_seq,kv_pages_per_seq_max,
     # Strides
     q_stride_b, q_stride_h,
     k_stride_p, k_stride_h,
@@ -26,9 +26,9 @@ def _compute_average_score_kernel(
     HEAD_DIM: tl.constexpr,
     num_pages: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
-    # Streaming info
-    STREAM_LEN: tl.constexpr,
-    ACTUAL_STREAM_LEN: tl.constexpr,
+    # Sink and local pages
+    num_sink_pages: tl.constexpr,
+    num_local_pages: tl.constexpr,
     # Block sizes and padding
     BLOCK_SIZE_P: tl.constexpr, 
     PADDED_GROUP_SIZE: tl.constexpr,
@@ -72,7 +72,7 @@ def _compute_average_score_kernel(
 
     scores_matrix = tl.dot(q_matrix, tl.trans(k_matrix), out_dtype=tl.float32, allow_tf32=False)
     final_scores = tl.sum(scores_matrix, axis=0)
-
+    
     num_valid_pages = tl.load(kv_pages_num_per_seq + bid)
     token_base_ptr = kv_pages_per_seq + bid * MAX_NUM_TOKEN_PAGES
     token_page_offsets = tl.arange(0, PADDED_MAX_NUM_TOKEN_PAGES)
@@ -84,14 +84,15 @@ def _compute_average_score_kernel(
     is_not_zero = page_offsets != 0
     is_page_valid = is_in_valid_pages & is_not_zero
 
+    if pid_block == 0:
+        is_sink = page_offsets < num_sink_pages
+        is_page_valid = is_page_valid & (~is_sink)
+        
+    last_valid_page_idx = max_page_index - 1
+    local_start_idx = last_valid_page_idx - num_local_pages + 1
     
-    if ACTUAL_STREAM_LEN > 0:
-        stream_base_ptr = Stream_indices_page + bid * ACTUAL_STREAM_LEN
-        stream_offsets = tl.arange(0, STREAM_LEN)
-        stream_page_ids = tl.load(stream_base_ptr + stream_offsets, mask=stream_offsets < ACTUAL_STREAM_LEN, other=-1)
-        is_in_stream_matrix = (page_offsets[:, None] == stream_page_ids[None, :])
-        is_in_stream = tl.sum(is_in_stream_matrix.to(tl.int32), axis=1) > 0
-        is_page_valid = is_page_valid & (~is_in_stream)
+    is_in_local = (page_offsets >= local_start_idx) & (page_offsets <= last_valid_page_idx)
+    is_page_valid = is_page_valid & (~is_in_local)
 
     out_ptrs = (Out + bid * scores_stride_b + 
                 kv_hid * scores_stride_h + 
@@ -104,9 +105,10 @@ def _compute_average_score_kernel(
 def compute_average_score(q: torch.Tensor,
                            k: torch.Tensor,
                            out: torch.Tensor,
-                           stream_indices_page: torch.Tensor = None,
                            kv_pages_per_seq: torch.Tensor = None,
                            kv_pages_num_per_seq: torch.Tensor = None,
+                           num_sink_pages: int = 0,
+                           num_local_pages: int = 0,
                            ):
 
     bs = q.shape[0]
@@ -123,9 +125,6 @@ def compute_average_score(q: torch.Tensor,
     PADDED_GROUP_SIZE = max(16, triton.next_power_of_2(GROUP_SIZE))
     PADDED_HEAD_DIM = max(16, triton.next_power_of_2(HEAD_DIM))
 
-    actual_stream_len = stream_indices_page.shape[1]
-    stream_len = triton.next_power_of_2(actual_stream_len) if actual_stream_len > 0 else 0
-
     max_num_token_pages = kv_pages_per_seq.shape[1]
     padded_max_num_token_pages = triton.next_power_of_2(max_num_token_pages)
 
@@ -139,7 +138,7 @@ def compute_average_score(q: torch.Tensor,
     )
     
     _compute_average_score_kernel[grid](
-        q, k, out, stream_indices_page,kv_pages_per_seq, kv_pages_num_per_seq, kv_pages_per_seq_max,
+        q, k, out, kv_pages_per_seq, kv_pages_num_per_seq, kv_pages_per_seq_max,
         # Strides
         q.stride(0), q.stride(1),
         k.stride(0), k.stride(1),
@@ -149,9 +148,9 @@ def compute_average_score(q: torch.Tensor,
         HEAD_DIM=HEAD_DIM,
         num_pages=num_pages,
         GROUP_SIZE=GROUP_SIZE, 
-        # Streaming info
-        STREAM_LEN=stream_len,
-        ACTUAL_STREAM_LEN=actual_stream_len,
+        # Sink and local pages
+        num_sink_pages=num_sink_pages,
+        num_local_pages=num_local_pages,
         # Padding info
         PADDED_GROUP_SIZE=PADDED_GROUP_SIZE,
         PADDED_HEAD_DIM=PADDED_HEAD_DIM,

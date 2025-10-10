@@ -5,7 +5,6 @@ import triton.language as tl
 
 @triton.jit
 def combine_indices_paged_kernel(
-    stream_indices_page_ptr,
     retrived_cache_indices_page_ptr,
     cur_req_pool_indices_ptr,
     pre_req_pool_indices_ptr,
@@ -20,7 +19,8 @@ def combine_indices_paged_kernel(
     max_bs,
     num_kv_heads,
     cache_len,
-    stream_len,
+    num_sink_pages,
+    num_local_pages,
     max_seq_len,
     max_pages,
     page_size,
@@ -79,37 +79,47 @@ def combine_indices_paged_kernel(
                     mask=block_mask
                 )
         
-        stream_offsets = tl.arange(0, BLOCK_SIZE)
-        if stream_len <= BLOCK_SIZE:
-            stream_mask = stream_offsets < stream_len
-            stream_vals = tl.load(
-                stream_indices_page_ptr + batch_idx * stream_len + stream_offsets,
-                mask=stream_mask,
-                other=0
-            )
-            tl.store(
-                page_table_ptr + page_table_offset + cache_len + stream_offsets,
-                stream_vals,
-                mask=stream_mask
-            )
-        else:
-            for block_start in range(0, stream_len, BLOCK_SIZE):
-                block_offsets = tl.arange(0, BLOCK_SIZE) + block_start
-                block_mask = block_offsets < stream_len
-                stream_vals = tl.load(
-                    stream_indices_page_ptr + batch_idx * stream_len + block_offsets,
-                    mask=block_mask,
-                    other=0
-                )
-                tl.store(
-                    page_table_ptr + page_table_offset + cache_len + block_offsets,
-                    stream_vals,
-                    mask=block_mask
-                )
+        seq_len = tl.load(seq_lens_ptr + batch_idx)
+        num_pages_per_seq = (seq_len + page_size - 1) // page_size
+        stream_len = num_sink_pages + num_local_pages
+        
+        sink_page_offsets = tl.arange(0, BLOCK_SIZE) * page_size
+        sink_mask = tl.arange(0, BLOCK_SIZE) < num_sink_pages
+        
+        token_offset_base = cur_req_idx * max_seq_len
+        sink_token_vals = tl.load(
+            req_to_token_ptr + token_offset_base + sink_page_offsets,
+            mask=sink_mask,
+            other=0
+        )
+        sink_page_vals = sink_token_vals // page_size
+        
+        tl.store(
+            page_table_ptr + page_table_offset + cache_len + tl.arange(0, BLOCK_SIZE),
+            sink_page_vals,
+            mask=sink_mask
+        )
+        
+        local_start_page = num_pages_per_seq - num_local_pages
+        local_page_offsets = (local_start_page + tl.arange(0, BLOCK_SIZE)) * page_size
+        local_mask = tl.arange(0, BLOCK_SIZE) < num_local_pages
+        
+        local_token_vals = tl.load(
+            req_to_token_ptr + token_offset_base + local_page_offsets,
+            mask=local_mask,
+            other=0
+        )
+        local_page_vals = local_token_vals // page_size
+        
+        tl.store(
+            page_table_ptr + page_table_offset + cache_len + num_sink_pages + tl.arange(0, BLOCK_SIZE),
+            local_page_vals,
+            mask=local_mask
+        )
         
         if kv_head_idx == 0:
             diff = tl.load(diff_ptr + batch_idx)
-            new_seq_len = page_size * (cache_len + stream_len) - diff
+            new_seq_len = page_size * (cache_len + num_sink_pages + num_local_pages) - diff
             tl.store(new_seq_lens_ptr + batch_idx, new_seq_len)
     else:
         seq_len = tl.load(seq_lens_ptr + batch_idx)
@@ -162,7 +172,6 @@ def combine_indices_paged_kernel(
 
 
 def combine_indices(
-    stream_indices: torch.Tensor,  # [cur_bs, stream_len]
     retrived_cache_indices: torch.Tensor,  # [pre_bs, cache_len] or [max_bs, num_kv_heads, top_k]
     cur_req_pool_indices: torch.Tensor,  # [cur_bs]
     pre_req_pool_indices: torch.Tensor,  # [pre_bs] or [max_bs]
@@ -170,21 +179,22 @@ def combine_indices(
     page_table: torch.Tensor,  # [max_bs, max_seq_len] or [max_bs, num_kv_heads, max_pages]
     seq_lens: torch.Tensor,  # [cur_bs]
     diff: torch.Tensor,  # [cur_bs]
+    num_sink_pages: int,
+    num_local_pages: int,
     page_size: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    cur_bs, stream_len = stream_indices.shape
+) -> torch.Tensor:
+    cur_bs = cur_req_pool_indices.shape[0]
     max_bs_pre = pre_req_pool_indices.shape[0]
     _, num_kv_heads, cache_len = retrived_cache_indices.shape
     _, _, max_pages = page_table.shape
     max_bs, max_seq_len = req_to_token.shape
-    new_seq_lens = torch.zeros(cur_bs, dtype=torch.int32, device=stream_indices.device)
+    new_seq_lens = torch.zeros(cur_bs, dtype=torch.int32, device=seq_lens.device)
     
     grid = (cur_bs * num_kv_heads,)
     
     BLOCK_SIZE = 256
     
     combine_indices_paged_kernel[grid](
-        stream_indices,
         retrived_cache_indices,
         cur_req_pool_indices,
         pre_req_pool_indices,
@@ -198,7 +208,8 @@ def combine_indices(
         max_bs,
         num_kv_heads,
         cache_len,
-        stream_len,
+        num_sink_pages,
+        num_local_pages,
         max_seq_len,
         max_pages,
         page_size,
