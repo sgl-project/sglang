@@ -1,8 +1,10 @@
 import inspect
+import os
 import unittest
 
 import torch
 
+from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
@@ -54,8 +56,6 @@ class TestMamba(unittest.TestCase):
         mamba_cache_size = 20
         max_context_len = 128
         device = "cuda"
-        conv_dtype = torch.bfloat16
-        ssm_dtype = torch.bfloat16
         global_interval = 4
         num_layers = 48
         full_attention_layer_ids = [
@@ -64,8 +64,17 @@ class TestMamba(unittest.TestCase):
         mamba_layers = [
             i for i in range(num_layers) if i not in full_attention_layer_ids
         ]
-        conv_state_shape = (8192, 4)
-        mamba_state_shape = (32, 128, 128)
+        shape = Mamba2StateShape.create(
+            tp_world_size=1,
+            intermediate_size=4096,
+            n_groups=16,
+            num_heads=32,
+            head_dim=128,
+            state_size=128,
+            conv_kernel=4,
+        )
+        os.environ["SGLANG_MAMBA_SSM_DTYPE"] = "bfloat16"
+        mamba2_cache_params = Mamba2CacheParams(shape=shape, layers=mamba_layers)
 
         req_to_token_pool = HybridReqToTokenPool(
             size=max_num_reqs,
@@ -73,11 +82,7 @@ class TestMamba(unittest.TestCase):
             max_context_len=max_context_len,
             device=device,
             enable_memory_saver=False,
-            conv_state_shape=conv_state_shape,
-            temporal_state_shape=mamba_state_shape,
-            conv_dtype=conv_dtype,
-            ssm_dtype=ssm_dtype,
-            mamba_layers=mamba_layers,
+            cache_params=mamba2_cache_params,
             speculative_num_draft_tokens=3,
         )
 
@@ -134,25 +139,28 @@ class TestMamba(unittest.TestCase):
         ]
 
         # mamba
-        conv_dtype = torch.bfloat16
-        ssm_dtype = torch.bfloat16
         mamba_layers = [
             i for i in range(num_layers) if i not in full_attention_layer_ids
         ]
-        conv_state_shape = (8192, 4)
-        mamba_state_shape = (32, 128, 128)
-        # setup req to token pool
+        os.environ["SGLANG_MAMBA_SSM_DTYPE"] = "bfloat16"
+        shape = Mamba2StateShape.create(
+            tp_world_size=1,
+            intermediate_size=4096,
+            n_groups=16,
+            num_heads=32,
+            head_dim=128,
+            state_size=128,
+            conv_kernel=4,
+        )
+        mamba2_cache_params = Mamba2CacheParams(shape=shape, layers=mamba_layers)
+
         req_to_token_pool = HybridReqToTokenPool(
             size=max_num_reqs,
             mamba_size=mamba_cache_size,
             max_context_len=max_context_len,
             device=device,
             enable_memory_saver=False,
-            conv_state_shape=conv_state_shape,
-            temporal_state_shape=mamba_state_shape,
-            conv_dtype=conv_dtype,
-            ssm_dtype=ssm_dtype,
-            mamba_layers=mamba_layers,
+            cache_params=mamba2_cache_params,
             speculative_num_draft_tokens=3,
         )
         # setup kv pool
@@ -311,12 +319,12 @@ class TestMamba(unittest.TestCase):
         kv_indices, last_node = result.device_indices, result.last_device_node
         assert req9.mamba_pool_idx is not None
         assert torch.all(
-            mamba_pool.mamba_cache[0][:, req9.mamba_pool_idx]
-            == mamba_pool.mamba_cache[0][:, last_node.mamba_value]
+            mamba_pool.mamba_cache.conv[:, req9.mamba_pool_idx]
+            == mamba_pool.mamba_cache.conv[:, last_node.mamba_value]
         )
         assert torch.all(
-            mamba_pool.mamba_cache[1][:, req9.mamba_pool_idx]
-            == mamba_pool.mamba_cache[1][:, last_node.mamba_value]
+            mamba_pool.mamba_cache.temporal[:, req9.mamba_pool_idx]
+            == mamba_pool.mamba_cache.temporal[:, last_node.mamba_value]
         )
 
 

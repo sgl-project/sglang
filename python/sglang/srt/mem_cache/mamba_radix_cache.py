@@ -158,15 +158,15 @@ class LRUList:
         Move an (existing) node and its parents to most recently used position. Child node is
         more recently used than parent node.
         """
-        assert not self.mamba
         prev_node = self.head
         while node != root_node:
-            assert (
-                node.id in self.cache
-            ), f"Resetting node {node.id=} not in lru list when resetting node and parents mru"
-            self._remove_node(node)
-            self._add_node_after(prev_node, node)
-            prev_node = node
+            if not self.mamba or node.mamba_value is not None:
+                assert (
+                    node.id in self.cache
+                ), f"Resetting node {node.id=} not in lru list when resetting node and parents mru"
+                self._remove_node(node)
+                self._add_node_after(prev_node, node)
+                prev_node = node
             node = node.parent
 
     def insert_mru(self, node):
@@ -273,13 +273,13 @@ class LRUList:
             else:
                 nodes = tree_cache._collect_all_nodes()
             total_nodes = len(nodes)
-            total_lru_plus_1 = len(self.cache) + 1
+            total_lru = len(self.cache)
             # heapify based on last_access_time
             heapq.heapify(nodes)
             # the root node is not in the lru list
-            assert (
-                len(nodes) == len(self.cache) + 1
-            ), f"len(nodes): {len(nodes)} != len(self.cache) + 1: {len(self.cache) + 1}"
+            assert len(nodes) == (
+                total_lru + (0 if self.mamba else 1)
+            ), f"len(nodes): {len(nodes)}, total_lru: {total_lru}"
 
             x_lru = self._get_lru()
             while len(nodes):
@@ -307,7 +307,7 @@ class LRUList:
 
             assert (
                 evictable_size == lru_list_evictable_size
-            ), f"{self.mamba=}, total nodes: {total_nodes}, total lru plus 1: {total_lru_plus_1}, evictable size: {evictable_size} != lru list evictable size: {lru_list_evictable_size}"
+            ), f"{self.mamba=}, total nodes: {total_nodes}, total lru: {total_lru}, evictable size: {evictable_size} != lru list evictable size: {lru_list_evictable_size}"
         except Exception as e:
             msg = f"Mamba Radix tree sanity check failed, ping @yizhang2077: {e}"
             logger.error(msg)
@@ -440,7 +440,7 @@ class MambaRadixCache(BasePrefixCache):
         ]
 
         page_aligned_len = len(kv_indices)
-        page_aligned_kv_indices = kv_indices.clone()
+        page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
 
         # Radix Cache takes one ref in memory pool
         # insert the token_ids and kv_indices into the radix tree
@@ -770,8 +770,7 @@ class MambaRadixCache(BasePrefixCache):
         # update time for matched nodes, and make nodes closer to root to be least recently used
         # this allows mamba to evict nodes closer to root first
         self.full_lru_list.reset_node_and_parents_mru(best_last_node, self.root_node)
-        if best_last_node.mamba_value is not None:
-            self.mamba_lru_list.reset_node_mru(best_last_node)
+        self.mamba_lru_list.reset_node_and_parents_mru(best_last_node, self.root_node)
 
         # This last_access_time is for sanity check, can be deleted after validation in production
         cur_time = time.monotonic()
@@ -797,6 +796,8 @@ class MambaRadixCache(BasePrefixCache):
         child.last_access_time = time.monotonic()
 
         self.full_lru_list.remove_node(child)
+        if child.mamba_value is not None:
+            self.mamba_lru_list.remove_node(child)
         child.parent = new_node
         child.key = child.key[split_len:]
         child.value = child.value[split_len:]
@@ -806,6 +807,8 @@ class MambaRadixCache(BasePrefixCache):
         # parent first so that parent is after child in the lru list
         self.full_lru_list.insert_mru(new_node)
         self.full_lru_list.insert_mru(child)
+        if child.mamba_value is not None:
+            self.mamba_lru_list.insert_mru(child)
         return new_node
 
     def _insert_helper(
@@ -821,6 +824,8 @@ class MambaRadixCache(BasePrefixCache):
         node.last_access_time = time.monotonic()
         if node != self.root_node:
             self.full_lru_list.reset_node_mru(node)
+            if node.mamba_value is not None:
+                self.mamba_lru_list.reset_node_mru(node)
         if len(key) == 0:
             return 0, True
 
@@ -831,6 +836,8 @@ class MambaRadixCache(BasePrefixCache):
             node = node.children[child_key]
             node.last_access_time = time.monotonic()
             self.full_lru_list.reset_node_mru(node)
+            if node.mamba_value is not None:
+                self.mamba_lru_list.reset_node_mru(node)
             prefix_len = self.key_match_fn(node.key, key)
             total_prefix_length += prefix_len
             key = key[prefix_len:]
@@ -861,6 +868,7 @@ class MambaRadixCache(BasePrefixCache):
             self.mamba_lru_list.insert_mru(node)
         else:
             mamba_value_exist = True
+            self.mamba_lru_list.reset_node_mru(node)
 
         return total_prefix_length, mamba_value_exist
 

@@ -1779,7 +1779,9 @@ class Scheduler(
         self._publish_kv_events()
 
     def check_tree_cache(self):
-        if self.is_hybrid and isinstance(self.tree_cache, SWARadixCache):
+        if (self.is_hybrid and isinstance(self.tree_cache, SWARadixCache)) or (
+            self.is_hybrid_gdn and isinstance(self.tree_cache, MambaRadixCache)
+        ):
             self.tree_cache.sanity_check()
 
     def _get_token_info(self):
