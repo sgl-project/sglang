@@ -6,13 +6,12 @@ consolidated trace file. Based on torch_utils/sglang_profiler_trace_merger.py
 but extended to support all parallelism types.
 """
 
+import glob
 import gzip
 import json
 import logging
 import os
 import re
-import time
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -101,7 +100,6 @@ class ProfileMerger:
         Returns:
             List of trace file paths
         """
-        import glob
 
         # Search for all possible patterns
         patterns = [
@@ -122,8 +120,8 @@ class ProfileMerger:
             and "TP-" in f  # Must have at least TP rank
         ]
 
-        # Remove duplicates and sort
-        trace_files = sorted(list(set(trace_files)))
+        # Remove duplicates (sorting will be done in merge_chrome_traces with rank-based key)
+        trace_files = list(set(trace_files))
         return trace_files
 
     def _extract_rank_info(self, filename: str) -> Dict[str, int]:
