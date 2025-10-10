@@ -14,12 +14,8 @@ use super::utils;
 use crate::core::{ConnectionMode, Worker, WorkerRegistry, WorkerType};
 use crate::grpc_client::proto;
 use crate::policies::PolicyRegistry;
-use crate::protocols::spec::{
-    ChatCompletionRequest, GenerateMetaInfo, GenerateRequest, GenerateResponse, InputIds,
-};
-use crate::tokenizer::stop::SequenceDecoderOutput;
+use crate::protocols::spec::{ChatCompletionRequest, GenerateRequest, InputIds};
 use crate::tokenizer::traits::Tokenizer;
-use proto::generate_complete::MatchedStop;
 use proto::DisaggregatedParams;
 use rand::Rng;
 use std::sync::Arc;
@@ -855,59 +851,29 @@ impl ResponseProcessingStage {
             .take()
             .ok_or_else(|| utils::internal_error_static("No execution result"))?;
 
-        if is_streaming {
-            // Get dispatch metadata for consistent response fields
-            let dispatch = ctx
-                .state
-                .dispatch
-                .as_ref()
-                .ok_or_else(|| utils::internal_error_static("Dispatch metadata not set"))?;
+        // Get dispatch metadata (needed by both streaming and non-streaming)
+        let dispatch = ctx
+            .state
+            .dispatch
+            .as_ref()
+            .ok_or_else(|| utils::internal_error_static("Dispatch metadata not set"))?
+            .clone();
 
+        if is_streaming {
             // Streaming: Use StreamingProcessor and return SSE response (done)
             return Ok(Some(
                 self.streaming_processor.clone().process_streaming_generate(
                     execution_result,
                     ctx.generate_request_arc(), // Cheap Arc clone (8 bytes)
-                    dispatch.clone(),
+                    dispatch,
                 ),
             ));
         }
 
-        // Non-streaming: Collect all responses
+        // Non-streaming: Delegate to ResponseProcessor
         let request_logprobs = ctx.generate_request().return_logprob;
-        let all_responses = match execution_result {
-            ExecutionResult::Single { stream } => {
-                utils::collect_stream_responses(stream, "Single").await?
-            }
-            ExecutionResult::Dual { prefill, decode } => {
-                // Collect prefill for input_logprobs
-                let prefill_responses = utils::collect_stream_responses(prefill, "Prefill").await?;
+        let generate_request = ctx.generate_request_arc();
 
-                // Collect decode for actual output
-                let mut decode_responses =
-                    utils::collect_stream_responses(*decode, "Decode").await?;
-
-                // Merge prefill input_logprobs if requested
-                if request_logprobs {
-                    if let Some(prefill_input_logprobs) = prefill_responses
-                        .first()
-                        .and_then(|r| r.input_logprobs.clone())
-                    {
-                        for response in &mut decode_responses {
-                            response.input_logprobs = Some(prefill_input_logprobs.clone());
-                        }
-                    }
-                }
-
-                decode_responses
-            }
-        };
-
-        if all_responses.is_empty() {
-            return Err(utils::internal_error_static("No responses from server"));
-        }
-
-        // Get stop decoder for processing
         let stop_decoder = ctx
             .state
             .response
@@ -915,103 +881,17 @@ impl ResponseProcessingStage {
             .as_mut()
             .ok_or_else(|| utils::internal_error_static("Stop decoder not initialized"))?;
 
-        // Get dispatch metadata
-        let dispatch = ctx
-            .state
-            .dispatch
-            .as_ref()
-            .ok_or_else(|| utils::internal_error_static("Dispatch metadata not set"))?;
-
-        // Process each completion (similar to router.rs:336-400)
-        let mut result_array = Vec::new();
-        for mut complete in all_responses {
-            stop_decoder.reset();
-
-            // Process tokens through stop decoder
-            let outputs = match stop_decoder.process_tokens(&complete.output_ids) {
-                Ok(outputs) => outputs,
-                Err(e) => {
-                    return Err(utils::internal_error_message(format!(
-                        "Failed to process tokens: {}",
-                        e
-                    )))
-                }
-            };
-
-            // Accumulate text with early breaks
-            let mut decoded_text = String::new();
-            for output in outputs {
-                match output {
-                    SequenceDecoderOutput::Text(t) => decoded_text.push_str(&t),
-                    SequenceDecoderOutput::StoppedWithText(t) => {
-                        decoded_text.push_str(&t);
-                        break;
-                    }
-                    SequenceDecoderOutput::Stopped => break,
-                    SequenceDecoderOutput::Held => {}
-                }
-            }
-
-            // Flush remaining text
-            if let SequenceDecoderOutput::Text(t) = stop_decoder.flush() {
-                decoded_text.push_str(&t);
-            }
-
-            let output_ids = std::mem::take(&mut complete.output_ids);
-            let finish_reason_str = std::mem::take(&mut complete.finish_reason);
-
-            // Parse finish_reason from string to proper type
-            let finish_reason =
-                utils::parse_finish_reason(&finish_reason_str, complete.completion_tokens);
-
-            // Handle matched_stop if present
-            let matched_stop = complete.matched_stop.take().map(|matched| match matched {
-                MatchedStop::MatchedTokenId(id) => serde_json::json!(id),
-                MatchedStop::MatchedStopStr(s) => serde_json::json!(s),
-            });
-
-            // Extract logprobs if requested (convert proto types to Generate format)
-            let input_token_logprobs = if request_logprobs {
-                complete
-                    .input_logprobs
-                    .as_ref()
-                    .map(utils::convert_generate_input_logprobs)
-            } else {
-                None
-            };
-
-            let output_token_logprobs = if request_logprobs {
-                complete
-                    .output_logprobs
-                    .as_ref()
-                    .map(utils::convert_generate_output_logprobs)
-            } else {
-                None
-            };
-
-            // Build GenerateResponse struct
-            let meta_info = GenerateMetaInfo {
-                id: dispatch.request_id.clone(),
-                finish_reason,
-                prompt_tokens: complete.prompt_tokens as u32,
-                weight_version: dispatch
-                    .weight_version
-                    .clone()
-                    .unwrap_or_else(|| "default".to_string()),
-                input_token_logprobs,
-                output_token_logprobs,
-                completion_tokens: complete.completion_tokens as u32,
-                cached_tokens: complete.cached_tokens as u32,
-                e2e_latency: start_time.elapsed().as_secs_f64(),
-                matched_stop,
-            };
-
-            result_array.push(GenerateResponse {
-                text: decoded_text,
-                output_ids,
-                meta_info,
-            });
-        }
+        let result_array = self
+            .processor
+            .process_non_streaming_generate_response(
+                execution_result,
+                generate_request,
+                dispatch,
+                stop_decoder,
+                request_logprobs,
+                start_time,
+            )
+            .await?;
 
         // Store the final response
         ctx.state.response.final_response = Some(FinalResponse::Generate(result_array));
