@@ -1049,7 +1049,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.scaling = self.qk_head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
-        self.kv_cache_dtype = global_server_args_dict["kv_cache_dtype"]
+        self.kv_cache_dtype = get_global_server_args().kv_cache_dtype
 
         # NOTE modification to rope_scaling must be done early enough, b/c e.g. Indexer needs it
         if rope_scaling:
@@ -1348,7 +1348,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 positions, hidden_states, forward_batch, zero_allocator
             )
         elif attn_forward_method == AttnForwardMethod.MHA_ONE_SHOT:
-            inner_state = self.forward_normal_one_hot_prepare(
+            inner_state = self.forward_normal_one_shot_prepare(
                 positions, hidden_states, forward_batch, zero_allocator
             )
         elif attn_forward_method == AttnForwardMethod.MLA:
@@ -1402,7 +1402,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         elif attn_forward_method == AttnForwardMethod.MHA_CHUNKED_KV:
             return self.forward_normal_chunked_kv_core(*inner_state)
         elif attn_forward_method == AttnForwardMethod.MHA_ONE_SHOT:
-            return self.forward_normal_one_hot_core(*inner_state)
+            return self.forward_normal_one_shot_core(*inner_state)
         elif attn_forward_method == AttnForwardMethod.MLA:
             return self.forward_absorb_core(*inner_state)
         elif attn_forward_method == AttnForwardMethod.NPU_MLA_SPARSE:
@@ -1442,9 +1442,12 @@ class DeepseekV2AttentionMLA(nn.Module):
         q[..., self.qk_nope_head_dim :] = q_pe
 
         self._set_mla_kv_buffer(latent_cache, kv_a, k_pe, forward_batch)
-        if forward_batch.mha_one_hot and sum(forward_batch.extend_prefix_lens_cpu) != 0:
+        if (
+            forward_batch.mha_one_shot
+            and sum(forward_batch.extend_prefix_lens_cpu) != 0
+        ):
             kv_a, k_pe = self._get_mla_kv_buffer(
-                forward_batch.fetch_mha_one_hot_kv_indices(), q.dtype, forward_batch
+                forward_batch.fetch_mha_one_shot_kv_indices(), q.dtype, forward_batch
             )
         kv = self.kv_b_proj(kv_a)[0]
         kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
@@ -2340,19 +2343,19 @@ class DeepseekV2AttentionMLA(nn.Module):
         output, _ = self.o_proj(attn_output)
         return output
 
-    def forward_normal_one_hot_prepare(
+    def forward_normal_one_shot_prepare(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ):
-        forward_batch.mha_one_hot = True
+        forward_batch.mha_one_shot = True
         return self.forward_normal_prepare(
             positions, hidden_states, forward_batch, zero_allocator
         )
 
-    def forward_normal_one_hot_core(self, q, k, v, forward_batch):
+    def forward_normal_one_shot_core(self, q, k, v, forward_batch):
         has_extend_prefix = any(forward_batch.extend_prefix_lens_cpu)
         # Only initialize the info once
         if has_extend_prefix and forward_batch.num_prefix_chunks is None:

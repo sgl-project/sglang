@@ -241,8 +241,8 @@ class ForwardBatch:
     # For MLA chunked prefix cache used in chunked prefill
     # Tell attention backend whether lse needs to be returned
     mha_return_lse: Optional[bool] = None
-    mha_one_hot_kv_indices: Optional[torch.Tensor] = None
-    mha_one_hot: Optional[bool] = None
+    mha_one_shot_kv_indices: Optional[torch.Tensor] = None
+    mha_one_shot: Optional[bool] = None
 
     # For multimodal
     mm_inputs: Optional[List[MultimodalInputs]] = None
@@ -911,9 +911,9 @@ class ForwardBatch:
     def can_run_tbo(self):
         return self.tbo_split_seq_index is not None
 
-    def fetch_mha_one_hot_kv_indices(self):
-        if self.mha_one_hot_kv_indices is not None:
-            return self.mha_one_hot_kv_indices
+    def fetch_mha_one_shot_kv_indices(self):
+        if self.mha_one_shot_kv_indices is not None:
+            return self.mha_one_shot_kv_indices
         batch_size = self.batch_size
         paged_kernel_lens_sum = sum(self.seq_lens_cpu)
         kv_indices = torch.empty(
@@ -936,7 +936,7 @@ class ForwardBatch:
             kv_indices,
             self.req_to_token_pool.req_to_token.shape[1],
         )
-        self.mha_one_hot_kv_indices = kv_indices
+        self.mha_one_shot_kv_indices = kv_indices
         return kv_indices
 
 
