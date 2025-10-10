@@ -648,12 +648,14 @@ class SchedulerDisaggregationPrefillMixin:
             self.disagg_metadata_buffers.set_buf(req)
 
             # Prepare extra pool indices for hybrid models
-            if isinstance(self.token_to_kv_pool_allocator, HybridLinearKVPool):
+            if isinstance(
+                self.token_to_kv_pool_allocator.get_kvcache(), HybridLinearKVPool
+            ):
                 # Mamba hybrid model: send single mamba state index
                 extra_pool_indices = [
                     self.req_to_token_pool.rid_to_mamba_index_mapping[req.rid]
                 ]
-            elif isinstance(self.token_to_kv_pool_allocator, SWAKVPool):
+            elif isinstance(self.token_to_kv_pool_allocator.get_kvcache(), SWAKVPool):
                 # SWA hybrid model: send last window KV indices
                 seq_len = len(req.fill_ids)
                 window_size = self.sliding_window_size
@@ -672,8 +674,9 @@ class SchedulerDisaggregationPrefillMixin:
                 )
                 extra_pool_indices = window_kv_indices_swa.cpu().numpy()
                 extra_pool_indices = kv_to_page_indices(extra_pool_indices, page_size)
-                logger.info(f"Extra pool indices: {len(extra_pool_indices)}")
-            elif isinstance(self.token_to_kv_pool_allocator, NSATokenToKVPool):
+            elif isinstance(
+                self.token_to_kv_pool_allocator.get_kvcache(), NSATokenToKVPool
+            ):
                 seq_len = len(req.fill_ids)
                 kv_indices_full = self.req_to_token_pool.req_to_token[
                     req.req_pool_idx, :seq_len
