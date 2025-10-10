@@ -257,27 +257,27 @@ class DecodePreallocQueue:
             self.metadata_buffers.get_buf_infos()
         )
 
-        if hasattr(self.token_to_kv_pool, "get_extra_pool_buf_infos"):
-            extra_pool_data_ptrs, extra_pool_data_lens, extra_pool_item_lens = (
-                self.token_to_kv_pool.get_extra_pool_buf_infos()
+        if hasattr(self.token_to_kv_pool, "get_state_buf_infos"):
+            state_data_ptrs, state_data_lens, state_item_lens = (
+                self.token_to_kv_pool.get_state_buf_infos()
             )
-            kv_args.extra_pool_data_ptrs = extra_pool_data_ptrs
-            kv_args.extra_pool_data_lens = extra_pool_data_lens
-            kv_args.extra_pool_item_lens = extra_pool_item_lens
+            kv_args.state_data_ptrs = state_data_ptrs
+            kv_args.state_data_lens = state_data_lens
+            kv_args.state_item_lens = state_item_lens
 
             if isinstance(self.token_to_kv_pool, SWAKVPool):
-                kv_args.extra_pool_type = "swa"
+                kv_args.state_type = "swa"
             elif isinstance(self.token_to_kv_pool, HybridLinearKVPool):
-                kv_args.extra_pool_type = "mamba"
+                kv_args.state_type = "mamba"
             elif isinstance(self.token_to_kv_pool, NSATokenToKVPool):
-                kv_args.extra_pool_type = "nsa"
+                kv_args.state_type = "nsa"
             else:
-                kv_args.extra_pool_type = "none"
+                kv_args.state_type = "none"
         else:
-            kv_args.extra_pool_data_ptrs = []
-            kv_args.extra_pool_data_lens = []
-            kv_args.extra_pool_item_lens = []
-            kv_args.extra_pool_type = "none"
+            kv_args.state_data_ptrs = []
+            kv_args.state_data_lens = []
+            kv_args.state_item_lens = []
+            kv_args.state_type = "none"
 
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.gpu_id
@@ -481,7 +481,7 @@ class DecodePreallocQueue:
             # Prepare extra pool indices for hybrid models
             if isinstance(self.token_to_kv_pool, HybridLinearKVPool):
                 # Mamba hybrid model: single mamba state index
-                extra_pool_indices = [
+                state_indices = [
                     self.req_to_token_pool.rid_to_mamba_index_mapping[
                         decode_req.req.rid
                     ]
@@ -503,18 +503,18 @@ class DecodePreallocQueue:
                         window_kv_indices_full
                     )
                 )
-                extra_pool_indices = window_kv_indices_swa.cpu().numpy()
-                extra_pool_indices = kv_to_page_indices(extra_pool_indices, page_size)
-                logger.info(f"Extra pool indices: {len(extra_pool_indices)}")
+                state_indices = window_kv_indices_swa.cpu().numpy()
+                state_indices = kv_to_page_indices(state_indices, page_size)
+                logger.info(f"Extra pool indices: {len(state_indices)}")
             elif isinstance(self.token_to_kv_pool, NSATokenToKVPool):
                 seq_len = len(decode_req.req.origin_input_ids)
                 kv_indices_full = self.req_to_token_pool.req_to_token[
                     decode_req.req.req_pool_idx, :seq_len
                 ]
-                extra_pool_indices = kv_indices_full.cpu().numpy()
-                extra_pool_indices = kv_to_page_indices(extra_pool_indices, page_size)
+                state_indices = kv_indices_full.cpu().numpy()
+                state_indices = kv_to_page_indices(state_indices, page_size)
             else:
-                extra_pool_indices = None
+                state_indices = None
 
             decode_req.metadata_buffer_index = (
                 self.req_to_metadata_buffer_idx_allocator.alloc()
@@ -522,7 +522,7 @@ class DecodePreallocQueue:
             assert decode_req.metadata_buffer_index is not None
             page_indices = kv_to_page_indices(kv_indices, page_size)
             decode_req.kv_receiver.init(
-                page_indices, decode_req.metadata_buffer_index, extra_pool_indices
+                page_indices, decode_req.metadata_buffer_index, state_indices
             )
             decode_req.req.add_latency(RequestStage.DECODE_BOOTSTRAP)
             preallocated_reqs.append(decode_req)

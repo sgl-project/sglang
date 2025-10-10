@@ -704,7 +704,7 @@ class NixlKVSender(CommonKVSender):
     def send(
         self,
         kv_indices: npt.NDArray[np.int32],
-        extra_pool_indices: Optional[List[int]] = None,
+        state_indices: Optional[List[int]] = None,
     ):
         index_slice = slice(self.curr_idx, self.curr_idx + len(kv_indices))
         self.curr_idx += len(kv_indices)
@@ -760,7 +760,7 @@ class NixlKVReceiver(CommonKVReceiver):
         self,
         kv_indices: npt.NDArray[np.int32],
         aux_index: Optional[int] = None,
-        extra_pool_indices: Optional[List[int]] = None,
+        state_indices: Optional[List[int]] = None,
     ):
         for bootstrap_info in self.bootstrap_infos:
             logger.debug(

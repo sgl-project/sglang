@@ -812,7 +812,7 @@ class HybridLinearKVPool(KVCache):
     def get_contiguous_buf_infos(self):
         return self.full_kv_pool.get_contiguous_buf_infos()
 
-    def get_extra_pool_buf_infos(self):
+    def get_state_buf_infos(self):
         mamba_data_ptrs, mamba_data_lens, mamba_item_lens = (
             self.mamba_pool.get_contiguous_buf_infos()
         )
@@ -929,7 +929,7 @@ class SWAKVPool(KVCache):
 
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
-    def get_extra_pool_buf_infos(self):
+    def get_state_buf_infos(self):
         swa_kv_data_ptrs, swa_kv_data_lens, swa_kv_item_lens = (
             self.swa_kv_pool.get_contiguous_buf_infos()
         )
@@ -1444,7 +1444,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
             pool=self, buf=buf, loc=loc, index_k=index_k, index_k_scale=index_k_scale
         )
 
-    def get_extra_pool_buf_infos(self):
+    def get_state_buf_infos(self):
         data_ptrs = [
             self.index_k_with_scale_buffer[i].data_ptr() for i in range(self.layer_num)
         ]

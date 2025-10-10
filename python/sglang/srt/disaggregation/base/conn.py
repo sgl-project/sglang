@@ -20,10 +20,10 @@ class KVArgs:
     aux_data_ptrs: List[int]
     aux_data_lens: List[int]
     aux_item_lens: List[int]
-    extra_pool_data_ptrs: List[int]
-    extra_pool_data_lens: List[int]
-    extra_pool_item_lens: List[int]
-    extra_pool_type: str  # "none", "mamba", "swa"
+    state_data_ptrs: List[int]
+    state_data_lens: List[int]
+    state_item_lens: List[int]
+    state_type: str  # "none", "mamba", "swa"
     ib_device: str
     ib_traffic_class: str
     gpu_id: int
@@ -83,7 +83,7 @@ class BaseKVSender(ABC):
     def send(
         self,
         kv_indices: npt.NDArray[np.int32],
-        extra_pool_indices: Optional[List[int]] = None,
+        state_indices: Optional[List[int]] = None,
     ):
         """
         Send the kv cache at the given kv indices and the extra cache/state at the given indices to the decoder server
@@ -120,10 +120,10 @@ class BaseKVReceiver(ABC):
         self,
         kv_indices: npt.NDArray[np.int32],
         aux_index: Optional[int] = None,
-        extra_pool_indices: Optional[List[int]] = None,
+        state_indices: Optional[List[int]] = None,
     ):
         """
-        Notify the prefill server about the kv indices, aux index, and extra_pool_indices.
+        Notify the prefill server about the kv indices, aux index, and state_indices.
         """
         ...
 

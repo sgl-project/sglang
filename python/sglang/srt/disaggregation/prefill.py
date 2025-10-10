@@ -151,27 +151,27 @@ class PrefillBootstrapQueue:
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.gpu_id
 
-        if hasattr(self.token_to_kv_pool, "get_extra_pool_buf_infos"):
-            extra_pool_data_ptrs, extra_pool_data_lens, extra_pool_item_lens = (
-                self.token_to_kv_pool.get_extra_pool_buf_infos()
+        if hasattr(self.token_to_kv_pool, "get_state_buf_infos"):
+            state_data_ptrs, state_data_lens, state_item_lens = (
+                self.token_to_kv_pool.get_state_buf_infos()
             )
-            kv_args.extra_pool_data_ptrs = extra_pool_data_ptrs
-            kv_args.extra_pool_data_lens = extra_pool_data_lens
-            kv_args.extra_pool_item_lens = extra_pool_item_lens
+            kv_args.state_data_ptrs = state_data_ptrs
+            kv_args.state_data_lens = state_data_lens
+            kv_args.state_item_lens = state_item_lens
 
             if isinstance(self.token_to_kv_pool, SWAKVPool):
-                kv_args.extra_pool_type = "swa"
+                kv_args.state_type = "swa"
             elif isinstance(self.token_to_kv_pool, HybridLinearKVPool):
-                kv_args.extra_pool_type = "mamba"
+                kv_args.state_type = "mamba"
             elif isinstance(self.token_to_kv_pool, NSATokenToKVPool):
-                kv_args.extra_pool_type = "nsa"
+                kv_args.state_type = "nsa"
             else:
-                kv_args.extra_pool_type = "none"
+                kv_args.state_type = "none"
         else:
-            kv_args.extra_pool_data_ptrs = []
-            kv_args.extra_pool_data_lens = []
-            kv_args.extra_pool_item_lens = []
-            kv_args.extra_pool_type = "none"
+            kv_args.state_data_ptrs = []
+            kv_args.state_data_lens = []
+            kv_args.state_item_lens = []
+            kv_args.state_type = "none"
 
         kv_manager_class: Type[BaseKVManager] = get_kv_class(
             self.transfer_backend, KVClassType.MANAGER
@@ -643,7 +643,7 @@ class SchedulerDisaggregationPrefillMixin:
             .numpy()
         )
         req.start_send_idx = end_idx
-        extra_pool_indices = None
+        state_indices = None
         if last_chunk:
             self.disagg_metadata_buffers.set_buf(req)
 
@@ -652,7 +652,7 @@ class SchedulerDisaggregationPrefillMixin:
                 self.token_to_kv_pool_allocator.get_kvcache(), HybridLinearKVPool
             ):
                 # Mamba hybrid model: send single mamba state index
-                extra_pool_indices = [
+                state_indices = [
                     self.req_to_token_pool.rid_to_mamba_index_mapping[req.rid]
                 ]
             elif isinstance(self.token_to_kv_pool_allocator.get_kvcache(), SWAKVPool):
@@ -672,8 +672,8 @@ class SchedulerDisaggregationPrefillMixin:
                         window_kv_indices_full
                     )
                 )
-                extra_pool_indices = window_kv_indices_swa.cpu().numpy()
-                extra_pool_indices = kv_to_page_indices(extra_pool_indices, page_size)
+                state_indices = window_kv_indices_swa.cpu().numpy()
+                state_indices = kv_to_page_indices(state_indices, page_size)
             elif isinstance(
                 self.token_to_kv_pool_allocator.get_kvcache(), NSATokenToKVPool
             ):
@@ -681,8 +681,8 @@ class SchedulerDisaggregationPrefillMixin:
                 kv_indices_full = self.req_to_token_pool.req_to_token[
                     req.req_pool_idx, :seq_len
                 ]
-                extra_pool_indices = kv_indices_full.cpu().numpy()
-                extra_pool_indices = kv_to_page_indices(extra_pool_indices, page_size)
+                state_indices = kv_indices_full.cpu().numpy()
+                state_indices = kv_to_page_indices(state_indices, page_size)
 
         page_indices = kv_to_page_indices(kv_indices, page_size)
         if len(page_indices) == 0:
@@ -690,7 +690,7 @@ class SchedulerDisaggregationPrefillMixin:
                 f"Skip sending kv chunk for request {req.rid=} {req.bootstrap_room=} because page_indices is empty"
             )
             return
-        req.disagg_kv_sender.send(page_indices, extra_pool_indices)
+        req.disagg_kv_sender.send(page_indices, state_indices)
 
     # PP
     @DynamicGradMode()

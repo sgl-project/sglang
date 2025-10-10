@@ -201,7 +201,7 @@ class CommonKVSender(BaseKVSender):
     def send(
         self,
         kv_indices: npt.NDArray[np.int32],
-        extra_pool_indices: Optional[List[int]] = None,
+        state_indices: Optional[List[int]] = None,
     ):
         pass
 
