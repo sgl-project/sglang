@@ -276,7 +276,7 @@ def flash_attn_varlen_func(
     k_descale=None,
     v_descale=None,
     window_size=(-1, -1),
-    attention_chunk=None,
+    attention_chunk: Optional[int] = None,
     softcap=0.0,
     num_splits=1,
     pack_gqa=None,
