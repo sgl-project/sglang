@@ -719,15 +719,14 @@ impl RouterTrait for Router {
             Ok(x) => x,
             Err(e) => return e,
         };
-        let text = crate::engine_metrics::compute_engine_metrics(
-            engine_responses
-                .into_iter()
-                .map(|(worker_base_url, body_text)| EngineMetricsOutput {
-                    worker_base_url,
-                    body_text,
-                })
-                .collect(),
-        );
+        let engine_responses = engine_responses
+            .into_iter()
+            .map(|(worker_base_url, body_text)| EngineMetricsOutput {
+                worker_base_url,
+                body_text,
+            })
+            .collect();
+        let text = crate::engine_metrics::compute_engine_metrics(engine_responses);
         (StatusCode::OK, text).into_response()
     }
 
