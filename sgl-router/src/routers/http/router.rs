@@ -365,9 +365,9 @@ impl Router {
         let mut responses = vec![];
         for worker in workers {
             let worker_url = worker.url();
-            let base = self.worker_base_url(worker_url);
+            let worker_base_url = self.worker_base_url(worker_url);
 
-            let url = format!("{}/{}", base, endpoint);
+            let url = format!("{}/{}", worker_base_url, endpoint);
             let mut request_builder = match method {
                 Method::GET => self.client.get(url),
                 Method::POST => self.client.post(url),
@@ -394,45 +394,22 @@ impl Router {
                 }
             }
 
-            match request_builder.send().await {
-                Ok(res) => {
-                    let status = StatusCode::from_u16(res.status().as_u16())
-                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                    let response_headers = header_utils::preserve_response_headers(res.headers());
-                    match res.bytes().await {
-                        Ok(body) => {
-                            let mut response = Response::new(Body::from(body));
-                            *response.status_mut() = status;
-                            *response.headers_mut() = response_headers;
-                            if status.is_success() {
-                                return response;
-                            }
-                            last_response = Some(response);
-                        }
-                        Err(e) => {
-                            last_response = Some(
-                                (
-                                    StatusCode::INTERNAL_SERVER_ERROR,
-                                    format!("Failed to read response: {}", e),
-                                )
-                                    .into_response(),
-                            );
-                        }
+            if let Ok(res) = request_builder.send().await {
+                let status = StatusCode::from_u16(res.status().as_u16())
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                let response_headers = header_utils::preserve_response_headers(res.headers());
+                if let Ok(body) = res.bytes().await {
+                    let mut response = Response::new(Body::from(body));
+                    *response.status_mut() = status;
+                    *response.headers_mut() = response_headers;
+                    if status.is_success() {
+                        responses.push((worker_base_url, response));
                     }
-                }
-                Err(e) => {
-                    last_response = Some(
-                        (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("Request failed: {}", e),
-                        )
-                            .into_response(),
-                    );
                 }
             }
         }
 
-        responses
+        Ok(responses)
     }
 
     // Route a GET request with provided headers to a specific endpoint
