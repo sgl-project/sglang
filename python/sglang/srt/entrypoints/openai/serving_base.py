@@ -4,12 +4,13 @@ import json
 import logging
 import uuid
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
 from fastapi import HTTPException, Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
 from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
+from sglang.srt.entrypoints.openai.utils import build_metric_labels
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.server_args import ServerArgs
 
@@ -42,6 +43,10 @@ class OpenAIServingBase(ABC):
             # Validate request
             error_msg = self._validate_request(request)
             if error_msg:
+                # Increment received requests metric for validation failures
+                self._label_and_observe_one_received_request(
+                    raw_request, http_status="400", custom_labels=request.custom_labels
+                )
                 return self.create_error_response(error_msg)
 
             # Convert to internal format
@@ -51,30 +56,53 @@ class OpenAIServingBase(ABC):
 
             # Note(Xinyuan): raw_request below is only used for detecting the connection of the client
             if hasattr(request, "stream") and request.stream:
-                return await self._handle_streaming_request(
+                response = await self._handle_streaming_request(
                     adapted_request, processed_request, raw_request
                 )
             else:
-                return await self._handle_non_streaming_request(
+                response = await self._handle_non_streaming_request(
                     adapted_request, processed_request, raw_request
                 )
+
+            self._label_and_observe_one_received_request(
+                raw_request,
+                adapted_request,
+                http_status="200",
+                custom_labels=adapted_request.custom_labels,
+            )
+
+            return response
         except HTTPException as e:
-            return self.create_error_response(
+            error_response = self.create_error_response(
                 message=e.detail, err_type=str(e.status_code), status_code=e.status_code
             )
+            self._label_and_observe_one_received_request(
+                raw_request,
+                http_status=str(e.status_code),
+                custom_labels=request.custom_labels,
+            )
+            return error_response
         except ValueError as e:
-            return self.create_error_response(
+            error_response = self.create_error_response(
                 message=str(e),
                 err_type="BadRequest",
                 status_code=400,
             )
+            self._label_and_observe_one_received_request(
+                raw_request, http_status="400", custom_labels=request.custom_labels
+            )
+            return error_response
         except Exception as e:
             logger.exception(f"Error in request: {e}")
-            return self.create_error_response(
+            error_response = self.create_error_response(
                 message=f"Internal server error: {str(e)}",
                 err_type="InternalServerError",
                 status_code=500,
             )
+            self._label_and_observe_one_received_request(
+                raw_request, http_status="500", custom_labels=request.custom_labels
+            )
+            return error_response
 
     @abstractmethod
     def _request_id_prefix(self) -> str:
@@ -212,3 +240,37 @@ class OpenAIServingBase(ABC):
                 if label in self.allowed_custom_labels
             }
         return custom_labels
+
+    def _label_and_observe_one_received_request(
+        self,
+        raw_request: Request,
+        adapted_request: Optional[GenerateReqInput] = None,
+        http_status: Optional[str] = None,
+        custom_labels: Optional[Dict[str, str]] = None,
+    ) -> None:
+        """Observe a received request metric with proper labels."""
+        if not self.tokenizer_manager.enable_metrics:
+            return
+
+        # Build metric labels for this request.
+        metric_labels = build_metric_labels(
+            self.tokenizer_manager.server_args,
+            raw_request.url.path,
+            http_status,
+        )
+
+        # Merge all labels together before sending to the metrics collector.
+        # We first take the default configured labels in the collector, then
+        # override with labels built for this specific request.
+        labels = {
+            **self.tokenizer_manager.metrics_collector.labels,
+            **metric_labels,
+            **(custom_labels or {}),
+        }
+
+        # Also need to update the adapted request's custom labels with newly
+        # merged labels, for metrics observed at the end of the request.
+        if adapted_request and adapted_request.custom_labels is not None:
+            adapted_request.custom_labels.update(metric_labels)
+
+        self.tokenizer_manager.metrics_collector.observe_one_received_request(labels)
