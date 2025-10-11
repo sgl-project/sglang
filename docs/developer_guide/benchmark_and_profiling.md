@@ -74,6 +74,41 @@ python3 -m sglang.test.send_one
 python3 -m sglang.profiler
 ```
 
+### Profiler Trace Merger for Distributed Traces
+
+SGLang now supports automatic merging of profiling traces from distributed setups with multiple parallelism types (TP, DP, PP, EP). This feature is particularly useful for analyzing performance across distributed runs.
+
+#### HTTP API Usage
+
+```bash
+# Start profiling with automatic trace merging enabled
+curl -X POST <BASE_URL>/start_profile \
+  -H "Content-Type: application/json" \
+  -d '{
+    "output_dir": "/tmp/profiles", # where to store profile traces
+    "num_steps": 10,
+    "activities": ["CPU", "GPU"],
+    "merge_profiles": true # optional argument to merge profile traces (default=False)
+  }'
+```
+
+#### Command Line Usage
+
+```bash
+# Start profiling with merge enabled
+python -m sglang.profiler \
+  --num-steps 10 \
+  --activities CPU GPU \
+  --output-dir /tmp/profiles \
+  --merge-profiles # optional argument to merge profile traces (default=False)
+```
+
+#### Output Files
+
+The profile merger generates:
+- Individual rank trace files: `{profile_id}-TP-{tp}-DP-{dp}-PP-{pp}-EP-{ep}.trace.json.gz`
+- Merged trace file: `merged-{profile_id}.trace.json.gz`
+
 ### Possible PyTorch bugs
 If in any cases you encounter the following error (for example, using qwen 2.5 VL):
 ```bash
