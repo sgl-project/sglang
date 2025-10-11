@@ -149,15 +149,13 @@ class Router:
         args_dict["prefill_policy"] = policy_from_str(args_dict["prefill_policy"])
         args_dict["decode_policy"] = policy_from_str(args_dict["decode_policy"])
 
-        # Convert backend and history backend
+        # Convert backend
         args_dict["backend"] = backend_from_str(args_dict.get("backend"))
-        args_dict["history_backend"] = history_backend_from_str(
-            args_dict.get("history_backend")
-        )
 
-        # Convert Oracle config if needed
+        # Convert Oracle config if needed (BEFORE converting history_backend to enum)
         oracle_config = None
-        if args_dict.get("history_backend") == "oracle":
+        history_backend_str = args_dict.get("history_backend", "memory")
+        if history_backend_str == "oracle":
             oracle_config = PyOracleConfig(
                 connect_descriptor=args_dict["oracle_connect_descriptor"],
                 username=args_dict["oracle_username"],
@@ -168,6 +166,9 @@ class Router:
                 pool_timeout_secs=args_dict.get("oracle_pool_timeout_secs", 30),
             )
         args_dict["oracle_config"] = oracle_config
+
+        # Now convert history_backend to enum (after checking the string value)
+        args_dict["history_backend"] = history_backend_from_str(history_backend_str)
 
         # Remove fields that shouldn't be passed to Rust Router constructor
         # These are either handled separately or are Python-only
