@@ -9,7 +9,7 @@ from collections import OrderedDict, defaultdict
 
 import torch
 
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, is_npu
 
 
 def is_cuda_v2():
@@ -86,6 +86,15 @@ def get_cuda_info():
             cuda_info.update(_get_cuda_version_info())
 
         return cuda_info
+    elif is_npu():
+        import torch_npu
+
+        cuda_info = {"NPU available": torch.npu.is_available()}
+        if cuda_info["NPU available"]:
+            cuda_info.update(_get_npu_info())
+            cuda_info.update(_get_cuda_version_info())
+
+        return cuda_info
 
 
 def _get_gpu_info():
@@ -115,6 +124,33 @@ def _get_gpu_info():
     return gpu_info
 
 
+def _get_npu_info():
+    """
+    Get information about available NPUs.
+    Cannot merged into `_get_gpu_info` due to torch_npu interface differences and NPUs do not have capabilities.
+    """
+    devices = defaultdict(list)
+    for k in range(torch.npu.device_count()):
+        devices[torch.npu.get_device_name(k)].append(str(k))
+
+    gpu_info = {}
+    for name, device_ids in devices.items():
+        gpu_info[f"NPU {','.join(device_ids)}"] = name
+
+    return gpu_info
+
+
+def _get_npu_cann_home():
+    cann_envs = ["ASCEND_TOOLKIT_HOME", "ASCEND_INSTALL_PATH"]
+    for var in cann_envs:
+        path = os.environ.get(var)
+        if path and os.path.exists(path):
+            return path
+
+    default_path = "/usr/local/Ascend/ascend-toolkit/latest"
+    return default_path if os.path.exists(default_path) else None
+
+
 def _get_cuda_version_info():
     """
     Get CUDA version information.
@@ -135,6 +171,16 @@ def _get_cuda_version_info():
         cuda_info = {"ROCM_HOME": ROCM_HOME}
 
         if ROCM_HOME and os.path.isdir(ROCM_HOME):
+            cuda_info.update(_get_nvcc_info())
+            cuda_info.update(_get_cuda_driver_version())
+
+        return cuda_info
+    elif is_npu():
+        CANN_HOME = _get_npu_cann_home()
+
+        cuda_info = {"CANN_HOME": CANN_HOME}
+
+        if CANN_HOME:
             cuda_info.update(_get_nvcc_info())
             cuda_info.update(_get_cuda_driver_version())
 
@@ -184,6 +230,17 @@ def _get_nvcc_info():
             }
         except subprocess.SubprocessError:
             return {"HIPCC": "Not Available"}
+    elif is_npu():
+        CANN_HOME = _get_npu_cann_home()
+
+        try:
+            bisheng = os.path.join(CANN_HOME, "aarch64-linux/ccec_compiler/bin/bisheng")
+            bisheng_output = (
+                subprocess.check_output([bisheng, "--version"]).decode("utf-8").strip()
+            )
+            return {"BiSheng": bisheng_output.split("\n")[0].strip()}
+        except subprocess.SubprocessError:
+            return {"BiSheng": "Not Available"}
     else:
         return {"NVCC": "Not Available"}
 
@@ -226,6 +283,28 @@ def _get_cuda_driver_version():
             return {"ROCM Driver Version": ver}
         except subprocess.SubprocessError:
             return {"ROCM Driver Version": "Not Available"}
+    elif is_npu():
+        try:
+            output = subprocess.check_output(
+                [
+                    "npu-smi",
+                    "info",
+                    "-t",
+                    "board",
+                    "-i",
+                    "0",
+                ]
+            )
+            for line in output.decode().strip().split("\n"):
+                if "Software Version" in line:
+                    version = line.split(":")[-1].strip()
+                    break
+            else:
+                version = "Not Available"
+
+            return {"Ascend Driver Version": version}
+        except subprocess.SubprocessError:
+            return {"Ascend Driver Version": "Not Available"}
     else:
         return {"CUDA Driver Version": "Not Available"}
 
@@ -250,6 +329,18 @@ def get_gpu_topology():
         try:
             result = subprocess.run(
                 ["rocm-smi", "--showtopotype"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=True,
+            )
+            return "\n" + result.stdout if result.returncode == 0 else None
+        except subprocess.SubprocessError:
+            return None
+    elif is_npu():
+        try:
+            result = subprocess.run(
+                ["npu-smi", "info", "-t", "topo"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -289,6 +380,8 @@ def check_env():
             env_info["NVIDIA Topology"] = gpu_topo
         elif is_hip():
             env_info["AMD Topology"] = gpu_topo
+        elif is_npu():
+            env_info["Ascend NPU"] = gpu_topo
 
     hypervisor_vendor = get_hypervisor_vendor()
     if hypervisor_vendor:
