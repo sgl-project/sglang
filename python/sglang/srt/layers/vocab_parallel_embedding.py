@@ -202,11 +202,9 @@ class VocabParallelEmbedding(torch.nn.Module):
         enable_tp: bool = True,
         use_attn_tp_group: bool = False,
         use_presharded_weights: bool = False,
-        return_results: bool = True,
     ):
         super().__init__()
         self.quant_config = quant_config
-        self.return_results = return_results
 
         self.enable_tp = enable_tp
         if self.enable_tp:
@@ -461,7 +459,7 @@ class VocabParallelEmbedding(torch.nn.Module):
         param[: loaded_weight.shape[0]].data.copy_(loaded_weight)
         param[loaded_weight.shape[0] :].data.fill_(0)
 
-    def forward(self, input_):
+    def forward(self, input_, reduce_results=True):
         if self.tp_size > 1:
             # Build the mask.
             masked_input, input_mask = get_masked_input_and_mask(
@@ -481,7 +479,7 @@ class VocabParallelEmbedding(torch.nn.Module):
         # Mask the output embedding.
         if self.tp_size > 1:
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
-            if self.return_results:
+            if reduce_results:
                 # Reduce across all the model parallel GPUs.
                 output_parallel = tensor_model_parallel_all_reduce(output_parallel)
         return output_parallel
