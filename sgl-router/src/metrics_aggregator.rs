@@ -19,7 +19,7 @@ pub fn aggregate_metrics(metric_packs: Vec<MetricPack>) -> anyhow::Result<String
             match openmetrics_parser::prometheus::parse_prometheus(&metric_pack.metrics_text) {
                 Ok(x) => x,
                 Err(err) => {
-                    warn!(
+                    eprintln!(
                         "aggregate_metrics error when parsing text: pack={:?} err={:?}",
                         metric_pack, err
                     );
