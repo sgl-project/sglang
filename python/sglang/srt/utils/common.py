@@ -523,7 +523,7 @@ def make_layers_non_pp(
     layer_fn: LayerFn,
     prefix: str = "",
 ) -> torch.nn.ModuleList:
-    from sglang.srt.offloader import get_offloader
+    from sglang.srt.utils.offloader import get_offloader
 
     layers = torch.nn.ModuleList(
         get_offloader().wrap_modules(

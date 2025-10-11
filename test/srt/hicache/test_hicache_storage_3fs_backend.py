@@ -29,6 +29,7 @@ class HiCacheStorage3FSBackendBaseMixin(HiCacheStorageBaseMixin):
             "numjobs": 2,
             "entries": 8,
             "use_mock_hf3fs_client": True,
+            "hicache_storage_pass_prefix_keys": True,
         }
 
         # Write config to temporary file
