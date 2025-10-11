@@ -5,6 +5,7 @@ use std::collections::HashMap;
 
 pub mod core;
 pub mod data_connector;
+pub mod engine_metrics;
 #[cfg(feature = "grpc-client")]
 pub mod grpc_client;
 pub mod mcp;
@@ -19,6 +20,7 @@ pub mod service_discovery;
 pub mod tokenizer;
 pub mod tool_parser;
 pub mod tree;
+
 use crate::metrics::PrometheusConfig;
 
 #[pyclass(eq)]
