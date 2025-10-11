@@ -1,6 +1,8 @@
 use openmetrics_parser::{MetricsExposition, PrometheusType, PrometheusValue};
 use std::collections::HashMap;
+use tracing::warn;
 
+#[derive(Debug)]
 pub struct MetricPack {
     pub labels: HashMap<String, String>,
     pub metrics_text: String,
@@ -17,7 +19,10 @@ pub fn aggregate_metrics(metric_packs: Vec<MetricPack>) -> anyhow::Result<String
             match openmetrics_parser::prometheus::parse_prometheus(&metric_pack.metrics_text) {
                 Ok(x) => x,
                 Err(err) => {
-                    eprintln!("hi err={err:?}");
+                    warn!(
+                        "aggregate_metrics error when parsing text: pack={:?} err={:?}",
+                        metric_pack, err
+                    );
                     continue;
                 }
             };
