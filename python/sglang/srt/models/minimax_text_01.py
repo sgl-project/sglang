@@ -572,9 +572,7 @@ class MiniMaxText01DecoderLayer(nn.Module):
                 prefix=prefix,
             )
         else:
-            raise ValueError(
-                f"Unsupported attention type: {config.attention_type}"
-            )
+            raise ValueError(f"Unsupported attention type: {config.attention_type}")
 
         if expert_num == 1:
             self.mlp = MiniMaxText01MLP(

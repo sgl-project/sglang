@@ -832,12 +832,7 @@ class LightningBackend(AttentionBackend):
         if self._get_num_decode_tokens(forward_batch) > 0:
             hidden.append(
                 self.forward_decode(
-                    q,
-                    k,
-                    v,
-                    state,
-                    self.forward_metadata.mamba_cache_indices,
-                    forward_batch,
+                    q, k, v, layer, forward_batch, save_kv_cache, **kwargs
                 )
             )
 

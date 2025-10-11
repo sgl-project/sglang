@@ -444,7 +444,7 @@ class MinimaxReqToTokenPool(ReqToTokenPool):
 
         assert len(select_index) == len(
             minimax_index
-        ), "Not enough Minimax cache slots. Increase --max-minimax-cache-size."
+        ), "Not enough Minimax cache slots. Increase --max-mamba-cache-size."
 
         self.req_index_to_minimax_index_mapping[select_index] = torch.tensor(
             minimax_index, dtype=torch.int32, device=self.device
