@@ -395,14 +395,20 @@ impl Router {
                 }
             }
 
-            if let Ok(res) = request_builder.send().await {
-                let status = StatusCode::from_u16(res.status().as_u16())
-                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                if let Ok(body_text) = res.text().await {
-                    if status.is_success() {
-                        responses.push((worker_base_url, body_text));
+            match request_builder.send().await {
+                Ok(res) => {
+                    let status = StatusCode::from_u16(res.status().as_u16())
+                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                    match res.text().await {
+                        Ok(body_text) => {
+                            if status.is_success() {
+                                responses.push((worker_base_url, body_text));
+                            }
+                        }
+                        Err(e) => tracing::warn!("fan_out_simple_request failed when reading text: {}", e),
                     }
                 }
+                Err(e) => tracing::warn!("fan_out_simple_request failed when sending: {}", e),
             }
         }
 
