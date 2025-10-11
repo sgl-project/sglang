@@ -183,6 +183,14 @@ impl RouterTrait for GrpcRouter {
             .into_response()
     }
 
+    async fn get_engine_metrics(&self) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Engine metrics is not yet implemented for GrpcRouter",
+        )
+            .into_response()
+    }
+
     async fn get_server_info(&self, _req: Request<Body>) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
     }

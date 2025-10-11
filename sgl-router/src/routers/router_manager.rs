@@ -290,6 +290,14 @@ impl RouterTrait for RouterManager {
         self
     }
 
+    async fn get_engine_metrics(&self) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Engine metrics is not yet implemented for RouterManager",
+        )
+            .into_response()
+    }
+
     async fn health_generate(&self, _req: Request<Body>) -> Response {
         // TODO: Should check if any router has healthy workers
         (
