@@ -3,7 +3,7 @@
 # Usage: docker build --build-arg UBUNTU_VERSION=24.04 --build-arg PYTHON_VERSION=3.10 -t sglang:xpu_kernel -f  Dockerfile.xpu --no-cache .
 
 # Use Intel deep learning essentials base image with Ubuntu 24.04
-FROM intel/deep-learning-essentials:2025.1.3-0-client-driver-libze1.21.1-1-devel-ubuntu24.10
+FROM intel/deep-learning-essentials:2025.1.3-0-devel-ubuntu24.04
 
 # Avoid interactive prompts during package install
 ENV DEBIAN_FRONTEND=noninteractive
@@ -28,10 +28,7 @@ ENV HOME=/home/sdp
 WORKDIR /home/sdp
 
 USER root
-RUN apt-get update && apt-get install -y software-properties-common && \
-    add-apt-repository -y ppa:kobuk-team/intel-graphics && \
-    apt-get install -y libze-intel-gpu1 libze1 intel-metrics-discovery intel-opencl-icd clinfo intel-gsc && \
-    apt-get install -y intel-media-va-driver-non-free libmfx-gen1 libvpl2 libvpl-tools libva-glx2 va-driver-all vainfo && \
+RUN apt-get update && 
     apt-get install -y libze-dev intel-ocloc
 
 RUN curl -fsSL -v -o miniforge.sh -O https://github.com/conda-forge/miniforge/releases/download/25.1.1-0/Miniforge3-Linux-x86_64.sh && \
