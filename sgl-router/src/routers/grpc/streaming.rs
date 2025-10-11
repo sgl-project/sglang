@@ -14,7 +14,6 @@ use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_stream::StreamExt;
-use tonic::codec::Streaming;
 use tracing::{debug, error, warn};
 
 use super::context;
@@ -153,7 +152,7 @@ impl StreamingProcessor {
     /// Process streaming chunks from a single stream (Regular mode)
     pub async fn process_streaming_chunks(
         &self,
-        mut grpc_stream: Streaming<proto::GenerateResponse>,
+        mut grpc_stream: crate::grpc_client::sglang_scheduler::AbortOnDropStream,
         dispatch: context::DispatchMetadata,
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool),
         original_request: Arc<ChatCompletionRequest>,
@@ -571,14 +570,17 @@ impl StreamingProcessor {
             }
         }
 
+        // Mark stream as completed successfully to prevent abort on drop
+        grpc_stream.mark_completed();
+
         Ok(())
     }
 
     /// Process dual streaming chunks (prefill + decode) - PD mode
     pub async fn process_dual_streaming_chunks(
         &self,
-        mut prefill_stream: Streaming<proto::GenerateResponse>,
-        decode_stream: Streaming<proto::GenerateResponse>,
+        mut prefill_stream: crate::grpc_client::sglang_scheduler::AbortOnDropStream,
+        decode_stream: crate::grpc_client::sglang_scheduler::AbortOnDropStream,
         dispatch: context::DispatchMetadata,
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool),
         original_request: Arc<ChatCompletionRequest>,
@@ -603,8 +605,18 @@ impl StreamingProcessor {
         }
 
         // Phase 2-5: Process decode stream (same as single mode)
-        self.process_streaming_chunks(decode_stream, dispatch, stop_params, original_request, tx)
-            .await
+        // Note: decode_stream will be marked completed inside process_streaming_chunks
+        let result = self
+            .process_streaming_chunks(decode_stream, dispatch, stop_params, original_request, tx)
+            .await;
+
+        // Mark prefill stream as completed AFTER decode completes successfully
+        // This ensures that if client disconnects during decode, BOTH streams send abort
+        if result.is_ok() {
+            prefill_stream.mark_completed();
+        }
+
+        result
     }
 
     /// Process streaming generate response and return SSE response
@@ -687,7 +699,7 @@ impl StreamingProcessor {
     /// Process streaming chunks for generate endpoint (no tool/reasoning parsing)
     async fn process_generate_streaming(
         tokenizer: Arc<dyn Tokenizer>,
-        mut stream: Streaming<proto::GenerateResponse>,
+        mut stream: crate::grpc_client::sglang_scheduler::AbortOnDropStream,
         request_id: String,
         weight_version: String,
         _include_logprobs: bool,
@@ -782,14 +794,17 @@ impl StreamingProcessor {
             }
         }
 
+        // Mark stream as completed successfully to prevent abort on drop
+        stream.mark_completed();
+
         Ok(())
     }
 
     /// Process dual streaming for generate endpoint (PD mode with logprobs support)
     async fn process_generate_streaming_dual(
         tokenizer: Arc<dyn Tokenizer>,
-        mut prefill_stream: Streaming<proto::GenerateResponse>,
-        decode_stream: Streaming<proto::GenerateResponse>,
+        mut prefill_stream: crate::grpc_client::sglang_scheduler::AbortOnDropStream,
+        decode_stream: crate::grpc_client::sglang_scheduler::AbortOnDropStream,
         request_id: String,
         weight_version: String,
         return_logprob: bool,
@@ -821,7 +836,8 @@ impl StreamingProcessor {
         };
 
         // Process decode stream with input_logprobs prepended
-        Self::process_generate_streaming_with_input_logprobs(
+        // Note: decode_stream will be marked completed inside the function
+        let result = Self::process_generate_streaming_with_input_logprobs(
             tokenizer,
             decode_stream,
             request_id,
@@ -830,13 +846,21 @@ impl StreamingProcessor {
             input_token_logprobs,
             tx,
         )
-        .await
+        .await;
+
+        // Mark prefill stream as completed AFTER decode completes successfully
+        // This ensures that if client disconnects during decode, BOTH streams send abort
+        if result.is_ok() {
+            prefill_stream.mark_completed();
+        }
+
+        result
     }
 
     /// Process generate streaming with optional input_logprobs
     async fn process_generate_streaming_with_input_logprobs(
         tokenizer: Arc<dyn Tokenizer>,
-        mut stream: Streaming<proto::GenerateResponse>,
+        mut stream: crate::grpc_client::sglang_scheduler::AbortOnDropStream,
         request_id: String,
         weight_version: String,
         _include_logprobs: bool,
@@ -956,6 +980,9 @@ impl StreamingProcessor {
                 None => continue,
             }
         }
+
+        // Mark stream as completed successfully to prevent abort on drop
+        stream.mark_completed();
 
         Ok(())
     }
