@@ -96,9 +96,15 @@ class DeepEPMoE(FusedMoE):
             self.use_block_quant = getattr(self.quant_method, "block_quant", False)
             self.use_fp8_w8a8 = True
             self.fp8_dtype = torch.float8_e4m3fn
+            self.use_w4afp8 = False
+        elif isinstance(quant_config, W4AFp8Config):
+            self.use_w4afp8 = True
+            self.use_block_quant = False
+            self.use_fp8_w8a8 = False
         else:
             self.use_fp8_w8a8 = False
             self.use_block_quant = False
+            self.use_w4afp8 = False
 
         self.deepep_mode = get_deepep_mode()
 
