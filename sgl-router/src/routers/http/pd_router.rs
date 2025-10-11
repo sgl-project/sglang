@@ -949,6 +949,14 @@ impl RouterTrait for PDRouter {
         self
     }
 
+    async fn get_engine_metrics(&self) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Engine metrics is not yet implemented for PDRouter",
+        )
+            .into_response()
+    }
+
     async fn health_generate(&self, _req: Request<Body>) -> Response {
         // Note: This endpoint actually causes the model to generate tokens, so we only test one pair
 

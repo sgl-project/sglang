@@ -258,6 +258,14 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         self
     }
 
+    async fn get_engine_metrics(&self) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Engine metrics is not yet implemented for OpenAIRouter",
+        )
+            .into_response()
+    }
+
     async fn health_generate(&self, _req: Request<Body>) -> Response {
         // Simple upstream probe: GET {base}/v1/models without auth
         let url = format!("{}/v1/models", self.base_url);
