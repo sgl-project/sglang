@@ -147,6 +147,42 @@ class Engine(EngineBase):
                 thread_label = "Tokenizer"
                 trace_set_thread_info(thread_label)
 
+    def _remove_output_ids_prefix_overlap(self, ret):
+        """
+        Remove the overlapping prefix from output_ids using completion_tokens.
+
+        This trims the beginning of output_ids if it overlaps with the input prompt.
+        Only trims if output_ids length is greater than completion_tokens.
+        Modifies ret in-place and returns it.
+        """
+
+        def _trim_one(item):
+            if not isinstance(item, dict):
+                return item
+            output_ids = item.get("output_ids")
+            meta_info = item.get("meta_info")
+            if not isinstance(meta_info, dict):
+                meta_info = {}
+            completion_tokens = meta_info.get("completion_tokens")
+            if (
+                isinstance(output_ids, list)
+                and isinstance(completion_tokens, int)
+                and completion_tokens > 0
+                and len(output_ids) > completion_tokens
+            ):
+                item["output_ids"] = output_ids[-completion_tokens:]
+            return item
+
+        # single input
+        if isinstance(ret, dict):
+            return _trim_one(ret)
+        # batch input
+        elif isinstance(ret, list):
+            for item in ret:
+                _trim_one(item)
+            return ret
+        return ret
+
     def generate(
         self,
         # The input prompt. It can be a single prompt or a batch of prompts.
@@ -219,6 +255,7 @@ class Engine(EngineBase):
                 while True:
                     try:
                         chunk = loop.run_until_complete(generator.__anext__())
+                        chunk = self._remove_output_ids_prefix_overlap(chunk)
                         yield chunk
                     except StopAsyncIteration:
                         break
@@ -226,6 +263,7 @@ class Engine(EngineBase):
             return generator_wrapper()
         else:
             ret = loop.run_until_complete(generator.__anext__())
+            ret = self._remove_output_ids_prefix_overlap(ret)
             return ret
 
     async def async_generate(
@@ -296,9 +334,16 @@ class Engine(EngineBase):
         generator = self.tokenizer_manager.generate_request(obj, None)
 
         if stream is True:
-            return generator
+
+            async def _trimmed_stream(agen):
+                async for chunk in agen:
+                    yield self._remove_output_ids_prefix_overlap(chunk)
+
+            return _trimmed_stream(generator)
         else:
-            return await generator.__anext__()
+            ret = await generator.__anext__()
+            ret = self._remove_output_ids_prefix_overlap(ret)
+            return ret
 
     def encode(
         self,
