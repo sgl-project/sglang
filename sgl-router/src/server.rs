@@ -48,7 +48,7 @@ use tracing::{error, info, warn, Level};
 pub struct AppContext {
     pub client: Client,
     pub router_config: RouterConfig,
-    pub rate_limiter: Arc<TokenBucket>,
+    pub rate_limiter: Option<Arc<TokenBucket>>,
     pub tokenizer: Option<Arc<dyn Tokenizer>>,
     pub reasoning_parser_factory: Option<ReasoningParserFactory>,
     pub tool_parser_factory: Option<ToolParserFactory>,
@@ -67,11 +67,20 @@ impl AppContext {
     pub fn new(
         router_config: RouterConfig,
         client: Client,
-        max_concurrent_requests: usize,
-        rate_limit_tokens_per_second: Option<usize>,
+        max_concurrent_requests: i32,
+        rate_limit_tokens_per_second: Option<i32>,
     ) -> Result<Self, String> {
-        let rate_limit_tokens = rate_limit_tokens_per_second.unwrap_or(max_concurrent_requests);
-        let rate_limiter = Arc::new(TokenBucket::new(max_concurrent_requests, rate_limit_tokens));
+        let rate_limiter = match max_concurrent_requests {
+            n if n <= 0 => None,
+            n => {
+                let rate_limit_tokens =
+                    rate_limit_tokens_per_second.filter(|&t| t > 0).unwrap_or(n);
+                Some(Arc::new(TokenBucket::new(
+                    n as usize,
+                    rate_limit_tokens as usize,
+                )))
+            }
+        };
 
         let (tokenizer, reasoning_parser_factory, tool_parser_factory) =
             if router_config.connection_mode == ConnectionMode::Grpc {
@@ -916,12 +925,24 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         Duration::from_secs(config.router_config.queue_timeout_secs),
     );
 
-    if let Some(processor) = processor {
-        spawn(processor.run());
-        info!(
-            "Started request queue with size: {}, timeout: {}s",
-            config.router_config.queue_size, config.router_config.queue_timeout_secs
-        );
+    if app_context.rate_limiter.is_none() {
+        info!("Rate limiting is disabled (max_concurrent_requests = -1)");
+    }
+
+    match processor {
+        Some(proc) => {
+            spawn(proc.run());
+            info!(
+                "Started request queue (size: {}, timeout: {}s)",
+                config.router_config.queue_size, config.router_config.queue_timeout_secs
+            );
+        }
+        None => {
+            info!(
+                "Rate limiting enabled (max_concurrent_requests = {}, queue disabled)",
+                config.router_config.max_concurrent_requests
+            );
+        }
     }
 
     let app_state = Arc::new(AppState {

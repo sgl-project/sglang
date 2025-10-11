@@ -192,8 +192,8 @@ struct CliArgs {
     #[arg(long, default_value_t = 1800)]
     request_timeout_secs: u64,
 
-    #[arg(long, default_value_t = 256)]
-    max_concurrent_requests: usize,
+    #[arg(long, default_value_t = -1)]
+    max_concurrent_requests: i32,
 
     #[arg(long, num_args = 0..)]
     cors_allowed_origins: Vec<String>,

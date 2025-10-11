@@ -54,8 +54,8 @@ class RouterArgs:
     request_id_headers: Optional[List[str]] = None
     # Request timeout in seconds
     request_timeout_secs: int = 1800
-    # Max concurrent requests for rate limiting
-    max_concurrent_requests: int = 256
+    # Max concurrent requests for rate limiting (-1 to disable)
+    max_concurrent_requests: int = -1
     # Queue size for pending requests when max concurrent limit reached
     queue_size: int = 100
     # Maximum time (in seconds) a request can wait in queue before timing out
@@ -409,7 +409,7 @@ class RouterArgs:
             f"--{prefix}max-concurrent-requests",
             type=int,
             default=RouterArgs.max_concurrent_requests,
-            help="Maximum number of concurrent requests allowed (for rate limiting)",
+            help="Maximum number of concurrent requests allowed (for rate limiting). Set to -1 to disable rate limiting.",
         )
         parser.add_argument(
             f"--{prefix}queue-size",
