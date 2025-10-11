@@ -6,11 +6,12 @@ import torch
 from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
 
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.cpp_ngram.ngram_cache import NgramCache
-from sglang.srt.speculative.ngram_utils import NgramVerifyInput
+from sglang.srt.speculative.ngram_info import NgramVerifyInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 logger = logging.getLogger(__name__)
@@ -207,17 +208,18 @@ class NGRAMWorker:
             batch_tokens.append(put_ids)
         self.ngram_cache.batch_put(batch_tokens)
 
-    def forward_batch_speculative_generation(self, batch: ScheduleBatch):
+    def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:
         self._prepare_for_speculative_decoding(batch)
         model_worker_batch = batch.get_model_worker_batch()
-        bid = model_worker_batch.bid
         num_accepted_tokens = 0
 
         if model_worker_batch.forward_mode.is_target_verify():
-            logits_output, _, can_run_cuda_graph = (
-                self.target_worker.forward_batch_generation(
-                    model_worker_batch, skip_sample=True
-                )
+            batch_result = self.target_worker.forward_batch_generation(
+                model_worker_batch, is_verify=True
+            )
+            logits_output, can_run_cuda_graph = (
+                batch_result.logits_output,
+                batch_result.can_run_cuda_graph,
             )
             verify_input = model_worker_batch.spec_info
             logits_output, next_token_ids, num_accepted_tokens = verify_input.verify(
@@ -227,14 +229,18 @@ class NGRAMWorker:
             batch.forward_mode = ForwardMode.DECODE
 
         else:
+            batch_result = self.target_worker.forward_batch_generation(
+                model_worker_batch
+            )
             logits_output, next_token_ids, can_run_cuda_graph = (
-                self.target_worker.forward_batch_generation(model_worker_batch)
+                batch_result.logits_output,
+                batch_result.next_token_ids,
+                batch_result.can_run_cuda_graph,
             )
 
-        return (
-            logits_output,
-            next_token_ids,
-            bid,
-            num_accepted_tokens,
-            can_run_cuda_graph,
+        return GenerationBatchResult(
+            logits_output=logits_output,
+            next_token_ids=next_token_ids,
+            num_accepted_tokens=num_accepted_tokens,
+            can_run_cuda_graph=can_run_cuda_graph,
         )
