@@ -1,7 +1,4 @@
-#[path = "../src/metrics_aggregator.rs"]
-mod metrics_aggregator;
-
-use metrics_aggregator::{aggregate_metrics, MetricPack};
+use sglang_router_rs::metrics_aggregator::{aggregate_metrics, MetricPack};
 
 #[test]
 fn test_aggregate_simple() {
