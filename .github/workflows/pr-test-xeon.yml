@@ -41,10 +41,12 @@ jobs:
         run: |
           version=$(cat python/sglang/version.py | cut -d'"' -f2)
           tag=v${version}-xeon
+          PR_REPO=${{ github.event.pull_request.head.repo.clone_url }}
+          PR_HEAD_REF=${{ github.head_ref }}
 
           docker build \
-            --build-arg SGLANG_REPO=${{ github.event.pull_request.head.repo.clone_url }} \
-            --build-arg VER_SGLANG=${{ github.head_ref }} \
+            ${PR_REPO:+--build-arg SGLANG_REPO=$PR_REPO} \
+            ${PR_HEAD_REF:+--build-arg VER_SGLANG=$PR_HEAD_REF} \
             . -f docker/Dockerfile.xeon  -t sglang_xeon --no-cache
 
       - name: Run container
