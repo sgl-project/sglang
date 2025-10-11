@@ -50,6 +50,7 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
+from sglang.srt.tracing.trace import trace_event_batch, trace_slice, trace_slice_end
 from sglang.srt.utils import (
     DynamicGradMode,
     broadcast_pyobj,
@@ -178,6 +179,7 @@ class PrefillBootstrapQueue:
         self._process_req(req)
         req.add_latency(RequestStage.PREFILL_PREPARE)
         self.queue.append(req)
+        trace_slice_end(RequestStage.PREFILL_PREPARE, req.rid, auto_next_anon=True)
 
     def extend(self, reqs: List[Req], num_kv_heads: int) -> None:
         for req in reqs:
@@ -269,6 +271,10 @@ class PrefillBootstrapQueue:
             req.time_stats.wait_queue_entry_time = time.perf_counter()
             req.add_latency(RequestStage.PREFILL_BOOTSTRAP)
 
+            trace_slice_end(
+                RequestStage.PREFILL_BOOTSTRAP, req.rid, auto_next_anon=True
+            )
+
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
         ]
@@ -296,6 +302,9 @@ class SchedulerDisaggregationPrefillMixin:
             )
             self.process_prefill_chunk()
             batch = self.get_new_batch_prefill()
+            if batch:
+                attrs = {"bid": hex(id(batch)), "batch_size": batch.batch_size()}
+                trace_event_batch("schedule", batch.reqs, attrs=attrs)
 
             if require_mlp_sync(self.server_args):
                 batch = self.prepare_mlp_sync_batch(batch)
@@ -330,6 +339,9 @@ class SchedulerDisaggregationPrefillMixin:
             )
             self.process_prefill_chunk()
             batch = self.get_new_batch_prefill()
+            if batch:
+                attrs = {"bid": hex(id(batch)), "batch_size": batch.batch_size()}
+                trace_event_batch("schedule", batch.reqs, attrs=attrs)
 
             if require_mlp_sync(self.server_args):
                 batch = self.prepare_mlp_sync_batch(batch)
@@ -401,6 +413,7 @@ class SchedulerDisaggregationPrefillMixin:
                 req.output_ids.append(next_token_id)
                 self.tree_cache.cache_unfinished_req(req)  # update the tree and lock
                 req.add_latency(RequestStage.PREFILL_FORWARD)
+                trace_slice(RequestStage.PREFILL_FORWARD, req.rid, auto_next_anon=True)
                 self.disagg_prefill_inflight_queue.append(req)
                 if (
                     logits_output is not None
@@ -477,6 +490,9 @@ class SchedulerDisaggregationPrefillMixin:
 
                 if self.enable_overlap:
                     self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
+                trace_slice(
+                    RequestStage.PREFILL_CHUNKED_FORWARD, req.rid, auto_next_anon=True
+                )
 
         self.maybe_send_health_check_signal()
 
@@ -548,6 +564,9 @@ class SchedulerDisaggregationPrefillMixin:
             req.add_latency(RequestStage.PREFILL_TRANSFER_KV_CACHE)
             self.req_to_metadata_buffer_idx_allocator.free(req.metadata_buffer_index)
             req.metadata_buffer_index = -1
+            trace_slice(
+                RequestStage.PREFILL_TRANSFER_KV_CACHE, req.rid, thread_finish_flag=True
+            )
 
         self.disagg_prefill_inflight_queue = undone_reqs
 

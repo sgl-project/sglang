@@ -89,6 +89,9 @@ class RouterArgs:
     # Parser configuration
     reasoning_parser: Optional[str] = None
     tool_call_parser: Optional[str] = None
+    # Trace
+    enable_trace: bool = False
+    otlp_traces_endpoint: str = "localhost:4317"
 
     @staticmethod
     def add_cli_args(
@@ -460,6 +463,17 @@ class RouterArgs:
             type=str,
             default=None,
             help="Specify the parser for handling tool-call interactions",
+        )
+        parser.add_argument(
+            f"--{prefix}enable-trace",
+            action="store_true",
+            help="Enable opentelemetry trace",
+        )
+        parser.add_argument(
+            f"--{prefix}otlp-traces-endpoint",
+            type=str,
+            default="localhost:4317",
+            help="Config opentelemetry collector endpoint if --enable-trace is set. format: <ip>:<port>",
         )
 
     @classmethod
