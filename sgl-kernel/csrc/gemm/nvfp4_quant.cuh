@@ -183,5 +183,3 @@ template <>
 struct PackedVec<__nv_fp8_e4m3> {
   __nv_fp8x2_e4m3 elts[8];
 };
-
-#undef CUDA_ARCH_FAMILY
