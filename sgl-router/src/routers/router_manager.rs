@@ -291,11 +291,16 @@ impl RouterTrait for RouterManager {
     }
 
     async fn get_engine_metrics(&self) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "Engine metrics is not yet implemented for RouterManager",
-        )
-            .into_response()
+        let num_routers = self.routers.len();
+        if num_routers != 1 {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                format!("Engine metrics is not yet implemented for {num_routers} routers"),
+            )
+                .into_response();
+        }
+
+        self.routers.iter().next().unwrap().value().get_engine_metrics().await
     }
 
     async fn health_generate(&self, _req: Request<Body>) -> Response {
