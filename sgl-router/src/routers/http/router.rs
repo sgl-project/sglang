@@ -719,7 +719,8 @@ impl RouterTrait for Router {
             Ok(x) => x,
             Err(e) => return e,
         };
-        TODO
+        let text = crate::engine_metrics::compute_engine_metrics();
+        (StatusCode::OK, text).into_response()
     }
 
     async fn get_server_info(&self, req: Request<Body>) -> Response {
