@@ -16,10 +16,10 @@
 import contextlib
 import json
 import os
+import tempfile
 import warnings
 from pathlib import Path
 from typing import Any, Dict, Optional, Type, Union
-import tempfile
 
 import torch
 from huggingface_hub import snapshot_download
