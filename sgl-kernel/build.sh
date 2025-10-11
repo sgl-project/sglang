@@ -35,19 +35,55 @@ fi
 CACHE_DIR="${PWD}/.cache"
 CMAKE_BUILD_CACHE="${CACHE_DIR}/cmake-build-py${PYTHON_VERSION}-cuda${CUDA_VERSION}-${ARCH}"
 CMAKE_DOWNLOAD_CACHE="${CACHE_DIR}/cmake-downloads"
+CCACHE_DIR="${CACHE_DIR}/ccache"
 
 mkdir -p "${CMAKE_BUILD_CACHE}"
 mkdir -p "${CMAKE_DOWNLOAD_CACHE}"
+mkdir -p "${CCACHE_DIR}"
 
-echo "Using CMake build cache: ${CMAKE_BUILD_CACHE}"
+echo "==================================="
+echo "Cache Configuration"
+echo "==================================="
+echo "CMake build cache: ${CMAKE_BUILD_CACHE}"
+echo "CMake download cache: ${CMAKE_DOWNLOAD_CACHE}"
+echo "ccache directory: ${CCACHE_DIR}"
+echo ""
 
 docker run --rm \
    -v $(pwd):/sgl-kernel \
    -v ${CMAKE_BUILD_CACHE}:/cmake-build-cache \
    -v ${CMAKE_DOWNLOAD_CACHE}:/cmake-downloads \
+   -v ${CCACHE_DIR}:/ccache \
    ${DOCKER_IMAGE} \
    bash -c "
+   echo \"==================================\"
+   echo \"Installing and configuring ccache\"
+   echo \"==================================\"
+
+   # Install ccache
+   yum install -y ccache
+
+   # Configure ccache
+   export CCACHE_DIR=/ccache
+   export CCACHE_MAXSIZE=10G
+   export CCACHE_COMPILERCHECK=content
+   export CCACHE_COMPRESS=true
+   export CCACHE_SLOPPINESS=file_macro,time_macros,include_file_mtime,include_file_ctime
+
+   # Set up ccache wrappers for compilers
+   export PATH=/usr/lib64/ccache:\$PATH
+   export CMAKE_C_COMPILER_LAUNCHER=ccache
+   export CMAKE_CXX_COMPILER_LAUNCHER=ccache
+   export CMAKE_CUDA_COMPILER_LAUNCHER=ccache
+
+   # Show ccache stats before build
+   ccache -sv || true
+   echo \"\"
+
    # Install CMake (version >= 3.26) - Robust Installation with caching
+   echo \"==================================\"
+   echo \"Installing CMake\"
+   echo \"==================================\"
    export CMAKE_VERSION_MAJOR=3.31
    export CMAKE_VERSION_MINOR=1
    # Setting these flags to reduce OOM chance only on ARM
@@ -112,4 +148,3 @@ docker run --rm \
    cp -r build/* /cmake-build-cache/ || true
 
    ./rename_wheels.sh
-   "
