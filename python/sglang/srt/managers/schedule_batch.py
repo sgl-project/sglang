@@ -750,17 +750,18 @@ class Req:
             return False
 
         for stop_str in self.sampling_params.stop_strs:
+            if not stop_str:
+                continue
             # Check if stop_str is contained in tail_str (fastest check first)
             if stop_str in tail_str:
                 return True
 
             # Check if tail_str suffix matches stop_str prefix
             # Only check if stop_str is not empty, it's for stream output
-            if stop_str:
-                min_len = min(len(tail_str), len(stop_str))
-                for i in range(1, min_len + 1):
-                    if tail_str[-i:] == stop_str[:i]:
-                        return True
+            min_len = min(len(tail_str), len(stop_str))
+            for i in range(1, min_len + 1):
+                if tail_str[-i:] == stop_str[:i]:
+                    return True
 
         return False
 
