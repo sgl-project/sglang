@@ -715,7 +715,11 @@ impl RouterTrait for Router {
     }
 
     async fn get_engine_metrics(&self) -> Response {
-        todo!()
+        let engine_responses = match self.fan_out_simple_request(None, "/metrics", Method::GET) {
+            Ok(x) => x,
+            Err(e) => return e,
+        };
+        TODO
     }
 
     async fn get_server_info(&self, req: Request<Body>) -> Response {
