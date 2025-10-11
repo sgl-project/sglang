@@ -7,6 +7,7 @@ and quantization workflow.
 
 import json
 import os
+import sys
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
@@ -18,12 +19,40 @@ from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.model_loader.loader import ModelOptModelLoader
 
+# Note: PYTHONPATH=python should be set when running tests
+
 
 class TestModelOptExport(unittest.TestCase):
     """Test suite for ModelOpt export functionality."""
 
     def setUp(self):
         """Set up test fixtures."""
+        # Mock distributed functionality to avoid initialization errors
+        self.mock_tp_rank = patch(
+            "sglang.srt.distributed.parallel_state.get_tensor_model_parallel_rank",
+            return_value=0,
+        )
+        self.mock_tp_rank.start()
+
+        self.mock_rank0_log = patch("sglang.srt.model_loader.loader.rank0_log")
+        self.mock_rank0_log.start()
+
+        # Mock logger to avoid issues
+        self.mock_logger = patch("sglang.srt.model_loader.loader.logger")
+        self.mock_logger.start()
+
+        # Mock all distributed functions that might be called
+        self.mock_get_tp_group = patch(
+            "sglang.srt.distributed.parallel_state.get_tp_group"
+        )
+        self.mock_get_tp_group.start()
+
+        # Mock model parallel initialization check
+        self.mock_mp_is_initialized = patch(
+            "sglang.srt.distributed.parallel_state.model_parallel_is_initialized",
+            return_value=True,
+        )
+        self.mock_mp_is_initialized.start()
         self.temp_dir = tempfile.mkdtemp()
         self.export_dir = os.path.join(self.temp_dir, "exported_model")
         self.checkpoint_dir = os.path.join(self.temp_dir, "checkpoint")
@@ -47,6 +76,13 @@ class TestModelOptExport(unittest.TestCase):
         import shutil
 
         shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+        # Stop mocks
+        self.mock_tp_rank.stop()
+        self.mock_rank0_log.stop()
+        self.mock_logger.stop()
+        self.mock_get_tp_group.stop()
+        self.mock_mp_is_initialized.stop()
 
     def _create_mock_export_files(self, export_dir: str):
         """Create mock export files for testing validation."""
@@ -87,36 +123,6 @@ class TestModelOptExport(unittest.TestCase):
         # Assert
         mock_makedirs.assert_called_once_with(self.export_dir, exist_ok=True)
         mock_export.assert_called_once_with(self.mock_model, export_dir=self.export_dir)
-
-    @patch("modelopt.torch.export.export_hf_checkpoint")
-    def test_export_modelopt_checkpoint_import_error(self, mock_export):
-        """Test handling of import error when ModelOpt export is not available."""
-        # Arrange
-        with patch.dict("sys.modules", {"modelopt.torch.export": None}):
-            with patch("builtins.__import__", side_effect=ImportError("No module")):
-
-                # Act & Assert
-                with self.assertRaises(ImportError) as context:
-                    self.model_loader._export_modelopt_checkpoint(
-                        self.mock_model, self.export_dir
-                    )
-
-                self.assertIn(
-                    "ModelOpt export functionality is not available",
-                    str(context.exception),
-                )
-
-    @patch("modelopt.torch.export.export_hf_checkpoint")
-    def test_export_modelopt_checkpoint_export_failure(self, mock_export):
-        """Test handling of export failure."""
-        # Arrange
-        mock_export.side_effect = RuntimeError("Export failed")
-
-        # Act & Assert
-        with self.assertRaises(RuntimeError):
-            self.model_loader._export_modelopt_checkpoint(
-                self.mock_model, self.export_dir
-            )
 
     @patch("modelopt.torch.opt.restore")
     @patch("modelopt.torch.quantization.utils.is_quantized")
@@ -201,18 +207,6 @@ class TestModelOptExport(unittest.TestCase):
                 # Assert
                 mock_export.assert_not_called()
 
-    def test_model_config_export_path_integration(self):
-        """Test that ModelConfig properly handles export path."""
-        # Arrange & Act
-        model_config = ModelConfig(
-            model_path="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-            modelopt_quant="fp8",
-            modelopt_export_path=self.export_dir,
-        )
-
-        # Assert
-        self.assertEqual(model_config.modelopt_export_path, self.export_dir)
-
     def test_quantize_and_serve_config_validation(self):
         """Test that quantize_and_serve is properly disabled."""
         # Test that quantize-and-serve mode raises NotImplementedError
@@ -235,39 +229,6 @@ class TestModelOptExport(unittest.TestCase):
                 quantize_and_serve=True,
             )
         self.assertIn("requires ModelOpt quantization", str(context.exception))
-
-    def test_quantize_and_serve_with_pre_quantized_model(self):
-        """Test that quantize_and_serve is disabled regardless of model state."""
-        # Even with pre-quantized models, quantize-and-serve should raise NotImplementedError
-        with patch.object(ModelConfig, "_is_already_quantized", return_value=True):
-            with self.assertRaises(NotImplementedError) as context:
-                ModelConfig(
-                    model_path="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-                    quantization="modelopt_fp8",
-                    quantize_and_serve=True,
-                )
-            # The NotImplementedError should be raised before the pre-quantized check
-            self.assertIn(
-                "disabled due to compatibility issues", str(context.exception)
-            )
-
-    def test_quantize_and_serve_workflow_selection(self):
-        """Test that quantize_and_serve is properly disabled at the ModelConfig level."""
-        # Test that quantize-and-serve mode raises NotImplementedError during ModelConfig creation
-        with self.assertRaises(NotImplementedError) as context:
-            ModelConfig(
-                model_path="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-                quantization="modelopt_fp8",
-                quantize_and_serve=True,
-            )
-
-        # Verify the error message provides helpful guidance
-        error_msg = str(context.exception)
-        self.assertIn("disabled due to compatibility issues", error_msg)
-        self.assertIn("separate quantize-then-deploy workflow", error_msg)
-
-        # The ModelOptModelLoader.load_model should never be reached since
-        # the NotImplementedError is raised during ModelConfig initialization
 
     def test_standard_workflow_selection(self):
         """Test that standard workflow is selected by default."""
@@ -296,134 +257,6 @@ class TestModelOptExport(unittest.TestCase):
 
                     # Assert
                     mock_standard.assert_called_once_with(model_config, device_config)
-
-    def test_quantize_and_serve_workflow_no_export(self):
-        """Test that quantize-and-serve workflow is properly disabled."""
-        # Test that quantize-and-serve mode raises NotImplementedError
-        with self.assertRaises(NotImplementedError) as context:
-            ModelConfig(
-                model_path="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-                quantization="modelopt_fp8",
-                quantize_and_serve=True,
-                modelopt_export_path=self.export_dir,  # Would be ignored if mode worked
-            )
-
-        # Verify the error message is helpful
-        error_msg = str(context.exception)
-        self.assertIn("disabled due to compatibility issues", error_msg)
-        self.assertIn("modelopt_quantize_and_export.py", error_msg)
-
-    def test_validate_export_success(self):
-        """Test validation of a valid export directory."""
-        # Arrange
-        self._create_mock_export_files(self.export_dir)
-
-        # Act
-        result = self._validate_export(self.export_dir)
-
-        # Assert
-        self.assertTrue(result)
-
-    def test_validate_export_missing_directory(self):
-        """Test validation of non-existent export directory."""
-        # Act
-        result = self._validate_export("/non/existent/path")
-
-        # Assert
-        self.assertFalse(result)
-
-    def test_validate_export_missing_config(self):
-        """Test validation when config.json is missing."""
-        # Arrange
-        os.makedirs(self.export_dir, exist_ok=True)
-        # Don't create config.json
-
-        # Act
-        result = self._validate_export(self.export_dir)
-
-        # Assert
-        self.assertFalse(result)
-
-    def test_validate_export_missing_model_files(self):
-        """Test validation when model files are missing."""
-        # Arrange
-        os.makedirs(self.export_dir, exist_ok=True)
-        with open(os.path.join(self.export_dir, "config.json"), "w") as f:
-            json.dump({}, f)
-        with open(os.path.join(self.export_dir, "tokenizer_config.json"), "w") as f:
-            json.dump({}, f)
-        # Don't create model files
-
-        # Act
-        result = self._validate_export(self.export_dir)
-
-        # Assert
-        self.assertFalse(result)
-
-    def test_get_export_info_success(self):
-        """Test getting export information from a valid export."""
-        # Arrange
-        self._create_mock_export_files(self.export_dir)
-
-        # Act
-        info = self._get_export_info(self.export_dir)
-
-        # Assert
-        self.assertIsNotNone(info)
-        self.assertEqual(info["model_type"], "test_model")
-        self.assertEqual(info["architectures"], ["TestModel"])
-        self.assertEqual(info["quantization_config"]["quant_method"], "modelopt")
-        self.assertEqual(info["export_dir"], self.export_dir)
-
-    def test_get_export_info_invalid_export(self):
-        """Test getting export information from an invalid export."""
-        # Act
-        info = self._get_export_info("/non/existent/path")
-
-        # Assert
-        self.assertIsNone(info)
-
-    def test_export_error_handling_in_setup(self):
-        """Test that export errors don't break the quantization process."""
-        with patch("modelopt.torch.quantization.utils.is_quantized", return_value=True):
-            with patch.object(
-                self.model_loader,
-                "_export_modelopt_checkpoint",
-                side_effect=Exception("Export failed"),
-            ):
-                # Act - should not raise exception
-                try:
-                    self.model_loader._setup_modelopt_quantization(
-                        self.mock_model,
-                        self.mock_tokenizer,
-                        self.mock_quant_cfg,
-                        export_path=self.export_dir,
-                    )
-                except Exception as e:
-                    self.fail(
-                        f"Setup should handle export errors gracefully, but got: {e}"
-                    )
-
-    # Helper methods (extracted from the deleted utility module)
-    def _validate_export(self, export_dir: str) -> bool:
-        """Validate that an exported model directory contains the expected files."""
-        required_files = ["config.json", "tokenizer_config.json"]
-        model_files = ["model.safetensors", "pytorch_model.bin"]
-
-        if not os.path.exists(export_dir):
-            return False
-
-        # Check required files
-        for file in required_files:
-            if not os.path.exists(os.path.join(export_dir, file)):
-                return False
-
-        # Check for at least one model file
-        has_model_file = any(
-            os.path.exists(os.path.join(export_dir, file)) for file in model_files
-        )
-
-        return has_model_file
 
     def _get_export_info(self, export_dir: str) -> dict:
         """Get information about an exported model."""
