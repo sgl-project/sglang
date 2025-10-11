@@ -814,6 +814,12 @@ class MiniMaxText01Model(nn.Module):
         self.embed_scale = 1.0
         return
 
+    def get_input_embeddings(
+        self,
+        input_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.embed_tokens(input_ids)
+
     def forward(
         self,
         input_ids: Optional[torch.Tensor],
