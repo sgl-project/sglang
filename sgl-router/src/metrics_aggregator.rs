@@ -70,7 +70,8 @@ fn merge_family(a: PrometheusFamily, b: PrometheusFamily) -> anyhow::Result<Prom
         a.get_label_names(),
         b.get_label_names()
     );
-    Ok(a.with_samples(b.into_iter_samples())?)
+    Ok(a.with_samples(b.into_iter_samples())
+        .map_err(|e| anyhow::anyhow!("failed to merge samples: {e:?}"))?)
 }
 
 pub fn try_reduce<I, T, E, F>(iterable: I, mut f: F) -> Result<Option<T>, E>
