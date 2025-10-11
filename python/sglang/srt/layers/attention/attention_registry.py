@@ -195,7 +195,35 @@ def create_hybrid_linear_attn_backend(runner):
 @register_attention_backend("bailing_hybrid_linear")
 def create_bailing_hybrid_linear_backend(runner):
     from sglang.srt.layers.attention.bailing_hybrid_linear_backend import (
-        HybridLinearAttentionBackend,
+        LightningAttentionBackend,
     )
+    from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+        HybridLinearAttnBackend,
+    )
+    from sglang.srt.utils import is_blackwell, is_npu
 
-    return HybridLinearAttentionBackend(runner)
+    if is_npu():
+        from sglang.srt.layers.attention.ascend_backend import AscendAttnBackend
+
+        full_attn_backend = AscendAttnBackend(runner)
+    elif is_blackwell():
+        from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+
+        full_attn_backend = TritonAttnBackend(runner)
+    else:
+        from sglang.srt.layers.attention.flashattention_backend import (
+            FlashAttentionBackend,
+        )
+
+        full_attn_backend = FlashAttentionBackend(runner)
+
+    linear_attn_backend = LightningAttentionBackend(runner)
+    decoder_attention_types = runner.model.get_decoder_attention_types()
+    full_attn_layers = [
+        i
+        for i in range(len(decoder_attention_types))
+        if decoder_attention_types[i] == 1
+    ]
+    return HybridLinearAttnBackend(
+        full_attn_backend, linear_attn_backend, full_attn_layers
+    )

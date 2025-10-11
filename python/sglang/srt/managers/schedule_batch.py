@@ -62,8 +62,8 @@ from sglang.srt.mem_cache.allocator import (
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
 from sglang.srt.mem_cache.memory_pool import (
-    HybridLinearReqToTokenPool,
     HybridReqToTokenPool,
+    LingHybridLinearReqToTokenPool,
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -1017,7 +1017,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def alloc_req_slots(self, num_reqs: int, reqs: Optional[List[Req]] = None):
         if isinstance(self.req_to_token_pool, HybridReqToTokenPool) or isinstance(
-            self.req_to_token_pool, HybridLinearReqToTokenPool
+            self.req_to_token_pool, LingHybridLinearReqToTokenPool
         ):
             req_pool_indices = self.req_to_token_pool.alloc(num_reqs, reqs)
         else:

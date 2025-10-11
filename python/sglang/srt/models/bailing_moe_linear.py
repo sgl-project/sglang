@@ -794,6 +794,9 @@ class BailingMoELinearForCausalLM(nn.Module):
     def end_layer(self):
         return self.model.end_layer
 
+    def get_decoder_attention_types(self):
+        return self.model.decoder_attention_types
+
     def forward(
         self,
         input_ids: torch.Tensor,

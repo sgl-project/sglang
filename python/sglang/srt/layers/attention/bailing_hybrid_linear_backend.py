@@ -24,9 +24,6 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
 
-from sgl_kernel import merge_state_v2
-from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
-
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -141,7 +138,7 @@ class BailingLinearKernel:
 
 
 @dataclass
-class HybridLinearAttentionMetadata:
+class LightningAttentionMetadata:
     """Metadata to be init once in the model forward pass,
     each layer's forward pass can reuse the metadata.
 
@@ -168,7 +165,7 @@ class HybridLinearAttentionMetadata:
     is_decode_req_tensor: torch.Tensor = None
 
 
-class HybridLinearAttentionBackend(AttentionBackend):
+class LightningAttentionBackend(AttentionBackend):
     """FlashAttention backend implementation.
 
     Note about the init:
@@ -186,14 +183,7 @@ class HybridLinearAttentionBackend(AttentionBackend):
     - For each forward batch, init_replay_cuda_graph will be called first and then replay the graph.
     """
 
-    def __init__(
-        self,
-        model_runner: ModelRunner,
-        skip_prefill: bool = False,
-        speculative_step_id=0,
-        topk=0,
-        speculative_num_steps=0,
-    ):
+    def __init__(self, model_runner: ModelRunner):
         super().__init__()
 
         assert not (
@@ -201,7 +191,7 @@ class HybridLinearAttentionBackend(AttentionBackend):
             and model_runner.model_config.is_encoder_decoder
         ), "Sliding window and cross attention are not supported together"
 
-        self.forward_metadata: HybridLinearAttentionMetadata = None
+        self.forward_metadata: LightningAttentionMetadata = None
         # extra metadata for handling speculative decoding topk > 1, extended draft decode and verify
         self.max_context_len = model_runner.model_config.context_len
         self.device = model_runner.device
@@ -211,7 +201,6 @@ class HybridLinearAttentionBackend(AttentionBackend):
         self.kv_cache_dtype = model_runner.kv_cache_dtype
         self.kv_cache_dtype_str = model_runner.server_args.kv_cache_dtype
         self.page_size = model_runner.page_size
-        self.skip_prefill = skip_prefill
         self.layer_group_size = model_runner.model_config.hf_config.layer_group_size
         self.BLOCK = (
             model_runner.model_config.block
@@ -246,7 +235,7 @@ class HybridLinearAttentionBackend(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
-        metadata = HybridLinearAttentionMetadata()
+        metadata = LightningAttentionMetadata()
         seqlens_in_batch = forward_batch.seq_lens
         batch_size = forward_batch.batch_size
         device = seqlens_in_batch.device
@@ -435,105 +424,39 @@ class HybridLinearAttentionBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
     ):
-        if k is not None and not is_linear_layer(layer.layer_id, self.layer_group_size):
-            assert v is not None
-            if save_kv_cache:
-                cache_loc = (
-                    forward_batch.out_cache_loc
-                    if not layer.is_cross_attention
-                    else forward_batch.encoder_out_cache_loc
-                )
-                forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer, cache_loc, k, v, layer.k_scale, layer.v_scale
-                )
-
         # Use precomputed metadata across all layers
         metadata = self.forward_metadata
 
-        # Calculate window size (can be moved to metadata if layer properties don't change)
-        # we don't do layer.sliding_window_size - 1 since in model.get_attention_sliding_window_size() we already - 1
-        # here is two side inclusive
-        window_size = (
-            (layer.sliding_window_size, 0)
-            if layer.sliding_window_size is not None and layer.sliding_window_size > -1
-            else (-1, -1)
-        )
-        k_descale, v_descale = None, None
-        # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
-        # has corresponding quantization method so that layer.k_scale is not None
         if self.kv_cache_dtype_str != "auto" and layer.k_scale is not None:
-            descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
-            k_descale = layer.k_scale.expand(descale_shape)
-            v_descale = layer.v_scale.expand(descale_shape)
             q = q.to(self.kv_cache_dtype)
-        causal = not layer.is_cross_attention
 
         # Get the appropriate page table based on whether we're using local attention
-        page_table = metadata.page_table
         cu_seqlens_q = metadata.cu_seqlens_q
-        cache_seqlens = metadata.cache_seqlens_int32
-        max_seqlen_q = metadata.max_seq_len_q
-        max_seqlen_k = metadata.max_seq_len_k
         cu_seqlens_k = metadata.cu_seqlens_k
         state_indices_tensor = metadata.linear_page_table
-        # Use Flash Attention for prefill
-        if not is_linear_layer(layer.layer_id, self.layer_group_size):
-            # Do softmax attention
-            key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
-                layer.layer_id
-            )
-            key_cache = key_cache.view(
-                -1, self.page_size, layer.tp_k_head_num, layer.head_dim
-            )
-            value_cache = value_cache.view(
-                -1, self.page_size, layer.tp_v_head_num, layer.head_dim
-            )
-            if layer.is_cross_attention:
-                page_table = metadata.encoder_page_table
-                cache_seqlens = metadata.encoder_lens_int32
-                cu_seqlens_k = metadata.encoder_cu_seqlens_k
-                window_size = (-1, -1)
 
-            result = flash_attn_with_kvcache(
-                q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                k_cache=key_cache,
-                v_cache=value_cache,
-                page_table=page_table,
-                cache_seqlens=cache_seqlens,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k_new=cu_seqlens_k,
-                max_seqlen_q=max_seqlen_q,
-                softmax_scale=layer.scaling,
-                causal=causal,
-                window_size=window_size,
-                softcap=layer.logit_cap,
-                k_descale=k_descale,
-                v_descale=v_descale,
+        # Do linear attention
+        kv_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)[0]
+        if self.linear_backend == "minimax":
+            o = self._prefill_and_mix_infer(
+                q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                k,
+                v,
+                kv_cache,
+                state_indices_tensor,
+                forward_batch,
+                layer,
+                cu_seqlens_q,
+                cu_seqlens_k,
             )
-            o = result
+        elif self.linear_backend == "seg_la":
+            o = self.linear_attention_entry(
+                q, k, v, kv_cache, state_indices_tensor, metadata, layer
+            )
         else:
-            # Do linear attention
-            kv_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)[0]
-            if self.linear_backend == "minimax":
-                o = self._prefill_and_mix_infer(
-                    q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                    k,
-                    v,
-                    kv_cache,
-                    state_indices_tensor,
-                    forward_batch,
-                    layer,
-                    cu_seqlens_q,
-                    cu_seqlens_k,
-                )
-            elif self.linear_backend == "seg_la":
-                o = self.linear_attention_entry(
-                    q, k, v, kv_cache, state_indices_tensor, metadata, layer
-                )
-            else:
-                raise ValueError(
-                    f"linear backend: {self.linear_backend} is not support for now"
-                )
+            raise ValueError(
+                f"linear backend: {self.linear_backend} is not support for now"
+            )
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def forward_decode(
@@ -548,91 +471,27 @@ class HybridLinearAttentionBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if k is not None and not is_linear_layer(layer.layer_id, self.layer_group_size):
-            assert v is not None
-            if save_kv_cache:
-                cache_loc = (
-                    forward_batch.out_cache_loc
-                    if not layer.is_cross_attention
-                    else forward_batch.encoder_out_cache_loc
-                )
-                forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer, cache_loc, k, v, layer.k_scale, layer.v_scale
-                )
-
         # Use precomputed metadata across all layers
         metadata = self.forward_metadata
 
-        causal = not layer.is_cross_attention
-
-        k_descale, v_descale = None, None
-        # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
-        # has corresponding quantization method so that layer.k_scale is not None
         if self.kv_cache_dtype_str != "auto":
-            if layer.k_scale is not None:
-                descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
-                k_descale = layer.k_scale.expand(descale_shape)
-                v_descale = layer.v_scale.expand(descale_shape)
             q = q.to(self.kv_cache_dtype)
 
-        if not is_linear_layer(layer.layer_id, self.layer_group_size):
-            # Do softmax attention
-
-            key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
-                layer.layer_id
+        # Do linear attention
+        kv_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)[0]
+        state_indices_tensor = metadata.linear_page_table
+        if self.linear_backend == "minimax":
+            o = self._decode_infer(
+                q, k, v, kv_cache, state_indices_tensor, forward_batch, layer
             )
-            key_cache = key_cache.view(
-                -1, self.page_size, layer.tp_k_head_num, layer.head_dim
+        elif self.linear_backend == "seg_la":
+            o = self.linear_attention_entry(
+                q, k, v, kv_cache, state_indices_tensor, metadata, layer
             )
-            value_cache = value_cache.view(
-                -1, self.page_size, layer.tp_v_head_num, layer.head_dim
-            )
-            window_size = (
-                (layer.sliding_window_size, 0)
-                if layer.sliding_window_size is not None
-                and layer.sliding_window_size > -1
-                else (-1, -1)
-            )
-            page_table = metadata.page_table
-            cache_seqlens = metadata.cache_seqlens_int32
-            cu_seqlens_k = metadata.cu_seqlens_k
-            max_seqlen_q = metadata.max_seq_len_q
-            q_reshaped = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
-
-            # Default: single-token self-attention
-            result = flash_attn_with_kvcache(
-                q=q_reshaped,
-                k_cache=key_cache,
-                v_cache=value_cache,
-                page_table=page_table,
-                cache_seqlens=cache_seqlens,
-                cu_seqlens_q=metadata.cu_seqlens_q,
-                cu_seqlens_k_new=cu_seqlens_k,
-                max_seqlen_q=max_seqlen_q,
-                softmax_scale=layer.scaling,
-                causal=causal,
-                window_size=window_size,
-                softcap=layer.logit_cap,
-                k_descale=k_descale,
-                v_descale=v_descale,
-            )
-            o = result
         else:
-            # Do linear attention
-            kv_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)[0]
-            state_indices_tensor = metadata.linear_page_table
-            if self.linear_backend == "minimax":
-                o = self._decode_infer(
-                    q, k, v, kv_cache, state_indices_tensor, forward_batch, layer
-                )
-            elif self.linear_backend == "seg_la":
-                o = self.linear_attention_entry(
-                    q, k, v, kv_cache, state_indices_tensor, metadata, layer
-                )
-            else:
-                raise ValueError(
-                    f"linear backend: {self.linear_backend} is not support for now"
-                )
+            raise ValueError(
+                f"linear backend: {self.linear_backend} is not support for now"
+            )
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
@@ -681,7 +540,7 @@ class HybridLinearAttentionBackend(AttentionBackend):
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
         """Initialize forward metadata for capturing CUDA graph."""
-        metadata = HybridLinearAttentionMetadata()
+        metadata = LightningAttentionMetadata()
 
         metadata.batch_size = bs
         metadata.is_decode_req_tensor = torch.ones_like(seq_lens)

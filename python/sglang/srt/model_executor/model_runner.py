@@ -92,9 +92,9 @@ from sglang.srt.mem_cache.memory_pool import (
     AscendTokenToKVPool,
     DoubleSparseTokenToKVPool,
     HybridLinearKVPool,
-    HybridLinearReqToTokenPool,
-    HybridLinearTokenToKVPool,
     HybridReqToTokenPool,
+    LinearTokenToKVPool,
+    LingHybridLinearReqToTokenPool,
     MHATokenToKVPool,
     MLATokenToKVPool,
     ReqToTokenPool,
@@ -1563,7 +1563,7 @@ class ModelRunner:
                     pre_alloc_size=pre_alloc_size,
                 )
             elif getattr(self.model_config.hf_config, "layer_group_size", 0) > 1:
-                self.req_to_token_pool = HybridLinearReqToTokenPool(
+                self.req_to_token_pool = LingHybridLinearReqToTokenPool(
                     size=max_num_reqs,
                     max_context_len=self.model_config.context_len
                     + extra_max_context_len,
@@ -1693,27 +1693,40 @@ class ModelRunner:
                     device=self.device,
                 )
             elif self.server_args.attention_backend == "bailing_hybrid_linear":
-                self.token_to_kv_pool = HybridLinearTokenToKVPool(
+                decoder_attention_types = self.model.get_decoder_attention_types()
+                full_attn_layers = [
+                    i
+                    for i in range(len(decoder_attention_types))
+                    if decoder_attention_types[i] == 1
+                ]
+
+                kwargs_for_linear_token_to_kv_pool = {
+                    "size": self.max_total_num_tokens,
+                    "linear_size": max_num_reqs,
+                    "page_size": self.page_size,
+                    "dtype": self.kv_cache_dtype,
+                    "head_num": self.model_config.num_attention_heads
+                    // get_attention_tp_size(),  # MHA
+                    "head_dim": self.model_config.head_dim,
+                    "layer_num": self.num_effective_layers - len(full_attn_layers),
+                    "device": self.device,
+                    "enable_memory_saver": self.server_args.enable_memory_saver,
+                }
+                self.token_to_kv_pool = HybridLinearKVPool(
+                    page_size=self.page_size if _is_npu else 1,
                     size=self.max_total_num_tokens,
-                    linear_size=max_num_reqs,
-                    page_size=self.page_size,
                     dtype=self.kv_cache_dtype,
+                    full_attention_layer_ids=full_attn_layers,
                     head_num=self.model_config.get_num_kv_heads(
                         get_attention_tp_size()
                     ),
-                    linear_head_num=self.model_config.num_attention_heads
-                    // get_attention_tp_size(),
                     head_dim=self.model_config.head_dim,
-                    softmax_layer_num=self.num_effective_layers
-                    // self.model_config.hf_config.layer_group_size,
-                    linear_layer_num=self.num_effective_layers
-                    - (
-                        self.num_effective_layers
-                        // self.model_config.hf_config.layer_group_size
-                    ),
-                    linear_layer_freq=self.model_config.hf_config.layer_group_size,
                     device=self.device,
                     enable_memory_saver=self.server_args.enable_memory_saver,
+                    layer_num=self.num_effective_layers,
+                    LinearTokenToKVPoolClass=LinearTokenToKVPool,
+                    kwargs_for_linear_token_to_kv_pool=kwargs_for_linear_token_to_kv_pool,
+                    enable_kvcache_transpose=False,
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
                 )
