@@ -186,6 +186,7 @@ elif _is_npu:
     import custom_ops
     import sgl_kernel_npu
     import torch_npu
+    
     from sglang.srt.layers.quantization.awq_triton import (
         awq_dequantize_decomposition as awq_dequantize,
     )
