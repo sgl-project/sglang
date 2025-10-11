@@ -4,7 +4,7 @@ use serde_json::Value;
 use crate::protocols::spec::Tool;
 
 use crate::tool_parser::{
-    errors::{ToolParserError, ToolParserResult},
+    errors::{ParserError, ParserResult},
     parsers::helpers,
     partial_json::PartialJson,
     traits::ToolParser,
@@ -117,7 +117,7 @@ impl JsonParser {
     }
 
     /// Parse a single JSON object into a ToolCall
-    fn parse_single_object(&self, obj: &Value) -> ToolParserResult<Option<ToolCall>> {
+    fn parse_single_object(&self, obj: &Value) -> ParserResult<Option<ToolCall>> {
         // Check if this looks like a tool call
         let name = obj
             .get("name")
@@ -134,7 +134,7 @@ impl JsonParser {
 
             // Convert arguments to JSON string
             let arguments = serde_json::to_string(args)
-                .map_err(|e| ToolParserError::ParsingFailed(e.to_string()))?;
+                .map_err(|e| ParserError::ParsingFailed(e.to_string()))?;
 
             Ok(Some(ToolCall {
                 function: FunctionCall {
@@ -148,7 +148,7 @@ impl JsonParser {
     }
 
     /// Parse JSON value(s) into tool calls
-    fn parse_json_value(&self, value: &Value) -> ToolParserResult<Vec<ToolCall>> {
+    fn parse_json_value(&self, value: &Value) -> ParserResult<Vec<ToolCall>> {
         let mut tools = Vec::new();
 
         match value {
@@ -184,11 +184,11 @@ impl Default for JsonParser {
 
 #[async_trait]
 impl ToolParser for JsonParser {
-    async fn parse_complete(&self, text: &str) -> ToolParserResult<(String, Vec<ToolCall>)> {
+    async fn parse_complete(&self, text: &str) -> ParserResult<(String, Vec<ToolCall>)> {
         // Always use extract_json_from_text to handle both pure JSON and mixed content
         if let Some((extracted_json, normal_text)) = self.extract_json_from_text(text) {
             let parsed = serde_json::from_str::<Value>(&extracted_json)
-                .map_err(|e| ToolParserError::ParsingFailed(e.to_string()))
+                .map_err(|e| ParserError::ParsingFailed(e.to_string()))
                 .and_then(|v| self.parse_json_value(&v));
 
             match parsed {
@@ -205,7 +205,7 @@ impl ToolParser for JsonParser {
         &mut self,
         chunk: &str,
         tools: &[Tool],
-    ) -> ToolParserResult<StreamingParseResult> {
+    ) -> ParserResult<StreamingParseResult> {
         // Append new text to buffer
         self.buffer.push_str(chunk);
         let current_text = &self.buffer.clone();
@@ -263,5 +263,15 @@ impl ToolParser for JsonParser {
 
     fn get_unstreamed_tool_args(&self) -> Option<Vec<ToolCallItem>> {
         helpers::get_unstreamed_args(&self.prev_tool_call_arr, &self.streamed_args_for_tool)
+    }
+
+    fn reset(&mut self) {
+        helpers::reset_parser_state(
+            &mut self.buffer,
+            &mut self.prev_tool_call_arr,
+            &mut self.current_tool_id,
+            &mut self.current_tool_name_sent,
+            &mut self.streamed_args_for_tool,
+        );
     }
 }

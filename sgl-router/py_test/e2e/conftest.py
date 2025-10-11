@@ -692,7 +692,7 @@ def pytest_configure(config):
 @pytest.fixture(scope="session")
 def e2e_model() -> str:
     # Always use the default test model
-    return DEFAULT_MODEL_NAME_FOR_TEST
+    return os.getenv("E2E_PRIMARY_MODEL", DEFAULT_MODEL_NAME_FOR_TEST)
 
 
 @pytest.fixture

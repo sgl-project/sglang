@@ -22,7 +22,7 @@ The radix tree data structure for managing the KV cache.
 import heapq
 import time
 from collections import defaultdict
-from functools import partial
+from functools import lru_cache, partial
 from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Tuple, Union
 
 import torch
@@ -113,6 +113,13 @@ class TreeNode:
         if self.hash_value is None or len(self.hash_value) == 0:
             return None
         return self.hash_value[-1]
+
+    @lru_cache(maxsize=1)
+    def get_prefix_hash_values(self, node: TreeNode) -> List[str]:
+        if node is None or node.hash_value is None:
+            return []
+
+        return node.get_prefix_hash_values(node.parent) + node.hash_value
 
     def __lt__(self, other: "TreeNode"):
         return self.last_access_time < other.last_access_time
