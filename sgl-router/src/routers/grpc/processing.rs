@@ -30,8 +30,8 @@ pub struct ResponseProcessor {
     pub tokenizer: Arc<dyn Tokenizer>,
     pub tool_parser_factory: ToolParserFactory,
     pub reasoning_parser_factory: ReasoningParserFactory,
-    configured_tool_parser: Option<String>,
-    configured_reasoning_parser: Option<String>,
+    pub configured_tool_parser: Option<String>,
+    pub configured_reasoning_parser: Option<String>,
 }
 
 impl ResponseProcessor {
@@ -52,6 +52,7 @@ impl ResponseProcessor {
     }
 
     /// Process a single choice from GenerateComplete response (EXACT COPY from router.rs:1573-1725)
+    #[allow(clippy::too_many_arguments)]
     pub async fn process_single_choice(
         &self,
         complete: &proto::GenerateComplete,
@@ -59,6 +60,8 @@ impl ResponseProcessor {
         original_request: &ChatCompletionRequest,
         stop_decoder: &mut StopSequenceDecoder,
         history_tool_calls_count: usize,
+        reasoning_parser_available: bool,
+        tool_parser_available: bool,
     ) -> Result<ChatChoice, String> {
         stop_decoder.reset();
         // Decode tokens
@@ -89,8 +92,8 @@ impl ResponseProcessor {
         let mut reasoning_text: Option<String> = None;
         let mut processed_text = final_text;
 
-        // Check if reasoning parsing is enabled and separate_reasoning is requested
-        if original_request.separate_reasoning {
+        // Check if reasoning parsing is enabled and parser is available
+        if original_request.separate_reasoning && reasoning_parser_available {
             let pooled_parser = utils::get_reasoning_parser(
                 &self.reasoning_parser_factory,
                 self.configured_reasoning_parser.as_ref(),
@@ -113,8 +116,6 @@ impl ResponseProcessor {
 
         // Step 2: Handle tool call parsing
         let mut tool_calls: Option<Vec<ToolCall>> = None;
-
-        // Check if tool calls should be processed
         let tool_choice_enabled = !matches!(
             &original_request.tool_choice,
             Some(ToolChoice::Value(ToolChoiceValue::None))
@@ -134,7 +135,7 @@ impl ResponseProcessor {
                     &processed_text,
                     &original_request.tool_choice,
                 );
-            } else {
+            } else if tool_parser_available {
                 (tool_calls, processed_text) = self
                     .parse_tool_calls(
                         &processed_text,

@@ -160,11 +160,6 @@ RUN if [ "$TARGETARCH" = "amd64" ]; then \
       pip install . ; \
     fi
 
-# Install tilelang
-RUN if [ "$TARGETARCH" = "amd64" ]; then \
-      pip install tilelang==0.1.6.post1 ; \
-    fi
-
 # Python tools
 RUN python3 -m pip install --no-cache-dir \
     datamodel_code_generator \

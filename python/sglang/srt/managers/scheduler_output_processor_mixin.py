@@ -634,7 +634,6 @@ class SchedulerOutputProcessorMixin:
         completion_tokens = []
         cached_tokens = []
         spec_verify_ct = []
-        spec_accepted_tokens = []
         output_hidden_states = None
 
         if return_logprob:
@@ -681,12 +680,18 @@ class SchedulerOutputProcessorMixin:
                     stream_interval = (
                         req.sampling_params.stream_interval or self.stream_interval
                     )
+
+                    # origin stream_interval logic
                     should_output = (
                         len(req.output_ids) % stream_interval == 1
                         if not self.model_config.is_multimodal_gen
                         and stream_interval > 1
                         else len(req.output_ids) % stream_interval == 0
                     )
+
+                    if should_output:
+                        # check_match_stop_str_prefix if  tail_str's suffix match stop_str prefix
+                        should_output &= not req.check_match_stop_str_prefix()
                 else:
                     should_output = (
                         len(req.output_ids) % DEFAULT_FORCE_STREAM_INTERVAL == 0
@@ -726,7 +731,6 @@ class SchedulerOutputProcessorMixin:
 
                 if not self.spec_algorithm.is_none():
                     spec_verify_ct.append(req.spec_verify_ct)
-                    spec_accepted_tokens.append(req.spec_accepted_tokens)
 
                 if return_logprob:
                     if (
@@ -827,7 +831,6 @@ class SchedulerOutputProcessorMixin:
                     completion_tokens,
                     cached_tokens,
                     spec_verify_ct,
-                    spec_accepted_tokens,
                     input_token_logprobs_val,
                     input_token_logprobs_idx,
                     output_token_logprobs_val,
