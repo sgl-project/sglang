@@ -60,7 +60,11 @@ from sglang.srt.mem_cache.allocator import (
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
-from sglang.srt.mem_cache.common import alloc_for_decode, alloc_for_extend
+from sglang.srt.mem_cache.common import (
+    alloc_for_decode,
+    alloc_for_extend,
+    alloc_token_slots,
+)
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
@@ -1016,7 +1020,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         new_allocate_lens = self.seq_lens + EagleDraftInput.ALLOC_LEN_PER_DECODE
         num_needed_tokens = (new_allocate_lens - draft_input.allocate_lens).sum().item()
-        out_cache_loc = self.alloc_token_slots(num_needed_tokens)
+        out_cache_loc = alloc_token_slots(self.tree_cache, num_needed_tokens)
 
         assign_req_to_token_pool[(bs,)](
             self.req_pool_indices,
