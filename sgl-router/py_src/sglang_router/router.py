@@ -1,7 +1,7 @@
 from typing import Optional
 
 from sglang_router.router_args import RouterArgs
-from sglang_router_rs import PolicyType
+from sglang_router_rs import BackendType, HistoryBackendType, PolicyType, PyOracleConfig
 from sglang_router_rs import Router as _Router
 
 
@@ -16,6 +16,36 @@ def policy_from_str(policy_str: Optional[str]) -> PolicyType:
         "power_of_two": PolicyType.PowerOfTwo,
     }
     return policy_map[policy_str]
+
+
+def backend_from_str(backend_str: Optional[str]) -> BackendType:
+    """Convert backend string to BackendType enum."""
+    if backend_str is None:
+        return BackendType.Sglang
+    backend_map = {
+        "sglang": BackendType.Sglang,
+        "vllm": BackendType.Vllm,
+        "trtllm": BackendType.Trtllm,
+        "openai": BackendType.Openai,
+        "anthropic": BackendType.Anthropic,
+    }
+    return backend_map.get(backend_str.lower(), BackendType.Sglang)
+
+
+def history_backend_from_str(backend_str: Optional[str]) -> HistoryBackendType:
+    """Convert history backend string to HistoryBackendType enum."""
+    if backend_str is None:
+        return HistoryBackendType.Memory
+    backend_lower = backend_str.lower()
+    if backend_lower == "memory":
+        return HistoryBackendType.Memory
+    elif backend_lower == "none":
+        # Use getattr to access 'None' which is a Python keyword
+        return getattr(HistoryBackendType, "None")
+    elif backend_lower == "oracle":
+        return HistoryBackendType.Oracle
+    else:
+        raise ValueError(f"Unknown history backend: {backend_str}")
 
 
 class Router:
@@ -119,8 +149,48 @@ class Router:
         args_dict["prefill_policy"] = policy_from_str(args_dict["prefill_policy"])
         args_dict["decode_policy"] = policy_from_str(args_dict["decode_policy"])
 
-        # remove mini_lb parameter
-        args_dict.pop("mini_lb")
+        # Convert backend
+        args_dict["backend"] = backend_from_str(args_dict.get("backend"))
+
+        # Convert Oracle config if needed
+        oracle_config = None
+        history_backend_str = args_dict.get("history_backend", "memory")
+        if history_backend_str == "oracle":
+            # Prioritize TNS alias over connect descriptor
+            tns_alias = args_dict.get("oracle_tns_alias")
+            connect_descriptor = args_dict.get("oracle_connect_descriptor")
+
+            # Use TNS alias if provided, otherwise use connect descriptor
+            final_descriptor = tns_alias if tns_alias else connect_descriptor
+
+            oracle_config = PyOracleConfig(
+                connect_descriptor=final_descriptor,
+                username=args_dict["oracle_username"],
+                password=args_dict["oracle_password"],
+                wallet_path=args_dict.get("oracle_wallet_path"),
+                pool_min=args_dict.get("oracle_pool_min", 1),
+                pool_max=args_dict.get("oracle_pool_max", 16),
+                pool_timeout_secs=args_dict.get("oracle_pool_timeout_secs", 30),
+            )
+        args_dict["oracle_config"] = oracle_config
+
+        # convert history_backend to enum
+        args_dict["history_backend"] = history_backend_from_str(history_backend_str)
+
+        # Remove fields that shouldn't be passed to Rust Router constructor
+        fields_to_remove = [
+            "mini_lb",
+            "oracle_wallet_path",
+            "oracle_tns_alias",
+            "oracle_connect_descriptor",
+            "oracle_username",
+            "oracle_password",
+            "oracle_pool_min",
+            "oracle_pool_max",
+            "oracle_pool_timeout_secs",
+        ]
+        for field in fields_to_remove:
+            args_dict.pop(field, None)
 
         return Router(_Router(**args_dict))
 

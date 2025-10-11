@@ -1,6 +1,7 @@
 import argparse
 import dataclasses
 import logging
+import os
 from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -89,6 +90,18 @@ class RouterArgs:
     # Parser configuration
     reasoning_parser: Optional[str] = None
     tool_call_parser: Optional[str] = None
+    # Backend selection
+    backend: str = "sglang"
+    # History backend configuration
+    history_backend: str = "memory"
+    oracle_wallet_path: Optional[str] = None
+    oracle_tns_alias: Optional[str] = None
+    oracle_connect_descriptor: Optional[str] = None
+    oracle_username: Optional[str] = None
+    oracle_password: Optional[str] = None
+    oracle_pool_min: int = 1
+    oracle_pool_max: int = 16
+    oracle_pool_timeout_secs: int = 30
 
     @staticmethod
     def add_cli_args(
@@ -461,6 +474,73 @@ class RouterArgs:
             default=None,
             help="Specify the parser for handling tool-call interactions",
         )
+        # Backend selection
+        parser.add_argument(
+            f"--{prefix}backend",
+            type=str,
+            default=RouterArgs.backend,
+            choices=["sglang", "vllm", "trtllm", "openai", "anthropic"],
+            help="Backend runtime to use (default: sglang)",
+        )
+        # History backend configuration
+        parser.add_argument(
+            f"--{prefix}history-backend",
+            type=str,
+            default=RouterArgs.history_backend,
+            choices=["memory", "none", "oracle"],
+            help="History storage backend for conversations and responses (default: memory)",
+        )
+        # Oracle configuration
+        parser.add_argument(
+            f"--{prefix}oracle-wallet-path",
+            type=str,
+            default=os.getenv("ATP_WALLET_PATH"),
+            help="Path to Oracle ATP wallet directory (env: ATP_WALLET_PATH)",
+        )
+        parser.add_argument(
+            f"--{prefix}oracle-tns-alias",
+            type=str,
+            default=os.getenv("ATP_TNS_ALIAS"),
+            help="Oracle TNS alias from tnsnames.ora (env: ATP_TNS_ALIAS).",
+        )
+        parser.add_argument(
+            f"--{prefix}oracle-connect-descriptor",
+            type=str,
+            default=os.getenv("ATP_DSN"),
+            help="Oracle connection descriptor/DSN (full connection string) (env: ATP_DSN)",
+        )
+        parser.add_argument(
+            f"--{prefix}oracle-username",
+            type=str,
+            default=os.getenv("ATP_USER"),
+            help="Oracle database username (env: ATP_USER)",
+        )
+        parser.add_argument(
+            f"--{prefix}oracle-password",
+            type=str,
+            default=os.getenv("ATP_PASSWORD"),
+            help="Oracle database password (env: ATP_PASSWORD)",
+        )
+        parser.add_argument(
+            f"--{prefix}oracle-pool-min",
+            type=int,
+            default=int(os.getenv("ATP_POOL_MIN", RouterArgs.oracle_pool_min)),
+            help="Minimum Oracle connection pool size (default: 1, env: ATP_POOL_MIN)",
+        )
+        parser.add_argument(
+            f"--{prefix}oracle-pool-max",
+            type=int,
+            default=int(os.getenv("ATP_POOL_MAX", RouterArgs.oracle_pool_max)),
+            help="Maximum Oracle connection pool size (default: 16, env: ATP_POOL_MAX)",
+        )
+        parser.add_argument(
+            f"--{prefix}oracle-pool-timeout-secs",
+            type=int,
+            default=int(
+                os.getenv("ATP_POOL_TIMEOUT_SECS", RouterArgs.oracle_pool_timeout_secs)
+            ),
+            help="Oracle connection pool timeout in seconds (default: 30, env: ATP_POOL_TIMEOUT_SECS)",
+        )
 
     @classmethod
     def from_cli_args(
@@ -531,6 +611,50 @@ class RouterArgs:
                 logger.info(
                     f"Using --policy '{self.policy}' for prefill nodes "
                     f"and --decode-policy '{self.decode_policy}' for decode nodes."
+                )
+
+        # Validate Oracle config when history_backend is oracle
+        if self.history_backend == "oracle":
+            # Check that exactly one of TNS alias or connect descriptor is provided
+            if self.oracle_tns_alias and self.oracle_connect_descriptor:
+                raise ValueError(
+                    "Cannot provide both oracle_tns_alias and oracle_connect_descriptor. "
+                    "Provide only one via --oracle-tns-alias/ATP_TNS_ALIAS or --oracle-connect-descriptor/ATP_DSN"
+                )
+
+            if not self.oracle_tns_alias and not self.oracle_connect_descriptor:
+                raise ValueError(
+                    "Either oracle_tns_alias or oracle_connect_descriptor is required when history_backend='oracle'. "
+                    "Provide via --oracle-tns-alias/ATP_TNS_ALIAS or --oracle-connect-descriptor/ATP_DSN env variable"
+                )
+
+            # If using TNS alias, wallet path is required
+            if self.oracle_tns_alias and not self.oracle_wallet_path:
+                raise ValueError(
+                    "oracle_wallet_path is required when using oracle_tns_alias. "
+                    "Provide via --oracle-wallet-path or ATP_WALLET_PATH env variable"
+                )
+
+            if not self.oracle_username:
+                raise ValueError(
+                    "oracle_username is required when history_backend='oracle'. "
+                    "Provide via --oracle-username or ATP_USER env variable"
+                )
+            if not self.oracle_password:
+                raise ValueError(
+                    "oracle_password is required when history_backend='oracle'. "
+                    "Provide via --oracle-password or ATP_PASSWORD env variable"
+                )
+            if self.oracle_pool_min < 1:
+                raise ValueError("oracle_pool_min must be at least 1")
+            if self.oracle_pool_max < self.oracle_pool_min:
+                raise ValueError("oracle_pool_max must be >= oracle_pool_min")
+
+        # Validate OpenAI backend
+        if self.backend == "openai":
+            if not self.worker_urls and not self.service_discovery:
+                raise ValueError(
+                    "worker_urls required for OpenAI backend when not using service discovery"
                 )
 
     @staticmethod
