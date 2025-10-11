@@ -51,3 +51,45 @@ fn should_forward_header(name: &str) -> bool {
         "host" // Should not forward the backend's host header
     )
 }
+
+/// Apply headers to a reqwest request builder, filtering out headers that shouldn't be forwarded
+/// or that will be set automatically by reqwest
+pub fn apply_request_headers(
+    headers: &HeaderMap,
+    mut request_builder: reqwest::RequestBuilder,
+    skip_content_headers: bool,
+) -> reqwest::RequestBuilder {
+    // Always forward Authorization header first if present
+    if let Some(auth) = headers
+        .get("authorization")
+        .or_else(|| headers.get("Authorization"))
+    {
+        request_builder = request_builder.header("Authorization", auth.clone());
+    }
+
+    // Forward other headers, filtering out problematic ones
+    for (key, value) in headers.iter() {
+        let key_str = key.as_str().to_lowercase();
+
+        // Skip headers that:
+        // - Are set automatically by reqwest (content-type, content-length for POST/PUT)
+        // - We already handled (authorization)
+        // - Are hop-by-hop headers (connection, transfer-encoding)
+        // - Should not be forwarded (host)
+        let should_skip = key_str == "authorization" || // Already handled above
+            key_str == "host" ||
+            key_str == "connection" ||
+            key_str == "transfer-encoding" ||
+            key_str == "keep-alive" ||
+            key_str == "te" ||
+            key_str == "trailers" ||
+            key_str == "upgrade" ||
+            (skip_content_headers && (key_str == "content-type" || key_str == "content-length"));
+
+        if !should_skip {
+            request_builder = request_builder.header(key.clone(), value.clone());
+        }
+    }
+
+    request_builder
+}
