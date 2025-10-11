@@ -13,7 +13,7 @@ jobs:
   build-and-test:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
       github.event.pull_request.draft == false
-    runs-on: xeon-pvc
+    runs-on: intel-bmg
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -28,7 +28,7 @@ jobs:
           docker build \
             --build-arg SG_LANG_BRANCH=${{ github.head_ref }} \
             --build-arg SG_LANG_REPO=${{ github.event.pull_request.head.repo.clone_url }} \
-            --no-cache --progress=plain -f docker/Dockerfile.xpu -t xpu_sglang_main:pvc .
+            --no-cache --progress=plain -f docker/Dockerfile.xpu -t xpu_sglang_main:bmg .
 
 
       - name: Run container
@@ -37,7 +37,7 @@ jobs:
             --device /dev/dri/ \
             --name main_sglang_xpu \
             -e HF_TOKEN=$(cat ~/huggingface_token.txt) \
-            xpu_sglang_main:pvc
+            xpu_sglang_main:bmg
 
       - name: Install Dependency
         timeout-minutes: 20
@@ -62,7 +62,7 @@ jobs:
   finish:
     if: always()
     needs: [build-and-test]
-    runs-on: xeon-pvc
+    runs-on: ubuntu
     steps:
       - name: Check job status
         run: |
