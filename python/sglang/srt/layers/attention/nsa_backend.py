@@ -149,7 +149,14 @@ NSA_DECODE_IMPL: _NSA_IMPL_T
 
 
 class NativeSparseAttnBackend(AttentionBackend):
-    def __init__(self, model_runner: ModelRunner):
+    def __init__(
+        self,
+        model_runner: ModelRunner,
+        skip_prefill: bool = False,
+        speculative_step_id=0,
+        topk=0,
+        speculative_num_steps=0,
+    ):
         super().__init__()
         self.forward_metadata: NSAMetadata
         self.device = model_runner.device
@@ -186,6 +193,14 @@ class NativeSparseAttnBackend(AttentionBackend):
                 (max_bs + 1,), dtype=torch.int32, device=model_runner.device
             )
 
+        # Speculative decoding
+        self.topk = model_runner.server_args.speculative_eagle_topk or 0
+        self.speculative_num_steps = speculative_num_steps
+        self.speculative_num_draft_tokens = (
+            model_runner.server_args.speculative_num_draft_tokens
+        )
+        self.speculative_step_id = speculative_step_id
+
     def get_device_int32_arange(self, l: int) -> torch.Tensor:
         if l > len(self._arange_buf):
             next_pow_of_2 = 1 << (l - 1).bit_length()
@@ -204,37 +219,127 @@ class NativeSparseAttnBackend(AttentionBackend):
         )
         return page_table[:, strided_indices] // page_size
 
+        # For speculative decoding
+        self.topk = model_runner.server_args.speculative_eagle_topk or 0
+        self.speculative_num_steps = speculative_num_steps
+        self.speculative_num_draft_tokens = (
+            model_runner.server_args.speculative_num_draft_tokens
+        )
+        self.speculative_step_id = speculative_step_id
+        assert (
+            self.topk <= 1
+        ), "NSA backend only supports topk = 1 for speculative decoding"
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         batch_size = forward_batch.batch_size
         device = forward_batch.seq_lens.device
 
-        assert (
-            forward_batch.spec_info is None
-        ), "Spec decoding is not supported for NSA backend now"
-        cache_seqlens_int32 = forward_batch.seq_lens.to(torch.int32)
-        cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
-        assert forward_batch.seq_lens_cpu is not None
-        max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item())
-        page_table = forward_batch.req_to_token_pool.req_to_token[
-            forward_batch.req_pool_indices, :max_seqlen_k
-        ]
-
         if forward_batch.forward_mode.is_decode_or_idle():
-            extend_seq_lens_cpu = [1] * batch_size
-            max_seqlen_q = 1
-            cu_seqlens_q = self.get_device_int32_arange(batch_size + 1)
+            if forward_batch.spec_info is not None:
+                # Draft Decode
+                assert self.topk <= 1
+                cache_seqlens_int32 = (
+                    forward_batch.seq_lens + (self.speculative_step_id + 1)
+                ).to(torch.int32)
+                max_seqlen_q = 1
+                max_seqlen_k = forward_batch.seq_lens_cpu.max().item() + (
+                    self.speculative_step_id + 1
+                )
+                cu_seqlens_q = torch.arange(
+                    0, batch_size + 1, dtype=torch.int32, device=device
+                )
+                cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
+                page_table = forward_batch.req_to_token_pool.req_to_token[
+                    forward_batch.req_pool_indices, :max_seqlen_k
+                ]
+                extend_seq_lens_cpu = [1] * batch_size
+            else:
+                # Normal Decode
+                cache_seqlens_int32 = forward_batch.seq_lens.to(torch.int32)
+                cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
+                assert forward_batch.seq_lens_cpu is not None
+                max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item())
+                page_table = forward_batch.req_to_token_pool.req_to_token[
+                    forward_batch.req_pool_indices, :max_seqlen_k
+                ]
+                extend_seq_lens_cpu = [1] * batch_size
+                max_seqlen_q = 1
+                cu_seqlens_q = torch.arange(
+                    0, batch_size + 1, dtype=torch.int32, device=device
+                )
             seqlens_expanded = cache_seqlens_int32
+        elif forward_batch.forward_mode.is_target_verify():
+            cache_seqlens_int32 = (
+                forward_batch.seq_lens + self.speculative_num_draft_tokens
+            ).to(torch.int32)
+            max_seqlen_q = self.speculative_num_draft_tokens
+            max_seqlen_k = (
+                forward_batch.seq_lens_cpu.max().item()
+                + self.speculative_num_draft_tokens
+            )
+            cu_seqlens_q = torch.arange(
+                0,
+                batch_size * self.speculative_num_draft_tokens + 1,
+                self.speculative_num_draft_tokens,
+                dtype=torch.int32,
+                device=device,
+            )
+            cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
+            page_table = forward_batch.req_to_token_pool.req_to_token[
+                forward_batch.req_pool_indices, :max_seqlen_k
+            ]
+            extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * batch_size
+            forward_batch.extend_seq_lens_cpu = extend_seq_lens_cpu
+
+            seqlens_int32_cpu = [
+                self.speculative_num_draft_tokens + kv_len
+                for kv_len in forward_batch.seq_lens_cpu.tolist()
+            ]
+            seqlens_expanded = torch.cat(
+                [
+                    torch.arange(
+                        kv_len - qo_len + 1,
+                        kv_len + 1,
+                        dtype=torch.int32,
+                        device=device,
+                    )
+                    for qo_len, kv_len in zip(
+                        extend_seq_lens_cpu,
+                        seqlens_int32_cpu,
+                        strict=True,
+                    )
+                ]
+            )
         elif forward_batch.forward_mode.is_extend():
             assert (
                 forward_batch.extend_seq_lens_cpu is not None
                 and forward_batch.extend_seq_lens is not None
                 and forward_batch.extend_prefix_lens_cpu is not None
             ), "All of them must not be None"
+            cache_seqlens_int32 = forward_batch.seq_lens.to(torch.int32)
+            cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
+            assert forward_batch.seq_lens_cpu is not None
+            max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item())
+            page_table = forward_batch.req_to_token_pool.req_to_token[
+                forward_batch.req_pool_indices, :max_seqlen_k
+            ]
             extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+            print(
+                f"init_forward_metadata forward_batch.mode: {forward_batch.forward_mode.name}, extend_seq_lens_cpu: {extend_seq_lens_cpu}, extend_seq_lens: {forward_batch.extend_seq_lens}"
+            )
             assert forward_batch.extend_seq_lens is not None
-            if any(forward_batch.extend_prefix_lens_cpu):
-                max_seqlen_q = max(extend_seq_lens_cpu)
+            if (
+                any(forward_batch.extend_prefix_lens_cpu)
+                or forward_batch.forward_mode == ForwardMode.DRAFT_EXTEND
+            ):
+                # Hack here, just to test the following path, change it later
+                # extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * batch_size
+
+                print(
+                    f"init_forward_metadata forward_batch.mode: {forward_batch.forward_mode.name}, seq_lens: {forward_batch.seq_lens}, seq_lens_cpu: {forward_batch.seq_lens_cpu}"
+                )
+                max_seqlen_q = max(forward_batch.extend_seq_lens_cpu)
                 cu_seqlens_q = compute_cu_seqlens(
                     forward_batch.extend_seq_lens.to(torch.int32)
                 )
@@ -474,10 +579,6 @@ class NativeSparseAttnBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        assert (
-            not forward_batch.forward_mode.is_target_verify()
-            and not forward_batch.forward_mode.is_draft_extend()
-        ), "NSA backend doesn't support speculative decoding"
         if k is not None:
             assert v is not None
             if save_kv_cache:
@@ -885,3 +986,27 @@ class NativeSparseAttnBackend(AttentionBackend):
             flashmla_metadata=flashmla_metadata,
             num_splits=num_splits,
         )
+
+
+class NativeSparseAttnMultiStepBackend:
+
+    def __init__(
+        self, model_runner: ModelRunner, topk: int, speculative_num_steps: int
+    ):
+        self.model_runner = model_runner
+        self.topk = topk
+        self.speculative_num_steps = speculative_num_steps
+        self.attn_backends = []
+        for i in range(self.speculative_num_steps):
+            self.attn_backends.append(
+                NativeSparseAttnBackend(
+                    model_runner,
+                    speculative_step_id=i,
+                    topk=self.topk,
+                    speculative_num_steps=self.speculative_num_steps,
+                )
+            )
+
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+        for i in range(self.speculative_num_steps - 1):
+            self.attn_backends[i].init_forward_metadata(forward_batch)
