@@ -71,7 +71,9 @@ class TritonAttnBackend(AttentionBackend):
 
         self.decode_attention_fwd = torch.compiler.disable(decode_attention_fwd)
         self.extend_attention_fwd = torch.compiler.disable(extend_attention_fwd)
-        self.extend_attention_fwd_unified = torch.compiler.disable(extend_attention_fwd_unified)
+        self.extend_attention_fwd_unified = torch.compiler.disable(
+            extend_attention_fwd_unified
+        )
 
         # Parse args
         self.skip_prefill = skip_prefill
@@ -843,7 +845,7 @@ class TritonAttnBackend(AttentionBackend):
         Both prefix and extend KV are accessed through unified kv_indices.
         """
         bs = forward_batch.batch_size
-        
+
         # Determine sliding window settings
         if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
             sliding_window_size = layer.sliding_window_size
@@ -858,37 +860,47 @@ class TritonAttnBackend(AttentionBackend):
         # Build unified kv_indices (prefix + extend)
         # Extend tokens are already in cache (written above)
         extend_kv_indices = forward_batch.out_cache_loc
-        
+
         # Concatenate prefix and extend indices
         unified_kv_indices_list = []
         unified_kv_indptr = torch.zeros(bs + 1, dtype=torch.int32, device=self.device)
         prefix_lens_list = []
-        
+
         for i in range(bs):
             # Get prefix indices for this sequence
             prefix_start = prefix_kv_indptr[i].item()
             prefix_end = prefix_kv_indptr[i + 1].item()
             prefix_len = prefix_end - prefix_start
             prefix_lens_list.append(prefix_len)
-            
+
             if prefix_len > 0:
                 seq_prefix_indices = prefix_kv_indices[prefix_start:prefix_end]
             else:
-                seq_prefix_indices = torch.tensor([], dtype=torch.int64, device=self.device)
-            
+                seq_prefix_indices = torch.tensor(
+                    [], dtype=torch.int64, device=self.device
+                )
+
             # Get extend indices for this sequence
-            extend_start = forward_batch.extend_start_loc[i].item() if hasattr(forward_batch, 'extend_start_loc') else sum(forward_batch.extend_seq_lens_cpu[:i])
+            extend_start = (
+                forward_batch.extend_start_loc[i].item()
+                if hasattr(forward_batch, "extend_start_loc")
+                else sum(forward_batch.extend_seq_lens_cpu[:i])
+            )
             extend_len = forward_batch.extend_seq_lens[i].item()
-            seq_extend_indices = extend_kv_indices[extend_start:extend_start + extend_len]
-            
+            seq_extend_indices = extend_kv_indices[
+                extend_start : extend_start + extend_len
+            ]
+
             # Concatenate
             seq_unified_indices = torch.cat([seq_prefix_indices, seq_extend_indices])
             unified_kv_indices_list.append(seq_unified_indices)
             unified_kv_indptr[i + 1] = unified_kv_indptr[i] + len(seq_unified_indices)
-        
+
         unified_kv_indices = torch.cat(unified_kv_indices_list)
-        prefix_lens = torch.tensor(prefix_lens_list, dtype=torch.int32, device=self.device)
-        
+        prefix_lens = torch.tensor(
+            prefix_lens_list, dtype=torch.int32, device=self.device
+        )
+
         # Call unified kernel
         self.extend_attention_fwd_unified(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -907,7 +919,7 @@ class TritonAttnBackend(AttentionBackend):
             sinks=sinks,
             xai_temperature_len=layer.xai_temperature_len,
         )
-        
+
         return o
 
     def forward_decode(
