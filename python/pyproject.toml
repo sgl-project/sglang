@@ -73,6 +73,7 @@ dependencies = [
 
 [project.optional-dependencies]
 decord = ["decord"]
+modelopt = ["nvidia-modelopt"]
 test = [
   "accelerate",
   "expecttest",
@@ -90,9 +91,9 @@ tracing = [
     "opentelemetry-exporter-otlp-proto-grpc",
     "opentelemetry-sdk",
 ]
-all = ["sglang[test]", "sglang[decord]"]
-all_aarch64 = ["sglang[test]"]
-dev = ["sglang[test]", "sglang[decord]"]
+all = ["sglang[test]", "sglang[decord]", "sglang[modelopt]"]
+all_aarch64 = ["sglang[test]", "sglang[modelopt]"]
+dev = ["sglang[test]", "sglang[decord]", "sglang[modelopt]"]
 
 
 # The following will be deprecated in 2 weeks

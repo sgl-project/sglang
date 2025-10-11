@@ -112,6 +112,24 @@ class ModelOptFp8Config(QuantizationConfig):
             )
 
     @classmethod
+    def override_quantization_method(cls, hf_quant_config, user_quant):
+        """Override quantization method based on the model's config."""
+        if hf_quant_config is None:
+            return None
+
+        # Check if this is a ModelOpt config
+        quant_algo = hf_quant_config.get("quant_algo", "").upper()
+
+        # If user specified generic "modelopt", auto-detect the specific method
+        if user_quant == "modelopt":
+            if "FP8" in quant_algo:
+                return "modelopt_fp8"
+            elif "NVFP4" in quant_algo or "FP4" in quant_algo:
+                return "modelopt_fp4"
+
+        return None
+
+    @classmethod
     def get_name(cls) -> str:
         return "modelopt_fp8"
 
@@ -528,6 +546,24 @@ class ModelOptFp4Config(QuantizationConfig):
         self.exclude_modules = exclude_modules
 
     @classmethod
+    def override_quantization_method(cls, hf_quant_config, user_quant):
+        """Override quantization method based on the model's config."""
+        if hf_quant_config is None:
+            return None
+
+        # Check if this is a ModelOpt config
+        quant_algo = hf_quant_config.get("quant_algo", "").upper()
+
+        # If user specified generic "modelopt", auto-detect the specific method
+        if user_quant == "modelopt":
+            if "FP8" in quant_algo:
+                return "modelopt_fp8"
+            elif "NVFP4" in quant_algo or "FP4" in quant_algo:
+                return "modelopt_fp4"
+
+        return None
+
+    @classmethod
     def get_name(cls) -> str:
         return "modelopt_fp4"
 
@@ -608,7 +644,16 @@ class ModelOptFp4Config(QuantizationConfig):
                 else:
                     kv_cache_quant_algo = "auto"
 
-            group_size = ModelOptFp4Config.common_group_size(config)
+            group_size = config.get("group_size")
+            # If group_size is not at top level, try to extract from config_groups
+            if group_size is None:
+                config_groups = config.get("config_groups", {})
+                if config_groups:
+                    # Get group_size from the first group's weights config
+                    first_group = next(iter(config_groups.values()), {})
+                    weights_config = first_group.get("weights", {})
+                    group_size = weights_config.get("group_size")
+
             exclude_modules = config.get("ignore", [])
         else:
             # Fall back to nested format (hf_quant_config.json - legacy format)
@@ -634,15 +679,15 @@ class ModelOptFp4Config(QuantizationConfig):
             )
         is_checkpoint_nvfp4_serialized = "NVFP4" in quant_method
 
-        if not (group_size and kv_cache_quant_algo) or exclude_modules is None:
+        if group_size is None or exclude_modules is None:
             logger.warning(
                 f"group_size: {group_size},"
                 f"kv_cache_quant_algo: {kv_cache_quant_algo},"
                 f"exclude_modules: {exclude_modules}"
             )
             raise ValueError(
-                "NVFP4 quantization requires group size and "
-                "kv_cache_quant_algo specified in the quantization config"
+                "NVFP4 quantization requires group_size and exclude_modules "
+                "specified in the quantization config"
             )
         return cls(
             is_checkpoint_nvfp4_serialized,
