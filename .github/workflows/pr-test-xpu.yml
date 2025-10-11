@@ -49,10 +49,10 @@ jobs:
         id: start_container
         run: |
           container_id=$(docker run -dt \
-            --group-add 992 \ 
-            --group-add video \
-            --device /dev/dri/ \
-            -e HF_TOKEN=$(cat ~/huggingface_token.txt) \
+            --group-add 992 \
+            --group-add $(getent group video | cut -d: -f3) \
+            --device /dev/dri \
+            -e HF_TOKEN="$(cat ~/huggingface_token.txt)" \
             xpu_sglang_main:bmg)
           echo "Started container: $container_id"
           echo "container_id=$container_id" >> "$GITHUB_OUTPUT"
