@@ -306,6 +306,7 @@ class TokenizerCommunicatorMixin:
         with_stack: Optional[bool] = None,
         record_shapes: Optional[bool] = None,
         profile_by_stage: bool = False,
+        merge_profiles: bool = False,
     ):
         self.auto_create_handle_loop()
         env_with_stack: bool = get_bool_env_var("SGLANG_PROFILE_WITH_STACK", "true")
@@ -320,6 +321,7 @@ class TokenizerCommunicatorMixin:
             record_shapes=record_shapes,
             profile_by_stage=profile_by_stage,
             profile_id=str(time.time()),
+            merge_profiles=merge_profiles,
         )
         return await self._execute_profile(req)
 
