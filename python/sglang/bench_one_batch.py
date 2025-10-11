@@ -72,6 +72,8 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     configure_logger,
     get_bool_env_var,
+    is_cuda_alike,
+    is_xpu,
     kill_process_tree,
     require_mlp_sync,
     require_mlp_tp_gather,
@@ -423,11 +425,15 @@ def latency_test_run_once(
 
     profiler = None
     if profile:
+        activities = [
+            torch.profiler.ProfilerActivity.CPU,
+        ]
+        if is_cuda_alike():
+            activities.append(torch.profiler.ProfilerActivity.CUDA)
+        if is_xpu():
+            activities.append(torch.profiler.ProfilerActivity.XPU)
         profiler = torch.profiler.profile(
-            activities=[
-                torch.profiler.ProfilerActivity.CPU,
-                torch.profiler.ProfilerActivity.CUDA,
-            ],
+            activities=activities,
             with_stack=True,
             record_shapes=profile_record_shapes,
         )
@@ -458,12 +464,15 @@ def latency_test_run_once(
     for i in range(output_len - 1):
         synchronize(device)
         if profile and i == output_len / 2:
-            profiler = None
+            activities = [
+                torch.profiler.ProfilerActivity.CPU,
+            ]
+            if is_cuda_alike():
+                activities.append(torch.profiler.ProfilerActivity.CUDA)
+            if is_xpu():
+                activities.append(torch.profiler.ProfilerActivity.XPU)
             profiler = torch.profiler.profile(
-                activities=[
-                    torch.profiler.ProfilerActivity.CPU,
-                    torch.profiler.ProfilerActivity.CUDA,
-                ],
+                activities=activities,
                 with_stack=True,
                 record_shapes=profile_record_shapes,
             )
