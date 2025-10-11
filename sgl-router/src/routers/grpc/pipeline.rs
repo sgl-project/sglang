@@ -861,6 +861,44 @@ impl ResponseProcessingStage {
         let chat_request = ctx.chat_request_arc();
         let history_tool_calls_count = utils::get_history_tool_calls_count(&chat_request);
 
+        // Check parser availability once upfront (not per choice)
+        let reasoning_parser_available = chat_request.separate_reasoning
+            && utils::check_reasoning_parser_availability(
+                &self.processor.reasoning_parser_factory,
+                self.processor.configured_reasoning_parser.as_ref(),
+                &chat_request.model,
+            );
+
+        let tool_choice_enabled = !matches!(
+            &chat_request.tool_choice,
+            Some(crate::protocols::spec::ToolChoice::Value(
+                crate::protocols::spec::ToolChoiceValue::None
+            ))
+        );
+
+        let tool_parser_available = tool_choice_enabled
+            && chat_request.tools.is_some()
+            && utils::check_tool_parser_availability(
+                &self.processor.tool_parser_factory,
+                self.processor.configured_tool_parser.as_ref(),
+                &chat_request.model,
+            );
+
+        // Log once per request (not per choice)
+        if chat_request.separate_reasoning && !reasoning_parser_available {
+            debug!(
+                "No reasoning parser found for model '{}', skipping reasoning parsing",
+                chat_request.model
+            );
+        }
+
+        if chat_request.tools.is_some() && tool_choice_enabled && !tool_parser_available {
+            debug!(
+                "No tool parser found for model '{}', skipping tool call parsing",
+                chat_request.model
+            );
+        }
+
         let stop_decoder = ctx
             .state
             .response
@@ -878,6 +916,8 @@ impl ResponseProcessingStage {
                     &chat_request,
                     stop_decoder,
                     history_tool_calls_count,
+                    reasoning_parser_available,
+                    tool_parser_available,
                 )
                 .await
             {
