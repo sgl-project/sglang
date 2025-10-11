@@ -94,7 +94,9 @@ python -m sglang_router.launch_router \
     --worker-urls http://my-openai-compatible-service:8000
 ```
 
-**Note**: OpenAI backend mode acts as a simple proxy. Load balancing is not applicable in this mode.
+**Note**:
+ - OpenAI backend mode acts as a simple proxy. Load balancing is not applicable in this mode.
+ - This mode now requires exctly one `--worker-urls` entry.
 
 #### Launch Router with Worker URLs in prefill-decode mode
 ```bash
@@ -481,9 +483,9 @@ curl -X POST http://localhost:8080/add_worker?url=http://worker3:8000&api_key=wo
 - `--backend`: Backend runtime to use (default: `sglang`)
   - `sglang`: SGLang workers (default)
   - `openai`: OpenAI or OpenAI-compatible endpoints
-  - `vllm`: vLLM workers (experimental)
-  - `trtllm`: TensorRT-LLM workers (experimental)
-  - `anthropic`: Anthropic API (experimental)
+  - `vllm`: vLLM workers (not implemented)
+  - `trtllm`: TensorRT-LLM workers (not implemented)
+  - `anthropic`: Anthropic API (not implemented)
 
 #### History Backend
 - `--history-backend`: Storage backend for conversations (default: `memory`)
