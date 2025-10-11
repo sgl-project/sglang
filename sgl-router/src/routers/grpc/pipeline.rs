@@ -816,16 +816,27 @@ impl ResponseProcessingStage {
 
         // Collect all responses from the execution result
         let all_responses = match execution_result {
-            ExecutionResult::Single { stream } => {
-                utils::collect_stream_responses(stream, "Single").await?
+            ExecutionResult::Single { mut stream } => {
+                let responses = utils::collect_stream_responses(&mut stream, "Single").await?;
+                stream.mark_completed();
+                responses
             }
-            ExecutionResult::Dual { prefill, decode } => {
-                // Collect prefill for input_logprobs
-                let prefill_responses = utils::collect_stream_responses(prefill, "Prefill").await?;
+            ExecutionResult::Dual {
+                mut prefill,
+                decode,
+            } => {
+                // Collect prefill for input_logprobs (don't mark completed yet)
+                let prefill_responses =
+                    utils::collect_stream_responses(&mut prefill, "Prefill").await?;
 
-                // Collect decode for actual output
+                // Collect decode for actual output (don't mark completed yet)
+                let mut decode_stream = *decode;
                 let mut decode_responses =
-                    utils::collect_stream_responses(*decode, "Decode").await?;
+                    utils::collect_stream_responses(&mut decode_stream, "Decode").await?;
+
+                // Mark both streams as completed now that both succeeded
+                prefill.mark_completed();
+                decode_stream.mark_completed();
 
                 // Merge prefill input_logprobs if requested
                 if request_logprobs {
@@ -952,16 +963,27 @@ impl ResponseProcessingStage {
         // Non-streaming: Collect all responses
         let request_logprobs = ctx.generate_request().return_logprob;
         let all_responses = match execution_result {
-            ExecutionResult::Single { stream } => {
-                utils::collect_stream_responses(stream, "Single").await?
+            ExecutionResult::Single { mut stream } => {
+                let responses = utils::collect_stream_responses(&mut stream, "Single").await?;
+                stream.mark_completed();
+                responses
             }
-            ExecutionResult::Dual { prefill, decode } => {
-                // Collect prefill for input_logprobs
-                let prefill_responses = utils::collect_stream_responses(prefill, "Prefill").await?;
+            ExecutionResult::Dual {
+                mut prefill,
+                decode,
+            } => {
+                // Collect prefill for input_logprobs (don't mark completed yet)
+                let prefill_responses =
+                    utils::collect_stream_responses(&mut prefill, "Prefill").await?;
 
-                // Collect decode for actual output
+                // Collect decode for actual output (don't mark completed yet)
+                let mut decode_stream = *decode;
                 let mut decode_responses =
-                    utils::collect_stream_responses(*decode, "Decode").await?;
+                    utils::collect_stream_responses(&mut decode_stream, "Decode").await?;
+
+                // Mark both streams as completed now that both succeeded
+                prefill.mark_completed();
+                decode_stream.mark_completed();
 
                 // Merge prefill input_logprobs if requested
                 if request_logprobs {
