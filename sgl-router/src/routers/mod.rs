@@ -39,6 +39,15 @@ pub trait RouterTrait: Send + Sync + Debug {
     /// Route a health generate request
     async fn health_generate(&self, req: Request<Body>) -> Response;
 
+    /// Route a health generate request
+    async fn get_engine_metrics(&self) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Engine metrics is not yet implemented for this router implementation",
+        )
+            .into_response()
+    }
+
     /// Get server information
     async fn get_server_info(&self, req: Request<Body>) -> Response;
 
