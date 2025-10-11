@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use crate::config::types::RetryConfig;
 use crate::core::{
     is_retryable_status, ConnectionMode, RetryExecutor, Worker, WorkerRegistry, WorkerType,
@@ -721,9 +722,9 @@ impl RouterTrait for Router {
         };
         let engine_responses = engine_responses
             .into_iter()
-            .map(|(worker_base_url, body_text)| MetricPack {
-                worker_base_url,
-                body_text,
+            .map(|(worker_base_url, metrics_text)| MetricPack {
+                labels: HashMap::from([("worker_addr".into(), worker_base_url)]),
+                metrics_text,
             })
             .collect();
         let text = match crate::metrics_aggregator::aggregate_metrics(engine_responses) {
