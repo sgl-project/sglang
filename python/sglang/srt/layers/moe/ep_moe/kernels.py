@@ -1104,11 +1104,11 @@ def _fp8_per_token_quant_to_per_tensor_quant_kernel(
         output_ptrs = output_ptr + pid_e * m * k + k_offsets
         x_scale_ptrs = x_scale_ptr + pid_e * x_scale_stride0 + scale_offsets
 
-        for token_id in tl.range(token_id, last_effective_id, pid_m_dim):
-            hidden = tl.load(x_ptrs + token_id * k).to(tl.float32)
-            scale_fp32 = tl.load(x_scale_ptrs + token_id * x_scale_stride1)
+        for tok_idx in tl.range(token_id, last_effective_id, pid_m_dim):
+            hidden = tl.load(x_ptrs + tok_idx * k).to(tl.float32)
+            scale_fp32 = tl.load(x_scale_ptrs + tok_idx * x_scale_stride1)
             hidden = hidden * scale_fp32 * output_scale_val_inv
-            tl.store(output_ptrs + token_id * k, hidden.to(output_ptr.dtype.element_ty))
+            tl.store(output_ptrs + tok_idx * k, hidden.to(output_ptr.dtype.element_ty))
 
 
 def deepep_fp8_quant_to_static_per_tensor_quant(
