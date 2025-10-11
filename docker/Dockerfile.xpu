@@ -3,7 +3,7 @@
 # Usage: docker build --build-arg UBUNTU_VERSION=24.04 --build-arg PYTHON_VERSION=3.10 -t sglang:xpu_kernel -f  Dockerfile.xpu --no-cache .
 
 # Use Intel deep learning essentials base image with Ubuntu 24.04
-FROM intel/deep-learning-essentials:2025.1.3-0-devel-ubuntu24.04
+FROM intel/deep-learning-essentials:2025.1.3-0-client-driver-libze1.21.1-1-devel-ubuntu24.10
 
 # Avoid interactive prompts during package install
 ENV DEBIAN_FRONTEND=noninteractive
