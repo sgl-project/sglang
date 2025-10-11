@@ -324,6 +324,7 @@ class PrefillAdder:
         rem_chunk_tokens: Optional[int],
         mixed_with_decode_tokens: int = 0,
         priority_scheduling_preemption_threshold: int = 0,
+        use_hybrid_full_pool: bool = False,
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache
@@ -361,6 +362,7 @@ class PrefillAdder:
         self.priority_scheduling_preemption_threshold = (
             priority_scheduling_preemption_threshold
         )
+        self.use_hybrid_full_pool = use_hybrid_full_pool
 
     def _get_running_request_total_token_offset(self, req: Req) -> int:
         return (
@@ -374,12 +376,20 @@ class PrefillAdder:
     @property
     def rem_total_tokens(self):
         if self.is_hybrid:
-            available_and_evictable = min(
+            full_available_and_evictable = (
                 self.token_to_kv_pool_allocator.full_available_size()
-                + self.tree_cache.full_evictable_size(),
-                self.token_to_kv_pool_allocator.swa_available_size()
-                + self.tree_cache.swa_evictable_size(),
+                + self.tree_cache.full_evictable_size()
             )
+            swa_available_and_evictable = (
+                self.token_to_kv_pool_allocator.swa_available_size()
+                + self.tree_cache.swa_evictable_size()
+            )
+            if self.use_hybrid_full_pool:
+                available_and_evictable = full_available_and_evictable
+            else:
+                available_and_evictable = min(
+                    full_available_and_evictable, swa_available_and_evictable
+                )
         else:
             available_and_evictable = (
                 self.token_to_kv_pool_allocator.available_size()
@@ -391,12 +401,20 @@ class PrefillAdder:
     @property
     def cur_rem_tokens(self):
         if self.is_hybrid:
-            available_and_evictable = min(
+            full_available_and_evictable = (
                 self.token_to_kv_pool_allocator.full_available_size()
-                + self.tree_cache.full_evictable_size(),
-                self.token_to_kv_pool_allocator.swa_available_size()
-                + self.tree_cache.swa_evictable_size(),
+                + self.tree_cache.full_evictable_size()
             )
+            swa_available_and_evictable = (
+                self.token_to_kv_pool_allocator.swa_available_size()
+                + self.tree_cache.swa_evictable_size()
+            )
+            if self.use_hybrid_full_pool:
+                available_and_evictable = full_available_and_evictable
+            else:
+                available_and_evictable = min(
+                    full_available_and_evictable, swa_available_and_evictable
+                )
         else:
             available_and_evictable = (
                 self.token_to_kv_pool_allocator.available_size()

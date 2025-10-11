@@ -217,6 +217,7 @@ class ServerArgs:
     swa_full_tokens_ratio: float = 0.8
     disable_hybrid_swa_memory: bool = False
     radix_eviction_policy: str = "lru"
+    hybrid_aggressive_schedule_use_full_pool: bool = False
 
     # Runtime options
     device: Optional[str] = None
@@ -1634,6 +1635,12 @@ class ServerArgs:
             "--disable-hybrid-swa-memory",
             action="store_true",
             help="Disable the hybrid SWA memory.",
+        )
+        parser.add_argument(
+            "--hybrid-aggressive-schedule-use-full-pool",
+            action="store_true",
+            default=ServerArgs.hybrid_aggressive_schedule_use_full_pool,
+            help="For hybrid KV cache, estimate prefill budget using the full-layer pool instead of the minimum with the SWA pool.",
         )
 
         # Runtime options

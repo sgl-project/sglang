@@ -743,6 +743,11 @@ class Scheduler(
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                 page_size=self.page_size,
+                **(
+                    {"sliding_window_size": self.sliding_window_size}
+                    if self.is_hybrid and ChunkCacheClass is SWAChunkCache
+                    else {}
+                ),
             )
         else:
             if os.environ.get("SGLANG_EXPERIMENTAL_CPP_RADIX_TREE") == "1":
@@ -1898,6 +1903,7 @@ class Scheduler(
             self.chunked_prefill_size,
             running_bs if self.is_mixed_chunk else 0,
             self.priority_scheduling_preemption_threshold,
+            use_hybrid_full_pool=self.server_args.hybrid_aggressive_schedule_use_full_pool,
         )
 
         if self.chunked_req is not None:
