@@ -46,32 +46,37 @@ jobs:
 
 
       - name: Run container
+        id: start_container
         run: |
-          docker run -dt \
+          container_id=$(docker run -dt \
             --device /dev/dri/ \
-            --name main_sglang_xpu \
             -e HF_TOKEN=$(cat ~/huggingface_token.txt) \
-            xpu_sglang_main:bmg
+            xpu_sglang_main:bmg)
+          echo "Started container: $container_id"
+          echo "container_id=$container_id" >> "$GITHUB_OUTPUT"
 
       - name: Install Dependency
         timeout-minutes: 20
         run: |
-          docker exec main_sglang_xpu /home/sdp/miniforge3/envs/py3.10/bin/python3 -m pip install --upgrade pip
-          docker exec main_sglang_xpu /home/sdp/miniforge3/envs/py3.10/bin/python3 -m pip install pytest expecttest ray huggingface_hub
-          docker exec main_sglang_xpu /home/sdp/miniforge3/envs/py3.10/bin/python3 -m pip uninstall -y flashinfer-python
-          docker exec main_sglang_xpu /bin/bash -c '/home/sdp/miniforge3/envs/py3.10/bin/huggingface-cli login --token ${HF_TOKEN} '
-          docker exec -u root main_sglang_xpu /bin/bash -c "ln -sf /home/sdp/miniforge3/envs/py3.10/bin/python3 /usr/bin/python3"
+          cid="${{ steps.start_container.outputs.container_id }}"
+          docker exec "$cid" /home/sdp/miniforge3/envs/py3.10/bin/python3 -m pip install --upgrade pip
+          docker exec "$cid" /home/sdp/miniforge3/envs/py3.10/bin/python3 -m pip install pytest expecttest ray huggingface_hub
+          docker exec "$cid" /home/sdp/miniforge3/envs/py3.10/bin/python3 -m pip uninstall -y flashinfer-python
+          docker exec "$cid" /bin/bash -c '/home/sdp/miniforge3/envs/py3.10/bin/huggingface-cli login --token ${HF_TOKEN} '
+          docker exec -u root "$cid" /bin/bash -c "ln -sf /home/sdp/miniforge3/envs/py3.10/bin/python3 /usr/bin/python3"
 
       - name: Run E2E Bfloat16 tests
         timeout-minutes: 20
         run: |
-          docker exec -w /home/sdp/sglang/ main_sglang_xpu \
+          cid="${{ steps.start_container.outputs.container_id }}"
+          docker exec -w /home/sdp/sglang/ "$cid" \
             bash -c "cd ./test/srt && python3 run_suite.py --suite per-commit-xpu"
 
       - name: Cleanup container
         if: always()
         run: |
-          docker rm -f main_sglang_xpu || true
+          cid="${{ steps.start_container.outputs.container_id }}"
+          docker rm -f "$cid" || true
 
   finish:
     if: always()
