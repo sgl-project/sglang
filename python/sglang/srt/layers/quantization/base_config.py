@@ -3,42 +3,15 @@ from __future__ import annotations
 
 import inspect
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type
 
 import torch
-from torch import nn
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
 
-
-class QuantizeMethodBase(ABC):
-    """Base class for different quantized methods."""
-
-    @abstractmethod
-    def create_weights(
-        self, layer: torch.nn.Module, *weight_args, **extra_weight_attrs
-    ):
-        """Create weights for a layer.
-
-        The weights will be set as attributes of the layer."""
-        raise NotImplementedError()
-
-    @abstractmethod
-    def apply(self, layer: torch.nn.Module, *args, **kwargs) -> torch.Tensor:
-        """Apply the weights in layer to the input tensor.
-
-        Expects create_weights to have been called before on the layer."""
-        raise NotImplementedError()
-
-    def process_weights_after_loading(self, layer: nn.Module) -> None:
-        """Process the weight after loading.
-
-        This can be used for example, to transpose weights for computation.
-        """
-        return
+from sglang.srt.utils.common import QuantizeMethodBase
 
 
 class LinearMethodBase(QuantizeMethodBase):
