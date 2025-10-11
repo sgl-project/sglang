@@ -115,7 +115,7 @@ class DeepSeekV31Detector(BaseFormatDetector):
         calls: list[ToolCallItem] = []
         try:
             partial_match = re.search(
-                pattern=r"<｜tool▁call▁begin｜>(.*)<｜tool▁sep｜>(.*)(<｜tool▁call▁end｜>)?",
+                pattern=r"<｜tool▁call▁begin｜>(.*)<｜tool▁sep｜>(.*?)(<｜tool▁call▁end｜>|$)",
                 string=current_text,
                 flags=re.DOTALL,
             )
@@ -183,7 +183,7 @@ class DeepSeekV31Detector(BaseFormatDetector):
                         # Find the end of the current tool call and remove only that part from buffer
                         if tool_end_match:
                             # Remove the completed tool call from buffer, keep any remaining content
-                            self._buffer = current_text[tool_end_match.end() :]
+                            self._buffer = current_text[partial_match.end(3) :]
                         else:
                             self._buffer = ""
 
