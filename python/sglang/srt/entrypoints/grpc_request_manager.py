@@ -19,15 +19,15 @@ import grpc
 import zmq
 import zmq.asyncio
 
-from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
     AbortReq,
-    BatchEmbeddingOut,
-    BatchTokenIDOut,
+    BatchEmbeddingOutput,
+    BatchTokenIDOutput,
     HealthCheckOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
+from sglang.srt.managers.scheduler import is_health_check_generate_req
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import get_zmq_socket, kill_process_tree
 from sglang.utils import get_exception_traceback
@@ -111,6 +111,7 @@ class GrpcRequestManager:
         self,
         server_args: ServerArgs,
         port_args: PortArgs,
+        bootstrap_server=None,
     ):
         """Initialize the gRPC request manager."""
         self.server_args = server_args
@@ -147,8 +148,8 @@ class GrpcRequestManager:
         self.crash_dump_request_list = []
         self.crash_dump_performed = False
 
-        # Bootstrap server for disaggregation mode
-        self.bootstrap_server = start_disagg_service(server_args)
+        # Bootstrap server (passed from serve_grpc, not started here)
+        self.bootstrap_server = bootstrap_server
 
         logger.info(
             f"GrpcRequestManager initialized with ZMQ IPC: "
@@ -157,7 +158,7 @@ class GrpcRequestManager:
         )
         if self.bootstrap_server:
             logger.info(
-                f"Bootstrap server started for disaggregation mode: "
+                f"Bootstrap server initialized for disaggregation mode: "
                 f"{server_args.disaggregation_mode}"
             )
 
@@ -263,8 +264,8 @@ class GrpcRequestManager:
                         response = await task
 
                         # Add index for client-side ordering
-                        if isinstance(response, dict) and "meta_info" in response:
-                            response_rid = response["meta_info"].get("id", "")
+                        if isinstance(response, dict):
+                            response_rid = response.get("request_id", "")
                             if response_rid in rid_to_index:
                                 response["index"] = rid_to_index[response_rid]
 
@@ -318,13 +319,8 @@ class GrpcRequestManager:
             is_stream = getattr(obj, "stream", False)
 
             while True:
-                # Client cancelled - notify scheduler and exit
-                if grpc_context and grpc_context.cancelled():
-                    await self.abort_request(request_id)
-                    return
-
                 try:
-                    response = await asyncio.wait_for(state.out_queue.get(), timeout=4)
+                    response = await state.out_queue.get()
 
                     if is_stream:
                         yield response
@@ -337,13 +333,11 @@ class GrpcRequestManager:
                             yield final_response
                         break
 
-                except asyncio.TimeoutError:
-                    # Timeout waiting for response - abort and cleanup
-                    logger.warning(
-                        f"Timeout waiting for response for request {request_id}"
-                    )
+                except asyncio.CancelledError:
+                    # Task was cancelled by gRPC framework when client disconnected
+                    logger.info(f"Request {request_id} cancelled by client")
                     await self.abort_request(request_id)
-                    return
+                    raise  # Re-raise to let gRPC server handle cleanup
 
         finally:
             # Always clean up request state when exiting
@@ -397,9 +391,7 @@ class GrpcRequestManager:
         # Wait for result in background
         async def wait_for_result():
             try:
-                # Wait for completion
                 await state.event.wait()
-                # Get result from queue
                 result = await state.out_queue.get()
                 future.set_result(result)
             except Exception as e:
@@ -413,42 +405,33 @@ class GrpcRequestManager:
         return future
 
     async def abort_request(self, request_id: str) -> bool:
-        """Abort a running request."""
-        if request_id not in self.rid_to_state:
+        """Abort a running request.
+
+        Sends abort request to scheduler and marks local state as finished
+        to stop processing any further outputs from the scheduler.
+        """
+        # Skip aborting health check requests (they clean themselves up)
+        if request_id.startswith("HEALTH_CHECK"):
             return False
 
-        # Send abort to scheduler
-        abort_req = AbortReq(rid=request_id)
-        try:
-            await self._send_to_scheduler(abort_req)
-        except Exception as e:
-            logger.error(f"Failed to send abort request: {e}")
-            return False
-
-        # Mark as finished
+        # Mark state as finished immediately to stop processing scheduler outputs
         state = self.rid_to_state.get(request_id)
         if state:
             state.finished = True
             state.stream_finished = True
-            state.event.set()
+            logger.debug(f"Marked request {request_id} as aborted locally")
 
-            # Send abort notification to output queue
-            await state.out_queue.put({"error": "Request aborted", "abort": True})
+        # Send abort to scheduler - the scheduler will send AbortReq back
+        # which will be handled by _handle_abort_req
+        abort_req = AbortReq(rid=request_id)
+        try:
+            await self._send_to_scheduler(abort_req)
+            logger.debug(f"Sent abort to scheduler for request {request_id}")
+        except Exception as e:
+            logger.error(f"Failed to send abort request to scheduler: {e}")
+            return False
 
         return True
-
-    async def pause_generation(self):
-        """Pause generation processing."""
-        async with self.is_pause_cond:
-            self.is_pause = True
-            logger.info("Generation paused")
-
-    async def resume_generation(self):
-        """Resume generation processing."""
-        async with self.is_pause_cond:
-            self.is_pause = False
-            self.is_pause_cond.notify_all()
-            logger.info("Generation resumed")
 
     async def handle_loop(self):
         """
@@ -467,12 +450,14 @@ class GrpcRequestManager:
                         await self.is_pause_cond.wait()
 
                 # Handle different output types
-                if isinstance(recv_obj, BatchTokenIDOut):
+                if isinstance(recv_obj, BatchTokenIDOutput):
                     await self._handle_batch_output(recv_obj)
-                elif isinstance(recv_obj, BatchEmbeddingOut):
+                elif isinstance(recv_obj, BatchEmbeddingOutput):
                     await self._handle_embedding_output(recv_obj)
                 elif isinstance(recv_obj, HealthCheckOutput):
                     await self._handle_health_check_output(recv_obj)
+                elif isinstance(recv_obj, AbortReq):
+                    await self._handle_abort_req(recv_obj)
                 else:
                     logger.warning(f"Unknown output type: {type(recv_obj)}")
 
@@ -498,7 +483,7 @@ class GrpcRequestManager:
     def _convert_logprob_style(
         self,
         state: GrpcReqState,
-        batch_out: BatchTokenIDOut,
+        batch_out: BatchTokenIDOutput,
         batch_index: int,
     ):
         """
@@ -545,7 +530,7 @@ class GrpcRequestManager:
                 batch_out.output_top_logprobs_idx[batch_index]
             )
 
-    async def _handle_batch_output(self, batch_out: BatchTokenIDOut):
+    async def _handle_batch_output(self, batch_out: BatchTokenIDOutput):
         """Handle batch generation output from scheduler."""
         # Process each request in the batch
         for i, rid in enumerate(batch_out.rids):
@@ -553,6 +538,11 @@ class GrpcRequestManager:
                 continue
 
             state = self.rid_to_state[rid]
+
+            # Skip if already aborted/finished locally (client cancelled)
+            if state.finished:
+                logger.debug(f"Skipping output for aborted request {rid}")
+                continue
 
             # Update metrics
             now = time.time()
@@ -578,7 +568,7 @@ class GrpcRequestManager:
                         batch_out.cached_tokens[i] if batch_out.cached_tokens else 0
                     ),
                     "finish_reason": (
-                        str(batch_out.finished_reasons[i])
+                        batch_out.finished_reasons[i]
                         if batch_out.finished_reasons[i]
                         else None
                     ),
@@ -666,7 +656,7 @@ class GrpcRequestManager:
 
                 asyncio.create_task(cleanup())
 
-    async def _handle_embedding_output(self, batch_out: BatchEmbeddingOut):
+    async def _handle_embedding_output(self, batch_out: BatchEmbeddingOutput):
         """Handle batch embedding output from scheduler."""
         for i, rid in enumerate(batch_out.rids):
             if rid not in self.rid_to_state:
@@ -725,6 +715,67 @@ class GrpcRequestManager:
         state.finished = True
         state.finished_time = time.time()
         state.event.set()
+
+    async def _handle_abort_req(self, recv_obj: AbortReq):
+        """Handle abort request from scheduler.
+
+        The scheduler sends AbortReq back to notify us that a request was aborted,
+        either due to explicit abort_request() call or scheduler-initiated abort
+        (priority preemption, queue full, KV cache pressure, etc).
+        """
+        # Skip health check requests
+        if recv_obj.rid.startswith("HEALTH_CHECK"):
+            return
+
+        # Check if request still exists
+        if recv_obj.rid not in self.rid_to_state:
+            logger.debug(
+                f"Abort request for {recv_obj.rid} not in local state (may have already finished or not started yet)"
+            )
+            return
+
+        state = self.rid_to_state[recv_obj.rid]
+
+        # Mark as finished
+        state.finished = True
+        state.stream_finished = True
+
+        # Create abort response
+        if recv_obj.finished_reason:
+            # Scheduler provided a specific finish reason (e.g., priority preemption, queue full)
+            abort_response = {
+                "request_id": recv_obj.rid,
+                "error": recv_obj.finished_reason.get("message", "Request aborted"),
+                "finished": True,
+                "meta_info": {
+                    "id": recv_obj.rid,
+                    "finish_reason": recv_obj.finished_reason,
+                },
+            }
+        else:
+            # Generic abort (e.g., explicit abort_request call)
+            abort_response = {
+                "request_id": recv_obj.rid,
+                "error": "Request aborted",
+                "finished": True,
+                "meta_info": {
+                    "id": recv_obj.rid,
+                    "finish_reason": {
+                        "type": "abort",
+                        "message": "Abort before prefill",
+                    },
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                },
+            }
+
+        # Send abort notification to output queue
+        await state.out_queue.put(abort_response)
+
+        # Wake up any waiting coroutines
+        state.event.set()
+
+        logger.debug(f"Handled abort request for {recv_obj.rid}")
 
     async def _send_to_scheduler(self, obj):
         """Send an object to the scheduler via ZMQ."""
