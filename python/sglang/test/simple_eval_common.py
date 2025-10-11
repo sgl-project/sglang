@@ -175,7 +175,7 @@ C) {C}
 D) {D}
 """.strip()
 
-ANSWER_PATTERN_MULTICHOICE = r"(?i)Answer\s*:\s*([A-D])"
+ANSWER_PATTERN_MULTICHOICE = r"(?i)Answer\s*:\s*\(?([A-D])\)?"
 ANSWER_PATTERN = r"(?i)Answer\s*:\s*([^\n]+)"
 
 
