@@ -311,6 +311,7 @@ class ServerArgs:
     nsa_decode: str = "fa3"
 
     # Speculative decoding
+    enable_beta_spec: bool = False
     speculative_algorithm: Optional[str] = None
     speculative_draft_model_path: Optional[str] = None
     speculative_draft_model_revision: Optional[str] = None
@@ -1101,15 +1102,14 @@ class ServerArgs:
                 )
             if self.max_running_requests is None:
                 self.max_running_requests = 48
-            if (
-                self.speculative_algorithm == "EAGLE"
-                and not self.disable_overlap_schedule
-            ):
+
+            if self.speculative_algorithm == "EAGLE" and self.enable_beta_spec:
+                self.disable_overlap_schedule = False
                 logger.warning(
-                    "Overlap scheduler with eagle speculative decoding is beta feature and may cause instability. "
+                    "Beta spec is enabled for eagle speculative decoding and overlap schedule is turned on."
                 )
 
-            if self.speculative_algorithm != "EAGLE":
+            if not self.enable_beta_spec:
                 self.disable_overlap_schedule = True
                 logger.warning(
                     "Overlap scheduler is disabled because of using eagle3 and standalone speculative decoding."
@@ -2129,6 +2129,7 @@ class ServerArgs:
         )
 
         # Speculative decoding
+        parser.add_argument("--enable-beta-spec", action="store_true")
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
