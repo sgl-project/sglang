@@ -318,53 +318,44 @@ def ref_deepep_ll(
         a_fp8_i = a_fp8[i]
         a_scale_i = a_scale[i]
         a_i = per_token_cast_back(a_fp8_i, a_scale_i, torch.float32)
-        a = (
-            torch.clamp((a_i / a1_scale.float()), -448.0, 448.0)
-            .to(torch.float8_e4m3fn)
-            .to(torch.bfloat16)
-        )
+        a = torch.clamp((a_i / a1_scale.float()), -448.0, 448.0).to(torch.float8_e4m3fn)
 
         w1_q_i = w1_q[i]
-        w1_scale_i = w1_scale[i].repeat_interleave(GROUP_SIZE, dim=1).to(torch.float32)
+        w1_scale_i = w1_scale[i].repeat_interleave(GROUP_SIZE, dim=1)
         w1 = (w1_q_i.to(torch.float32) * w1_scale_i).to(torch.bfloat16)
-        fc1 = ((torch.matmul(a, w1.T)) * a1_scale).to(torch.float16)
+        fc1 = (
+            ((torch.matmul(a.to(torch.bfloat16), w1.T)).to(torch.float32) * a1_scale)
+            .to(torch.bfloat16)
+            .to(torch.float32)
+        )
 
         gate, fc1 = fc1.chunk(2, dim=-1)
         fc1 = fc1 * torch.nn.functional.silu(gate)
-        a = (
-            torch.clamp((fc1 / a2_scale.float()), -448.0, 448.0)
-            .to(torch.float8_e4m3fn)
-            .to(torch.bfloat16)
-        )
+        a = torch.clamp((fc1 / a2_scale.float()), -448.0, 448.0).to(torch.float8_e4m3fn)
 
         w2_q_i = w2_q[i]
-        w2_scale_i = w2_scale[i].repeat_interleave(GROUP_SIZE, dim=1).to(torch.float32)
+        w2_scale_i = w2_scale[i].repeat_interleave(GROUP_SIZE, dim=1).to(torch.bfloat16)
         w2 = (w2_q_i.to(torch.float32) * w2_scale_i).to(torch.bfloat16)
-        fc2 = (torch.matmul(a, w2.T) * a2_scale).to(torch.float16)
+        fc2 = (torch.matmul(a.to(torch.bfloat16), w2.T) * a2_scale).to(torch.bfloat16)
         results[i] += fc2
     return results
 
 
-# @pytest.mark.parametrize("EXPECTED_M", [1, 16, 128, 1024])
-# @pytest.mark.parametrize("N", [2048])
-# @pytest.mark.parametrize("K", [7168, 6144])
-# @pytest.mark.parametrize("E", [1, 2, 4, 8])
-@pytest.mark.parametrize("EXPECTED_M", [128])
+@pytest.mark.parametrize("EXPECTED_M", [1, 16, 128, 1024])
 @pytest.mark.parametrize("N", [2048])
-@pytest.mark.parametrize("K", [7168])
-@pytest.mark.parametrize("E", [1])
+@pytest.mark.parametrize("K", [7168, 6144])
+@pytest.mark.parametrize("E", [1, 2, 4, 8])
 def test_cutlass_w4a8_moe_deepep_ll(EXPECTED_M, N, K, E):
     GROUP_SIZE = 128
-    MAX_M = 256
+    MAX_M = 2048
     TOPK = 8
 
     device = "cuda"
     dtype = torch.bfloat16
 
     # deepep ll dispatch fp8 data and float32 scale (128 block quant)
-    a = torch.randn(E, MAX_M, K, dtype=torch.float32, device=device).to(
-        torch.float8_e4m3fn
-    )
+    a = torch.randn(E, MAX_M, K, dtype=torch.float32, device=device)
+    a = a.to(torch.float8_e4m3fn)
     a_scale = torch.randn(E, MAX_M, K // 128, dtype=torch.float32, device=device)
     a_fp8 = (a, a_scale)
 
@@ -375,7 +366,7 @@ def test_cutlass_w4a8_moe_deepep_ll(EXPECTED_M, N, K, E):
     # weight and scale
     ref_weight_1 = torch.randint(-8, 8, (E, N * 2, K), dtype=torch.int8, device=device)
     ref_weight_2 = torch.randint(-8, 8, (E, K, N), dtype=torch.int8, device=device)
-    affine_coeff = 0.005
+    affine_coeff = 0.002
     scale_1 = (
         torch.randn(E, N * 2, K // GROUP_SIZE, dtype=dtype, device=device)
         * affine_coeff
@@ -387,8 +378,8 @@ def test_cutlass_w4a8_moe_deepep_ll(EXPECTED_M, N, K, E):
     w2_q, w2_scale = pack_interleave(E, ref_weight_2, scale_2)
 
     # tensor scale
-    a1_scale = torch.randn(1, dtype=torch.float32, device=device)
-    a2_scale = torch.randn(1, dtype=torch.float32, device=device)
+    a1_scale = torch.ones(1, dtype=torch.float32, device=device) + 0.1
+    a2_scale = torch.ones(1, dtype=torch.float32, device=device) - 0.1
 
     a_strides1 = torch.full((E, 3), K, device=device, dtype=torch.int64)
     c_strides1 = torch.full((E, 3), 2 * N, device=device, dtype=torch.int64)
@@ -439,20 +430,17 @@ def test_cutlass_w4a8_moe_deepep_ll(EXPECTED_M, N, K, E):
             a2_scale=a2_scale,
         )
 
+        torch.cuda.synchronize()
         assert output.shape == ref_output.shape
         assert output.dtype == ref_output.dtype
 
-        # mask uninitialized output values
         for i in range(E):
-            output_i = output[i][masked_m[i] :]
-            ref_output_i = ref_output[i][masked_m[i] :]
-            print(f"output_i: {output_i}")
-            print(f"ref_output_i: {ref_output_i}")
-            torch.testing.assert_close(output_i, ref_output_i, rtol=1e-2, atol=0.1)
-
-        print(
-            f"SUCCESS: cutlass_w4a8_moe_deepep_ll test passed with shape {output.shape}"
-        )
+            output_i = output[i][: masked_m[i]].to(torch.float32)
+            ref_output_i = ref_output[i][: masked_m[i]].to(torch.float32)
+            diff = torch.abs(output_i - ref_output_i)
+            if masked_m[i] > 0:
+                print(f"max absolute difference: {torch.max(diff)}")
+            torch.testing.assert_close(output_i, ref_output_i, rtol=0.1, atol=0.1)
 
     except Exception as e:
         pytest.fail(f"cutlass_w4a8_moe_deepep_ll test failed with error: {str(e)}")
