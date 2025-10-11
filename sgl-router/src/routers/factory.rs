@@ -3,7 +3,8 @@
 use super::grpc::pd_router::GrpcPDRouter;
 use super::grpc::router::GrpcRouter;
 use super::{
-    http::{openai_router::OpenAIRouter, pd_router::PDRouter, router::Router},
+    http::{pd_router::PDRouter, router::Router},
+    openai::OpenAIRouter,
     RouterTrait,
 };
 use crate::config::{ConnectionMode, PolicyConfig, RoutingMode};
