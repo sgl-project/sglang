@@ -617,20 +617,16 @@ def _fwd_kernel_unified(
 
     # Load Q
     offs_q = (
-        (cur_seq_q_start_idx + cur_block_m * BLOCK_M + offs_m[:, None])
-        * stride_qbs
+        (cur_seq_q_start_idx + cur_block_m * BLOCK_M + offs_m[:, None]) * stride_qbs
         + cur_head * stride_qh
         + offs_d[None, :]
     )
-    q = tl.load(
-        Q + offs_q, mask=(mask_m[:, None]) & (mask_d[None, :]), other=0.0
-    )
+    q = tl.load(Q + offs_q, mask=(mask_m[:, None]) & (mask_d[None, :]), other=0.0)
 
     if BLOCK_DPE > 0:
         offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
         offs_qpe = (
-            (cur_seq_q_start_idx + cur_block_m * BLOCK_M + offs_m[:, None])
-            * stride_qbs
+            (cur_seq_q_start_idx + cur_block_m * BLOCK_M + offs_m[:, None]) * stride_qbs
             + cur_head * stride_qh
             + offs_dpe[None, :]
         )
@@ -649,14 +645,14 @@ def _fwd_kernel_unified(
 
         # Compute mask
         final_mask = mask_m[:, None] & mask_n[None, :]
-        
+
         # Apply causal mask for extend part
         if IS_CAUSAL:
             # Determine if current KV block is in extend region
             # Only apply causal mask when both Q and K are in extend region
             q_idx = cur_block_m * BLOCK_M + offs_m[:, None]
             k_idx_in_total = start_n + offs_n[None, :]
-            
+
             # Causal mask: q_idx >= (k_idx - prefix_len) when k_idx >= prefix_len
             # For prefix region (k_idx < prefix_len), no causal mask
             k_is_extend = k_idx_in_total >= cur_seq_prefix_len
@@ -711,7 +707,7 @@ def _fwd_kernel_unified(
                     other=0.0,
                 )
                 qk += tl.dot(qpe.to(kpe.dtype), kpe)
-            
+
             qk *= sm_scale
 
             if logit_cap > 0:
@@ -749,8 +745,7 @@ def _fwd_kernel_unified(
 
     # Store output
     offs_o = (
-        (cur_seq_q_start_idx + cur_block_m * BLOCK_M + offs_m[:, None])
-        * stride_obs
+        (cur_seq_q_start_idx + cur_block_m * BLOCK_M + offs_m[:, None]) * stride_obs
         + cur_head * stride_oh
         + offs_dv[None, :]
     )
@@ -780,7 +775,7 @@ def extend_attention_fwd_unified(
 ):
     """
     Unified 1-stage extend attention for deterministic inference.
-    
+
     Args:
         q: Query tensor [num_tokens, num_heads, head_dim]
         o: Output tensor [num_tokens, num_heads, head_dim]
