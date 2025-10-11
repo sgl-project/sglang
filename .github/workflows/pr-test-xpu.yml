@@ -56,16 +56,16 @@ jobs:
       - name: Install Dependency
         timeout-minutes: 20
         run: |
-          docker exec main_sglang_xpu /miniforge3/envs/py3.10/bin/python3 -m pip install --upgrade pip
-          docker exec main_sglang_xpu /miniforge3/envs/py3.10/bin/python3 -m pip install pytest expecttest ray huggingface_hub
-          docker exec main_sglang_xpu /miniforge3/envs/py3.10/bin/python3 -m pip uninstall -y flashinfer-python
-          docker exec main_sglang_xpu /bin/bash -c '/miniforge3/envs/py3.10/bin/huggingface-cli login --token ${HF_TOKEN} '
-          docker exec main_sglang_xpu /bin/bash -c "ln -sf /miniforge3/envs/py3.10/bin/python3 /usr/bin/python3"
+          docker exec main_sglang_xpu /home/sdp/miniforge3/envs/py3.10/bin/python3 -m pip install --upgrade pip
+          docker exec main_sglang_xpu /home/sdp/miniforge3/envs/py3.10/bin/python3 -m pip install pytest expecttest ray huggingface_hub
+          docker exec main_sglang_xpu /home/sdp/miniforge3/envs/py3.10/bin/python3 -m pip uninstall -y flashinfer-python
+          docker exec main_sglang_xpu /bin/bash -c '/home/sdp/miniforge3/envs/py3.10/bin/huggingface-cli login --token ${HF_TOKEN} '
+          docker exec -u root main_sglang_xpu /bin/bash -c "ln -sf /home/sdp/miniforge3/envs/py3.10/bin/python3 /usr/bin/python3"
 
       - name: Run E2E Bfloat16 tests
         timeout-minutes: 20
         run: |
-          docker exec -w /root/sglang/ main_sglang_xpu \
+          docker exec -w /home/sdp/sglang/ main_sglang_xpu \
             bash -c "cd ./test/srt && python3 run_suite.py --suite per-commit-xpu"
 
       - name: Cleanup container
