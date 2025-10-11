@@ -17,6 +17,9 @@ if is_cuda():
     except ImportError as e:
         deep_gemm = e
 
+from sglang.srt.layers.attention.nsa.fused_logits_head_gate import (
+    fused_logits_head_gate,
+)
 from sglang.srt.layers.attention.nsa.utils import NSA_DUAL_STREAM, NSA_USE_REAL_INDEXER
 from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -207,8 +210,9 @@ class Indexer(CustomOp):
 
     def _get_logits_head_gate(self, x: torch.Tensor, q_scale: torch.Tensor):
         weights, _ = self.weights_proj(x)
-        weights = weights * self.n_heads**-0.5
-        weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
+        weights = fused_logits_head_gate(
+            weights, q_scale, self.n_heads, self.softmax_scale
+        )
         return weights
 
     def _get_q_k_bf16(
