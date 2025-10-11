@@ -39,7 +39,7 @@ pub trait RouterTrait: Send + Sync + Debug {
     /// Route a health generate request
     async fn health_generate(&self, req: Request<Body>) -> Response;
 
-    /// Route a health generate request
+    /// Compute engine metrics
     async fn get_engine_metrics(&self) -> Response {
         (
             StatusCode::NOT_IMPLEMENTED,
