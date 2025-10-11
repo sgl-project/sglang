@@ -1201,9 +1201,9 @@ class ServerArgs:
                     f"Currently only {DETERMINISTIC_ATTENTION_BACKEND_CHOICES} attention backends are supported for deterministic inference."
                 )
 
-            # Currently, only FA3 supports radix cache. Support for other backends is in progress
-            if self.attention_backend != "fa3":
-                # self.disable_radix_cache = True
+            # Currently, only FA3, Triton supports radix cache. Support for other backends is in progress
+            if self.attention_backend not in ["fa3", "triton"]:
+                self.disable_radix_cache = True
                 logger.warning(
                     f"Currently radix cache is not compatible with {self.attention_backend} attention backend for deterministic inference. It will be supported in the future."
                 )
