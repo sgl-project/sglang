@@ -156,7 +156,6 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.tracing.trace import (
     process_tracing_init,
     trace_set_proc_propagate_context,
@@ -192,6 +191,7 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_tokenizer,
     get_tokenizer_from_processor,
 )
+from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -1442,26 +1442,29 @@ class Scheduler(
             or req.sampling_params.ebnf is not None
             or req.sampling_params.structural_tag is not None
         ):
-            assert self.grammar_backend is not None
-            if req.sampling_params.json_schema is not None:
-                key = ("json", req.sampling_params.json_schema)
-            elif req.sampling_params.regex is not None:
-                key = ("regex", req.sampling_params.regex)
-            elif req.sampling_params.ebnf is not None:
-                key = ("ebnf", req.sampling_params.ebnf)
-            elif req.sampling_params.structural_tag:
-                key = ("structural_tag", req.sampling_params.structural_tag)
-
-            value, cache_hit = self.grammar_backend.get_cached_or_future_value(key)
-            req.grammar = value
-
-            if not cache_hit:
-                req.grammar_key = key
-                add_to_grammar_queue = True
+            if self.grammar_backend is None:
+                error_msg = "Grammar-based generation (json_schema, regex, ebnf, structural_tag) is not supported when the server is launched with --grammar-backend none"
+                req.set_finish_with_abort(error_msg)
             else:
-                if value is INVALID_GRAMMAR_OBJ:  # We hit a cached invalid grammar.
-                    error_msg = f"Invalid grammar request with cache hit: {key=}"
-                    req.set_finish_with_abort(error_msg)
+                if req.sampling_params.json_schema is not None:
+                    key = ("json", req.sampling_params.json_schema)
+                elif req.sampling_params.regex is not None:
+                    key = ("regex", req.sampling_params.regex)
+                elif req.sampling_params.ebnf is not None:
+                    key = ("ebnf", req.sampling_params.ebnf)
+                elif req.sampling_params.structural_tag:
+                    key = ("structural_tag", req.sampling_params.structural_tag)
+
+                value, cache_hit = self.grammar_backend.get_cached_or_future_value(key)
+                req.grammar = value
+
+                if not cache_hit:
+                    req.grammar_key = key
+                    add_to_grammar_queue = True
+                else:
+                    if value is INVALID_GRAMMAR_OBJ:  # We hit a cached invalid grammar.
+                        error_msg = f"Invalid grammar request with cache hit: {key=}"
+                        req.set_finish_with_abort(error_msg)
 
         if add_to_grammar_queue:
             self.grammar_queue.append(req)
@@ -1488,8 +1491,18 @@ class Scheduler(
                 last_hash = req.last_host_node.get_last_hash_value()
                 matched_len = len(req.prefix_indices) + req.host_hit_length
                 new_input_tokens = req.fill_ids[matched_len:]
+
+                prefix_keys = (
+                    req.last_node.get_prefix_hash_values(req.last_node.parent)
+                    if self.tree_cache.hicache_storage_pass_prefix_keys
+                    else None
+                )
                 self.tree_cache.prefetch_from_storage(
-                    req.rid, req.last_host_node, new_input_tokens, last_hash
+                    req.rid,
+                    req.last_host_node,
+                    new_input_tokens,
+                    last_hash,
+                    prefix_keys,
                 )
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
@@ -2918,7 +2931,9 @@ def run_scheduler_process(
 
     # Set cpu affinity to this gpu process
     if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
-        set_gpu_proc_affinity(server_args.tp_size, server_args.nnodes, gpu_id)
+        set_gpu_proc_affinity(
+            server_args.pp_size, server_args.tp_size, server_args.nnodes, gpu_id
+        )
     if (numa_node := server_args.numa_node) is not None:
         numa_bind_to_node(numa_node[gpu_id])
 

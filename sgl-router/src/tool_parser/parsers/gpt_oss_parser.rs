@@ -5,7 +5,7 @@ use serde_json::Value;
 use crate::protocols::spec::Tool;
 
 use crate::tool_parser::{
-    errors::{ToolParserError, ToolParserResult},
+    errors::{ParserError, ParserResult},
     parsers::helpers,
     partial_json::PartialJson,
     traits::ToolParser,
@@ -76,7 +76,7 @@ impl Default for GptOssParser {
 
 #[async_trait]
 impl ToolParser for GptOssParser {
-    async fn parse_complete(&self, text: &str) -> ToolParserResult<(String, Vec<ToolCall>)> {
+    async fn parse_complete(&self, text: &str) -> ParserResult<(String, Vec<ToolCall>)> {
         // Check if text contains GPT-OSS format
         if !self.has_tool_markers(text) {
             return Ok((text.to_string(), vec![]));
@@ -100,7 +100,7 @@ impl ToolParser for GptOssParser {
                 } else {
                     match serde_json::from_str::<Value>(args_content) {
                         Ok(value) => serde_json::to_string(&value)
-                            .map_err(|e| ToolParserError::ParsingFailed(e.to_string()))?,
+                            .map_err(|e| ParserError::ParsingFailed(e.to_string()))?,
                         Err(_) => {
                             // Skip malformed JSON
                             continue;
@@ -126,7 +126,7 @@ impl ToolParser for GptOssParser {
         &mut self,
         chunk: &str,
         tools: &[Tool],
-    ) -> ToolParserResult<StreamingParseResult> {
+    ) -> ParserResult<StreamingParseResult> {
         self.buffer.push_str(chunk);
 
         // Check for tool markers
@@ -211,7 +211,7 @@ impl ToolParser for GptOssParser {
                             partial_args
                         };
 
-                        match self.partial_json.parse_value(json_part) {
+                        match self.partial_json.parse_value(json_part, true) {
                             Ok((value, _consumed)) => {
                                 let args_str = serde_json::to_string(&value)
                                     .unwrap_or_else(|_| "{}".to_string());
