@@ -393,7 +393,7 @@ class ForwardBatch:
             ret.positions = ret.spec_info.positions
 
         # Init position information
-        if ret.forward_mode.is_decode():
+        if ret.forward_mode.is_decode() or ret.forward_mode.is_target_verify():
             if ret.positions is None:
                 ret.positions = clamp_position(batch.seq_lens)
         else:
