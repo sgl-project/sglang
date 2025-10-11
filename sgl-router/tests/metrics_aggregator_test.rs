@@ -265,4 +265,3 @@ fn assert_eq_sorted(result: &str, expected: &str) {
     expected_lines.sort();
     assert_eq!(result_lines, expected_lines);
 }
-
