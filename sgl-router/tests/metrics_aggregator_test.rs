@@ -41,8 +41,8 @@ fn test_aggregate_multiple_metrics() {
         metrics_text: r#"
 # TYPE metric_a gauge
 metric_a{dim="x"} 1.0
-# TYPE metric_b counter
-metric_b 10
+# TYPE metric_b_total counter
+metric_b_total 10
 "#.to_string(),
     };
     let pack2 = MetricPack {
@@ -58,8 +58,8 @@ metric_a{dim="y"} 2.0
 metric_a{dim="x",source="w1"} 1
 metric_a{dim="y",source="w2"} 2
 
-# TYPE metric_b counter
-metric_b{source="w1"} 10
+# TYPE metric_b_total counter
+metric_b_total{source="w1"} 10
 "#;
     // Split into lines and sort to handle BTreeMap ordering issues between test environments
     let mut result_lines: Vec<_> = result.trim().lines().map(|l| l.trim()).collect();
