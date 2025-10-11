@@ -17,7 +17,9 @@ pub fn aggregate_metrics(metric_packs: Vec<MetricPack>) -> anyhow::Result<String
                 Err(_) => continue,
             };
 
-        TODO
+        for (_, family) in exposition.families {
+            TODO
+        }
     }
 
     encode_metric_families(output_metric_families)
