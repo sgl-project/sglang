@@ -36,7 +36,6 @@ else:
     Image = Any
 
 
-# Parameters for a session
 @dataclass
 class BaseReq(ABC):
     rid: Optional[Union[str, List[str]]] = field(default=None, kw_only=True)
@@ -60,9 +59,11 @@ class BaseBatchReq(ABC):
         return self.rids
 
 
+# Parameters for a session
 @dataclass
 class SessionParams:
     id: Optional[str] = None
+    rid: Optional[str] = None
     offset: Optional[int] = None
     replace: Optional[bool] = None
     drop_previous_output: Optional[bool] = None
@@ -166,8 +167,6 @@ class GenerateReqInput(BaseReq):
     # For custom metric labels
     custom_labels: Optional[Dict[str, str]] = None
 
-    # (Deprecated, please use custom_labels) Label for the request
-    label: Optional[str] = None
     # (Internal) Whether to return bytes for image generation
     return_bytes: bool = False
 
@@ -568,7 +567,6 @@ class GenerateReqInput(BaseReq):
             extra_key=self.extra_key,
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
-            label=self.label,
             return_bytes=self.return_bytes,
         )
 
@@ -632,8 +630,6 @@ class TokenizedGenerateReqInput(BaseReq):
     # tracing context
     trace_context: Optional[Dict] = None
 
-    # (Deprecated, please use custom_labels) Label for the request
-    label: Optional[str] = None
     # (Internal) Whether to return bytes for image generation
     return_bytes: bool = False
 

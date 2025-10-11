@@ -263,6 +263,17 @@ def is_flashinfer_available():
     return importlib.util.find_spec("flashinfer") is not None and is_cuda()
 
 
+def is_nvidia_cublas_cu12_version_ge_12_9():
+    """
+    temporary fix for issue #11272
+    """
+    try:
+        installed_version = version("nvidia-cublas-cu12")
+    except PackageNotFoundError:
+        return False
+    return pkg_version.parse(installed_version) >= pkg_version.parse("12.9")
+
+
 def random_uuid() -> str:
     return str(uuid.uuid4().hex)
 
@@ -471,7 +482,7 @@ def is_pin_memory_available() -> bool:
 
 class LayerFn(Protocol):
 
-    def __call__(self, layer_id: int, prefix: str) -> torch.nn.Module: ...
+    def __call__(self, idx: int, prefix: str) -> torch.nn.Module: ...
 
 
 def make_layers(
@@ -482,12 +493,12 @@ def make_layers(
     prefix: str = "",
     return_tuple: bool = False,
     offloader_kwargs: Dict[str, Any] = {},
-) -> Tuple[int, int, torch.nn.ModuleList]:
+) -> Tuple[torch.nn.Module, int, int]:
     """Make a list of layers with the given layer function"""
     # circula imports
     from sglang.srt.distributed import get_pp_indices
     from sglang.srt.layers.utils import PPMissingLayer
-    from sglang.srt.offloader import get_offloader
+    from sglang.srt.utils.offloader import get_offloader
 
     assert not pp_size or num_hidden_layers >= pp_size
     start_layer, end_layer = (
@@ -516,6 +527,24 @@ def make_layers(
     if pp_rank is None or pp_size is None:
         return modules
     return modules, start_layer, end_layer
+
+
+def make_layers_non_pp(
+    num_hidden_layers: int,
+    layer_fn: LayerFn,
+    prefix: str = "",
+) -> torch.nn.ModuleList:
+    from sglang.srt.utils.offloader import get_offloader
+
+    layers = torch.nn.ModuleList(
+        get_offloader().wrap_modules(
+            (
+                layer_fn(idx=idx, prefix=add_prefix(idx, prefix))
+                for idx in range(num_hidden_layers)
+            )
+        )
+    )
+    return layers
 
 
 cmo_stream = None
@@ -1873,6 +1902,7 @@ def direct_register_custom_op(
 
 
 def set_gpu_proc_affinity(
+    pp_size: int,
     tp_size: int,
     nnodes: int,
     gpu_id: int,
@@ -1881,7 +1911,8 @@ def set_gpu_proc_affinity(
     pid = os.getpid()
     p = psutil.Process(pid)
 
-    tp_size_per_node = tp_size // nnodes
+    nnodes_per_tp_group = max(nnodes // pp_size, 1)
+    tp_size_per_node = tp_size // nnodes_per_tp_group
 
     # total physical cores
     total_pcores = psutil.cpu_count(logical=False)

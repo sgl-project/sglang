@@ -174,6 +174,14 @@ void copy_to_gpu_no_ce(const at::Tensor& input, at::Tensor& output);
 void concat_mla_k(torch::Tensor k, torch::Tensor k_nope, torch::Tensor k_rope);
 void concat_mla_absorb_q(at::Tensor a, at::Tensor b, at::Tensor out);
 
+void fast_topk_interface(at::Tensor score, at::Tensor indices, at::Tensor lengths);
+void fast_topk_transform_interface(
+    at::Tensor score,
+    at::Tensor lengths,
+    at::Tensor dst_page_table,
+    at::Tensor src_page_table,
+    at::Tensor cu_seqlens_q);
+
 #ifdef USE_ROCM
 void gelu_quick(at::Tensor& out, const at::Tensor& input);
 #endif
@@ -211,7 +219,7 @@ torch::Tensor fp8_blockwise_scaled_mm(
     const torch::Dtype& out_dtype);
 void scaled_fp4_quant(
     torch::Tensor& output, torch::Tensor const& input, torch::Tensor& output_scale, torch::Tensor const& input_scale);
-void sgl_per_token_group_quant_fp8(
+void sgl_per_token_group_quant_8bit(
     at::Tensor input,
     at::Tensor output_q,
     at::Tensor output_s,
@@ -220,14 +228,17 @@ void sgl_per_token_group_quant_fp8(
     double fp8_min,
     double fp8_max,
     bool scale_ue8m0);
-void sgl_per_token_group_quant_int8(
+void sgl_per_token_group_quant_8bit_v2(
     at::Tensor input,
     at::Tensor output_q,
     at::Tensor output_s,
     int64_t group_size,
     double eps,
-    double int8_min,
-    double int8_max);
+    double min_8bit,
+    double max_8bit,
+    bool scale_ue8m0,
+    bool fuse_silu_and_mul,
+    const std::optional<torch::Tensor>& masked_m);
 void sgl_per_tensor_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s, bool is_static);
 void sgl_per_token_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s);
 void bmm_fp8(
