@@ -734,6 +734,26 @@ class Req:
 
         return self.surr_and_decode_ids, self.read_offset - self.surr_offset
 
+    def check_match_stop_str_prefix(self) -> bool:
+        """
+        Check if the suffix of tail_str overlaps with any stop_str prefix
+        """
+        if not self.sampling_params.stop_strs:
+            return False
+
+        tail_str = self.tokenizer.decode(
+            self.output_ids[-(self.sampling_params.stop_str_max_len + 1) :]
+        )
+
+        # Use any() and generator expressions for optimal performance
+        return any(
+            any(
+                tail_str[-i:] == stop_str[:i]
+                for i in range(1, min(len(tail_str), len(stop_str)) + 1)
+            )
+            for stop_str in self.sampling_params.stop_strs
+        )
+
     def check_finished(self):
         if self.finished():
             return

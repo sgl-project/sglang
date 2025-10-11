@@ -680,12 +680,19 @@ class SchedulerOutputProcessorMixin:
                     stream_interval = (
                         req.sampling_params.stream_interval or self.stream_interval
                     )
-                    should_output = (
-                        len(req.output_ids) % stream_interval == 1
-                        if not self.model_config.is_multimodal_gen
-                        and stream_interval > 1
-                        else len(req.output_ids) % stream_interval == 0
-                    )
+                    # check_match_stop_str_prefix if  tail_str's suffix match stop_str prefix
+                    matches_stop_str_prefix = req.check_match_stop_str_prefix()
+
+                    if matches_stop_str_prefix:
+                        should_output = False
+                    else:
+                        # origin stream_interval logic
+                        should_output = (
+                            len(req.output_ids) % stream_interval == 1
+                            if not self.model_config.is_multimodal_gen
+                            and stream_interval > 1
+                            else len(req.output_ids) % stream_interval == 0
+                        )
                 else:
                     should_output = (
                         len(req.output_ids) % DEFAULT_FORCE_STREAM_INTERVAL == 0
