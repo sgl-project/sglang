@@ -9,7 +9,7 @@ pub struct MetricPack {
 }
 
 type PrometheusExposition = MetricsExposition<PrometheusType, PrometheusValue>;
-type PrometheusFamily = MetricsFamily<PrometheusType, PrometheusValue>;
+type PrometheusFamily = MetricFamily<PrometheusType, PrometheusValue>;
 
 /// Aggregate Prometheus metrics scraped from multiple sources into a unified one
 pub fn aggregate_metrics(metric_packs: Vec<MetricPack>) -> anyhow::Result<String> {
@@ -48,19 +48,20 @@ fn transform_metrics(
     exposition
 }
 
-fn merge_exposition(a: PrometheusExposition, b: PrometheusExposition) -> PrometheusExposition {
+fn merge_exposition(a: PrometheusExposition, b: PrometheusExposition) -> anyhow::Result<PrometheusExposition> {
     let mut ans = a;
     for (name, family_b) in b.families.into_iter() {
         ans[name] = if let Some(family_a) = ans.families.remove(&name) {
-            merge_family(family_a, family_b)
+            merge_family(family_a, family_b)?
         } else {
             family_b
         };
     }
-    ans
+    Ok(ans)
 }
 
-fn merge_family(a: PrometheusFamily, b: PrometheusFamily) -> PrometheusFamily {
+fn merge_family(a: PrometheusFamily, b: PrometheusFamily) -> anyhow::Result<PrometheusFamily> {
     let mut ans = a;
+
     ans
 }
