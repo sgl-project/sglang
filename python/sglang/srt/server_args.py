@@ -238,6 +238,7 @@ class ServerArgs:
     log_requests: bool = False
     log_requests_level: int = 2
     crash_dump_folder: Optional[str] = None
+    crash_on_nan: bool = False
     show_time_cost: bool = False
     enable_metrics: bool = False
     enable_metrics_for_all_schedulers: bool = False
@@ -862,9 +863,6 @@ class ServerArgs:
 
                 self.page_size = 64
                 logger.warning("Setting page size to 64 for DeepSeek NSA.")
-
-                self.mem_fraction_static = 0.8
-                logger.warning("Setting mem fraction static to 0.8 for DeepSeek NSA.")
 
                 # For Hopper, we support both bf16 and fp8 kv cache; for Blackwell, we support fp8 only currently
                 import torch
@@ -1735,6 +1733,12 @@ class ServerArgs:
             type=str,
             default=ServerArgs.crash_dump_folder,
             help="Folder path to dump requests from the last 5 min before a crash (if any). If not specified, crash dumping is disabled.",
+        )
+        parser.add_argument(
+            "--crash-on-nan",
+            type=str,
+            default=ServerArgs.crash_on_nan,
+            help="Crash the server on nan logprobs.",
         )
         parser.add_argument(
             "--show-time-cost",

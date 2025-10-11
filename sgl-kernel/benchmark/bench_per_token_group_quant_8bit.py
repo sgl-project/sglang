@@ -8,7 +8,6 @@ import torch
 import triton
 from sgl_kernel.test_utils import create_per_token_group_quant_test_data
 
-from sglang.srt.bench_utils import bench_kineto
 from sglang.srt.layers.quantization.fp8_kernel import (
     create_per_token_group_quant_fp8_output_scale,
 )
@@ -17,6 +16,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 )
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_8bit
 from sglang.srt.utils import is_hip
+from sglang.srt.utils.bench_utils import bench_kineto
 
 # CI environment detection
 IS_CI = (
