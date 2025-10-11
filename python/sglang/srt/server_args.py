@@ -227,6 +227,7 @@ class ServerArgs:
     stream_output: bool = False
     random_seed: Optional[int] = None
     constrained_json_whitespace_pattern: Optional[str] = None
+    constrained_json_disable_any_whitespace: bool = False
     watchdog_timeout: float = 300
     dist_timeout: Optional[int] = None  # timeout for torch.distributed
     download_dir: Optional[str] = None
@@ -1683,7 +1684,12 @@ class ServerArgs:
             "--constrained-json-whitespace-pattern",
             type=str,
             default=ServerArgs.constrained_json_whitespace_pattern,
-            help="(outlines backend only) Regex pattern for syntactic whitespaces allowed in JSON constrained output. For example, to allow the model generate consecutive whitespaces, set the pattern to [\n\t ]*",
+            help="(outlines and llguidance backends only) Regex pattern for syntactic whitespaces allowed in JSON constrained output. For example, to allow the model generate consecutive whitespaces, set the pattern to [\n\t ]*",
+        )
+        parser.add_argument(
+            "--constrained-json-disable-any-whitespace",
+            action="store_true",
+            help="(xgrammar and llguidance backends only) Enforce compact representation in JSON constrained output.",
         )
         parser.add_argument(
             "--watchdog-timeout",
