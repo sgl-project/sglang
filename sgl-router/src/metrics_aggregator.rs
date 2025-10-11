@@ -70,10 +70,7 @@ fn merge_family(a: PrometheusFamily, b: PrometheusFamily) -> anyhow::Result<Prom
         a.get_label_names(),
         b.get_label_names()
     );
-
-    let ans = a;
-    let ans = ans.with_samples(b.into_iter_samples())?;
-    Ok(ans)
+    Ok(a.with_samples(b.into_iter_samples())?)
 }
 
 pub fn try_reduce<I, T, E, F>(iterable: I, mut f: F) -> Result<Option<T>, E>
