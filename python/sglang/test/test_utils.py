@@ -9,6 +9,7 @@ import os
 import random
 import re
 import subprocess
+import sys
 import threading
 import time
 import unittest
@@ -19,7 +20,6 @@ from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, List, Optional, Tuple
-from urllib.parse import quote
 
 import aiohttp
 import numpy as np
@@ -43,6 +43,7 @@ from sglang.utils import get_exception_traceback
 DEFAULT_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.1-8B-Instruct"
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.2-1B-Instruct"
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE = "meta-llama/Llama-3.2-1B"
+DEFAULT_SMALL_MODEL_NAME_FOR_TEST_SCORE = "Qwen/Qwen3-Reranker-0.6B"
 DEFAULT_MOE_MODEL_NAME_FOR_TEST = "mistralai/Mixtral-8x7B-Instruct-v0.1"
 DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_BASE = "Qwen/Qwen1.5-MoE-A2.7B"
 DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT = "Qwen/Qwen1.5-MoE-A2.7B-Chat"
@@ -507,6 +508,7 @@ def popen_launch_server(
     return_stdout_stderr: Optional[tuple] = None,
     device: str = "auto",
     pd_separated: bool = False,
+    num_replicas: Optional[int] = None,
 ):
     """Launch a server process with automatic device detection.
 
@@ -524,7 +526,8 @@ def popen_launch_server(
     _, host, port = base_url.split(":")
     host = host[2:]
 
-    if pd_separated:
+    use_mixed_pd_engine = not pd_separated and num_replicas is not None
+    if pd_separated or use_mixed_pd_engine:
         command = "sglang.launch_pd_server"
     else:
         command = "sglang.launch_server"
@@ -538,7 +541,7 @@ def popen_launch_server(
         *[str(x) for x in other_args],
     ]
 
-    if pd_separated:
+    if pd_separated or use_mixed_pd_engine:
         command.extend(
             [
                 "--lb-host",
@@ -557,6 +560,15 @@ def popen_launch_server(
             ]
         )
 
+    if use_mixed_pd_engine:
+        command.extend(
+            [
+                "--mixed",
+                "--num-replicas",
+                str(num_replicas),
+            ]
+        )
+
     if api_key:
         command += ["--api-key", api_key]
 
@@ -565,11 +577,30 @@ def popen_launch_server(
     if return_stdout_stderr:
         process = subprocess.Popen(
             command,
-            stdout=return_stdout_stderr[0],
-            stderr=return_stdout_stderr[1],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             env=env,
             text=True,
+            bufsize=1,
         )
+
+        def _dump(src, sinks):
+            for line in iter(src.readline, ""):
+                for sink in sinks:
+                    sink.write(line)
+                    sink.flush()
+            src.close()
+
+        threading.Thread(
+            target=_dump,
+            args=(process.stdout, [return_stdout_stderr[0], sys.stdout]),
+            daemon=True,
+        ).start()
+        threading.Thread(
+            target=_dump,
+            args=(process.stderr, [return_stdout_stderr[1], sys.stderr]),
+            daemon=True,
+        ).start()
     else:
         process = subprocess.Popen(command, stdout=None, stderr=None, env=env)
 
@@ -873,6 +904,154 @@ def run_bench_serving(
     return res
 
 
+def run_score_benchmark(
+    model,
+    num_requests=100,
+    batch_size=5,
+    other_server_args=None,
+    need_warmup=False,
+    device="auto",
+):
+    """Score API benchmark function compatible with run_bench_serving pattern"""
+    if other_server_args is None:
+        other_server_args = []
+
+    if device == "auto":
+        device = auto_config_device()
+
+    # Launch the server (consistent with run_bench_serving)
+    base_url = DEFAULT_URL_FOR_TEST
+    process = popen_launch_server(
+        model,
+        base_url,
+        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        other_args=other_server_args,
+    )
+
+    async def _run_benchmark():
+
+        # Load tokenizer for generating test data
+        from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+
+        tokenizer = get_tokenizer(model)
+
+        # Score API configuration
+        score_query_tokens = 120
+        score_item_tokens = 180
+        score_label_token_ids = [9454, 2753]  # Yes/No token IDs
+        special_token = "<|im_start|>"
+
+        def generate_text_with_token_count(num_tokens):
+            """Generate text with precise token count using replicated token."""
+            text = special_token * num_tokens
+            actual_tokens = len(tokenizer.encode(text, add_special_tokens=False))
+            if actual_tokens != num_tokens:
+                text = special_token * (
+                    num_tokens
+                    // len(tokenizer.encode(special_token, add_special_tokens=False))
+                )
+            return text
+
+        if need_warmup:
+            warmup_data = {
+                "query": generate_text_with_token_count(score_query_tokens),
+                "items": [
+                    generate_text_with_token_count(score_item_tokens) for _ in range(3)
+                ],
+                "label_token_ids": score_label_token_ids,
+                "model": model,
+                "apply_softmax": True,
+            }
+
+            async with aiohttp.ClientSession() as session:
+                try:
+                    await session.post(
+                        f"{base_url}/v1/score",
+                        json=warmup_data,
+                        timeout=aiohttp.ClientTimeout(total=30),
+                    )
+                except:
+                    pass  # Ignore warmup errors
+
+        test_requests = []
+        for i in range(num_requests):
+            query = generate_text_with_token_count(score_query_tokens)
+            items = [
+                generate_text_with_token_count(score_item_tokens)
+                for _ in range(batch_size)
+            ]
+
+            score_data = {
+                "query": query,
+                "items": items,
+                "label_token_ids": score_label_token_ids,
+                "model": model,
+                "apply_softmax": True,
+            }
+            test_requests.append(score_data)
+
+        start_time = time.monotonic()
+        successful_requests = 0
+        total_latency = 0
+        latencies = []
+
+        async with aiohttp.ClientSession() as session:
+            for request_data in test_requests:
+                try:
+                    request_start = time.monotonic()
+                    async with session.post(
+                        f"{base_url}/v1/score",
+                        json=request_data,
+                        timeout=aiohttp.ClientTimeout(total=30),
+                    ) as response:
+                        if response.status == 200:
+                            response_data = await response.json()
+                            request_end = time.monotonic()
+
+                            if "scores" in response_data or "logprobs" in response_data:
+                                latency_ms = (request_end - request_start) * 1000
+                                latencies.append(latency_ms)
+                                total_latency += latency_ms
+                                successful_requests += 1
+                except Exception:
+                    continue
+
+        end_time = time.monotonic()
+        total_time = end_time - start_time
+
+        if successful_requests > 0:
+            throughput = successful_requests / total_time
+            avg_latency = total_latency / successful_requests
+            latencies.sort()
+            p95_latency = latencies[int(len(latencies) * 0.95)] if latencies else 0
+
+            return {
+                "completed": successful_requests,
+                "total_requests": num_requests,
+                "throughput": throughput,
+                "avg_latency_ms": avg_latency,
+                "p95_latency_ms": p95_latency,
+                "successful_requests": successful_requests,
+            }
+        else:
+            return {
+                "completed": 0,
+                "total_requests": num_requests,
+                "throughput": 0,
+                "avg_latency_ms": 0,
+                "p95_latency_ms": 0,
+                "successful_requests": 0,
+            }
+
+    try:
+        res = asyncio.run(_run_benchmark())
+    finally:
+        kill_process_tree(process.pid)
+
+    assert res["completed"] == res["successful_requests"]
+    return res
+
+
 def run_bench_serving_multi(
     model,
     base_url,
@@ -980,7 +1159,7 @@ def run_bench_offline_throughput(model, other_args):
         *[str(x) for x in other_args],
     ]
 
-    print(f"{command=}")
+    print(f"command={' '.join(command)}")
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
     try:
@@ -1472,15 +1651,26 @@ def _ensure_remove_suffix(text: str, suffix: str):
     return text.removesuffix(suffix)
 
 
-class ModelDeploySetup:
-    def __init__(self, model_path: str, extra_args: List[str] = []):
+class ModelLaunchSettings:
+    def __init__(
+        self,
+        model_path: str,
+        tp_size: int = 1,
+        extra_args: Optional[List[str]] = None,
+        env: Optional[dict] = None,
+    ):
         self.model_path = model_path
-        if "--enable-multimodal" not in extra_args:
-            extra_args.append("--enable-multimodal")
-        if "--trust-remote-code" not in extra_args:
-            extra_args.append("--trust-remote-code")
+        self.tp_size = tp_size
+        self.extra_args = list(extra_args) if extra_args else []
+        self.env = env
 
-        self.extra_args = extra_args
+        if self.tp_size > 1 and "--tp" not in self.extra_args:
+            self.extra_args.extend(["--tp", str(self.tp_size)])
+
+        fixed_args = ["--enable-multimodal", "--trust-remote-code"]
+        for fixed_arg in fixed_args:
+            if fixed_arg not in self.extra_args:
+                self.extra_args.append(fixed_arg)
 
 
 class ModelEvalMetrics:
