@@ -300,7 +300,8 @@ impl RouterTrait for RouterManager {
                 .into_response();
         }
 
-        self.routers.iter().next().unwrap().value().get_engine_metrics().await
+        let router = self.routers.iter().next().unwrap().value().clone();
+        router.get_engine_metrics().await
     }
 
     async fn health_generate(&self, _req: Request<Body>) -> Response {
