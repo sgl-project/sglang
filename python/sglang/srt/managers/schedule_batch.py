@@ -745,14 +745,24 @@ class Req:
             self.output_ids[-(self.sampling_params.stop_str_max_len + 1) :]
         )
 
-        # Use any() and generator expressions for optimal performance
-        return any(
-            any(
-                tail_str[-i:] == stop_str[:i]
-                for i in range(1, min(len(tail_str), len(stop_str)) + 1)
-            )
-            for stop_str in self.sampling_params.stop_strs
-        )
+        # Early return if tail_str is empty
+        if not tail_str:
+            return False
+
+        for stop_str in self.sampling_params.stop_strs:
+            # Check if stop_str is contained in tail_str (fastest check first)
+            if stop_str in tail_str:
+                return True
+
+            # Check if tail_str suffix matches stop_str prefix
+            # Only check if stop_str is not empty, it's for stream output
+            if stop_str:
+                min_len = min(len(tail_str), len(stop_str))
+                for i in range(1, min_len + 1):
+                    if tail_str[-i:] == stop_str[:i]:
+                        return True
+
+        return False
 
     def check_finished(self):
         if self.finished():
