@@ -958,14 +958,14 @@ async fn create_and_link_item(
             .await
             .map_err(|e| format!("Failed to link item: {}", e))?;
 
-        info!(
+        debug!(
             conversation_id = %conv_id.0,
             item_id = %created.id.0,
             item_type = %created.item_type,
             "Persisted conversation item and link"
         );
     } else {
-        info!(
+        debug!(
             item_id = %created.id.0,
             item_type = %created.item_type,
             "Persisted conversation item (no conversation link)"

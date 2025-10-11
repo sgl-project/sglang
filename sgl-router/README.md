@@ -86,12 +86,12 @@ Route requests to OpenAI or OpenAI-compatible endpoints:
 # Route to OpenAI API
 python -m sglang_router.launch_router \
     --backend openai \
-    --worker-urls https://api.openai.com/v1
+    --worker-urls https://api.openai.com
 
 # Route to custom OpenAI-compatible endpoint
 ./target/release/sglang-router \
     --backend openai \
-    --worker-urls http://my-openai-compatible-service:8000/v1
+    --worker-urls http://my-openai-compatible-service:8000
 ```
 
 **Note**: OpenAI backend mode acts as a simple proxy. Load balancing is not applicable in this mode.
@@ -214,6 +214,8 @@ Default headers: `x-request-id`, `x-correlation-id`, `x-trace-id`, `request-id`
 
 Store conversation and response data for tracking, debugging, or analytics.
 
+**NOTE: This feature is currently only supported in OpenAI router mode.**
+
 #### Available Backends
 
 - **Memory** (default): In-memory storage, fast but ephemeral
@@ -223,12 +225,12 @@ Store conversation and response data for tracking, debugging, or analytics.
 ```bash
 # Memory backend (default)
 python -m sglang_router.launch_router \
-    --worker-urls http://worker1:8000 http://worker2:8000 \
+    --worker-urls https://api.openai.com \
     --history-backend memory
 
 # No storage for maximum performance
 python -m sglang_router.launch_router \
-    --worker-urls http://worker1:8000 http://worker2:8000 \
+    --worker-urls https://api.openai.com \
     --history-backend none
 
 # Oracle ATP backend with environment variables
@@ -238,7 +240,7 @@ export ATP_PASSWORD="YourPassword123"
 export ATP_WALLET_PATH="/path/to/wallet"
 
 python -m sglang_router.launch_router \
-    --worker-urls http://worker1:8000 http://worker2:8000 \
+    --worker-urls https://api.openai.com \
     --history-backend oracle
 ```
 
