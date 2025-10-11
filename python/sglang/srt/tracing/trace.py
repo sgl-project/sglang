@@ -198,7 +198,9 @@ def process_tracing_init(otlp_endpoint, server_name):
         )
 
         processor = BatchSpanProcessor(
-            OTLPSpanExporter(endpoint=otlp_endpoint, insecure=True)
+            OTLPSpanExporter(endpoint=otlp_endpoint, insecure=True),
+            schedule_delay_millis=500,
+            max_export_batch_size=64,
         )
         tracer_provider.add_span_processor(processor)
         trace.set_tracer_provider(tracer_provider)
