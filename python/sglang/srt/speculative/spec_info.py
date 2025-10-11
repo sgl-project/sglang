@@ -48,7 +48,6 @@ class SpeculativeAlgorithm(IntEnum):
         if name is not None:
             name = name.upper()
         return name_map[name]
-    
 
 class SpecInputType(IntEnum):
     # NOTE: introduce this to distinguish the SpecInput types of multiple algorithms when asserting in attention backends.

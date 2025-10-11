@@ -44,7 +44,6 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 from sglang.srt.parser.reasoning_parser import ReasoningParser
-from sglang.utils import convert_json_schema_to_str
 
 if TYPE_CHECKING:
     from sglang.srt.managers.template_manager import TemplateManager
@@ -64,6 +63,16 @@ class OpenAIServingChat(OpenAIServingBase):
         super().__init__(tokenizer_manager)
         self.template_manager = template_manager
         self.tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
+        self.reasoning_parser = self.tokenizer_manager.server_args.reasoning_parser
+
+        # Get default sampling parameters from model's generation config
+        self.default_sampling_params = (
+            self.tokenizer_manager.model_config.get_default_sampling_params()
+        )
+        if self.default_sampling_params:
+            logger.info(
+                f"Using default chat sampling params from model generation config: {self.default_sampling_params}",
+            )
 
     def _request_id_prefix(self) -> str:
         return "chatcmpl-"
@@ -136,10 +145,10 @@ class OpenAIServingChat(OpenAIServingBase):
         processed_messages = self._process_messages(request, is_multimodal)
 
         # Build sampling parameters
-        sampling_params = self._build_sampling_params(
-            request,
-            processed_messages.stop,
-            processed_messages.tool_call_constraint,
+        sampling_params = request.to_sampling_params(
+            stop=processed_messages.stop,
+            model_generation_config=self.default_sampling_params,
+            tool_call_constraint=processed_messages.tool_call_constraint,
         )
 
         # Handle single vs multiple requests
@@ -409,72 +418,6 @@ class OpenAIServingChat(OpenAIServingBase):
             stop=stop,
         )
 
-    def _build_sampling_params(
-        self,
-        request: ChatCompletionRequest,
-        stop: List[str],
-        tool_call_constraint: Optional[Any],
-    ) -> Dict[str, Any]:
-        """Build sampling parameters for the request"""
-
-        sampling_params = {
-            "temperature": request.temperature,
-            "max_new_tokens": request.max_tokens or request.max_completion_tokens,
-            "min_new_tokens": request.min_tokens,
-            "stop": stop,
-            "stop_token_ids": request.stop_token_ids,
-            "top_p": request.top_p,
-            "top_k": request.top_k,
-            "min_p": request.min_p,
-            "presence_penalty": request.presence_penalty,
-            "frequency_penalty": request.frequency_penalty,
-            "repetition_penalty": request.repetition_penalty,
-            "regex": request.regex,
-            "ebnf": request.ebnf,
-            "n": request.n,
-            "no_stop_trim": request.no_stop_trim,
-            "ignore_eos": request.ignore_eos,
-            "skip_special_tokens": request.skip_special_tokens,
-            "logit_bias": request.logit_bias,
-        }
-
-        if request.response_format and request.response_format.type == "json_schema":
-            sampling_params["json_schema"] = convert_json_schema_to_str(
-                request.response_format.json_schema.schema_
-            )
-        elif request.response_format and request.response_format.type == "json_object":
-            sampling_params["json_schema"] = '{"type": "object"}'
-        elif (
-            request.response_format and request.response_format.type == "structural_tag"
-        ):
-            sampling_params["structural_tag"] = convert_json_schema_to_str(
-                request.response_format.model_dump(by_alias=True)
-            )
-
-        # Check if there are already existing output constraints
-        has_existing_constraints = (
-            sampling_params.get("regex")
-            or sampling_params.get("ebnf")
-            or sampling_params.get("structural_tag")
-            or sampling_params.get("json_schema")
-        )
-
-        if tool_call_constraint and has_existing_constraints:
-            logger.warning("Constrained decoding is not compatible with tool calls.")
-        elif tool_call_constraint:
-            constraint_type, constraint_value = tool_call_constraint
-            if constraint_type == "structural_tag":
-                sampling_params[constraint_type] = convert_json_schema_to_str(
-                    constraint_value.model_dump(by_alias=True)
-                )
-            elif constraint_type == "json_schema":
-                sampling_params[constraint_type] = convert_json_schema_to_str(
-                    constraint_value
-                )
-            else:
-                sampling_params[constraint_type] = constraint_value
-        return sampling_params
-
     async def _handle_streaming_request(
         self,
         adapted_request: GenerateReqInput,
@@ -563,10 +506,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 stream_buffers[index] = stream_buffer + delta
 
                 # Handle reasoning content
-                if (
-                    self.tokenizer_manager.server_args.reasoning_parser
-                    and request.separate_reasoning
-                ):
+                if self.reasoning_parser and request.separate_reasoning:
                     reasoning_text, delta = self._process_reasoning_stream(
                         index, delta, reasoning_parser_dict, content, request
                     )
@@ -756,7 +696,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
             # Handle reasoning content
             reasoning_text = None
-            reasoning_parser = self.tokenizer_manager.server_args.reasoning_parser
+            reasoning_parser = self.reasoning_parser
             if reasoning_parser and request.separate_reasoning:
                 is_force_reasoning = (
                     self.template_manager.force_reasoning
@@ -1010,7 +950,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 or self._get_enable_thinking_from_request(request)
             )
             reasoning_parser_dict[index] = ReasoningParser(
-                self.tokenizer_manager.server_args.reasoning_parser,
+                self.reasoning_parser,
                 request.stream_reasoning,
                 is_force_reasoning,
             )
@@ -1050,11 +990,11 @@ class OpenAIServingChat(OpenAIServingBase):
         """
         if hasattr(request, "chat_template_kwargs") and request.chat_template_kwargs:
             # For Qwen3 models, `enable_thinking` is supported.
-            if request.chat_template_kwargs.get("enable_thinking") is not None:
-                return request.chat_template_kwargs.get("enable_thinking")
+            if self.reasoning_parser in ["qwen3", "glm45"]:
+                return request.chat_template_kwargs.get("enable_thinking", False)
             # For DeepSeek-V3.1 models, `thinking` is supported.
-            elif request.chat_template_kwargs.get("thinking") is not None:
-                return request.chat_template_kwargs.get("thinking")
+            elif self.reasoning_parser in ["deepseek-v3"]:
+                return request.chat_template_kwargs.get("thinking", False)
             else:
                 return False
         return False

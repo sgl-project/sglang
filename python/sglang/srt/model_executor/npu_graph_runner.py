@@ -75,11 +75,16 @@ class NPUGraphRunner(CudaGraphRunner):
             self.positions[: self.raw_num_token].copy_(forward_batch.positions)
 
         # Replay
-        seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (self.bs - self.raw_bs)
-        thread = threading.Thread(target=self._update_inputs, args=(seq_lens,))
-        thread.start()
-        self.graphs[self.bs].replay()
-        thread.join()
+        if self.model_runner.model_config.index_head_dim is None:
+            seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (
+                self.bs - self.raw_bs
+            )
+            thread = threading.Thread(target=self._update_inputs, args=(seq_lens,))
+            thread.start()
+            self.graphs[self.bs].replay()
+            thread.join()
+        else:
+            self.graphs[self.bs].replay()
 
         output = self.output_buffers[self.bs]
         if isinstance(output, LogitsProcessorOutput):

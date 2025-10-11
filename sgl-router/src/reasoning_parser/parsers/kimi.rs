@@ -54,6 +54,10 @@ impl ReasoningParser for KimiParser {
     fn model_type(&self) -> &str {
         self.base.model_type()
     }
+
+    fn is_in_reasoning(&self) -> bool {
+        self.base.is_in_reasoning()
+    }
 }
 
 #[cfg(test)]

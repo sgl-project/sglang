@@ -13,22 +13,18 @@ from sgl_kernel import (
 from sglang.srt.layers.moe.ep_moe.kernels import (
     post_reorder_triton_kernel_for_cutlass_moe,
     pre_reorder_triton_kernel_for_cutlass_moe,
-    run_cutlass_moe_ep_preproess,
+    run_moe_ep_preproess,
 )
 
 
 def cutlass_w4a8_moe(
-    start_expert_id: int,
-    end_expert_id: int,
-    total_num_experts: int,
     a: torch.Tensor,
     w1_q: torch.Tensor,
     w2_q: torch.Tensor,
     w1_scale: torch.Tensor,
     w2_scale: torch.Tensor,
     topk_weights: torch.Tensor,
-    topk_ids_: torch.Tensor,
-    local_topk_ids: torch.Tensor,
+    topk_ids: torch.Tensor,
     a_strides1: torch.Tensor,
     b_strides1: torch.Tensor,
     c_strides1: torch.Tensor,
@@ -64,6 +60,7 @@ def cutlass_w4a8_moe(
     - w2_scale (torch.Tensor): The fp32 scale to dequantize w2_q.
         Shape: [num_experts, N // 512, K * 4]
     - topk_weights (torch.Tensor): The weights of each token->expert mapping.
+    - topk_ids (torch.Tensor): The ids of each token->expert mapping.
     - a_strides1 (torch.Tensor): The input strides of the first grouped gemm.
     - b_strides1 (torch.Tensor): The weights strides of the first grouped gemm.
     - c_strides1 (torch.Tensor): The output strides of the first grouped gemm.
@@ -83,7 +80,7 @@ def cutlass_w4a8_moe(
     Returns:
     - torch.Tensor: The fp8 output tensor after applying the MoE layer.
     """
-    assert topk_weights.shape == topk_ids_.shape, "topk shape mismatch"
+    assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
     assert w1_q.dtype == torch.int8
     assert w2_q.dtype == torch.int8
     assert a.shape[1] // 2 == w1_q.shape[2], "Hidden size mismatch w1"
@@ -96,20 +93,21 @@ def cutlass_w4a8_moe(
     assert b_strides1.shape[0] == w1_q.shape[0], "B Strides 1 expert number mismatch"
     assert a_strides2.shape[0] == w2_q.shape[0], "A Strides 2 expert number mismatch"
     assert b_strides2.shape[0] == w2_q.shape[0], "B Strides 2 expert number mismatch"
-    num_experts = w1_q.size(0)
+    num_local_experts = w1_q.size(0)
     m = a.size(0)
     k = w1_q.size(2) * 2  # w1_q is transposed and packed
     n = w2_q.size(2) * 2  # w2_q is transposed and packed
-    topk = topk_ids_.size(1)
+    topk = topk_ids.size(1)
 
     if apply_router_weight_on_input:
         assert topk == 1, "apply_router_weight_on_input is only implemented for topk=1"
 
     device = a.device
+    topk_ids = torch.where(topk_ids == -1, num_local_experts, topk_ids)
 
-    _, src2dst, _ = run_cutlass_moe_ep_preproess(
-        local_topk_ids,
-        num_experts,
+    _, src2dst, _ = run_moe_ep_preproess(
+        topk_ids,
+        num_local_experts,
     )
 
     gateup_input = torch.empty(
@@ -122,9 +120,9 @@ def cutlass_w4a8_moe(
         a,
         gateup_input,
         src2dst,
-        local_topk_ids,
+        topk_ids,
         a1_scale,
-        total_num_experts,
+        num_local_experts,
         topk,
         k,
         BLOCK_SIZE=512,
@@ -133,16 +131,16 @@ def cutlass_w4a8_moe(
     # NOTE: a_map and c_map are not used in the get_cutlass_w4a8_moe_mm_data kernel,
     # they are kept to allow for a quick switch of the permutation logic
     # from the current triton kernel implementation to the cutlass-based one if needed.
-    a_map = torch.empty((local_topk_ids.numel()), dtype=torch.int32, device=device)
-    c_map = torch.empty((local_topk_ids.numel()), dtype=torch.int32, device=device)
+    a_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
+    c_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
     get_cutlass_w4a8_moe_mm_data(
-        local_topk_ids,
+        topk_ids,
         expert_offsets,
         problem_sizes1,
         problem_sizes2,
         a_map,
         c_map,
-        num_experts,
+        num_local_experts,
         n,
         k,
     )
@@ -195,12 +193,11 @@ def cutlass_w4a8_moe(
         c2,
         output,
         src2dst,
-        local_topk_ids,
+        topk_ids,
         topk_weights,
-        num_experts,
         topk,
+        num_local_experts,
         k,
-        0,
         BLOCK_SIZE=512,
     )
     return output

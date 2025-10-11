@@ -19,8 +19,12 @@ from torch.distributed.fsdp.api import (
 from transformers import AutoModelForCausalLM
 
 from sglang.srt.entrypoints.verl_engine import VerlEngine
+<<<<<<< HEAD
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+=======
+>>>>>>> upstream/main
 from sglang.srt.utils import is_port_available
+from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.runners import (
     HFRunner,
     SRTRunner,

@@ -1,14 +1,12 @@
 import time
 import unittest
 from types import SimpleNamespace
-from urllib.parse import urlparse
 
 from sglang.test.few_shot_gsm8k import run_eval
 from sglang.test.test_disaggregation_utils import TestDisaggregationBase
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    DEFAULT_URL_FOR_TEST,
     popen_launch_pd_server,
 )
 
@@ -16,17 +14,8 @@ from sglang.test.test_utils import (
 class TestDisaggregationPPAccuracy(TestDisaggregationBase):
     @classmethod
     def setUpClass(cls):
+        super().setUpClass()
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
-        parsed_url = urlparse(DEFAULT_URL_FOR_TEST)
-        cls.base_host = parsed_url.hostname
-        base_port = str(parsed_url.port)
-        cls.lb_port = base_port
-        cls.prefill_port = f"{int(base_port) + 100}"
-        cls.decode_port = f"{int(base_port) + 200}"
-        cls.prefill_url = f"http://{cls.base_host}:{cls.prefill_port}"
-        cls.decode_url = f"http://{cls.base_host}:{cls.decode_port}"
-        cls.lb_url = f"http://{cls.base_host}:{cls.lb_port}"
-        print(f"{cls.base_host=} {cls.lb_port=} {cls.prefill_port=} {cls.decode_port=}")
 
         # Non blocking start servers
         cls.start_prefill()
@@ -45,13 +34,12 @@ class TestDisaggregationPPAccuracy(TestDisaggregationBase):
             "--disaggregation-mode",
             "prefill",
             "--tp-size",
-            "1",
+            "2",
             "--pp-size",
             "2",
-            "--disaggregation-ib-device",
-            "mlx5_roce0,mlx5_roce1",
             "--disable-overlap-schedule",
         ]
+        prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
             cls.model,
             cls.prefill_url,
@@ -66,12 +54,11 @@ class TestDisaggregationPPAccuracy(TestDisaggregationBase):
             "--disaggregation-mode",
             "decode",
             "--tp",
-            "1",
-            "--base-gpu-id",
             "2",
-            "--disaggregation-ib-device",
-            "mlx5_roce2",
+            "--base-gpu-id",
+            "4",
         ]
+        decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
             cls.model,
             cls.decode_url,

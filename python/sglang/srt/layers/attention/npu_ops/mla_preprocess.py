@@ -76,12 +76,14 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         self.rotary_emb = rotary_emb
         self.layer_id = layer_id
         self.has_preprocess_weights = False
+        self.dtype = None
 
         self.q_lora_rank = self.q_b_proj.input_size  # 1536
         self.kv_lora_rank = self.kv_a_layernorm.hidden_size  # 512
         self.num_local_heads = num_local_heads  # tp
         self.qk_nope_head_dim = qk_nope_head_dim  # 128
         self.qk_rope_head_dim = qk_rope_head_dim  # 64
+        self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
 
     def preprocess_weights(self, hidden_states):
         self.dummy = torch.empty(
@@ -236,7 +238,83 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         slot_mapping = forward_batch.out_cache_loc.to(dtype=torch.int32)
         return k_cache, v_cache, slot_mapping
 
-    def forward(self, positions, hidden_states, forward_batch, zero_allocator):
+    def forward_absorb_prepare_npu_rms_norm_cache(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch,
+        zero_allocator,
+    ):
+        bsz, _ = hidden_states.view(-1, hidden_states.shape[-1]).shape
+        self.dtype = hidden_states.dtype
+        self.cos, self.sin = self.get_sin_cos(positions)
+        self.kvCache, self.kvCacheRope, self.slotmapping = (
+            self.get_kv_cache_and_cache_idx(forward_batch)
+        )
+
+        if not self.has_preprocess_weights:
+            self.has_preprocess_weights = True
+
+        cos, sin = self.cos, self.sin
+
+        if self.q_lora_rank is not None:
+            fused_qkv_a_proj_out = self.qkv_a_proj(hidden_states)[0]
+            q_lowrank, latent_cache = fused_qkv_a_proj_out.split(
+                [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
+            )
+            q = self.q_a_layernorm(q_lowrank)
+            q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+        else:
+            q = self.q_proj(hidden_states)[0].view(
+                -1, self.num_local_heads, self.qk_head_dim
+            )
+            latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
+
+        q_nope, q_pe = torch.split(
+            q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+        )  # b*s,n,d
+
+        q_nope = q_nope.view(-1, self.num_local_heads, self.qk_nope_head_dim)
+        q_nope = torch.matmul(q_nope.transpose(0, 1), self.w_kc).transpose(0, 1)
+
+        q_pe = q_pe.view(-1, self.num_local_heads, 1, self.qk_rope_head_dim)
+        cos = cos.view(-1, 1, 1, self.qk_rope_head_dim)
+        sin = sin.view(-1, 1, 1, self.qk_rope_head_dim)
+        q_pe = torch_npu.npu_interleave_rope(q_pe, cos, sin)  # (B,N,S,D)
+        q_pe = q_pe.view(cos.shape[0], self.num_local_heads, self.qk_rope_head_dim)
+
+        latent_cache = latent_cache.view(
+            -1, 1, 1, self.kv_lora_rank + self.qk_rope_head_dim
+        )  # (B*S,N,1,D)
+
+        cache_mode = "PA_BNSD"
+        self.kvCache = self.kvCache.view(
+            -1,
+            forward_batch.attn_backend.page_size,
+            1,
+            forward_batch.attn_backend.kv_lora_rank,
+        )
+        self.kvCacheRope = self.kvCacheRope.view(
+            -1,
+            forward_batch.attn_backend.page_size,
+            1,
+            forward_batch.attn_backend.qk_rope_head_dim,
+        )
+        k_rope, k_nope, _, _ = torch_npu.npu_kv_rmsnorm_rope_cache(
+            latent_cache,
+            self.kv_a_layernorm.weight,
+            cos,
+            sin,
+            self.slotmapping.to(torch.int64),
+            self.kvCacheRope,
+            self.kvCache,
+            epsilon=self.kv_a_layernorm.variance_epsilon,
+            cache_mode=cache_mode,
+        )
+
+        return (q_pe, k_rope, q_nope, k_nope, forward_batch, zero_allocator, positions)
+
+    def forward_mlapo(self, positions, hidden_states, forward_batch, zero_allocator):
         input_dtype = hidden_states.dtype
         if not self.has_preprocess_weights:
             self.preprocess_weights(hidden_states)
@@ -298,3 +376,18 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             zero_allocator,
             positions,
         )
+
+    def forward(self, positions, hidden_states, forward_batch, zero_allocator):
+        _is_w8a8 = (
+            hasattr(self.qkv_a_proj.quant_method, "quantization_config")
+            and self.qkv_a_proj.quant_method.quantization_config.get_name()
+            == "w8a8_int8"
+        )
+        if _is_w8a8:
+            return self.forward_mlapo(
+                positions, hidden_states, forward_batch, zero_allocator
+            )
+        else:
+            return self.forward_absorb_prepare_npu_rms_norm_cache(
+                positions, hidden_states, forward_batch, zero_allocator
+            )
