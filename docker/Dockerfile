@@ -31,7 +31,7 @@ RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
  && echo 'tzdata tzdata/Zones/America select Los_Angeles' | debconf-set-selections \
  && apt-get update && apt-get install -y --no-install-recommends \
     tzdata \
-    software-properties-common netcat-openbsd kmod unzip openssh-server \
+    netcat-openbsd kmod unzip openssh-server \
     curl wget lsof zsh ccache tmux htop git-lfs tree \
     build-essential cmake \
     libopenmpi-dev libnuma1 libnuma-dev \
@@ -164,11 +164,6 @@ RUN python3 -m pip install --no-cache-dir \
     datamodel_code_generator \
     mooncake-transfer-engine==0.3.6.post1 \
     pre-commit \
-    pytest \
-    black \
-    isort \
-    icdiff \
-    uv \
     wheel \
     scikit-build-core \
     nixl \
@@ -179,25 +174,15 @@ RUN apt-get update && apt-get install -y \
     gdb \
     ninja-build \
     vim \
-    tmux \
-    htop \
-    wget \
-    curl \
     locales \
-    lsof \
     git \
-    git-lfs \
-    zsh \
-    tree \
     silversearcher-ag \
     cloc \
-    unzip \
     pkg-config \
     libssl-dev \
     bear \
-    ccache \
     less \
-    && apt install -y rdma-core infiniband-diags openssh-server perftest ibverbs-providers libibumad3 libibverbs1 libnl-3-200 libnl-route-3-200 librdmacm1 \
+    && apt install -y rdma-core \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
@@ -220,7 +205,6 @@ RUN python3 -m pip install --no-cache-dir --break-system-packages \
     black \
     isort \
     icdiff \
-    scikit-build-core \
     uv \
     pre-commit \
     pandas \
