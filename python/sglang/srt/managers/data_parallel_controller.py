@@ -33,6 +33,7 @@ from sglang.srt.managers.io_struct import (
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     WatchLoadUpdateReq,
+    GetLoadReqOutput,
 )
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import run_scheduler_process
@@ -66,20 +67,32 @@ class LoadBalanceMethod(Enum):
 
 
 class DPBudget:
-    def __init__(self):
+    def __init__(self, dp_size: int):
         # TODO: support minimum tokens method
         self.budget_queue = deque()
+        self.dp_size = dp_size
+        self.loads = [GetLoadReqOutput(dp_rank=i, num_reqs=0, num_waiting_reqs=0, num_tokens=0) for i in range(dp_size)]
 
     def update_budget(self, load_update: WatchLoadUpdateReq):
         """Update the budget queue.
         Use num_reqs instead of num_waiting_reqs to balance decode running batch.
         """
+        # check if any load
         loads = load_update.loads
-        self.budget_queue.clear()
-
         num_reqs = [load.num_reqs for load in loads]
         if not num_reqs:
             return
+
+        # update self.loads
+        for new_load in loads:
+            load_idx = new_load.dp_rank
+            self.loads[load_idx].num_reqs = new_load.num_reqs
+            self.loads[load_idx].num_waiting_reqs = new_load.num_waiting_reqs
+            self.loads[load_idx].num_tokens = new_load.num_tokens
+
+        # ready to update budget_queue, load_idx equals to dp_rank
+        num_reqs = [load.num_reqs for load in self.loads]
+        self.budget_queue.clear()
 
         max_num_reqs = max(num_reqs)
         if all(x == max_num_reqs for x in num_reqs):
@@ -87,10 +100,10 @@ class DPBudget:
 
         while any(x != num_reqs[0] for x in num_reqs):
             min_load = min(num_reqs)
-            min_indices = [i for i, x in enumerate(num_reqs) if x == min_load]
+            min_indices = [dp_rank for dp_rank, x in enumerate(num_reqs) if x == min_load]
             second_min_load = min(x for x in num_reqs if x > min_load)
             self.budget_queue.extend(
-                [loads[i].dp_rank for i in min_indices] * (second_min_load - min_load)
+                [dp_rank for dp_rank in min_indices] * (second_min_load - min_load)
             )
             for idx in min_indices:
                 num_reqs[idx] = second_min_load
@@ -133,7 +146,7 @@ class DataParallelController:
         self.dispatching = dispatch_lookup[self.load_balance_method]
 
         # Load balance budget
-        self.dp_budget = DPBudget()
+        self.dp_budget = DPBudget(server_args.dp_size)
 
         # Launch data parallel workers
         self.scheduler_procs = []
