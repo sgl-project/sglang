@@ -31,9 +31,7 @@ pub fn aggregate_metrics(metric_packs: Vec<MetricPack>) -> anyhow::Result<String
         expositions.push(exposition);
     }
 
-    let text = expositions
-        .into_iter()
-        .reduce(merge_exposition)
+    let text = try_reduce(expositions.into_iter(), merge_exposition)?
         .map(|x| format!("{x}"))
         .unwrap_or_default();
     Ok(text)
@@ -76,4 +74,18 @@ fn merge_family(a: PrometheusFamily, b: PrometheusFamily) -> anyhow::Result<Prom
     let ans = a;
     let ans = ans.with_samples(b.into_iter_samples())?;
     Ok(ans)
+}
+
+pub fn try_reduce<I, T, E, F>(iterable: I, mut f: F) -> Result<Option<T>, E>
+where
+    I: IntoIterator<Item = T>,
+    F: FnMut(T, T) -> Result<T, E>,
+{
+    let mut it = iterable.into_iter();
+    let first = match it.next() {
+        None => return Ok(None),
+        Some(x) => x,
+    };
+
+    Ok(Some(it.try_fold(first, |acc, item| f(acc, item))?))
 }
