@@ -334,8 +334,8 @@ def group_rms_norm_sigmoid_gate_fn(
     return GroupRMSNormSigmoidGateFn.apply(x, o, weight, eps)
 
 
-class BailingMoEFusedGroupRMSNormSigmoidGate(CustomOp):
-    name = "BailingMoEFusedGroupRMSNormSigmoidGate"
+class FusedGroupRMSNormSigmoidGate(CustomOp):
+    name = "FusedGroupRMSNormSigmoidGate"
 
     def __init__(self, hidden_size, eps: float = 1e-6, group_norm_size: int = 1):
         super().__init__()
@@ -382,8 +382,8 @@ class BailingMoEFusedGroupRMSNormSigmoidGate(CustomOp):
         return out.view(out.size(0), -1)
 
 
-class BailingMoERMSNormTP(CustomOp):
-    name = "BailingMoERMSNormTP"
+class RMSNormTP(CustomOp):
+    name = "RMSNormTP"
 
     def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
         super().__init__()

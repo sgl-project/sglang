@@ -18,8 +18,8 @@ from sglang.srt.distributed import (
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.lightning_attn.fused_group_rmsnorm import (
-    BailingMoEFusedGroupRMSNormSigmoidGate,
-    BailingMoERMSNormTP,
+    FusedGroupRMSNormSigmoidGate,
+    RMSNormTP,
 )
 from sglang.srt.layers.attention.lightning_attn.rmsnorm import rms_norm_triton_fn
 from sglang.srt.layers.layernorm import RMSNorm
@@ -357,15 +357,13 @@ class BailingMoELinearAttention(nn.Module):
             assert (
                 self.group_norm_size % self.tp_size == 0
             ), "group_norm_size must be divisible by tp_size"
-            self.g_norm = BailingMoEFusedGroupRMSNormSigmoidGate(
+            self.g_norm = FusedGroupRMSNormSigmoidGate(
                 self.hidden_inner_size,
                 eps=self.rms_norm_eps,
                 group_norm_size=self.group_norm_size,
             )
         else:
-            self.g_norm = BailingMoERMSNormTP(
-                self.hidden_inner_size, eps=self.rms_norm_eps
-            )
+            self.g_norm = RMSNormTP(self.hidden_inner_size, eps=self.rms_norm_eps)
         # use fp32 rotary embedding
         if hasattr(config, "rotary_dim"):
             rotary_dim = config.rotary_dim
