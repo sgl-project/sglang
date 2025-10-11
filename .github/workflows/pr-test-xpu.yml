@@ -76,7 +76,7 @@ jobs:
   finish:
     if: always()
     needs: [build-and-test]
-    runs-on: ubuntu
+    runs-on: ubuntu-latest
     steps:
       - name: Check job status
         run: |
