@@ -1542,7 +1542,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_sum += bs
 
     def maybe_wait_verify_done(self):
-        if self.spec_info is not None:
+        if self.is_v2_eagle:
             from sglang.srt.speculative.eagle_info import EagleDraftInput
 
             draft_input: EagleDraftInput = self.spec_info
