@@ -840,6 +840,9 @@ class BatchTokenIDOutput(BaseBatchReq):
     placeholder_tokens_idx: List[Optional[List[int]]]
     placeholder_tokens_val: List[Optional[List[int]]]
 
+    # Load for DP balance
+    load: 'GetLoadReqOutput'
+
 
 @dataclass
 class BatchMultimodalDecodeReq(BaseBatchReq):
@@ -902,6 +905,9 @@ class BatchStrOutput(BaseBatchReq):
 
     placeholder_tokens_idx: List[Optional[List[int]]]
     placeholder_tokens_val: List[Optional[List[int]]]
+
+    # Load for DP balance
+    load: 'GetLoadReqOutput'
 
 
 @dataclass

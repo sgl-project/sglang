@@ -1311,6 +1311,8 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             BatchTokenIDOutput,
         ],
     ):
+        sent_load_update = False
+
         for i, rid in enumerate(recv_obj.rids):
             state = self.rid_to_state.get(rid, None)
             if state is None:
@@ -1368,6 +1370,13 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     "output_ids": output_token_ids,
                     "meta_info": meta_info,
                 }
+
+                # load update once for batch reqs on the same dp rank
+                if not sent_load_update:
+                    load_update_req = WatchLoadUpdateReq(loads=[recv_obj.load])
+                    self.send_to_scheduler.send_pyobj(load_update_req)
+                    sent_load_update = True
+
             elif isinstance(recv_obj, BatchTokenIDOutput):
                 if self.server_args.stream_output and state.obj.stream:
                     state.output_ids.extend(recv_obj.output_ids[i])
@@ -2013,8 +2022,8 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         while True:
             await asyncio.sleep(self.server_args.load_watch_interval)
             loads = await self.get_load_communicator(GetLoadReqInput())
-            load_udpate_req = WatchLoadUpdateReq(loads=loads)
-            self.send_to_scheduler.send_pyobj(load_udpate_req)
+            load_update_req = WatchLoadUpdateReq(loads=loads)
+            self.send_to_scheduler.send_pyobj(load_update_req)
 
     def _trace_request_start(
         self,

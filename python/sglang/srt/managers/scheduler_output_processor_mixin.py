@@ -847,6 +847,7 @@ class SchedulerOutputProcessorMixin:
                     rids=rids,
                     placeholder_tokens_idx=None,
                     placeholder_tokens_val=None,
+                    load=self.get_load(),
                 )
             )
 
