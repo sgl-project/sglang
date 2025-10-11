@@ -350,6 +350,91 @@ impl Router {
             .unwrap_or_else(|| (StatusCode::BAD_GATEWAY, "No worker response").into_response())
     }
 
+    // NOTE: temporarily have code duplication with `route_simple_request` since that one will be refactored
+    async fn fan_out_simple_request(
+        &self,
+        headers: Option<&HeaderMap>,
+        endpoint: &str,
+        method: Method,
+    ) -> Result<Vec<(String, Response)>, Response> {
+        let workers = self.worker_registry.get_all();
+        if workers.is_empty() {
+            return Err((StatusCode::SERVICE_UNAVAILABLE, "No available workers").into_response());
+        }
+
+        let mut responses = vec![];
+        for worker in workers {
+            let worker_url = worker.url();
+            let base = self.worker_base_url(worker_url);
+
+            let url = format!("{}/{}", base, endpoint);
+            let mut request_builder = match method {
+                Method::GET => self.client.get(url),
+                Method::POST => self.client.post(url),
+                _ => {
+                    return Err((
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "Unsupported method for simple routing",
+                    )
+                        .into_response())
+                }
+            };
+
+            if let Some(api_key) = worker.api_key() {
+                request_builder =
+                    request_builder.header("Authorization", format!("Bearer {}", api_key));
+            }
+
+            if let Some(hdrs) = headers {
+                for (name, value) in hdrs {
+                    let name_lc = name.as_str().to_lowercase();
+                    if name_lc != "content-type" && name_lc != "content-length" {
+                        request_builder = request_builder.header(name, value);
+                    }
+                }
+            }
+
+            match request_builder.send().await {
+                Ok(res) => {
+                    let status = StatusCode::from_u16(res.status().as_u16())
+                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                    let response_headers = header_utils::preserve_response_headers(res.headers());
+                    match res.bytes().await {
+                        Ok(body) => {
+                            let mut response = Response::new(Body::from(body));
+                            *response.status_mut() = status;
+                            *response.headers_mut() = response_headers;
+                            if status.is_success() {
+                                return response;
+                            }
+                            last_response = Some(response);
+                        }
+                        Err(e) => {
+                            last_response = Some(
+                                (
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    format!("Failed to read response: {}", e),
+                                )
+                                    .into_response(),
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    last_response = Some(
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("Request failed: {}", e),
+                        )
+                            .into_response(),
+                    );
+                }
+            }
+        }
+
+        responses
+    }
+
     // Route a GET request with provided headers to a specific endpoint
     async fn route_get_request(&self, headers: Option<&HeaderMap>, endpoint: &str) -> Response {
         self.route_simple_request(headers, endpoint, Method::GET)
