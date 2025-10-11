@@ -1,7 +1,4 @@
-use openmetrics_parser::{PrometheusType, PrometheusValue};
-use prometheus::Encoder;
 use std::collections::HashMap;
-use std::string::FromUtf8Error;
 
 pub struct MetricPack {
     pub labels: HashMap<String, String>,
