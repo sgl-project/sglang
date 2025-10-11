@@ -114,6 +114,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "nsa_prefill",
     "nsa_decode",
     "multi_item_scoring_delimiter",
+    "kv_cache_dtype",
 ]
 
 # Put some global args for easy access
