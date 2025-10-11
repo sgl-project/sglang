@@ -452,11 +452,11 @@ class Qwen3_VisionTransformer(nn.Module):
         position_embeddings = (emb.cos(), emb.sin())
 
         # compute cu_seqlens
-        cu_seqlens = torch.cat(
-            [
-                torch.tensor([0], device=grid_thw.device),
-                (grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2]).cumsum(dim=0),
-            ]
+        cu_seqlens = torch.repeat_interleave(
+            grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
+        ).cumsum(
+            dim=0,
+            dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
         )
         cu_seqlens = torch.cat([cu_seqlens.new_zeros(1), cu_seqlens])
 
