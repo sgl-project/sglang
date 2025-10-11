@@ -734,6 +734,11 @@ class Req:
 
         return self.surr_and_decode_ids, self.read_offset - self.surr_offset
 
+    def tail_str(self) -> str:
+        tail_len = self.sampling_params.stop_str_max_len + 1
+        tail_len = min(tail_len, len(self.output_ids))
+        return self.tokenizer.decode(self.output_ids[-tail_len:])
+
     def check_match_stop_str_prefix(self) -> bool:
         """
         Check if the suffix of tail_str overlaps with any stop_str prefix
@@ -741,9 +746,7 @@ class Req:
         if not self.sampling_params.stop_strs:
             return False
 
-        tail_str = self.tokenizer.decode(
-            self.output_ids[-(self.sampling_params.stop_str_max_len + 1) :]
-        )
+        tail_str = self.tail_str()
 
         # Early return if tail_str is empty
         if not tail_str:
@@ -816,9 +819,7 @@ class Req:
 
         # Check stop strings
         if len(self.sampling_params.stop_strs) > 0:
-            tail_str = self.tokenizer.decode(
-                self.output_ids[-(self.sampling_params.stop_str_max_len + 1) :]
-            )
+            tail_str = self.tail_str()
 
             for stop_str in self.sampling_params.stop_strs:
                 if stop_str in tail_str or stop_str in self.decoded_text:
