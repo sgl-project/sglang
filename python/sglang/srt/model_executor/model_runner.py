@@ -627,7 +627,7 @@ class ModelRunner:
         if self.model_config.hf_config.model_type == "qwen3_vl_moe":
             if (
                 quantization_config := getattr(
-                    self.model_config.hf_config, "quantization_config"
+                    self.model_config.hf_config, "quantization_config", None
                 )
             ) is not None:
                 text_config = self.model_config.hf_text_config
