@@ -9,7 +9,8 @@ fn test_aggregate_simple() {
 # TYPE http_requests_total counter
 http_requests_total{method="post",code="200"} 1027
 http_requests_total{method="post",code="400"} 3
-"#.to_string(),
+"#
+        .to_string(),
     };
     let pack2 = MetricPack {
         labels: vec![("source".to_string(), "worker2".to_string())],
@@ -17,7 +18,8 @@ http_requests_total{method="post",code="400"} 3
 # HELP http_requests_total The total number of HTTP requests.
 # TYPE http_requests_total counter
 http_requests_total{method="post",code="200"} 500
-"#.to_string(),
+"#
+        .to_string(),
     };
 
     let result = aggregate_metrics(vec![pack1, pack2]).unwrap();
@@ -39,14 +41,16 @@ fn test_aggregate_multiple_metrics() {
 metric_a{dim="x"} 1.0
 # TYPE metric_b_total counter
 metric_b_total 10
-"#.to_string(),
+"#
+        .to_string(),
     };
     let pack2 = MetricPack {
         labels: vec![("source".to_string(), "w2".to_string())],
         metrics_text: r#"
 # TYPE metric_a gauge
 metric_a{dim="y"} 2.0
-"#.to_string(),
+"#
+        .to_string(),
     };
 
     let result = aggregate_metrics(vec![pack1, pack2]).unwrap();

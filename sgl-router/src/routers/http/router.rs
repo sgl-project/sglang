@@ -405,7 +405,9 @@ impl Router {
                                 responses.push((worker_base_url, body_text));
                             }
                         }
-                        Err(e) => tracing::warn!("fan_out_simple_request failed when reading text: {}", e),
+                        Err(e) => {
+                            tracing::warn!("fan_out_simple_request failed when reading text: {}", e)
+                        }
                     }
                 }
                 Err(e) => tracing::warn!("fan_out_simple_request failed when sending: {}", e),
