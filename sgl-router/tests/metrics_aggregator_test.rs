@@ -74,16 +74,16 @@ fn test_empty_input() {
 #[test]
 fn test_invalid_metrics_are_skipped() {
     let pack1 = MetricPack {
-        labels: vec![],
+        labels: vec![("source".to_string(), "worker1".to_string())],
         metrics_text: "invalid metrics text".to_string(),
     };
     let pack2 = MetricPack {
-        labels: vec![("source".to_string(), "worker1".to_string())],
+        labels: vec![("source".to_string(), "worker2".to_string())],
         metrics_text: "# TYPE valid_metric gauge\nvalid_metric 123\n".to_string(),
     };
     let result = aggregate_metrics(vec![pack1, pack2]).unwrap();
     let expected = r#"# TYPE valid_metric gauge
-valid_metric{source="worker1"} 123
+valid_metric{source="worker2"} 123
 "#;
     assert_eq!(result.trim(), expected.trim());
 }

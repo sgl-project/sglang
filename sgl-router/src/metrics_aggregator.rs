@@ -55,11 +55,12 @@ fn merge_exposition(
 ) -> anyhow::Result<PrometheusExposition> {
     let mut ans = a;
     for (name, family_b) in b.families.into_iter() {
-        ans[name] = if let Some(family_a) = ans.families.remove(&name) {
+        let family_merged = if let Some(family_a) = ans.families.remove(&name) {
             merge_family(family_a, family_b)?
         } else {
             family_b
         };
+        ans.families.insert(name, family_merged);
     }
     Ok(ans)
 }
@@ -67,7 +68,7 @@ fn merge_exposition(
 fn merge_family(a: PrometheusFamily, b: PrometheusFamily) -> anyhow::Result<PrometheusFamily> {
     ensure!(
         a.get_label_names() == b.get_label_names(),
-        "Label names should agree a={} b={}",
+        "Label names should agree a={:?} b={:?}",
         a.get_label_names(),
         b.get_label_names()
     );
