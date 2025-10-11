@@ -1,6 +1,5 @@
 use anyhow::ensure;
 use openmetrics_parser::{MetricFamily, MetricsExposition, PrometheusType, PrometheusValue};
-use std::collections::hash_map::Entry;
 use tracing::warn;
 
 #[derive(Debug)]

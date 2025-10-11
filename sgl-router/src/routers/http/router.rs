@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use crate::config::types::RetryConfig;
 use crate::core::{
     is_retryable_status, ConnectionMode, RetryExecutor, Worker, WorkerRegistry, WorkerType,
