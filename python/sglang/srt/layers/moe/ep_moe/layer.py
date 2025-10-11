@@ -223,7 +223,6 @@ class DeepEPMoE(FusedMoE):
                 return self.forward_flashinfer_cutedsl(
                     dispatch_output, down_gemm_overlap_args=down_gemm_overlap_args
                 )
-                return self.forward_flashinfer_cutedsl(dispatch_output)
             if self.use_w4afp8:
                 return self.forward_w4afp8_masked(dispatch_output)
             assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8
