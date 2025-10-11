@@ -174,6 +174,31 @@ class Qwen3Detector(BaseReasoningFormatDetector):
         )
 
 
+class MiniMaxM1Detector(BaseReasoningFormatDetector):
+    """
+    Detector for MiniMax-M1 models (e.g., MiniMax-AI/MiniMax-M1).
+    Assumes reasoning format:
+      (<think>)*(.*)</think>
+
+    MiniMax-M1 models supports switching between thinking mode and normal
+    mode using `enable_thinking` parameter in the request parameter.
+      - enable_thinking=True: "<think>reasoning content</think>The answer is 42."
+      - enable_thinking=False: "The answer is 42." (no thinking tokens)
+
+    Args:
+        stream_reasoning (bool): If False, accumulates reasoning content until the end tag.
+            If True, streams reasoning content as it arrives.
+    """
+
+    def __init__(self, stream_reasoning: bool = True, force_reasoning: bool = False):
+        super().__init__(
+            "<think>",
+            "</think>",
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+        )
+
+
 class KimiDetector(BaseReasoningFormatDetector):
     """
     Detector for Kimi Thinking model.
@@ -267,6 +292,7 @@ class ReasoningParser:
         "glm45": Qwen3Detector,
         "gpt-oss": GptOssDetector,
         "kimi": KimiDetector,
+        "minimax-m1": MiniMaxM1Detector,
         "qwen3": Qwen3Detector,
         "qwen3-thinking": Qwen3Detector,
         "step3": DeepSeekR1Detector,
