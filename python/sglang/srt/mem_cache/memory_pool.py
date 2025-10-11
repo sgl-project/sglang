@@ -205,6 +205,7 @@ class MambaPool:
         self.size = size
         self.free_slots = list(range(size))
         self.mem_usage = self.mamba_cache.mem_usage_bytes() / GB
+        self.num_mamba_layers = num_mamba_layers
 
     def get_speculative_mamba2_params_all_layers(self) -> SpeculativeState:
         assert isinstance(self.mamba_cache, self.SpeculativeState)
@@ -237,6 +238,22 @@ class MambaPool:
     def clear(self):
         self.free_slots = list(range(self.size))
 
+    def get_contiguous_buf_infos(self):
+        state_tensors = [
+            getattr(self.mamba_cache, field) for field in vars(self.mamba_cache)
+        ]
+        data_ptrs, data_lens, item_lens = [], [], []
+
+        for _, state_tensor in enumerate(state_tensors):
+            data_ptrs += [
+                state_tensor[i].data_ptr() for i in range(self.num_mamba_layers)
+            ]
+            data_lens += [state_tensor[i].nbytes for i in range(self.num_mamba_layers)]
+            item_lens += [
+                state_tensor[i][0].nbytes for i in range(self.num_mamba_layers)
+            ]
+        return data_ptrs, data_lens, item_lens
+
 
 class HybridReqToTokenPool(ReqToTokenPool):
     """A memory pool that maps a request to its token locations."""
@@ -257,7 +274,15 @@ class HybridReqToTokenPool(ReqToTokenPool):
             device=device,
             enable_memory_saver=enable_memory_saver,
         )
+        self._init_mamba_pool(size, cache_params, device, speculative_num_draft_tokens)
 
+    def _init_mamba_pool(
+        self,
+        size: int,
+        cache_params: "Mamba2CacheParams",
+        device: str,
+        speculative_num_draft_tokens: int = None,
+    ):
         self.mamba_pool = MambaPool(
             size=size,
             cache_params=cache_params,
@@ -747,12 +772,18 @@ class HybridLinearKVPool(KVCache):
         full_attention_layer_ids: List[int],
         enable_kvcache_transpose: bool,
         device: str,
+        mamba_pool: MambaPool,
     ):
         self.size = size
         self.dtype = dtype
         self.device = device
         self.full_layer_nums = len(full_attention_layer_ids)
         self.page_size = page_size
+        # TODO support pp?
+        self.start_layer = 0
+        self.head_num = head_num
+        self.head_dim = head_dim
+        self.mamba_pool = mamba_pool
         # TODO MHATransposedTokenToKVPool if enable_kvcache_transpose is True
         assert not enable_kvcache_transpose
         if _is_npu:
@@ -780,6 +811,15 @@ class HybridLinearKVPool(KVCache):
 
     def get_contiguous_buf_infos(self):
         return self.full_kv_pool.get_contiguous_buf_infos()
+
+    def get_state_buf_infos(self):
+        mamba_data_ptrs, mamba_data_lens, mamba_item_lens = (
+            self.mamba_pool.get_contiguous_buf_infos()
+        )
+        return mamba_data_ptrs, mamba_data_lens, mamba_item_lens
+
+    def maybe_get_custom_mem_pool(self):
+        return self.full_kv_pool.maybe_get_custom_mem_pool()
 
     def _transfer_full_attention_id(self, layer_id: int):
         if layer_id not in self.full_attention_layer_id_mapping:
@@ -869,6 +909,9 @@ class SWAKVPool(KVCache):
 
         k_size, v_size = self.get_kv_size_bytes()
         self.mem_usage = (k_size + v_size) / GB
+        logger.info(
+            f"SWAKVPool mem usage: {self.mem_usage} GB, swa size: {self.size_swa}, full size: {self.size}"
+        )
 
     def get_kv_size_bytes(self):
         k_size, v_size = self.full_kv_pool.get_kv_size_bytes()
@@ -879,15 +922,19 @@ class SWAKVPool(KVCache):
         full_kv_data_ptrs, full_kv_data_lens, full_kv_item_lens = (
             self.full_kv_pool.get_contiguous_buf_infos()
         )
+
+        kv_data_ptrs = full_kv_data_ptrs
+        kv_data_lens = full_kv_data_lens
+        kv_item_lens = full_kv_item_lens
+
+        return kv_data_ptrs, kv_data_lens, kv_item_lens
+
+    def get_state_buf_infos(self):
         swa_kv_data_ptrs, swa_kv_data_lens, swa_kv_item_lens = (
             self.swa_kv_pool.get_contiguous_buf_infos()
         )
 
-        kv_data_ptrs = full_kv_data_ptrs + swa_kv_data_ptrs
-        kv_data_lens = full_kv_data_lens + swa_kv_data_lens
-        kv_item_lens = full_kv_item_lens + swa_kv_item_lens
-
-        return kv_data_ptrs, kv_data_lens, kv_item_lens
+        return swa_kv_data_ptrs, swa_kv_data_lens, swa_kv_item_lens
 
     def get_key_buffer(self, layer_id: int):
         layer_id_pool, is_swa = self.layers_mapping[layer_id]
@@ -1396,6 +1443,18 @@ class NSATokenToKVPool(MLATokenToKVPool):
         index_buf_accessor.SetKAndS.execute(
             pool=self, buf=buf, loc=loc, index_k=index_k, index_k_scale=index_k_scale
         )
+
+    def get_state_buf_infos(self):
+        data_ptrs = [
+            self.index_k_with_scale_buffer[i].data_ptr() for i in range(self.layer_num)
+        ]
+        data_lens = [
+            self.index_k_with_scale_buffer[i].nbytes for i in range(self.layer_num)
+        ]
+        item_lens = [
+            self.index_k_with_scale_buffer[i][0].nbytes for i in range(self.layer_num)
+        ]
+        return data_ptrs, data_lens, item_lens
 
     def get_kv_size_bytes(self):
         kv_size_bytes = super().get_kv_size_bytes()
