@@ -25,7 +25,6 @@ import signal
 import sys
 import threading
 import time
-import uuid
 from collections import deque
 from contextlib import nullcontext
 from datetime import datetime
@@ -359,7 +358,8 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 (
                     FreezeGCReq,
                     lambda x: None,
-                ),  # For handling case when scheduler skips detokenizer and forwards back to the tokenizer manager, we ignore it.
+                ),
+                # For handling case when scheduler skips detokenizer and forwards back to the tokenizer manager, we ignore it.
                 (HealthCheckOutput, lambda x: None),
             ]
         )
@@ -586,9 +586,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             )
 
         if self.mm_processor and obj.contains_mm_input():
-            if not isinstance(obj.image_data, list):
+            if not isinstance(obj.image_data, list) and obj.image_data:
                 obj.image_data = [obj.image_data]
-            if not isinstance(obj.audio_data, list):
+            if not isinstance(obj.audio_data, list) and obj.audio_data:
                 obj.audio_data = [obj.audio_data]
             mm_inputs: Dict = await self.mm_processor.process_mm_data_async(
                 image_data=obj.image_data,
@@ -894,8 +894,8 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     if finish_reason.get("type") == "abort" and finish_reason.get(
                         "status_code"
                     ) in (
-                        HTTPStatus.SERVICE_UNAVAILABLE,
-                        HTTPStatus.INTERNAL_SERVER_ERROR,
+                            HTTPStatus.SERVICE_UNAVAILABLE,
+                            HTTPStatus.INTERNAL_SERVER_ERROR,
                     ):
                         # This is an abort request initiated by scheduler.
                         # Delete the key to prevent resending abort request to the scheduler and
@@ -1357,7 +1357,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 state.text += recv_obj.output_strs[i]
                 if state.obj.stream:
                     state.output_ids.extend(recv_obj.output_ids[i])
-                    output_token_ids = state.output_ids[state.last_output_offset :]
+                    output_token_ids = state.output_ids[state.last_output_offset:]
                     state.last_output_offset = len(state.output_ids)
                 else:
                     state.output_ids.extend(recv_obj.output_ids[i])
@@ -1371,7 +1371,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             elif isinstance(recv_obj, BatchTokenIDOutput):
                 if self.server_args.stream_output and state.obj.stream:
                     state.output_ids.extend(recv_obj.output_ids[i])
-                    output_token_ids = state.output_ids[state.last_output_offset :]
+                    output_token_ids = state.output_ids[state.last_output_offset:]
                     state.last_output_offset = len(state.output_ids)
                 else:
                     state.output_ids.extend(recv_obj.output_ids[i])
@@ -2088,7 +2088,6 @@ class SignalHandler:
         )
         self.tokenizer_manager.dump_requests_before_crash()
         kill_process_tree(os.getpid())
-
 
 # Note: request abort handling logic
 # We should handle all of the following cases correctly.
