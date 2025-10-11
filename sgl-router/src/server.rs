@@ -253,7 +253,7 @@ async fn health_generate(State(state): State<Arc<AppState>>, req: Request) -> Re
     state.router.health_generate(req).await
 }
 
-async fn engine_metrics(State(state): State<Arc<AppState>>, req: Request) -> Response {
+async fn engine_metrics(State(_state): State<Arc<AppState>>, _req: Request) -> Response {
     (StatusCode::OK, "hello").into_response()
 }
 
