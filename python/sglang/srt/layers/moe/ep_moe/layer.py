@@ -1,14 +1,10 @@
 from __future__ import annotations
 
 import logging
-from contextlib import nullcontext
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import torch
-import triton
-import triton.language as tl
 
-from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
 from sglang.srt.layers.moe import (
     get_deepep_mode,
     get_moe_a2a_backend,
@@ -18,13 +14,10 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe.ep_moe.kernels import (
     ep_gather,
     ep_scatter,
-    moe_ep_deepgemm_preprocess,
-    post_reorder_triton_kernel,
     silu_and_mul_masked_post_quant_fwd,
     tma_align_input_scale,
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import FlashInferFusedMoE, FusedMoE
-from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
@@ -36,19 +29,10 @@ from sglang.srt.layers.quantization.modelopt_quant import (
     CUTEDSL_MOE_NVFP4_DISPATCH,
     ModelOptNvFp4FusedMoEMethod,
 )
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.offloader import get_offloader
 from sglang.srt.single_batch_overlap import DownGemmOverlapArgs
-from sglang.srt.utils import (
-    ceil_div,
-    dispose_tensor,
-    get_bool_env_var,
-    get_int_env_var,
-    is_cuda,
-    is_hip,
-    is_npu,
-)
+from sglang.srt.utils import ceil_div, dispose_tensor, get_bool_env_var, is_hip, is_npu
+from sglang.srt.utils.offloader import get_offloader
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -72,275 +56,7 @@ if _use_aiter:
 logger = logging.getLogger(__name__)
 
 
-# TODO(kaixih@nvidia): ideally we should merge this logic into
-# `fill_gateup_input_triton_kernel` to directly generate e8m0 scale.
-@torch.compile
-def _cast_to_e8m0_with_rounding_up(x: torch.Tensor) -> torch.Tensor:
-    temp = x.to(torch.float32).view(torch.int32)
-    exp = torch.bitwise_right_shift(temp, 23)
-    mant = torch.bitwise_and(temp, 0x7FFFFF)
-    is_ru = torch.logical_and(
-        torch.logical_and((mant > 0), (exp != 0xFE)),
-        ~torch.logical_and((exp == 0), (mant <= 0x400000)),
-    )
-    exp = torch.where(is_ru, exp + 1, exp)
-    new_x = exp.to(torch.uint8).view(torch.int)
-    return new_x.transpose(1, 2).contiguous().transpose(1, 2)
-
-
-class EPMoE(FusedMoE):
-    """
-    MoE Expert Parallel Impl
-
-
-    """
-
-    def __init__(
-        self,
-        num_experts: int,
-        top_k: int,
-        hidden_size: int,
-        intermediate_size: int,
-        layer_id: int,
-        num_fused_shared_experts: int = 0,
-        params_dtype: Optional[torch.dtype] = None,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-        activation: str = "silu",
-        routed_scaling_factor: Optional[float] = None,
-        gemm1_alpha: Optional[float] = None,
-        gemm1_clamp_limit: Optional[float] = None,
-        with_bias: bool = False,
-    ):
-        super().__init__(
-            num_experts=num_experts,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            num_fused_shared_experts=num_fused_shared_experts,
-            layer_id=layer_id,
-            top_k=top_k,
-            params_dtype=params_dtype,
-            quant_config=quant_config,
-            prefix=prefix,
-            activation=activation,
-            # apply_router_weight_on_input=apply_router_weight_on_input,
-            routed_scaling_factor=routed_scaling_factor,
-            gemm1_alpha=gemm1_alpha,
-            gemm1_clamp_limit=gemm1_clamp_limit,
-            with_bias=with_bias,
-        )
-
-        self.intermediate_size = intermediate_size
-
-        if isinstance(quant_config, Fp8Config):
-            self.use_block_quant = getattr(self.quant_method, "block_quant", False)
-            self.block_shape = (
-                self.quant_method.quant_config.weight_block_size
-                if self.use_block_quant
-                else None
-            )
-            self.use_fp8_w8a8 = True
-            self.fp8_dtype = torch.float8_e4m3fn
-            self.activation_scheme = quant_config.activation_scheme
-        else:
-            self.use_fp8_w8a8 = False
-            self.use_block_quant = False
-            self.block_shape = None
-            self.activation_scheme = None
-
-    def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
-        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8:
-            return self.forward_deepgemm(hidden_states, topk_output)
-        else:
-            return super().forward(hidden_states, topk_output)
-
-    def forward_deepgemm(
-        self,
-        hidden_states: torch.Tensor,
-        topk_output: TopKOutput,
-    ):
-
-        self.w13_weight_fp8 = (
-            self.w13_weight,
-            (
-                self.w13_weight_scale_inv
-                if self.use_block_quant
-                else self.w13_weight_scale
-            ),
-        )
-        self.w2_weight_fp8 = (
-            self.w2_weight,
-            self.w2_weight_scale_inv if self.use_block_quant else self.w2_weight_scale,
-        )
-
-        assert self.quant_method is not None
-        assert self.moe_runner_config.activation == "silu"
-
-        hidden_states_shape = hidden_states.shape
-        hidden_states_dtype = hidden_states.dtype
-        hidden_states_device = hidden_states.device
-
-        topk_weights, topk_ids, _ = topk_output
-
-        if not self.use_block_quant:
-            # Convert per-tensor quant to per-block quant by repeating scales for forward_deepgemm
-            scale_block_size = 128
-            w13_weight_scale_n = 2 * (
-                (self.intermediate_size + scale_block_size - 1) // scale_block_size
-            )
-            w13_weight_scale_k = (
-                hidden_states_shape[-1] + scale_block_size - 1
-            ) // scale_block_size
-            w13_weight_scale = (
-                self.w13_weight_scale.unsqueeze(1)
-                .repeat_interleave(w13_weight_scale_n, dim=1)
-                .unsqueeze(2)
-                .repeat_interleave(w13_weight_scale_k, dim=2)
-            )
-            self.w13_weight_fp8 = (
-                self.w13_weight,
-                w13_weight_scale,
-            )
-            w2_weight_scale_n = (
-                hidden_states_shape[-1] + scale_block_size - 1
-            ) // scale_block_size
-            w2_weight_scale_k = (
-                self.intermediate_size + scale_block_size - 1
-            ) // scale_block_size
-            w2_weight_scale = (
-                self.w2_weight_scale.unsqueeze(1)
-                .repeat_interleave(w2_weight_scale_n, dim=1)
-                .unsqueeze(2)
-                .repeat_interleave(w2_weight_scale_k, dim=2)
-            )
-            self.w2_weight_fp8 = (
-                self.w2_weight,
-                w2_weight_scale,
-            )
-
-        # PreReorder
-        m_max, masked_m, expected_m, src2dst, gateup_input, gateup_input_scale = (
-            moe_ep_deepgemm_preprocess(
-                topk_ids,
-                self.num_experts,
-                hidden_states,
-                self.top_k,
-                self.start_expert_id,
-                self.end_expert_id,
-                self.block_shape,
-            )
-        )
-
-        dispose_tensor(hidden_states)
-
-        if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
-            b, s_mn, s_k = gateup_input_scale.shape
-            assert (
-                s_mn % 4 == 0 and s_k % 4 == 0
-            ), f"scales must be aligned to 4, but got ({b}, {s_mn}, {s_k})"
-
-        # GroupGemm-0
-        gateup_input_fp8 = (
-            gateup_input,
-            (
-                _cast_to_e8m0_with_rounding_up(gateup_input_scale)
-                if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
-                else deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(
-                    gateup_input_scale
-                )
-            ),
-        )
-        num_groups, m, k = gateup_input_fp8[0].size()
-        n = self.w13_weight.size(1)
-        gateup_output = torch.empty(
-            (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
-        )
-        deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
-            gateup_input_fp8,
-            self.w13_weight_fp8,
-            gateup_output,
-            masked_m,
-            expected_m,
-        )
-        del gateup_input
-        del gateup_input_fp8
-
-        # Act
-        down_input = torch.empty(
-            (
-                gateup_output.shape[0],
-                gateup_output.shape[1],
-                gateup_output.shape[2] // 2,
-            ),
-            device=hidden_states_device,
-            dtype=self.fp8_dtype,
-        )
-        scale_block_size = 128
-        down_input_scale = torch.empty(
-            (
-                gateup_output.shape[0],
-                gateup_output.shape[1],
-                gateup_output.shape[2] // 2 // scale_block_size,
-            ),
-            device=hidden_states_device,
-            dtype=torch.float32,
-        )
-        silu_and_mul_masked_post_quant_fwd(
-            gateup_output,
-            down_input,
-            down_input_scale,
-            scale_block_size,
-            masked_m,
-            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-        )
-        del gateup_output
-
-        # GroupGemm-1
-        n = self.w2_weight.size(1)
-        down_input_fp8 = (
-            down_input,
-            (
-                down_input_scale
-                if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
-                else deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(down_input_scale)
-            ),
-        )
-        down_output = torch.empty(
-            (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
-        )
-        deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
-            down_input_fp8,
-            self.w2_weight_fp8,
-            down_output,
-            masked_m,
-            expected_m,
-        )
-        del down_input
-        del down_input_fp8
-
-        # PostReorder
-        output = torch.empty(
-            hidden_states_shape, dtype=hidden_states_dtype, device=hidden_states_device
-        )
-        post_reorder_triton_kernel[(hidden_states_shape[0],)](
-            down_output,
-            output,
-            src2dst,
-            topk_ids,
-            topk_weights,
-            self.start_expert_id,
-            self.end_expert_id,
-            self.top_k,
-            hidden_states_shape[1],
-            m_max * self.start_expert_id,
-            BLOCK_SIZE=512,
-        )
-        if self.moe_runner_config.routed_scaling_factor is not None:
-            output *= self.moe_runner_config.routed_scaling_factor
-        return output
-
-
-class DeepEPMoE(EPMoE):
+class DeepEPMoE(FusedMoE):
     """
     MoE Expert Parallel Impl based on DeepEP (https://github.com/deepseek-ai/DeepEP/tree/main)
     """
@@ -374,6 +90,15 @@ class DeepEPMoE(EPMoE):
             activation=activation,
             routed_scaling_factor=routed_scaling_factor,
         )
+
+        if isinstance(quant_config, Fp8Config):
+            self.use_block_quant = getattr(self.quant_method, "block_quant", False)
+            self.use_fp8_w8a8 = True
+            self.fp8_dtype = torch.float8_e4m3fn
+        else:
+            self.use_fp8_w8a8 = False
+            self.use_block_quant = False
+
         self.deepep_mode = get_deepep_mode()
 
         # TODO: move to the beginning of the file
@@ -567,7 +292,6 @@ class DeepEPMoE(EPMoE):
         N = self.w13_weight.size(1)
         scale_block_size = 128
 
-        # TODO also unify other branches (e.g. `EPMoE.forward_deepgemm` sets the field on forward pass)
         w13_weight_fp8 = (
             self.w13_weight,
             (
@@ -988,8 +712,6 @@ def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
         return FlashInferFusedMoE
     if get_moe_runner_backend().is_flashinfer_cutlass():
         return FusedMoE
-    if get_moe_expert_parallel_world_size() > 1:
-        return EPMoE
     return FusedMoE
 
 

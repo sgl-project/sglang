@@ -3,7 +3,8 @@
 use super::grpc::pd_router::GrpcPDRouter;
 use super::grpc::router::GrpcRouter;
 use super::{
-    http::{openai_router::OpenAIRouter, pd_router::PDRouter, router::Router},
+    http::{pd_router::PDRouter, router::Router},
+    openai::OpenAIRouter,
     RouterTrait,
 };
 use crate::config::{ConnectionMode, PolicyConfig, RoutingMode};
@@ -128,6 +129,8 @@ impl RouterFactory {
             base_url,
             Some(ctx.router_config.circuit_breaker.clone()),
             ctx.response_storage.clone(),
+            ctx.conversation_storage.clone(),
+            ctx.conversation_item_storage.clone(),
         )
         .await?;
 

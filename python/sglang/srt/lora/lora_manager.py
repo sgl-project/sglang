@@ -169,6 +169,15 @@ class LoRAManager:
         Validate if an adapter can be loaded into the current LoRA memory pool and generate error if it is incompatible.
         """
 
+        # Check if this LoRA adapter is already loaded
+        if any(
+            lora_ref.lora_name == existing_lora_ref.lora_name
+            for existing_lora_ref in self.lora_refs.values()
+        ):
+            raise ValueError(
+                f"Failed to load LoRA adapter {lora_ref.lora_name} because it is already loaded"
+            )
+
         # Check if the LoRA adapter shape is compatible with the current LoRA memory pool configuration.
         memory_pool = getattr(self, "memory_pool", None)
         incompatible = memory_pool and not memory_pool.can_support(lora_config)

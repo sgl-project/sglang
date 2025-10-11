@@ -75,10 +75,6 @@ class ForwardMode(IntEnum):
     # Used in speculative decoding: extend a batch in the draft model.
     DRAFT_EXTEND = auto()
 
-    # A dummy first batch to start the pipeline for overlap scheduler.
-    # It is now used for triggering the sampling_info_done event for the first prefill batch.
-    DUMMY_FIRST = auto()
-
     # Split Prefill for PD multiplexing
     SPLIT_PREFILL = auto()
 
@@ -127,9 +123,6 @@ class ForwardMode(IntEnum):
 
     def is_cpu_graph(self):
         return self == ForwardMode.DECODE
-
-    def is_dummy_first(self):
-        return self == ForwardMode.DUMMY_FIRST
 
     def is_split_prefill(self):
         return self == ForwardMode.SPLIT_PREFILL
@@ -285,6 +278,9 @@ class ForwardBatch:
     can_run_dp_cuda_graph: bool = False
     global_forward_mode: Optional[ForwardMode] = None
 
+    # Whether this batch is prefill-only (no token generation needed)
+    is_prefill_only: bool = False
+
     # Speculative decoding
     spec_info: Optional[SpecInput] = None
     spec_algorithm: SpeculativeAlgorithm = None
@@ -332,6 +328,7 @@ class ForwardBatch:
             is_extend_in_batch=batch.is_extend_in_batch,
             can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
             global_forward_mode=batch.global_forward_mode,
+            is_prefill_only=batch.is_prefill_only,
             lora_ids=batch.lora_ids,
             sampling_info=batch.sampling_info,
             req_to_token_pool=model_runner.req_to_token_pool,
@@ -900,17 +897,6 @@ class ForwardBatch:
     @property
     def can_run_tbo(self):
         return self.tbo_split_seq_index is not None
-
-
-@dataclass
-class ForwardBatchOutput:
-    # FIXME(lsyin): unify the forward batch output between different spec and parallelism
-    # need to be more organized
-    logits_output: Optional[torch.Tensor] = None
-    next_token_ids: Optional[torch.Tensor] = None
-    num_accepted_tokens: Optional[int] = None
-    pp_proxy_tensors: Optional[PPProxyTensors] = None
-    can_run_cuda_graph: bool = False
 
 
 def enable_num_token_non_padded(server_args):

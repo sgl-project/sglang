@@ -192,8 +192,8 @@ struct CliArgs {
     #[arg(long, default_value_t = 1800)]
     request_timeout_secs: u64,
 
-    #[arg(long, default_value_t = 256)]
-    max_concurrent_requests: usize,
+    #[arg(long, default_value_t = -1)]
+    max_concurrent_requests: i32,
 
     #[arg(long, num_args = 0..)]
     cors_allowed_origins: Vec<String>,
@@ -281,6 +281,12 @@ struct CliArgs {
 
     #[arg(long, env = "ATP_POOL_TIMEOUT_SECS")]
     oracle_pool_timeout_secs: Option<u64>,
+
+    #[arg(long)]
+    reasoning_parser: Option<String>,
+
+    #[arg(long)]
+    tool_call_parser: Option<String>,
 }
 
 enum OracleConnectSource {
@@ -557,6 +563,8 @@ impl CliArgs {
             tokenizer_path: self.tokenizer_path.clone(),
             history_backend,
             oracle,
+            reasoning_parser: self.reasoning_parser.clone(),
+            tool_call_parser: self.tool_call_parser.clone(),
         })
     }
 

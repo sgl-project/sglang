@@ -14,16 +14,17 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import get_token_ids_logprobs, get_top_logprobs
-from sglang.srt.managers.schedule_batch import (
-    ScheduleBatch,
-    get_last_loc,
-    global_server_args_dict,
-)
+from sglang.srt.managers.schedule_batch import ScheduleBatch, global_server_args_dict
+from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.mem_cache.common import (
+    alloc_paged_token_slots_extend,
+    alloc_token_slots,
+    get_last_loc,
+)
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
-    ForwardBatchOutput,
     ForwardMode,
 )
 from sglang.srt.server_args import ServerArgs
@@ -429,7 +430,7 @@ class EAGLEWorker(TpModelWorker):
     def draft_model_runner(self):
         return self.model_runner
 
-    def forward_batch_generation(self, batch: ScheduleBatch) -> ForwardBatchOutput:
+    def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:
         """Run speculative decoding forward.
 
         NOTE: Many states of batch is modified as you go through. It is not guaranteed that
@@ -449,7 +450,7 @@ class EAGLEWorker(TpModelWorker):
                 self.forward_draft_extend(
                     batch, logits_output.hidden_states, next_token_ids, seq_lens_cpu
                 )
-            return ForwardBatchOutput(
+            return GenerationBatchResult(
                 logits_output=logits_output,
                 next_token_ids=next_token_ids,
                 num_accepted_tokens=0,
@@ -472,7 +473,7 @@ class EAGLEWorker(TpModelWorker):
                     # decode is not finished
                     self.forward_draft_extend_after_decode(batch)
 
-            return ForwardBatchOutput(
+            return GenerationBatchResult(
                 logits_output=logits_output,
                 next_token_ids=verify_output.verified_id,
                 num_accepted_tokens=sum(verify_output.accept_length_per_req_cpu),
@@ -513,12 +514,10 @@ class EAGLEWorker(TpModelWorker):
         # We need the full hidden states to prefill the KV cache of the draft model.
         model_worker_batch = batch.get_model_worker_batch()
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
-        forward_batch_output = self.target_worker.forward_batch_generation(
-            model_worker_batch
-        )
+        batch_result = self.target_worker.forward_batch_generation(model_worker_batch)
         logits_output, next_token_ids = (
-            forward_batch_output.logits_output,
-            forward_batch_output.next_token_ids,
+            batch_result.logits_output,
+            batch_result.next_token_ids,
         )
         return (
             logits_output,
@@ -543,8 +542,10 @@ class EAGLEWorker(TpModelWorker):
         # [       topk 0         ] [       topk 1         ]
         # [iter=0, iter=1, iter=2] [iter=0, iter=1, iter=2]
         if self.page_size == 1:
-            out_cache_loc, token_to_kv_pool_state_backup = batch.alloc_token_slots(
-                num_seqs * self.speculative_num_steps * self.topk, backup_state=True
+            out_cache_loc, token_to_kv_pool_state_backup = alloc_token_slots(
+                batch.tree_cache,
+                num_seqs * self.speculative_num_steps * self.topk,
+                backup_state=True,
             )
         else:
             if self.topk == 1:
@@ -603,7 +604,8 @@ class EAGLEWorker(TpModelWorker):
                 extend_num_tokens = torch.sum((seq_lens_cpu - prefix_lens_cpu)).item()
 
             out_cache_loc, token_to_kv_pool_state_backup = (
-                batch.alloc_paged_token_slots_extend(
+                alloc_paged_token_slots_extend(
+                    batch.tree_cache,
                     prefix_lens,
                     prefix_lens_cpu,
                     seq_lens,
@@ -822,12 +824,12 @@ class EAGLEWorker(TpModelWorker):
             ).cpu()
 
         # Forward
-        forward_batch_output = self.target_worker.forward_batch_generation(
+        batch_result = self.target_worker.forward_batch_generation(
             model_worker_batch, is_verify=True
         )
         logits_output, can_run_cuda_graph = (
-            forward_batch_output.logits_output,
-            forward_batch_output.can_run_cuda_graph,
+            batch_result.logits_output,
+            batch_result.can_run_cuda_graph,
         )
 
         vocab_mask = None
@@ -868,7 +870,7 @@ class EAGLEWorker(TpModelWorker):
         logits_output.hidden_states = logits_output.hidden_states[res.accepted_indices]
 
         # QQ: can be optimized
-        if self.target_worker.model_runner.is_hybrid_gdn:
+        if self.target_worker.model_runner.hybrid_gdn_config is not None:
             # res.draft_input.accept_length is on GPU but may be empty for last verify?
             accepted_length = (
                 torch.tensor(
