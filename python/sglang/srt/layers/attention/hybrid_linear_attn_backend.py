@@ -835,7 +835,7 @@ class LightningBackend(AttentionBackend):
             hidden.append(out_slice.contiguous())
         if self._get_num_decode_tokens(forward_batch) > 0:
             hidden.append(
-                self._decode_infer(
+                self.forward_decode(
                     q,
                     k,
                     v,
