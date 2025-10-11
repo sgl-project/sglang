@@ -356,7 +356,7 @@ impl Router {
         headers: Option<&HeaderMap>,
         endpoint: &str,
         method: Method,
-    ) -> Result<Vec<(String, Response)>, Response> {
+    ) -> Result<Vec<(String, String)>, Response> {
         let workers = self.worker_registry.get_all();
         if workers.is_empty() {
             return Err((StatusCode::SERVICE_UNAVAILABLE, "No available workers").into_response());
@@ -398,13 +398,9 @@ impl Router {
             if let Ok(res) = request_builder.send().await {
                 let status = StatusCode::from_u16(res.status().as_u16())
                     .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                let response_headers = header_utils::preserve_response_headers(res.headers());
-                if let Ok(body) = res.bytes().await {
-                    let mut response = Response::new(Body::from(body));
-                    *response.status_mut() = status;
-                    *response.headers_mut() = response_headers;
+                if let Ok(body_text) = res.text().await {
                     if status.is_success() {
-                        responses.push((worker_base_url, response));
+                        responses.push((worker_base_url, body_text));
                     }
                 }
             }
