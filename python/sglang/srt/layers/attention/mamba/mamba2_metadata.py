@@ -16,6 +16,7 @@
 
 import math
 from dataclasses import dataclass
+from typing import Optional
 
 import torch
 
@@ -26,6 +27,9 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 class ForwardMetadata:
     query_start_loc: torch.Tensor
     mamba_cache_indices: torch.Tensor
+    retrieve_next_token: Optional[torch.Tensor] = None
+    retrieve_next_sibling: Optional[torch.Tensor] = None
+    retrieve_parent_token: Optional[torch.Tensor] = None
 
 
 @dataclass(kw_only=True)
