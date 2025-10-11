@@ -439,3 +439,161 @@ def w8a8_block_int8_matmul(
     )
 
     return C
+
+
+@triton.jit
+def _swizzle_tile(
+    pid,
+    m,
+    n,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+):
+    grid_m = tl.cdiv(m, BLOCK_SIZE_M)
+    grid_n = tl.cdiv(n, BLOCK_SIZE_N)
+    width = GROUP_SIZE_M * grid_n
+    group_id = pid // width
+    group_size = tl.minimum(grid_m - group_id * GROUP_SIZE_M, GROUP_SIZE_M)
+    pid_m = group_id * GROUP_SIZE_M + (pid % group_size)
+    pid_n = (pid % width) // group_size
+    return pid_m, pid_n
+
+
+@triton.jit
+def _w8a8_per_channel_per_token_matmul(
+    A,
+    B,
+    C,
+    As,
+    Bs,
+    Bias,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    stride_As_m,
+    stride_Bs_n,
+    # Meta-parameters
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    # Meta-parameter for bias fusion
+    BIAS: tl.constexpr,
+):
+
+    pid = tl.program_id(axis=0)
+    pid_m, pid_n = _swizzle_tile(pid, M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, GROUP_SIZE_M)
+
+    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    a_ptrs = A + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_ptrs = B + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+
+    As_ptrs = As + offs_am * stride_As_m
+    Bs_ptrs = Bs + offs_bn * stride_Bs_n
+    a_s = tl.load(As_ptrs)
+    b_s = tl.load(Bs_ptrs)
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
+        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+        accumulator += tl.dot(a, b, out_dtype=tl.float32) * a_s[:, None] * b_s[None, :]
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += BLOCK_SIZE_K * stride_bk
+
+    if BIAS:
+        offs_bias = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        bias_ptrs = Bias + offs_bias
+        bias = tl.load(bias_ptrs, mask=offs_bias < N, other=0.0)
+        accumulator += bias[None, :]
+
+    if C.dtype.element_ty == tl.bfloat16:
+        c = accumulator.to(tl.bfloat16)
+    elif C.dtype.element_ty == tl.float16:
+        c = accumulator.to(tl.float16)
+
+    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = C + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    tl.store(c_ptrs, c, mask=c_mask)
+
+
+def w8a8_per_channel_per_token_matmul(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    As: torch.Tensor,
+    Bs: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.float16,
+) -> torch.Tensor:
+    assert A.shape[-1] == B.shape[-1]
+    M = A.numel() // A.shape[-1]
+    N, K = B.shape
+
+    assert A.is_contiguous()
+    assert A.shape[0] == As.shape[0]
+    assert B.is_contiguous()
+    assert B.ndim == 2
+    assert Bs.shape[0] == N
+
+    if bias is not None:
+        assert bias.ndim == 1 and bias.shape[0] == N
+
+    C_shape = A.shape[:-1] + (N,)
+    C = A.new_empty(C_shape, dtype=out_dtype)
+
+    if M < 64:
+        config = {
+            "BLOCK_SIZE_M": 16,
+            "BLOCK_SIZE_N": 32,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 8,
+            "num_warps": 4,
+            "num_stages": 3,
+        }
+    else:
+        config = {
+            "BLOCK_SIZE_M": 64,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 32,
+            "num_warps": 4,
+            "num_stages": 3,
+        }
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+    )
+    bias_ptr = bias if bias is not None else B
+    _w8a8_per_channel_per_token_matmul[grid](
+        A,
+        B,
+        C,
+        As,
+        Bs,
+        bias_ptr,
+        M,
+        N,
+        K,
+        A.stride(-2),
+        A.stride(-1),
+        B.stride(1),
+        B.stride(0),
+        C.stride(-2),
+        C.stride(-1),
+        As.stride(0),
+        Bs.stride(0),
+        **config,
+        BIAS=bias is not None,
+    )
+
+    return C
