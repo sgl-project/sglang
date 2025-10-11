@@ -791,7 +791,7 @@ class Req:
             )
 
             for stop_str in self.sampling_params.stop_strs:
-                if stop_str in tail_str or stop_str in self.decoded_text:
+                if stop_str in tail_str:
                     self.finished_reason = FINISH_MATCHED_STR(matched=stop_str)
                     return
 
