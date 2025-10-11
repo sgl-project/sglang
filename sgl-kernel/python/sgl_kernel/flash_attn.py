@@ -136,7 +136,7 @@ def flash_attn_with_kvcache(
             Default to 1 / sqrt(headdim).
         causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
         window_size: (left, right). If not (-1, -1), implements sliding window local attention.
-        attention_chunk: Optional[int]. If not None, split the query into chunks of this size
+        attention_chunk: Optional[int]. If not None, splits the query into chunks of this size to save memory.
         softcap: float. Anything > 0 activates softcapping attention.
         rotary_interleaved: bool. Only applicable if rotary_cos and rotary_sin are passed in.
             If True, rotary embedding will combine dimensions 0 & 1, 2 & 3, etc. If False,
