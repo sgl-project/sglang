@@ -69,6 +69,7 @@ suites = {
         TestFile("test_deterministic.py", 300),
         TestFile("test_eagle_infer_a.py", 370),
         TestFile("test_eagle_infer_b.py", 700),
+        TestFile("test_eagle_infer_beta.py", 300),
         TestFile("test_ebnf_constrained.py", 108),
         TestFile("test_eval_fp8_accuracy.py", 303),
         TestFile("test_fa3.py", 376),
