@@ -726,7 +726,13 @@ impl RouterTrait for Router {
                 body_text,
             })
             .collect();
-        let text = crate::engine_metrics::compute_engine_metrics(engine_responses);
+        let text = match crate::engine_metrics::compute_engine_metrics(engine_responses) {
+            Ok(x) => x,
+            Err(e) => {
+                let error_msg = format!("Failed to aggregate metrics: {}", e);
+                return (StatusCode::INTERNAL_SERVER_ERROR, error_msg).into_response();
+            }
+        };
         (StatusCode::OK, text).into_response()
     }
 
