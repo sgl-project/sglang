@@ -12,15 +12,6 @@ namespace {
 //   4. provide amx kernel for index_gemm_kernel_nn when M = 16
 //
 
-template <typename scalar_t>
-constexpr int block_size_n() {
-  return 6;
-}
-template <>
-constexpr int block_size_n<at::Half>() {
-  return 4;
-}
-
 #if defined(CPU_CAPABILITY_AVX512)
 // key: from [N, 32] to [32/2, N, 2]
 // val: from [N, 32] to [N/2, 32, 2]
@@ -692,7 +683,7 @@ void index_gemm_kernel_nt(
   // default pattern: 1-6-24
   // FP16 pattern: 2-8-16
   constexpr int64_t BLOCK_M = 4;
-  constexpr int64_t BLOCK_N = block_size_n<scalar_t>();
+  constexpr int64_t BLOCK_N = std::is_same_v<scalar_t, at::Half> ? 4 : 6;
   const int64_t MB = div_up(M, BLOCK_M);
   const int64_t NB = div_up(N, BLOCK_N);
 
