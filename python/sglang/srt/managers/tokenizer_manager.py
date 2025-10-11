@@ -1394,36 +1394,6 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             if state.finished:
                 if self.server_args.speculative_algorithm:
                     meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
-                    if (
-                        recv_obj.spec_verify_ct[i] > 0
-                        and self.server_args.speculative_num_steps is not None
-                        and not isinstance(recv_obj, BatchEmbeddingOutput)
-                        and hasattr(recv_obj, "spec_accepted_tokens")
-                        # Checks that `spec_accepted_tokens[i]` will exist.
-                        and len(recv_obj.spec_accepted_tokens) > i
-                    ):
-                        total_draft_tokens = (
-                            recv_obj.spec_verify_ct[i]
-                            * self.server_args.speculative_num_steps
-                        )
-                        accepted_tokens = recv_obj.spec_accepted_tokens[i]
-
-                        # Calculate per-request acceptance rate and average acceptance length.
-                        if total_draft_tokens > 0:
-                            # Calculate acceptance rate: accepted / (steps * lookahead)
-                            meta_info["spec_accept_rate"] = (
-                                accepted_tokens / total_draft_tokens
-                            )
-                            meta_info["spec_accept_length"] = (
-                                recv_obj.completion_tokens[i]
-                                / recv_obj.spec_verify_ct[i]
-                            )
-                        else:
-                            meta_info["spec_accept_rate"] = 0.0
-                            meta_info["spec_accept_length"] = 0
-                    else:
-                        meta_info["spec_acceptance_rate"] = 0.0
-                        meta_info["spec_accept_length"] = 0
                 state.finished_time = time.time()
                 meta_info["e2e_latency"] = state.finished_time - state.created_time
 
