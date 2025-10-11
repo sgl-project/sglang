@@ -73,4 +73,5 @@ RUN --mount=type=secret,id=github_token \
 SHELL ["bash", "-c"]
 
 # Start an interactive bash shell with all environment set up
+USER sdp
 CMD ["bash", "-c", "source /home/sdp/.bashrc && exec bash"]
