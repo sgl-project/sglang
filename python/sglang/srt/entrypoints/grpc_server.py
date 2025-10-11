@@ -35,8 +35,8 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.sampling.sampling_params import SamplingParams as SGLSamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import configure_logger, prepare_model_and_tokenizer
+from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -211,13 +211,6 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             )
 
             async for output in response_generator:
-                # Check if client cancelled before processing/yielding
-                if context.cancelled():
-                    logger.info(f"Client cancelled request {request.request_id}")
-                    # Explicitly abort the request to notify scheduler
-                    await self.request_manager.abort_request(request.request_id)
-                    break
-
                 # Handle batch responses (for n>1 non-streaming)
                 if isinstance(output, list):
                     for batch_output in output:
