@@ -13,7 +13,6 @@ type PrometheusExposition = MetricsExposition<PrometheusType, PrometheusValue>;
 /// Aggregate Prometheus metrics scraped from multiple sources into a unified one
 pub fn aggregate_metrics(metric_packs: Vec<MetricPack>) -> anyhow::Result<String> {
     let mut expositions = vec![];
-
     for metric_pack in metric_packs {
         let exposition =
             match openmetrics_parser::prometheus::parse_prometheus(&metric_pack.metrics_text) {
@@ -30,7 +29,7 @@ pub fn aggregate_metrics(metric_packs: Vec<MetricPack>) -> anyhow::Result<String
         expositions.push(exposition);
     }
 
-    Ok("hi".into())
+    Ok(expositions.into_iter().map(|x| format!("{x}")).join("\n"))
 }
 
 fn transform_metrics(
