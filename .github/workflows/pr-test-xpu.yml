@@ -66,7 +66,6 @@ jobs:
           docker exec "$cid" /home/sdp/miniforge3/envs/py3.10/bin/python3 -m pip uninstall -y flashinfer-python
           docker exec "$cid" /bin/bash -c '/home/sdp/miniforge3/envs/py3.10/bin/huggingface-cli login --token ${HF_TOKEN} '
           docker exec -u root "$cid" /bin/bash -c "ln -sf /home/sdp/miniforge3/envs/py3.10/bin/python3 /usr/bin/python3"
-          docker exec "$cid" /bin/bash -c "source /home/sdp/.bashrc --force"
 
       - name: Run E2E Bfloat16 tests
         timeout-minutes: 20
