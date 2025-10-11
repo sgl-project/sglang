@@ -77,7 +77,6 @@ subtle = "2.6"
 rustpython-parser = "0.4.0"
 num-traits = "0.2"
 openmetrics-parser = "0.4.4"
-prometheus = "0.14.0"
 
 # gRPC and Protobuf dependencies
 tonic = { version = "0.12", features = ["tls", "gzip", "transport"] }
