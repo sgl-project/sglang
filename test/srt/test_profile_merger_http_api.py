@@ -8,7 +8,6 @@ Usage:
 
 import json
 import unittest
-from unittest.mock import MagicMock, patch
 
 from sglang.srt.managers.io_struct import ProfileReqInput
 
