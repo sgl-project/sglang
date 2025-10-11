@@ -1625,15 +1625,6 @@ class CkptEngineModelLoader(BaseModelLoader):
 
         return model.eval()
 
-    def _get_weights_iterator(
-        self,
-        client,
-    ) -> Generator[Tuple[str, torch.Tensor], None, None]:
-        """Get an iterator for the model weights from CKPT Engine."""
-        assert get_connector_type(client) == ConnectorType.CKPTENGINE
-        tp_rank = get_tensor_model_parallel_rank()
-        return client.weight_iterator(tp_rank)
-
     def load_model_from_ckpt_engine(
         self, model, client, model_config: ModelConfig, device_config: DeviceConfig
     ) -> nn.Module:
