@@ -67,6 +67,7 @@ python3 -m sglang.launch_server \
   --enable-hierarchical-cache \
   --hicache-ratio 2 \
   --hicache-size 0 \
+  --hicache-mem-layout page_first_direct \
   --hicache-io-backend direct \
   --hicache-write-policy write_through \
   --hicache-storage-backend hf3fs \
@@ -86,6 +87,7 @@ python3 -m sglang.launch_server \
   --page-size 64 \
   --hicache-ratio 2 \
   --hicache-size 0 \
+  --hicache-mem-layout page_first_direct \
   --hicache-io-backend direct \
   --hicache-write-policy write_through \
   --hicache-storage-backend hf3fs \
@@ -115,7 +117,8 @@ python3 -m sglang.launch_server \
   --enable-hierarchical-cache \
   --hicache-ratio 2 \
   --hicache-size 0 \
-  --hicache-mem-layout page_first \
+  --hicache-mem-layout page_first_direct \
+  --hicache-io-backend direct \
   --hicache-write-policy write_through \
   --hicache-storage-backend hf3fs \
   --hicache-storage-prefetch-policy wait_complete \
@@ -140,8 +143,8 @@ python3 -m sglang.launch_server \
   --page-size 64 \
   --enable-hierarchical-cache \
   --hicache-ratio 2 \
-  --hicache-mem-layout page_first \
-  --hicache-io-backend kernel \
+  --hicache-mem-layout page_first_direct \
+  --hicache-io-backend direct \
   --hicache-storage-backend mooncake \
   --hicache-write-policy write_through \
   --hicache-storage-prefetch-policy timeout
