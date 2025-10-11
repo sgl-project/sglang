@@ -254,7 +254,8 @@ async fn health_generate(State(state): State<Arc<AppState>>, req: Request) -> Re
 }
 
 async fn engine_metrics(State(_state): State<Arc<AppState>>, _req: Request) -> Response {
-    (StatusCode::OK, "hello").into_response()
+    let text = super::engine_metrics::compute_engine_metrics();
+    (StatusCode::OK, text).into_response()
 }
 
 async fn get_server_info(State(state): State<Arc<AppState>>, req: Request) -> Response {
