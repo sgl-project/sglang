@@ -698,6 +698,7 @@ impl Router {
     }
 }
 
+use crate::engine_metrics::EngineMetricsOutput;
 use async_trait::async_trait;
 
 #[async_trait]
@@ -711,11 +712,22 @@ impl RouterTrait for Router {
     }
 
     async fn get_engine_metrics(&self) -> Response {
-        let engine_responses = match self.fan_out_simple_request(None, "/metrics", Method::GET).await {
+        let engine_responses = match self
+            .fan_out_simple_request(None, "/metrics", Method::GET)
+            .await
+        {
             Ok(x) => x,
             Err(e) => return e,
         };
-        let text = crate::engine_metrics::compute_engine_metrics();
+        let text = crate::engine_metrics::compute_engine_metrics(
+            engine_responses
+                .into_iter()
+                .map(|(worker_base_url, body_text)| EngineMetricsOutput {
+                    worker_base_url,
+                    body_text,
+                })
+                .collect(),
+        );
         (StatusCode::OK, text).into_response()
     }
 
