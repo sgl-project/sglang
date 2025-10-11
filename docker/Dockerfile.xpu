@@ -56,8 +56,9 @@ RUN --mount=type=secret,id=github_token \
     conda activate py${PYTHON_VERSION} && \
     echo "Cloning ${SG_LANG_BRANCH} from ${SG_LANG_REPO}" && \
     git clone --branch ${SG_LANG_BRANCH} --single-branch ${SG_LANG_REPO} && \
-    cd sglang && \
-    pip install -e "python[all_xpu]" --root-user-action=ignore && \
+    cd sglang && cd python && \
+    cp pyproject_xpu.toml pyproject.toml && \
+    pip install . && \
     echo "Cloning ${SG_LANG_KERNEL_REPO} from ${SG_LANG_KERNEL_BRANCH}" && \
     git clone --branch ${SG_LANG_KERNEL_BRANCH} --single-branch ${SG_LANG_KERNEL_REPO} && \
     cd sgl-kernel-xpu && \
