@@ -536,7 +536,9 @@ class RouterArgs:
         parser.add_argument(
             f"--{prefix}oracle-pool-timeout-secs",
             type=int,
-            default=int(os.getenv("ATP_POOL_TIMEOUT_SECS", RouterArgs.oracle_pool_timeout_secs)),
+            default=int(
+                os.getenv("ATP_POOL_TIMEOUT_SECS", RouterArgs.oracle_pool_timeout_secs)
+            ),
             help="Oracle connection pool timeout in seconds (default: 30, env: ATP_POOL_TIMEOUT_SECS)",
         )
 
