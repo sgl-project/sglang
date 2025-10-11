@@ -86,6 +86,8 @@ class ModelConfig:
         dtype: str = "auto",
         quantization: Optional[str] = None,
         modelopt_quant: Optional[Union[str, Dict]] = None,
+        modelopt_checkpoint_restore_path: Optional[str] = None,
+        modelopt_checkpoint_save_path: Optional[str] = None,
         override_config_file: Optional[str] = None,
         is_draft_model: bool = False,
         hybrid_kvcache_ratio: Optional[float] = None,
