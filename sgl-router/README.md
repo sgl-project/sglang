@@ -229,7 +229,7 @@ python -m sglang_router.launch_router --backend openai \
     --history-backend memory
 
 # No storage for maximum performance
-python -m sglang_router.launch_router \
+python -m sglang_router.launch_router --backend openai \
     --worker-urls https://api.openai.com \
     --history-backend none
 
