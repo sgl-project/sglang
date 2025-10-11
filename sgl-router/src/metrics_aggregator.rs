@@ -1,3 +1,4 @@
+use anyhow::ensure;
 use openmetrics_parser::{MetricFamily, MetricsExposition, PrometheusType, PrometheusValue};
 use std::collections::hash_map::Entry;
 use tracing::warn;
@@ -48,7 +49,10 @@ fn transform_metrics(
     exposition
 }
 
-fn merge_exposition(a: PrometheusExposition, b: PrometheusExposition) -> anyhow::Result<PrometheusExposition> {
+fn merge_exposition(
+    a: PrometheusExposition,
+    b: PrometheusExposition,
+) -> anyhow::Result<PrometheusExposition> {
     let mut ans = a;
     for (name, family_b) in b.families.into_iter() {
         ans[name] = if let Some(family_a) = ans.families.remove(&name) {
@@ -61,7 +65,14 @@ fn merge_exposition(a: PrometheusExposition, b: PrometheusExposition) -> anyhow:
 }
 
 fn merge_family(a: PrometheusFamily, b: PrometheusFamily) -> anyhow::Result<PrometheusFamily> {
-    let mut ans = a;
+    ensure!(
+        a.get_label_names() == b.get_label_names(),
+        "Label names should agree a={} b={}",
+        a.get_label_names(),
+        b.get_label_names()
+    );
 
-    ans
+    let ans = a;
+    let ans = ans.with_samples(b.into_iter_samples())?;
+    Ok(ans)
 }
