@@ -100,11 +100,11 @@ void bmm_kernel_impl(
     alignas(64) at::BFloat16 Btmp[BLOCK_N * BLOCK_K];
 
     loop_2d<at::Float8_e4m3fn>(mb0, mb1, nb0, nb1, BLOCK_N * K, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
-      int bs = mb / MB;
-      int mb_start = (mb % MB) * BLOCK_M;
-      int mb_size = std::min(M - mb_start, BLOCK_M);
-      int nb_start = nb * BLOCK_N;
-      int nb_size = std::min(N - nb_start, BLOCK_N);
+      int64_t bs = mb / MB;
+      int64_t mb_start = (mb % MB) * BLOCK_M;
+      int64_t mb_size = std::min(M - mb_start, BLOCK_M);
+      int64_t nb_start = nb * BLOCK_N;
+      int64_t nb_size = std::min(N - nb_start, BLOCK_N);
 
       tinygemm_kernel(
           /*   A */ mat1 + bs * mat1_strideB + mb_start * mat1_strideM,
