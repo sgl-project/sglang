@@ -1,4 +1,5 @@
-use openmetrics_parser::{MetricsExposition, PrometheusType, PrometheusValue};
+use openmetrics_parser::{MetricFamily, MetricsExposition, PrometheusType, PrometheusValue};
+use std::collections::hash_map::Entry;
 use tracing::warn;
 
 #[derive(Debug)]
@@ -8,6 +9,7 @@ pub struct MetricPack {
 }
 
 type PrometheusExposition = MetricsExposition<PrometheusType, PrometheusValue>;
+type PrometheusFamily = MetricsFamily<PrometheusType, PrometheusValue>;
 
 /// Aggregate Prometheus metrics scraped from multiple sources into a unified one
 pub fn aggregate_metrics(metric_packs: Vec<MetricPack>) -> anyhow::Result<String> {
@@ -43,4 +45,20 @@ fn transform_metrics(
         *family = family.with_labels(extra_labels.iter().map(|(k, v)| (k.as_str(), v.as_str())));
     }
     exposition
+}
+
+fn merge_exposition(a: PrometheusExposition, b: PrometheusExposition) -> PrometheusExposition {
+    let mut ans = a;
+    for (name, family_b) in b.families.into_iter() {
+        ans[name] = if let Some(family_a) = ans.families.remove(&name) {
+            merge_family(family_a, family_b)
+        } else {
+            family_b
+        };
+    }
+    ans
+}
+
+fn merge_family(a: PrometheusFamily, b: PrometheusFamily) -> PrometheusFamily {
+    TDO
 }
