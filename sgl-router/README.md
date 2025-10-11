@@ -224,7 +224,7 @@ Store conversation and response data for tracking, debugging, or analytics.
 
 ```bash
 # Memory backend (default)
-python -m sglang_router.launch_router \
+python -m sglang_router.launch_router --backend openai \
     --worker-urls https://api.openai.com \
     --history-backend memory
 
