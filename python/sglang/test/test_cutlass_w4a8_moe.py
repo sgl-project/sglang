@@ -1,11 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Literal, Optional
+import random
+from typing import Literal, Optional, Tuple
 
 import pytest
 import torch
 
-from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
+from sglang.srt.layers.moe.cutlass_w4a8_moe import (
+    cutlass_w4a8_moe,
+    cutlass_w4a8_moe_deepep_ll,
+)
 from sglang.srt.layers.moe.topk import TopKConfig, select_experts
 
 
@@ -283,3 +287,172 @@ def ref(
         results[activated_tokens, :] += (fc2 * final_scale).to(results.dtype)
 
     return results
+
+
+def per_token_cast_back(
+    x_fp8: torch.Tensor, x_scales: torch.Tensor, dtype: torch.dtype = torch.bfloat16
+):
+    assert x_fp8.dim() == 2 and x_fp8.size(1) % 128 == 0
+    m, n = x_fp8.shape
+    x_fp32 = x_fp8.to(torch.float32).view(m, -1, 128)
+    x_scales = x_scales.view(m, -1, 1)
+    x_rec = (x_fp32 * x_scales).view(m, n)
+    return x_rec.to(dtype)
+
+
+def ref_deepep_ll(
+    a_fp8: Tuple[torch.Tensor, torch.Tensor],
+    masked_m: torch.Tensor,
+    w1_q: torch.Tensor,
+    w2_q: torch.Tensor,
+    w1_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    a1_scale: torch.Tensor,
+    a2_scale: torch.Tensor,
+    GROUP_SIZE: int = 128,
+):
+    a_fp8, a_scale = a_fp8
+    e, max_m, k = a_fp8.shape
+    results = torch.zeros_like(a_fp8, dtype=torch.bfloat16)
+    for i in range(e):
+        a_fp8_i = a_fp8[i]
+        a_scale_i = a_scale[i]
+        a_i = per_token_cast_back(a_fp8_i, a_scale_i, torch.float32)
+        a = (
+            torch.clamp((a_i / a1_scale.float()), -448.0, 448.0)
+            .to(torch.float8_e4m3fn)
+            .to(torch.bfloat16)
+        )
+
+        w1_q_i = w1_q[i]
+        w1_scale_i = w1_scale[i].repeat_interleave(GROUP_SIZE, dim=1).to(torch.float32)
+        w1 = (w1_q_i.to(torch.float32) * w1_scale_i).to(torch.bfloat16)
+        fc1 = ((torch.matmul(a, w1.T)) * a1_scale).to(torch.float16)
+
+        gate, fc1 = fc1.chunk(2, dim=-1)
+        fc1 = fc1 * torch.nn.functional.silu(gate)
+        a = (
+            torch.clamp((fc1 / a2_scale.float()), -448.0, 448.0)
+            .to(torch.float8_e4m3fn)
+            .to(torch.bfloat16)
+        )
+
+        w2_q_i = w2_q[i]
+        w2_scale_i = w2_scale[i].repeat_interleave(GROUP_SIZE, dim=1).to(torch.float32)
+        w2 = (w2_q_i.to(torch.float32) * w2_scale_i).to(torch.bfloat16)
+        fc2 = (torch.matmul(a, w2.T) * a2_scale).to(torch.float16)
+        results[i] += fc2
+    return results
+
+
+# @pytest.mark.parametrize("EXPECTED_M", [1, 16, 128, 1024])
+# @pytest.mark.parametrize("N", [2048])
+# @pytest.mark.parametrize("K", [7168, 6144])
+# @pytest.mark.parametrize("E", [1, 2, 4, 8])
+@pytest.mark.parametrize("EXPECTED_M", [128])
+@pytest.mark.parametrize("N", [2048])
+@pytest.mark.parametrize("K", [7168])
+@pytest.mark.parametrize("E", [1])
+def test_cutlass_w4a8_moe_deepep_ll(EXPECTED_M, N, K, E):
+    GROUP_SIZE = 128
+    MAX_M = 256
+    TOPK = 8
+
+    device = "cuda"
+    dtype = torch.bfloat16
+
+    # deepep ll dispatch fp8 data and float32 scale (128 block quant)
+    a = torch.randn(E, MAX_M, K, dtype=torch.float32, device=device).to(
+        torch.float8_e4m3fn
+    )
+    a_scale = torch.randn(E, MAX_M, K // 128, dtype=torch.float32, device=device)
+    a_fp8 = (a, a_scale)
+
+    masked_m = torch.empty(E, dtype=torch.int32, device=device)
+    for i in range(E):
+        masked_m[i] = min(MAX_M, int(EXPECTED_M * random.uniform(0.7, 1.3)))
+
+    # weight and scale
+    ref_weight_1 = torch.randint(-8, 8, (E, N * 2, K), dtype=torch.int8, device=device)
+    ref_weight_2 = torch.randint(-8, 8, (E, K, N), dtype=torch.int8, device=device)
+    affine_coeff = 0.005
+    scale_1 = (
+        torch.randn(E, N * 2, K // GROUP_SIZE, dtype=dtype, device=device)
+        * affine_coeff
+    )
+    scale_2 = (
+        torch.randn(E, K, N // GROUP_SIZE, dtype=dtype, device=device) * affine_coeff
+    )
+    w1_q, w1_scale = pack_interleave(E, ref_weight_1, scale_1)
+    w2_q, w2_scale = pack_interleave(E, ref_weight_2, scale_2)
+
+    # tensor scale
+    a1_scale = torch.randn(1, dtype=torch.float32, device=device)
+    a2_scale = torch.randn(1, dtype=torch.float32, device=device)
+
+    a_strides1 = torch.full((E, 3), K, device=device, dtype=torch.int64)
+    c_strides1 = torch.full((E, 3), 2 * N, device=device, dtype=torch.int64)
+    a_strides2 = torch.full((E, 3), N, device=device, dtype=torch.int64)
+    c_strides2 = torch.full((E, 3), K, device=device, dtype=torch.int64)
+    b_strides1 = a_strides1
+    s_strides13 = c_strides1
+    b_strides2 = a_strides2
+    s_strides2 = c_strides2
+
+    # some buffer tensors
+    expert_offsets = torch.empty(E + 1, dtype=torch.int32, device=device)
+    problem_sizes1 = torch.empty((E, 3), dtype=torch.int32, device=device)
+    problem_sizes2 = torch.empty((E, 3), dtype=torch.int32, device=device)
+
+    try:
+        output = cutlass_w4a8_moe_deepep_ll(
+            a_fp8=a_fp8,
+            w1_q=w1_q,
+            w2_q=w2_q,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            topk_ids=torch.empty((0, TOPK), dtype=torch.int32, device=device),
+            masked_m=masked_m,
+            a_strides1=a_strides1,
+            b_strides1=b_strides1,
+            c_strides1=c_strides1,
+            a_strides2=a_strides2,
+            b_strides2=b_strides2,
+            c_strides2=c_strides2,
+            s_strides13=s_strides13,
+            s_strides2=s_strides2,
+            expert_offsets=expert_offsets,
+            problem_sizes1=problem_sizes1,
+            problem_sizes2=problem_sizes2,
+            a1_scale=a1_scale,
+            a2_scale=a2_scale,
+        )
+
+        ref_output = ref_deepep_ll(
+            a_fp8=a_fp8,
+            masked_m=masked_m,
+            w1_q=ref_weight_1,
+            w2_q=ref_weight_2,
+            w1_scale=scale_1,
+            w2_scale=scale_2,
+            a1_scale=a1_scale,
+            a2_scale=a2_scale,
+        )
+
+        assert output.shape == ref_output.shape
+        assert output.dtype == ref_output.dtype
+
+        # mask uninitialized output values
+        for i in range(E):
+            output_i = output[i][masked_m[i] :]
+            ref_output_i = ref_output[i][masked_m[i] :]
+            print(f"output_i: {output_i}")
+            print(f"ref_output_i: {ref_output_i}")
+            torch.testing.assert_close(output_i, ref_output_i, rtol=1e-2, atol=0.1)
+
+        print(
+            f"SUCCESS: cutlass_w4a8_moe_deepep_ll test passed with shape {output.shape}"
+        )
+
+    except Exception as e:
+        pytest.fail(f"cutlass_w4a8_moe_deepep_ll test failed with error: {str(e)}")
