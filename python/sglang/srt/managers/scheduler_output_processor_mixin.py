@@ -689,10 +689,9 @@ class SchedulerOutputProcessorMixin:
                         else len(req.output_ids) % stream_interval == 0
                     )
 
-                    # check_match_stop_str_prefix if  tail_str's suffix match stop_str prefix
-                    should_output = should_output and (
-                        not req.check_match_stop_str_prefix()
-                    )
+                    if should_output:
+                        # check_match_stop_str_prefix if  tail_str's suffix match stop_str prefix
+                        should_output &= not req.check_match_stop_str_prefix()
                 else:
                     should_output = (
                         len(req.output_ids) % DEFAULT_FORCE_STREAM_INTERVAL == 0
