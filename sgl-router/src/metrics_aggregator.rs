@@ -29,7 +29,11 @@ pub fn aggregate_metrics(metric_packs: Vec<MetricPack>) -> anyhow::Result<String
         expositions.push(exposition);
     }
 
-    Ok(expositions.into_iter().map(|x| format!("{x}")).join("\n"))
+    Ok(expositions
+        .into_iter()
+        .map(|x| format!("{x}"))
+        .collect::<Vec<_>>()
+        .join("\n"))
 }
 
 fn transform_metrics(
@@ -37,7 +41,7 @@ fn transform_metrics(
     extra_labels: &HashMap<String, String>,
 ) -> PrometheusExposition {
     for (_, family) in &mut exposition.families {
-        *family = family.with_labels(extra_labels);
+        *family = family.with_labels(extra_labels.iter().map(|(k, v)| (k.as_str(), v.as_str())));
     }
     exposition
 }
