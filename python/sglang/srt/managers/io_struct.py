@@ -1207,6 +1207,7 @@ class ProfileReqInput(BaseReq):
     profile_by_stage: bool = False
     with_stack: Optional[bool] = None
     record_shapes: Optional[bool] = None
+    profile_stage: str = "all"  # "prefill", "decode", or "all" (default)
 
 
 class ProfileReqType(Enum):
@@ -1225,6 +1226,7 @@ class ProfileReq(BaseReq):
     with_stack: Optional[bool] = None
     record_shapes: Optional[bool] = None
     profile_id: Optional[str] = None
+    profile_stage: str = "all"  # "prefill", "decode", or "all" (default)
 
 
 @dataclass
