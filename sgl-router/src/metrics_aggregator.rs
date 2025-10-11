@@ -15,8 +15,11 @@ type PrometheusFamily = MetricFamily<PrometheusType, PrometheusValue>;
 pub fn aggregate_metrics(metric_packs: Vec<MetricPack>) -> anyhow::Result<String> {
     let mut expositions = vec![];
     for metric_pack in metric_packs {
+        let metrics_text = &metric_pack.metrics_text;
+        let metrics_text = metrics_text.replace(":", "_");
+
         let exposition =
-            match openmetrics_parser::prometheus::parse_prometheus(&metric_pack.metrics_text) {
+            match openmetrics_parser::prometheus::parse_prometheus(&metrics_text) {
                 Ok(x) => x,
                 Err(err) => {
                     eprintln!(

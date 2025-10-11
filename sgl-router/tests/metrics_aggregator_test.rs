@@ -93,8 +93,7 @@ fn test_real() {
     let pack1 = MetricPack {
         labels: vec![("source".to_string(), "worker1".to_string())],
         // https://docs.sglang.ai/references/production_metrics.html
-        metrics_text: r###"
-# HELP sglang:prompt_tokens_total Number of prefill tokens processed.
+        metrics_text: r###"# HELP sglang:prompt_tokens_total Number of prefill tokens processed.
 # TYPE sglang:prompt_tokens_total counter
 sglang:prompt_tokens_total{model_name="meta-llama/Llama-3.1-8B-Instruct"} 8.128902e+06
 # HELP sglang:generation_tokens_total Number of generation tokens processed.
