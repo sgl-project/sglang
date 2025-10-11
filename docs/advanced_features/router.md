@@ -224,6 +224,8 @@ python -m sglang_router.launch_router \
     --cb-window-duration-secs 60
 ```
 
+![Circuit Breaker](../_static/image/sgl-router-circuit-breaker.jpg)
+
 **Behavior**:
 - Worker is marked unhealthy after `cb-failure-threshold` consecutive failures
 - Returns to service after `cb-success-threshold` successful health checks
