@@ -30,11 +30,12 @@ pub fn aggregate_metrics(metric_packs: Vec<MetricPack>) -> anyhow::Result<String
         expositions.push(exposition);
     }
 
-    Ok(expositions
+    let text = expositions
         .into_iter()
+        .reduce(merge_exposition)
         .map(|x| format!("{x}"))
-        .collect::<Vec<_>>()
-        .join("\n"))
+        .unwrap_or_default();
+    Ok(text)
 }
 
 fn transform_metrics(
@@ -60,5 +61,6 @@ fn merge_exposition(a: PrometheusExposition, b: PrometheusExposition) -> Prometh
 }
 
 fn merge_family(a: PrometheusFamily, b: PrometheusFamily) -> PrometheusFamily {
-    TDO
+    let mut ans = a;
+    ans
 }
