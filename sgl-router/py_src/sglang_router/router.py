@@ -45,7 +45,7 @@ def history_backend_from_str(backend_str: Optional[str]) -> HistoryBackendType:
     elif backend_lower == "oracle":
         return HistoryBackendType.Oracle
     else:
-        return HistoryBackendType.Memory
+        raise ValueError(f"Unknown history backend: {backend_str}")
 
 
 class Router:
