@@ -2,6 +2,7 @@ from dataclasses import astuple, dataclass
 from functools import lru_cache
 from typing import Optional, Union
 
+import einops
 import torch
 import torch.nn.functional as F
 
@@ -23,8 +24,16 @@ from sglang.srt.layers.attention.mamba.mamba2_metadata import (
     ForwardMetadata,
     Mamba2Metadata,
 )
+from sglang.srt.layers.lightning_attn import (
+    lightning_attention,
+    linear_decode_forward_triton,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, MambaPool
+from sglang.srt.mem_cache.memory_pool import (
+    HybridReqToTokenPool,
+    MambaPool,
+    MinimaxReqToTokenPool,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.models.qwen3_next import fused_gdn_gating
@@ -528,13 +537,352 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         )
 
 
+class LightningBackend(AttentionBackend):
+    """Attention backend using Lightning kernel."""
+
+    @staticmethod
+    def _get_num_prefills(forward_batch: ForwardBatch):
+        if forward_batch.forward_mode.is_extend():
+            return forward_batch.batch_size
+        elif forward_batch.forward_mode.is_mixed():
+            return (
+                len(forward_batch.extend_seq_lens)
+                if forward_batch.extend_seq_lens is not None
+                else 0
+            )
+        else:
+            return 0
+
+    @staticmethod
+    def _get_num_prefill_tokens(forward_batch: ForwardBatch):
+        if (
+            forward_batch.forward_mode.is_extend()
+            or forward_batch.forward_mode.is_mixed()
+        ):
+            if forward_batch.extend_num_tokens is not None:
+                return forward_batch.extend_num_tokens
+            elif forward_batch.extend_seq_lens is not None:
+                return int(forward_batch.extend_seq_lens.sum().item())
+            else:
+                return 0
+        else:
+            return 0
+
+    @staticmethod
+    def _get_num_decode_tokens(forward_batch: ForwardBatch):
+        if forward_batch.forward_mode.is_decode():
+            return forward_batch.batch_size
+        elif forward_batch.forward_mode.is_mixed():
+            num_prefills = LightningBackend._get_num_prefills(forward_batch)
+            return max(0, forward_batch.batch_size - num_prefills)
+        else:
+            return 0
+
+    def __init__(self, model_runner: ModelRunner):
+        super().__init__()
+        self.pad_slot_id = PAD_SLOT_ID
+        self.device = model_runner.device
+        self.req_to_token_pool: MinimaxReqToTokenPool = model_runner.req_to_token_pool
+        self.forward_metadata: ForwardMetadata = None
+        self.state_indices_list = []
+        self.query_start_loc_list = []
+        self.cached_cuda_graph_decode_query_start_loc: torch.Tensor = None
+
+    def _forward_metadata(self, forward_batch: ForwardBatch):
+        bs = forward_batch.batch_size
+
+        if forward_batch.forward_mode.is_decode_or_idle():
+            query_start_loc = torch.arange(
+                0, bs + 1, dtype=torch.int32, device=self.device
+            )
+        elif forward_batch.forward_mode.is_extend():
+            if forward_batch.forward_mode.is_target_verify():
+                raise ValueError("Target verify mode is not implemented")
+            else:
+                query_start_loc = torch.empty(
+                    (bs + 1,), dtype=torch.int32, device=self.device
+                )
+                query_start_loc[:bs] = forward_batch.extend_start_loc
+                query_start_loc[bs] = (
+                    forward_batch.extend_start_loc[-1]
+                    + forward_batch.extend_seq_lens[-1]
+                )
+        else:
+            raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode=}")
+        mamba_cache_indices = self.req_to_token_pool.get_minimax_indices(
+            forward_batch.req_pool_indices
+        )
+        return ForwardMetadata(
+            query_start_loc=query_start_loc,
+            mamba_cache_indices=mamba_cache_indices,
+        )
+
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+        self.forward_metadata = self._forward_metadata(forward_batch)
+
+    def init_forward_metadata_capture_cuda_graph(
+        self,
+        bs: int,
+        num_tokens: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+    ):
+        self.forward_metadata = self._capture_metadata(
+            bs, req_pool_indices, forward_mode
+        )
+
+    def init_forward_metadata_replay_cuda_graph(
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_sum: int,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        seq_lens_cpu: Optional[torch.Tensor],
+    ):
+        self.forward_metadata = self._replay_metadata(
+            bs, req_pool_indices, forward_mode, spec_info, seq_lens_cpu
+        )
+
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        assert (
+            max_num_tokens % max_bs == 0
+        ), f"max_num_tokens={max_num_tokens} must be divisible by max_bs={max_bs}"
+        for i in range(max_bs):
+            self.state_indices_list.append(
+                torch.full(
+                    (i + 1,), self.pad_slot_id, dtype=torch.int32, device=self.device
+                )
+            )
+            self.query_start_loc_list.append(
+                torch.empty((i + 2,), dtype=torch.int32, device=self.device)
+            )
+        self.cached_cuda_graph_decode_query_start_loc = torch.arange(
+            0, max_bs + 1, dtype=torch.int32, device=self.device
+        )
+
+    def _capture_metadata(
+        self, bs: int, req_pool_indices: torch.Tensor, forward_mode: ForwardMode
+    ):
+        if forward_mode.is_decode_or_idle():
+            self.query_start_loc_list[bs - 1].copy_(
+                self.cached_cuda_graph_decode_query_start_loc[: bs + 1]
+            )
+        elif forward_mode.is_target_verify():
+            raise ValueError("Target verify mode is not implemented")
+        else:
+            raise ValueError(f"Invalid forward mode: {forward_mode=}")
+        mamba_indices = self.req_to_token_pool.get_minimax_indices(req_pool_indices)
+        self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
+        return ForwardMetadata(
+            query_start_loc=self.query_start_loc_list[bs - 1],
+            mamba_cache_indices=self.state_indices_list[bs - 1],
+        )
+
+    def _replay_metadata(
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        forward_mode: ForwardMode,
+        spec_info: Optional[SpecInput],
+        seq_lens_cpu: Optional[torch.Tensor],
+    ):
+        num_padding = torch.count_nonzero(
+            seq_lens_cpu == self.get_cuda_graph_seq_len_fill_value()
+        )
+        # Make sure forward metadata is correctly handled for padding reqs
+        req_pool_indices[bs - num_padding :] = 0
+        mamba_indices = self.req_to_token_pool.get_minimax_indices(req_pool_indices)
+        mamba_indices[bs - num_padding :] = -1
+        self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
+        if forward_mode.is_decode_or_idle():
+            if num_padding == 0:
+                self.query_start_loc_list[bs - 1].copy_(
+                    self.cached_cuda_graph_decode_query_start_loc[: bs + 1]
+                )
+            else:
+                self.query_start_loc_list[bs - 1][: bs - num_padding].copy_(
+                    self.cached_cuda_graph_decode_query_start_loc[: bs - num_padding]
+                )
+                self.query_start_loc_list[bs - 1][bs - num_padding :].copy_(
+                    bs - num_padding
+                )
+        elif forward_mode.is_target_verify():
+            raise ValueError("Target verify mode is not implemented")
+        else:
+            raise ValueError(f"Invalid forward mode: {forward_mode=}")
+
+        return ForwardMetadata(
+            query_start_loc=self.query_start_loc_list[bs - 1],
+            mamba_cache_indices=self.state_indices_list[bs - 1],
+        )
+
+    def get_cuda_graph_seq_len_fill_value(self):
+        return 1  # Mamba attn does not use seq lens to index kv cache
+
+    def forward_decode(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
+        **kwargs,
+    ):
+        layer_id = kwargs["layer_id"]
+        slope_rate = kwargs["slope_rate"]
+
+        num_prefill_tokens = LightningBackend._get_num_prefill_tokens(forward_batch)
+        q = q[num_prefill_tokens:].unsqueeze(2).contiguous()
+        k = k[num_prefill_tokens:].unsqueeze(2).contiguous()
+        v = v[num_prefill_tokens:].unsqueeze(2).contiguous()
+
+        (state,) = self.req_to_token_pool.get_minimax_params(layer_id)
+        slot_id = self.forward_metadata.mamba_cache_indices
+        assert len(slot_id) == q.shape[0], (
+            f"slot_id length {len(slot_id)} does not match decode batch size {q.shape[0]}. "
+            "This indicates a bug in the upstream logic that should be investigated."
+        )
+
+        hidden = linear_decode_forward_triton(q, k, v, state, slope_rate, slot_id, 32)
+        return hidden
+
+    def forward_extend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
+        **kwargs,
+    ):
+        layer_id = kwargs["layer_id"]
+        slope_rate = kwargs["slope_rate"]
+        block_size = kwargs.get("BLOCK", 256)
+
+        (state,) = self.req_to_token_pool.get_minimax_params(layer_id)
+        query_start_loc = self.forward_metadata.query_start_loc
+
+        hidden = []
+        for _prefill_idx in range(self._get_num_prefills(forward_batch)):
+            if _prefill_idx >= len(forward_batch.extend_start_loc):
+                break
+            if _prefill_idx >= len(query_start_loc):
+                break
+
+            _start = forward_batch.extend_start_loc[_prefill_idx]
+
+            if _prefill_idx + 1 < len(forward_batch.extend_start_loc):
+                _end = forward_batch.extend_start_loc[_prefill_idx + 1]
+            else:
+                if forward_batch.extend_seq_lens is not None and _prefill_idx < len(
+                    forward_batch.extend_seq_lens
+                ):
+                    seq_len = forward_batch.extend_seq_lens[_prefill_idx]
+                    _end = _start + seq_len
+                else:
+                    _end = q.shape[0]
+
+            slot_id = self.forward_metadata.mamba_cache_indices[_prefill_idx]
+            qs = q[_start:_end].transpose(0, 1).contiguous()
+            ks = k[_start:_end].transpose(0, 1).contiguous()
+            vs = v[_start:_end].transpose(0, 1).contiguous()
+            slice_layer_cache = state[slot_id, ...]
+
+            def jit_linear_forward_prefix(
+                q: torch.Tensor,
+                k: torch.Tensor,
+                v: torch.Tensor,
+                kv_caches: torch.Tensor,
+                slope_rate: torch.Tensor,
+                block_size: int,
+                layer_idx: int = None,
+                **kwargs,
+            ) -> torch.Tensor:
+
+                slope_rate = slope_rate.to(torch.float32)
+                should_pad_dim = q.dim() == 3
+                if should_pad_dim:
+                    q = q.unsqueeze(0)
+                    k = k.unsqueeze(0)
+                    v = v.unsqueeze(0)
+                b, h, n, d = q.shape
+                e = d
+                kv_history = kv_caches.reshape(1, h, d, e).contiguous()
+                output, kv_history = lightning_attention(
+                    q, k, v, slope_rate, block_size=block_size, kv_history=kv_history
+                )
+                kv_caches.copy_(kv_history[:, :, -1, :, :].reshape(h, d, e))
+                assert output.shape[0] == 1, "batch size must be 1"
+                return einops.rearrange(output.squeeze(0), "h n d -> n (h d)")
+
+            out_slice = jit_linear_forward_prefix(
+                qs,
+                ks,
+                vs,
+                slice_layer_cache,
+                slope_rate,
+                block_size,
+                layer_id,
+            )
+            hidden.append(out_slice.contiguous())
+        if self._get_num_decode_tokens(forward_batch) > 0:
+            hidden.append(
+                self._decode_infer(
+                    q,
+                    k,
+                    v,
+                    state,
+                    self.forward_metadata.mamba_cache_indices,
+                    forward_batch,
+                )
+            )
+
+        if not hidden:
+            return torch.empty((0, q.size(-1)), device=q.device, dtype=q.dtype)
+
+        hidden = torch.concat(hidden, dim=0).contiguous()
+        return hidden
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
+        **kwargs,
+    ):
+        mode = forward_batch.forward_mode
+        if mode.is_idle():
+            return torch.empty_like(q)
+        elif mode.is_decode():
+            return self.forward_decode(
+                q, k, v, layer, forward_batch, save_kv_cache, **kwargs
+            )
+        elif mode.is_extend():
+            return self.forward_extend(
+                q, k, v, layer, forward_batch, save_kv_cache, **kwargs
+            )
+        else:
+            raise ValueError(f"Unsupported forward mode: {mode}")
+
+
 class HybridLinearAttnBackend(AttentionBackend):
     """Manages a full and linear attention backend"""
 
     def __init__(
         self,
         full_attn_backend: AttentionBackend,
-        linear_attn_backend: MambaAttnBackendBase,
+        linear_attn_backend: MambaAttnBackendBase | LightningBackend,
         full_attn_layers: list[int],
     ):
         self.full_attn_layers = full_attn_layers

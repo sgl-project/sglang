@@ -238,6 +238,63 @@ class MambaPool:
         self.free_slots = list(range(self.size))
 
 
+class MinimaxCachePool:
+    def __init__(
+        self,
+        size: int,
+        state_dtype: torch.dtype,
+        num_linear_layers: int,
+        state_shape: Tuple[int, int, int],  # (H, D, D)
+        device: str,
+    ):
+        state = torch.zeros(
+            size=(num_linear_layers, size + 1) + state_shape,
+            dtype=state_dtype,
+            device=device,
+        )
+
+        self.minimax_cache = (state,)
+        logger.info(
+            f"[MinimaxCachePool] Allocated. "
+            f"state: L={num_linear_layers}, slots={size}, D={state_shape[0]}x{state_shape[1]}x{state_shape[2]}, "
+            f"state size={get_tensor_size_bytes(state) / GB:.2f} GB"
+        )
+        self.size = size
+        self.free_slots = list(range(size))
+        self.mem_usage = self.get_minimax_size() / GB
+
+    def get_minimax_params_all_layers(self):
+        return [self.minimax_cache[i] for i in range(len(self.minimax_cache))]
+
+    def get_minimax_params(self, layer_id: int):
+        return [self.minimax_cache[i][layer_id] for i in range(len(self.minimax_cache))]
+
+    def get_minimax_size(self):
+        return sum(get_tensor_size_bytes(t) for t in self.minimax_cache)
+
+    def available_size(self):
+        return len(self.free_slots)
+
+    def alloc(self, need_size: int) -> Optional[List[int]]:
+        if need_size > len(self.free_slots):
+            return None
+
+        select_index = self.free_slots[:need_size]
+        self.free_slots = self.free_slots[need_size:]
+
+        return select_index
+
+    def free(self, free_index: Union[int, List[int]]):
+        if isinstance(free_index, (int,)):
+            self.free_slots.append(free_index)
+        else:
+            self.free_slots.extend(free_index)
+        self.minimax_cache[0][:, free_index] = 0
+
+    def clear(self):
+        self.free_slots = list(range(self.size))
+
+
 class HybridReqToTokenPool(ReqToTokenPool):
     """A memory pool that maps a request to its token locations."""
 
@@ -328,6 +385,98 @@ class HybridReqToTokenPool(ReqToTokenPool):
     def clear(self):
         super().clear()
         self.mamba_pool.clear()
+
+
+class MinimaxReqToTokenPool(ReqToTokenPool):
+    def __init__(
+        self,
+        size: int,
+        max_context_len: int,
+        device: str,
+        enable_memory_saver: bool,
+        state_dtype: torch.dtype,
+        linear_layers: List[int],
+        state_shape: Tuple[int, int, int],  # (H, D, D)
+    ):
+        super().__init__(
+            size=size,
+            max_context_len=max_context_len,
+            device=device,
+            enable_memory_saver=enable_memory_saver,
+        )
+
+        self.minimax_pool = MinimaxCachePool(
+            size=size,
+            state_dtype=state_dtype,
+            num_linear_layers=len(linear_layers),
+            state_shape=state_shape,
+            device=device,
+        )
+
+        self.minimax_map = {layer_id: i for i, layer_id in enumerate(linear_layers)}
+
+        self.device = device
+
+        self.req_index_to_minimax_index_mapping: torch.Tensor = torch.zeros(
+            size, dtype=torch.int32, device=self.device
+        )
+
+        self.rid_to_minimax_index_mapping: Dict[str, int] = {}
+        self.minimax_index_to_rid_mapping: Dict[int, str] = {}
+
+    def alloc(
+        self, need_size: int, reqs: Optional[List["Req"]] = None
+    ) -> Optional[List[int]]:
+        select_index = super().alloc(need_size)
+        if select_index == None:
+            return None
+
+        minimax_index = []
+        for req in reqs:
+            rid = req.rid
+            if rid in self.rid_to_minimax_index_mapping:
+                mid = self.rid_to_minimax_index_mapping[rid]
+            elif (mid := self.minimax_pool.alloc(1)) is not None:
+                mid = mid[0]
+                self.rid_to_minimax_index_mapping[rid] = mid
+                self.minimax_index_to_rid_mapping[mid] = rid
+            minimax_index.append(mid)
+
+        assert len(select_index) == len(
+            minimax_index
+        ), "Not enough Minimax cache slots. Increase --max-minimax-cache-size."
+
+        self.req_index_to_minimax_index_mapping[select_index] = torch.tensor(
+            minimax_index, dtype=torch.int32, device=self.device
+        )
+        return select_index
+
+    def get_minimax_indices(self, req_indices: torch.Tensor) -> torch.Tensor:
+        return self.req_index_to_minimax_index_mapping[req_indices]
+
+    def get_minimax_params(self, layer_id: int):
+        assert layer_id in self.minimax_map
+        return self.minimax_pool.get_minimax_params(self.minimax_map[layer_id])
+
+    def get_minimax_params_all_layers(self):
+        return self.minimax_pool.get_minimax_params_all_layers()
+
+    def free(self, free_index: Union[int, List[int]], free_mamba_cache: bool = True):
+        super().free(free_index)
+        if free_mamba_cache:
+            minimax_index = self.req_index_to_minimax_index_mapping[free_index]
+            minimax_index_list = minimax_index.tolist()
+            if isinstance(minimax_index_list, int):
+                minimax_index_list = [minimax_index_list]
+            self.minimax_pool.free(minimax_index_list)
+            for mid in minimax_index_list:
+                rid = self.minimax_index_to_rid_mapping[mid]
+                self.minimax_index_to_rid_mapping.pop(mid)
+                self.rid_to_minimax_index_mapping.pop(rid)
+
+    def clear(self):
+        super().clear()
+        self.minimax_pool.clear()
 
 
 class KVCache(abc.ABC):

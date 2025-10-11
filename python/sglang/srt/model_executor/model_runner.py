@@ -29,7 +29,12 @@ from typing import List, Optional, Tuple, Union
 import torch
 import torch.distributed as dist
 
-from sglang.srt.configs import FalconH1Config, NemotronHConfig, Qwen3NextConfig
+from sglang.srt.configs import (
+    FalconH1Config,
+    MiniMaxText01Config,
+    NemotronHConfig,
+    Qwen3NextConfig,
+)
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.configs.model_config import (
@@ -101,6 +106,7 @@ from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     HybridReqToTokenPool,
     MHATokenToKVPool,
+    MinimaxReqToTokenPool,
     MLATokenToKVPool,
     NSATokenToKVPool,
     ReqToTokenPool,
@@ -1303,10 +1309,13 @@ class ModelRunner:
             1 - self.mem_fraction_static
         )
         if config := self.mambaish_config:
+            mamba_cache_per_req = (
+                config.mamba2_cache_params.mamba_cache_per_req
+                if self.minimax_config is None
+                else config.minimax_cache_per_req
+            )
             rest_memory -= (
-                self.server_args.max_mamba_cache_size
-                * config.mamba2_cache_params.mamba_cache_per_req
-                / (1 << 30)
+                self.server_args.max_mamba_cache_size * mamba_cache_per_req / (1 << 30)
             )
         max_num_token = int(rest_memory * (1 << 30) // cell_size)
         return max_num_token
@@ -1326,8 +1335,15 @@ class ModelRunner:
         return None
 
     @property
+    def minimax_config(self):
+        config = self.model_config.hf_config
+        if isinstance(config, MiniMaxText01Config):
+            return config
+        return None
+
+    @property
     def mambaish_config(self):
-        return self.mamba2_config or self.hybrid_gdn_config
+        return self.mamba2_config or self.hybrid_gdn_config or self.minimax_config
 
     def set_num_token_hybrid(self):
         if (
@@ -1544,15 +1560,27 @@ class ModelRunner:
                     pre_alloc_size=pre_alloc_size,
                 )
             elif config := self.mambaish_config:
-                self.req_to_token_pool = HybridReqToTokenPool(
-                    size=max_num_reqs,
-                    max_context_len=self.model_config.context_len
-                    + extra_max_context_len,
-                    device=self.device,
-                    enable_memory_saver=self.server_args.enable_memory_saver,
-                    cache_params=config.mamba2_cache_params,
-                    speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
-                )
+                if self.minimax_config is not None:
+                    self.req_to_token_pool = MinimaxReqToTokenPool(
+                        size=max_num_reqs,
+                        max_context_len=self.model_config.context_len
+                        + extra_max_context_len,
+                        device=self.device,
+                        state_dtype=torch.float32,
+                        state_shape=config.state_shape,
+                        enable_memory_saver=self.server_args.enable_memory_saver,
+                        linear_layers=config.linear_layer_ids,
+                    )
+                else:
+                    self.req_to_token_pool = HybridReqToTokenPool(
+                        size=max_num_reqs,
+                        max_context_len=self.model_config.context_len
+                        + extra_max_context_len,
+                        device=self.device,
+                        enable_memory_saver=self.server_args.enable_memory_saver,
+                        cache_params=config.mamba2_cache_params,
+                        speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
+                    )
             else:
                 self.req_to_token_pool = ReqToTokenPool(
                     size=max_num_reqs,
