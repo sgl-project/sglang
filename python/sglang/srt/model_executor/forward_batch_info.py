@@ -322,6 +322,9 @@ class ForwardBatch:
     # For matryoshka embeddings
     dimensions: Optional[list[int]] = None
 
+    # For attention tp scattered
+    attn_input_tp_scattered: Optional[bool] = None
+
     @classmethod
     def init_new(
         cls,
