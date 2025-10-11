@@ -334,9 +334,10 @@ class TestPhi4MMServer(ImageOpenAITestMixin, AudioOpenAITestMixin):
 
 if __name__ == "__main__":
     del (
-        TestOpenAIOmniServerBase,
+        TestOpenAIMLLMServerBase,
         ImageOpenAITestMixin,
         VideoOpenAITestMixin,
         AudioOpenAITestMixin,
+        OmniOpenAITestMixin,
     )
     unittest.main()

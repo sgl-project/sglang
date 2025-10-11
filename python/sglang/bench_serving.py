@@ -671,7 +671,7 @@ def get_processor(
     if pretrained_model_name_or_path.endswith(
         ".json"
     ) or pretrained_model_name_or_path.endswith(".model"):
-        from sglang.srt.hf_transformers_utils import get_processor
+        from sglang.srt.utils.hf_transformers_utils import get_processor
 
         return get_processor(pretrained_model_name_or_path)
 
