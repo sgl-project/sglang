@@ -400,7 +400,6 @@ class ForwardBatch:
 
         # Init position information
         if ret.forward_mode.is_decode() or ret.forward_mode.is_target_verify():
-            # FIXME(lsyin): merge this `is_target_verify` into main to check correctness
             if ret.positions is None:
                 ret.positions = clamp_position(batch.seq_lens)
         else:
