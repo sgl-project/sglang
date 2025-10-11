@@ -208,7 +208,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             linear_attn_backend = LightningBackend(runner)
         else:
             raise ValueError(
-                "Expected hybrid GDN or NemotronH models, but got unknown model."
+                "Expected hybrid GDN, NemotronH, or MiniMax models, but got unknown model."
             )
         full_attn_layers = cfg.full_attention_layer_ids
         return HybridLinearAttnBackend(
