@@ -72,6 +72,7 @@ class TestPortArgs(unittest.TestCase):
         server_args.port = 30000
         server_args.nccl_port = None
         server_args.enable_dp_attention = True
+        server_args.enable_dp_attention_port_picking = False
         server_args.nnodes = 1
         server_args.dist_init_addr = "192.168.1.1:25000"
 
