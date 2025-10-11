@@ -89,7 +89,7 @@ python -m sglang_router.launch_router \
     --worker-urls https://api.openai.com
 
 # Route to custom OpenAI-compatible endpoint
-./target/release/sglang-router \
+python -m sglang_router.launch_router \
     --backend openai \
     --worker-urls http://my-openai-compatible-service:8000
 ```
