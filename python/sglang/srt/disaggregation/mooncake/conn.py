@@ -279,7 +279,7 @@ class MooncakeKVManager(CommonKVManager):
     ) -> int:
         """
         Generic KV cache transfer supporting both MHA and MLA architectures.
-        This method is used by both send_kvcache (full pool) and send_extra.
+        This method is used by both send_kvcache (full pool) and maybe_send_extra.
         """
         # Group by indices for optimization
         prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
@@ -636,25 +636,37 @@ class MooncakeKVManager(CommonKVManager):
             f"Received AUX_DATA for bootstrap_room {room} with length:{len(data)}"
         )
 
-    def send_extra(
+    def maybe_send_extra(
         self,
         req: TransferInfo,
         prefill_state_indices: list[int],
         dst_state_data_ptrs: list[int],
     ):
-        """Send extra pool data with type-specific handling."""
+        """Send state or extra pool data with type-specific handling."""
         state_type = getattr(self.kv_args, "state_type", "none")
 
         if state_type == "mamba":
-            return self._send_extra_mamba(
-                req, prefill_state_indices, dst_state_data_ptrs
+            return self._send_mamba_state(
+                req,
+                prefill_state_indices,
+                dst_state_data_ptrs,
             )
-        elif state_type == "swa":
-            return self._send_extra_swa(req, prefill_state_indices, dst_state_data_ptrs)
-        elif state_type == "nsa":
-            return self._send_extra_nsa(req, prefill_state_indices, dst_state_data_ptrs)
+        elif state_type in ["swa", "nsa"]:
+            prefill_state_indices = np.array(prefill_state_indices, dtype=np.int32)
+            dst_state_indices = np.array(req.dst_state_indices, dtype=np.int32)
+            return self._send_kvcache_generic(
+                mooncake_session_id=req.mooncake_session_id,
+                src_data_ptrs=self.kv_args.state_data_ptrs,
+                dst_data_ptrs=dst_state_data_ptrs,
+                item_lens=self.kv_args.state_item_lens,
+                prefill_data_indices=prefill_state_indices,
+                dst_data_indices=dst_state_indices,
+                executor=self.state_executors,
+            )
+        else:
+            return 0
 
-    def _send_extra_mamba(
+    def _send_mamba_state(
         self,
         req: TransferInfo,
         prefill_mamba_index: list[int],
@@ -674,45 +686,6 @@ class MooncakeKVManager(CommonKVManager):
             transfer_blocks.append((src_addr, dst_addr, length))
 
         return self._transfer_data(req.mooncake_session_id, transfer_blocks)
-
-    def _send_extra_swa(
-        self,
-        req: TransferInfo,
-        prefill_swa_kv_indices: list[int],
-        dst_state_data_ptrs: list[int],
-    ):
-        """Transfer SWA window KV cache (reuses optimized generic KV transfer logic)."""
-        prefill_kv_indices = np.array(prefill_swa_kv_indices, dtype=np.int32)
-        dst_kv_indices = np.array(req.dst_state_indices, dtype=np.int32)
-
-        return self._send_kvcache_generic(
-            mooncake_session_id=req.mooncake_session_id,
-            src_data_ptrs=self.kv_args.state_data_ptrs,
-            dst_data_ptrs=dst_state_data_ptrs,
-            item_lens=self.kv_args.state_item_lens,
-            prefill_data_indices=prefill_kv_indices,
-            dst_data_indices=dst_kv_indices,
-            executor=self.state_executors,
-        )
-
-    def _send_extra_nsa(
-        self,
-        req: TransferInfo,
-        prefill_nsa_indices: list[int],
-        dst_state_data_ptrs: list[int],
-    ):
-        prefill_state_indices = np.array(prefill_nsa_indices, dtype=np.int32)
-        dst_state_indices = np.array(req.dst_state_indices, dtype=np.int32)
-
-        return self._send_kvcache_generic(
-            mooncake_session_id=req.mooncake_session_id,
-            src_data_ptrs=self.kv_args.state_data_ptrs,
-            dst_data_ptrs=dst_state_data_ptrs,
-            item_lens=self.kv_args.state_item_lens,
-            prefill_data_indices=prefill_state_indices,
-            dst_data_indices=dst_state_indices,
-            executor=self.state_executors,
-        )
 
     def sync_status_to_decode_endpoint(
         self, remote: str, dst_port: int, room: int, status: int, prefill_rank: int
@@ -824,7 +797,7 @@ class MooncakeKVManager(CommonKVManager):
 
                         if kv_chunk.is_last:
                             if kv_chunk.state_indices is not None:
-                                self.send_extra(
+                                self.maybe_send_extra(
                                     req,
                                     kv_chunk.state_indices,
                                     target_rank_registration_info.dst_state_data_ptrs,
