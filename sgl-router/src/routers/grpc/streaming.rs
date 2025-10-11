@@ -195,41 +195,29 @@ impl StreamingProcessor {
         let system_fingerprint = dispatch.weight_version.as_deref();
 
         // Check parser availability once upfront (log warning only once per request)
-        let reasoning_parser_available = if separate_reasoning {
-            if let Some(parser_name) = self.configured_reasoning_parser.as_ref() {
-                self.reasoning_parser_factory
-                    .registry()
-                    .has_parser(parser_name)
-            } else {
-                self.reasoning_parser_factory
-                    .registry()
-                    .has_parser_for_model(model)
-            }
-        } else {
-            false
-        };
+        let reasoning_parser_available = separate_reasoning
+            && utils::check_reasoning_parser_availability(
+                &self.reasoning_parser_factory,
+                self.configured_reasoning_parser.as_ref(),
+                model,
+            );
 
-        let tool_parser_available = if tools.is_some() {
-            if let Some(parser_name) = self.configured_tool_parser.as_ref() {
-                self.tool_parser_factory.registry().has_parser(parser_name)
-            } else {
-                self.tool_parser_factory
-                    .registry()
-                    .has_parser_for_model(model)
-            }
-        } else {
-            false
-        };
+        let tool_parser_available = tools.is_some()
+            && utils::check_tool_parser_availability(
+                &self.tool_parser_factory,
+                self.configured_tool_parser.as_ref(),
+                model,
+            );
 
         if separate_reasoning && !reasoning_parser_available {
-            warn!(
+            debug!(
                 "No reasoning parser found for model '{}', skipping reasoning parsing",
                 model
             );
         }
 
         if tools.is_some() && !tool_parser_available {
-            warn!(
+            debug!(
                 "No tool parser found for model '{}', skipping tool call parsing",
                 model
             );
