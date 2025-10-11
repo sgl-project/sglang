@@ -715,7 +715,7 @@ impl RouterTrait for Router {
     }
 
     async fn get_engine_metrics(&self) -> Response {
-        let engine_responses = match self.fan_out_simple_request(None, "/metrics", Method::GET) {
+        let engine_responses = match self.fan_out_simple_request(None, "/metrics", Method::GET).await {
             Ok(x) => x,
             Err(e) => return e,
         };
