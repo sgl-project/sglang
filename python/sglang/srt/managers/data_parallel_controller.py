@@ -346,11 +346,7 @@ class DataParallelController:
                 self.workers
             )
         else:
-            # self.workers[req.bootstrap_room % len(self.workers)].send_pyobj(req)
-            self.workers[self.round_robin_counter].send_pyobj(req)
-            self.round_robin_counter = (self.round_robin_counter + 1) % len(
-                self.workers
-            )
+            self.workers[req.bootstrap_room % len(self.workers)].send_pyobj(req)
 
     def shortest_queue_scheduler(self, req):
         if self.maybe_external_dp_rank_routing(req):

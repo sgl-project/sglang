@@ -149,7 +149,7 @@ def cutlass_w4a8_moe(
     )
 
     c1 = torch.empty((m * topk, n * 2), device=device, dtype=torch.bfloat16)
-    c2 = torch.empty((m * topk, k), device=device, dtype=torch.bfloat16)
+    c2 = torch.zeros((m * topk, k), device=device, dtype=torch.bfloat16)
 
     cutlass_w4a8_moe_mm(
         c1,
