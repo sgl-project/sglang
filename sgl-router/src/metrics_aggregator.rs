@@ -19,17 +19,16 @@ pub fn aggregate_metrics(metric_packs: Vec<MetricPack>) -> anyhow::Result<String
         // Hacky workaround since the parser do not understand `:`, should improve later
         let metrics_text = metrics_text.replace(":", "_");
 
-        let exposition =
-            match openmetrics_parser::prometheus::parse_prometheus(&metrics_text) {
-                Ok(x) => x,
-                Err(err) => {
-                    warn!(
-                        "aggregate_metrics error when parsing text: pack={:?} err={:?}",
-                        metric_pack, err
-                    );
-                    continue;
-                }
-            };
+        let exposition = match openmetrics_parser::prometheus::parse_prometheus(&metrics_text) {
+            Ok(x) => x,
+            Err(err) => {
+                warn!(
+                    "aggregate_metrics error when parsing text: pack={:?} err={:?}",
+                    metric_pack, err
+                );
+                continue;
+            }
+        };
         let exposition = transform_metrics(exposition, &metric_pack.labels);
         expositions.push(exposition);
     }
@@ -42,9 +41,9 @@ pub fn aggregate_metrics(metric_packs: Vec<MetricPack>) -> anyhow::Result<String
 
 fn transform_metrics(
     mut exposition: PrometheusExposition,
-    extra_labels: &Vec<(String, String)>,
+    extra_labels: &[(String, String)],
 ) -> PrometheusExposition {
-    for (_, family) in &mut exposition.families {
+    for family in exposition.families.values_mut() {
         *family = family.with_labels(extra_labels.iter().map(|(k, v)| (k.as_str(), v.as_str())));
     }
     exposition
@@ -73,8 +72,8 @@ fn merge_family(a: PrometheusFamily, b: PrometheusFamily) -> anyhow::Result<Prom
         a.get_label_names(),
         b.get_label_names()
     );
-    Ok(a.with_samples(b.into_iter_samples())
-        .map_err(|e| anyhow::anyhow!("failed to merge samples: {e:?}"))?)
+    a.with_samples(b.into_iter_samples())
+        .map_err(|e| anyhow::anyhow!("failed to merge samples: {e:?}"))
 }
 
 pub fn try_reduce<I, T, E, F>(iterable: I, mut f: F) -> Result<Option<T>, E>
@@ -88,5 +87,5 @@ where
         Some(x) => x,
     };
 
-    Ok(Some(it.try_fold(first, |acc, item| f(acc, item))?))
+    Ok(Some(it.try_fold(first, f)?))
 }
