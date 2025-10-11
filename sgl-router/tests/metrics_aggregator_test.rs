@@ -158,6 +158,7 @@ sglang:num_queue_reqs{model_name="meta-llama/Llama-3.1-8B-Instruct"} 2826.0
     };
     let result = aggregate_metrics(vec![pack1, pack2]).unwrap();
     let expected = "TODO";
+    println!("result=\n{result}");
     assert_eq!(result.trim(), expected.trim());
 }
 
