@@ -33,6 +33,7 @@ suites = {
         TestFile("models/test_generation_models.py", 103),
         TestFile("models/test_nvidia_nemotron_nano_v2.py", 180),
         TestFile("models/test_qwen_models.py", 82),
+        TestFile("batch_invariant/test_batch_invariant_ops.py", 10),
         TestFile("models/test_reward_models.py", 132),
         TestFile("models/test_transformers_models.py", 320),
         TestFile("models/test_vlm_models.py", 741),

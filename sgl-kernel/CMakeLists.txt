@@ -287,6 +287,7 @@ set(SOURCES
     "csrc/gemm/nvfp4_scaled_mm_kernels.cu"
     "csrc/gemm/per_tensor_quant_fp8.cu"
     "csrc/gemm/per_token_group_quant_8bit.cu"
+    "csrc/gemm/per_token_group_quant_8bit_v2.cu"
     "csrc/gemm/per_token_quant_fp8.cu"
     "csrc/gemm/qserve_w4a8_per_chn_gemm.cu"
     "csrc/gemm/qserve_w4a8_per_group_gemm.cu"
