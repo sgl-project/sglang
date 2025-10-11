@@ -356,7 +356,7 @@ impl Router {
         headers: Option<&HeaderMap>,
         endpoint: &str,
         method: Method,
-    ) -> Result<Vec<(String, String)>, Response> {
+    ) -> Result<Vec<FanOutSimpleOutput>, Response> {
         let workers = self.worker_registry.get_all();
         if workers.is_empty() {
             return Err((StatusCode::SERVICE_UNAVAILABLE, "No available workers").into_response());
@@ -400,7 +400,10 @@ impl Router {
                     .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                 if let Ok(body_text) = res.text().await {
                     if status.is_success() {
-                        responses.push((worker_base_url, body_text));
+                        responses.push(FanOutSimpleOutput {
+                            worker_base_url,
+                            body_text,
+                        });
                     }
                 }
             }
@@ -698,6 +701,11 @@ impl Router {
     }
 }
 
+struct FanOutSimpleOutput {
+    worker_base_url: String,
+    body_text: String,
+}
+
 use async_trait::async_trait;
 
 #[async_trait]
@@ -711,7 +719,10 @@ impl RouterTrait for Router {
     }
 
     async fn get_engine_metrics(&self) -> Response {
-        let engine_responses = match self.fan_out_simple_request(None, "/metrics", Method::GET).await {
+        let engine_responses = match self
+            .fan_out_simple_request(None, "/metrics", Method::GET)
+            .await
+        {
             Ok(x) => x,
             Err(e) => return e,
         };
