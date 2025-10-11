@@ -124,7 +124,6 @@ def install_torch_compiled(
     backend_factory: Optional[Callable[[torch.fx.GraphModule, list], Callable]] = None,
     compile_config: CompilationConfig = None,
     fullgraph: bool = True,
-    use_custom_dispatcher: bool = True,
     graph_pool: Any = None,
 ):
     unbound_fwd = module.__class__.forward
@@ -201,18 +200,8 @@ def install_torch_compiled(
             if not state["compiled"]:
                 _ensure_compiled(self, *args, **kwargs)
 
-            # Prefer compiled callable for safety; switch to custom dispatcher if you really want it
-            if use_custom_dispatcher and compiled_codes:
-                cls = self.__class__
-                saved = cls.forward.__code__
-                try:
-                    cls.forward.__code__ = compiled_codes[0]
-                    return unbound_fwd(self, *args, **kwargs)
-                finally:
-                    cls.forward.__code__ = saved
-            else:
-                compiled_callable = state["compiled_callable"]
-                return compiled_callable(*args, **kwargs)
+            compiled_callable = state["compiled_callable"]
+            return compiled_callable(*args, **kwargs)
         else:
             # Explicitly run the original uncompiled forward
             return unbound_fwd(self, *args, **kwargs)

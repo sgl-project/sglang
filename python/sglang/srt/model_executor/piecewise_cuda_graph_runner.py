@@ -107,6 +107,15 @@ def _to_torch(model: torch.nn.Module, reverse: bool, num_tokens: int):
             _to_torch(sub, reverse, num_tokens)
 
 
+@contextmanager
+def patch_model(model: torch.nn.Module):
+    try:
+        _to_torch(model, reverse=False, num_tokens=16)
+        yield model
+    finally:
+        _to_torch(model, reverse=True, num_tokens=16)
+
+
 # Reuse this memory pool across all cuda graph runners.
 global_graph_memory_pool = None
 
@@ -144,19 +153,6 @@ class PiecewiseCudaGraphRunner:
             self.model_runner.server_args.piecewise_cuda_graph_tokens
         )
 
-        if get_global_graph_memory_pool() is None:
-            set_global_graph_memory_pool(self.device_module.graph_pool_handle())
-        # Set graph pool id globally to be able to use symmetric memory
-        set_graph_pool_id(get_global_graph_memory_pool())
-
-        install_torch_compiled(
-            self.model_runner.model.model,
-            fullgraph=True,
-            dynamic_arg_dims=None,
-            compile_config=self.compile_config,
-            graph_pool=get_global_graph_memory_pool(),
-        )
-
         # Batch sizes to capture
         self.capture_num_tokens = self.compile_config.get_capture_sizes()
         log_info_on_rank0(
@@ -182,8 +178,23 @@ class PiecewiseCudaGraphRunner:
             self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
         self.attention_layers = self.model_runner.attention_layers
-        with set_compiled(True):
-            self.warmup_and_capture()
+
+        if get_global_graph_memory_pool() is None:
+            set_global_graph_memory_pool(self.device_module.graph_pool_handle())
+        # Set graph pool id globally to be able to use symmetric memory
+        set_graph_pool_id(get_global_graph_memory_pool())
+
+        with patch_model(self.model_runner.model.model) as patched_model:
+            install_torch_compiled(
+                patched_model,
+                fullgraph=True,
+                dynamic_arg_dims=None,
+                compile_config=self.compile_config,
+                graph_pool=get_global_graph_memory_pool(),
+            )
+
+            with set_compiled(True):
+                self.warmup_and_capture()
 
         # Capture
         try:
