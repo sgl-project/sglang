@@ -745,10 +745,6 @@ class LightningBackend(AttentionBackend):
 
         (state,) = self.req_to_token_pool.get_minimax_params(layer_id)
         slot_id = self.forward_metadata.mamba_cache_indices
-        assert len(slot_id) == q.shape[0], (
-            f"slot_id length {len(slot_id)} does not match decode batch size {q.shape[0]}. "
-            "This indicates a bug in the upstream logic that should be investigated."
-        )
 
         hidden = linear_decode_forward_triton(q, k, v, state, slope_rate, slot_id, 32)
         return hidden

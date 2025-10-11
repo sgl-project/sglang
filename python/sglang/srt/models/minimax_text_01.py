@@ -475,14 +475,6 @@ class MiniMaxText01Attention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
-        # self.rotary_emb = get_rope(
-        #     head_dim,
-        #     rotary_dim=config.rotary_dim if hasattr(config, "rotary_dim") else head_dim,
-        #     max_position=max_position_embeddings,
-        #     base=int(rope_theta),
-        #     is_neox_style=True,
-        #     dtype=torch.float32,
-        # )
         self.rotary_emb = get_rope(
             head_size=self.head_dim,
             rotary_dim=rotary_dim,
@@ -1175,56 +1167,6 @@ class MiniMaxText01ForCausalLM(nn.Module):
 
             load_basic_weight(name, loaded_weight, self)
         return loaded_params
-
-
-def get_request_mapping_info(forward_batch: ForwardBatch, **kwargs):
-    """
-    Returns:
-        tuple: (request_ids_to_seq_ids, finished_requests_ids)
-    """
-    request_ids_to_seq_ids = {}
-    finished_requests_ids = []
-
-    # Priority 1: Get latest data from forward_batch
-    if (
-        hasattr(forward_batch, "request_ids_to_seq_ids")
-        and forward_batch.request_ids_to_seq_ids is not None
-    ):
-        request_ids_to_seq_ids = forward_batch.request_ids_to_seq_ids
-    else:
-        # Fallback: Get from kwargs
-        request_ids_to_seq_ids = kwargs.get("request_ids_to_seq_ids", {})
-
-    # Multiple checks for finished_requests_ids
-    # Priority 1: Get latest finished requests from forward_batch
-    if (
-        hasattr(forward_batch, "finished_requests_ids")
-        and forward_batch.finished_requests_ids is not None
-        and len(forward_batch.finished_requests_ids) > 0
-    ):
-        finished_requests_ids = forward_batch.finished_requests_ids
-    else:
-        # Priority 2: Get from kwargs
-        finished_requests_ids = kwargs.get("finished_requests_ids", [])
-
-        # Priority 3: Dynamic detection through request status
-        if not finished_requests_ids and hasattr(forward_batch, "reqs"):
-            for req in forward_batch.reqs:
-                if (
-                    hasattr(req, "finished")
-                    and callable(req.finished)
-                    and req.finished()
-                ):
-                    if hasattr(req, "rid"):
-                        finished_requests_ids.append(req.rid)
-
-    # Ensure return values are not None
-    if finished_requests_ids is None:
-        finished_requests_ids = []
-    if request_ids_to_seq_ids is None:
-        request_ids_to_seq_ids = {}
-
-    return request_ids_to_seq_ids, finished_requests_ids
 
 
 class MiniMaxM1ForCausalLM(MiniMaxText01ForCausalLM):
