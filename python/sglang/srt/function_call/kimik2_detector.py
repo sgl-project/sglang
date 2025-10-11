@@ -69,24 +69,19 @@ class KimiK2Detector(BaseFormatDetector):
             return StreamingParseResult(normal_text=text, calls=[])
 
         try:
-            # Try complete tool calls first
-            function_call_tuples = self.tool_call_regex.findall(text)
-
-            # Fallback: incomplete tool calls (missing end token)
-            if not function_call_tuples:
-                incomplete_regex = re.compile(
-                    r"<\|tool_call_begin\|>\s*(?P<tool_call_id>[\w\.]+:\d+)\s*"
-                    r"<\|tool_call_argument_begin\|>\s*(?P<function_arguments>\{(.*)"
-                )
-                function_call_tuples = incomplete_regex.findall(text)
-                if function_call_tuples:
-                    logger.warning(
-                        "Detected incomplete tool call - generation was likely truncated."
-                    )
-
             tool_calls = []
-            for match in function_call_tuples:
-                function_id, function_args = match
+
+            # Match each tool call individually, both complete and incomplete
+            pattern = re.compile(
+                r"<\|tool_call_begin\|>\s*(?P<tool_call_id>[\w\.]+:\d+)\s*"
+                r"<\|tool_call_argument_begin\|>\s*(?P<function_arguments>\{.*?)(?:<\|tool_call_end\|>|<\|tool_call_begin\|>|<\|tool_calls_section_end\|>|$)",
+                re.DOTALL,
+            )
+
+            for match in pattern.finditer(text):
+                function_id = match.group("tool_call_id")
+                function_args = match.group("function_arguments").strip()
+
                 m = self.tool_call_id_regex.match(function_id)
                 if not m:
                     logger.warning("Unexpected tool_call_id format: %s", function_id)
@@ -113,19 +108,17 @@ class KimiK2Detector(BaseFormatDetector):
                                 ToolCallItem(
                                     tool_index=function_idx,
                                     name=function_name,
-                                    parameters=function_args,
+                                    parameters=repaired,
                                 )
                             )
                         else:
                             logger.error(
                                 f"Invalid JSON in tool call {function_name=}: {function_args=} and failed to repair"
                             )
-                            continue
                     except Exception:
                         logger.error(
                             f"Invalid JSON in tool call {function_name}: {function_args}, repaired JSON invalid"
                         )
-                        continue
 
             content = text[: text.find(self.bot_token)]
             return StreamingParseResult(normal_text=content, calls=tool_calls)
