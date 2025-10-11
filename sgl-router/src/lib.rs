@@ -49,7 +49,7 @@ pub enum HistoryBackendType {
 }
 
 #[pyclass]
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct PyOracleConfig {
     #[pyo3(get, set)]
     pub wallet_path: Option<String>,
@@ -65,6 +65,20 @@ pub struct PyOracleConfig {
     pub pool_max: usize,
     #[pyo3(get, set)]
     pub pool_timeout_secs: u64,
+}
+
+impl std::fmt::Debug for PyOracleConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PyOracleConfig")
+            .field("wallet_path", &self.wallet_path)
+            .field("connect_descriptor", &"<redacted>")
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .field("pool_min", &self.pool_min)
+            .field("pool_max", &self.pool_max)
+            .field("pool_timeout_secs", &self.pool_timeout_secs)
+            .finish()
+    }
 }
 
 #[pymethods]
