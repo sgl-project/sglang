@@ -94,9 +94,6 @@ if [ "$RUN_DEEPSEEK_V32" = "1" ]; then
     git checkout ${FAST_HADAMARD_TRANSFORM_COMMIT}
     $PIP_CMD install . $PIP_INSTALL_SUFFIX --no-build-isolation
     cd ..
-
-    # Install tilelang
-    $PIP_CMD install tilelang==0.1.6.post1 $PIP_INSTALL_SUFFIX
 fi
 
 # Show current packages
