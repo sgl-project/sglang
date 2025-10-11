@@ -300,6 +300,9 @@ class ForwardBatch:
     tbo_parent_token_range: Optional[Tuple[int, int]] = None
     tbo_children: Optional[List[ForwardBatch]] = None
 
+    # For attention tp scattered
+    attn_input_tp_scattered: Optional[bool] = None
+
     @classmethod
     def init_new(
         cls,

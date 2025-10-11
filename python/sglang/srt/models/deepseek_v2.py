@@ -60,6 +60,9 @@ from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
     enable_moe_dense_fully_dp,
+    support_attn_input_tp_scattered,
+    tp_all_gather_qkv_latent,
+    use_attn_input_tp_scattered,
 )
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
@@ -1310,13 +1313,19 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         # when hidden_states is a tuple of tensors, the tuple will include quantized weight and scale tensor
         if isinstance(hidden_states, tuple):
-            if hidden_states[0].shape[0] == 0:
+            if (
+                not forward_batch.attn_input_tp_scattered
+                and hidden_states[0].shape[0] == 0
+            ):
                 assert (
                     not self.o_proj.reduce_results
                 ), "short-circuiting allreduce will lead to hangs"
                 return hidden_states[0]
         else:
-            if hidden_states.shape[0] == 0:
+            if (
+                not forward_batch.attn_input_tp_scattered
+                and hidden_states.shape[0] == 0
+            ):
                 assert (
                     not self.o_proj.reduce_results
                 ), "short-circuiting allreduce will lead to hangs"
@@ -1392,6 +1401,29 @@ class DeepseekV2AttentionMLA(nn.Module):
         else:
             raise NotImplementedError
 
+    def apply_fused_qkv_a_proj_with_mqa(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
+        if (
+            (not isinstance(hidden_states, tuple))
+            and hidden_states.shape[0] <= 16
+            and self.use_min_latency_fused_a_gemm
+        ):
+            qkv_latent = dsv3_fused_a_gemm(
+                hidden_states, self.fused_qkv_a_proj_with_mqa.weight.T
+            )
+        else:
+            qkv_latent = self.fused_qkv_a_proj_with_mqa(hidden_states)[0]
+
+        if forward_batch.attn_input_tp_scattered:
+            qkv_latent = tp_all_gather_qkv_latent(
+                qkv_latent,
+                forward_batch,
+            )
+        return qkv_latent
+
     def forward_normal_prepare(
         self,
         positions: torch.Tensor,
@@ -1400,7 +1432,9 @@ class DeepseekV2AttentionMLA(nn.Module):
         zero_allocator: BumpAllocator,
     ):
         if self.q_lora_rank is not None:
-            q, latent_cache = self.fused_qkv_a_proj_with_mqa(hidden_states)[0].split(
+            q, latent_cache = self.apply_fused_qkv_a_proj_with_mqa(
+                hidden_states, forward_batch
+            ).split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
             )
             q = self.q_a_layernorm(q)
@@ -1482,17 +1516,9 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         q_lora = None
         if self.q_lora_rank is not None:
-            if (
-                (not isinstance(hidden_states, tuple))
-                and hidden_states.shape[0] <= 16
-                and self.use_min_latency_fused_a_gemm
-            ):
-                fused_qkv_a_proj_out = dsv3_fused_a_gemm(
-                    hidden_states, self.fused_qkv_a_proj_with_mqa.weight.T
-                )
-            else:
-                fused_qkv_a_proj_out = self.fused_qkv_a_proj_with_mqa(hidden_states)[0]
-            q, latent_cache = fused_qkv_a_proj_out.split(
+            q, latent_cache = self.apply_fused_qkv_a_proj_with_mqa(
+                hidden_states, forward_batch
+            ).split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
             )
             k_nope = latent_cache[..., : self.kv_lora_rank]
@@ -2600,6 +2626,11 @@ class DeepseekV2Model(nn.Module):
         self.first_k_dense_replace = config.first_k_dense_replace
         self.pp_group = get_pp_group()
 
+        q_lora_rank = config.q_lora_rank if hasattr(config, "q_lora_rank") else None
+        self.allow_attn_input_tp_scattered = support_attn_input_tp_scattered(
+            q_lora_rank,
+            is_deepseek_nsa(config),
+        )
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
@@ -2694,6 +2725,11 @@ class DeepseekV2Model(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        forward_batch.attn_input_tp_scattered = (
+            self.allow_attn_input_tp_scattered
+            and use_attn_input_tp_scattered(forward_batch)
+        )
+
         total_num_layers = self.end_layer - self.start_layer
         device = input_embeds.device if input_embeds is not None else input_ids.device
         zero_allocator = BumpAllocator(
@@ -2719,7 +2755,8 @@ class DeepseekV2Model(nn.Module):
 
         if self.pp_group.is_first_rank:
             if input_embeds is None:
-                hidden_states = self.embed_tokens(input_ids)
+                reduce_result = not forward_batch.attn_input_tp_scattered
+                hidden_states = self.embed_tokens(input_ids, reduce_result)
             else:
                 hidden_states = input_embeds
             residual = None
