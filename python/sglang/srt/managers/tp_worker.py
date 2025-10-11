@@ -266,10 +266,16 @@ class TpModelWorker:
 
             if model_worker_batch.is_prefill_only:
                 # For prefill-only requests, create dummy token IDs on CPU
-                batch_result.next_token_ids = torch.zeros_like(
-                    model_worker_batch.input_ids, dtype=torch.long
+                # The size should match the batch size (number of sequences), not total tokens
+                batch_result.next_token_ids = torch.zeros(
+                    len(model_worker_batch.seq_lens),
+                    dtype=torch.long,
+                    device=model_worker_batch.input_ids.device,
                 )
-                if model_worker_batch.return_logprob:
+                if (
+                    model_worker_batch.return_logprob
+                    and logits_output.next_token_logits is not None
+                ):
                     # NOTE: Compute logprobs without full sampling
                     self.model_runner.compute_logprobs_only(
                         logits_output, model_worker_batch

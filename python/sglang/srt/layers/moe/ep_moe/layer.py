@@ -30,9 +30,9 @@ from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptNvFp4FusedMoEMethod,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.offloader import get_offloader
 from sglang.srt.single_batch_overlap import DownGemmOverlapArgs
 from sglang.srt.utils import ceil_div, dispose_tensor, get_bool_env_var, is_hip, is_npu
+from sglang.srt.utils.offloader import get_offloader
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (

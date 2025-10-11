@@ -102,6 +102,19 @@ BASIC_TESTS = [
         ],
         op_sequence=[
             Operation(
+                type=OperationType.LOAD,
+                data="philschmid/code-llama-3-1-8b-text-to-sql-lora",
+                expected_error="already loaded",
+            ),
+            Operation(
+                type=OperationType.UNLOAD,
+                data="philschmid/code-llama-3-1-8b-text-to-sql-lora",
+            ),
+            Operation(
+                type=OperationType.LOAD,
+                data="philschmid/code-llama-3-1-8b-text-to-sql-lora",
+            ),
+            Operation(
                 type=OperationType.FORWARD,
                 data=create_batch_data(
                     [
@@ -223,6 +236,19 @@ BASIC_TESTS = [
             Operation(
                 type=OperationType.LOAD,
                 data="pbevan11/llama-3.1-8b-ocr-correction",
+            ),
+            Operation(
+                type=OperationType.LOAD,
+                data="philschmid/code-llama-3-1-8b-text-to-sql-lora",
+                expected_error="already loaded",
+            ),
+            Operation(
+                type=OperationType.UNLOAD,
+                data="philschmid/code-llama-3-1-8b-text-to-sql-lora",
+            ),
+            Operation(
+                type=OperationType.LOAD,
+                data="philschmid/code-llama-3-1-8b-text-to-sql-lora",
             ),
             Operation(
                 type=OperationType.FORWARD,

@@ -107,7 +107,7 @@ jobs:
 
       - name: Install SGLang dependencies
         run: |
-          sudo bash scripts/ci/ci_install_dependency.sh
+          sudo --preserve-env=PATH bash scripts/ci/ci_install_dependency.sh
 
       - name: Build python binding
         run: |

@@ -12,7 +12,10 @@ from sglang.srt.custom_op import CustomOp
 from sglang.srt.utils import add_prefix, align, is_cuda, is_hip, is_npu
 
 if is_cuda():
-    import deep_gemm
+    try:
+        import deep_gemm
+    except ImportError as e:
+        deep_gemm = e
 
 from sglang.srt.layers.attention.nsa.utils import NSA_DUAL_STREAM, NSA_USE_REAL_INDEXER
 from sglang.srt.layers.dp_attention import get_attention_tp_group
@@ -502,8 +505,10 @@ class Indexer(CustomOp):
         forward_batch: ForwardBatch,
         layer_id: int,
     ) -> Optional[torch.Tensor]:
-        if not is_npu():
+        if is_hip():
             from sglang.srt.layers.attention.nsa.tilelang_kernel import act_quant
+        elif not is_npu():
+            from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
 
         if TYPE_CHECKING:
             assert isinstance(forward_batch.token_to_kv_pool, NSATokenToKVPool)
