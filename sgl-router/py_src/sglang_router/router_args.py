@@ -524,19 +524,19 @@ class RouterArgs:
         parser.add_argument(
             f"--{prefix}oracle-pool-min",
             type=int,
-            default=RouterArgs.oracle_pool_min,
+            default=int(os.getenv("ATP_POOL_MIN", RouterArgs.oracle_pool_min)),
             help="Minimum Oracle connection pool size (default: 1, env: ATP_POOL_MIN)",
         )
         parser.add_argument(
             f"--{prefix}oracle-pool-max",
             type=int,
-            default=RouterArgs.oracle_pool_max,
+            default=int(os.getenv("ATP_POOL_MAX", RouterArgs.oracle_pool_max)),
             help="Maximum Oracle connection pool size (default: 16, env: ATP_POOL_MAX)",
         )
         parser.add_argument(
             f"--{prefix}oracle-pool-timeout-secs",
             type=int,
-            default=RouterArgs.oracle_pool_timeout_secs,
+            default=int(os.getenv("ATP_POOL_TIMEOUT_SECS", RouterArgs.oracle_pool_timeout_secs)),
             help="Oracle connection pool timeout in seconds (default: 30, env: ATP_POOL_TIMEOUT_SECS)",
         )
 
