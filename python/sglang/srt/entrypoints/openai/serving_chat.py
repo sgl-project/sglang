@@ -7,6 +7,7 @@ import time
 import uuid
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
 
+from cllmv import generate as get_chutes_verification_value
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 from jsonschema import Draft202012Validator, SchemaError
@@ -45,7 +46,6 @@ from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.utils import convert_json_schema_to_str
-from cllmv import generate as get_chutes_verification_value
 
 if TYPE_CHECKING:
     from sglang.srt.managers.template_manager import TemplateManager
@@ -501,7 +501,9 @@ class OpenAIServingChat(OpenAIServingBase):
                         choices=[choice_data],
                         model=request.model,
                     )
-                    chunk.chutes_verification = get_chutes_verification_value(chunk.id, chunk.created, None)
+                    chunk.chutes_verification = get_chutes_verification_value(
+                        chunk.id, chunk.created, None
+                    )
                     yield f"data: {chunk.model_dump_json()}\n\n"
 
                 stream_buffer = stream_buffers.get(index, "")
@@ -525,7 +527,9 @@ class OpenAIServingChat(OpenAIServingBase):
                             choices=[choice_data],
                             model=request.model,
                         )
-                        chunk.chutes_verification = get_chutes_verification_value(chunk.id, chunk.created, reasoning_text)
+                        chunk.chutes_verification = get_chutes_verification_value(
+                            chunk.id, chunk.created, reasoning_text
+                        )
                         yield f"data: {chunk.model_dump_json()}\n\n"
 
                 # Handle tool calls
@@ -570,7 +574,9 @@ class OpenAIServingChat(OpenAIServingBase):
                             choices=[choice_data],
                             model=request.model,
                         )
-                        chunk.chutes_verification = get_chutes_verification_value(chunk.id, chunk.created, delta)
+                        chunk.chutes_verification = get_chutes_verification_value(
+                            chunk.id, chunk.created, delta
+                        )
                         yield f"data: {chunk.model_dump_json()}\n\n"
 
             # Send finish_reason chunks for each index that completed
@@ -602,7 +608,9 @@ class OpenAIServingChat(OpenAIServingBase):
                     model=request.model,
                     usage=None,
                 )
-                finish_reason_chunk.chutes_verification = get_chutes_verification_value(finish_reason_chunk.id, finish_reason_chunk.created, None)
+                finish_reason_chunk.chutes_verification = get_chutes_verification_value(
+                    finish_reason_chunk.id, finish_reason_chunk.created, None
+                )
 
                 yield f"data: {finish_reason_chunk.model_dump_json()}\n\n"
 
@@ -629,7 +637,13 @@ class OpenAIServingChat(OpenAIServingBase):
                             ],
                             model=request.model,
                         )
-                        hidden_states_chunk.chutes_verification = get_chutes_verification_value(hidden_states_chunk.id, hidden_states_chunk.created, None)
+                        hidden_states_chunk.chutes_verification = (
+                            get_chutes_verification_value(
+                                hidden_states_chunk.id,
+                                hidden_states_chunk.created,
+                                None,
+                            )
+                        )
                         yield f"data: {hidden_states_chunk.model_dump_json()}\n\n"
 
             # Additional usage chunk
@@ -648,7 +662,9 @@ class OpenAIServingChat(OpenAIServingBase):
                     model=request.model,
                     usage=usage,
                 )
-                usage_chunk.chutes_verification = get_chutes_verification_value(usage_chunk.id, usage_chunk.created, None)
+                usage_chunk.chutes_verification = get_chutes_verification_value(
+                    usage_chunk.id, usage_chunk.created, None
+                )
                 yield f"data: {usage_chunk.model_dump_json()}\n\n"
 
         except ValueError as e:
@@ -777,7 +793,9 @@ class OpenAIServingChat(OpenAIServingBase):
             metadata={"weight_version": ret[0]["meta_info"]["weight_version"]},
         )
         if choices:
-            chunk.chutes_verification = get_chutes_verification_value(chunk.id, chunk.created, choices[0].message.content)
+            chunk.chutes_verification = get_chutes_verification_value(
+                chunk.id, chunk.created, choices[0].message.content
+            )
         return chunk
 
     def _process_logprobs_tokens(
@@ -1055,7 +1073,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 choices=[choice_data],
                 model=request.model,
             )
-            chunk.chutes_verification = get_chutes_verification_value(chunk.id, chunk.created, normal_text)
+            chunk.chutes_verification = get_chutes_verification_value(
+                chunk.id, chunk.created, normal_text
+            )
             yield f"data: {chunk.model_dump_json()}\n\n"
 
         # Yield tool calls

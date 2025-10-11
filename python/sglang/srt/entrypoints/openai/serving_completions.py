@@ -4,6 +4,7 @@ import logging
 import time
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
 
+from cllmv import generate as get_chutes_verification_value
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
@@ -26,8 +27,6 @@ from sglang.srt.parser.code_completion_parser import (
     generate_completion_prompt_from_request,
 )
 from sglang.utils import convert_json_schema_to_str
-from cllmv import generate as get_chutes_verification_value
-
 
 if TYPE_CHECKING:
     from sglang.srt.managers.template_manager import TemplateManager
@@ -259,7 +258,9 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     choices=[choice_data],
                     model=request.model,
                 )
-                chunk.chutes_verification = get_chutes_verification_value(chunk.id, chunk.created, delta)
+                chunk.chutes_verification = get_chutes_verification_value(
+                    chunk.id, chunk.created, delta
+                )
                 yield f"data: {chunk.model_dump_json()}\n\n"
 
             if request.return_hidden_states and hidden_states:
@@ -284,7 +285,13 @@ class OpenAIServingCompletion(OpenAIServingBase):
                             ],
                             model=request.model,
                         )
-                        hidden_states_chunk.chutes_verification = get_chutes_verification_value(hidden_states_chunk.id, hidden_states_chunk.created, None)
+                        hidden_states_chunk.chutes_verification = (
+                            get_chutes_verification_value(
+                                hidden_states_chunk.id,
+                                hidden_states_chunk.created,
+                                None,
+                            )
+                        )
                         yield f"data: {hidden_states_chunk.model_dump_json()}\n\n"
 
             # Handle final usage chunk
@@ -303,7 +310,9 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     model=request.model,
                     usage=usage,
                 )
-                final_usage_chunk.chutes_verification = get_chutes_verification_value(final_usage_chunk.id, final_usage_chunk.created, None)
+                final_usage_chunk.chutes_verification = get_chutes_verification_value(
+                    final_usage_chunk.id, final_usage_chunk.created, None
+                )
                 final_usage_data = final_usage_chunk.model_dump_json(exclude_none=True)
                 yield f"data: {final_usage_data}\n\n"
 
@@ -415,9 +424,10 @@ class OpenAIServingCompletion(OpenAIServingBase):
             usage=usage,
             metadata={"weight_version": ret[0]["meta_info"]["weight_version"]},
         )
-        chunk.chutes_verification = get_chutes_verification_value(chunk.id, chunk.created, choices[0].text)
+        chunk.chutes_verification = get_chutes_verification_value(
+            chunk.id, chunk.created, choices[0].text
+        )
         return chunk
-
 
     def _get_echo_text(self, request: CompletionRequest, index: int) -> str:
         """Get echo text for streaming response"""

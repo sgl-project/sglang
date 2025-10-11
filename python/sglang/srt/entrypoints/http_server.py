@@ -1290,8 +1290,8 @@ def launch_server(
     1. The HTTP server, Engine, and TokenizerManager both run in the main process.
     2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
-    os.environ['SGL_MODEL_NAME'] = server_args.model_path
-    os.environ['SGL_REVISION'] = server_args.revision
+    os.environ["SGL_MODEL_NAME"] = server_args.model_path
+    os.environ["SGL_REVISION"] = server_args.revision
 
     if server_args.tokenizer_worker_num > 1:
         port_args = PortArgs.init_new(server_args)

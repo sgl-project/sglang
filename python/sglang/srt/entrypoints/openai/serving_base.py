@@ -3,10 +3,10 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-import jinja2
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Optional, Union
 
+import jinja2
 from fastapi import HTTPException, Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 

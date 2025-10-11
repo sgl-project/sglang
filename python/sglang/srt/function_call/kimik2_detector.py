@@ -3,6 +3,8 @@ import logging
 import re
 from typing import List
 
+from json_repair import repair_json
+
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
@@ -61,22 +63,26 @@ class KimiK2Detector(BaseFormatDetector):
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """
-        One-time parsing: Detects and parses tool calls in the provided text.
-
-        :param text: The complete text to parse.
-        :param tools: List of available tools.
-        :return: ParseResult indicating success or failure, consumed text, leftover text, and parsed calls.
+        One-time parsing with fallback for incomplete tool calls.
         """
         if self.bot_token not in text:
             return StreamingParseResult(normal_text=text, calls=[])
+
         try:
-            # there are two possible captures - between tags, or between a
-            # tag and end-of-string so the result of
-            # findall is an array of tuples where one is a function call and
-            # the other is None
+            # Try complete tool calls first
             function_call_tuples = self.tool_call_regex.findall(text)
 
-            logger.debug("function_call_tuples: %s", function_call_tuples)
+            # Fallback: incomplete tool calls (missing end token)
+            if not function_call_tuples:
+                incomplete_regex = re.compile(
+                    r"<\|tool_call_begin\|>\s*(?P<tool_call_id>[\w\.]+:\d+)\s*"
+                    r"<\|tool_call_argument_begin\|>\s*(?P<function_arguments>\{(.*)"
+                )
+                function_call_tuples = incomplete_regex.findall(text)
+                if function_call_tuples:
+                    logger.warning(
+                        "Detected incomplete tool call - generation was likely truncated."
+                    )
 
             tool_calls = []
             for match in function_call_tuples:
@@ -88,22 +94,44 @@ class KimiK2Detector(BaseFormatDetector):
                 function_name = m.group("name")
                 function_idx = int(m.group("index"))
 
-                logger.info(f"function_name {function_name}")
-
-                tool_calls.append(
-                    ToolCallItem(
-                        tool_index=function_idx,
-                        name=function_name,
-                        parameters=function_args,
+                # Validate JSON
+                try:
+                    json.loads(function_args)
+                    tool_calls.append(
+                        ToolCallItem(
+                            tool_index=function_idx,
+                            name=function_name,
+                            parameters=function_args,
+                        )
                     )
-                )
+                except Exception:
+                    try:
+                        repaired = repair_json(function_args)
+                        if repaired:
+                            json.loads(repaired)
+                            tool_calls.append(
+                                ToolCallItem(
+                                    tool_index=function_idx,
+                                    name=function_name,
+                                    parameters=function_args,
+                                )
+                            )
+                        else:
+                            logger.error(
+                                f"Invalid JSON in tool call {function_name=}: {function_args=} and failed to repair"
+                            )
+                            continue
+                    except Exception:
+                        logger.error(
+                            f"Invalid JSON in tool call {function_name}: {function_args}, repaired JSON invalid"
+                        )
+                        continue
 
             content = text[: text.find(self.bot_token)]
             return StreamingParseResult(normal_text=content, calls=tool_calls)
 
         except Exception as e:
             logger.error(f"Error in detect_and_parse: {e}")
-            # return the normal text if parsing fails
             return StreamingParseResult(normal_text=text)
 
     def parse_streaming_increment(
