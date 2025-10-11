@@ -28,8 +28,7 @@ ENV HOME=/home/sdp
 WORKDIR /home/sdp
 
 USER root
-RUN apt-get update && 
-    apt-get install -y libze-dev intel-ocloc
+RUN apt-get update && apt-get install -y libze-dev intel-ocloc
 
 RUN curl -fsSL -v -o miniforge.sh -O https://github.com/conda-forge/miniforge/releases/download/25.1.1-0/Miniforge3-Linux-x86_64.sh && \
     bash miniforge.sh -b -p ./miniforge3 && \
