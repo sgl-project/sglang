@@ -1,13 +1,12 @@
 #[path = "../src/metrics_aggregator.rs"]
 mod metrics_aggregator;
 
-use std::collections::HashMap;
 use metrics_aggregator::{aggregate_metrics, MetricPack};
 
 #[test]
 fn test_aggregate_simple() {
     let pack1 = MetricPack {
-        labels: HashMap::from([("source".to_string(), "worker1".to_string())]),
+        labels: vec![("source".to_string(), "worker1".to_string())],
         metrics_text: r#"
 # HELP http_requests_total The total number of HTTP requests.
 # TYPE http_requests_total counter
@@ -16,7 +15,7 @@ http_requests_total{method="post",code="400"} 3
 "#.to_string(),
     };
     let pack2 = MetricPack {
-        labels: HashMap::from([("source".to_string(), "worker2".to_string())]),
+        labels: vec![("source".to_string(), "worker2".to_string())],
         metrics_text: r#"
 # HELP http_requests_total The total number of HTTP requests.
 # TYPE http_requests_total counter
@@ -37,7 +36,7 @@ http_requests_total{code="200",method="post",source="worker2"} 500
 #[test]
 fn test_aggregate_multiple_metrics() {
     let pack1 = MetricPack {
-        labels: HashMap::from([("source".to_string(), "w1".to_string())]),
+        labels: vec![("source".to_string(), "w1".to_string())],
         metrics_text: r#"
 # TYPE metric_a gauge
 metric_a{dim="x"} 1.0
@@ -46,7 +45,7 @@ metric_b_total 10
 "#.to_string(),
     };
     let pack2 = MetricPack {
-        labels: HashMap::from([("source".to_string(), "w2".to_string())]),
+        labels: vec![("source".to_string(), "w2".to_string())],
         metrics_text: r#"
 # TYPE metric_a gauge
 metric_a{dim="y"} 2.0
@@ -78,11 +77,11 @@ fn test_empty_input() {
 #[test]
 fn test_invalid_metrics_are_skipped() {
     let pack1 = MetricPack {
-        labels: HashMap::new(),
+        labels: vec![],
         metrics_text: "invalid metrics text".to_string(),
     };
     let pack2 = MetricPack {
-        labels: HashMap::from([("source".to_string(), "worker1".to_string())]),
+        labels: vec![("source".to_string(), "worker1".to_string())],
         metrics_text: "# TYPE valid_metric gauge\nvalid_metric 123\n".to_string(),
     };
     let result = aggregate_metrics(vec![pack1, pack2]).unwrap();
@@ -95,7 +94,7 @@ valid_metric{source="worker1"} 123
 #[test]
 fn test_real() {
     let pack1 = MetricPack {
-        labels: HashMap::new(),
+        labels: vec![],
         // https://docs.sglang.ai/references/production_metrics.html
         metrics_text: r###"
 # HELP sglang:prompt_tokens_total Number of prefill tokens processed.
@@ -158,7 +157,7 @@ sglang:num_queue_reqs{model_name="meta-llama/Llama-3.1-8B-Instruct"} 2826.0
 "###.to_string(),
     };
     let pack2 = MetricPack {
-        labels: HashMap::from([("source".to_string(), "worker1".to_string())]),
+        labels: vec![("source".to_string(), "worker1".to_string())],
         metrics_text: pack1.metrics_text.clone(),
     };
     let result = aggregate_metrics(vec![pack1, pack2]).unwrap();

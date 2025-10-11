@@ -4,7 +4,7 @@ use tracing::warn;
 
 #[derive(Debug)]
 pub struct MetricPack {
-    pub labels: HashMap<String, String>,
+    pub labels: Vec<(String, String)>,
     pub metrics_text: String,
 }
 
@@ -38,7 +38,7 @@ pub fn aggregate_metrics(metric_packs: Vec<MetricPack>) -> anyhow::Result<String
 
 fn transform_metrics(
     mut exposition: PrometheusExposition,
-    extra_labels: &HashMap<String, String>,
+    extra_labels: &Vec<(String, String)>,
 ) -> PrometheusExposition {
     for (_, family) in &mut exposition.families {
         *family = family.with_labels(extra_labels.iter().map(|(k, v)| (k.as_str(), v.as_str())));

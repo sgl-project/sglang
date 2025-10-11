@@ -723,7 +723,7 @@ impl RouterTrait for Router {
         let engine_responses = engine_responses
             .into_iter()
             .map(|(worker_base_url, metrics_text)| MetricPack {
-                labels: HashMap::from([("worker_addr".into(), worker_base_url)]),
+                labels: vec![("worker_addr".into(), worker_base_url)],
                 metrics_text,
             })
             .collect();
