@@ -328,6 +328,8 @@ class GroupCoordinator:
         if use_custom_allreduce and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
             if torch_compile is not None and torch_compile:
+                # For piecewise CUDA graph, the requirement for custom allreduce is larger to
+                # avoid illegal cuda memory access.
                 ca_max_size = 256 * 1024 * 1024
             else:
                 ca_max_size = 8 * 1024 * 1024

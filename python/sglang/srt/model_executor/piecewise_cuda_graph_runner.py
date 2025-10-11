@@ -202,7 +202,7 @@ class PiecewiseCudaGraphRunner:
                 self.capture()
         except RuntimeError as e:
             raise Exception(
-                f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
+                f"Capture cuda graph failed: {e}\n{PIECEWISE_CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
 
         self.raw_num_tokens = 0
@@ -523,11 +523,10 @@ class PiecewiseCudaGraphRunner:
         return spec_info
 
 
-CUDA_GRAPH_CAPTURE_FAILED_MSG = (
+PIECEWISE_CUDA_GRAPH_CAPTURE_FAILED_MSG = (
     "Possible solutions:\n"
     "1. set --mem-fraction-static to a smaller value (e.g., 0.8 or 0.7)\n"
-    "2. set --cuda-graph-max-bs to a smaller value (e.g., 16)\n"
-    "3. disable torch compile by not using --enable-torch-compile\n"
-    "4. disable CUDA graph by --disable-cuda-graph. (Not recommended. Huge performance loss)\n"
+    "2. set --piecewise-cuda-graph-max-tokens to a smaller value (e.g., 512)\n"
+    "3. disable Piecewise CUDA graph by unset --enable-piecewise-cuda-graph\n"
     "Open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose \n"
 )
