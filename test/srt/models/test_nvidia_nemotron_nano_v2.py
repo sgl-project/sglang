@@ -1,3 +1,4 @@
+import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
@@ -42,3 +43,7 @@ class TestNvidiaNemotronNanoV2(CustomTestCase):
         metrics = run_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["accuracy"], 0.87)
+
+
+if __name__ == "__main__":
+    unittest.main()
