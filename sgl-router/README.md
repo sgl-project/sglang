@@ -233,45 +233,36 @@ python -m sglang_router.launch_router \
     --worker-urls https://api.openai.com \
     --history-backend none
 
-# Oracle ATP backend with environment variables
-export ATP_DSN="tcps://adb.region.oraclecloud.com:1522/service_name"
+# Oracle ATP backend - choose ONE of the following connection methods:
+
+# Option 1: Using full connection descriptor
+export ATP_DSN="(description=(address=(protocol=tcps)(port=1522)(host=adb.region.oraclecloud.com))(connect_data=(service_name=service_name)))"
+
+# Option 2: Using TNS alias (requires wallet)
+export ATP_TNS_ALIAS="sglroutertestatp_high"
+export ATP_WALLET_PATH="/path/to/wallet"
+
+# service user config
 export ATP_USER="admin"
 export ATP_PASSWORD="YourPassword123"
-export ATP_WALLET_PATH="/path/to/wallet"
 
 python -m sglang_router.launch_router \
     --worker-urls https://api.openai.com \
+    --backend openai \
     --history-backend oracle
 ```
 
 **Oracle Configuration Parameters:**
-- `--oracle-connect-descriptor`: Connection string or TNS alias (env: `ATP_DSN`)
+- `--oracle-tns-alias`: TNS alias from tnsnames.ora (env: `ATP_TNS_ALIAS`)
+  - Requires `--oracle-wallet-path` to locate tnsnames.ora
 - `--oracle-username`: Database username (env: `ATP_USER`)
 - `--oracle-password`: Database password (env: `ATP_PASSWORD`)
-- `--oracle-wallet-path`: Path to wallet directory (env: `ATP_WALLET_PATH`, optional)
+- `--oracle-wallet-path`: Path to wallet directory (env: `ATP_WALLET_PATH`)
+  - Required when using TNS alias
 - `--oracle-pool-min`: Minimum connections (default: 1, env: `ATP_POOL_MIN`)
 - `--oracle-pool-max`: Maximum connections (default: 16, env: `ATP_POOL_MAX`)
 
-**Python API Example:**
-```python
-from sglang_router_rs import Router, HistoryBackendType, PyOracleConfig
-
-oracle_config = PyOracleConfig(
-    connect_descriptor="tcps://adb.region.oraclecloud.com:1522/service_name",
-    username="admin",
-    password="YourPassword123",
-    wallet_path="/path/to/wallet",
-    pool_min=2,
-    pool_max=10,
-)
-
-router = Router(
-    worker_urls=["http://worker1:8000", "http://worker2:8000"],
-    history_backend=HistoryBackendType.Oracle,
-    oracle_config=oracle_config,
-)
-router.start()
-```
+**Note**: You must provide **either** `--oracle-tns-alias` **or** `--oracle-connect-descriptor`, but not both.
 
 ## Advanced Features
 
@@ -499,10 +490,11 @@ curl -X POST http://localhost:8080/add_worker?url=http://worker3:8000&api_key=wo
   - `memory`: In-memory storage (default)
   - `none`: No storage
   - `oracle`: Oracle ATP persistent storage
-- `--oracle-connect-descriptor`: Oracle connection string (env: `ATP_DSN`)
+- `--oracle-tns-alias`: Oracle TNS alias from tnsnames.ora (env: `ATP_TNS_ALIAS`, mutually exclusive with `--oracle-connect-descriptor`)
+- `--oracle-connect-descriptor`: Oracle full connection string (env: `ATP_DSN`, mutually exclusive with `--oracle-tns-alias`)
 - `--oracle-username`: Oracle username (env: `ATP_USER`)
 - `--oracle-password`: Oracle password (env: `ATP_PASSWORD`)
-- `--oracle-wallet-path`: Oracle wallet directory (env: `ATP_WALLET_PATH`)
+- `--oracle-wallet-path`: Oracle wallet directory (env: `ATP_WALLET_PATH`, required for TNS alias)
 - `--oracle-pool-min`: Min pool connections (default: 1, env: `ATP_POOL_MIN`)
 - `--oracle-pool-max`: Max pool connections (default: 16, env: `ATP_POOL_MAX`)
 

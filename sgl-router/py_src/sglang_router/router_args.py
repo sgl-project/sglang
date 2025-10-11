@@ -95,6 +95,7 @@ class RouterArgs:
     # History backend configuration
     history_backend: str = "memory"
     oracle_wallet_path: Optional[str] = None
+    oracle_tns_alias: Optional[str] = None
     oracle_connect_descriptor: Optional[str] = None
     oracle_username: Optional[str] = None
     oracle_password: Optional[str] = None
@@ -497,10 +498,16 @@ class RouterArgs:
             help="Path to Oracle ATP wallet directory (env: ATP_WALLET_PATH)",
         )
         parser.add_argument(
+            f"--{prefix}oracle-tns-alias",
+            type=str,
+            default=os.getenv("ATP_TNS_ALIAS"),
+            help="Oracle TNS alias from tnsnames.ora (env: ATP_TNS_ALIAS).",
+        )
+        parser.add_argument(
             f"--{prefix}oracle-connect-descriptor",
             type=str,
             default=os.getenv("ATP_DSN"),
-            help="Oracle connection descriptor/DSN or TNS alias (env: ATP_DSN)",
+            help="Oracle connection descriptor/DSN (full connection string) (env: ATP_DSN)",
         )
         parser.add_argument(
             f"--{prefix}oracle-username",
@@ -606,11 +613,26 @@ class RouterArgs:
 
         # Validate Oracle config when history_backend is oracle
         if self.history_backend == "oracle":
-            if not self.oracle_connect_descriptor:
+            # Check that exactly one of TNS alias or connect descriptor is provided
+            if self.oracle_tns_alias and self.oracle_connect_descriptor:
                 raise ValueError(
-                    "oracle_connect_descriptor is required when history_backend='oracle'. "
-                    "Provide via --oracle-connect-descriptor or ATP_DSN env variable"
+                    "Cannot provide both oracle_tns_alias and oracle_connect_descriptor. "
+                    "Provide only one via --oracle-tns-alias/ATP_TNS_ALIAS or --oracle-connect-descriptor/ATP_DSN"
                 )
+
+            if not self.oracle_tns_alias and not self.oracle_connect_descriptor:
+                raise ValueError(
+                    "Either oracle_tns_alias or oracle_connect_descriptor is required when history_backend='oracle'. "
+                    "Provide via --oracle-tns-alias/ATP_TNS_ALIAS or --oracle-connect-descriptor/ATP_DSN env variable"
+                )
+
+            # If using TNS alias, wallet path is required
+            if self.oracle_tns_alias and not self.oracle_wallet_path:
+                raise ValueError(
+                    "oracle_wallet_path is required when using oracle_tns_alias. "
+                    "Provide via --oracle-wallet-path or ATP_WALLET_PATH env variable"
+                )
+
             if not self.oracle_username:
                 raise ValueError(
                     "oracle_username is required when history_backend='oracle'. "

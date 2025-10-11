@@ -156,8 +156,15 @@ class Router:
         oracle_config = None
         history_backend_str = args_dict.get("history_backend", "memory")
         if history_backend_str == "oracle":
+            # Prioritize TNS alias over connect descriptor
+            tns_alias = args_dict.get("oracle_tns_alias")
+            connect_descriptor = args_dict.get("oracle_connect_descriptor")
+
+            # Use TNS alias if provided, otherwise use connect descriptor
+            final_descriptor = tns_alias if tns_alias else connect_descriptor
+
             oracle_config = PyOracleConfig(
-                connect_descriptor=args_dict["oracle_connect_descriptor"],
+                connect_descriptor=final_descriptor,
                 username=args_dict["oracle_username"],
                 password=args_dict["oracle_password"],
                 wallet_path=args_dict.get("oracle_wallet_path"),
@@ -167,13 +174,14 @@ class Router:
             )
         args_dict["oracle_config"] = oracle_config
 
-        # convert history_backend to enum 
+        # convert history_backend to enum
         args_dict["history_backend"] = history_backend_from_str(history_backend_str)
 
         # Remove fields that shouldn't be passed to Rust Router constructor
         fields_to_remove = [
             "mini_lb",
             "oracle_wallet_path",
+            "oracle_tns_alias",
             "oracle_connect_descriptor",
             "oracle_username",
             "oracle_password",
