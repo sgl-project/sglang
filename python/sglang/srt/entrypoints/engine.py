@@ -155,6 +155,7 @@ class Engine(EngineBase):
         Only trims if output_ids length is greater than completion_tokens.
         Modifies ret in-place and returns it.
         """
+
         def _trim_one(item):
             if not isinstance(item, dict):
                 return item
@@ -163,7 +164,12 @@ class Engine(EngineBase):
             if not isinstance(meta_info, dict):
                 meta_info = {}
             completion_tokens = meta_info.get("completion_tokens")
-            if isinstance(output_ids, list) and isinstance(completion_tokens, int) and completion_tokens > 0 and len(output_ids) > completion_tokens:
+            if (
+                isinstance(output_ids, list)
+                and isinstance(completion_tokens, int)
+                and completion_tokens > 0
+                and len(output_ids) > completion_tokens
+            ):
                 item["output_ids"] = output_ids[-completion_tokens:]
             return item
 
@@ -176,7 +182,7 @@ class Engine(EngineBase):
                 _trim_one(item)
             return ret
         return ret
-    
+
     def generate(
         self,
         # The input prompt. It can be a single prompt or a batch of prompts.
@@ -328,9 +334,11 @@ class Engine(EngineBase):
         generator = self.tokenizer_manager.generate_request(obj, None)
 
         if stream is True:
+
             async def _trimmed_stream(agen):
                 async for chunk in agen:
                     yield self._remove_output_ids_prefix_overlap(chunk)
+
             return _trimmed_stream(generator)
         else:
             ret = await generator.__anext__()
