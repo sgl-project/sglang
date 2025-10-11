@@ -11,12 +11,13 @@ from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_trito
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.overlap_utils import FutureIndices
-from sglang.srt.managers.schedule_batch import (
-    ScheduleBatch,
-    get_last_loc,
-    global_server_args_dict,
-)
+from sglang.srt.managers.schedule_batch import ScheduleBatch, global_server_args_dict
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.common import (
+    alloc_paged_token_slots_extend,
+    alloc_token_slots,
+    get_last_loc,
+)
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.speculative.eagle_info_v2 import (
     EagleDraftInputV2Mixin,
@@ -105,7 +106,10 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         batch.input_ids = self.draft_token
 
         if page_size == 1:
-            batch.out_cache_loc = batch.alloc_token_slots(len(batch.input_ids))
+            batch.out_cache_loc = alloc_token_slots(
+                batch.tree_cache,
+                len(batch.input_ids),
+            )
             end_offset = batch.seq_lens + self.draft_token_num
         else:
             prefix_lens = batch.seq_lens
@@ -117,7 +121,8 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 batch.req_pool_indices,
                 prefix_lens,
             )
-            batch.out_cache_loc = batch.alloc_paged_token_slots_extend(
+            batch.out_cache_loc = alloc_paged_token_slots_extend(
+                batch.tree_cache,
                 prefix_lens,
                 prefix_lens_cpu,
                 end_offset,
