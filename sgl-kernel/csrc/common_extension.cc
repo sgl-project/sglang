@@ -470,6 +470,17 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor _ascales, Tensor! _out_feats) -> ()");
   m.impl("qserve_w4a8_per_group_gemm", torch::kCUDA, &qserve_w4a8_per_group_gemm);
 
+  // Rotary embedding kernel
+  m.def(
+      "rotary_embedding("
+      "    Tensor! cos_cache, "
+      "    Tensor! sin_cache, "
+      "    Tensor! query,"
+      "    Tensor? key, "
+      "    int head_size, "
+      "    bool is_neox) -> ()");
+  m.impl("rotary_embedding", torch::kCUDA, &rotary_embedding);
+
   /*
    * From csrc/mamba
    */

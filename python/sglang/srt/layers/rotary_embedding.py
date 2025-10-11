@@ -111,9 +111,9 @@ class RotaryEmbedding(CustomOp):
         if (
             not (_is_cuda or _is_npu) or self.head_size not in [64, 128, 256, 512]
         ) and not (_is_cpu and _is_cpu_amx_available):
-            from vllm._custom_ops import rotary_embedding
+            from sgl_kernel import rotary_embedding
 
-            self.vllm_rotary_embedding = rotary_embedding
+            self.sglang_rotary_embedding = rotary_embedding
 
         self.cos_sin_cache: torch.Tensor
         self.register_buffer("cos_sin_cache", cache, persistent=False)
@@ -266,16 +266,26 @@ class RotaryEmbedding(CustomOp):
         else:
             assert (
                 fused_set_kv_buffer_arg is None
-            ), "save kv cache is not supported for vllm_rotary_embedding."
-            self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
-            self.vllm_rotary_embedding(
-                positions,
+            ), "save kv cache is not supported for sglang_rotary_embedding."
+
+            cos, sin = positions
+            assert cos.dtype == torch.float and cos.is_contiguous()
+            assert sin.dtype == torch.float and sin.is_contiguous()
+            orig_q_dtype = query.dtype
+            orig_k_dtype = key.dtype
+            query, key = query.float(), key.float()
+
+            self.sglang_rotary_embedding(
+                cos,
+                sin,
                 query,
                 key,
                 self.head_size,
-                self.cos_sin_cache,
                 self.is_neox_style,
             )
+
+            query = query.to(dtype=orig_q_dtype)
+            key = key.to(dtype=orig_k_dtype)
         return query, key
 
     def extra_repr(self) -> str:

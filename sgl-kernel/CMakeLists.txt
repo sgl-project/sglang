@@ -311,10 +311,10 @@ set(SOURCES
     "csrc/moe/nvfp4_blockwise_moe.cu"
     "csrc/moe/fp8_blockwise_moe_kernel.cu"
     "csrc/moe/prepare_moe_input.cu"
+    "csrc/multimodal/rotary_embedding.cu"
 
     "csrc/memory/store.cu"
     "csrc/kvcacheio/transfer.cu"
-
     "csrc/speculative/eagle_utils.cu"
     "csrc/speculative/ngram_utils.cu"
     "csrc/speculative/packbit.cu"
