@@ -48,6 +48,7 @@ jobs:
       - name: Run container
         run: |
           docker run -dt \
+            -u $(id -u):$(id -g) \
             --device /dev/dri/ \
             --name main_sglang_xpu \
             -e HF_TOKEN=$(cat ~/huggingface_token.txt) \
