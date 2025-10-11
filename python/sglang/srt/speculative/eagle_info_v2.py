@@ -24,7 +24,7 @@ from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
     generate_simulated_accept_index,
 )
-from sglang.srt.utils.common import fast_topk, is_cuda, next_power_of_2
+from sglang.srt.utils.common import fast_topk, is_cuda, is_hip, next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tp_worker import TpModelWorker
