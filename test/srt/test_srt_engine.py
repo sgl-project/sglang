@@ -12,6 +12,10 @@ import torch
 
 import sglang as sgl
 from sglang.bench_offline_throughput import BenchArgs, throughput_test
+<<<<<<< HEAD
+from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+=======
+>>>>>>> upstream/main
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.few_shot_gsm8k_engine import run_eval

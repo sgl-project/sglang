@@ -9,6 +9,10 @@ from concurrent.futures import ThreadPoolExecutor
 
 import openai
 
+<<<<<<< HEAD
+from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+=======
+>>>>>>> upstream/main
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.test_utils import (

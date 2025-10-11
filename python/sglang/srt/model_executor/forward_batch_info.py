@@ -74,6 +74,8 @@ class ForwardMode(IntEnum):
     TARGET_VERIFY = auto()
     # Used in speculative decoding: extend a batch in the draft model.
     DRAFT_EXTEND = auto()
+    SIMPLE_DRAFT_EXTEND = auto()
+    SIMPLE_TARGET_VERIFY = auto()
 
     # Split Prefill for PD multiplexing
     SPLIT_PREFILL = auto()
@@ -87,6 +89,7 @@ class ForwardMode(IntEnum):
             or self == ForwardMode.MIXED
             or self == ForwardMode.DRAFT_EXTEND
             or self == ForwardMode.TARGET_VERIFY
+            or self == ForwardMode.SIMPLE_DRAFT_EXTEND
         )
 
     def is_decode(self):
@@ -101,17 +104,26 @@ class ForwardMode(IntEnum):
     def is_decode_or_idle(self):
         return self == ForwardMode.DECODE or self == ForwardMode.IDLE
 
+    def is_simple_draft(self):
+        return self == ForwardMode.SIMPLE_DRAFT_EXTEND
+
+    def is_simple_verify(self):
+        return self == ForwardMode.SIMPLE_TARGET_VERIFY
+
     def is_target_verify(self):
         return self == ForwardMode.TARGET_VERIFY
 
     def is_draft_extend(self):
-        return self == ForwardMode.DRAFT_EXTEND
+        return (
+            self == ForwardMode.DRAFT_EXTEND or self == ForwardMode.SIMPLE_DRAFT_EXTEND
+        )
 
     def is_extend_or_draft_extend_or_mixed(self):
         return (
             self == ForwardMode.EXTEND
             or self == ForwardMode.DRAFT_EXTEND
             or self == ForwardMode.MIXED
+            or self == ForwardMode.SIMPLE_DRAFT_EXTEND
         )
 
     def is_cuda_graph(self):
@@ -285,6 +297,7 @@ class ForwardBatch:
     spec_info: Optional[SpecInput] = None
     spec_algorithm: SpeculativeAlgorithm = None
     capture_hidden_mode: CaptureHiddenMode = None
+    simple_eagle_skip_attn_backend_init: bool = False
 
     # For padding
     padded_static_len: int = -1  # -1 if not padded
