@@ -246,13 +246,12 @@ class EagleVerifyInputV2Mixin:
             # This is currently not used
             draft_probs = torch.empty_like(target_probs)
 
-            all_coins = torch.rand(
-                (bs * self.draft_token_num + bs), dtype=torch.float32, device=device
-            )
             # coins for rejection sampling
-            coins = all_coins[:-bs]
+            coins = torch.rand_like(candidates, dtype=torch.float32, device=device)
             # coins for final sampling
-            coins_for_final_sampling = all_coins[-bs:]
+            coins_for_final_sampling = torch.rand(
+                (bs,), dtype=torch.float32, device=device
+            )
 
             tree_speculative_sampling_target_only(
                 predicts=predict,  # mutable
