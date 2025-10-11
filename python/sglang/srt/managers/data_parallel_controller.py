@@ -21,7 +21,7 @@ import threading
 import time
 from collections import deque
 from enum import Enum, auto
-from typing import List
+from typing import List, Optional
 
 import psutil
 import setproctitle
@@ -36,7 +36,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import run_scheduler_process
-from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.server_args import DP_ATTENTION_HANDSHAKE_PORT_DELTA, PortArgs, ServerArgs
 from sglang.srt.utils import (
     bind_port,
     configure_logger,
@@ -258,7 +258,7 @@ class DataParallelController:
     def _dispatch_dp_attn_ctrl_zmq_port(self, server_args: ServerArgs):
         ex_endpoint = None
         if server_args.dist_init_addr is None:
-            ex_endpoint = f"tcp://127.0.0.1:{server_args.port + 5}"
+            ex_endpoint = f"tcp://127.0.0.1:{server_args.port + DP_ATTENTION_HANDSHAKE_PORT_DELTA}"
         else:
             ex_endpoint = f"tcp://{server_args.dist_init_addr}"
 
@@ -302,15 +302,16 @@ class DataParallelController:
             except zmq.Again:
                 logger.error("Handshake timeout with node 0")
                 raise
-        PortArgs.register_dp_controller_to_attn_tp_rk0_port(free_ports)
+        return free_ports
 
     def launch_dp_attention_schedulers(self, server_args, port_args):
+        dp_port_mapping = None
         if server_args.enable_dp_attention_port_picking:
-            self._dispatch_dp_attn_ctrl_zmq_port(server_args)
+            dp_port_mapping = self._dispatch_dp_attn_ctrl_zmq_port(server_args)
         dp_port_args = []
         for dp_rank in range(server_args.dp_size):
-            dp_port_args.append(PortArgs.init_new(server_args, dp_rank))
-        self.launch_tensor_parallel_group(server_args, port_args, 0, None)
+            dp_port_args.append(PortArgs.init_new(server_args, dp_rank, dp_port_mapping))
+        self.launch_tensor_parallel_group(server_args, port_args, 0, None, dp_port_mapping)
         return dp_port_args
 
     def launch_tensor_parallel_group(
@@ -318,7 +319,8 @@ class DataParallelController:
         server_args: ServerArgs,
         port_args: PortArgs,
         base_gpu_id: int,
-        dp_rank: int,
+        dp_rank: Optional[int],
+        dp_port_mapping: Optional[dict[int, int]] = None,
     ):
         if not server_args.enable_dp_attention:
             logger.info(f"Launch DP{dp_rank} starting at GPU #{base_gpu_id}.")
@@ -355,7 +357,7 @@ class DataParallelController:
                         server_args.dp_size,
                     )
                     # compute zmq ports for this dp rank
-                    rank_port_args = PortArgs.init_new(server_args, dp_rank)
+                    rank_port_args = PortArgs.init_new(server_args, dp_rank, dp_port_mapping)
                     # Data parallelism reuses the tensor parallelism group,
                     # so all dp ranks should use the same nccl port.
                     rank_port_args.nccl_port = port_args.nccl_port

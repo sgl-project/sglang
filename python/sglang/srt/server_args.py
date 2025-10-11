@@ -13,6 +13,8 @@
 # ==============================================================================
 """The arguments of the server."""
 
+from __future__ import annotations
+
 import argparse
 import dataclasses
 import json
@@ -3261,9 +3263,7 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
 
 
 ZMQ_TCP_PORT_DELTA = 233
-
-
-dp_controller_zmq_ports: dict[int, int] = {}
+DP_ATTENTION_HANDSHAKE_PORT_DELTA = 5
 
 
 @dataclasses.dataclass
@@ -3288,12 +3288,7 @@ class PortArgs:
     tokenizer_worker_ipc_name: Optional[str]
 
     @staticmethod
-    def register_dp_controller_to_attn_tp_rk0_port(ports: dict[int, int]):
-        global dp_controller_zmq_ports
-        dp_controller_zmq_ports = ports
-
-    @staticmethod
-    def init_new(server_args, dp_rank: Optional[int] = None) -> "PortArgs":
+    def init_new(server_args, dp_rank: Optional[int] = None, dp_port_mapping: Optional[dict[int, int]] = None) -> PortArgs:
         if server_args.nccl_port is None:
             nccl_port = server_args.port + random.randint(100, 1000)
             while True:
@@ -3341,7 +3336,9 @@ class PortArgs:
                 scheduler_input_port = port_base + 4
             else:
                 if server_args.enable_dp_attention_port_picking:
-                    scheduler_input_port = dp_controller_zmq_ports[dp_rank]
+                    if dp_port_mapping is None:
+                        raise ValueError("dp_port_mapping must be provided when enable_dp_attention_port_picking is True")
+                    scheduler_input_port = dp_port_mapping[dp_rank]
                 else:
                     scheduler_input_port = port_base + 4 + 1 + dp_rank
             return PortArgs(
