@@ -1,8 +1,8 @@
-import argparse
-import glob
-from dataclasses import dataclass
+"""
+Sort the test case by name alphabetically for run_suite.py
+"""
 
-from sglang.test.test_utils import run_unittest_files
+from dataclasses import dataclass
 
 
 @dataclass
@@ -11,7 +11,6 @@ class TestFile:
     estimated_time: float = 60
 
 
-# NOTE: please sort the test cases alphabetically by the test file name
 suites = {
     "per-commit": [
         TestFile("function_call/test_json_schema_constraint.py", 30),
@@ -26,22 +25,22 @@ suites = {
         TestFile("lora/test_lora_radix_cache.py", 100),
         TestFile("lora/test_lora_update.py", 400),
         TestFile("lora/test_multi_lora_backend.py", 60),
-        TestFile("models/test_compressed_tensors_models.py", 42),
-        TestFile("models/test_cross_encoder_models.py", 100),
         TestFile("models/test_embedding_models.py", 73),
         TestFile("models/test_encoder_embedding_models.py", 100),
+        TestFile("models/test_cross_encoder_models.py", 100),
+        TestFile("models/test_compressed_tensors_models.py", 42),
         TestFile("models/test_generation_models.py", 103),
         TestFile("models/test_nvidia_nemotron_nano_v2.py", 180),
         TestFile("models/test_qwen_models.py", 82),
         TestFile("models/test_reward_models.py", 132),
         TestFile("models/test_transformers_models.py", 320),
         TestFile("models/test_vlm_models.py", 741),
-        TestFile("openai_server/basic/test_openai_embedding.py", 141),
-        TestFile("openai_server/basic/test_openai_server.py", 149),
         TestFile("openai_server/basic/test_protocol.py", 10),
         TestFile("openai_server/basic/test_serving_chat.py", 10),
         TestFile("openai_server/basic/test_serving_completions.py", 10),
         TestFile("openai_server/basic/test_serving_embedding.py", 10),
+        TestFile("openai_server/basic/test_openai_embedding.py", 141),
+        TestFile("openai_server/basic/test_openai_server.py", 149),
         TestFile("openai_server/features/test_enable_thinking.py", 70),
         TestFile("openai_server/features/test_json_constrained.py", 98),
         TestFile("openai_server/features/test_json_mode.py", 90),
@@ -63,8 +62,8 @@ suites = {
         TestFile("rl/test_update_weights_from_disk.py", 114),
         TestFile("rl/test_update_weights_from_tensor.py", 48),
         TestFile("test_abort.py", 51),
-        TestFile("test_chunked_prefill.py", 313),
         TestFile("test_create_kvindices.py", 2),
+        TestFile("test_chunked_prefill.py", 313),
         TestFile("test_deterministic.py", 300),
         TestFile("test_eagle_infer_a.py", 370),
         TestFile("test_eagle_infer_b.py", 700),
@@ -86,30 +85,30 @@ suites = {
         TestFile("test_metrics_utils.py", 1),
         TestFile("test_mla.py", 167),
         TestFile("test_mla_deepseek_v3.py", 500),
+        TestFile("test_mla_int8_deepseek_v3.py", 429),
         TestFile("test_mla_flashinfer.py", 302),
         TestFile("test_mla_fp8.py", 93),
-        TestFile("test_mla_int8_deepseek_v3.py", 429),
         TestFile("test_modelopt_loader.py", 30),
         TestFile("test_multi_tokenizer.py", 230),
         TestFile("test_ngram_speculative_decoding.py", 250),
         TestFile("test_no_chunked_prefill.py", 108),
         TestFile("test_no_overlap_scheduler.py", 234),
         TestFile("test_original_logprobs.py", 41),
-        TestFile("test_page_size.py", 60),
         TestFile("test_penalty.py", 41),
+        TestFile("test_page_size.py", 60),
         TestFile("test_priority_scheduling.py", 100),
         TestFile("test_pytorch_sampling_backend.py", 66),
         TestFile("test_radix_attention.py", 105),
         TestFile("test_radix_cache_unit.py", 5),
-        TestFile("test_reasoning_parser.py", 5),
         TestFile("test_regex_constrained.py", 64),
-        TestFile("test_request_queue_validation.py", 30),
+        TestFile("test_reasoning_parser.py", 5),
         TestFile("test_retract_decode.py", 54),
+        TestFile("test_request_queue_validation.py", 30),
         TestFile("test_score_api.py", 180),
         TestFile("test_server_args.py", 1),
         TestFile("test_skip_tokenizer_init.py", 117),
-        TestFile("test_srt_endpoint.py", 130),
         TestFile("test_srt_engine.py", 261),
+        TestFile("test_srt_endpoint.py", 130),
         TestFile("test_standalone_speculative_decoding.py", 250),
         TestFile("test_start_profile.py", 60),
         TestFile("test_swa_unittest.py", 1),
@@ -117,21 +116,21 @@ suites = {
         TestFile("test_torch_compile_moe.py", 172),
         TestFile("test_torch_native_attention_backend.py", 123),
         TestFile("test_torchao.py", 70),
-        TestFile("test_triton_attention_backend.py", 150),
         TestFile("test_triton_attention_kernels.py", 4),
+        TestFile("test_triton_attention_backend.py", 150),
         TestFile("test_triton_moe_channel_fp8_kernel.py", 25),
         TestFile("test_triton_sliding_window.py", 250),
         TestFile("test_utils_update_weights.py", 48),
         TestFile("test_vision_chunked_prefill.py", 175),
+        TestFile("test_vlm_input_format.py", 300),
         TestFile("test_vision_openai_server_a.py", 724),
         TestFile("test_vision_openai_server_b.py", 446),
-        TestFile("test_vlm_input_format.py", 300),
     ],
     "per-commit-2-gpu": [
         TestFile("ep/test_moe_ep.py", 140),
-        TestFile("hicache/test_hicache_storage_3fs_backend.py", 200),
         TestFile("hicache/test_hicache_storage_file_backend.py", 200),
         TestFile("hicache/test_hicache_storage_mooncake_backend.py", 400),
+        TestFile("hicache/test_hicache_storage_3fs_backend.py", 200),
         TestFile("layers/attention/mamba/test_mamba2_mixer.py", 110),
         TestFile("lora/test_lora_tp.py", 116),
         TestFile("rl/test_update_weights_from_distributed.py", 103),
@@ -183,43 +182,46 @@ suites = {
 # NOTE: please sort the test cases alphabetically by the test file name
 suite_amd = {
     "per-commit-amd": [
-        TestFile("function_call/test_json_schema_constraint.py", 30),
         TestFile("hicache/test_hicache.py", 116),
         TestFile("hicache/test_hicache_mla.py", 127),
         TestFile("hicache/test_hicache_storage.py", 127),
         TestFile("lora/test_lora.py", 200),
-        TestFile("lora/test_lora_backend.py", 99),
-        TestFile("lora/test_lora_cuda_graph.py", 250),
         TestFile("lora/test_lora_eviction.py", 200),
-        TestFile("lora/test_lora_qwen3.py", 97),
+        TestFile("lora/test_lora_backend.py", 99),
         TestFile("lora/test_multi_lora_backend.py", 60),
+        TestFile("lora/test_lora_cuda_graph.py", 250),
+        TestFile("lora/test_lora_qwen3.py", 97),
+        # TestFile("models/test_embedding_models.py", 73), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/11127
         TestFile("models/test_compressed_tensors_models.py", 42),
         TestFile("models/test_qwen_models.py", 82),
         TestFile("models/test_reward_models.py", 132),
         TestFile("models/test_transformers_models.py", 320),
-        TestFile("openai_server/basic/test_openai_embedding.py", 141),
-        TestFile("openai_server/basic/test_openai_server.py", 149),
         TestFile("openai_server/basic/test_protocol.py", 10),
         TestFile("openai_server/basic/test_serving_chat.py", 10),
         TestFile("openai_server/basic/test_serving_completions.py", 10),
         TestFile("openai_server/basic/test_serving_embedding.py", 10),
+        TestFile("openai_server/basic/test_openai_embedding.py", 141),
+        TestFile("openai_server/basic/test_openai_server.py", 149),
         TestFile("openai_server/features/test_enable_thinking.py", 70),
         TestFile("openai_server/features/test_json_constrained.py", 98),
         TestFile("openai_server/features/test_json_mode.py", 90),
         TestFile("openai_server/features/test_openai_server_ebnf.py", 95),
+        # TestFile("openai_server/features/test_openai_server_hidden_states.py", 240),
         TestFile("openai_server/features/test_reasoning_content.py", 89),
         TestFile("openai_server/function_call/test_openai_function_calling.py", 60),
         TestFile("openai_server/function_call/test_tool_choice.py", 226),
+        TestFile("function_call/test_json_schema_constraint.py", 30),
         TestFile("openai_server/validation/test_large_max_new_tokens.py", 41),
         TestFile("openai_server/validation/test_matched_stop.py", 60),
         TestFile("openai_server/validation/test_openai_server_ignore_eos.py", 85),
         TestFile("openai_server/validation/test_request_length_validation.py", 31),
-        TestFile("quant/test_awq_dequant.py", 2),
         TestFile("quant/test_block_int8.py", 22),
+        TestFile("quant/test_awq_dequant.py", 2),
         TestFile("rl/test_update_weights_from_disk.py", 114),
+        # TestFile("rl/test_update_weights_from_tensor.py", 48),
         TestFile("test_abort.py", 51),
-        TestFile("test_chunked_prefill.py", 313),
         TestFile("test_create_kvindices.py", 2),
+        TestFile("test_chunked_prefill.py", 313),
         TestFile("test_ebnf_constrained.py", 108),
         TestFile("test_eval_fp8_accuracy.py", 303),
         TestFile("test_function_call_parser.py", 10),
@@ -232,34 +234,30 @@ suite_amd = {
         TestFile("test_mla.py", 242),
         TestFile("test_mla_deepseek_v3.py", 221),
         TestFile("test_no_chunked_prefill.py", 108),
-        TestFile("test_page_size.py", 60),
+        # TestFile("test_no_overlap_scheduler.py", 234), # Disabled temporarily and track in #7703
         TestFile("test_penalty.py", 41),
+        TestFile("test_page_size.py", 60),
         TestFile("test_pytorch_sampling_backend.py", 66),
         TestFile("test_radix_attention.py", 105),
-        TestFile("test_reasoning_parser.py", 5),
         TestFile("test_regex_constrained.py", 64),
         TestFile("test_retract_decode.py", 54),
+        TestFile("test_reasoning_parser.py", 5),
         TestFile("test_rope_rocm.py", 3),
         TestFile("test_server_args.py", 1),
         TestFile("test_skip_tokenizer_init.py", 117),
-        TestFile("test_srt_endpoint.py", 130),
         TestFile("test_srt_engine.py", 261),
+        TestFile("test_srt_endpoint.py", 130),
         TestFile("test_torch_compile.py", 169),
         TestFile("test_torch_compile_moe.py", 172),
         TestFile("test_torch_native_attention_backend.py", 123),
         TestFile("test_triton_attention_backend.py", 150),
-        TestFile("test_wave_attention_kernels.py", 2),
-        # Disabled temporarily
-        # TestFile("models/test_embedding_models.py", 73), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/11127
-        # TestFile("openai_server/features/test_openai_server_hidden_states.py", 240),
-        # TestFile("rl/test_update_weights_from_tensor.py", 48),
-        # TestFile("test_no_overlap_scheduler.py", 234), # Disabled temporarily and track in #7703
         # TestFile("test_vision_chunked_prefill.py", 175), # Disabled temporarily and track in #7701
+        TestFile("test_wave_attention_kernels.py", 2),
         # TestFile("test_wave_attention_backend.py", 150), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/11127
     ],
     "per-commit-amd-mi35x": [
-        TestFile("test_gpt_oss_1gpu.py", 600),
         TestFile("test_mla.py", 242),
+        TestFile("test_gpt_oss_1gpu.py", 600),
     ],
     "per-commit-2-gpu-amd": [
         TestFile("lora/test_lora_tp.py", 116),
@@ -296,8 +294,8 @@ suite_xeon = {
         TestFile("cpu/test_rope.py"),
         TestFile("cpu/test_shared_expert.py"),
         TestFile("cpu/test_topk.py"),
-        TestFile("test_cpu_graph.py"),
         TestFile("test_intel_amx_attention_backend.py"),
+        TestFile("test_cpu_graph.py"),
     ],
 }
 
@@ -328,101 +326,14 @@ suites.update(suite_xeon)
 suites.update(suite_ascend)
 
 
-def auto_partition(files, rank, size):
-    """
-    Partition files into size sublists with approximately equal sums of estimated times
-    using stable sorting, and return the partition for the specified rank.
-
-    Args:
-        files (list): List of file objects with estimated_time attribute
-        rank (int): Index of the partition to return (0 to size-1)
-        size (int): Number of partitions
-
-    Returns:
-        list: List of file objects in the specified rank's partition
-    """
-    weights = [f.estimated_time for f in files]
-
-    if not weights or size <= 0 or size > len(weights):
-        return []
-
-    # Create list of (weight, original_index) tuples
-    # Using negative index as secondary key to maintain original order for equal weights
-    indexed_weights = [(w, -i) for i, w in enumerate(weights)]
-    # Stable sort in descending order by weight
-    # If weights are equal, larger (negative) index comes first (i.e., earlier original position)
-    indexed_weights = sorted(indexed_weights, reverse=True)
-
-    # Extract original indices (negate back to positive)
-    indexed_weights = [(w, -i) for w, i in indexed_weights]
-
-    # Initialize partitions and their sums
-    partitions = [[] for _ in range(size)]
-    sums = [0.0] * size
-
-    # Greedy approach: assign each weight to partition with smallest current sum
-    for weight, idx in indexed_weights:
-        # Find partition with minimum sum
-        min_sum_idx = sums.index(min(sums))
-        partitions[min_sum_idx].append(idx)
-        sums[min_sum_idx] += weight
-
-    # Return the files corresponding to the indices in the specified rank's partition
-    indices = partitions[rank]
-    return [files[i] for i in indices]
-
-
 if __name__ == "__main__":
-    arg_parser = argparse.ArgumentParser()
-    arg_parser.add_argument(
-        "--timeout-per-file",
-        type=int,
-        default=1200,
-        help="The time limit for running one file in seconds.",
-    )
-    arg_parser.add_argument(
-        "--suite",
-        type=str,
-        default=list(suites.keys())[0],
-        choices=list(suites.keys()) + ["all"],
-        help="The suite to run",
-    )
-    arg_parser.add_argument(
-        "--range-begin",
-        type=int,
-        default=0,
-        help="The begin index of the range of the files to run.",
-    )
-    arg_parser.add_argument(
-        "--range-end",
-        type=int,
-        default=None,
-        help="The end index of the range of the files to run.",
-    )
-    arg_parser.add_argument(
-        "--auto-partition-id",
-        type=int,
-        help="Use auto load balancing. The part id.",
-    )
-    arg_parser.add_argument(
-        "--auto-partition-size",
-        type=int,
-        help="Use auto load balancing. The number of parts.",
-    )
-    args = arg_parser.parse_args()
-    print(f"{args=}")
+    for key in suites:
+        cases = suites[key]
+        names = [x.name for x in cases]
+        names.sort()
 
-    if args.suite == "all":
-        files = glob.glob("**/test_*.py", recursive=True)
-    else:
-        files = suites[args.suite]
-
-    if args.auto_partition_size:
-        files = auto_partition(files, args.auto_partition_id, args.auto_partition_size)
-    else:
-        files = files[args.range_begin : args.range_end]
-
-    print("The running tests are ", [f.name for f in files])
-
-    exit_code = run_unittest_files(files, args.timeout_per_file)
-    exit(exit_code)
+        print(f'    "{key}": [')
+        for name in names:
+            estimated_time = [x.estimated_time for x in cases if x.name == name][0]
+            print(f'        TestFile("{name}", {estimated_time}),')
+        print(f"    ],\n")

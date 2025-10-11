@@ -816,16 +816,27 @@ impl ResponseProcessingStage {
 
         // Collect all responses from the execution result
         let all_responses = match execution_result {
-            ExecutionResult::Single { stream } => {
-                utils::collect_stream_responses(stream, "Single").await?
+            ExecutionResult::Single { mut stream } => {
+                let responses = utils::collect_stream_responses(&mut stream, "Single").await?;
+                stream.mark_completed();
+                responses
             }
-            ExecutionResult::Dual { prefill, decode } => {
-                // Collect prefill for input_logprobs
-                let prefill_responses = utils::collect_stream_responses(prefill, "Prefill").await?;
+            ExecutionResult::Dual {
+                mut prefill,
+                decode,
+            } => {
+                // Collect prefill for input_logprobs (don't mark completed yet)
+                let prefill_responses =
+                    utils::collect_stream_responses(&mut prefill, "Prefill").await?;
 
-                // Collect decode for actual output
+                // Collect decode for actual output (don't mark completed yet)
+                let mut decode_stream = *decode;
                 let mut decode_responses =
-                    utils::collect_stream_responses(*decode, "Decode").await?;
+                    utils::collect_stream_responses(&mut decode_stream, "Decode").await?;
+
+                // Mark both streams as completed now that both succeeded
+                prefill.mark_completed();
+                decode_stream.mark_completed();
 
                 // Merge prefill input_logprobs if requested
                 if request_logprobs {
@@ -850,6 +861,44 @@ impl ResponseProcessingStage {
         let chat_request = ctx.chat_request_arc();
         let history_tool_calls_count = utils::get_history_tool_calls_count(&chat_request);
 
+        // Check parser availability once upfront (not per choice)
+        let reasoning_parser_available = chat_request.separate_reasoning
+            && utils::check_reasoning_parser_availability(
+                &self.processor.reasoning_parser_factory,
+                self.processor.configured_reasoning_parser.as_ref(),
+                &chat_request.model,
+            );
+
+        let tool_choice_enabled = !matches!(
+            &chat_request.tool_choice,
+            Some(crate::protocols::spec::ToolChoice::Value(
+                crate::protocols::spec::ToolChoiceValue::None
+            ))
+        );
+
+        let tool_parser_available = tool_choice_enabled
+            && chat_request.tools.is_some()
+            && utils::check_tool_parser_availability(
+                &self.processor.tool_parser_factory,
+                self.processor.configured_tool_parser.as_ref(),
+                &chat_request.model,
+            );
+
+        // Log once per request (not per choice)
+        if chat_request.separate_reasoning && !reasoning_parser_available {
+            debug!(
+                "No reasoning parser found for model '{}', skipping reasoning parsing",
+                chat_request.model
+            );
+        }
+
+        if chat_request.tools.is_some() && tool_choice_enabled && !tool_parser_available {
+            debug!(
+                "No tool parser found for model '{}', skipping tool call parsing",
+                chat_request.model
+            );
+        }
+
         let stop_decoder = ctx
             .state
             .response
@@ -867,6 +916,8 @@ impl ResponseProcessingStage {
                     &chat_request,
                     stop_decoder,
                     history_tool_calls_count,
+                    reasoning_parser_available,
+                    tool_parser_available,
                 )
                 .await
             {
@@ -952,16 +1003,27 @@ impl ResponseProcessingStage {
         // Non-streaming: Collect all responses
         let request_logprobs = ctx.generate_request().return_logprob;
         let all_responses = match execution_result {
-            ExecutionResult::Single { stream } => {
-                utils::collect_stream_responses(stream, "Single").await?
+            ExecutionResult::Single { mut stream } => {
+                let responses = utils::collect_stream_responses(&mut stream, "Single").await?;
+                stream.mark_completed();
+                responses
             }
-            ExecutionResult::Dual { prefill, decode } => {
-                // Collect prefill for input_logprobs
-                let prefill_responses = utils::collect_stream_responses(prefill, "Prefill").await?;
+            ExecutionResult::Dual {
+                mut prefill,
+                decode,
+            } => {
+                // Collect prefill for input_logprobs (don't mark completed yet)
+                let prefill_responses =
+                    utils::collect_stream_responses(&mut prefill, "Prefill").await?;
 
-                // Collect decode for actual output
+                // Collect decode for actual output (don't mark completed yet)
+                let mut decode_stream = *decode;
                 let mut decode_responses =
-                    utils::collect_stream_responses(*decode, "Decode").await?;
+                    utils::collect_stream_responses(&mut decode_stream, "Decode").await?;
+
+                // Mark both streams as completed now that both succeeded
+                prefill.mark_completed();
+                decode_stream.mark_completed();
 
                 // Merge prefill input_logprobs if requested
                 if request_logprobs {
