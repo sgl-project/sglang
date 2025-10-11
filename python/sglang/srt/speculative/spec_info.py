@@ -12,7 +12,6 @@ class SpeculativeAlgorithm(IntEnum):
     EAGLE3 = auto()
     STANDALONE = auto()
     NGRAM = auto()
-    NGRAM = auto()
     SIMPLE_EAGLE = auto()
 
     def is_none(self):
