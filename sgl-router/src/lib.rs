@@ -109,7 +109,6 @@ impl PyOracleConfig {
             pool_timeout_secs,
         })
     }
-
 }
 
 impl PyOracleConfig {
