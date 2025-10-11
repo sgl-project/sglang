@@ -363,6 +363,7 @@ impl Router {
         }
 
         let mut responses = vec![];
+        // May do parallel requests later
         for worker in workers {
             let worker_url = worker.url();
             let worker_base_url = self.worker_base_url(worker_url);
