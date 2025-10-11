@@ -520,6 +520,7 @@ class SchedulerMetricsCollector:
 
         # Speculative decoding
         self._log_gauge(self.spec_accept_length, stats.spec_accept_length)
+        self._log_gauge(self.avg_request_queue_latency, stats.avg_request_queue_latency)
 
         # PD disaggregation
         self._log_gauge(
