@@ -209,9 +209,19 @@ if torch.version.cuda is not None:
     elif (cuda_home / "lib64").is_dir():
         cuda_path = cuda_home / "lib64"
     else:
-        # Search for 'libcudart.so.12' in subdirectories
-        for path in cuda_home.rglob("libcudart.so.12"):
-            cuda_path = path.parent
+        # Search for libcudart.so.12 in common system locations
+        candidates = [
+            cuda_home,
+            Path("/usr/lib/x86_64-linux-gnu"),
+            Path("/usr/lib64"),
+            Path("/usr/lib")
+        ]
+        for base in candidates:
+            for path in base.rglob("libcudart.so.12"):
+                cuda_path = path.parent
+                break
+            else:
+                continue
             break
         else:
             raise RuntimeError("Could not find CUDA lib directory.")
