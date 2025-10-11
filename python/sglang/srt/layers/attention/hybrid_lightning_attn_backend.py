@@ -9,11 +9,14 @@ import numpy as np
 import torch
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.hybrid_linear.lightning_attn import (
-    lightning_attention,
+from sglang.srt.layers.attention.lightning_attn.lightning_attn_minimax import (
+    LightningAttnPrefillKernel,
     linear_decode_forward_triton,
 )
-from sglang.srt.layers.hybrid_linear.seg_la import SegLaMeta, seg_la_fwd
+from sglang.srt.layers.attention.lightning_attn.lightning_attn_seg_la import (
+    SegLaMeta,
+    seg_la_fwd,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
 from sglang.srt.utils import get_compiler_backend
@@ -97,46 +100,6 @@ def get_num_decode_tokens(forward_batch: ForwardBatch):
         return 0
 
 
-class BailingLinearKernel:
-    """
-    Linear attention kernel implementation for Bailing models.
-
-    This class is adapted from MiniMaxText01LinearKernel in vllm:
-    https://github.com/vllm-project/vllm/blob/a9138e85b14047e06300685b48e3485b995425fb/vllm/model_executor/models/minimax_text_01.py#L289
-
-    The implementation maintains the same functionality while being renamed to
-    match our Bailing model naming convention.
-    """
-
-    @staticmethod
-    def jit_linear_forward_prefix(
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        kv_caches: torch.Tensor,
-        slope_rate: torch.Tensor,
-        block_size: int,
-        layer_idx: int = None,
-        **kwargs,
-    ) -> torch.Tensor:
-
-        slope_rate = slope_rate.to(torch.float32)
-        should_pad_dim = q.dim() == 3
-        if should_pad_dim:
-            q = q.unsqueeze(0)
-            k = k.unsqueeze(0)
-            v = v.unsqueeze(0)
-        b, h, n, d = q.shape
-        e = d
-        kv_history = kv_caches.reshape(1, h, d, e).contiguous()
-        output, kv_history = lightning_attention(
-            q, k, v, slope_rate, block_size=block_size, kv_history=kv_history
-        )
-        kv_caches.copy_(kv_history[:, :, -1, :, :].reshape(h, d, e))
-        assert output.shape[0] == 1, "batch size must be 1"
-        return output.squeeze(0).transpose(0, 1).reshape([n, h * d]).contiguous()
-
-
 @dataclass
 class LightningAttentionMetadata:
     """Metadata to be init once in the model forward pass,
@@ -166,15 +129,7 @@ class LightningAttentionMetadata:
 
 
 class LightningAttentionBackend(AttentionBackend):
-    """FlashAttention backend implementation.
-
-    Note about the init:
-    - If no spec decoding
-        - FlashAttentionBackend will be init once when the server starts.
-    - If spec decoding
-        - FlashAttentionBackend will be init once for the target worker
-        - FlashAttentionMultiStepBackend will be once for the draft worker
-            - It will spawn num_steps FlashAttentionBackend for the draft worker
+    """Lightning Attention backend implementation.
 
     Note about CUDA Graph:
     - We only support CUDA Graph for Decode (Normal Decode and Draft Decode) and Target Verify.
@@ -347,7 +302,7 @@ class LightningAttentionBackend(AttentionBackend):
             batch_seqlen_k = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
             if batch_seqlen_q[_prefill_idx] == batch_seqlen_k[_prefill_idx]:
                 slice_layer_cache.copy_(0).to(torch.float32)
-            out_slice = BailingLinearKernel.jit_linear_forward_prefix(
+            out_slice = LightningAttnPrefillKernel.jit_linear_forward_prefix(
                 qs,
                 ks,
                 vs,
@@ -545,7 +500,6 @@ class LightningAttentionBackend(AttentionBackend):
         metadata.batch_size = bs
         metadata.is_decode_req_tensor = torch.ones_like(seq_lens)
 
-        device = seq_lens.device
         if forward_mode.is_decode_or_idle():
             # Normal Decode
             # Get sequence information
@@ -589,9 +543,7 @@ class LightningAttentionBackend(AttentionBackend):
         req_pool_indices_long = req_pool_indices
         # req_pool_indices_long[bs:] = -1
         seq_lens = seq_lens[:bs]
-        seq_lens_cpu = seq_lens_cpu[:bs]
         req_pool_indices = req_pool_indices[:bs]
-        device = seq_lens.device
         metadata = None
 
         if forward_mode.is_decode_or_idle():

@@ -17,12 +17,11 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.hybrid_linear.fused_group_rmsnorm import (
+from sglang.srt.layers.attention.lightning_attn.fused_group_rmsnorm import (
     BailingMoEFusedGroupRMSNormSigmoidGate,
     BailingMoERMSNormTP,
 )
-from sglang.srt.layers.hybrid_linear.linear_rotary_embedding import get_linear_rope
-from sglang.srt.layers.hybrid_linear.rmsnorm import rms_norm_triton_fn
+from sglang.srt.layers.attention.lightning_attn.rmsnorm import rms_norm_triton_fn
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -35,6 +34,7 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -299,7 +299,8 @@ class BailingMoELinearAttention(nn.Module):
         # minimax / seg_la / fla
         # TODO support fla
         self.linear_backend = getattr(config, "linear_backend", "minimax")
-        logger.info(f"linear_backend in bailing_moe_linear: {self.linear_backend}")
+        if layer_id == 0:
+            logger.info(f"linear_backend in bailing_moe_linear: {self.linear_backend}")
         self.linear_scale = True if self.linear_backend == "minimax" else False
         self.linear_rope = getattr(config, "linear_rope", True)
         if hasattr(config, "use_linear_silu"):
@@ -372,7 +373,7 @@ class BailingMoELinearAttention(nn.Module):
             rotary_dim = int(self.head_dim * config.partial_rotary_factor)
         else:
             rotary_dim = self.head_dim
-        self.rotary_emb = get_linear_rope(
+        self.rotary_emb = get_rope(
             head_size=self.head_dim,
             rotary_dim=rotary_dim,
             max_position=self.max_position_embeddings,
@@ -503,7 +504,7 @@ class BailingMoEAttention(nn.Module):
             self.rotary_dim = self.head_dim
         self.max_position_embeddings = config.max_position_embeddings
         self.rope_theta = getattr(config, "rope_theta", 600000)
-        self.rotary_emb = get_linear_rope(
+        self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.rotary_dim,
             max_position=self.max_position_embeddings,

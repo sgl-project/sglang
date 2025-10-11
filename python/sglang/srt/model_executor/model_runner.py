@@ -523,8 +523,11 @@ class ModelRunner:
                     server_args.attention_backend = (
                         "flashinfer" if is_flashinfer_available() else "triton"
                     )
-                if getattr(self.model_config.hf_config, "layer_group_size", 0) > 1:
-                    server_args.attention_backend = "bailing_hybrid_linear"
+                if (
+                    self.is_hybrid_lightning
+                    and getattr(self.model_config.hf_config, "layer_group_size", 0) > 1
+                ):
+                    server_args.attention_backend = "hybrid_lightning_attn"
                     logger.info("Use Hybrid Linear backend!")
             else:
                 # MLA architecture
@@ -1342,6 +1345,14 @@ class ModelRunner:
             "Qwen3NextForCausalLMMTP",
         ]
 
+    @property
+    def is_hybrid_lightning(self):
+        return self.model_config.hf_config.architectures[0] in [
+            "BailingMoELinearForCausalLM",
+            "BailingMoeLinearForCausalLM",
+            "BailingMoeLinearV2ForCausalLM",
+        ]
+
     def set_num_token_hybrid(self):
         if (
             "Llama4ForConditionalGeneration"
@@ -1461,7 +1472,7 @@ class ModelRunner:
 
         log_info_on_rank0(logger, f"Using KV cache dtype: {self.kv_cache_dtype}")
 
-        if self.server_args.attention_backend == "bailing_hybrid_linear":
+        if self.server_args.attention_backend == "hybrid_lightning_attn":
             if max_num_reqs is None:
                 max_num_reqs = 256
             self.max_total_num_tokens = self.profile_linear_max_num_token(
@@ -1692,7 +1703,7 @@ class ModelRunner:
                     enable_kvcache_transpose=False,
                     device=self.device,
                 )
-            elif self.server_args.attention_backend == "bailing_hybrid_linear":
+            elif self.server_args.attention_backend == "hybrid_lightning_attn":
                 decoder_attention_types = self.model.get_decoder_attention_types()
                 full_attn_layers = [
                     i

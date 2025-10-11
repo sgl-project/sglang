@@ -316,7 +316,7 @@ class CudaGraphRunner:
             self.input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
             if (
                 self.model_runner.server_args.attention_backend
-                == "bailing_hybrid_linear"
+                == "hybrid_lightning_attn"
             ):
                 self.req_pool_indices = torch.full(
                     (self.max_bs,), -1, dtype=torch.int32
@@ -755,7 +755,7 @@ class CudaGraphRunner:
             self.out_cache_loc.zero_()
             if (
                 self.model_runner.server_args.attention_backend
-                == "bailing_hybrid_linear"
+                == "hybrid_lightning_attn"
             ):
                 self.req_pool_indices.fill_(-1)
 

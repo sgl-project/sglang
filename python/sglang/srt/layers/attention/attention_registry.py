@@ -192,9 +192,9 @@ def create_hybrid_linear_attn_backend(runner):
     )
 
 
-@register_attention_backend("bailing_hybrid_linear")
-def create_bailing_hybrid_linear_backend(runner):
-    from sglang.srt.layers.attention.bailing_hybrid_linear_backend import (
+@register_attention_backend("hybrid_lightning_attn")
+def create_hybrid_lightning_attn_backend(runner):
+    from sglang.srt.layers.attention.hybrid_lightning_attn_backend import (
         LightningAttentionBackend,
     )
     from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
