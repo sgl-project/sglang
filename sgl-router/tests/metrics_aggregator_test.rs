@@ -91,7 +91,7 @@ valid_metric{source="worker2"} 123
 #[test]
 fn test_real() {
     let pack1 = MetricPack {
-        labels: vec![],
+        labels: vec![("source".to_string(), "worker1".to_string())],
         // https://docs.sglang.ai/references/production_metrics.html
         metrics_text: r###"
 # HELP sglang:prompt_tokens_total Number of prefill tokens processed.
@@ -154,7 +154,7 @@ sglang:num_queue_reqs{model_name="meta-llama/Llama-3.1-8B-Instruct"} 2826.0
 "###.to_string(),
     };
     let pack2 = MetricPack {
-        labels: vec![("source".to_string(), "worker1".to_string())],
+        labels: vec![("source".to_string(), "worker2".to_string())],
         metrics_text: pack1.metrics_text.clone(),
     };
     let result = aggregate_metrics(vec![pack1, pack2]).unwrap();
