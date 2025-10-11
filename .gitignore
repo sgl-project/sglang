@@ -179,6 +179,9 @@ benchmark/llava_bench/mme_pack
 *.jsonl
 tmp*.txt
 
+# SGL Kernel build cache
+sgl-kernel/.cache/
+
 # Plots
 *.png
 *.pdf

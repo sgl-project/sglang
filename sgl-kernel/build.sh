@@ -31,11 +31,23 @@ else
    TORCH_INSTALL="pip install --no-cache-dir torch==2.8.0 --index-url https://download.pytorch.org/whl/cu126"
 fi
 
+# Create cache directories for persistent build artifacts
+CACHE_DIR="${PWD}/.cache"
+CMAKE_BUILD_CACHE="${CACHE_DIR}/cmake-build-py${PYTHON_VERSION}-cuda${CUDA_VERSION}-${ARCH}"
+CMAKE_DOWNLOAD_CACHE="${CACHE_DIR}/cmake-downloads"
+
+mkdir -p "${CMAKE_BUILD_CACHE}"
+mkdir -p "${CMAKE_DOWNLOAD_CACHE}"
+
+echo "Using CMake build cache: ${CMAKE_BUILD_CACHE}"
+
 docker run --rm \
    -v $(pwd):/sgl-kernel \
+   -v ${CMAKE_BUILD_CACHE}:/cmake-build-cache \
+   -v ${CMAKE_DOWNLOAD_CACHE}:/cmake-downloads \
    ${DOCKER_IMAGE} \
    bash -c "
-   # Install CMake (version >= 3.26) - Robust Installation
+   # Install CMake (version >= 3.26) - Robust Installation with caching
    export CMAKE_VERSION_MAJOR=3.31
    export CMAKE_VERSION_MINOR=1
    # Setting these flags to reduce OOM chance only on ARM
@@ -46,9 +58,21 @@ docker run --rm \
       export CMAKE_BUILD_PARALLEL_LEVEL=2
       export NINJAFLAGS='-j2'
    fi
-   echo \"Downloading CMake from: https://cmake.org/files/v\${CMAKE_VERSION_MAJOR}/cmake-\${CMAKE_VERSION_MAJOR}.\${CMAKE_VERSION_MINOR}-linux-${ARCH}.tar.gz\"
-   wget https://cmake.org/files/v\${CMAKE_VERSION_MAJOR}/cmake-\${CMAKE_VERSION_MAJOR}.\${CMAKE_VERSION_MINOR}-linux-${ARCH}.tar.gz
-   tar -xzf cmake-\${CMAKE_VERSION_MAJOR}.\${CMAKE_VERSION_MINOR}-linux-${ARCH}.tar.gz
+
+   CMAKE_TARBALL=\"cmake-\${CMAKE_VERSION_MAJOR}.\${CMAKE_VERSION_MINOR}-linux-${ARCH}.tar.gz\"
+
+   # Check if CMake is already cached
+   if [ -f \"/cmake-downloads/\${CMAKE_TARBALL}\" ]; then
+      echo \"Using cached CMake from /cmake-downloads/\${CMAKE_TARBALL}\"
+      cp /cmake-downloads/\${CMAKE_TARBALL} .
+   else
+      echo \"Downloading CMake from: https://cmake.org/files/v\${CMAKE_VERSION_MAJOR}/\${CMAKE_TARBALL}\"
+      wget https://cmake.org/files/v\${CMAKE_VERSION_MAJOR}/\${CMAKE_TARBALL}
+      # Cache the downloaded file
+      cp \${CMAKE_TARBALL} /cmake-downloads/
+   fi
+
+   tar -xzf \${CMAKE_TARBALL}
    mv cmake-\${CMAKE_VERSION_MAJOR}.\${CMAKE_VERSION_MINOR}-linux-${ARCH} /opt/cmake
    export PATH=/opt/cmake/bin:\$PATH
    export LD_LIBRARY_PATH=/lib64:\$LD_LIBRARY_PATH
@@ -70,6 +94,22 @@ docker run --rm \
 
    cd /sgl-kernel && \
    ls -la ${PYTHON_ROOT_PATH}/lib/python${PYTHON_VERSION}/site-packages/wheel/ && \
+
+   # Use persistent build cache directory
+   # Copy cached build artifacts if they exist
+   if [ -d /cmake-build-cache ] && [ \"\$(ls -A /cmake-build-cache 2>/dev/null)\" ]; then
+      echo \"Restoring CMake build cache...\"
+      mkdir -p build
+      cp -r /cmake-build-cache/* build/ || true
+   fi
+
+   # Build with cached directory
    PYTHONPATH=${PYTHON_ROOT_PATH}/lib/python${PYTHON_VERSION}/site-packages ${PYTHON_ROOT_PATH}/bin/python -m uv build --wheel -Cbuild-dir=build . --color=always --no-build-isolation && \
+
+   # Save build artifacts back to cache
+   echo \"Saving CMake build cache...\"
+   rm -rf /cmake-build-cache/*
+   cp -r build/* /cmake-build-cache/ || true
+
    ./rename_wheels.sh
    "
