@@ -72,14 +72,15 @@ The correct answer is"""
 def extract_longbench_v2_answer(response: str) -> Optional[str]:
     """Extract answer from model response using official LongBench-v2 method."""
     response = response.replace("*", "")
+    response = response.replace("\n", "")
 
     # First try: "The correct answer is (A)"
-    match = re.search(r"The correct answer is \(([A-D])\)", response, re.IGNORECASE)
+    match = re.search(r"The correct answer is:?\s*\(([A-D])\)", response, re.IGNORECASE)
     if match:
         return match.group(1).upper()
 
     # Second try: "The correct answer is A"
-    match = re.search(r"The correct answer is ([A-D])", response, re.IGNORECASE)
+    match = re.search(r"The correct answer is:?\s*([A-D])", response, re.IGNORECASE)
     if match:
         return match.group(1).upper()
 
