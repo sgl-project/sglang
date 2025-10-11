@@ -226,7 +226,7 @@ def _max_length_from_subpattern(subpattern: sre_parse.SubPattern):
             total += max(_max_length_from_subpattern(branch) for branch in branches)
         elif token in {sre_parse.MAX_REPEAT, sre_parse.MIN_REPEAT}:
             _, max_num_repeat, inner_subpattern = value
-            if max_num_repeat in {sre_parse.MAX_REPEAT, sre_parse.MAXREPEAT}:
+            if max_num_repeat == sre_parse.MAXREPEAT:
                 total += MAX_LEN
             else:
                 total += max_num_repeat * _max_length_from_subpattern(inner_subpattern)
