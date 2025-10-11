@@ -1,5 +1,4 @@
 use openmetrics_parser::{MetricsExposition, PrometheusType, PrometheusValue};
-use std::collections::HashMap;
 use tracing::warn;
 
 #[derive(Debug)]
