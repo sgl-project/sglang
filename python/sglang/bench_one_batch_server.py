@@ -27,6 +27,7 @@ import requests
 from pydantic import BaseModel
 
 from sglang.bench_serving import (
+    get_processor,
     get_tokenizer,
     sample_mmmu_requests,
     sample_random_requests,
@@ -104,8 +105,14 @@ Note: To view the traces through perfetto-ui, please:
             if self.profile_links.extend or self.profile_links.decode:
                 # Create a combined link or use the first available one
                 trace_files = [self.profile_links.extend, self.profile_links.decode]
+                if any(trace_file is None for trace_file in trace_files):
+                    logger.error("Some trace files are None", f"{trace_files=}")
                 trace_files_relay_links = [
-                    f"[trace]({get_perfetto_relay_link_from_trace_file(trace_file)})"
+                    (
+                        f"[trace]({get_perfetto_relay_link_from_trace_file(trace_file)})"
+                        if trace_file
+                        else "N/A"
+                    )
                     for trace_file in trace_files
                 ]
 
@@ -364,6 +371,8 @@ def run_one_case(
     if dataset_name == "mmmu":
         # vlm
         input_ids = []
+        # for vlms, tokenizer is an instance of AutoProcessor
+        tokenizer = tokenizer.tokenizer
         for input_req in input_requests:
             input_ids += [tokenizer.encode(input_req.prompt)]
         payload["image_data"] = [req.image_data for req in input_requests]
@@ -609,7 +618,12 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
         tokenizer_path = server_info["tokenizer_path"]
     elif "prefill" in server_info:
         tokenizer_path = server_info["prefill"][0]["tokenizer_path"]
-    tokenizer = get_tokenizer(tokenizer_path)
+
+    if bench_args.dataset_name == "mmmu":
+        # mmmu implies this is a MLLM
+        tokenizer = get_processor(tokenizer_path)
+    else:
+        tokenizer = get_tokenizer(tokenizer_path)
 
     # warmup
     if not bench_args.skip_warmup:
