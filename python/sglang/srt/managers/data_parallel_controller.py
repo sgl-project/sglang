@@ -205,13 +205,13 @@ class DataParallelController:
             base_gpu_id += (
                 server_args.tp_size * server_args.pp_size * server_args.gpu_id_step
             )
-            
+
             if server_args.node_rank == 0:
-                self.workers[dp_rank] = get_zmq_socket(	
-                    self.context,	
-                    zmq.PUSH,	
-                    tmp_port_args.scheduler_input_ipc_name,	
-                    True,	
+                self.workers[dp_rank] = get_zmq_socket(
+                    self.context,
+                    zmq.PUSH,
+                    tmp_port_args.scheduler_input_ipc_name,
+                    True,
                 )
 
         # Free all sockets before starting the threads to launch TP workers
