@@ -183,6 +183,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
     ), "hybrid_gdn can only be used with non-MLA models."
 
     if cfg := runner.mambaish_config:
+        from sglang.srt.layers.attention.fla.utils import check_environments
         from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
             GDNAttnBackend,
             HybridLinearAttnBackend,
@@ -190,6 +191,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         )
         from sglang.srt.utils import is_blackwell, is_npu
 
+        check_environments()
         if runner.hybrid_gdn_config is not None:
             if is_blackwell():
                 assert (
