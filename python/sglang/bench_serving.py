@@ -12,7 +12,6 @@ python3 -m sglang.bench_serving --backend sglang --dataset-name random --num-pro
 
 import argparse
 import asyncio
-import base64
 import io
 import json
 import os
@@ -935,7 +934,7 @@ async def get_mooncake_request_over_time(
         for i in range(num_rounds):
             # Add user query for the current round
             chat_history.append(
-                {"role": "user", "content": f"Round {i+1}: {user_query_base}"}
+                {"role": "user", "content": f"Round {i + 1}: {user_query_base}"}
             )
 
             # Form the full prompt from history
@@ -1283,7 +1282,7 @@ def parse_image_resolution(image_resolution: str) -> Tuple[int, int]:
 def create_mm_data_row(text_prompt, images: list, images_base64, output_len, processor):
     try:
         content_items = [
-            {"type": "image_url", "image_url": {"url": image_base64}}
+            {"type": "image", "image": {"url": image_base64}}
             for image_base64 in images_base64
         ]
         content_items.append({"type": "text", "text": text_prompt})
@@ -1425,7 +1424,7 @@ def sample_image_requests(
     print(f"#Input tokens: {np.sum([x.prompt_len for x in dataset])}")
     print(f"#Output tokens: {np.sum([x.output_len for x in dataset])}")
     print(
-        f"\nCreated {len(dataset)} {image_content} {image_format} images with average {total_image_bytes//num_requests} bytes per request"
+        f"\nCreated {len(dataset)} {image_content} {image_format} images with average {total_image_bytes // num_requests} bytes per request"
     )
     return dataset
 

@@ -122,30 +122,31 @@ Note: To view the traces through perfetto-ui, please:
         # Build the row
         return f"| {self.batch_size} | {self.input_len} | {self.latency:.2f} | {self.input_throughput:.2f} | {self.output_throughput:.2f} | {accept_length} | {itl:.2f} | {input_cost:.2f} | {output_cost:.2f} | {profile_link} |\n"
 
-    @classmethod
-    def generate_markdown_report(
-        cls, trace_dir, results: List["BenchmarkResult"]
-    ) -> str:
-        """Generate a markdown report from a list of BenchmarkResult object from a single run."""
-        import os
 
-        summary = f"### {results[0].model_path}\n"
+def generate_markdown_report(trace_dir, results: List["BenchmarkResult"]) -> str:
+    """Generate a markdown report from a list of BenchmarkResult object from a single run."""
+    import os
 
-        # summary += (
-        #     f"Input lens: {result.input_len}. Output lens: {result.output_len}.\n"
-        # )
-        summary += "| batch size | input len | latency (s) | input throughput (tok/s)  | output throughput (tok/s) | acc length | ITL (ms) | input cost ($/1M) | output cost ($/1M) | profile (extend) | profile (decode)|\n"
-        summary += "| ---------- | --------- | ----------- | ------------------------- | ------------------------- | ---------- | -------- | ----------------- | ------------------ | --------------- | -------------- |\n"
+    summary = f"### {results[0].model_path}\n"
 
-        # all results should share the same isl & osl
-        for result in results:
-            base_url = os.getenv("TRACE_BASE_URL", "").rstrip("/")
-            relay_base = os.getenv("PERFETTO_RELAY_URL", "").rstrip("/")
-            relay_base = "https://docs.sglang.ai/ci-data/pages/perfetto_relay.html"
-            # base_url = "https://github.com/sgl-project/ci-data/traces"
-            summary += result.to_markdown_row(trace_dir, base_url, relay_base)
+    # summary += (
+    #     f"Input lens: {result.input_len}. Output lens: {result.output_len}.\n"
+    # )
+    summary += "| batch size | input len | latency (s) | input throughput (tok/s)  | output throughput (tok/s) | acc length | ITL (ms) | input cost ($/1M) | output cost ($/1M) | profile (extend) | profile (decode)|\n"
+    summary += "| ---------- | --------- | ----------- | ------------------------- | ------------------------- | ---------- | -------- | ----------------- | ------------------ | --------------- | -------------- |\n"
 
-        return summary
+    # all results should share the same isl & osl
+    for result in results:
+        base_url = os.getenv(
+            "TRACE_BASE_URL", "https://github.com/sgl-project/ci-data/traces"
+        ).rstrip("/")
+        relay_base = os.getenv(
+            "PERFETTO_RELAY_URL",
+            "https://docs.sglang.ai/ci-data/pages/perfetto_relay.html",
+        ).rstrip("/")
+        summary += result.to_markdown_row(trace_dir, base_url, relay_base)
+
+    return summary
 
 
 @dataclasses.dataclass
@@ -312,7 +313,6 @@ def run_one_case(
             num_requests=batch_size,
             processor=tokenizer,
             fixed_output_len=output_len,
-            apply_chat_template=True,
             random_sample=False,
         )
     elif dataset_name == "random":
