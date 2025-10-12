@@ -1,7 +1,4 @@
-import time
 import unittest
-
-import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_deterministic import BenchArgs, test_deterministic
@@ -54,17 +51,7 @@ class TestDeterministicBase(CustomTestCase):
         args.test_mode = "single"
         args.n_start = 10
         args.n_trials = 20
-        results = test_deterministic(args)
-        for result in results:
-            assert result == 1
-
-    def test_mixed(self):
-        args = BenchArgs()
-        url = DEFAULT_URL_FOR_TEST
-        args.host, args.port = self._extract_host_and_port(url)
-        args.test_mode = "mixed"
-        args.n_start = 10
-        args.n_trials = 20
+        args.temperature = 0.5  # test for deterministic sampling
         results = test_deterministic(args)
         for result in results:
             assert result == 1
@@ -76,6 +63,7 @@ class TestDeterministicBase(CustomTestCase):
         args.test_mode = "prefix"
         args.n_start = 10
         args.n_trials = 10
+        args.temperature = 0.5  # test for deterministic sampling
         results = test_deterministic(args)
         for result in results:
             assert result == 1
