@@ -114,7 +114,7 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
         for layer_idx, layer in enumerate(
             self.layers[self.start_layer : self.end_layer]
         ):
-            layer_idx = layer_idx + self.start_layer
+            layer_idx += self.start_layer
             if layer_idx in self.layers_to_capture:
                 aux_hidden_states.append(
                     hidden_states + residual if residual is not None else hidden_states
@@ -130,9 +130,8 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
             # process deepstack
             if input_deepstack_embeds is not None and layer_idx in range(3):
                 sep = self.hidden_size * layer_idx
-                hidden_states = (
-                    hidden_states
-                    + input_deepstack_embeds[:, sep : sep + self.hidden_size]
+                hidden_states.add_(
+                    input_deepstack_embeds[:, sep : sep + self.hidden_size]
                 )
 
         if not self.pp_group.is_last_rank:
