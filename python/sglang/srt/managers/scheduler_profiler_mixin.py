@@ -225,12 +225,12 @@ class SchedulerProfilerMixin:
                 filename_parts = [self.profile_id, f"TP-{self.tp_rank}"]
 
                 # Only add other ranks if parallelism is enabled (size > 1)
-                if self.dp_size is not None and self.dp_size > 1:
-                    filename_parts.append(f"DP-{self.dp_rank}")
-                if self.pp_size is not None and self.pp_size > 1:
-                    filename_parts.append(f"PP-{self.pp_rank}")
-                if self.moe_ep_size is not None and self.moe_ep_size > 1:
-                    filename_parts.append(f"EP-{self.moe_ep_rank}")
+                if getattr(self, "dp_size", 1) > 1:
+                    filename_parts.append(f"DP-{getattr(self, 'dp_rank', 0)}")
+                if getattr(self, "pp_size", 1) > 1:
+                    filename_parts.append(f"PP-{getattr(self, 'pp_rank', 0)}")
+                if getattr(self, "moe_ep_size", 1) > 1:
+                    filename_parts.append(f"EP-{getattr(self, 'moe_ep_rank', 0)}")
 
                 filename = "-".join(filename_parts) + stage_suffix + ".trace.json.gz"
 
