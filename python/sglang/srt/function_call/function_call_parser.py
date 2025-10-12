@@ -177,13 +177,9 @@ class FunctionCallParser:
         """
         # NOTE: structural_tag only supports JSON-compatible content between the begin and end.
         # It cannot parse or validate function call Pythonic or XML-ish syntax.
-        if (
-            self.detector.supports_structural_tag()
-            and tool_choice == "auto"
-            and any(tool.function.strict for tool in self.tools)
-        ):
-            strict_tag = self.get_structure_tag()
-            return ("structural_tag", strict_tag)
+        if self.detector.supports_structural_tag() and tool_choice == "auto":
+            structural_tag = self.get_structure_tag()
+            return ("structural_tag", structural_tag)
         elif (
             tool_choice == "required"
             or isinstance(tool_choice, ToolChoice)

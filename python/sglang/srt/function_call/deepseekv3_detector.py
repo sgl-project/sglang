@@ -121,6 +121,18 @@ class DeepSeekV3Detector(BaseFormatDetector):
                 func_name = partial_match.group(2).strip()
                 func_args_raw = partial_match.group(3).strip()
 
+                if func_name not in self._tool_indices:
+                    logger.warning(
+                        "Model attempted to call undefined function: %s", func_name
+                    )
+                    self._buffer = ""
+                    self.current_tool_id = -1
+                    self.prev_tool_call_arr = []
+                    self.streamed_args_for_tool = []
+                    self._last_arguments = ""
+                    self.current_tool_name_sent = False
+                    return StreamingParseResult(normal_text="", calls=[])
+
                 # Initialize state if this is the first tool call
                 if self.current_tool_id == -1:
                     self.current_tool_id = 0

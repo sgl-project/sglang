@@ -7,6 +7,7 @@ from sglang.srt.entrypoints.openai.protocol import Function, Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import StreamingParseResult
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
+from sglang.srt.function_call.deepseekv31_detector import DeepSeekV31Detector
 from sglang.srt.function_call.glm4_moe_detector import Glm4MoeDetector
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.kimik2_detector import KimiK2Detector
@@ -16,6 +17,7 @@ from sglang.srt.function_call.mistral_detector import MistralDetector
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 from sglang.srt.function_call.qwen25_detector import Qwen25Detector
+from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
@@ -1379,6 +1381,43 @@ class TestKimiK2Detector(unittest.TestCase):
         self.assertEqual(tool_calls[1]["name"], "get_tourist_attractions")
         self.assertEqual(tool_calls[1]["parameters"], '{"city": "London"}')
 
+    def test_detect_and_parse_ignores_unknown_tool(self):
+        """Ensure detect_and_parse skips tool calls not present in the tools list."""
+        text = '<|tool_calls_section_begin|><|tool_call_begin|>functions.img_gen:0<|tool_call_argument_begin|>{"prompt": "abc"}<|tool_call_end|><|tool_calls_section_end|>'
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(result.calls, [])
+
+    def test_streaming_ignores_unknown_tool_and_recovers(self):
+        """Ensure streaming parsing drops unknown tools and still handles subsequent valid calls."""
+        unknown_chunks = [
+            "<|tool_calls_section_begin|><|tool_call_begin|>functions.img_gen:0<|tool_call_argument_begin|>{",
+            '"prompt": "abc"}',
+            "<|tool_call_end|><|tool_calls_section_end|>",
+        ]
+
+        for chunk in unknown_chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            self.assertFalse(result.calls)
+
+        self.assertEqual(
+            self.detector.current_tool_id, -1, "State should reset after unknown tool"
+        )
+
+        valid_chunks = [
+            "<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{",
+            '"city": "Berlin"}',
+            "<|tool_call_end|><|tool_calls_section_end|>",
+        ]
+
+        tool_calls = []
+        for chunk in valid_chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            for call in result.calls:
+                if call.name:
+                    tool_calls.append(call)
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0].name, "get_weather")
+
     def test_tool_call_completion(self):
         """Test that the buffer and state are reset after a tool call is completed."""
         chunks = [
@@ -1549,6 +1588,161 @@ class TestDeepSeekV3Detector(unittest.TestCase):
         params2 = json.loads(tool_calls_parameters[1])
         self.assertEqual(params1["city"], "Shanghai")
         self.assertEqual(params2["city"], "Beijing")
+
+    def test_streaming_ignores_unknown_tool(self):
+        """Ensure streaming parser drops tool calls for functions that are not provided."""
+        chunks = [
+            "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>img_gen\n```json\n",
+            '{"prompt": "test"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>',
+        ]
+
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            self.assertFalse(result.calls)
+
+        self.assertEqual(
+            self.detector.current_tool_id, -1, "State should reset after unknown tool"
+        )
+
+        follow_up = [
+            "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n```json\n",
+            '{"city": "Osaka"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>',
+        ]
+
+        seen = []
+        for chunk in follow_up:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            for call in result.calls:
+                if call.name:
+                    seen.append(call.name)
+        self.assertEqual(seen, ["get_weather"])
+
+
+class TestDeepSeekV31Detector(unittest.TestCase):
+    def setUp(self):
+        """Set up test tools and detector for DeepSeekV31 format testing."""
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    description="Get weather information",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "city": {
+                                "type": "string",
+                                "description": "City name",
+                            }
+                        },
+                        "required": ["city"],
+                    },
+                ),
+            ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_tourist_attractions",
+                    description="Get tourist attractions",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "city": {
+                                "type": "string",
+                                "description": "City name",
+                            }
+                        },
+                        "required": ["city"],
+                    },
+                ),
+            ),
+        ]
+        self.detector = DeepSeekV31Detector()
+
+    def test_streaming_ignores_unknown_tool(self):
+        """Ensure streaming parser ignores unknown tool names and can recover."""
+        chunks = [
+            "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>img_gen<｜tool▁sep｜>{\"prompt\": \"test\"}<｜tool▁call▁end｜><｜tool▁calls▁end｜>"
+        ]
+
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            self.assertFalse(result.calls)
+
+        self.assertEqual(
+            self.detector.current_tool_id, -1, "State should reset after unknown tool"
+        )
+
+        follow_up = [
+            "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>{\"city\": \"Osaka\"}<｜tool▁call▁end｜><｜tool▁calls▁end｜>"
+        ]
+
+        seen = []
+        for chunk in follow_up:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            for call in result.calls:
+                if call.name:
+                    seen.append(call.name)
+        self.assertEqual(seen, ["get_weather"])
+
+
+class TestFunctionCallParserConstraints(unittest.TestCase):
+    def setUp(self):
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    description="Get weather information",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "city": {
+                                "type": "string",
+                                "description": "City name",
+                            }
+                        },
+                        "required": ["city"],
+                    },
+                ),
+            ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_tourist_attractions",
+                    description="Get tourist attractions",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "city": {
+                                "type": "string",
+                                "description": "City name",
+                            }
+                        },
+                        "required": ["city"],
+                    },
+                ),
+            ),
+        ]
+
+    def test_auto_structural_tag_without_strict(self):
+        """Auto tool choice should still receive structural tags even if tools are not strict."""
+        parser = FunctionCallParser(self.tools, "kimi_k2")
+        constraint = parser.get_structure_constraint("auto")
+
+        self.assertIsNotNone(constraint)
+        constraint_type, payload = constraint
+        self.assertEqual(constraint_type, "structural_tag")
+        self.assertEqual(len(payload.structures), len(self.tools))
+
+        begins = [structure.begin for structure in payload.structures]
+        for tool, begin in zip(self.tools, begins):
+            self.assertIn(f"functions.{tool.function.name}", begin)
+
+        # structural tag should expose triggers matching detector format
+        self.assertTrue(payload.triggers)
+        for trigger in payload.triggers:
+            self.assertIn("<|tool_calls_section_begin|>", trigger)
 
 
 class TestQwen3CoderDetector(unittest.TestCase):

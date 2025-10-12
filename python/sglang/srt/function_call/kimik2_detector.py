@@ -70,6 +70,7 @@ class KimiK2Detector(BaseFormatDetector):
 
         try:
             tool_calls = []
+            tool_indices = self._get_tool_indices(tools)
 
             # Match each tool call individually, both complete and incomplete
             pattern = re.compile(
@@ -88,6 +89,13 @@ class KimiK2Detector(BaseFormatDetector):
                     continue
                 function_name = m.group("name")
                 function_idx = int(m.group("index"))
+
+                if function_name not in tool_indices:
+                    logger.warning(
+                        "Model attempted to call undefined function: %s",
+                        function_name,
+                    )
+                    continue
 
                 # Validate JSON
                 try:
@@ -163,6 +171,19 @@ class KimiK2Detector(BaseFormatDetector):
                     logger.warning("Unexpected tool_call_id format: %s", function_id)
                     return StreamingParseResult(normal_text="", calls=calls)
                 function_name = m.group("name")
+
+                if function_name not in self._tool_indices:
+                    logger.warning(
+                        "Model attempted to call undefined function: %s",
+                        function_name,
+                    )
+                    self._buffer = ""
+                    self.current_tool_id = -1
+                    self.prev_tool_call_arr = []
+                    self.streamed_args_for_tool = []
+                    self._last_arguments = ""
+                    self.current_tool_name_sent = False
+                    return StreamingParseResult(normal_text="", calls=[])
 
                 # Initialize state if this is the first tool call
                 if self.current_tool_id == -1:
