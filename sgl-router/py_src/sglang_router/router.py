@@ -155,10 +155,13 @@ class Router:
         # Convert backend
         args_dict["backend"] = backend_from_str(args_dict.get("backend"))
 
+        # Convert history_backend to enum first
+        history_backend_raw = args_dict.get("history_backend", "memory")
+        history_backend = history_backend_from_str(history_backend_raw)
+
         # Convert Oracle config if needed
         oracle_config = None
-        history_backend_str = args_dict.get("history_backend", "memory")
-        if history_backend_str == "oracle":
+        if history_backend == HistoryBackendType.Oracle:
             # Prioritize TNS alias over connect descriptor
             tns_alias = args_dict.get("oracle_tns_alias")
             connect_descriptor = args_dict.get("oracle_connect_descriptor")
@@ -176,9 +179,7 @@ class Router:
                 pool_timeout_secs=args_dict.get("oracle_pool_timeout_secs", 30),
             )
         args_dict["oracle_config"] = oracle_config
-
-        # convert history_backend to enum
-        args_dict["history_backend"] = history_backend_from_str(history_backend_str)
+        args_dict["history_backend"] = history_backend
 
         # Remove fields that shouldn't be passed to Rust Router constructor
         fields_to_remove = [
