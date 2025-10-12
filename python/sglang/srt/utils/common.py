@@ -12,7 +12,6 @@
 # limitations under the License.
 # ==============================================================================
 """Common utilities."""
-
 from __future__ import annotations
 
 import argparse
@@ -70,6 +69,7 @@ from typing import (
 )
 
 import numpy as np
+import orjson
 import psutil
 import pybase64
 import requests
@@ -261,6 +261,17 @@ def is_flashinfer_available():
     if not get_bool_env_var("SGLANG_IS_FLASHINFER_AVAILABLE", default="true"):
         return False
     return importlib.util.find_spec("flashinfer") is not None and is_cuda()
+
+
+def is_nvidia_cublas_cu12_version_ge_12_9():
+    """
+    temporary fix for issue #11272
+    """
+    try:
+        installed_version = version("nvidia-cublas-cu12")
+    except PackageNotFoundError:
+        return False
+    return pkg_version.parse(installed_version) >= pkg_version.parse("12.9")
 
 
 def random_uuid() -> str:
@@ -481,13 +492,13 @@ def make_layers(
     pp_size: Optional[int] = None,
     prefix: str = "",
     return_tuple: bool = False,
-    offloader_kwargs: Dict[str, Any] = {},
+    offloader_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Tuple[torch.nn.Module, int, int]:
     """Make a list of layers with the given layer function"""
     # circula imports
     from sglang.srt.distributed import get_pp_indices
     from sglang.srt.layers.utils import PPMissingLayer
-    from sglang.srt.offloader import get_offloader
+    from sglang.srt.utils.offloader import get_offloader
 
     assert not pp_size or num_hidden_layers >= pp_size
     start_layer, end_layer = (
@@ -506,7 +517,7 @@ def make_layers(
                 layer_fn(idx=idx, prefix=add_prefix(idx, prefix))
                 for idx in range(start_layer, end_layer)
             ),
-            **offloader_kwargs,
+            **(offloader_kwargs or {}),
         )
         + [
             PPMissingLayer(return_tuple=return_tuple)
@@ -516,6 +527,24 @@ def make_layers(
     if pp_rank is None or pp_size is None:
         return modules
     return modules, start_layer, end_layer
+
+
+def make_layers_non_pp(
+    num_hidden_layers: int,
+    layer_fn: LayerFn,
+    prefix: str = "",
+) -> torch.nn.ModuleList:
+    from sglang.srt.utils.offloader import get_offloader
+
+    layers = torch.nn.ModuleList(
+        get_offloader().wrap_modules(
+            (
+                layer_fn(idx=idx, prefix=add_prefix(idx, prefix))
+                for idx in range(num_hidden_layers)
+            )
+        )
+    )
+    return layers
 
 
 cmo_stream = None
@@ -1083,7 +1112,7 @@ def configure_logger(server_args, prefix: str = ""):
                 f"{SGLANG_LOGGING_CONFIG_PATH} but it does not exist!"
             )
         with open(SGLANG_LOGGING_CONFIG_PATH, encoding="utf-8") as file:
-            custom_config = json.loads(file.read())
+            custom_config = orjson.loads(file.read())
         logging.config.dictConfig(custom_config)
         return
     format = f"[%(asctime)s{prefix}] %(message)s"
@@ -1873,6 +1902,7 @@ def direct_register_custom_op(
 
 
 def set_gpu_proc_affinity(
+    pp_size: int,
     tp_size: int,
     nnodes: int,
     gpu_id: int,
@@ -1881,7 +1911,8 @@ def set_gpu_proc_affinity(
     pid = os.getpid()
     p = psutil.Process(pid)
 
-    tp_size_per_node = tp_size // nnodes
+    nnodes_per_tp_group = max(nnodes // pp_size, 1)
+    tp_size_per_node = tp_size // nnodes_per_tp_group
 
     # total physical cores
     total_pcores = psutil.cpu_count(logical=False)
@@ -2494,9 +2525,9 @@ def log_info_on_rank0(logger, msg):
 
 def load_json_config(data: str):
     try:
-        return json.loads(data)
+        return orjson.loads(data)
     except JSONDecodeError:
-        return json.loads(Path(data).read_text())
+        return orjson.loads(Path(data).read_text())
 
 
 def dispose_tensor(x: torch.Tensor):
@@ -3205,7 +3236,7 @@ def numa_bind_to_node(node: int):
 
 def json_list_type(value):
     try:
-        return json.loads(value)
+        return orjson.loads(value)
     except json.JSONDecodeError:
         raise argparse.ArgumentTypeError(
             f"Invalid JSON list: {value}. Please provide a valid JSON list."

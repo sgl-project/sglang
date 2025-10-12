@@ -1180,7 +1180,7 @@ impl WorkerManager {
             });
         }
 
-        let results = futures::future::join_all(tasks).await;
+        let results = future::join_all(tasks).await;
 
         let mut successful = Vec::new();
         let mut failed = Vec::new();
@@ -1321,7 +1321,7 @@ impl WorkerManager {
             });
         }
 
-        let loads = futures::future::join_all(tasks).await;
+        let loads = future::join_all(tasks).await;
 
         let successful = loads.iter().filter(|l| l.load >= 0).count();
         let failed = loads.iter().filter(|l| l.load < 0).count();

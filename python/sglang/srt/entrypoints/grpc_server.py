@@ -35,8 +35,8 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.sampling.sampling_params import SamplingParams as SGLSamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import configure_logger, prepare_model_and_tokenizer
+from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -189,7 +189,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         # Start the request manager's event loop using auto_create_handle_loop
         self.request_manager.auto_create_handle_loop()
 
-        logger.info("Standalone gRPC scheduler service initialized")
+        logger.info("gRPC scheduler servicer initialized")
 
     async def Generate(
         self,
@@ -197,7 +197,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         context: grpc.aio.ServicerContext,
     ) -> AsyncIterator[sglang_scheduler_pb2.GenerateResponse]:
         """Handle generation requests with streaming responses."""
-        logger.info(f"Generation request: {request.request_id}")
+        logger.info(f"Receive generation request: {request.request_id}")
 
         try:
             # Convert gRPC request to internal format
@@ -249,7 +249,10 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                         yield self._create_chunk_response(request.request_id, output)
 
         except Exception as e:
-            logger.error(f"Generate failed: {e}\n{get_exception_traceback()}")
+            logger.error(
+                f"Generate failed for request {request.request_id}: {e}\n"
+                f"{get_exception_traceback()}"
+            )
             yield sglang_scheduler_pb2.GenerateResponse(
                 request_id=request.request_id,
                 error=sglang_scheduler_pb2.GenerateError(
@@ -262,10 +265,10 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
     async def Embed(
         self,
         request: sglang_scheduler_pb2.EmbedRequest,
-        context: grpc.aio.ServicerContext,
+        _context: grpc.aio.ServicerContext,
     ) -> sglang_scheduler_pb2.EmbedResponse:
         """Handle embedding requests."""
-        logger.info(f"Embedding request: {request.request_id}")
+        logger.info(f"Receive embedding request: {request.request_id}")
 
         try:
             # Convert request
@@ -292,7 +295,10 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             )
 
         except Exception as e:
-            logger.error(f"Embed failed: {e}\n{get_exception_traceback()}")
+            logger.error(
+                f"Embed failed for request {request.request_id}: {e}\n"
+                f"{get_exception_traceback()}"
+            )
             return sglang_scheduler_pb2.EmbedResponse(
                 request_id=request.request_id,
                 error=sglang_scheduler_pb2.EmbedError(
@@ -307,86 +313,95 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         request: sglang_scheduler_pb2.HealthCheckRequest,
         context: grpc.aio.ServicerContext,
     ) -> sglang_scheduler_pb2.HealthCheckResponse:
-        """Health check by generating from client input."""
-        try:
-            # Check if request manager is shutting down
-            if self.request_manager.gracefully_exit:
-                return sglang_scheduler_pb2.HealthCheckResponse(
-                    healthy=False, message="Server shutting down"
-                )
+        """
+        Check the health of the inference server by sending a special request to generate one token.
+        Similar to HTTP server's /health endpoint.
+        """
+        logger.info("Receive health check request")
 
-            # Extract tokenized input from request
-            if not request.HasField("tokenized"):
-                return sglang_scheduler_pb2.HealthCheckResponse(
-                    healthy=False, message="Tokenized input required for health check"
-                )
+        if self.request_manager.gracefully_exit:
+            logger.info(
+                "Health check request received during shutdown. Returning unhealthy."
+            )
+            return sglang_scheduler_pb2.HealthCheckResponse(
+                healthy=False, message="Server is shutting down"
+            )
 
-            input_text = request.tokenized.original_text
-            input_ids = list(request.tokenized.input_ids)
+        # Create a special health check request
+        rid = f"HEALTH_CHECK_{time.time()}"
+        sampling_params = SGLSamplingParams(max_new_tokens=1, temperature=0.0)
+        sampling_params.normalize(tokenizer=None)
 
-            # Create health check request
-            rid = f"HEALTH_CHECK_GRPC_{time.time()}"
-
-            health_request = TokenizedGenerateReqInput(
+        # Create health check request
+        is_generation = self.scheduler_info.get("is_generation", True)
+        if is_generation:
+            health_req = TokenizedGenerateReqInput(
                 rid=rid,
-                input_text=input_text,
-                input_ids=input_ids,
-                sampling_params=SGLSamplingParams(max_new_tokens=1, temperature=0.0),
-                stream=False,
-                mm_inputs=None,
+                input_text="",
+                input_ids=[0],
+                sampling_params=sampling_params,
                 return_logprob=False,
                 logprob_start_len=-1,
                 top_logprobs_num=0,
+                stream=False,
+                mm_inputs=None,
                 token_ids_logprob=None,
             )
-
+            # Set disaggregation params if needed
             if self.server_args.disaggregation_mode != DisaggregationMode.NULL:
-                health_request.bootstrap_host = FAKE_BOOTSTRAP_HOST
-                health_request.bootstrap_room = 0
-
-            logger.info(f"Sending health check request to request manager...")
-
-            # Submit and wait for response
-            output_generator = self.request_manager.generate_request(
-                health_request, request_id=rid
+                health_req.bootstrap_host = FAKE_BOOTSTRAP_HOST
+                health_req.bootstrap_room = 0
+        else:
+            health_req = TokenizedEmbeddingReqInput(
+                rid=rid,
+                input_text="",
+                input_ids=[0],
             )
 
+        # Submit health check request
+        async def run_health_check():
             try:
-                # Get first response with timeout
-                response = await asyncio.wait_for(
-                    output_generator.__anext__(), timeout=HEALTH_CHECK_TIMEOUT
-                )
+                async for _ in self.request_manager.generate_request(
+                    obj=health_req,
+                    request_id=rid,
+                ):
+                    # Got at least one response, server is healthy
+                    return True
+            except Exception as e:
+                logger.warning(f"Health check failed: {e}")
+                return False
+            return False
 
-                # Clean up
-                if rid in self.request_manager.rid_to_state:
-                    del self.request_manager.rid_to_state[rid]
+        task = asyncio.create_task(run_health_check())
 
+        # Wait for response with timeout
+        tic = time.time()
+        while time.time() < tic + HEALTH_CHECK_TIMEOUT:
+            await asyncio.sleep(1)
+            # Check if we got a response from scheduler
+            if self.request_manager.last_receive_tstamp > tic:
+                task.cancel()
+                # Clean up health check state
+                self.request_manager._cleanup_request_state(rid)
                 return sglang_scheduler_pb2.HealthCheckResponse(
                     healthy=True, message="Health check passed"
                 )
 
-            except asyncio.TimeoutError:
-                # Clean up on timeout
-                if rid in self.request_manager.rid_to_state:
-                    del self.request_manager.rid_to_state[rid]
-
-                return sglang_scheduler_pb2.HealthCheckResponse(
-                    healthy=False, message="Health check timeout"
-                )
-
-        except Exception as e:
-            logger.error(f"Health check failed: {e}")
-            return sglang_scheduler_pb2.HealthCheckResponse(
-                healthy=False, message=f"Health check error: {str(e)}"
-            )
+        # Timeout - server not responding
+        task.cancel()
+        self.request_manager._cleanup_request_state(rid)
+        logger.warning(f"Health check timeout after {HEALTH_CHECK_TIMEOUT}s")
+        return sglang_scheduler_pb2.HealthCheckResponse(
+            healthy=False, message=f"Health check timeout after {HEALTH_CHECK_TIMEOUT}s"
+        )
 
     async def Abort(
         self,
         request: sglang_scheduler_pb2.AbortRequest,
-        context: grpc.aio.ServicerContext,
+        _context: grpc.aio.ServicerContext,
     ) -> sglang_scheduler_pb2.AbortResponse:
         """Abort an ongoing request."""
-        logger.info(f"Aborting request: {request.request_id}")
+        logger.info(f"Receive abort request: {request.request_id}")
 
         try:
             success = await self.request_manager.abort_request(request.request_id)
@@ -396,7 +411,10 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 message=f"Request {request.request_id} {'aborted' if success else 'not found'}",
             )
         except Exception as e:
-            logger.error(f"Abort failed: {e}")
+            logger.error(
+                f"Abort failed for request {request.request_id}: {e}\n"
+                f"{get_exception_traceback()}"
+            )
             return sglang_scheduler_pb2.AbortResponse(
                 success=False,
                 message=str(e),
@@ -404,11 +422,11 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
 
     async def GetModelInfo(
         self,
-        request: sglang_scheduler_pb2.GetModelInfoRequest,
-        context: grpc.aio.ServicerContext,
+        _request: sglang_scheduler_pb2.GetModelInfoRequest,
+        _context: grpc.aio.ServicerContext,
     ) -> sglang_scheduler_pb2.GetModelInfoResponse:
         """Get model information."""
-        logger.info("Model info request received")
+        logger.debug("Receive model info request")
 
         is_generation = self.scheduler_info.get("is_generation")
         if is_generation is None:
@@ -435,11 +453,11 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
 
     async def GetServerInfo(
         self,
-        request: sglang_scheduler_pb2.GetServerInfoRequest,
-        context: grpc.aio.ServicerContext,
+        _request: sglang_scheduler_pb2.GetServerInfoRequest,
+        _context: grpc.aio.ServicerContext,
     ) -> sglang_scheduler_pb2.GetServerInfoResponse:
         """Get server information."""
-        logger.info("Server info request received")
+        logger.debug("Receive server info request")
 
         server_args_dict = dataclasses.asdict(self.server_args)
         server_args_struct = Struct()
@@ -861,9 +879,8 @@ async def serve_grpc(
     listen_addr = f"{server_args.host}:{server_args.port}"
     server.add_insecure_port(listen_addr)
 
-    logger.info(f"Starting standalone gRPC server on {listen_addr}")
-
     await server.start()
+    logger.info(f"gRPC server listening on {listen_addr}")
 
     # Handle shutdown signals
     loop = asyncio.get_running_loop()

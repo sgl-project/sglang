@@ -12,11 +12,13 @@ use serde_json::Value;
 
 use crate::core::Worker;
 use crate::grpc_client::{proto, SglangSchedulerClient};
-use crate::protocols::spec::{ChatCompletionRequest, ChatCompletionResponse, GenerateRequest};
-use crate::reasoning_parser::ReasoningParserFactory;
+use crate::protocols::spec::{
+    ChatCompletionRequest, ChatCompletionResponse, GenerateRequest, GenerateResponse,
+};
+use crate::reasoning_parser::ParserFactory as ReasoningParserFactory;
 use crate::tokenizer::stop::StopSequenceDecoder;
 use crate::tokenizer::traits::Tokenizer;
-use crate::tool_parser::ToolParserFactory;
+use crate::tool_parser::ParserFactory as ToolParserFactory;
 
 // ============================================================================
 // Core Context Types
@@ -46,9 +48,10 @@ pub struct RequestInput {
 }
 
 /// Request type variants
+/// Using Arc instead of Box to enable cheap cloning for background tasks
 pub enum RequestType {
-    Chat(Box<ChatCompletionRequest>),
-    Generate(Box<GenerateRequest>),
+    Chat(Arc<ChatCompletionRequest>),
+    Generate(Arc<GenerateRequest>),
 }
 
 /// Shared components (injected once at creation)
@@ -179,14 +182,14 @@ pub struct StreamingState {
 impl RequestContext {
     /// Create context for chat completion request
     pub fn for_chat(
-        request: ChatCompletionRequest,
+        request: Arc<ChatCompletionRequest>,
         headers: Option<HeaderMap>,
         model_id: Option<String>,
         components: Arc<SharedComponents>,
     ) -> Self {
         Self {
             input: RequestInput {
-                request_type: RequestType::Chat(Box::new(request)),
+                request_type: RequestType::Chat(request),
                 headers,
                 model_id,
             },
@@ -197,14 +200,14 @@ impl RequestContext {
 
     /// Create context for generate request
     pub fn for_generate(
-        request: GenerateRequest,
+        request: Arc<GenerateRequest>,
         headers: Option<HeaderMap>,
         model_id: Option<String>,
         components: Arc<SharedComponents>,
     ) -> Self {
         Self {
             input: RequestInput {
-                request_type: RequestType::Generate(Box::new(request)),
+                request_type: RequestType::Generate(request),
                 headers,
                 model_id,
             },
@@ -226,11 +229,11 @@ impl RequestContext {
         }
     }
 
-    /// Try to get chat request
-    pub fn try_chat_request(&self) -> Option<&ChatCompletionRequest> {
+    /// Get Arc clone of chat request (panics if not chat)
+    pub fn chat_request_arc(&self) -> Arc<ChatCompletionRequest> {
         match &self.input.request_type {
-            RequestType::Chat(req) => Some(req.as_ref()),
-            _ => None,
+            RequestType::Chat(req) => Arc::clone(req),
+            _ => panic!("Expected chat request"),
         }
     }
 
@@ -242,11 +245,11 @@ impl RequestContext {
         }
     }
 
-    /// Try to get generate request
-    pub fn try_generate_request(&self) -> Option<&GenerateRequest> {
+    /// Get Arc clone of generate request (panics if not generate)
+    pub fn generate_request_arc(&self) -> Arc<GenerateRequest> {
         match &self.input.request_type {
-            RequestType::Generate(req) => Some(req.as_ref()),
-            _ => None,
+            RequestType::Generate(req) => Arc::clone(req),
+            _ => panic!("Expected generate request"),
         }
     }
 
@@ -256,16 +259,6 @@ impl RequestContext {
             RequestType::Chat(req) => req.stream,
             RequestType::Generate(req) => req.stream,
         }
-    }
-
-    /// Check if request is chat
-    pub fn is_chat(&self) -> bool {
-        matches!(&self.input.request_type, RequestType::Chat(_))
-    }
-
-    /// Check if request is generate
-    pub fn is_generate(&self) -> bool {
-        matches!(&self.input.request_type, RequestType::Generate(_))
     }
 }
 
@@ -378,21 +371,23 @@ impl ClientSelection {
 // Execution and Response Types
 // ============================================================================
 
-use tonic::codec::Streaming;
+use crate::grpc_client::sglang_scheduler::AbortOnDropStream;
 
 /// Result of request execution (streams from workers)
+/// Uses AbortOnDropStream to automatically abort on cancellation
 pub enum ExecutionResult {
     Single {
-        stream: Streaming<proto::GenerateResponse>,
+        stream: AbortOnDropStream,
     },
     Dual {
-        prefill: Streaming<proto::GenerateResponse>,
-        decode: Box<Streaming<proto::GenerateResponse>>,
+        prefill: AbortOnDropStream,
+        decode: Box<AbortOnDropStream>,
     },
 }
 
 /// Final processed response
 pub enum FinalResponse {
     Chat(ChatCompletionResponse),
-    Generate(Box<GenerateRequest>),
+    /// Generate response is a Vec of GenerateResponse (n=1 returns single item, n>1 returns multiple)
+    Generate(Vec<GenerateResponse>),
 }
