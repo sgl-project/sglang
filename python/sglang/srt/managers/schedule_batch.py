@@ -72,7 +72,7 @@ from sglang.srt.metrics.collector import SchedulerMetricsCollector, TimeStats
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.server_args import ServerArgs, global_server_args
+from sglang.srt.server_args import ServerArgs, _global_server_args
 from sglang.srt.utils import flatten_nested_list
 from sglang.srt.utils.common import next_power_of_2
 
@@ -643,7 +643,7 @@ class Req:
         """Check if this request is prefill-only (no token generation needed)."""
         # NOTE: when spec is enabled, prefill_only optimizations are disabled
 
-        spec_alg = global_server_args.speculative_algorithm
+        spec_alg = get_global_server_args().speculative_algorithm
         return self.sampling_params.max_new_tokens == 0 and spec_alg is None
 
     def add_latency(self, stage: RequestStage):

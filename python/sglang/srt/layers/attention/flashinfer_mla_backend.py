@@ -29,7 +29,7 @@ from sglang.srt.layers.attention.flashinfer_backend import (
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.server_args import global_server_args
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import (
     is_flashinfer_available,
@@ -193,9 +193,9 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.skip_prefill = skip_prefill
         self.enable_chunk_kv = (
             not skip_prefill
-            and global_server_args.disaggregation_mode != "decode"
-            and not global_server_args.disable_chunked_prefix_cache
-            and not global_server_args.flashinfer_mla_disable_ragged
+            and get_global_server_args().disaggregation_mode != "decode"
+            and not get_global_server_args().disable_chunked_prefix_cache
+            and not get_global_server_args().flashinfer_mla_disable_ragged
         )
         self.page_size = model_runner.page_size
 
@@ -306,7 +306,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             prefix_lens = forward_batch.extend_prefix_lens
             extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
             use_ragged = (
-                not global_server_args.flashinfer_mla_disable_ragged
+                not get_global_server_args().flashinfer_mla_disable_ragged
                 and extend_no_prefix
             )
 

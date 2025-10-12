@@ -27,7 +27,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.server_args import ServerArgs, global_server_args
+from sglang.srt.server_args import ServerArgs, get_global_server_args
 from sglang.srt.speculative.build_eagle_tree import build_tree_kernel_efficient
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
@@ -261,7 +261,7 @@ class EAGLEWorker(TpModelWorker):
         )
 
     def _create_flashinfer_decode_backend(self):
-        if not global_server_args.use_mla_backend:
+        if not get_global_server_args().use_mla_backend:
             from sglang.srt.layers.attention.flashinfer_backend import (
                 FlashInferMultiStepDraftBackend,
             )
@@ -325,7 +325,7 @@ class EAGLEWorker(TpModelWorker):
         )
 
     def _create_trtllm_mla_decode_backend(self):
-        if not global_server_args.use_mla_backend:
+        if not get_global_server_args().use_mla_backend:
             raise ValueError(
                 "trtllm_mla backend requires MLA model (use_mla_backend=True)."
             )
@@ -340,7 +340,7 @@ class EAGLEWorker(TpModelWorker):
         )
 
     def _create_flashinfer_prefill_backend(self):
-        if not global_server_args.use_mla_backend:
+        if not get_global_server_args().use_mla_backend:
             from sglang.srt.layers.attention.flashinfer_backend import (
                 FlashInferAttnBackend,
             )
@@ -376,7 +376,7 @@ class EAGLEWorker(TpModelWorker):
         return TRTLLMHAAttnBackend(self.draft_model_runner, skip_prefill=False)
 
     def _create_trtllm_mla_prefill_backend(self):
-        if not global_server_args.use_mla_backend:
+        if not get_global_server_args().use_mla_backend:
             raise ValueError(
                 "trtllm_mla backend requires MLA model (use_mla_backend=True)."
             )

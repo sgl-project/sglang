@@ -75,7 +75,7 @@ from sglang.srt.models.utils import (
     create_fused_set_kv_buffer_arg,
     enable_fused_set_kv_buffer,
 )
-from sglang.srt.server_args import global_server_args
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, is_cuda, is_non_idle_and_non_empty, make_layers
 
 LoraConfig = None
@@ -205,7 +205,7 @@ class BailingMoESparseMoeBlock(nn.Module):
             self.router_dtype = torch.bfloat16
 
         # TODO global_server_args.ep_num_redundant_experts is used for eplb, not supported now
-        assert global_server_args.ep_num_redundant_experts == 0
+        assert get_global_server_args().ep_num_redundant_experts == 0
         # check group topk
         self.num_expert_group = getattr(config, "n_group", 0)
         self.topk_group = getattr(config, "topk_group", 0)
@@ -220,7 +220,7 @@ class BailingMoESparseMoeBlock(nn.Module):
             self.use_grouped_topk = False
 
         self.num_experts = (
-            config.num_experts + global_server_args.ep_num_redundant_experts
+            config.num_experts + get_global_server_args().ep_num_redundant_experts
         )
 
         self.gate = BailingMoEGate(
@@ -824,7 +824,7 @@ class BailingMoEForCausalLM(nn.Module):
                 config.hidden_size,
                 quant_config=quant_config,
                 prefix=add_prefix("lm_head", prefix),
-                use_attn_tp_group=global_server_args.enable_dp_lm_head,
+                use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
             )
         self.logits_processor = LogitsProcessor(config)
 

@@ -68,9 +68,9 @@ class SamplingBatchInfo:
 
     @classmethod
     def _get_global_server_args(cls):
-        from sglang.srt.server_args import global_server_args
+        from sglang.srt.server_args import get_global_server_args
 
-        return global_server_args
+        return _global_server_args
 
     @classmethod
     def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):

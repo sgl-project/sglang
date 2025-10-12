@@ -21,7 +21,7 @@ from sglang.srt.layers.attention.utils import (
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.server_args import global_server_args
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_cuda, is_flashinfer_available
 
 if is_flashinfer_available():
@@ -124,7 +124,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self.forward_decode_metadata: Union[TRTLLMMLADecodeMetadata, None] = None
 
         self.disable_chunked_prefix_cache = (
-            global_server_args.disable_chunked_prefix_cache
+            get_global_server_args().disable_chunked_prefix_cache
         )
 
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens

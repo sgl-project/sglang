@@ -46,7 +46,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.server_args import global_server_args
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import dump_to_file, is_npu, use_intel_amx_backend
 
 logger = logging.getLogger(__name__)
@@ -228,8 +228,8 @@ class LogitsProcessor(nn.Module):
         super().__init__()
         self.config = config
         self.logit_scale = logit_scale
-        self.use_attn_tp_group = global_server_args.enable_dp_lm_head
-        self.use_fp32_lm_head = global_server_args.enable_fp32_lm_head
+        self.use_attn_tp_group = get_global_server_args().enable_dp_lm_head
+        self.use_fp32_lm_head = get_global_server_args().enable_fp32_lm_head
         if self.use_attn_tp_group:
             self.attn_tp_size = get_attention_tp_size()
             self.do_tensor_parallel_all_gather = (
@@ -253,7 +253,7 @@ class LogitsProcessor(nn.Module):
             self.final_logit_softcapping = None
 
         self.debug_tensor_dump_output_folder = (
-            global_server_args.debug_tensor_dump_output_folder
+            get_global_server_args().debug_tensor_dump_output_folder
         )
 
     def compute_logprobs_for_multi_item_scoring(
@@ -370,7 +370,7 @@ class LogitsProcessor(nn.Module):
             logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
 
         # Check if multi-item scoring is enabled via server args (only for prefill-only requests)
-        multi_item_delimiter = global_server_args.multi_item_scoring_delimiter
+        multi_item_delimiter = get_global_server_args().multi_item_scoring_delimiter
         if multi_item_delimiter is not None and logits_metadata.is_prefill_only:
             return self.compute_logprobs_for_multi_item_scoring(
                 input_ids, hidden_states, lm_head, logits_metadata, multi_item_delimiter

@@ -46,7 +46,7 @@ from sglang.srt.model_loader.weight_utils import (
     sharded_weight_loader,
 )
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP, Qwen2MoeSparseMoeBlock
-from sglang.srt.server_args import global_server_args
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
@@ -905,7 +905,7 @@ class Qwen3NextForCausalLM(nn.Module):
             quant_config=quant_config,
             org_num_embeddings=config.vocab_size,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=global_server_args.enable_dp_lm_head,
+            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
         )
         self.lm_head = self.lm_head.float()
         self.logits_processor = LogitsProcessor(config)

@@ -6,7 +6,7 @@ import torch
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.server_args import global_server_args
+from sglang.srt.server_args import get_global_server_args
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -42,7 +42,7 @@ class DoubleSparseAttnBackend(AttentionBackend):
         # TODO: Change the hard-coded block_seq_num
         self.BLOCK_SEQ = 128
 
-        if global_server_args.triton_attention_reduce_in_fp32:
+        if get_global_server_args().triton_attention_reduce_in_fp32:
             self.reduce_dtype = torch.float32
         else:
             self.reduce_dtype = torch.float16

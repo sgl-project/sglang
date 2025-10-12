@@ -32,7 +32,7 @@ import huggingface_hub
 import numpy as np
 import torch
 
-from sglang.srt.server_args import global_server_args
+from sglang.srt.server_args import get_global_server_args
 
 # Try to import accelerate (optional dependency)
 try:
@@ -440,7 +440,9 @@ class DefaultModelLoader(BaseModelLoader):
                 hf_weights_files,
             )
         elif use_safetensors:
-            weight_loader_disable_mmap = global_server_args.weight_loader_disable_mmap
+            weight_loader_disable_mmap = (
+                get_global_server_args().weight_loader_disable_mmap
+            )
 
             if extra_config.get("enable_multithread_load"):
                 weights_iterator = multi_thread_safetensors_weights_iterator(
@@ -607,9 +609,9 @@ class LayeredModelLoader(DefaultModelLoader):
         device_config: DeviceConfig,
     ) -> nn.Module:
         from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
-        from sglang.srt.server_args import global_server_args
+        from sglang.srt.server_args import get_global_server_args
 
-        torchao_config = global_server_args.torchao_config
+        torchao_config = get_global_server_args().torchao_config
         target_device = torch.device(device_config.device)
 
         with set_default_torch_dtype(model_config.dtype):
