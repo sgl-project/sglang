@@ -18,20 +18,15 @@ from sglang.srt.utils.profile_merger import ProfileMerger
 
 
 class TestProfileMerger(unittest.TestCase):
-    """Test cases for ProfileMerger core functionality."""
-
     def setUp(self):
-        """Set up test fixtures."""
         self.temp_dir = tempfile.mkdtemp()
         self.profile_id = "test_profile_123"
         self.merger = ProfileMerger(self.temp_dir, self.profile_id)
 
     def tearDown(self):
-        """Clean up test fixtures."""
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     def test_rank_extraction_and_labeling(self):
-        """Test rank extraction and label creation for various scenarios."""
         # Test TP-only
         filename = f"{self.profile_id}-TP-0.trace.json.gz"
         rank_info = self.merger._extract_rank_info(filename)
@@ -63,7 +58,6 @@ class TestProfileMerger(unittest.TestCase):
         self.assertEqual(label, "[Unknown]")
 
     def test_sort_index_calculation(self):
-        """Test sort index calculation for different rank scenarios."""
         # Single rank
         rank_info = {"tp_rank": 0}
         sort_idx = self.merger._calculate_sort_index(rank_info, 83)
@@ -81,19 +75,17 @@ class TestProfileMerger(unittest.TestCase):
         self.assertEqual(sort_idx, 83)
 
     def test_rank_sort_key(self):
-        """Test rank sort key generation."""
-        # Full ranks
+        # Full ranks: TP-1, DP-2, PP-3, EP-4 → sorted as (DP, EP, PP, TP)
         filename = f"{self.profile_id}-TP-1-DP-2-PP-3-EP-4.trace.json.gz"
         sort_key = self.merger._get_rank_sort_key(filename)
-        self.assertEqual(sort_key, (1, 2, 3, 4))
+        self.assertEqual(sort_key, (2, 4, 3, 1))
 
-        # Missing ranks
+        # Missing ranks: only TP-1 → sorted as (DP=0, EP=0, PP=0, TP=1)
         filename = f"{self.profile_id}-TP-1.trace.json.gz"
         sort_key = self.merger._get_rank_sort_key(filename)
-        self.assertEqual(sort_key, (1, 0, 0, 0))
+        self.assertEqual(sort_key, (0, 0, 0, 1))
 
     def test_discover_trace_files(self):
-        """Test trace file discovery and backward compatibility."""
         # Create mock trace files
         trace_files = [
             f"{self.profile_id}-TP-0.trace.json.gz",  # Old format
@@ -124,7 +116,6 @@ class TestProfileMerger(unittest.TestCase):
         self.assertEqual(len(discovered), 0)
 
     def test_merge_chrome_traces(self):
-        """Test merging trace files with proper ordering and event processing."""
         # Create multiple trace files in random order
         trace_files = [
             {
@@ -201,15 +192,13 @@ class TestProfileMerger(unittest.TestCase):
 
         # Test no files error
         empty_merger = ProfileMerger(self.temp_dir, "nonexistent")
-        with self.assertRaises(Exception):
+        with self.assertRaises(ValueError):
             empty_merger.merge_chrome_traces()
 
 
 class TestProfileMergerIntegration(unittest.TestCase):
-    """Test cases for data structures and integration."""
 
     def test_data_structures_merge_profiles(self):
-        """Test data structures with merge_profiles parameter."""
         # Test ProfileReqInput
         req_input = ProfileReqInput()
         self.assertFalse(req_input.merge_profiles)
@@ -225,7 +214,6 @@ class TestProfileMergerIntegration(unittest.TestCase):
         self.assertTrue(req.merge_profiles)
 
     def test_integration_parameters(self):
-        """Test that integration points accept merge_profiles parameter."""
         import inspect
 
         # Test TokenizerManager
@@ -250,22 +238,17 @@ class TestProfileMergerIntegration(unittest.TestCase):
 
 
 class TestProfileMergerEdgeCases(unittest.TestCase):
-    """Test cases for edge cases and error conditions."""
-
     def setUp(self):
-        """Set up test fixtures."""
         self.temp_dir = tempfile.mkdtemp()
         self.profile_id = "test_edge_cases"
         self.merger = ProfileMerger(self.temp_dir, self.profile_id)
 
     def tearDown(self):
-        """Clean up test fixtures."""
         import shutil
 
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     def test_error_handling_and_edge_cases(self):
-        """Test comprehensive error handling and edge cases."""
         # Test malformed trace file
         filename = f"{self.profile_id}-TP-0.trace.json.gz"
         filepath = os.path.join(self.temp_dir, filename)
@@ -301,7 +284,6 @@ class TestProfileMergerEdgeCases(unittest.TestCase):
         self.assertNotIn("deviceProperties", merged_data)
 
     def test_missing_ranks_and_none_handling(self):
-        """Test handling of missing ranks and None values."""
         # Test rank extraction with missing ranks
         filename = f"{self.profile_id}-TP-0.trace.json.gz"
         rank_info = self.merger._extract_rank_info(filename)
@@ -332,7 +314,6 @@ class TestProfileMergerEdgeCases(unittest.TestCase):
         self.assertEqual(self.merger._maybe_cast_int(456), 456)
 
     def test_mixed_rank_scenarios(self):
-        """Test merging files with different rank scenarios."""
         trace_scenarios = [
             {
                 "filename": f"{self.profile_id}-TP-0.trace.json.gz",

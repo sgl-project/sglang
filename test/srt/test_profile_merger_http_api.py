@@ -1,11 +1,3 @@
-"""
-Unit tests for HTTP API integration with merge_profiles parameter.
-
-Usage:
-    python test_profile_merger_http_api.py
-    python -m unittest test_profile_merger_http_api.py -v
-"""
-
 import json
 import unittest
 
@@ -13,10 +5,7 @@ from sglang.srt.managers.io_struct import ProfileReqInput
 
 
 class TestProfileMergerHTTPAPI(unittest.TestCase):
-    """Test cases for HTTP API integration with merge_profiles."""
-
     def test_profile_req_input_merge_profiles_json_serialization(self):
-        """Test that ProfileReqInput with merge_profiles can be JSON serialized."""
         # Test with merge_profiles=True
         req_input = ProfileReqInput(
             output_dir="/tmp/test",
@@ -46,7 +35,6 @@ class TestProfileMergerHTTPAPI(unittest.TestCase):
         self.assertTrue(parsed_data["profile_by_stage"])
 
     def test_profile_req_input_merge_profiles_json_deserialization(self):
-        """Test that ProfileReqInput can be created from JSON with merge_profiles."""
         # Test JSON data as would come from HTTP request
         json_data = {
             "output_dir": "/tmp/test",
@@ -66,7 +54,6 @@ class TestProfileMergerHTTPAPI(unittest.TestCase):
         self.assertFalse(req_input.profile_by_stage)
 
     def test_profile_req_input_merge_profiles_default_value(self):
-        """Test that merge_profiles defaults to False when not specified."""
         # Test with minimal data
         json_data = {"output_dir": "/tmp/test"}
 
@@ -74,14 +61,12 @@ class TestProfileMergerHTTPAPI(unittest.TestCase):
         self.assertFalse(req_input.merge_profiles)
 
     def test_profile_req_input_merge_profiles_explicit_false(self):
-        """Test that merge_profiles can be explicitly set to False."""
         json_data = {"output_dir": "/tmp/test", "merge_profiles": False}
 
         req_input = ProfileReqInput(**json_data)
         self.assertFalse(req_input.merge_profiles)
 
     def test_http_api_parameter_flow(self):
-        """Test that merge_profiles parameter flows through HTTP API."""
         # Simulate HTTP request data
         request_data = {
             "output_dir": "/tmp/test",
@@ -102,7 +87,6 @@ class TestProfileMergerHTTPAPI(unittest.TestCase):
         self.assertTrue(obj.profile_by_stage)
 
     def test_http_api_parameter_validation(self):
-        """Test that merge_profiles parameter accepts boolean values."""
         # Test with True
         json_data = {"merge_profiles": True}
         req_input = ProfileReqInput(**json_data)
@@ -119,7 +103,6 @@ class TestProfileMergerHTTPAPI(unittest.TestCase):
         self.assertEqual(req_input.merge_profiles, "true")  # String, not boolean
 
     def test_http_api_backward_compatibility(self):
-        """Test that existing API calls without merge_profiles still work."""
         # Test minimal request (no merge_profiles)
         json_data = {}
         req_input = ProfileReqInput(**json_data)
@@ -135,7 +118,6 @@ class TestProfileMergerHTTPAPI(unittest.TestCase):
         self.assertFalse(req_input.merge_profiles)  # Should default to False
 
     def test_http_api_parameter_combinations(self):
-        """Test various combinations of parameters with merge_profiles."""
         test_cases = [
             {
                 "name": "minimal with merge_profiles",

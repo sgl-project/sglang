@@ -172,6 +172,28 @@ class SchedulerProfilerMixin:
 
         return ProfileReqOutput(success=True, message="Succeeded")
 
+    def _merge_profile_traces(self) -> str:
+        if not self.merge_profiles or self.tp_rank != 0:
+            return ""
+
+        try:
+            logger.info("Starting profile merge...")
+            merger = ProfileMerger(self.torch_profiler_output_dir, self.profile_id)
+            merged_path = merger.merge_chrome_traces()
+
+            summary = merger.get_merge_summary()
+            merge_message = (
+                f" Merged trace: {merged_path} "
+                f"(Events: {summary.get('total_events', '?')}, "
+                f"Files: {summary.get('total_files', '?')})"
+            )
+
+            logger.info(f"Profile merge completed: {merged_path}")
+            return merge_message
+        except Exception as e:
+            logger.error(f"Failed to merge profiles: {e}", exc_info=True)
+            return f" Merge failed: {str(e)}"
+
     def stop_profile(
         self, stage: Optional[ForwardMode] = None
     ) -> ProfileReqOutput | None:
@@ -192,12 +214,12 @@ class SchedulerProfilerMixin:
                 # Build filename with only non-zero ranks to maintain backward compatibility
                 filename_parts = [self.profile_id, f"TP-{self.tp_rank}"]
 
-                # Only add other ranks if they are non-zero
-                if self.dp_rank is not None and self.dp_rank > 0:
+                # Only add other ranks if parallelism is enabled (size > 1)
+                if self.dp_size is not None and self.dp_size > 1:
                     filename_parts.append(f"DP-{self.dp_rank}")
-                if self.pp_rank is not None and self.pp_rank > 0:
+                if self.pp_size is not None and self.pp_size > 1:
                     filename_parts.append(f"PP-{self.pp_rank}")
-                if self.moe_ep_rank is not None and self.moe_ep_rank > 0:
+                if self.moe_ep_size is not None and self.moe_ep_size > 1:
                     filename_parts.append(f"EP-{self.moe_ep_rank}")
 
                 filename = "-".join(filename_parts) + stage_suffix + ".trace.json.gz"
@@ -234,21 +256,7 @@ class SchedulerProfilerMixin:
         if "CUDA_PROFILER" in self.profiler_activities:
             torch.cuda.cudart().cudaProfilerStop()
 
-        # Merge profiles if requested (only rank 0)
-        merge_message = ""
-        if self.merge_profiles and self.tp_rank == 0:
-            try:
-                logger.info("Starting profile merge...")
-                merger = ProfileMerger(self.torch_profiler_output_dir, self.profile_id)
-                merged_path = merger.merge_chrome_traces()
-
-                summary = merger.get_merge_summary()
-                merge_message = f" Merged trace: {merged_path} (Events: {summary.get('total_events', '?')}, Files: {summary.get('total_files', '?')})"
-
-                logger.info(f"Profile merge completed: {merged_path}")
-            except Exception as e:
-                logger.error(f"Failed to merge profiles: {e}", exc_info=True)
-                merge_message = f" Merge failed: {str(e)}"
+        merge_message = self._merge_profile_traces()
 
         logger.info(
             "Profiling done. Traces are saved to: %s%s",
