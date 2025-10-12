@@ -692,6 +692,7 @@ class EagleDraftInput(SpecInput):
         paged_kernel_lens: torch.Tensor,
         paged_kernel_lens_sum: int,
         req_to_token: torch.Tensor,
+        page_size: int = 1,
     ):
         bs = self.accept_length.numel()
         qo_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device="cuda")
@@ -714,6 +715,7 @@ class EagleDraftInput(SpecInput):
             None,
             kv_indices,
             req_to_token.size(1),
+            page_size,
         )
         return kv_indices, cum_kv_seq_len, qo_indptr, None
 

@@ -849,6 +849,12 @@ class FlashInferMLAIndicesUpdaterPrefill:
         else:
             assert isinstance(spec_info, SpecInput)
             # TODO: Support topk > 1 with custom mask
+            if spec_info.is_verify_input():
+                kv_lens = (paged_kernel_lens + 
+                          spec_info.draft_token_num)
+            else:
+                # Eagle Draft Input
+                kv_lens = paged_kernel_lens
             kv_indices, kv_indptr, qo_indptr, custom_mask = (
                 spec_info.generate_attn_arg_prefill(
                     req_pool_indices,

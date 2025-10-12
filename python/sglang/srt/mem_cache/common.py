@@ -350,11 +350,12 @@ def alloc_for_extend(
         out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
     else:
         # Paged allocation - build last_loc
+        print(f"DEBUG: [batch.tree_cache] = {batch.tree_cache}", flush=True)
         last_loc = [
             (
                 t[-1:]
                 if len(t) > 0
-                else torch.tensor([-1], device=batch.tree_cache.device)
+                else torch.tensor([-1], device=batch.tree_cache.req_to_token_pool.device)
             )
             for t in prefix_tensors
         ]
