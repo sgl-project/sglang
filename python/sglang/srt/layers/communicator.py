@@ -19,6 +19,7 @@ from typing import Dict, Optional
 
 import torch
 
+from python.sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
@@ -314,7 +315,9 @@ class LayerCommunicator:
     def should_fuse_mlp_allreduce_with_next_layer(
         self, forward_batch: ForwardBatch
     ) -> bool:
-        speculative_algo = global_server_args.speculative_algorithm
+        speculative_algo = SpeculativeAlgorithm.from_string(
+            global_server_args.speculative_algorithm
+        )
         if (
             is_dp_attention_enabled()
             and speculative_algo is not None

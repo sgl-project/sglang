@@ -28,6 +28,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
+from python.sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt import single_batch_overlap
 from sglang.srt.configs.model_config import (
     get_nsa_index_head_dim,
@@ -2363,7 +2364,9 @@ class DeepseekV2DecoderLayer(nn.Module):
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
-        self.speculative_algorithm = global_server_args.speculative_algorithm
+        self.speculative_algorithm = SpeculativeAlgorithm.from_string(
+            global_server_args.speculative_algorithm
+        )
         self.layer_id = layer_id
         self.is_nextn = is_nextn
         self.self_attn = DeepseekV2AttentionMLA(

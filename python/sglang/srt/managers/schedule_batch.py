@@ -642,12 +642,9 @@ class Req:
     def is_prefill_only(self) -> bool:
         """Check if this request is prefill-only (no token generation needed)."""
         # NOTE: when spec is enabled, prefill_only optimizations are disabled
-        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
         spec_alg = global_server_args.speculative_algorithm
-        return self.sampling_params.max_new_tokens == 0 and (
-            spec_alg is None or spec_alg == SpeculativeAlgorithm.NONE
-        )
+        return self.sampling_params.max_new_tokens == 0 and spec_alg is None
 
     def add_latency(self, stage: RequestStage):
         if self.metrics_collector is None:

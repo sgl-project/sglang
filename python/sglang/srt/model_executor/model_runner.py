@@ -271,16 +271,8 @@ class ModelRunner:
         # Model-specific adjustment
         self.model_specific_adjustment()
 
-        # Global vars
-        # FIXME: deprecate this, use `global_server_args` from sglang.srt.server_args instead
-        # global_server_args_dict.update(
-        #     {k: getattr(server_args, k) for k in GLOBAL_SERVER_ARGS_KEYS}
-        #     | {
-        #         # TODO it is indeed not a "server args"
-        #         "use_mla_backend": self.use_mla_backend,
-        #         "speculative_algorithm": self.spec_algorithm,
-        #     }
-        # )
+        # FIXME: hacky set `use_mla_backend`
+        global_server_args.use_mla_backend = self.use_mla_backend
 
         # Init OpenMP threads binding for CPU
         if self.device == "cpu":
