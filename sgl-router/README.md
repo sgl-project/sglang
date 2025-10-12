@@ -96,7 +96,7 @@ python -m sglang_router.launch_router \
 
 **Note**:
  - OpenAI backend mode acts as a simple proxy. Load balancing is not applicable in this mode.
- - This mode now requires exctly one `--worker-urls` entry.
+ - This mode now requires exactly one `--worker-urls` entry.
 
 #### Launch Router with Worker URLs in prefill-decode mode
 ```bash
