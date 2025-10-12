@@ -503,7 +503,7 @@ def popen_launch_server(
     base_url: str,
     timeout: float,
     api_key: Optional[str] = None,
-    other_args: list[str] = [],
+    other_args: Optional[list[str]] = None,
     env: Optional[dict] = None,
     return_stdout_stderr: Optional[tuple] = None,
     device: str = "auto",
@@ -516,6 +516,8 @@ def popen_launch_server(
         device: Device type ("auto", "cuda", "rocm" or "cpu").
                 If "auto", will detect available platforms automatically.
     """
+    other_args = other_args or []
+
     # Auto-detect device if needed
     if device == "auto":
         device = auto_config_device()
