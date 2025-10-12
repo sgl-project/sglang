@@ -327,7 +327,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [0, 1, 2]
+        part: [0, 1]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -348,7 +348,7 @@ jobs:
         timeout-minutes: 20
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-8-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 3
+          python3 run_suite.py --suite per-commit-8-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
   performance-test-1-gpu-part-1:
     needs: [check-changes, sgl-kernel-build-wheels]
