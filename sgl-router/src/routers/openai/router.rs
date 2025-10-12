@@ -148,7 +148,11 @@ impl OpenAIRouter {
         original_previous_response_id: Option<String>,
     ) -> Response {
         // Check if MCP is active for this request
-        let req_mcp_manager = mcp_manager_from_request_tools(&original_body.tools).await;
+        let req_mcp_manager = if let Some(ref tools) = original_body.tools {
+            mcp_manager_from_request_tools(tools.as_slice()).await
+        } else {
+            None
+        };
         let active_mcp = req_mcp_manager.as_ref().or(self.mcp_manager.as_ref());
 
         let mut response_json: Value;
@@ -183,6 +187,17 @@ impl OpenAIRouter {
             }
         } else {
             // No MCP - simple request
+            let payload_str = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "failed to serialize".to_string());
+            eprintln!("=== UPSTREAM REQUEST (non-streaming) ===");
+            eprintln!("URL: {}", url);
+            eprintln!("Payload:\n{}", payload_str);
+            eprintln!("=========================================");
+            info!(
+                target: "openai_router",
+                url = %url,
+                "Sending non-streaming request to upstream"
+            );
+
             let mut request_builder = self.client.post(&url).json(&payload);
             if let Some(h) = headers {
                 request_builder = apply_request_headers(h, request_builder, true);
@@ -385,6 +400,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
             }
         };
         if let Some(obj) = payload.as_object_mut() {
+            // Always remove SGLang-specific fields (unsupported by OpenAI)
             for key in [
                 "top_k",
                 "min_p",
@@ -535,7 +551,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                 .into_response();
         }
 
-        // Clone the body and override model if needed
+        // Clone the body for validation and logic, but we'll build payload differently
         let mut request_body = body.clone();
         if let Some(model) = model_id {
             request_body.model = Some(model.to_string());
@@ -690,7 +706,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         }
 
         // Always set store=false for upstream (we store internally)
-        request_body.store = false;
+        request_body.store = Some(false);
 
         // Convert to JSON and strip SGLang-specific fields
         let mut payload = match to_value(&request_body) {
@@ -704,14 +720,13 @@ impl crate::routers::RouterTrait for OpenAIRouter {
             }
         };
 
-        // Remove SGLang-specific fields
+        // Remove SGLang-specific fields only
         if let Some(obj) = payload.as_object_mut() {
+            // Remove SGLang-specific fields (not part of OpenAI API)
             for key in [
                 "request_id",
                 "priority",
                 "top_k",
-                "frequency_penalty",
-                "presence_penalty",
                 "min_p",
                 "min_tokens",
                 "regex",
@@ -734,8 +749,20 @@ impl crate::routers::RouterTrait for OpenAIRouter {
             }
         }
 
+        // Log the cleaned payload for debugging
+        let payload_str = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "failed to serialize".to_string());
+        eprintln!("=== UPSTREAM REQUEST ===");
+        eprintln!("URL: {}", url);
+        eprintln!("Payload:\n{}", payload_str);
+        eprintln!("========================");
+        info!(
+            target: "openai_router",
+            url = %url,
+            "Sending request to upstream"
+        );
+
         // Delegate to streaming or non-streaming handler
-        if body.stream {
+        if body.stream.unwrap_or(false) {
             handle_streaming_response(
                 &self.client,
                 &self.circuit_breaker,
