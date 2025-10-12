@@ -90,7 +90,7 @@ FetchContent_Populate(repo-flashinfer)
 FetchContent_Declare(
     repo-flash-attention
     GIT_REPOSITORY https://github.com/sgl-project/sgl-attn
-    GIT_TAG        sgl-kernel
+    GIT_TAG        f9af0c2a1d82ab1812e6987e9338363cc2bf0f8d
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-flash-attention)
@@ -271,6 +271,8 @@ set(SOURCES
     "csrc/elementwise/topk.cu"
     "csrc/common_extension.cc"
 
+    "csrc/quantization/gguf/gguf_kernel.cu"
+
     "csrc/gemm/awq_kernel.cu"
     "csrc/gemm/bmm_fp8.cu"
     "csrc/gemm/dsv3_fused_a_gemm.cu"
@@ -287,6 +289,7 @@ set(SOURCES
     "csrc/gemm/nvfp4_scaled_mm_kernels.cu"
     "csrc/gemm/per_tensor_quant_fp8.cu"
     "csrc/gemm/per_token_group_quant_8bit.cu"
+    "csrc/gemm/per_token_group_quant_8bit_v2.cu"
     "csrc/gemm/per_token_quant_fp8.cu"
     "csrc/gemm/qserve_w4a8_per_chn_gemm.cu"
     "csrc/gemm/qserve_w4a8_per_group_gemm.cu"
@@ -305,6 +308,7 @@ set(SOURCES
     "csrc/moe/marlin_moe_wna16/ops.cu"
     "csrc/moe/moe_align_kernel.cu"
     "csrc/moe/moe_fused_gate.cu"
+    "csrc/moe/moe_sum.cu"
     "csrc/moe/moe_sum_reduce.cu"
     "csrc/moe/moe_topk_softmax_kernels.cu"
     "csrc/moe/nvfp4_blockwise_moe.cu"
