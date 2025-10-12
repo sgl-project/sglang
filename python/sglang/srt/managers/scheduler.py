@@ -1026,22 +1026,22 @@ class Scheduler(
         self.result_queue: Deque[Tuple[ScheduleBatch, GenerationBatchResult]] = deque()
 
         while True:
-            self.launch_last_batch_sample_if_needed()
-
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
 
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
 
+            batch_result = None
             if batch:
-                result = self.run_batch(batch)
-                self.result_queue.append((batch.copy(), result))
+                batch_result = self.run_batch(batch)
+                self.result_queue.append((batch.copy(), batch_result))
 
             if self.last_batch:
                 # Process the results of the last batch
                 tmp_batch, tmp_result = self.result_queue.popleft()
                 self.process_batch_result(tmp_batch, tmp_result)
+                self.launch_last_batch_sample_if_needed(batch_result)
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
@@ -2210,28 +2210,19 @@ class Scheduler(
         return ret
 
     def launch_last_batch_sample_if_needed(
-        self,
+        self, batch_result: GenerationBatchResult
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
-        if len(self.result_queue) == 0:
-            return
-
-        tmp_batch, tmp_result = self.result_queue.popleft()
-
-        tmp_result: GenerationBatchResult
-        if not tmp_result.delay_sample_launch:
-            self.result_queue.appendleft((tmp_batch, tmp_result))
+        if batch_result is None or not batch_result.delay_sample_launch:
             return
 
         with self.forward_stream_ctx:
             self.forward_stream.wait_stream(self.default_stream)
-            tmp_result.next_token_ids = self.model_worker.model_runner.sample(
-                tmp_result.logits_output,
-                tmp_result.forward_batch,
+            batch_result.next_token_ids = self.model_worker.model_runner.sample(
+                batch_result.logits_output,
+                batch_result.forward_batch,
             )
-            future_indices = tmp_result.future_indices
-            self.future_map.store_to_map(future_indices, tmp_result)
-            tmp_result.copy_to_cpu()
-            self.result_queue.appendleft((tmp_batch, tmp_result))
+            self.future_map.store_to_map(batch_result.future_indices, batch_result)
+            batch_result.copy_to_cpu()
 
     def process_batch_result(
         self,
