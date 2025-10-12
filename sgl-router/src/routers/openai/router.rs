@@ -735,7 +735,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                 "no_stop_trim",
                 "ignore_eos",
                 "continue_final_message",
-                "skip_special_tokens",
+                "skip_serializing",
                 "lora_path",
                 "session_params",
                 "separate_reasoning",
@@ -746,6 +746,37 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                 "sampling_seed",
             ] {
                 obj.remove(key);
+            }
+            // XAI doesn't support the OPENAI item type input: https://platform.openai.com/docs/api-reference/responses/create#responses-create-input-input-item-list-item
+            // To Achieve XAI compatibility, strip extra fields from input messages (id, status)
+            // XAI doesn't support output_text as type for content with role of assistant
+            // so normalize content types: output_text -> input_text
+            if let Some(input_val) = obj.get_mut("input") {
+                if let Some(input_arr) = input_val.as_array_mut() {
+                    for item in input_arr.iter_mut() {
+                        if let Some(item_obj) = item.as_object_mut() {
+                            // Remove fields not universally supported
+                            item_obj.remove("id");
+                            item_obj.remove("status");
+
+                            // Normalize content types to input_text (xAI compatibility)
+                            if let Some(content_val) = item_obj.get_mut("content") {
+                                if let Some(content_arr) = content_val.as_array_mut() {
+                                    for content_item in content_arr.iter_mut() {
+                                        if let Some(content_obj) = content_item.as_object_mut() {
+                                            // Change output_text to input_text
+                                            if let Some(type_val) = content_obj.get("type") {
+                                                if type_val.as_str() == Some("output_text") {
+                                                    content_obj.insert("type".to_string(), Value::String("input_text".to_string()));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
 
