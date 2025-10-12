@@ -35,7 +35,7 @@ ENV CONDA_PREFIX=/sgl-workspace/miniforge3
 RUN pip config set global.index-url https://download.pytorch.org/whl/cpu && \
     pip config set global.extra-index-url https://pypi.org/simple
 
-RUN git clone ${SGLANG_REPO} && \
+RUN git clone ${SGLANG_REPO} sglang && \
     cd sglang && \
     git checkout ${VER_SGLANG} && \
     cd python && \

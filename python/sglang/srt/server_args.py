@@ -178,6 +178,8 @@ class ServerArgs:
     model_loader_extra_config: str = "{}"
     trust_remote_code: bool = False
     modelopt_quant: Optional[Union[str, Dict]] = None
+    modelopt_checkpoint_restore_path: Optional[str] = None
+    modelopt_checkpoint_save_path: Optional[str] = None
     context_length: Optional[int] = None
     is_embedding: bool = False
     enable_multimodal: Optional[bool] = None
@@ -225,6 +227,7 @@ class ServerArgs:
     stream_output: bool = False
     random_seed: Optional[int] = None
     constrained_json_whitespace_pattern: Optional[str] = None
+    constrained_json_disable_any_whitespace: bool = False
     watchdog_timeout: float = 300
     dist_timeout: Optional[int] = None  # timeout for torch.distributed
     download_dir: Optional[str] = None
@@ -309,6 +312,7 @@ class ServerArgs:
     nsa_decode: str = "fa3"
 
     # Speculative decoding
+    enable_beta_spec: bool = False
     speculative_algorithm: Optional[str] = None
     speculative_draft_model_path: Optional[str] = None
     speculative_draft_model_revision: Optional[str] = None
@@ -469,7 +473,8 @@ class ServerArgs:
 
     # For PD-Multiplexing
     enable_pdmux: bool = False
-    sm_group_num: int = 3
+    pdmux_config_path: Optional[str] = None
+    sm_group_num: int = 8
 
     def get_attention_backends(server_args):
         prefill_attention_backend_str = (
@@ -1099,11 +1104,19 @@ class ServerArgs:
                 )
             if self.max_running_requests is None:
                 self.max_running_requests = 48
-            self.disable_overlap_schedule = True
-            logger.warning(
-                "Overlap scheduler is disabled because of using "
-                "eagle speculative decoding."
-            )
+
+            if self.speculative_algorithm == "EAGLE" and self.enable_beta_spec:
+                self.disable_overlap_schedule = False
+                logger.warning(
+                    "Beta spec is enabled for eagle speculative decoding and overlap schedule is turned on."
+                )
+
+            if not self.enable_beta_spec:
+                self.disable_overlap_schedule = True
+                logger.warning(
+                    "Overlap scheduler is disabled because of using eagle3 and standalone speculative decoding."
+                )
+
             if self.enable_mixed_chunk:
                 self.enable_mixed_chunk = False
                 logger.warning(
@@ -1505,6 +1518,21 @@ class ServerArgs:
             "This requires the NVIDIA Model Optimizer library to be installed: pip install nvidia-modelopt",
         )
         parser.add_argument(
+            "--modelopt-checkpoint-restore-path",
+            type=str,
+            default=ServerArgs.modelopt_checkpoint_restore_path,
+            help="Path to restore a previously saved ModelOpt quantized checkpoint. "
+            "If provided, the quantization process will be skipped and the model "
+            "will be loaded from this checkpoint.",
+        )
+        parser.add_argument(
+            "--modelopt-checkpoint-save-path",
+            type=str,
+            default=ServerArgs.modelopt_checkpoint_save_path,
+            help="Path to save the ModelOpt quantized checkpoint after quantization. "
+            "This allows reusing the quantized model in future runs.",
+        )
+        parser.add_argument(
             "--kv-cache-dtype",
             type=str,
             default=ServerArgs.kv_cache_dtype,
@@ -1665,7 +1693,12 @@ class ServerArgs:
             "--constrained-json-whitespace-pattern",
             type=str,
             default=ServerArgs.constrained_json_whitespace_pattern,
-            help="(outlines backend only) Regex pattern for syntactic whitespaces allowed in JSON constrained output. For example, to allow the model generate consecutive whitespaces, set the pattern to [\n\t ]*",
+            help="(outlines and llguidance backends only) Regex pattern for syntactic whitespaces allowed in JSON constrained output. For example, to allow the model generate consecutive whitespaces, set the pattern to [\n\t ]*",
+        )
+        parser.add_argument(
+            "--constrained-json-disable-any-whitespace",
+            action="store_true",
+            help="(xgrammar and llguidance backends only) Enforce compact representation in JSON constrained output.",
         )
         parser.add_argument(
             "--watchdog-timeout",
@@ -2103,6 +2136,7 @@ class ServerArgs:
         )
 
         # Speculative decoding
+        parser.add_argument("--enable-beta-spec", action="store_true")
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
@@ -2876,6 +2910,12 @@ class ServerArgs:
             action="store_true",
             help="Enable PD-Multiplexing, PD running on greenctx stream.",
         )
+        parser.add_argument(
+            "--pdmux-config-path",
+            type=str,
+            default=None,
+            help="The path of the PD-Multiplexing config file.",
+        )
 
         parser.add_argument(
             "--sm-group-num",
@@ -3003,6 +3043,34 @@ class ServerArgs:
             assert (
                 self.chunked_prefill_size % self.page_size == 0
             ), "chunked_prefill_size must be divisible by page_size"
+
+        # Check pdmux
+        if self.enable_pdmux:
+            assert (
+                self.pp_size == 1
+            ), "PD-Multiplexing is only supported with pipeline parallelism disabled (pp_size=1)."
+            assert (
+                self.chunked_prefill_size == -1
+            ), "PD-Multiplexing is not compatible with chunked prefill."
+            assert (
+                self.disaggregation_mode == "null"
+            ), "PD-Multiplexing is not compatible with disaggregation mode."
+            assert (
+                self.disable_overlap_schedule
+            ), "PD-Multiplexing is not compatible with overlap schedule."
+
+            # NOTE: CUDA Green Context may encounter potential issues with CudaGraph on torch 2.7.x – 2.8.x, leading to performance degradation.
+            import torch
+
+            parts = torch.__version__.split("+", 1)[0].split(".")
+            major = int(parts[0]) if len(parts) > 0 and parts[0].isdigit() else 0
+            minor = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+            if (major, minor) > (2, 6):
+                logger.warning(
+                    "WARNING: PD-Multiplexing may experience performance degradation with torch versions > 2.6.x.\n"
+                    f"  Current torch version is {torch.__version__}.\n"
+                    "  Please manually install torch 2.6.x."
+                )
 
         # Check multi tokenizer
         assert self.tokenizer_worker_num > 0, "Tokenizer worker num must >= 1"
