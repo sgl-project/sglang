@@ -173,7 +173,16 @@ class SchedulerProfilerMixin:
         return ProfileReqOutput(success=True, message="Succeeded")
 
     def _merge_profile_traces(self) -> str:
-        if not self.merge_profiles or self.tp_rank != 0:
+        if not self.merge_profiles:
+            return ""
+
+        if self.tp_rank != 0:
+            return ""
+        if getattr(self, "dp_size", 1) > 1 and getattr(self, "dp_rank", 0) != 0:
+            return ""
+        if getattr(self, "pp_size", 1) > 1 and getattr(self, "pp_rank", 0) != 0:
+            return ""
+        if getattr(self, "moe_ep_size", 1) > 1 and getattr(self, "moe_ep_rank", 0) != 0:
             return ""
 
         try:
