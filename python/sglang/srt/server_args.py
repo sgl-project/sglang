@@ -433,7 +433,7 @@ class ServerArgs:
     disable_chunked_prefix_cache: bool = False
     disable_fast_image_processor: bool = False
     keep_mm_feature_on_device: bool = False
-    enable_dp_attention_port_picking: bool = False
+    enable_dp_port_preallocation: bool = False
     enable_return_hidden_states: bool = False
     scheduler_recv_interval: int = 1
     numa_node: Optional[List[int]] = None
@@ -2939,9 +2939,9 @@ class ServerArgs:
         )
 
         parser.add_argument(
-            "--enable-dp-attention-port-picking",
+            "--enable-dp-port-preallocation",
             action="store_true",
-            help="Whether to picks dp ports from free ports, or use fixed dp port as default. Useful when get frequent port conflict under huge DP cases",
+            help="Pre-allocate DP ports on node 0 and broadcast to other nodes to avoid port conflicts. Useful for large DP setups where conflicts are common.",
         )
 
     @classmethod
@@ -3339,10 +3339,10 @@ class PortArgs:
                 # TokenizerManager to DataParallelController
                 scheduler_input_port = port_base + 4
             else:
-                if server_args.enable_dp_attention_port_picking:
+                if server_args.enable_dp_port_preallocation:
                     if worker_ports is None:
                         raise ValueError(
-                            "worker_ports must be provided when enable_dp_attention_port_picking is True"
+                            "worker_ports must be provided when enable_dp_port_preallocation is True"
                         )
                     scheduler_input_port = worker_ports[dp_rank]
                 else:

@@ -145,7 +145,7 @@ class DataParallelController:
         self.worker_ports: Optional[List[int]] = None
 
         # Pre-allocate worker ports on node 0 to avoid conflicts
-        if server_args.node_rank == 0 and server_args.enable_dp_attention_port_picking:
+        if server_args.node_rank == 0 and server_args.enable_dp_port_preallocation:
             self.worker_ports = []
             for dp_rank in range(server_args.dp_size):
                 port_and_socket = get_zmq_socket(self.context, zmq.PUSH)
@@ -162,7 +162,7 @@ class DataParallelController:
 
         if (
             server_args.node_rank == 0
-            and not server_args.enable_dp_attention_port_picking
+            and not server_args.enable_dp_port_preallocation
         ):
             for dp_rank in range(server_args.dp_size):
                 self.workers[dp_rank] = get_zmq_socket(
@@ -339,7 +339,7 @@ class DataParallelController:
         self, server_args: ServerArgs, port_args: PortArgs
     ) -> List[PortArgs]:
         worker_ports = None
-        if server_args.enable_dp_attention_port_picking:
+        if server_args.enable_dp_port_preallocation:
             worker_ports = self._broadcast_worker_ports(server_args)
         dp_port_args = []
         for dp_rank in range(server_args.dp_size):
