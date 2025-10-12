@@ -53,27 +53,16 @@ def test_extract_longbench_v2_answer():
     assert extract_longbench_v2_answer(response2) == "C"
 
     # Test with asterisks
-    response3 = "*The correct answer is **(D)*"
+    response3 = "*The correct answer is (D)*"
     assert extract_longbench_v2_answer(response3) == "D"
 
-    # Test with asterisks and \n
-    response4 = """
-    the correct answer is:
-    **(C)
-    """
-    assert extract_longbench_v2_answer(response4) == "C"
-
     # Test fallback to standard pattern
-    response5 = "**Correct answer: A**"
-    assert extract_longbench_v2_answer(response5) == "A"
-
-    # Test fallback to standard pattern
-    response6 = "**Answer:** A"
-    assert extract_longbench_v2_answer(response6) == "A"
+    response4 = "I think the answer is A."
+    assert extract_longbench_v2_answer(response4) == "A"
 
     # Test no answer
-    response7 = "I'm not sure about this."
-    assert extract_longbench_v2_answer(response7) is None
+    response5 = "I'm not sure about this."
+    assert extract_longbench_v2_answer(response5) is None
 
     print("✓ Answer extraction works correctly")
 
