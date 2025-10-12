@@ -138,9 +138,10 @@ class DataParallelController:
         # Launch data parallel workers
         self.scheduler_procs = []
         self.workers: List[zmq.Socket] = [None] * server_args.dp_size
-        self.worker_ports: List[int] = [0] * server_args.dp_size
+        self.worker_ports: Optional[List[int]] = None
 
         if server_args.node_rank == 0 and server_args.enable_dp_attention_port_picking:
+            self.worker_ports = [0] * server_args.dp_size
             for dp_rank in range(server_args.dp_size):
                 port_and_socket = get_zmq_socket(
                     self.context, zmq.PUSH
