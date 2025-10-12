@@ -3288,7 +3288,11 @@ class PortArgs:
     tokenizer_worker_ipc_name: Optional[str]
 
     @staticmethod
-    def init_new(server_args, dp_rank: Optional[int] = None, worker_ports: Optional[List[int]] = None) -> PortArgs:
+    def init_new(
+        server_args: ServerArgs,
+        dp_rank: Optional[int] = None,
+        worker_ports: Optional[List[int]] = None,
+    ) -> PortArgs:
         if server_args.nccl_port is None:
             nccl_port = server_args.port + random.randint(100, 1000)
             while True:
@@ -3337,7 +3341,9 @@ class PortArgs:
             else:
                 if server_args.enable_dp_attention_port_picking:
                     if worker_ports is None:
-                        raise ValueError("worker_ports must be provided when enable_dp_attention_port_picking is True")
+                        raise ValueError(
+                            "worker_ports must be provided when enable_dp_attention_port_picking is True"
+                        )
                     scheduler_input_port = worker_ports[dp_rank]
                 else:
                     scheduler_input_port = port_base + 4 + 1 + dp_rank

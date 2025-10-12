@@ -36,7 +36,11 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import run_scheduler_process
-from sglang.srt.server_args import DP_ATTENTION_HANDSHAKE_PORT_DELTA, PortArgs, ServerArgs
+from sglang.srt.server_args import (
+    DP_ATTENTION_HANDSHAKE_PORT_DELTA,
+    PortArgs,
+    ServerArgs,
+)
 from sglang.srt.utils import (
     bind_port,
     configure_logger,
@@ -140,15 +144,14 @@ class DataParallelController:
         self.workers: List[zmq.Socket] = [None] * server_args.dp_size
         self.worker_ports: Optional[List[int]] = None
 
+        # Pre-allocate worker ports on node 0 to avoid conflicts
         if server_args.node_rank == 0 and server_args.enable_dp_attention_port_picking:
-            self.worker_ports = [0] * server_args.dp_size
+            self.worker_ports = []
             for dp_rank in range(server_args.dp_size):
-                port_and_socket = get_zmq_socket(
-                    self.context, zmq.PUSH
-                )
-                self.worker_ports[dp_rank] = port_and_socket[0]
+                port_and_socket = get_zmq_socket(self.context, zmq.PUSH)
+                self.worker_ports.append(port_and_socket[0])
                 self.workers[dp_rank] = port_and_socket[1]
-                logger.debug(f"Port assign to worker {dp_rank}: {port_and_socket[0]}")
+                logger.debug(f"Assigned port {port_and_socket[0]} to worker {dp_rank}")
 
         if server_args.enable_dp_attention:
             dp_port_args = self.launch_dp_attention_schedulers(server_args, port_args)
@@ -254,59 +257,90 @@ class DataParallelController:
         while True:
             time.sleep(30 * 24 * 3600)
 
-    def _dispatch_dp_attn_ctrl_zmq_port(self, server_args: ServerArgs) -> List[int]:
-        ex_endpoint = None
+    def _broadcast_worker_ports(self, server_args: ServerArgs) -> List[int]:
+        """Broadcast worker ports from node 0 to all other nodes.
+
+        Node 0 acts as the server, waiting for all other nodes to connect and
+        sending them the pre-allocated worker ports. Other nodes act as clients,
+        connecting to node 0 to receive their copy of the worker ports.
+
+        Args:
+            server_args: Server arguments containing node configuration.
+
+        Returns:
+            List of worker ports (same on all nodes after broadcast).
+        """
+        # Determine the endpoint for inter-node communication
         if server_args.dist_init_addr is None:
-            ex_endpoint = f"tcp://127.0.0.1:{server_args.port + DP_ATTENTION_HANDSHAKE_PORT_DELTA}"
+            endpoint = f"tcp://127.0.0.1:{server_args.port + DP_ATTENTION_HANDSHAKE_PORT_DELTA}"
         else:
-            ex_endpoint = f"tcp://{server_args.dist_init_addr}"
+            endpoint = f"tcp://{server_args.dist_init_addr}"
 
         if server_args.node_rank == 0:
-            worker_ports = self.worker_ports
-            logger.debug(f"Worker ports: {worker_ports}")
-
-            # broadcast dp_port_args to all dp ranks
-            rep_socket = get_zmq_socket(self.context, zmq.REP, ex_endpoint, True)
-
-            connected_nodes = 0
-            expected_nodes = server_args.nnodes - 1
-
-            logger.debug(
-                f"DP Controller: Node Rank 0 started, waiting for {expected_nodes} nodes to connect."
-            )
-            while connected_nodes < expected_nodes:
-                msg = rep_socket.recv()
-                logger.debug(f"Node 0 received handshake from node {msg.decode()}")
-                # send dp_port_args to the node
-                rep_socket.send_pyobj(worker_ports)
-                connected_nodes += 1
-                logger.debug(
-                    f"DP Controller: {connected_nodes}/{expected_nodes} nodes connected."
-                )
-            logger.debug("DP Controller: All nodes connected")
-
-            rep_socket.close()
+            # Node 0: Broadcast worker ports to all other nodes
+            return self._broadcast_ports_as_server(endpoint, server_args.nnodes - 1)
         else:
-            req_socket = get_zmq_socket(self.context, zmq.REQ, ex_endpoint, False)
+            # Other nodes: Receive worker ports from node 0
+            return self._receive_ports_as_client(endpoint, server_args.node_rank)
 
-            req_socket.setsockopt(zmq.RCVTIMEO, 60 * 1000)  # 1 min timeout
-            req_socket.setsockopt(zmq.SNDTIMEO, 60 * 1000)
+    def _broadcast_ports_as_server(
+        self, endpoint: str, expected_clients: int
+    ) -> List[int]:
+        """Broadcast worker ports to all client nodes."""
+        logger.debug(f"Broadcasting worker ports to {expected_clients} client nodes")
+        logger.debug(f"Worker ports: {self.worker_ports}")
 
-            try:
-                req_socket.send(str(server_args.node_rank).encode())
-                worker_ports = req_socket.recv_pyobj()
+        rep_socket = get_zmq_socket(self.context, zmq.REP, endpoint, True)
+
+        try:
+            connected_clients = 0
+            while connected_clients < expected_clients:
+                # Wait for client handshake
+                client_rank = rep_socket.recv().decode()
+                logger.debug(f"Received handshake from node {client_rank}")
+
+                # Send worker ports to client
+                rep_socket.send_pyobj(self.worker_ports)
+                connected_clients += 1
                 logger.debug(
-                    f"Node {server_args.node_rank} received handshake from node 0, len {len(worker_ports)}"
+                    f"Sent worker ports to {connected_clients}/{expected_clients} nodes"
                 )
-            except zmq.Again:
-                logger.error("Handshake timeout with node 0")
-                raise
-        return worker_ports
 
-    def launch_dp_attention_schedulers(self, server_args, port_args):
+            logger.debug("Worker port broadcast completed")
+            return self.worker_ports
+        finally:
+            rep_socket.close()
+
+    def _receive_ports_as_client(self, endpoint: str, node_rank: int) -> List[int]:
+        """Receive worker ports from the server node."""
+        logger.debug(f"Connecting to node 0 to receive worker ports")
+
+        req_socket = get_zmq_socket(self.context, zmq.REQ, endpoint, False)
+        req_socket.setsockopt(zmq.RCVTIMEO, 60 * 1000)  # 1 minute timeout
+        req_socket.setsockopt(zmq.SNDTIMEO, 60 * 1000)
+
+        try:
+            # Send handshake with our node rank
+            req_socket.send(str(node_rank).encode())
+
+            # Receive worker ports
+            worker_ports = req_socket.recv_pyobj()
+            logger.debug(f"Received {len(worker_ports)} worker ports from node 0")
+            return worker_ports
+        except zmq.Again:
+            logger.error("Timeout waiting for worker ports from node 0")
+            raise RuntimeError(
+                "Failed to receive worker ports from node 0 within timeout"
+            )
+        finally:
+            req_socket.close()
+
+    def launch_dp_attention_schedulers(
+        self, server_args: ServerArgs, port_args: PortArgs
+    ) -> List[PortArgs]:
         worker_ports = None
         if server_args.enable_dp_attention_port_picking:
-            worker_ports = self._dispatch_dp_attn_ctrl_zmq_port(server_args)
+            worker_ports = self._broadcast_worker_ports(server_args)
         dp_port_args = []
         for dp_rank in range(server_args.dp_size):
             dp_port_args.append(PortArgs.init_new(server_args, dp_rank, worker_ports))
@@ -356,7 +390,9 @@ class DataParallelController:
                         server_args.dp_size,
                     )
                     # compute zmq ports for this dp rank
-                    rank_port_args = PortArgs.init_new(server_args, dp_rank, worker_ports)
+                    rank_port_args = PortArgs.init_new(
+                        server_args, dp_rank, worker_ports
+                    )
                     # Data parallelism reuses the tensor parallelism group,
                     # so all dp ranks should use the same nccl port.
                     rank_port_args.nccl_port = port_args.nccl_port

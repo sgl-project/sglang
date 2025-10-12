@@ -1347,7 +1347,6 @@ def config_socket(socket, socket_type: zmq.SocketType):
         raise ValueError(f"Unsupported socket type: {socket_type}")
 
 
-
 def dump_to_file(dirpath, name, value):
     from sglang.srt.distributed import get_tensor_model_parallel_rank
 
