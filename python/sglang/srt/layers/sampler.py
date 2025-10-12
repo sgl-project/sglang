@@ -33,7 +33,6 @@ RETURN_ORIGINAL_LOGPROB = get_bool_env_var("RETURN_ORIGINAL_LOGPROB")
 class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
-        print(f"[ModelRunner]: {type(get_global_server_args())=}")
         self.use_nan_detection = get_global_server_args().enable_nan_detection
         self.tp_sync_group = get_tp_group().device_group
 
