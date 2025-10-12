@@ -185,7 +185,7 @@ docker run --rm \
       echo \"==================================\"
 
       # Download ninjatracing script from GitHub (using PR #39 branch for ninja log v7 support)
-      wget -q https://raw.githubusercontent.com/dimitrisudell/ninjatracing/ninja_log_v7/ninjatracing -O /tmp/ninjatracing || echo \"Note: Failed to download ninjatracing, skipping build trace\"
+      wget -q https://raw.githubusercontent.com/cradleapps/ninjatracing/084212eaf68f25c70579958a2ed67fb4ec2a9ca4/ninjatracing -O /tmp/ninjatracing || echo \"Note: Failed to download ninjatracing, skipping build trace\"
 
       # Convert .ninja_log to Chrome trace (JSON format)
       if [ -f /tmp/ninjatracing ]; then
@@ -199,7 +199,6 @@ docker run --rm \
             if [ -f /sgl-kernel/build-trace.json.gz ]; then
                ORIGINAL_SIZE=\$(stat -f%z /sgl-kernel/build-trace.json 2>/dev/null || stat -c%s /sgl-kernel/build-trace.json)
                COMPRESSED_SIZE=\$(stat -f%z /sgl-kernel/build-trace.json.gz 2>/dev/null || stat -c%s /sgl-kernel/build-trace.json.gz)
-               RATIO=\$(awk \"BEGIN {printf \\\"%.1f\\\", 100 - ($COMPRESSED_SIZE * 100.0 / $ORIGINAL_SIZE)}\")
                echo \"Compressed to: build-trace.json.gz (\${RATIO}% smaller)\"
             fi
             echo \"\"
