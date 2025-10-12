@@ -11,6 +11,7 @@ import json
 import os
 import re
 from typing import Any, Dict, List, Optional
+from transformers import AutoTokenizer
 
 from sglang.test import simple_eval_common as common
 from sglang.test.simple_eval_common import (
@@ -107,6 +108,7 @@ class LongBenchV2Eval(Eval):
 
     def __init__(
         self,
+        model: str = None,
         data_source: str = DEFAULT_DATASET,
         num_examples: Optional[int] = None,
         num_threads: int = 1,
@@ -127,6 +129,7 @@ class LongBenchV2Eval(Eval):
             max_context_length: Maximum context length in characters
             min_context_length: Minimum context length in characters
         """
+        self.tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
         # Load dataset based on data source type
         examples = self._load_dataset(data_source)
 
@@ -136,7 +139,7 @@ class LongBenchV2Eval(Eval):
 
         if min_context_length or max_context_length:
             examples = self._filter_by_context_length(
-                examples, min_context_length, max_context_length
+                examples, self.tokenizer, min_context_length, max_context_length
             )
 
         # Sample examples if specified
@@ -250,14 +253,16 @@ class LongBenchV2Eval(Eval):
     def _filter_by_context_length(
         self,
         examples: List[Dict[str, Any]],
+        tokenizer: AutoTokenizer,
         min_length: Optional[int],
         max_length: Optional[int],
     ) -> List[Dict[str, Any]]:
         """Filter examples by context length measured in characters."""
         filtered = []
         for example in examples:
-            context = example.get("context", "")
-            context_length = len(context)
+            formatted_question = format_longbench_v2_question(example)
+            input_ids = tokenizer.encode(formatted_question)
+            context_length = len(input_ids)
 
             if min_length is not None and context_length < min_length:
                 continue
