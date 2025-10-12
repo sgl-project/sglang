@@ -38,14 +38,14 @@ pub struct RouterConfig {
     pub log_level: Option<String>,
     /// Custom request ID headers to check (defaults to common headers)
     pub request_id_headers: Option<Vec<String>>,
-    /// Maximum concurrent requests allowed (for rate limiting)
-    pub max_concurrent_requests: usize,
+    /// Maximum concurrent requests allowed (for rate limiting). Set to -1 to disable rate limiting.
+    pub max_concurrent_requests: i32,
     /// Queue size for pending requests when max concurrent limit reached (0 = no queue, return 429 immediately)
     pub queue_size: usize,
     /// Maximum time (in seconds) a request can wait in queue before timing out
     pub queue_timeout_secs: u64,
     /// Token bucket refill rate (tokens per second). If not set, defaults to max_concurrent_requests
-    pub rate_limit_tokens_per_second: Option<usize>,
+    pub rate_limit_tokens_per_second: Option<i32>,
     /// CORS allowed origins
     pub cors_allowed_origins: Vec<String>,
     /// Retry configuration
@@ -73,6 +73,10 @@ pub struct RouterConfig {
     /// Oracle history backend configuration (required when `history_backend` = "oracle")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oracle: Option<OracleConfig>,
+    /// Parser for reasoning models (e.g., deepseek-r1, qwen3)
+    pub reasoning_parser: Option<String>,
+    /// Parser for handling tool-call interactions
+    pub tool_call_parser: Option<String>,
 }
 
 fn default_history_backend() -> HistoryBackend {
@@ -432,7 +436,7 @@ impl Default for RouterConfig {
             log_dir: None,
             log_level: None,
             request_id_headers: None,
-            max_concurrent_requests: 256,
+            max_concurrent_requests: -1,
             queue_size: 100,
             queue_timeout_secs: 60,
             rate_limit_tokens_per_second: None,
@@ -448,6 +452,8 @@ impl Default for RouterConfig {
             tokenizer_path: None,
             history_backend: default_history_backend(),
             oracle: None,
+            reasoning_parser: None,
+            tool_call_parser: None,
         }
     }
 }
@@ -990,6 +996,8 @@ mod tests {
             tokenizer_path: None,
             history_backend: default_history_backend(),
             oracle: None,
+            reasoning_parser: None,
+            tool_call_parser: None,
         };
 
         assert!(config.mode.is_pd_mode());
@@ -1055,6 +1063,8 @@ mod tests {
             tokenizer_path: None,
             history_backend: default_history_backend(),
             oracle: None,
+            reasoning_parser: None,
+            tool_call_parser: None,
         };
 
         assert!(!config.mode.is_pd_mode());
@@ -1116,6 +1126,8 @@ mod tests {
             tokenizer_path: None,
             history_backend: default_history_backend(),
             oracle: None,
+            reasoning_parser: None,
+            tool_call_parser: None,
         };
 
         assert!(config.has_service_discovery());
