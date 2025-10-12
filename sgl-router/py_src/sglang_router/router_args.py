@@ -479,7 +479,7 @@ class RouterArgs:
             f"--{prefix}backend",
             type=str,
             default=RouterArgs.backend,
-            choices=["sglang", "vllm", "trtllm", "openai", "anthropic"],
+            choices=["sglang", "openai"],
             help="Backend runtime to use (default: sglang)",
         )
         # History backend configuration

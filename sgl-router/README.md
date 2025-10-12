@@ -219,7 +219,7 @@ Store conversation and response data for tracking, debugging, or analytics.
 
 **NOTE: This feature is currently only supported in OpenAI router mode.**
 
-#### Available Backends
+#### Available options for conversation storage
 
 - **Memory** (default): In-memory storage, fast but ephemeral
 - **None**: No storage, minimal overhead
@@ -484,9 +484,6 @@ curl -X POST http://localhost:8080/add_worker?url=http://worker3:8000&api_key=wo
 - `--backend`: Backend runtime to use (default: `sglang`)
   - `sglang`: SGLang workers (default)
   - `openai`: OpenAI or OpenAI-compatible endpoints
-  - `vllm`: vLLM workers (not implemented)
-  - `trtllm`: TensorRT-LLM workers (not implemented)
-  - `anthropic`: Anthropic API (not implemented)
 
 #### History Backend
 - `--history-backend`: Storage backend for conversations (default: `memory`)

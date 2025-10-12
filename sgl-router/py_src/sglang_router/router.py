@@ -22,13 +22,7 @@ def backend_from_str(backend_str: Optional[str]) -> BackendType:
     """Convert backend string to BackendType enum."""
     if backend_str is None:
         return BackendType.Sglang
-    backend_map = {
-        "sglang": BackendType.Sglang,
-        "vllm": BackendType.Vllm,
-        "trtllm": BackendType.Trtllm,
-        "openai": BackendType.Openai,
-        "anthropic": BackendType.Anthropic,
-    }
+    backend_map = {"sglang": BackendType.Sglang, "openai": BackendType.Openai}
     return backend_map.get(backend_str.lower(), BackendType.Sglang)
 
 
