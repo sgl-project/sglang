@@ -423,9 +423,6 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(Qwen3VLMoeForConditionalGenera
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
-        # for k, v in config.text_config.__dict__.items():
-        #     setattr(config, k, v)
-        # config.vocab_size = config.text_config.vocab_size
         super().__init__(
             config, quant_config, prefix, language_model_cls=Qwen3MoeLLMModel
         )

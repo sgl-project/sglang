@@ -312,7 +312,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             use_audio_in_video=False,
             audio_seqlens=audio_feature_lengths,
             audio_token_id=getattr(self.hf_config, "audio_token_id", None),
-            audio_start_token_id=getattr(self.hf_config, "audio_start_token_id", None),
+            audio_start_token_id=self.audio_start_token_id,
             position_id_per_seconds=getattr(
                 self.hf_config, "position_id_per_seconds", None
             ),
