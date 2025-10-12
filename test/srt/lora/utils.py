@@ -135,7 +135,7 @@ def run_lora_test_one_by_one(
     model_case: LoRAModelCase,
     torch_dtype: torch.dtype,
     max_new_tokens: int,
-    backend: Optional[str] = None,
+    backend: str = "csgmv",
     disable_cuda_graph: bool = False,
     disable_radix_cache: bool = False,
     mem_fraction_static: float = 0.88,
