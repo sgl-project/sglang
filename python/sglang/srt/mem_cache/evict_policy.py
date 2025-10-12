@@ -31,3 +31,8 @@ class FIFOStrategy(EvictionStrategy):
 class MRUStrategy(EvictionStrategy):
     def get_priority(self, node: "TreeNode") -> float:
         return -node.last_access_time
+
+
+class FILOStrategy(EvictionStrategy):
+    def get_priority(self, node: "TreeNode") -> float:
+        return -node.creation_time

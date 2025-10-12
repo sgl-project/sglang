@@ -37,6 +37,7 @@ from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 from sglang.srt.mem_cache.evict_policy import (
     EvictionStrategy,
     FIFOStrategy,
+    FILOStrategy,
     LFUStrategy,
     LRUStrategy,
     MRUStrategy,
@@ -227,9 +228,11 @@ class RadixCache(BasePrefixCache):
             self.eviction_strategy: EvictionStrategy = FIFOStrategy()
         elif eviction_policy.lower() == "mru":
             self.eviction_strategy: EvictionStrategy = MRUStrategy()
+        elif eviction_policy.lower() == "filo":
+            self.eviction_strategy: EvictionStrategy = FILOStrategy()
         else:
             raise ValueError(
-                f"Unknown eviction policy: {eviction_policy}. Supported policies: 'lru', 'lfu', 'fifo', 'mru'."
+                f"Unknown eviction policy: {eviction_policy}. Supported policies: 'lru', 'lfu', 'fifo', 'mru', 'filo'."
             )
         self.reset()
 
