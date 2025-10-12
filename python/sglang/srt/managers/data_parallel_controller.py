@@ -40,8 +40,6 @@ from sglang.srt.server_args import DP_ATTENTION_HANDSHAKE_PORT_DELTA, PortArgs, 
 from sglang.srt.utils import (
     bind_port,
     configure_logger,
-    get_free_port,
-    get_tcp_zmq_socket_binded_to_local_free_port,
     get_zmq_socket,
     kill_itself_when_parent_died,
 )
@@ -144,11 +142,11 @@ class DataParallelController:
         if server_args.node_rank == 0 and server_args.enable_dp_attention_port_picking:
             self.workers_port = {}
             for dp_rank in range(server_args.dp_size):
-                port_and_socket = get_tcp_zmq_socket_binded_to_local_free_port(
+                port_and_socket = get_zmq_socket(
                     self.context, zmq.PUSH
                 )
-                self.workers[dp_rank] = port_and_socket[1]
                 self.workers_port[dp_rank] = port_and_socket[0]
+                self.workers[dp_rank] = port_and_socket[1]
                 logger.debug(f"Port assign to worker {dp_rank}: {port_and_socket[0]}")
 
         if server_args.enable_dp_attention:

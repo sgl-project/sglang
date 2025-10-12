@@ -1279,6 +1279,46 @@ def pytorch_profile(name, func, *args, data_size=-1):
     return result
 
 
+def get_zmq_socket(
+    context: zmq.Context,
+    socket_type: zmq.SocketType,
+    endpoint: Optional[str] = None,
+    bind: bool = True,
+) -> Union[zmq.Socket, Tuple[int, zmq.Socket]]:
+    """Create and configure a ZeroMQ socket.
+
+    Args:
+        context: ZeroMQ context to create the socket from.
+        socket_type: Type of ZeroMQ socket to create.
+        endpoint: Optional endpoint to bind/connect to. If None, binds to a random TCP port.
+        bind: Whether to bind (True) or connect (False) to the endpoint. Ignored if endpoint is None.
+
+    Returns:
+        If endpoint is None: Tuple of (port, socket) where port is the randomly assigned TCP port.
+        If endpoint is provided: The configured ZeroMQ socket.
+    """
+    socket = context.socket(socket_type)
+
+    if endpoint is None:
+        # Bind to random TCP port
+        config_socket(socket, socket_type)
+        port = socket.bind_to_random_port("tcp://*")
+        return port, socket
+    else:
+        # Handle IPv6 if endpoint contains brackets
+        if endpoint.find("[") != -1:
+            socket.setsockopt(zmq.IPV6, 1)
+
+        config_socket(socket, socket_type)
+
+        if bind:
+            socket.bind(endpoint)
+        else:
+            socket.connect(endpoint)
+
+        return socket
+
+
 def config_socket(socket, socket_type: zmq.SocketType):
     mem = psutil.virtual_memory()
     total_mem = mem.total / 1024**3
@@ -1306,31 +1346,6 @@ def config_socket(socket, socket_type: zmq.SocketType):
     else:
         raise ValueError(f"Unsupported socket type: {socket_type}")
 
-
-def get_tcp_zmq_socket_binded_to_local_free_port(
-    context: zmq.Context, socket_type: zmq.SocketType
-) -> Tuple[int, zmq.Socket]:
-    socket = context.socket(socket_type)
-    config_socket(socket, socket_type)
-    port = socket.bind_to_random_port("tcp://*")
-    return port, socket
-
-
-def get_zmq_socket(
-    context: zmq.Context, socket_type: zmq.SocketType, endpoint: str, bind: bool
-) -> zmq.Socket:
-    socket = context.socket(socket_type)
-    if endpoint.find("[") != -1:
-        socket.setsockopt(zmq.IPV6, 1)
-
-    config_socket(socket, socket_type)
-
-    if bind:
-        socket.bind(endpoint)
-    else:
-        socket.connect(endpoint)
-
-    return socket
 
 
 def dump_to_file(dirpath, name, value):
