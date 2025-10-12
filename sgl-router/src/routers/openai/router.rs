@@ -725,7 +725,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                 "no_stop_trim",
                 "ignore_eos",
                 "continue_final_message",
-                "skip_serializing",
+                "skip_special_tokens",
                 "lora_path",
                 "session_params",
                 "separate_reasoning",
