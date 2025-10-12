@@ -185,7 +185,7 @@ class CustomAllreduce:
             # is enough for 131072 such tuples. The largest model I've seen only
             # needs less than 10000 of registered tuples.
             self.rank_data = torch.empty(
-                8 * 1024 * 1024, dtype=torch.uint8, device=self.device
+                max_size, dtype=torch.uint8, device=self.device
             )
             self._ptr = ops.init_custom_ar(
                 self.meta_ptrs, self.rank_data, rank, self.full_nvlink
@@ -202,7 +202,7 @@ class CustomAllreduce:
             )
             handles, offsets = self._gather_ipc_meta(shard_data)
             self.rank_data = torch.empty(
-                8 * 1024 * 1024, dtype=torch.uint8, device=self.device
+                max_size, dtype=torch.uint8, device=self.device
             )
             self._ptr = ops.init_custom_ar(
                 self.meta, self.rank_data, handles, offsets, rank, self.full_nvlink

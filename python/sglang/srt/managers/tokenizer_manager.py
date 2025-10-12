@@ -34,6 +34,7 @@ from http import HTTPStatus
 from typing import Any, Awaitable, Dict, List, Optional, Tuple, Union
 
 import fastapi
+import orjson
 import torch
 import uvloop
 import zmq
@@ -157,7 +158,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         self.log_requests = server_args.log_requests
         self.log_requests_level = server_args.log_requests_level
         self.preferred_sampling_params = (
-            json.loads(server_args.preferred_sampling_params)
+            orjson.loads(server_args.preferred_sampling_params)
             if server_args.preferred_sampling_params
             else None
         )
