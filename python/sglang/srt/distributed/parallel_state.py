@@ -240,6 +240,7 @@ class GroupCoordinator:
         use_message_queue_broadcaster: bool = False,
         group_name: Optional[str] = None,
         torch_compile: Optional[bool] = None,
+        gloo_timeout: timedelta = timedelta(seconds=120 * 60),
     ):
         # Set group info
         group_name = group_name or "anonymous"
@@ -259,7 +260,9 @@ class GroupCoordinator:
             )
             # a group with `gloo` backend, to allow direct coordination between
             # processes through the CPU.
-            cpu_group = torch.distributed.new_group(ranks, backend="gloo")
+            cpu_group = torch.distributed.new_group(
+                ranks, backend="gloo", timeout=gloo_timeout
+            )
             if self.rank in ranks:
                 self.ranks = ranks
                 self.world_size = len(ranks)
