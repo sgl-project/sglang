@@ -37,7 +37,6 @@ import copy
 import dataclasses
 import logging
 import re
-import threading
 import time
 from enum import Enum, auto
 from http import HTTPStatus
@@ -47,7 +46,6 @@ from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple, Union
 import numpy as np
 import torch
 
-from sglang.global_config import global_config
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.disaggregation.base import BaseKVSender
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
@@ -55,6 +53,7 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
@@ -74,7 +73,7 @@ from sglang.srt.metrics.collector import SchedulerMetricsCollector, TimeStats
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.server_args import ServerArgs, get_global_server_args
 from sglang.srt.utils import flatten_nested_list
 from sglang.srt.utils.common import next_power_of_2
 
@@ -84,47 +83,6 @@ if TYPE_CHECKING:
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
-GLOBAL_SERVER_ARGS_KEYS = [
-    "attention_backend",
-    "mm_attention_backend",
-    "debug_tensor_dump_inject",
-    "debug_tensor_dump_output_folder",
-    "chunked_prefill_size",
-    "device",
-    "disable_chunked_prefix_cache",
-    "disable_flashinfer_cutlass_moe_fp4_allgather",
-    "disable_radix_cache",
-    "enable_dp_lm_head",
-    "enable_fp32_lm_head",
-    "flashinfer_mxfp4_moe_precision",
-    "enable_flashinfer_allreduce_fusion",
-    "moe_dense_tp_size",
-    "ep_dispatch_algorithm",
-    "ep_num_redundant_experts",
-    "enable_nan_detection",
-    "flashinfer_mla_disable_ragged",
-    "pp_max_micro_batch_size",
-    "disable_shared_experts_fusion",
-    "sampling_backend",
-    "speculative_accept_threshold_single",
-    "speculative_accept_threshold_acc",
-    "speculative_attention_mode",
-    "torchao_config",
-    "triton_attention_reduce_in_fp32",
-    "num_reserved_decode_tokens",
-    "weight_loader_disable_mmap",
-    "enable_multimodal",
-    "enable_symm_mem",
-    "enable_custom_logit_processor",
-    "disaggregation_mode",
-    "enable_deterministic_inference",
-    "nsa_prefill",
-    "nsa_decode",
-    "multi_item_scoring_delimiter",
-]
-
-# Put some global args for easy access
-global_server_args_dict = {k: getattr(ServerArgs, k) for k in GLOBAL_SERVER_ARGS_KEYS}
 
 logger = logging.getLogger(__name__)
 
@@ -686,12 +644,9 @@ class Req:
     def is_prefill_only(self) -> bool:
         """Check if this request is prefill-only (no token generation needed)."""
         # NOTE: when spec is enabled, prefill_only optimizations are disabled
-        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
-        spec_alg = global_server_args_dict["speculative_algorithm"]
-        return self.sampling_params.max_new_tokens == 0 and (
-            spec_alg is None or spec_alg == SpeculativeAlgorithm.NONE
-        )
+        spec_alg = get_global_server_args().speculative_algorithm
+        return self.sampling_params.max_new_tokens == 0 and spec_alg is None
 
     def add_latency(self, stage: RequestStage):
         if self.metrics_collector is None:
@@ -1510,7 +1465,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         total_max_new_tokens = sum(r.sampling_params.max_new_tokens for r in self.reqs)
 
         new_estimate_ratio = (
-            total_decoded_tokens + global_config.retract_decode_steps * len(self.reqs)
+            total_decoded_tokens
+            + envs.SGLANG_RETRACT_DECODE_STEPS.get() * len(self.reqs)
         ) / total_max_new_tokens
         new_estimate_ratio = min(1.0, new_estimate_ratio)
 
@@ -1549,7 +1505,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.tree_cache.dec_lock_ref(req.last_node)
 
             # NOTE(lsyin): we should use the newly evictable memory instantly.
-            num_tokens = remaing_req_count * global_config.retract_decode_steps
+            num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
             self._evict_tree_cache_if_needed(num_tokens)
 
         req.reset_for_retract()
