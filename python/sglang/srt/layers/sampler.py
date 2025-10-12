@@ -11,8 +11,8 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import crash_on_warnings, get_bool_env_var, is_cuda
 
 if is_cuda():
@@ -33,7 +33,7 @@ RETURN_ORIGINAL_LOGPROB = get_bool_env_var("RETURN_ORIGINAL_LOGPROB")
 class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
-        self.use_nan_detection = global_server_args_dict["enable_nan_detection"]
+        self.use_nan_detection = get_global_server_args().enable_nan_detection
         self.tp_sync_group = get_tp_group().device_group
 
         if is_dp_attention_enabled():
@@ -104,7 +104,7 @@ class Sampler(nn.Module):
             del logits
 
             if True:  # Keep this redundant check to simplify some internal code sync
-                if global_server_args_dict["sampling_backend"] == "flashinfer":
+                if get_global_server_args().sampling_backend == "flashinfer":
                     if sampling_info.need_min_p_sampling:
                         probs = top_k_renorm_prob(probs, sampling_info.top_ks)
                         probs = top_p_renorm_prob(probs, sampling_info.top_ps)
@@ -119,7 +119,7 @@ class Sampler(nn.Module):
                             filter_apply_order="joint",
                             check_nan=self.use_nan_detection,
                         )
-                elif global_server_args_dict["sampling_backend"] == "pytorch":
+                elif get_global_server_args().sampling_backend == "pytorch":
                     # A slower fallback implementation with torch native operations.
                     batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_torch(
                         probs,
@@ -132,7 +132,7 @@ class Sampler(nn.Module):
                     )
                 else:
                     raise ValueError(
-                        f"Invalid sampling backend: {global_server_args_dict['sampling_backend']}"
+                        f"Invalid sampling backend: {get_global_server_args().sampling_backend}"
                     )
 
             if return_logprob:
