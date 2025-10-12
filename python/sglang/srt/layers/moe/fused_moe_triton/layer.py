@@ -5,7 +5,8 @@ from enum import Enum
 from typing import List, Optional, Tuple
 
 import torch
-
+import re
+from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.distributed import (
     get_moe_expert_parallel_rank,
     get_moe_expert_parallel_world_size,
@@ -106,7 +107,6 @@ class FusedMoE(torch.nn.Module):
         quant_config: Quantization configuration.
         inplace: suggestion to compute inplace (modify input activation).
     """
-
     def __init__(
         self,
         num_experts: int,
@@ -131,7 +131,6 @@ class FusedMoE(torch.nn.Module):
         with_bias=False,
     ):
         super().__init__()
-
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
 
@@ -223,6 +222,8 @@ class FusedMoE(torch.nn.Module):
                 if not use_weight_loader_fused
                 else self.weight_loader_fused
             ),
+            intermediate_size_full=intermediate_size,
+            top_k=top_k,
             with_bias=with_bias,
         )
 
@@ -535,6 +536,11 @@ class FusedMoE(torch.nn.Module):
             if expert_id == -1:
                 return
 
+        if hasattr(self.quant_method, "num_gpu_experts"):
+            if self.quant_method.num_gpu_experts != -1:
+                if expert_id >= self.quant_method.num_gpu_experts:
+                    return 
+
         self._weight_loader_impl(
             param=param,
             loaded_weight=loaded_weight,
@@ -561,7 +567,11 @@ class FusedMoE(torch.nn.Module):
             loaded_weight.t().contiguous()
             if (
                 self.quant_method.__class__.__name__
-                == "CompressedTensorsWNA16MoEMethod"
+                in [
+                    "CompressedTensorsWNA16MarlinMoEMethod",
+                    "CompressedTensorsWNA16MoEMethod",
+                    "CompressedTensorsWNA16AMXEPMoEMethod",
+                ]
             )
             else loaded_weight
         )
@@ -830,16 +840,12 @@ class FusedMoE(torch.nn.Module):
         )
 
         # TODO: consider using symmetric memory
+
         combine_input = self.quant_method.apply(
             layer=self,
             dispatch_output=dispatch_output,
         )
-
         final_hidden_states = self.dispatcher.combine(combine_input)
-
-        final_hidden_states = final_hidden_states[
-            ..., :origin_hidden_states_dim
-        ].contiguous()
 
         if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)

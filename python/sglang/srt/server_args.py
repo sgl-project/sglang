@@ -84,6 +84,7 @@ QUANTIZATION_CHOICES = [
     "qoq",
     "w4afp8",
     "mxfp4",
+    "compressed-tensors", # for Ktransformers
 ]
 
 ATTENTION_BACKEND_CHOICES = [
@@ -185,6 +186,16 @@ class ServerArgs:
     enable_multimodal: Optional[bool] = None
     revision: Optional[str] = None
     model_impl: str = "auto"
+    
+    # Ktransformers
+    amx_weight_path: Optional[str] = None
+    amx_method: Optional[str] = None
+    cpu_embed: Optional[str] = None
+    cpuinfer: Optional[int] = None
+    subpool_count: Optional[int] = None
+    cpu_save: bool = False
+    num_gpu_experts: Optional[int] = None
+    enable_defer: bool = False
 
     # HTTP server
     host: str = "127.0.0.1"
@@ -519,6 +530,9 @@ class ServerArgs:
         self._handle_amd_specifics()
         self._handle_grammar_backend()
 
+        # Handle Ktransformers specific configs
+        self._handle_ktransformers_configs()
+
         # Handle data parallelism.
         self._handle_data_parallelism()
 
@@ -569,6 +583,23 @@ class ServerArgs:
                 f"The tool_call_parser '{self.tool_call_parser}' is deprecated. Please use '{deprecated_tool_call_parsers[self.tool_call_parser]}' instead."
             )
             self.tool_call_parser = deprecated_tool_call_parsers[self.tool_call_parser]
+
+    
+    def _handle_ktransformers_configs(self):
+        from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe import CompressedTensorsWNA16AMXEPMoEMethod, override_config
+        override_config(
+            CompressedTensorsWNA16AMXEPMoEMethod,
+            self.num_gpu_experts,
+            self.cpuinfer,
+            self.subpool_count,
+            self.amx_weight_path,
+            self.amx_method,
+            self.chunked_prefill_size,
+            self.enable_defer,
+            self.cpu_embed,
+            self.cpu_save
+        )
+
 
     def _handle_missing_default_values(self):
         if self.tokenizer_path is None:
@@ -1340,6 +1371,53 @@ class ServerArgs:
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
+
+        # Ktransformer server args
+        parser.add_argument(
+            "--amx-weight-path",
+            type=str,
+            help="The path of the quantized expert weights for amx kernel. A local folder.",
+        )
+        parser.add_argument(
+            "--amx-method",
+            type=str,
+            default="AMXINT4",
+            help="Quantization formats for CPU execution.",
+        )
+        parser.add_argument(
+            "--cpu-embed",
+            type=str,
+            default=False,
+            help="Enable moving embed_token to cpu",
+        )
+        parser.add_argument(
+            "--cpuinfer",
+            type=int,
+            help="The number of CPUInfer threads.",
+        )
+        parser.add_argument(
+            "--subpool-count",
+            type=int,
+            default=2,
+            help="The number of NUMA nodes.",
+        )
+        parser.add_argument(
+            "--cpu-save",
+            type=bool,
+            default=False,
+            help="Enable saving expert weights on cpu",
+        )
+        parser.add_argument(
+            "--num-gpu-experts",
+            type=int,
+            help="The number of GPU experts.",
+        )
+        parser.add_argument(
+            "--enable-defer",
+            action="store_true",
+            help="Enable Expert Deferral.",
+        )
+
         # Model and tokenizer
         parser.add_argument(
             "--model-path",

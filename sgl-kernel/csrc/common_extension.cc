@@ -295,7 +295,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor sorted_token_ids,"
       "Tensor! expert_ids, Tensor! num_tokens_past_padded,"
       "Tensor! topk_weights, int moe_block_size, int top_k, "
-      "bool mul_topk_weights, bool is_ep, int b_q_type_id,"
+      "bool mul_topk_weights, bool is_ep, int num_gpu_experts, int b_q_type_id,"
       "int size_m, int size_n, int size_k,"
       "bool is_k_full, bool use_atomic_add,"
       "bool use_fp32_reduce, bool is_zp_float) -> Tensor");

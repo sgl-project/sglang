@@ -458,6 +458,7 @@ torch::Tensor moe_wna16_marlin_gemm(
     int64_t top_k,
     bool mul_topk_weights,
     bool is_ep,
+    int64_t num_gpu_experts,
     sglang::ScalarTypeId const& b_q_type_id,
     int64_t size_m,
     int64_t size_n,

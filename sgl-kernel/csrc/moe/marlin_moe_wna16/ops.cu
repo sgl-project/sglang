@@ -69,6 +69,7 @@ torch::Tensor moe_wna16_marlin_gemm(
     int64_t top_k,
     bool mul_topk_weights,
     bool is_ep,
+    int64_t num_gpu_experts,
     sglang::ScalarTypeId const& b_q_type_id,
     int64_t size_m,
     int64_t size_n,
@@ -559,6 +560,7 @@ void marlin_mm(
     int top_k,
     bool mul_topk_weights,
     bool is_ep,
+    const int num_gpu_experts,
     int prob_m,
     int prob_n,
     int prob_k,
@@ -789,7 +791,7 @@ void marlin_mm(
   kernel<<<blocks, num_threads, max_shared_mem, stream>>>(
       A_ptr, B_ptr, C_ptr, C_tmp_ptr, s_ptr, zp_ptr, g_idx_ptr,
       sorted_token_ids_ptr, expert_ids_ptr, num_tokens_past_padded_ptr,
-      topk_weights_ptr, top_k, mul_topk_weights, is_ep, num_groups, prob_m,
+      topk_weights_ptr, top_k, mul_topk_weights, is_ep, num_gpu_experts, num_groups, prob_m,
       prob_n, prob_k, locks, use_atomic_add, use_fp32_reduce);
   // clang-format on
 }
@@ -813,6 +815,7 @@ torch::Tensor moe_wna16_marlin_gemm(
     int64_t top_k,
     bool mul_topk_weights,
     bool is_ep,
+    int64_t num_gpu_experts,
     sglang::ScalarTypeId const& b_q_type_id,
     int64_t size_m,
     int64_t size_n,
@@ -1046,6 +1049,7 @@ torch::Tensor moe_wna16_marlin_gemm(
         top_k,
         mul_topk_weights,
         is_ep,
+        num_gpu_experts,
         size_m,
         size_n,
         size_k,
@@ -1083,6 +1087,7 @@ torch::Tensor moe_wna16_marlin_gemm(
         top_k,
         mul_topk_weights,
         is_ep,
+        num_gpu_experts,
         size_m,
         size_n,
         size_k,

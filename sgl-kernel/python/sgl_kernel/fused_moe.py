@@ -25,6 +25,7 @@ def fused_marlin_moe(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     global_num_experts: int = -1,
+    num_gpu_experts: int = -1,
     expert_map: Optional[torch.Tensor] = None,
     g_idx1: Optional[torch.Tensor] = None,
     g_idx2: Optional[torch.Tensor] = None,
@@ -101,6 +102,10 @@ def fused_marlin_moe(
 
     if global_num_experts == -1:
         global_num_experts = E
+
+    if num_gpu_experts == -1:
+        num_gpu_experts = global_num_experts
+
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
         topk_ids, block_size_m, global_num_experts
     )
@@ -156,6 +161,7 @@ def fused_marlin_moe(
         top_k=topk,
         mul_topk_weights=False,
         is_ep=expert_map is not None,
+        num_gpu_experts=num_gpu_experts,
         b_q_type_id=scalar_type1.id,
         size_m=M,
         size_n=2 * N,
@@ -168,7 +174,7 @@ def fused_marlin_moe(
 
     silu_and_mul(intermediate_cache1.view(-1, 2 * N), intermediate_cache2)
 
-    if expert_map is not None:
+    if expert_map is not None or num_gpu_experts != global_num_experts:
         intermediate_cache3.zero_()
 
     intermediate_cache3 = torch.ops.sgl_kernel.moe_wna16_marlin_gemm.default(
@@ -188,6 +194,7 @@ def fused_marlin_moe(
         top_k=1,
         mul_topk_weights=True,
         is_ep=expert_map is not None,
+        num_gpu_experts=num_gpu_experts,
         b_q_type_id=scalar_type2.id,
         size_m=M * topk,
         size_n=K,
