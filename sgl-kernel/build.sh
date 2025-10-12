@@ -184,12 +184,12 @@ docker run --rm \
       echo \"Generating Ninja Build Trace\"
       echo \"==================================\"
 
-      # Install ninjatracing if not available
-      ${PYTHON_ROOT_PATH}/bin/pip install --quiet ninjatracing 2>/dev/null || echo \"Note: ninjatracing not available, skipping build trace\"
+      # Download ninjatracing script from GitHub (using PR #39 branch for ninja log v7 support)
+      wget -q https://raw.githubusercontent.com/dimitrisudell/ninjatracing/ninja_log_v7/ninjatracing -O /tmp/ninjatracing || echo \"Note: Failed to download ninjatracing, skipping build trace\"
 
       # Convert .ninja_log to Chrome trace (JSON format)
-      if ${PYTHON_ROOT_PATH}/bin/python -c \"import ninjatracing\" 2>/dev/null; then
-         ${PYTHON_ROOT_PATH}/bin/python -m ninjatracing /sgl-kernel/build/.ninja_log > /sgl-kernel/build-trace.json 2>/dev/null || true
+      if [ -f /tmp/ninjatracing ]; then
+         ${PYTHON_ROOT_PATH}/bin/python /tmp/ninjatracing /sgl-kernel/build/.ninja_log > /sgl-kernel/build-trace.json || true
 
          if [ -f /sgl-kernel/build-trace.json ]; then
             # Compress the trace for smaller file size and faster loading
