@@ -19,7 +19,6 @@ from typing import Dict, Optional
 
 import torch
 
-from python.sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
@@ -43,6 +42,7 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import global_server_args
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     get_bool_env_var,
     is_cuda,
