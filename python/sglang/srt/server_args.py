@@ -433,7 +433,6 @@ class ServerArgs:
     disable_chunked_prefix_cache: bool = False
     disable_fast_image_processor: bool = False
     keep_mm_feature_on_device: bool = False
-    enable_dp_port_preallocation: bool = False
     enable_return_hidden_states: bool = False
     scheduler_recv_interval: int = 1
     numa_node: Optional[List[int]] = None
@@ -2938,12 +2937,6 @@ class ServerArgs:
             help="Read CLI options from a config file. Must be a YAML file with configuration options.",
         )
 
-        parser.add_argument(
-            "--enable-dp-port-preallocation",
-            action="store_true",
-            help="Pre-allocate DP ports on node 0 and broadcast to other nodes to avoid port conflicts. Useful for large DP setups where conflicts are common.",
-        )
-
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
         args.tp_size = args.tensor_parallel_size
@@ -3339,14 +3332,8 @@ class PortArgs:
                 # TokenizerManager to DataParallelController
                 scheduler_input_port = port_base + 4
             else:
-                if server_args.enable_dp_port_preallocation:
-                    if worker_ports is None:
-                        raise ValueError(
-                            "worker_ports must be provided when enable_dp_port_preallocation is True"
-                        )
-                    scheduler_input_port = worker_ports[dp_rank]
-                else:
-                    scheduler_input_port = port_base + 4 + 1 + dp_rank
+                assert worker_ports is not None
+                scheduler_input_port = worker_ports[dp_rank]
             return PortArgs(
                 tokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base}",
                 scheduler_input_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port}",

@@ -72,11 +72,12 @@ class TestPortArgs(unittest.TestCase):
         server_args.port = 30000
         server_args.nccl_port = None
         server_args.enable_dp_attention = True
-        server_args.enable_dp_port_preallocation = False
         server_args.nnodes = 1
         server_args.dist_init_addr = "192.168.1.1:25000"
 
-        port_args = PortArgs.init_new(server_args, dp_rank=2)
+        # Since DP port preallocation is now default, provide worker_ports
+        worker_ports = [25006, 25007, 25008, 25009]  # Example ports for dp_ranks 0, 1, 2, 3
+        port_args = PortArgs.init_new(server_args, dp_rank=2, worker_ports=worker_ports)
 
         self.assertTrue(port_args.scheduler_input_ipc_name.endswith(":25008"))
 

@@ -145,7 +145,7 @@ class DataParallelController:
         self.worker_ports: Optional[List[int]] = None
 
         # Pre-allocate worker ports on node 0 to avoid conflicts
-        if server_args.node_rank == 0 and server_args.enable_dp_port_preallocation:
+        if server_args.node_rank == 0:
             self.worker_ports = []
             for dp_rank in range(server_args.dp_size):
                 port_and_socket = get_zmq_socket(self.context, zmq.PUSH)
@@ -154,20 +154,11 @@ class DataParallelController:
                 logger.debug(f"Assigned port {port_and_socket[0]} to worker {dp_rank}")
 
         if server_args.enable_dp_attention:
-            dp_port_args = self.launch_dp_attention_schedulers(server_args, port_args)
+            self.launch_dp_attention_schedulers(server_args, port_args)
             self.control_message_step = server_args.tp_size
         else:
-            dp_port_args = self.launch_dp_schedulers(server_args, port_args)
+            self.launch_dp_schedulers(server_args, port_args)
             self.control_message_step = 1
-
-        if server_args.node_rank == 0 and not server_args.enable_dp_port_preallocation:
-            for dp_rank in range(server_args.dp_size):
-                self.workers[dp_rank] = get_zmq_socket(
-                    self.context,
-                    zmq.PUSH,
-                    dp_port_args[dp_rank].scheduler_input_ipc_name,
-                    True,
-                )
 
         self.max_req_input_len = None
 
@@ -201,13 +192,11 @@ class DataParallelController:
 
         threads = []
         sockets = []
-        dp_port_args = []
         ready_events = []
         for dp_rank in range(server_args.dp_size):
             tmp_port_args = PortArgs.init_new(server_args)
             tmp_port_args.tokenizer_ipc_name = port_args.tokenizer_ipc_name
             tmp_port_args.detokenizer_ipc_name = port_args.detokenizer_ipc_name
-            dp_port_args.append(tmp_port_args)
 
             # This port is checked free in PortArgs.init_new.
             # We hold it first so that the next dp worker gets a different port
@@ -235,8 +224,6 @@ class DataParallelController:
             thread.start()
         for event in ready_events:
             event.wait()
-
-        return dp_port_args
 
     def launch_tensor_parallel_group_thread(
         self,
@@ -334,15 +321,9 @@ class DataParallelController:
 
     def launch_dp_attention_schedulers(
         self, server_args: ServerArgs, port_args: PortArgs
-    ) -> List[PortArgs]:
-        worker_ports = None
-        if server_args.enable_dp_port_preallocation:
-            worker_ports = self._broadcast_worker_ports(server_args)
-        dp_port_args = []
-        for dp_rank in range(server_args.dp_size):
-            dp_port_args.append(PortArgs.init_new(server_args, dp_rank, worker_ports))
+    ):
+        worker_ports = self._broadcast_worker_ports(server_args)
         self.launch_tensor_parallel_group(server_args, port_args, 0, None, worker_ports)
-        return dp_port_args
 
     def launch_tensor_parallel_group(
         self,
