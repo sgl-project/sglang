@@ -1,7 +1,5 @@
 """Global configurations"""
 
-import os
-
 
 class GlobalConfig:
     """
