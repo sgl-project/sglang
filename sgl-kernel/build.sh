@@ -31,8 +31,9 @@ else
    TORCH_INSTALL="pip install --no-cache-dir torch==2.8.0 --index-url https://download.pytorch.org/whl/cu126"
 fi
 
-# Create cache directories for persistent build artifacts
-CACHE_DIR="${PWD}/.cache"
+# Create cache directories for persistent build artifacts in home directory
+# Using home directory to persist across workspace cleanups/checkouts
+CACHE_DIR="${HOME}/.cache/sgl-kernel"
 CMAKE_DOWNLOAD_CACHE="${CACHE_DIR}/cmake-downloads"
 CCACHE_DIR="${CACHE_DIR}/ccache"
 
