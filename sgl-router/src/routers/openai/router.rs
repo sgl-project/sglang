@@ -187,17 +187,6 @@ impl OpenAIRouter {
             }
         } else {
             // No MCP - simple request
-            let payload_str = serde_json::to_string_pretty(&payload)
-                .unwrap_or_else(|_| "failed to serialize".to_string());
-            eprintln!("=== UPSTREAM REQUEST (non-streaming) ===");
-            eprintln!("URL: {}", url);
-            eprintln!("Payload:\n{}", payload_str);
-            eprintln!("=========================================");
-            info!(
-                target: "openai_router",
-                url = %url,
-                "Sending non-streaming request to upstream"
-            );
 
             let mut request_builder = self.client.post(&url).json(&payload);
             if let Some(h) = headers {
