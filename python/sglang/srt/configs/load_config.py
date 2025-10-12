@@ -1,9 +1,10 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
 import enum
-import json
 import logging
 from dataclasses import dataclass, field
 from typing import List, Optional, Union
+
+import orjson
 
 from sglang.srt.utils import is_hip
 
@@ -66,7 +67,7 @@ class LoadConfig:
     def __post_init__(self):
         model_loader_extra_config = self.model_loader_extra_config or {}
         if isinstance(model_loader_extra_config, str):
-            self.model_loader_extra_config = json.loads(model_loader_extra_config)
+            self.model_loader_extra_config = orjson.loads(model_loader_extra_config)
         self._verify_load_format()
 
         if self.ignore_patterns is not None and len(self.ignore_patterns) > 0:
