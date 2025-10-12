@@ -23,7 +23,12 @@ def backend_from_str(backend_str: Optional[str]) -> BackendType:
     if backend_str is None:
         return BackendType.Sglang
     backend_map = {"sglang": BackendType.Sglang, "openai": BackendType.Openai}
-    return backend_map.get(backend_str.lower(), BackendType.Sglang)
+    backend_lower = backend_str.lower()
+    if backend_lower not in backend_map:
+        raise ValueError(
+            f"Unknown backend: {backend_str}. Valid options: {', '.join(backend_map.keys())}"
+        )
+    return backend_map[backend_lower]
 
 
 def history_backend_from_str(backend_str: Optional[str]) -> HistoryBackendType:
