@@ -156,10 +156,10 @@ docker run --rm \
       export CMAKE_ARGS=\"--profiling-output=/sgl-kernel/cmake-profile.json --profiling-format=google-trace\"
    fi
 
+   export NINJA_STATUS=\"[%f/%t %es] \"
    # Enable Ninja build profiling if requested
    if [ -n \"${ENABLE_BUILD_PROFILE}\" ]; then
       echo \"Ninja build profiling enabled - will save to /sgl-kernel/build-trace.json\"
-      export NINJA_STATUS=\"[%f/%t %es] \"
    fi
 
    PYTHONPATH=${PYTHON_ROOT_PATH}/lib/python${PYTHON_VERSION}/site-packages ${PYTHON_ROOT_PATH}/bin/python -m uv build --wheel -Cbuild-dir=build . --color=always --no-build-isolation && \
