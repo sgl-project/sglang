@@ -71,7 +71,6 @@ class TestLoRAQwen3(CustomTestCase):
         for model_case in model_cases:
             for torch_dtype in TORCH_DTYPES:
                 max_new_tokens = 32
-                backend = "triton"
                 base_path = model_case.base
                 lora_adapter_paths = [a.name for a in model_case.adaptors]
                 assert len(lora_adapter_paths) >= 2
@@ -139,7 +138,6 @@ class TestLoRAQwen3(CustomTestCase):
                     model_type="generation",
                     lora_paths=[lora_adapter_paths[0], lora_adapter_paths[1]],
                     max_loras_per_batch=len(lora_adapter_paths) + 1,
-                    lora_backend=backend,
                     sleep_on_idle=True,  # Eliminate non-determinism by forcing all requests to be processed in one batch.
                     attention_backend="torch_native",
                 )
