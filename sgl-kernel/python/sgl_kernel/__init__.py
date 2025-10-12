@@ -204,31 +204,35 @@ def _find_cuda_home():
 if torch.version.cuda is not None:
     cuda_home = Path(_find_cuda_home())
 
-    if (cuda_home / "lib").is_dir():
-        cuda_path = cuda_home / "lib"
-    elif (cuda_home / "lib64").is_dir():
-        cuda_path = cuda_home / "lib64"
-    else:
-        # Search for libcudart.so.12 in common system locations
-        candidates = [
-            cuda_home,
-            Path("/usr/lib/x86_64-linux-gnu"),
-            Path("/usr/lib64"),
-            Path("/usr/lib")
-        ]
-        for base in candidates:
-            for path in base.rglob("libcudart.so.12"):
-                cuda_path = path.parent
-                break
-            else:
-                continue
-            break
-        else:
-            raise RuntimeError("Could not find CUDA lib directory.")
+    # List of possible library names and directories
+    candidate_libs = ["libcudart.so.12", "libcuda.so"]
+    candidate_dirs = [
+        cuda_home / "lib",
+        cuda_home / "lib64",
+        Path("/usr/lib/x86_64-linux-gnu"),
+        Path("/usr/lib/aarch64-linux-gnu"),
+        Path("/usr/lib64"),
+        Path("/usr/lib"),
+    ]
 
-    cuda_include = (cuda_path / "libcudart.so.12").resolve()
-    if cuda_include.exists():
-        ctypes.CDLL(str(cuda_include), mode=ctypes.RTLD_GLOBAL)
+    # Search for an existing library
+    cuda_path = None
+    for libname in candidate_libs:
+        for base in candidate_dirs:
+            candidate = base / libname
+            if candidate.exists():
+                cuda_path = candidate.parent
+                cuda_lib = candidate.resolve()
+                break
+        if cuda_path is not None:
+            break
+    else:
+        raise RuntimeError(
+            f"Could not find any of {candidate_libs} in {[str(d) for d in candidate_dirs]}"
+        )
+
+    # Load the found CUDA library globally
+    ctypes.CDLL(str(cuda_lib), mode=ctypes.RTLD_GLOBAL)
 
 from sgl_kernel.allreduce import *
 from sgl_kernel.attention import (
