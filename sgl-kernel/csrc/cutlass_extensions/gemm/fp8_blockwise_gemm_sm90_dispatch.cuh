@@ -2,8 +2,6 @@
 // https://github.com/vllm-project/vllm/blob/main/csrc/quantization/cutlass_w8a8/c3x/scaled_mm_blockwise_sm90_fp8_dispatch.cuh
 #pragma once
 
-#include <cstdlib>
-
 #include "cute/tensor.hpp"
 #include "cutlass/cutlass.h"
 #include "cutlass/epilogue/collective/collective_builder.hpp"
@@ -20,14 +18,6 @@
 #include "cutlass_extensions/gemm/dispatch_policy.hpp"
 
 using namespace cute;
-
-static inline bool sglang_determinism_enabled() {
-  const char* v = std::getenv("SGLANG_ENABLE_DETERMINISTIC_INFERENCE");
-  if (v == nullptr || v[0] == '\0') return false;
-  char c0 = v[0];
-  if (c0 == '0' || c0 == 'f' || c0 == 'F' || c0 == 'n' || c0 == 'N') return false;
-  return true;
-}
 
 template <
     typename SchedulerType,
