@@ -748,10 +748,14 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                     item_obj.remove("status");
 
                     // Normalize content types to input_text (xAI compatibility)
-                    if let Some(content_arr) = item_obj.get_mut("content").and_then(Value::as_array_mut) {
+                    if let Some(content_arr) =
+                        item_obj.get_mut("content").and_then(Value::as_array_mut)
+                    {
                         for content_obj in content_arr.iter_mut().filter_map(Value::as_object_mut) {
                             // Change output_text to input_text
-                            if content_obj.get("type").and_then(Value::as_str) == Some("output_text") {
+                            if content_obj.get("type").and_then(Value::as_str)
+                                == Some("output_text")
+                            {
                                 content_obj.insert(
                                     "type".to_string(),
                                     Value::String("input_text".to_string()),
