@@ -4,10 +4,6 @@ import unittest
 
 import openai
 
-<<<<<<< HEAD
-=======
-from sglang.srt.utils.hf_transformers_utils import get_tokenizer
->>>>>>> c477caa22 (fix bug)
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.test_utils import (

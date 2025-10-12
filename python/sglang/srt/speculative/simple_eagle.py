@@ -22,19 +22,17 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.eagle_utils import (
+from sglang.srt.speculative.eagle_info import (
     EagleDraftInput,
     EagleVerifyInput,
     EagleVerifyOutput,
-    align_evict_mask_to_page_size,
-    assign_req_to_token_pool,
-    create_draft_kv_indices,
 )
 from sglang.srt.speculative.eagle_worker import get_last_loc_large_page_size_top_k_1
 from sglang.srt.speculative.simple_eagle_cuda_graph_runner import (
     SimpleEAGLECudaGraphRunner,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_utils import assign_req_to_token_pool,create_draft_kv_indices
 from sglang.srt.utils import (
     empty_context,
     fast_topk,

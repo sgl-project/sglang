@@ -38,7 +38,8 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.speculative.eagle_utils import EagleDraftInput, create_draft_kv_indices
+from sglang.srt.speculative.eagle_info import EagleDraftInput
+from sglang.srt.speculative.spec_utils import create_draft_kv_indices
 from sglang.srt.utils import fast_topk, is_cuda, next_power_of_2
 
 if TYPE_CHECKING:
@@ -541,7 +542,7 @@ class SimpleEAGLECudaGraphRunner:
         verify_spec_info = None
         draft_spec_info = None
         if self.model_runner.spec_algorithm.is_simple_eagle():
-            from sglang.srt.speculative.eagle_utils import (
+            from sglang.srt.speculative.eagle_info import (
                 EagleDraftInput,
                 EagleVerifyInput,
             )
