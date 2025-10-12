@@ -780,18 +780,6 @@ impl crate::routers::RouterTrait for OpenAIRouter {
             }
         }
 
-        // Log the cleaned payload for debugging
-        let payload_str = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "failed to serialize".to_string());
-        eprintln!("=== UPSTREAM REQUEST ===");
-        eprintln!("URL: {}", url);
-        eprintln!("Payload:\n{}", payload_str);
-        eprintln!("========================");
-        info!(
-            target: "openai_router",
-            url = %url,
-            "Sending request to upstream"
-        );
-
         // Delegate to streaming or non-streaming handler
         if body.stream.unwrap_or(false) {
             handle_streaming_response(
