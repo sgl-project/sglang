@@ -741,31 +741,21 @@ impl crate::routers::RouterTrait for OpenAIRouter {
             // To Achieve XAI compatibility, strip extra fields from input messages (id, status)
             // XAI doesn't support output_text as type for content with role of assistant
             // so normalize content types: output_text -> input_text
-            if let Some(input_val) = obj.get_mut("input") {
-                if let Some(input_arr) = input_val.as_array_mut() {
-                    for item in input_arr.iter_mut() {
-                        if let Some(item_obj) = item.as_object_mut() {
-                            // Remove fields not universally supported
-                            item_obj.remove("id");
-                            item_obj.remove("status");
+            if let Some(input_arr) = obj.get_mut("input").and_then(Value::as_array_mut) {
+                for item_obj in input_arr.iter_mut().filter_map(Value::as_object_mut) {
+                    // Remove fields not universally supported
+                    item_obj.remove("id");
+                    item_obj.remove("status");
 
-                            // Normalize content types to input_text (xAI compatibility)
-                            if let Some(content_val) = item_obj.get_mut("content") {
-                                if let Some(content_arr) = content_val.as_array_mut() {
-                                    for content_item in content_arr.iter_mut() {
-                                        if let Some(content_obj) = content_item.as_object_mut() {
-                                            // Change output_text to input_text
-                                            if let Some(type_val) = content_obj.get("type") {
-                                                if type_val.as_str() == Some("output_text") {
-                                                    content_obj.insert(
-                                                        "type".to_string(),
-                                                        Value::String("input_text".to_string()),
-                                                    );
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
+                    // Normalize content types to input_text (xAI compatibility)
+                    if let Some(content_arr) = item_obj.get_mut("content").and_then(Value::as_array_mut) {
+                        for content_obj in content_arr.iter_mut().filter_map(Value::as_object_mut) {
+                            // Change output_text to input_text
+                            if content_obj.get("type").and_then(Value::as_str) == Some("output_text") {
+                                content_obj.insert(
+                                    "type".to_string(),
+                                    Value::String("input_text".to_string()),
+                                );
                             }
                         }
                     }
