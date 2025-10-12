@@ -371,16 +371,17 @@ impl ClientSelection {
 // Execution and Response Types
 // ============================================================================
 
-use tonic::codec::Streaming;
+use crate::grpc_client::sglang_scheduler::AbortOnDropStream;
 
 /// Result of request execution (streams from workers)
+/// Uses AbortOnDropStream to automatically abort on cancellation
 pub enum ExecutionResult {
     Single {
-        stream: Streaming<proto::GenerateResponse>,
+        stream: AbortOnDropStream,
     },
     Dual {
-        prefill: Streaming<proto::GenerateResponse>,
-        decode: Box<Streaming<proto::GenerateResponse>>,
+        prefill: AbortOnDropStream,
+        decode: Box<AbortOnDropStream>,
     },
 }
 
