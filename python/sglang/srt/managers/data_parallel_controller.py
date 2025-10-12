@@ -239,7 +239,9 @@ class DataParallelController:
         while True:
             time.sleep(30 * 24 * 3600)
 
-    def _broadcast_worker_ports(self, server_args: ServerArgs, worker_ports: Optional[List[int]] = None) -> List[int]:
+    def _broadcast_worker_ports(
+        self, server_args: ServerArgs, worker_ports: Optional[List[int]] = None
+    ) -> List[int]:
         """Broadcast worker ports from node 0 to all other nodes.
 
         Node 0 acts as the server, waiting for all other nodes to connect and
@@ -261,7 +263,9 @@ class DataParallelController:
 
         if server_args.node_rank == 0:
             # Node 0: Broadcast worker ports to all other nodes
-            return self._broadcast_ports_as_server(endpoint, server_args.nnodes - 1, worker_ports)
+            return self._broadcast_ports_as_server(
+                endpoint, server_args.nnodes - 1, worker_ports
+            )
         else:
             # Other nodes: Receive worker ports from node 0
             return self._receive_ports_as_client(endpoint, server_args.node_rank)
@@ -330,8 +334,12 @@ class DataParallelController:
                 self.workers[dp_rank] = port_and_socket[1]
                 logger.debug(f"Assigned port {port_and_socket[0]} to worker {dp_rank}")
 
-        broadcasted_ports = self._broadcast_worker_ports(server_args, worker_ports if worker_ports else None)
-        self.launch_tensor_parallel_group(server_args, port_args, 0, None, broadcasted_ports)
+        broadcasted_ports = self._broadcast_worker_ports(
+            server_args, worker_ports if worker_ports else None
+        )
+        self.launch_tensor_parallel_group(
+            server_args, port_args, 0, None, broadcasted_ports
+        )
 
     def launch_tensor_parallel_group(
         self,
