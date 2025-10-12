@@ -34,7 +34,7 @@ def get_model_config(tp_size: int):
         "topk": topk,
         "hidden_size": config.hidden_size,
         "shard_intermediate_size": shard_intermediate_size,
-        "dtype": config.torch_dtype,
+        "dtype": config.dtype,
         "block_shape": config.quantization_config["weight_block_size"],
     }
 

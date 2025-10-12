@@ -455,7 +455,6 @@ class ServerArgs:
     debug_tensor_dump_output_folder: Optional[str] = None
     debug_tensor_dump_input_file: Optional[str] = None
     debug_tensor_dump_inject: bool = False
-    debug_tensor_dump_prefill_only: bool = False
 
     # PD disaggregation: can be "null" (not disaggregated), "prefill" (prefill-only), or "decode" (decode-only)
     disaggregation_mode: Literal["null", "prefill", "decode"] = "null"
@@ -2830,11 +2829,6 @@ class ServerArgs:
             type=str,
             default=ServerArgs.debug_tensor_dump_inject,
             help="Inject the outputs from jax as the input of every layer.",
-        )
-        parser.add_argument(
-            "--debug-tensor-dump-prefill-only",
-            action="store_true",
-            help="Only dump the tensors for prefill requests (i.e. batch size > 1).",
         )
         parser.add_argument(
             "--enable-dynamic-batch-tokenizer",

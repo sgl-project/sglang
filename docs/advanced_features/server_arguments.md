@@ -321,7 +321,6 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--debug-tensor-dump-output-folder` | The output folder for debug tensor dumps. | None |
 | `--debug-tensor-dump-input-file` | The input file for debug tensor dumps. | None |
 | `--debug-tensor-dump-inject` | Enable injection of debug tensor dumps. | False |
-| `--debug-tensor-dump-prefill-only` | Enable prefill-only mode for debug tensor dumps. | False |
 
 ## PD disaggregation
 

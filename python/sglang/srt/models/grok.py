@@ -73,9 +73,6 @@ logger = logging.getLogger(__name__)
 
 # Dump tensors for debugging
 debug_tensor_dump_output_folder = None
-debug_tensor_dump_prefill_only = False
-# Skip all the other tensor dumps, only dump the target logits
-debug_tensor_dump_only_target_logprobs = False
 debug_tensor_dump_inject = False
 debug_tensor_dump_layers = None
 debug_tensor_dump_test = False
