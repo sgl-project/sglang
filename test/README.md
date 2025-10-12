@@ -46,4 +46,4 @@ python3 test_choices.py
 
 ## Adding New Models to Nightly CI
 - **For text models**: extend [global model lists variables](https://github.com/sgl-project/sglang/blob/85c1f7937781199203b38bb46325a2840f353a04/python/sglang/test/test_utils.py#L104) in `test_utils.py`, or add more model lists
-- **For vlms**: extend global variable of lauch setttings list containing `ModelLaunchSettings` in `test_nightly_vlms_.*.py`, see [here](https://github.com/sgl-project/sglang/blob/85c1f7937781199203b38bb46325a2840f353a04/test/srt/test_nightly_vlms_mmmu_eval.py#L18)
+- **For vlms**: extend the `MODEL_THRESHOLDS` global dictionary in `test_nightly_vlms_.*.py`, see [here](https://github.com/sgl-project/sglang/blob/85c1f7937781199203b38bb46325a2840f353a04/test/srt/test_nightly_vlms_mmmu_eval.py#L19)
