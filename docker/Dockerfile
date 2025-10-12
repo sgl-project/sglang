@@ -128,7 +128,6 @@ RUN set -eux; \
     fi && \
     tar -xf "${NVSHMEM_TARBALL}" && \
     mv nvshmem_src nvshmem && \
-    # Cleanup tarball
     rm -f "/sgl-workspace/${NVSHMEM_TARBALL}"
 
 # Build and install NVSHMEM
