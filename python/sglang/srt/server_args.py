@@ -22,6 +22,8 @@ import random
 import tempfile
 from typing import Dict, List, Literal, Optional, Union
 
+import orjson
+
 from sglang.srt.connector import ConnectorType
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.lora.lora_registry import LoRARef
@@ -50,6 +52,7 @@ from sglang.srt.utils.hf_transformers_utils import check_gguf_file, get_config
 from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
+
 
 # Define constants
 LOAD_FORMAT_CHOICES = [
@@ -312,6 +315,7 @@ class ServerArgs:
     nsa_decode: str = "fa3"
 
     # Speculative decoding
+    enable_beta_spec: bool = False
     speculative_algorithm: Optional[str] = None
     speculative_draft_model_path: Optional[str] = None
     speculative_draft_model_revision: Optional[str] = None
@@ -416,7 +420,10 @@ class ServerArgs:
     enable_single_batch_overlap: bool = False
     tbo_token_distribution_threshold: float = 0.48
     enable_torch_compile: bool = False
+    enable_piecewise_cuda_graph: bool = False
     torch_compile_max_bs: int = 32
+    piecewise_cuda_graph_max_tokens: int = 4096
+    piecewise_cuda_graph_tokens: Optional[List[int]] = None
     torchao_config: str = ""
     enable_nan_detection: bool = False
     enable_p2p_check: bool = False
@@ -448,7 +455,6 @@ class ServerArgs:
     debug_tensor_dump_output_folder: Optional[str] = None
     debug_tensor_dump_input_file: Optional[str] = None
     debug_tensor_dump_inject: bool = False
-    debug_tensor_dump_prefill_only: bool = False
 
     # PD disaggregation: can be "null" (not disaggregated), "prefill" (prefill-only), or "decode" (decode-only)
     disaggregation_mode: Literal["null", "prefill", "decode"] = "null"
@@ -674,6 +680,11 @@ class ServerArgs:
         else:
             self.cuda_graph_max_bs = max(self.cuda_graph_bs)
 
+        if self.piecewise_cuda_graph_tokens is None:
+            self.piecewise_cuda_graph_tokens = (
+                self._generate_piecewise_cuda_graph_tokens()
+            )
+
         if self.mem_fraction_static is None:
             # Constant meta data (e.g., from attention backend)
             reserved_mem = 512
@@ -751,6 +762,25 @@ class ServerArgs:
         capture_bs = [bs for bs in capture_bs if bs <= self.cuda_graph_max_bs]
 
         return capture_bs
+
+    def _generate_piecewise_cuda_graph_tokens(self):
+        """
+        Generate the list of batch sizes for piecewise CUDA graph capture
+        based on piecewise_cuda_graph_max_tokens.
+        """
+        capture_sizes = (
+            list(range(4, 33, 4))
+            + list(range(48, 257, 16))
+            + list(range(288, 513, 32))
+            + list(range(640, 4096 + 1, 128))
+            + list(range(4352, self.piecewise_cuda_graph_max_tokens + 1, 256))
+        )
+
+        capture_sizes = [
+            s for s in capture_sizes if s <= self.piecewise_cuda_graph_max_tokens
+        ]
+
+        return capture_sizes
 
     def _handle_hpu_backends(self):
         if self.device == "hpu":
@@ -1103,11 +1133,19 @@ class ServerArgs:
                 )
             if self.max_running_requests is None:
                 self.max_running_requests = 48
-            self.disable_overlap_schedule = True
-            logger.warning(
-                "Overlap scheduler is disabled because of using "
-                "eagle speculative decoding."
-            )
+
+            if self.speculative_algorithm == "EAGLE" and self.enable_beta_spec:
+                self.disable_overlap_schedule = False
+                logger.warning(
+                    "Beta spec is enabled for eagle speculative decoding and overlap schedule is turned on."
+                )
+
+            if not self.enable_beta_spec:
+                self.disable_overlap_schedule = True
+                logger.warning(
+                    "Overlap scheduler is disabled because of using eagle3 and standalone speculative decoding."
+                )
+
             if self.enable_mixed_chunk:
                 self.enable_mixed_chunk = False
                 logger.warning(
@@ -2127,6 +2165,7 @@ class ServerArgs:
         )
 
         # Speculative decoding
+        parser.add_argument("--enable-beta-spec", action="store_true")
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
@@ -2640,10 +2679,27 @@ class ServerArgs:
             help="Optimize the model with torch.compile. Experimental feature.",
         )
         parser.add_argument(
+            "--enable-piecewise-cuda-graph",
+            action="store_true",
+            help="Optimize the model with piecewise cuda graph for extend/prefill only. Experimental feature.",
+        )
+        parser.add_argument(
+            "--piecewise-cuda-graph-tokens",
+            type=json_list_type,
+            default=ServerArgs.piecewise_cuda_graph_tokens,
+            help="Set the list of tokens when using piecewise cuda graph.",
+        )
+        parser.add_argument(
             "--torch-compile-max-bs",
             type=int,
             default=ServerArgs.torch_compile_max_bs,
             help="Set the maximum batch size when using torch compile.",
+        )
+        parser.add_argument(
+            "--piecewise-cuda-graph-max-tokens",
+            type=int,
+            default=ServerArgs.piecewise_cuda_graph_max_tokens,
+            help="Set the maximum tokens when using piecewise cuda graph.",
         )
         parser.add_argument(
             "--torchao-config",
@@ -2773,11 +2829,6 @@ class ServerArgs:
             type=str,
             default=ServerArgs.debug_tensor_dump_inject,
             help="Inject the outputs from jax as the input of every layer.",
-        )
-        parser.add_argument(
-            "--debug-tensor-dump-prefill-only",
-            action="store_true",
-            help="Only dump the tensors for prefill requests (i.e. batch size > 1).",
         )
         parser.add_argument(
             "--enable-dynamic-batch-tokenizer",
@@ -2987,7 +3038,7 @@ class ServerArgs:
             self.model_path,
             trust_remote_code=self.trust_remote_code,
             revision=self.revision,
-            model_override_args=json.loads(self.json_model_override_args),
+            model_override_args=orjson.loads(self.json_model_override_args),
             **kwargs,
         )
         return hf_config
@@ -3273,6 +3324,22 @@ class ServerArgs:
         )
 
 
+# NOTE: This is a global variable to hold the server args for scheduler.
+_global_server_args: Optional[ServerArgs] = None
+
+
+def set_global_server_args_for_scheduler(server_args: ServerArgs):
+    global _global_server_args
+    _global_server_args = server_args
+
+
+def get_global_server_args() -> ServerArgs:
+    if _global_server_args is None:
+        raise ValueError("Global server args is not set yet!")
+
+    return _global_server_args
+
+
 def prepare_server_args(argv: List[str]) -> ServerArgs:
     """
     Prepare the server arguments from the command line arguments.
@@ -3307,8 +3374,8 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
     raw_args = parser.parse_args(argv)
-    server_args = ServerArgs.from_cli_args(raw_args)
-    return server_args
+
+    return ServerArgs.from_cli_args(raw_args)
 
 
 ZMQ_TCP_PORT_DELTA = 233
