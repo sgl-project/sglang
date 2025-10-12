@@ -75,6 +75,8 @@ class ForwardMode(IntEnum):
     # Used in speculative decoding: extend a batch in the draft model.
     DRAFT_EXTEND = auto()
 
+    DRAFT_EXTEND_V2 = auto()
+
     # Split Prefill for PD multiplexing
     SPLIT_PREFILL = auto()
 
@@ -106,6 +108,10 @@ class ForwardMode(IntEnum):
 
     def is_draft_extend(self):
         return self == ForwardMode.DRAFT_EXTEND
+
+    def is_draft_extend_v2(self):
+        # For fixed shape logits output in v2 eagle worker
+        return self == ForwardMode.DRAFT_EXTEND_V2
 
     def is_extend_or_draft_extend_or_mixed(self):
         return (
