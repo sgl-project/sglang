@@ -198,10 +198,11 @@ class SchedulerProfilerMixin:
             )
 
             logger.info(f"Profile merge completed: {merged_path}")
-            return merge_message
         except Exception as e:
             logger.error(f"Failed to merge profiles: {e}", exc_info=True)
-            return f" Merge failed: {str(e)}"
+            return f" Merge failed: {e!s}"
+        else:
+            return merge_message
 
     def stop_profile(
         self, stage: Optional[ForwardMode] = None
