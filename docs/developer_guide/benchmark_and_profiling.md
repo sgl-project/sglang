@@ -78,6 +78,12 @@ python3 -m sglang.profiler
 
 SGLang now supports automatic merging of profiling traces from distributed setups with multiple parallelism types (TP, DP, PP, EP). This feature is particularly useful for analyzing performance across distributed runs.
 
+#### Multi-Node Profiling and Shared Storage Considerations
+
+Single-node profiler output merging is completely supported. When profiling in distributed environments spanning multiple nodes, shared storage (e.g., NFS, Lustre) should be accessible by all nodes for the output directory to enable merging of trace files.
+
+If there is no shared storage accessible across nodes, automatic merging of trace files during profiling is not supported directly as of now.
+
 #### HTTP API Usage
 
 ```bash
