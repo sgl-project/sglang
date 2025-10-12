@@ -106,12 +106,11 @@ class AscendAttnBackend(AttentionBackend):
             )
         self.forward_metadata.seq_lens_cpu_int = forward_batch.seq_lens_cpu.int()
 
-        if forward_batch.is_extend():
+        seq_lens_list_cumsum = np.cumsum(forward_batch.extend_seq_lens_cpu)
+        if forward_batch.forward_mode.is_extend():
             seq_lens_list_cumsum[-1] = (
                 (seq_lens_list_cumsum[-1] - 1) // tp_size + 1
             ) * tp_size
-
-        seq_lens_list_cumsum = np.cumsum(forward_batch.extend_seq_lens_cpu)
         self.forward_metadata.seq_lens_list_cumsum = seq_lens_list_cumsum
 
         self.graph_mode = False
