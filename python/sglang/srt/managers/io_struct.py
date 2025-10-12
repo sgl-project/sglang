@@ -1001,7 +1001,7 @@ class UpdateWeightFromDiskReqInput(BaseReq):
     # Whether to keep the scheduler paused after weight update
     keep_pause: bool = False
     # The trainer step id. Used to know which step's weights are used for sampling.
-    token_step: int
+    token_step: int = 0
 
 
 @dataclass
