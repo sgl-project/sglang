@@ -54,6 +54,7 @@ docker run --rm \
    -e ENABLE_BUILD_PROFILE="${ENABLE_BUILD_PROFILE:-}" \
    ${DOCKER_IMAGE} \
    bash -c "
+   set -e
    # Install CMake (version >= 3.26) - Robust Installation with caching
    echo \"==================================\"
    echo \"Installing CMake\"
