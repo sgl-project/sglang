@@ -2,6 +2,8 @@
 // https://github.com/vllm-project/vllm/blob/main/csrc/quantization/cutlass_w8a8/c3x/scaled_mm_blockwise_sm90_fp8_dispatch.cuh
 #pragma once
 
+#include <cstdlib>
+
 #include "cute/tensor.hpp"
 #include "cutlass/cutlass.h"
 #include "cutlass/epilogue/collective/collective_builder.hpp"
@@ -18,6 +20,14 @@
 #include "cutlass_extensions/gemm/dispatch_policy.hpp"
 
 using namespace cute;
+
+static inline bool sglang_determinism_enabled() {
+  const char* v = std::getenv("SGLANG_ENABLE_DETERMINISTIC_INFERENCE");
+  if (v == nullptr || v[0] == '\0') return false;
+  char c0 = v[0];
+  if (c0 == '0' || c0 == 'f' || c0 == 'F' || c0 == 'n' || c0 == 'N') return false;
+  return true;
+}
 
 template <
     typename SchedulerType,
@@ -119,7 +129,8 @@ void cutlass_gemm_caller_blockwise(
     torch::Tensor const& a,
     torch::Tensor const& b,
     torch::Tensor const& a_scales,
-    torch::Tensor const& b_scales) {
+    torch::Tensor const& b_scales,
+    bool deterministic) {
   using GemmKernel = typename Gemm::GemmKernel;
   using ElementAB = typename Gemm::ElementAB;
   using ElementA = ElementAB;
@@ -170,7 +181,7 @@ void cutlass_gemm_caller_blockwise(
         typename cutlass::gemm::kernel::detail::PersistentTileSchedulerSm90StreamKParams::ReductionMode;
 
     scheduler.decomposition_mode = DecompositionMode::StreamK;
-    scheduler.reduction_mode = ReductionMode::Nondeterministic;
+    scheduler.reduction_mode = deterministic ? ReductionMode::Deterministic : ReductionMode::Nondeterministic;
   }
 
   cutlass_gemm_caller<GemmKernel>(a.device(), {m, n, k, 1}, mainloop_args, epilogue_args, scheduler);
@@ -182,16 +193,17 @@ void cutlass_gemm_blockwise_sm90_fp8_dispatch(
     torch::Tensor const& a,
     torch::Tensor const& b,
     torch::Tensor const& a_scales,
-    torch::Tensor const& b_scales) {
+    torch::Tensor const& b_scales,
+    bool deterministic) {
   auto k = a.size(1);
   auto n = b.size(1);
 
-  if (k > 3 * n) {
+  if (!deterministic && (k > 3 * n)) {
     cutlass_gemm_caller_blockwise<cutlass_3x_gemm_fp8_blockwise<cutlass::gemm::StreamKScheduler, OutType, 1, 128, 128>>(
-        out, a, b, a_scales, b_scales);
+        out, a, b, a_scales, b_scales, deterministic);
   } else {
     cutlass_gemm_caller_blockwise<
         cutlass_3x_gemm_fp8_blockwise<cutlass::gemm::PersistentScheduler, OutType, 1, 128, 128>>(
-        out, a, b, a_scales, b_scales);
+        out, a, b, a_scales, b_scales, deterministic);
   }
 }

@@ -418,10 +418,20 @@ torch::Tensor fp8_blockwise_scaled_mm(
     torch::Tensor scales_b_contiguous = scales_b.contiguous();
     if (out_dtype == torch::kBFloat16) {
       cutlass_gemm_blockwise_sm90_fp8_dispatch<cutlass::bfloat16_t>(
-          out_padded, mat_a_padded, mat_b, scales_a_padded, scales_b_contiguous);
+          out_padded,
+          mat_a_padded,
+          mat_b,
+          scales_a_padded,
+          scales_b_contiguous,
+          getBoolEnv("SGLANG_ENABLE_DETERMINISTIC_INFERENCE"));
     } else {
       cutlass_gemm_blockwise_sm90_fp8_dispatch<cutlass::half_t>(
-          out_padded, mat_a_padded, mat_b, scales_a_padded, scales_b_contiguous);
+          out_padded,
+          mat_a_padded,
+          mat_b,
+          scales_a_padded,
+          scales_b_contiguous,
+          getBoolEnv("SGLANG_ENABLE_DETERMINISTIC_INFERENCE"));
     }
     return out_padded.slice(0, 0, original_rows);
   }
