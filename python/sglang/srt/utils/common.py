@@ -12,7 +12,6 @@
 # limitations under the License.
 # ==============================================================================
 """Common utilities."""
-
 from __future__ import annotations
 
 import argparse
@@ -70,6 +69,7 @@ from typing import (
 )
 
 import numpy as np
+import orjson
 import psutil
 import pybase64
 import requests
@@ -492,7 +492,7 @@ def make_layers(
     pp_size: Optional[int] = None,
     prefix: str = "",
     return_tuple: bool = False,
-    offloader_kwargs: Dict[str, Any] = {},
+    offloader_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Tuple[torch.nn.Module, int, int]:
     """Make a list of layers with the given layer function"""
     # circula imports
@@ -517,7 +517,7 @@ def make_layers(
                 layer_fn(idx=idx, prefix=add_prefix(idx, prefix))
                 for idx in range(start_layer, end_layer)
             ),
-            **offloader_kwargs,
+            **(offloader_kwargs or {}),
         )
         + [
             PPMissingLayer(return_tuple=return_tuple)
@@ -1112,7 +1112,7 @@ def configure_logger(server_args, prefix: str = ""):
                 f"{SGLANG_LOGGING_CONFIG_PATH} but it does not exist!"
             )
         with open(SGLANG_LOGGING_CONFIG_PATH, encoding="utf-8") as file:
-            custom_config = json.loads(file.read())
+            custom_config = orjson.loads(file.read())
         logging.config.dictConfig(custom_config)
         return
     format = f"[%(asctime)s{prefix}] %(message)s"
@@ -2525,9 +2525,9 @@ def log_info_on_rank0(logger, msg):
 
 def load_json_config(data: str):
     try:
-        return json.loads(data)
+        return orjson.loads(data)
     except JSONDecodeError:
-        return json.loads(Path(data).read_text())
+        return orjson.loads(Path(data).read_text())
 
 
 def dispose_tensor(x: torch.Tensor):
@@ -3236,7 +3236,7 @@ def numa_bind_to_node(node: int):
 
 def json_list_type(value):
     try:
-        return json.loads(value)
+        return orjson.loads(value)
     except json.JSONDecodeError:
         raise argparse.ArgumentTypeError(
             f"Invalid JSON list: {value}. Please provide a valid JSON list."
