@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import suppress
 from typing import Any, Dict, List, Literal, NamedTuple, Optional, Tuple, cast
-import os
 
 import torch
 from compressed_tensors.config import (
@@ -25,10 +25,6 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.layers.quantization.fp8 import (
-    Fp8LinearMethod,
-    Fp8MoEMethod,
-)
 from sglang.srt.layers.quantization.compressed_tensors import WNA16_SUPPORTED_BITS
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa: E501
     CompressedTensorsMoEMethod,
@@ -44,6 +40,7 @@ from sglang.srt.layers.quantization.compressed_tensors.utils import (
     is_activation_quantization_format,
     should_ignore_layer,
 )
+from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod, Fp8MoEMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
 try:
@@ -138,7 +135,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         if isinstance(layer, LinearBase):
             if CompressedTensorsConfig.DeepSeekFP8Config is not None:
                 return Fp8LinearMethod(CompressedTensorsConfig.DeepSeekFP8Config)
-            if os.environ['MOE_AMX_WEIGHT_PATH'] is not None:
+            if os.environ["MOE_AMX_WEIGHT_PATH"] is not None:
                 return UnquantizedLinearMethod()
             scheme = self.get_scheme(layer=layer, layer_name=prefix)
             if scheme is None:
@@ -149,7 +146,7 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         if isinstance(layer, FusedMoE):
             # Ktransformers use CompressedTensorsWNA16AMXMOEMethod if AMX weights are provided
-            if os.environ['MOE_AMX_WEIGHT_PATH'] is not None and 'decoder' in prefix:
+            if os.environ["MOE_AMX_WEIGHT_PATH"] is not None and "decoder" in prefix:
                 return Fp8MoEMethod(CompressedTensorsConfig.FP8Config)
             else:
                 return CompressedTensorsMoEMethod.get_moe_method(self, layer, prefix)

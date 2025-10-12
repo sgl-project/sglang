@@ -2,16 +2,21 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import ctypes
 import enum
+import glob
 import logging
+import os
+import re
 from enum import Enum
-from typing import TYPE_CHECKING, List, Optional, Dict
-import re, os, glob, ctypes
+from typing import TYPE_CHECKING, Dict, List, Optional
+
 from safetensors import safe_open
 from sgl_kernel import fused_marlin_moe
 
 try:
     from kt_kernel import AMXMoEWrapper
+
     KTRANSFORMERS_AVAILABLE = True
 except ImportError:
     KTRANSFORMERS_AVAILABLE = True
@@ -20,9 +25,11 @@ import torch
 from compressed_tensors import CompressionFormat
 from compressed_tensors.quantization import QuantizationStrategy
 
+from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
+from sglang.srt.layers.quantization.compressed_tensors import WNA16_SUPPORTED_BITS
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz, scaled_fp8_quant
 from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
 from sglang.srt.layers.quantization.utils import (
@@ -30,8 +37,6 @@ from sglang.srt.layers.quantization.utils import (
     per_tensor_dequantize,
     replace_parameter,
 )
-from sglang.srt.distributed import get_tensor_model_parallel_rank
-from sglang.srt.layers.quantization.compressed_tensors import WNA16_SUPPORTED_BITS
 from sglang.srt.utils import (
     get_bool_env_var,
     is_cpu,
@@ -78,8 +83,9 @@ __all__ = [
     "CompressedTensorsMoEMethod",
     "CompressedTensorsW8A8Fp8MoEMethod",
     "CompressedTensorsWNA16MoEMethod",
-    "CompressedTensorsWNA16AMXEPMoEMethod" # for Ktransformers
+    "CompressedTensorsWNA16AMXEPMoEMethod",  # for Ktransformers
 ]
+
 
 class CompressedTensorsMoEMethod(FusedMoEMethodBase):
     def __new__(cls, *args, **kwargs):
@@ -99,9 +105,9 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
         assert match
         layer_number = int(match.group(1))
 
-        if os.environ.get('MOE_AMX_WEIGHT_PATH') is not None:
+        if os.environ.get("MOE_AMX_WEIGHT_PATH") is not None:
             return CompressedTensorsWNA16AMXEPMoEMethod(quant_config, layer_number)
-        
+
         weight_quant = quant_config.target_scheme_map["Linear"].get("weights")
         input_quant = quant_config.target_scheme_map["Linear"].get("input_activations")
         if quant_config._is_wNa16_group_channel(weight_quant, input_quant):
@@ -375,7 +381,7 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
 
 class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
 
-    def __init__(self, quant_config: CompressedTensorsConfig, num_gpu_experts = -1):
+    def __init__(self, quant_config: CompressedTensorsConfig, num_gpu_experts=-1):
         self.quant_config = quant_config
         # TODO: @dsikka: refactor this to use schemes as other kernels
         # are supported + check if the layer is being ignored.
@@ -408,7 +414,8 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        if self.num_gpu_experts != -1: num_experts = self.num_gpu_experts
+        if self.num_gpu_experts != -1:
+            num_experts = self.num_gpu_experts
         # assert (
         #     params_dtype == torch.float16
         # ), "float16 is required for MoE compressed models. Set dtype=torch.float16"  # noqa: E501
@@ -711,14 +718,22 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         )
         return StandardCombineInput(hidden_states=output)
 
+
 class CompressedTensorsWNA16AMXMoEMethod(CompressedTensorsMoEMethod):
     """AMX MoE method using AMXMoEWrapper for CPU inference."""
 
     def __init__(
-        self, quant_config: "CompressedTensorsConfig",  # type: ignore # noqa E501
-        layer_idx, num_gpu_experts, cpuinfer, subpool_count, amx_weight_path, chunked_prefill_size, cpu_save
+        self,
+        quant_config: "CompressedTensorsConfig",  # type: ignore # noqa E501
+        layer_idx,
+        num_gpu_experts,
+        cpuinfer,
+        subpool_count,
+        amx_weight_path,
+        chunked_prefill_size,
+        cpu_save,
     ):
-        
+
         if not KTRANSFORMERS_AVAILABLE:
             raise ImportError(
                 "kt_kernel is not installed, to use CompressedTensorsWNA16AMXEPMoEMethod, please install kt_kernel."
@@ -733,7 +748,7 @@ class CompressedTensorsWNA16AMXMoEMethod(CompressedTensorsMoEMethod):
         self.cpuinfer = cpuinfer
         self.subpool_count = subpool_count
         self.amx_wrapper = None
-        
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -763,21 +778,28 @@ class CompressedTensorsWNA16AMXMoEMethod(CompressedTensorsMoEMethod):
             chunked_prefill_size=self.chunked_prefill_size,
             cpu_save=self.cpu_save,
         )
-        
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if self.tp_rank != 0:
             return
 
         if self.amx_wrapper is None:
-            raise RuntimeError("AMXMoEWrapper not initialized. Call create_weights first.")
+            raise RuntimeError(
+                "AMXMoEWrapper not initialized. Call create_weights first."
+            )
 
         torch.cuda.synchronize()
         # Load weights using wrapper
-        from sglang.srt.eplb.expert_location_dispatch import get_global_expert_location_metadata
-        physical_to_logical_map_cpu = get_global_expert_location_metadata().physical_to_logical_map_cpu[self.layer_idx].contiguous()
+        from sglang.srt.eplb.expert_location_dispatch import (
+            get_global_expert_location_metadata,
+        )
+
+        physical_to_logical_map_cpu = (
+            get_global_expert_location_metadata()
+            .physical_to_logical_map_cpu[self.layer_idx]
+            .contiguous()
+        )
         self.amx_wrapper.load_weights(physical_to_logical_map_cpu)
-
-
 
     def submit(
         self,
@@ -808,8 +830,10 @@ class CompressedTensorsWNA16AMXMoEMethod(CompressedTensorsMoEMethod):
             return torch.zeros_like(x)
 
         # Sync forward task using wrapper
-        return self.amx_wrapper.sync_forward(x, torch.cuda.current_stream(x.device).cuda_stream)
-        
+        return self.amx_wrapper.sync_forward(
+            x, torch.cuda.current_stream(x.device).cuda_stream
+        )
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
@@ -841,52 +865,76 @@ class CompressedTensorsWNA16AMXMoEMethod(CompressedTensorsMoEMethod):
         return StandardCombineInput(hidden_states=output)
 
 
-def override_config(cls, num_gpu_experts, cpuinfer, subpool_count, amx_weight_path, amx_method, chunked_prefill_size, enable_defer, cpu_embed, cpu_save):
+def override_config(
+    cls,
+    num_gpu_experts,
+    cpuinfer,
+    subpool_count,
+    amx_weight_path,
+    amx_method,
+    chunked_prefill_size,
+    enable_defer,
+    cpu_embed,
+    cpu_save,
+):
     if num_gpu_experts is not None:
-        os.environ['MOE_NUM_GPU_EXPERTS'] = str(num_gpu_experts)
+        os.environ["MOE_NUM_GPU_EXPERTS"] = str(num_gpu_experts)
     if cpuinfer is not None:
-        os.environ['MOE_CPUINFER'] = str(cpuinfer)
+        os.environ["MOE_CPUINFER"] = str(cpuinfer)
     if subpool_count is not None:
-        os.environ['SUBPOOL_COUNT'] = str(subpool_count)
+        os.environ["SUBPOOL_COUNT"] = str(subpool_count)
     if amx_weight_path is not None:
-        os.environ['MOE_AMX_WEIGHT_PATH'] = str(amx_weight_path)
+        os.environ["MOE_AMX_WEIGHT_PATH"] = str(amx_weight_path)
     if amx_method is not None:
-        os.environ['AMX_METHOD'] = str(amx_method)
+        os.environ["AMX_METHOD"] = str(amx_method)
     if cpu_embed is not None:
-        os.environ['CPU_EMBED'] = str(cpu_embed)
-    os.environ['MOE_CHUNKED_PREFILL_SIZE'] = str(chunked_prefill_size)
-    os.environ['MOE_ENABLE_DEFER'] = str(enable_defer)
-    os.environ['MOE_CPU_SAVE'] = str(cpu_save)
+        os.environ["CPU_EMBED"] = str(cpu_embed)
+    os.environ["MOE_CHUNKED_PREFILL_SIZE"] = str(chunked_prefill_size)
+    os.environ["MOE_ENABLE_DEFER"] = str(enable_defer)
+    os.environ["MOE_CPU_SAVE"] = str(cpu_save)
 
-        
+
 class CompressedTensorsWNA16AMXEPMoEMethod(CompressedTensorsMoEMethod):
 
     def __init__(
-        self, quant_config: "CompressedTensorsConfig",  # type: ignore # noqa E501
-        layer_idx
+        self,
+        quant_config: "CompressedTensorsConfig",  # type: ignore # noqa E501
+        layer_idx,
     ):
         self.tp_rank = get_tensor_model_parallel_rank()
 
-        if 'MOE_NUM_GPU_EXPERTS' not in os.environ or 'MOE_CPUINFER' not in os.environ or 'MOE_AMX_WEIGHT_PATH' not in os.environ:
-            raise RuntimeError("the following arguments are required: --amx-weight-path, --cpuinfer, --num-gpu-experts")
-        self.num_gpu_experts = int(os.environ.get('MOE_NUM_GPU_EXPERTS'))
-        cpuinfer = int(os.environ.get('MOE_CPUINFER'))
-        subpool_count = int(os.environ.get('SUBPOOL_COUNT'))
-        amx_weight_path = os.environ.get('MOE_AMX_WEIGHT_PATH')
-        chunked_prefill_size = int(os.environ.get('MOE_CHUNKED_PREFILL_SIZE'))
-        cpu_save = os.environ.get('MOE_CPU_SAVE', 'False').lower() == 'true'
-        self.enable_defer = os.environ.get("MOE_ENABLE_DEFER", "False").lower() == "true"
-        self.AMX_method = CompressedTensorsWNA16AMXMoEMethod(quant_config, 
-                                                                layer_idx, 
-                                                                self.num_gpu_experts,
-                                                                cpuinfer,
-                                                                subpool_count,
-                                                                amx_weight_path,
-                                                                chunked_prefill_size,
-                                                                cpu_save)
-        self.marlin_method = CompressedTensorsWNA16MoEMethod(quant_config, self.num_gpu_experts)
+        if (
+            "MOE_NUM_GPU_EXPERTS" not in os.environ
+            or "MOE_CPUINFER" not in os.environ
+            or "MOE_AMX_WEIGHT_PATH" not in os.environ
+        ):
+            raise RuntimeError(
+                "the following arguments are required: --amx-weight-path, --cpuinfer, --num-gpu-experts"
+            )
+        self.num_gpu_experts = int(os.environ.get("MOE_NUM_GPU_EXPERTS"))
+        cpuinfer = int(os.environ.get("MOE_CPUINFER"))
+        subpool_count = int(os.environ.get("SUBPOOL_COUNT"))
+        amx_weight_path = os.environ.get("MOE_AMX_WEIGHT_PATH")
+        chunked_prefill_size = int(os.environ.get("MOE_CHUNKED_PREFILL_SIZE"))
+        cpu_save = os.environ.get("MOE_CPU_SAVE", "False").lower() == "true"
+        self.enable_defer = (
+            os.environ.get("MOE_ENABLE_DEFER", "False").lower() == "true"
+        )
+        self.AMX_method = CompressedTensorsWNA16AMXMoEMethod(
+            quant_config,
+            layer_idx,
+            self.num_gpu_experts,
+            cpuinfer,
+            subpool_count,
+            amx_weight_path,
+            chunked_prefill_size,
+            cpu_save,
+        )
+        self.marlin_method = CompressedTensorsWNA16MoEMethod(
+            quant_config, self.num_gpu_experts
+        )
         self.layer_id = layer_idx
-        
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -897,14 +945,26 @@ class CompressedTensorsWNA16AMXEPMoEMethod(CompressedTensorsMoEMethod):
         **extra_weight_attrs,
     ):
         self.global_num_experts = num_experts
-        self.AMX_method.create_weights(layer, num_experts, hidden_size, intermediate_size_per_partition, params_dtype, **extra_weight_attrs)
-        self.marlin_method.create_weights(layer, num_experts, hidden_size, intermediate_size_per_partition, params_dtype, **extra_weight_attrs)
-        
+        self.AMX_method.create_weights(
+            layer,
+            num_experts,
+            hidden_size,
+            intermediate_size_per_partition,
+            params_dtype,
+            **extra_weight_attrs,
+        )
+        self.marlin_method.create_weights(
+            layer,
+            num_experts,
+            hidden_size,
+            intermediate_size_per_partition,
+            params_dtype,
+            **extra_weight_attrs,
+        )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         self.AMX_method.process_weights_after_loading(layer)
         self.marlin_method.process_weights_after_loading(layer)
-
 
     def submit(
         self,
@@ -947,15 +1007,13 @@ class CompressedTensorsWNA16AMXEPMoEMethod(CompressedTensorsMoEMethod):
             num_gpu_experts=self.num_gpu_experts,
         )
         return StandardCombineInput(hidden_states=output)
-       
+
     def sync(self, x):
         """Synchronize and retrieve AMX results."""
         if self.tp_rank != 0:
             return torch.zeros_like(x)
         return self.AMX_method.sync(x)
-        
-    
-    
+
     def apply(
         self,
         layer: torch.nn.Module,

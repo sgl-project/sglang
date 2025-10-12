@@ -1,12 +1,12 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/model_executor/layers/fused_moe/layer.py
 
 import logging
+import re
 from enum import Enum
 from typing import List, Optional, Tuple
 
 import torch
-import re
-from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
+
 from sglang.srt.distributed import (
     get_moe_expert_parallel_rank,
     get_moe_expert_parallel_world_size,
@@ -107,6 +107,7 @@ class FusedMoE(torch.nn.Module):
         quant_config: Quantization configuration.
         inplace: suggestion to compute inplace (modify input activation).
     """
+
     def __init__(
         self,
         num_experts: int,
@@ -539,7 +540,7 @@ class FusedMoE(torch.nn.Module):
         if hasattr(self.quant_method, "num_gpu_experts"):
             if self.quant_method.num_gpu_experts != -1:
                 if expert_id >= self.quant_method.num_gpu_experts:
-                    return 
+                    return
 
         self._weight_loader_impl(
             param=param,

@@ -84,7 +84,7 @@ QUANTIZATION_CHOICES = [
     "qoq",
     "w4afp8",
     "mxfp4",
-    "compressed-tensors", # for Ktransformers
+    "compressed-tensors",  # for Ktransformers
 ]
 
 ATTENTION_BACKEND_CHOICES = [
@@ -186,7 +186,7 @@ class ServerArgs:
     enable_multimodal: Optional[bool] = None
     revision: Optional[str] = None
     model_impl: str = "auto"
-    
+
     # Ktransformers
     amx_weight_path: Optional[str] = None
     amx_method: Optional[str] = None
@@ -584,9 +584,12 @@ class ServerArgs:
             )
             self.tool_call_parser = deprecated_tool_call_parsers[self.tool_call_parser]
 
-    
     def _handle_ktransformers_configs(self):
-        from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe import CompressedTensorsWNA16AMXEPMoEMethod, override_config
+        from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe import (
+            CompressedTensorsWNA16AMXEPMoEMethod,
+            override_config,
+        )
+
         override_config(
             CompressedTensorsWNA16AMXEPMoEMethod,
             self.num_gpu_experts,
@@ -597,9 +600,8 @@ class ServerArgs:
             self.chunked_prefill_size,
             self.enable_defer,
             self.cpu_embed,
-            self.cpu_save
+            self.cpu_save,
         )
-
 
     def _handle_missing_default_values(self):
         if self.tokenizer_path is None:

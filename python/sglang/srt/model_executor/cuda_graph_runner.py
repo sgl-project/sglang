@@ -65,6 +65,7 @@ from sglang.srt.utils.patch_torch import monkey_patch_torch_compile
 
 try:
     from kt_kernel import AMXMoEWrapper
+
     KTRANSFORMERS_AVAILABLE = True
 except ImportError:
     KTRANSFORMERS_AVAILABLE = True

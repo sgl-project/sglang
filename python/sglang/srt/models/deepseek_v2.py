@@ -83,14 +83,14 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
-from sglang.srt.layers.quantization import deep_gemm_wrapper, CompressedTensorsConfig
+from sglang.srt.layers.quantization import CompressedTensorsConfig, deep_gemm_wrapper
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_kernel import (
     is_fp8_fnuz,
     per_tensor_quant_mla_fp8,
     per_token_group_quant_mla_deep_gemm_masked_fp8,
 )
-from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_utils import (
     block_quant_dequant,
     block_quant_to_tensor_quant,
@@ -2809,7 +2809,9 @@ class DeepseekV2ForCausalLM(nn.Module):
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
-        CompressedTensorsConfig.DeepSeekFP8Config = Fp8Config(True, "dynamic", None, [128, 128])
+        CompressedTensorsConfig.DeepSeekFP8Config = Fp8Config(
+            True, "dynamic", None, [128, 128]
+        )
         self.determine_num_fused_shared_experts()
         self.model = DeepseekV2Model(
             config, quant_config, prefix=add_prefix("model", prefix)
