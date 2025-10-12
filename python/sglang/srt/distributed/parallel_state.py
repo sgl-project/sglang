@@ -215,12 +215,14 @@ class GroupCoordinator:
     use_pynccl: bool  # a hint of whether to use PyNccl
     use_pymscclpp: bool  # a hint of whether to use PyMsccl
     use_custom_allreduce: bool  # a hint of whether to use CustomAllreduce
+    use_torch_symm_mem: bool  # a hint of whether to use SymmMemAllReduce
     use_message_queue_broadcaster: (
         bool  # a hint of whether to use message queue broadcaster
     )
     # communicators are only created for world size > 1
     pynccl_comm: Optional[Any]  # PyNccl communicator
     ca_comm: Optional[Any]  # Custom allreduce communicator
+    symm_mem_comm: Optional[Any]  # Symm mem communicator
     mq_broadcaster: Optional[Any]  # shared memory broadcaster
 
     def __init__(
@@ -231,11 +233,13 @@ class GroupCoordinator:
         use_pynccl: bool,
         use_pymscclpp: bool,
         use_custom_allreduce: bool,
+        use_torch_symm_mem: bool,
         use_hpu_communicator: bool,
         use_xpu_communicator: bool,
         use_npu_communicator: bool,
         use_message_queue_broadcaster: bool = False,
         group_name: Optional[str] = None,
+        torch_compile: Optional[bool] = None,
     ):
         # Set group info
         group_name = group_name or "anonymous"
@@ -279,6 +283,7 @@ class GroupCoordinator:
         self.use_pynccl = use_pynccl
         self.use_pymscclpp = use_pymscclpp
         self.use_custom_allreduce = use_custom_allreduce
+        self.use_torch_symm_mem = use_torch_symm_mem
         self.use_hpu_communicator = use_hpu_communicator
         self.use_xpu_communicator = use_xpu_communicator
         self.use_npu_communicator = use_npu_communicator
@@ -293,6 +298,9 @@ class GroupCoordinator:
         )
         from sglang.srt.distributed.device_communicators.pynccl import (
             PyNcclCommunicator,
+        )
+        from sglang.srt.distributed.device_communicators.symm_mem import (
+            SymmMemCommunicator,
         )
 
         if is_hip():
@@ -319,10 +327,18 @@ class GroupCoordinator:
         self.qr_comm: Optional[QuickAllReduce] = None
         if use_custom_allreduce and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
+            if torch_compile is not None and torch_compile:
+                # For piecewise CUDA graph, the requirement for custom allreduce is larger to
+                # avoid illegal cuda memory access.
+                ca_max_size = 256 * 1024 * 1024
+            else:
+                ca_max_size = 8 * 1024 * 1024
             try:
+                # print(f"ca_max_size: {ca_max_size}")
                 self.ca_comm = CustomAllreduce(
                     group=self.cpu_group,
                     device=self.device,
+                    max_size=ca_max_size,
                 )
             except Exception as e:
                 logger.warning(
@@ -341,6 +357,13 @@ class GroupCoordinator:
                         )
                 except Exception as e:
                     logger.warning(f"Failed to initialize QuickAllReduce: {e}")
+
+        self.symm_mem_comm: Optional[SymmMemCommunicator] = None
+        if self.use_torch_symm_mem and self.world_size > 1:
+            self.symm_mem_comm = SymmMemCommunicator(
+                group=self.cpu_group,
+                device=self.device,
+            )
 
         # Create communicator for other hardware backends
         from sglang.srt.distributed.device_communicators.hpu_communicator import (
@@ -446,6 +469,7 @@ class GroupCoordinator:
             # custom allreduce       | enabled | enabled |
             # PyNccl                 | disabled| enabled |
             # PyMscclpp              | disabled| enabled |
+            # TorchSymmMem           | disabled| enabled |
             # torch.distributed      | enabled | disabled|
             #
             # Note: When custom quick allreduce is enabled, a runtime check
@@ -547,7 +571,12 @@ class GroupCoordinator:
             and self.pymscclpp_comm.should_mscclpp_allreduce(input_)
         ):
             outplace_all_reduce_method = "pymscclpp"
-
+        elif (
+            self.symm_mem_comm is not None
+            and not self.symm_mem_comm.disabled
+            and self.symm_mem_comm.should_symm_mem_allreduce(input_)
+        ):
+            outplace_all_reduce_method = "symm_mem"
         if outplace_all_reduce_method is not None:
             return torch.ops.sglang.outplace_all_reduce(
                 input_,
@@ -564,6 +593,7 @@ class GroupCoordinator:
         ca_comm = self.ca_comm
         qr_comm = self.qr_comm
         pymscclpp_comm = self.pymscclpp_comm
+        symm_mem_comm = self.symm_mem_comm
         assert any([qr_comm, ca_comm, pymscclpp_comm])
         if outplace_all_reduce_method == "ca":
             assert not ca_comm.disabled
@@ -571,6 +601,9 @@ class GroupCoordinator:
         elif outplace_all_reduce_method == "qr":
             assert not qr_comm.disabled
             out = qr_comm.quick_all_reduce(input_)
+        elif outplace_all_reduce_method == "symm_mem":
+            assert not symm_mem_comm.disabled
+            out = symm_mem_comm.all_reduce(input_)
         else:
             assert not pymscclpp_comm.disabled
             out = pymscclpp_comm.all_reduce(input_)
@@ -1219,6 +1252,7 @@ def init_world_group(
         use_pynccl=False,
         use_pymscclpp=False,
         use_custom_allreduce=False,
+        use_torch_symm_mem=False,
         use_hpu_communicator=False,
         use_xpu_communicator=False,
         use_npu_communicator=False,
@@ -1234,11 +1268,15 @@ def init_model_parallel_group(
     use_message_queue_broadcaster: bool = False,
     group_name: Optional[str] = None,
     use_mscclpp_allreduce: Optional[bool] = None,
+    use_symm_mem_allreduce: Optional[bool] = None,
+    torch_compile: Optional[bool] = None,
 ) -> GroupCoordinator:
     if use_custom_allreduce is None:
         use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
     if use_mscclpp_allreduce is None:
         use_mscclpp_allreduce = _ENABLE_MSCCLPP_ALL_REDUCE
+    if use_symm_mem_allreduce is None:
+        use_symm_mem_allreduce = _ENABLE_SYMM_MEM_ALL_REDUCE
     return GroupCoordinator(
         group_ranks=group_ranks,
         local_rank=local_rank,
@@ -1246,11 +1284,13 @@ def init_model_parallel_group(
         use_pynccl=not _is_npu,
         use_pymscclpp=use_mscclpp_allreduce,
         use_custom_allreduce=use_custom_allreduce,
+        use_torch_symm_mem=use_symm_mem_allreduce,
         use_hpu_communicator=True,
         use_xpu_communicator=True,
         use_npu_communicator=True,
         use_message_queue_broadcaster=use_message_queue_broadcaster,
         group_name=group_name,
+        torch_compile=torch_compile,
     )
 
 
@@ -1331,6 +1371,7 @@ logger = logging.getLogger(__name__)
 
 _ENABLE_CUSTOM_ALL_REDUCE = True
 _ENABLE_MSCCLPP_ALL_REDUCE = False
+_ENABLE_SYMM_MEM_ALL_REDUCE = False
 
 
 def set_custom_all_reduce(enable: bool):
@@ -1341,6 +1382,11 @@ def set_custom_all_reduce(enable: bool):
 def set_mscclpp_all_reduce(enable: bool):
     global _ENABLE_MSCCLPP_ALL_REDUCE
     _ENABLE_MSCCLPP_ALL_REDUCE = enable
+
+
+def set_symm_mem_all_reduce(enable: bool):
+    global _ENABLE_SYMM_MEM_ALL_REDUCE
+    _ENABLE_SYMM_MEM_ALL_REDUCE = enable
 
 
 def init_distributed_environment(
@@ -1404,6 +1450,7 @@ def initialize_model_parallel(
     pipeline_model_parallel_size: int = 1,
     backend: Optional[str] = None,
     duplicate_tp_group: bool = False,
+    torch_compile: Optional[bool] = None,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -1459,6 +1506,7 @@ def initialize_model_parallel(
             "SGLANG_USE_MESSAGE_QUEUE_BROADCASTER", "true"
         ),
         group_name="tp",
+        torch_compile=torch_compile,
     )
 
     if duplicate_tp_group:
@@ -1474,6 +1522,7 @@ def initialize_model_parallel(
                 "SGLANG_USE_MESSAGE_QUEUE_BROADCASTER", "true"
             ),
             group_name="pdmux_prefill_tp",
+            torch_compile=torch_compile,
         )
         _TP.pynccl_comm.disabled = False
         _PDMUX_PREFILL_TP_GROUP.pynccl_comm.disabled = False
@@ -1483,7 +1532,6 @@ def initialize_model_parallel(
 
     global _MOE_EP
     assert _MOE_EP is None, "expert model parallel group is already initialized"
-
     if moe_ep_size == tensor_model_parallel_size:
         _MOE_EP = _TP
     else:
@@ -1504,7 +1552,6 @@ def initialize_model_parallel(
 
     global _MOE_TP
     assert _MOE_TP is None, "expert model parallel group is already initialized"
-
     if moe_tp_size == tensor_model_parallel_size:
         _MOE_TP = _TP
     else:

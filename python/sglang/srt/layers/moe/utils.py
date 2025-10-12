@@ -44,6 +44,7 @@ class MoeA2ABackend(Enum):
 class MoeRunnerBackend(Enum):
 
     AUTO = "auto"
+    DEEP_GEMM = "deep_gemm"
     TRITON = "triton"
     TRITON_KERNEL = "triton_kernel"
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
@@ -53,6 +54,9 @@ class MoeRunnerBackend(Enum):
 
     def is_auto(self):
         return self == MoeRunnerBackend.AUTO
+
+    def is_deep_gemm(self):
+        return self == MoeRunnerBackend.DEEP_GEMM
 
     def is_triton(self):
         return self == MoeRunnerBackend.TRITON
@@ -147,7 +151,9 @@ def get_moe_a2a_backend() -> MoeA2ABackend:
 def get_moe_runner_backend() -> MoeRunnerBackend:
     global MOE_RUNNER_BACKEND
     if MOE_RUNNER_BACKEND is None:
-        logger.warning("MOE_RUNNER_BACKEND is not initialized, using triton backend")
+        logger.warning(
+            "MOE_RUNNER_BACKEND is not initialized, the backend will be automatically selected"
+        )
         MOE_RUNNER_BACKEND = MoeRunnerBackend.AUTO
     return MOE_RUNNER_BACKEND
 
