@@ -385,6 +385,11 @@ class ModelRunner:
             if architectures and not any("Llama4" in arch for arch in architectures):
                 self.is_hybrid = self.model_config.is_hybrid = True
 
+        if config := self.mamba2_config:
+            class_name = config.__class__.__name__
+            logger.warning(f"{class_name} model detected, disable radix cache")
+            self.server_args.disable_radix_cache = True
+
         # For MTP models like DeepSeek-V3 or GLM-4.5, the MTP layer(s) are used separately as draft
         # models for speculative decoding. In those cases, `num_nextn_predict_layers` is used to
         # determine the number of layers.
