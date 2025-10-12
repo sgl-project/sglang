@@ -11,6 +11,7 @@ import json
 import os
 import re
 from typing import Any, Dict, List, Optional
+
 from transformers import AutoTokenizer
 
 from sglang.test import simple_eval_common as common
@@ -268,7 +269,6 @@ class LongBenchV2Eval(Eval):
 
         return True
 
-
     def __call__(self, sampler: SamplerBase) -> EvalResult:
         """Run the evaluation."""
 
@@ -278,7 +278,10 @@ class LongBenchV2Eval(Eval):
 
             if self.min_context_length or self.max_context_length:
                 if not self._check_context_length(
-                    formatted_question, self.tokenizer, self.min_context_length, self.max_context_length
+                    formatted_question,
+                    self.tokenizer,
+                    self.min_context_length,
+                    self.max_context_length,
                 ):
                     # Skip this example
                     return None
