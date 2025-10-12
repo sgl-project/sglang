@@ -255,7 +255,7 @@ jobs:
         timeout-minutes: 30
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit --auto-partition-id ${{ matrix.part }} --auto-partition-size 11
+          python3 run_suite.py --suite per-commit-1-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 11
 
   unit-test-backend-2-gpu:
     needs: [check-changes, sgl-kernel-build-wheels]
