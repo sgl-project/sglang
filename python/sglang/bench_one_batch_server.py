@@ -25,6 +25,7 @@ from typing import List, Optional, Tuple
 import numpy as np
 import requests
 from pydantic import BaseModel
+from transformers import AutoProcessor, PreTrainedTokenizer
 
 from sglang.bench_serving import (
     get_processor,
@@ -295,7 +296,7 @@ def run_one_case(
     input_len_step_percentage: float,
     run_name: str,
     result_filename: str,
-    tokenizer,
+    tokenizer: PreTrainedTokenizer | AutoProcessor,
     dataset_name="",
     profile: bool = False,
     profile_steps: int = 3,
@@ -309,7 +310,7 @@ def run_one_case(
     if dataset_name == "mmmu":
         input_requests = sample_mmmu_requests(
             num_requests=batch_size,
-            tokenizer=tokenizer,
+            processor=tokenizer,
             fixed_output_len=output_len,
             apply_chat_template=True,
             random_sample=False,
