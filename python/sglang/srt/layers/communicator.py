@@ -96,6 +96,7 @@ def support_attn_input_tp_scattered(q_lora_rank, is_nsa):
         and get_tensor_model_parallel_world_size() > 1
         and not is_dp_attention_enabled()
         and not get_moe_a2a_backend().is_deepep()
+        and not enable_moe_dense_fully_dp()
     )
 
 
