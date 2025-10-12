@@ -33,53 +33,27 @@ fi
 
 # Create cache directories for persistent build artifacts
 CACHE_DIR="${PWD}/.cache"
-CMAKE_BUILD_CACHE="${CACHE_DIR}/cmake-build-py${PYTHON_VERSION}-cuda${CUDA_VERSION}-${ARCH}"
 CMAKE_DOWNLOAD_CACHE="${CACHE_DIR}/cmake-downloads"
 CCACHE_DIR="${CACHE_DIR}/ccache"
 
-mkdir -p "${CMAKE_BUILD_CACHE}"
 mkdir -p "${CMAKE_DOWNLOAD_CACHE}"
 mkdir -p "${CCACHE_DIR}"
 
 echo "==================================="
 echo "Cache Configuration"
 echo "==================================="
-echo "CMake build cache: ${CMAKE_BUILD_CACHE}"
 echo "CMake download cache: ${CMAKE_DOWNLOAD_CACHE}"
 echo "ccache directory: ${CCACHE_DIR}"
 echo ""
 
 docker run --rm \
    -v $(pwd):/sgl-kernel \
-   -v ${CMAKE_BUILD_CACHE}:/cmake-build-cache \
    -v ${CMAKE_DOWNLOAD_CACHE}:/cmake-downloads \
    -v ${CCACHE_DIR}:/ccache \
+   -e ENABLE_CMAKE_PROFILE="${ENABLE_CMAKE_PROFILE:-}" \
+   -e ENABLE_BUILD_PROFILE="${ENABLE_BUILD_PROFILE:-}" \
    ${DOCKER_IMAGE} \
    bash -c "
-   echo \"==================================\"
-   echo \"Installing and configuring ccache\"
-   echo \"==================================\"
-
-   # Install ccache
-   yum install -y ccache
-
-   # Configure ccache
-   export CCACHE_DIR=/ccache
-   export CCACHE_MAXSIZE=10G
-   export CCACHE_COMPILERCHECK=content
-   export CCACHE_COMPRESS=true
-   export CCACHE_SLOPPINESS=file_macro,time_macros,include_file_mtime,include_file_ctime
-
-   # Set up ccache wrappers for compilers
-   export PATH=/usr/lib64/ccache:\$PATH
-   export CMAKE_C_COMPILER_LAUNCHER=ccache
-   export CMAKE_CXX_COMPILER_LAUNCHER=ccache
-   export CMAKE_CUDA_COMPILER_LAUNCHER=ccache
-
-   # Show ccache stats before build
-   ccache -sv || true
-   echo \"\"
-
    # Install CMake (version >= 3.26) - Robust Installation with caching
    echo \"==================================\"
    echo \"Installing CMake\"
@@ -93,6 +67,7 @@ docker run --rm \
       export MAKEFLAGS='-j2'
       export CMAKE_BUILD_PARALLEL_LEVEL=2
       export NINJAFLAGS='-j2'
+      echo \"ARM detected: Using extra conservative settings (2 parallel jobs)\"
    fi
 
    CMAKE_TARBALL=\"cmake-\${CMAKE_VERSION_MAJOR}.\${CMAKE_VERSION_MINOR}-linux-${ARCH}.tar.gz\"
@@ -118,6 +93,50 @@ docker run --rm \
    which cmake
    cmake --version
 
+   echo \"==================================\"
+   echo \"Installing and configuring ccache\"
+   echo \"==================================\"
+
+   # Install ccache 4.12.1 from source for CUDA support (yum provides old 3.7.7)
+   echo \"Installing ccache 4.12.1 from source...\"
+
+   # Install build dependencies
+   yum install -y gcc gcc-c++ make wget tar
+
+   # Download and build ccache 4.12.1
+   cd /tmp
+   wget -q https://github.com/ccache/ccache/releases/download/v4.12.1/ccache-4.12.1.tar.xz
+   tar -xf ccache-4.12.1.tar.xz
+   cd ccache-4.12.1
+
+   # Build and install (uses already-installed CMake 3.31)
+   mkdir build && cd build
+   /opt/cmake/bin/cmake -D CMAKE_BUILD_TYPE=Release -D CMAKE_INSTALL_PREFIX=/usr .. >/dev/null
+   make -j\$(nproc) >/dev/null
+   make install >/dev/null
+
+   # Verify installation
+   ccache --version
+   echo \"ccache 4.12.1 installed successfully\"
+   cd /sgl-kernel
+
+   # Configure ccache
+   export CCACHE_DIR=/ccache
+   export CCACHE_BASEDIR=/sgl-kernel
+   export CCACHE_MAXSIZE=10G
+   export CCACHE_COMPILERCHECK=content
+   export CCACHE_COMPRESS=true
+   export CCACHE_SLOPPINESS=file_macro,time_macros,include_file_mtime,include_file_ctime
+
+   # Set up ccache as compiler launcher (don't use PATH to avoid -ccbin conflicts)
+   export CMAKE_C_COMPILER_LAUNCHER=ccache
+   export CMAKE_CXX_COMPILER_LAUNCHER=ccache
+   export CMAKE_CUDA_COMPILER_LAUNCHER=ccache
+
+   # Show ccache stats before build
+   ccache -sV || true
+   echo \"\"
+
    yum install numactl-devel -y && \
    yum install libibverbs -y --nogpgcheck && \
    ln -sv /usr/lib64/libibverbs.so.1 /usr/lib64/libibverbs.so && \
@@ -131,20 +150,77 @@ docker run --rm \
    cd /sgl-kernel && \
    ls -la ${PYTHON_ROOT_PATH}/lib/python${PYTHON_VERSION}/site-packages/wheel/ && \
 
-   # Use persistent build cache directory
-   # Copy cached build artifacts if they exist
-   if [ -d /cmake-build-cache ] && [ \"\$(ls -A /cmake-build-cache 2>/dev/null)\" ]; then
-      echo \"Restoring CMake build cache...\"
-      mkdir -p build
-      cp -r /cmake-build-cache/* build/ || true
+   # Enable CMake profiling if requested
+   if [ -n \"${ENABLE_CMAKE_PROFILE}\" ]; then
+      echo \"CMake profiling enabled - will save to /sgl-kernel/cmake-profile.json\"
+      export CMAKE_ARGS=\"--profiling-output=/sgl-kernel/cmake-profile.json --profiling-format=google-trace\"
    fi
 
-   # Build with cached directory
+   # Enable Ninja build profiling if requested
+   if [ -n \"${ENABLE_BUILD_PROFILE}\" ]; then
+      echo \"Ninja build profiling enabled - will save to /sgl-kernel/build-trace.json\"
+      export NINJA_STATUS=\"[%f/%t %es] \"
+   fi
+
    PYTHONPATH=${PYTHON_ROOT_PATH}/lib/python${PYTHON_VERSION}/site-packages ${PYTHON_ROOT_PATH}/bin/python -m uv build --wheel -Cbuild-dir=build . --color=always --no-build-isolation && \
-
-   # Save build artifacts back to cache
-   echo \"Saving CMake build cache...\"
-   rm -rf /cmake-build-cache/*
-   cp -r build/* /cmake-build-cache/ || true
-
    ./rename_wheels.sh
+
+   # Show profile location if profiling was enabled
+   if [ -n \"${ENABLE_CMAKE_PROFILE}\" ] && [ -f /sgl-kernel/cmake-profile.json ]; then
+      echo \"\"
+      echo \"==================================\"
+      echo \"CMake Profile Generated\"
+      echo \"==================================\"
+      echo \"Profile saved to: cmake-profile.json\"
+      echo \"View in browser: chrome://tracing or edge://tracing\"
+      echo \"\"
+   fi
+
+   # Generate Ninja build trace if profiling enabled
+   if [ -n \"${ENABLE_BUILD_PROFILE}\" ] && [ -f /sgl-kernel/build/.ninja_log ]; then
+      echo \"\"
+      echo \"==================================\"
+      echo \"Generating Ninja Build Trace\"
+      echo \"==================================\"
+
+      # Install ninjatracing if not available
+      ${PYTHON_ROOT_PATH}/bin/pip install --quiet ninjatracing 2>/dev/null || echo \"Note: ninjatracing not available, skipping build trace\"
+
+      # Convert .ninja_log to Chrome trace (JSON format)
+      if ${PYTHON_ROOT_PATH}/bin/python -c \"import ninjatracing\" 2>/dev/null; then
+         ${PYTHON_ROOT_PATH}/bin/python -m ninjatracing /sgl-kernel/build/.ninja_log > /sgl-kernel/build-trace.json 2>/dev/null || true
+
+         if [ -f /sgl-kernel/build-trace.json ]; then
+            # Compress the trace for smaller file size and faster loading
+            gzip -9 -k /sgl-kernel/build-trace.json 2>/dev/null || true
+
+            echo \"Build trace saved to: build-trace.json\"
+            if [ -f /sgl-kernel/build-trace.json.gz ]; then
+               ORIGINAL_SIZE=\$(stat -f%z /sgl-kernel/build-trace.json 2>/dev/null || stat -c%s /sgl-kernel/build-trace.json)
+               COMPRESSED_SIZE=\$(stat -f%z /sgl-kernel/build-trace.json.gz 2>/dev/null || stat -c%s /sgl-kernel/build-trace.json.gz)
+               RATIO=\$(awk \"BEGIN {printf \\\"%.1f\\\", 100 - ($COMPRESSED_SIZE * 100.0 / $ORIGINAL_SIZE)}\")
+               echo \"Compressed to: build-trace.json.gz (\${RATIO}% smaller)\"
+            fi
+            echo \"\"
+            echo \"View in browser:\"
+            echo \"  - chrome://tracing (load JSON file)\"
+            echo \"  - ui.perfetto.dev (recommended, supports .gz files)\"
+            echo \"\"
+            echo \"Shows:\"
+            echo \"  - Compilation time per file\"
+            echo \"  - Parallelism utilization\"
+            echo \"  - Critical path (longest dependency chain)\"
+            echo \"  - Where the 2-hour build time went\"
+         fi
+      fi
+      echo \"\"
+   fi
+
+   # Show ccache statistics after build
+   echo \"\"
+   echo \"==================================\"
+   echo \"ccache Statistics\"
+   echo \"==================================\"
+   ccache -s
+   echo \"\"
+   "
