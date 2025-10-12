@@ -96,10 +96,10 @@ async fn test_mistral_with_brackets_in_strings() {
 async fn test_mistral_format_detection() {
     let parser = MistralParser::new();
 
-    assert!(parser.detect_format("[TOOL_CALLS] ["));
-    assert!(parser.detect_format("Some text [TOOL_CALLS] ["));
-    assert!(!parser.detect_format("Just plain text"));
-    assert!(!parser.detect_format("[{\"name\": \"test\"}]")); // JSON array without TOOL_CALLS
+    assert!(parser.has_tool_markers("[TOOL_CALLS] ["));
+    assert!(parser.has_tool_markers("Some text [TOOL_CALLS] ["));
+    assert!(!parser.has_tool_markers("Just plain text"));
+    assert!(!parser.has_tool_markers("[{\"name\": \"test\"}]")); // JSON array without TOOL_CALLS
 }
 
 #[tokio::test]
