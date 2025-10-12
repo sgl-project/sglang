@@ -598,7 +598,11 @@ pub(super) fn apply_event_transformations_inplace(
                 let requested_mcp = original_request
                     .tools
                     .as_ref()
-                    .map(|tools| tools.iter().any(|t| matches!(t.r#type, ResponseToolType::Mcp)))
+                    .map(|tools| {
+                        tools
+                            .iter()
+                            .any(|t| matches!(t.r#type, ResponseToolType::Mcp))
+                    })
                     .unwrap_or(false);
 
                 if requested_mcp {

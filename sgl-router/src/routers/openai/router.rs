@@ -187,7 +187,8 @@ impl OpenAIRouter {
             }
         } else {
             // No MCP - simple request
-            let payload_str = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "failed to serialize".to_string());
+            let payload_str = serde_json::to_string_pretty(&payload)
+                .unwrap_or_else(|_| "failed to serialize".to_string());
             eprintln!("=== UPSTREAM REQUEST (non-streaming) ===");
             eprintln!("URL: {}", url);
             eprintln!("Payload:\n{}", payload_str);
@@ -767,7 +768,10 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                                             // Change output_text to input_text
                                             if let Some(type_val) = content_obj.get("type") {
                                                 if type_val.as_str() == Some("output_text") {
-                                                    content_obj.insert("type".to_string(), Value::String("input_text".to_string()));
+                                                    content_obj.insert(
+                                                        "type".to_string(),
+                                                        Value::String("input_text".to_string()),
+                                                    );
                                                 }
                                             }
                                         }
