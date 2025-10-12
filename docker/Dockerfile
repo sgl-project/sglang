@@ -8,10 +8,10 @@ ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
 ARG FLASHMLA_COMMIT=1408756a88e52a25196b759eaf8db89d2b51b5a1
 ARG FAST_HADAMARD_TRANSFORM_COMMIT=7fd811c2b47f63b0b08d2582619f939e14dad77c
 ARG CMAKE_BUILD_PARALLEL_LEVEL=2
-ARG SGL_KERNEL_VERSION=0.3.15
+ARG SGL_KERNEL_VERSION=0.3.12
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
-    GDRCOPY_HOME=/usr/src/gdrdrv-2.5.1/ \
+    GDRCOPY_HOME=/usr/src/gdrdrv-2.4.4/ \
     NVSHMEM_DIR=/sgl-workspace/nvshmem/install
 # Add GKE default lib and bin locations.
 ENV PATH="${PATH}:/usr/local/nvidia/bin" \
@@ -54,7 +54,7 @@ RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
 
 # GDRCopy installation
 RUN mkdir -p /tmp/gdrcopy && cd /tmp \
- && git clone https://github.com/NVIDIA/gdrcopy.git -b v2.5.1 \
+ && git clone https://github.com/NVIDIA/gdrcopy.git -b v2.4.4 \
  && cd gdrcopy/packages \
  && CUDA=/usr/local/cuda ./build-deb-packages.sh \
  && dpkg -i gdrdrv-dkms_*.deb libgdrapi_*.deb gdrcopy-tests_*.deb gdrcopy_*.deb \
@@ -83,13 +83,12 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5li
       12.6.1) CUINDEX=126 ;; \
       12.8.1) CUINDEX=128 ;; \
       12.9.1) CUINDEX=129 ;; \
-      13.0.1) CUINDEX=130 ;; \
       *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
  && if [ "$CUDA_VERSION" = "12.6.1" ]; then \
      python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}+cu124-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps ; \
    fi \
-&& if [ "$CUDA_VERSION" = "12.8.1" ] || [ "$CUDA_VERSION" = "12.9.1" ] || [ "$CUDA_VERSION" = "13.0.1" ]; then \
+&& if [ "$CUDA_VERSION" = "12.8.1" ] || [ "$CUDA_VERSION" = "12.9.1" ]; then \
      python3 -m pip install --no-cache-dir sgl-kernel==${SGL_KERNEL_VERSION} ; \
    fi \
  && python3 -m pip install --no-cache-dir -e "python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
@@ -99,7 +98,7 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5li
 
 # Download NVSHMEM source files
 # We use Tom's DeepEP fork for GB200 for now
-RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.4.5/source/nvshmem_src_cuda12-all-all-3.4.5.tar.gz && \
+RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.3.9/source/nvshmem_src_cuda12-all-all-3.3.9.tar.gz && \
     if [ "$BUILD_TYPE" = "blackwell_aarch64" ]; then \
       git clone https://github.com/fzyzcjy/DeepEP.git \
       && cd DeepEP && git checkout 1b14ad661c7640137fcfe93cccb2694ede1220b0 && sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && cd .. ; \
@@ -107,9 +106,9 @@ RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.4.5/sour
       git clone https://github.com/deepseek-ai/DeepEP.git \
       && cd DeepEP && git checkout ${DEEPEP_COMMIT} && sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && cd .. ; \
     fi \
-    && tar -xf nvshmem_src_cuda12-all-all-3.4.5.tar.gz \
+    && tar -xf nvshmem_src_cuda12-all-all-3.3.9.tar.gz \
     && mv nvshmem_src nvshmem \
-    && rm -f /sgl-workspace/nvshmem_src_cuda12-all-all-3.4.5.tar.gz
+    && rm -f /sgl-workspace/nvshmem_src_cuda12-all-all-3.3.9.tar.gz
 
 # Build and install NVSHMEM
 RUN cd /sgl-workspace/nvshmem && \
@@ -131,7 +130,7 @@ RUN cd /sgl-workspace/DeepEP && \
       12.6.1) \
         CHOSEN_TORCH_CUDA_ARCH_LIST='9.0' \
         ;; \
-      12.8.1|12.9.1|13.0.1) \
+      12.8.1|12.9.1) \
         CHOSEN_TORCH_CUDA_ARCH_LIST='9.0;10.0' \
         ;; \
       *) \
