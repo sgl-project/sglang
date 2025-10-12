@@ -160,10 +160,7 @@ class DataParallelController:
             dp_port_args = self.launch_dp_schedulers(server_args, port_args)
             self.control_message_step = 1
 
-        if (
-            server_args.node_rank == 0
-            and not server_args.enable_dp_port_preallocation
-        ):
+        if server_args.node_rank == 0 and not server_args.enable_dp_port_preallocation:
             for dp_rank in range(server_args.dp_size):
                 self.workers[dp_rank] = get_zmq_socket(
                     self.context,
