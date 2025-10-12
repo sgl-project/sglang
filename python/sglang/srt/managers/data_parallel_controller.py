@@ -142,7 +142,6 @@ class DataParallelController:
         # Launch data parallel workers
         self.scheduler_procs = []
         self.workers: List[zmq.Socket] = [None] * server_args.dp_size
-        self.worker_ports: Optional[List[int]] = None
 
         if server_args.enable_dp_attention:
             self.launch_dp_attention_schedulers(server_args, port_args)
@@ -240,7 +239,7 @@ class DataParallelController:
         while True:
             time.sleep(30 * 24 * 3600)
 
-    def _broadcast_worker_ports(self, server_args: ServerArgs) -> List[int]:
+    def _broadcast_worker_ports(self, server_args: ServerArgs, worker_ports: Optional[List[int]] = None) -> List[int]:
         """Broadcast worker ports from node 0 to all other nodes.
 
         Node 0 acts as the server, waiting for all other nodes to connect and
@@ -249,6 +248,7 @@ class DataParallelController:
 
         Args:
             server_args: Server arguments containing node configuration.
+            worker_ports: Pre-allocated worker ports to broadcast.
 
         Returns:
             List of worker ports (same on all nodes after broadcast).
@@ -261,17 +261,17 @@ class DataParallelController:
 
         if server_args.node_rank == 0:
             # Node 0: Broadcast worker ports to all other nodes
-            return self._broadcast_ports_as_server(endpoint, server_args.nnodes - 1)
+            return self._broadcast_ports_as_server(endpoint, server_args.nnodes - 1, worker_ports)
         else:
             # Other nodes: Receive worker ports from node 0
             return self._receive_ports_as_client(endpoint, server_args.node_rank)
 
     def _broadcast_ports_as_server(
-        self, endpoint: str, expected_clients: int
+        self, endpoint: str, expected_clients: int, worker_ports: List[int]
     ) -> List[int]:
         """Broadcast worker ports to all client nodes."""
         logger.debug(f"Broadcasting worker ports to {expected_clients} client nodes")
-        logger.debug(f"Worker ports: {self.worker_ports}")
+        logger.debug(f"Worker ports: {worker_ports}")
 
         rep_socket = get_zmq_socket(self.context, zmq.REP, endpoint, True)
 
@@ -283,14 +283,14 @@ class DataParallelController:
                 logger.debug(f"Received handshake from node {client_rank}")
 
                 # Send worker ports to client
-                rep_socket.send_pyobj(self.worker_ports)
+                rep_socket.send_pyobj(worker_ports)
                 connected_clients += 1
                 logger.debug(
                     f"Sent worker ports to {connected_clients}/{expected_clients} nodes"
                 )
 
             logger.debug("Worker port broadcast completed")
-            return self.worker_ports
+            return worker_ports
         finally:
             rep_socket.close()
 
@@ -322,15 +322,16 @@ class DataParallelController:
         self, server_args: ServerArgs, port_args: PortArgs
     ):
         # Pre-allocate worker ports on node 0 to avoid conflicts
+        worker_ports = []
         if server_args.node_rank == 0:
-            self.worker_ports = []
             for dp_rank in range(server_args.dp_size):
                 port_and_socket = get_zmq_socket(self.context, zmq.PUSH)
-                self.worker_ports.append(port_and_socket[0])
+                worker_ports.append(port_and_socket[0])
                 self.workers[dp_rank] = port_and_socket[1]
                 logger.debug(f"Assigned port {port_and_socket[0]} to worker {dp_rank}")
-        worker_ports = self._broadcast_worker_ports(server_args)
-        self.launch_tensor_parallel_group(server_args, port_args, 0, None, worker_ports)
+
+        broadcasted_ports = self._broadcast_worker_ports(server_args, worker_ports if worker_ports else None)
+        self.launch_tensor_parallel_group(server_args, port_args, 0, None, broadcasted_ports)
 
     def launch_tensor_parallel_group(
         self,
