@@ -144,15 +144,6 @@ class DataParallelController:
         self.workers: List[zmq.Socket] = [None] * server_args.dp_size
         self.worker_ports: Optional[List[int]] = None
 
-        # Pre-allocate worker ports on node 0 to avoid conflicts
-        if server_args.node_rank == 0:
-            self.worker_ports = []
-            for dp_rank in range(server_args.dp_size):
-                port_and_socket = get_zmq_socket(self.context, zmq.PUSH)
-                self.worker_ports.append(port_and_socket[0])
-                self.workers[dp_rank] = port_and_socket[1]
-                logger.debug(f"Assigned port {port_and_socket[0]} to worker {dp_rank}")
-
         if server_args.enable_dp_attention:
             self.launch_dp_attention_schedulers(server_args, port_args)
             self.control_message_step = server_args.tp_size
@@ -214,6 +205,14 @@ class DataParallelController:
             base_gpu_id += (
                 server_args.tp_size * server_args.pp_size * server_args.gpu_id_step
             )
+            
+            if server_args.node_rank == 0:
+                self.workers[dp_rank] = get_zmq_socket(	
+                    self.context,	
+                    zmq.PUSH,	
+                    tmp_port_args.scheduler_input_ipc_name,	
+                    True,	
+                )
 
         # Free all sockets before starting the threads to launch TP workers
         for sock in sockets:
@@ -322,6 +321,14 @@ class DataParallelController:
     def launch_dp_attention_schedulers(
         self, server_args: ServerArgs, port_args: PortArgs
     ):
+        # Pre-allocate worker ports on node 0 to avoid conflicts
+        if server_args.node_rank == 0:
+            self.worker_ports = []
+            for dp_rank in range(server_args.dp_size):
+                port_and_socket = get_zmq_socket(self.context, zmq.PUSH)
+                self.worker_ports.append(port_and_socket[0])
+                self.workers[dp_rank] = port_and_socket[1]
+                logger.debug(f"Assigned port {port_and_socket[0]} to worker {dp_rank}")
         worker_ports = self._broadcast_worker_ports(server_args)
         self.launch_tensor_parallel_group(server_args, port_args, 0, None, worker_ports)
 
