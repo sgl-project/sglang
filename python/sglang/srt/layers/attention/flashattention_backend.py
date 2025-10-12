@@ -705,7 +705,9 @@ class FlashAttentionBackend(AttentionBackend):
             q = q.to(self.kv_cache_dtype)
             q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
             k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
-        causal = not layer.is_cross_attention
+        causal = True
+        if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
+            causal = False
 
         # Check if we should use local attention
         use_local_attn = (
@@ -1005,7 +1007,9 @@ class FlashAttentionBackend(AttentionBackend):
             if layer.sliding_window_size is not None and layer.sliding_window_size > -1
             else (-1, -1)
         )
-        causal = not layer.is_cross_attention
+        causal = True
+        if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
+            causal = False
 
         # For fa3 interface version compatibility, we put new fields into conditional keyword args
         kwargs = {}
