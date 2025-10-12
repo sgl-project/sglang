@@ -83,10 +83,6 @@ from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef
-from sglang.srt.managers.schedule_batch import (
-    GLOBAL_SERVER_ARGS_KEYS,
-    global_server_args_dict,
-)
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     PagedTokenToKVPoolAllocator,
@@ -125,7 +121,7 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.server_args import ServerArgs, global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     MultiprocessingSerializer,
@@ -277,14 +273,14 @@ class ModelRunner:
 
         # Global vars
         # FIXME: deprecate this, use `global_server_args` from sglang.srt.server_args instead
-        global_server_args_dict.update(
-            {k: getattr(server_args, k) for k in GLOBAL_SERVER_ARGS_KEYS}
-            | {
-                # TODO it is indeed not a "server args"
-                "use_mla_backend": self.use_mla_backend,
-                "speculative_algorithm": self.spec_algorithm,
-            }
-        )
+        # global_server_args_dict.update(
+        #     {k: getattr(server_args, k) for k in GLOBAL_SERVER_ARGS_KEYS}
+        #     | {
+        #         # TODO it is indeed not a "server args"
+        #         "use_mla_backend": self.use_mla_backend,
+        #         "speculative_algorithm": self.spec_algorithm,
+        #     }
+        # )
 
         # Init OpenMP threads binding for CPU
         if self.device == "cpu":
@@ -432,9 +428,7 @@ class ModelRunner:
         torchao_applied = getattr(self.model, "torchao_applied", False)
         # In layered loading, torchao may have been applied
         if not torchao_applied:
-            apply_torchao_config_to_model(
-                self.model, global_server_args_dict["torchao_config"]
-            )
+            apply_torchao_config_to_model(self.model, global_server_args.torchao_config)
 
         # Apply torch TP if the model supports it
         supports_torch_tp = getattr(self.model, "supports_torch_tp", False)
@@ -1839,12 +1833,10 @@ class ModelRunner:
                 self.server_args.attention_backend
             )
 
-        global_server_args_dict.update(
-            {
-                "decode_attention_backend": self.decode_attention_backend_str,
-                "prefill_attention_backend": self.prefill_attention_backend_str,
-            }
-        )
+        (
+            global_server_args.prefill_attention_backend,
+            global_server_args.decode_attention_backend,
+        ) = (self.prefill_attention_backend_str, self.decode_attention_backend_str)
         return attn_backend
 
     def _get_attention_backend_from_str(self, backend_str: str):

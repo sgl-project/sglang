@@ -7,6 +7,8 @@ from typing import Optional, Tuple
 import torch
 import triton
 
+from sglang.srt.server_args import global_server_args
+
 logger = logging.getLogger(__name__)
 
 from dataclasses import dataclass
@@ -16,7 +18,7 @@ import torch.nn.functional as F
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import apply_custom_logit_processor
-from sglang.srt.managers.schedule_batch import ScheduleBatch, global_server_args_dict
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
@@ -350,10 +352,8 @@ class NgramVerifyInput(SpecInput):
             uniform_samples_for_final_sampling=coins_for_final_sampling,
             target_probs=target_probs,
             draft_probs=draft_probs,
-            threshold_single=global_server_args_dict[
-                "speculative_accept_threshold_single"
-            ],
-            threshold_acc=global_server_args_dict["speculative_accept_threshold_acc"],
+            threshold_single=global_server_args.speculative_accept_threshold_single,
+            threshold_acc=global_server_args.speculative_accept_threshold_acc,
             deterministic=True,
         )
 

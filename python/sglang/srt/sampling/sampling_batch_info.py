@@ -67,15 +67,15 @@ class SamplingBatchInfo:
     logit_bias: Optional[torch.Tensor] = None
 
     @classmethod
-    def _get_global_server_args_dict(cls):
-        from sglang.srt.managers.schedule_batch import global_server_args_dict
+    def _get_global_server_args(cls):
+        from sglang.srt.server_args import global_server_args
 
-        return global_server_args_dict
+        return global_server_args
 
     @classmethod
     def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
-        global_server_args_dict = cls._get_global_server_args_dict()
-        enable_deterministic = global_server_args_dict["enable_deterministic_inference"]
+        global_server_args = cls._get_global_server_args()
+        enable_deterministic = global_server_args.enable_deterministic_inference
 
         reqs = batch.reqs
         device = batch.device
@@ -112,10 +112,9 @@ class SamplingBatchInfo:
                         logit_bias[i, int(key)] = value
 
         # Check if any request has custom logit processor
-        has_custom_logit_processor = global_server_args_dict[
-            "enable_custom_logit_processor"
-        ] and any(  # check the flag first.
-            r.custom_logit_processor for r in reqs
+        has_custom_logit_processor = (
+            global_server_args.enable_custom_logit_processor
+            and any(r.custom_logit_processor for r in reqs)  # check the flag first.
         )  # then check the requests.
 
         if has_custom_logit_processor:
