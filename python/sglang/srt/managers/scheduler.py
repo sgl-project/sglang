@@ -225,9 +225,21 @@ class GenerationBatchResult:
     next_draft_input: Optional[EagleDraftInput] = None
 
     def copy_to_cpu(self, return_logprob: bool = False):
-        """Copy tensors to CPU in overlap scheduling.
-        Only the tensors which are needed for processing results are copied,
-        e.g., next_token_ids, logits outputs
+        """
+        Move selected batch-result tensors to CPU for result processing.
+        
+        Transfers the following tensors to CPU (non-blocking) so downstream CPU-side processing can proceed:
+        - self.next_token_ids
+        - self.logits_output.hidden_states (if present)
+        - self.accept_lens and self.last_batch_allocate_lens (if present)
+        If `return_logprob` is True, also transfers:
+        - self.logits_output.next_token_logits (if present)
+        - self.logits_output.input_token_logprobs (if present)
+        
+        After scheduling the non-blocking copies, records completion by signaling `self.copy_done`.
+        
+        Parameters:
+            return_logprob (bool): When True, also copy logits tensors required for log-probability computation.
         """
         if return_logprob:
             if self.logits_output.next_token_logits is not None:
@@ -298,6 +310,20 @@ class Scheduler(
         dp_rank: Optional[int],
     ):
         # Parse args
+        """
+        Initialize the Scheduler and configure runtime components for a tensor-parallel GPU worker.
+        
+        This constructor configures the scheduler according to provided server and port arguments, establishes inter-process communication channels, initializes model and draft workers, memory pools and caches, tokenizer and grammar backends, scheduling policy, disaggregation and overlap subsystems, metrics/profiling, and other background services required to receive and process generation and embedding requests. It also starts necessary background threads (for example, a watchdog) and prepares rank/group information and device-specific resources.
+        
+        Parameters:
+            server_args (ServerArgs): Global server configuration and feature flags.
+            port_args (PortArgs): IPC and NCCL port configuration for inter-process communication.
+            gpu_id (int): Local GPU device identifier for this scheduler process.
+            tp_rank (int): Tensor-parallel rank of this process.
+            moe_ep_rank (int): MOE expert-parallel (EP) rank for this process.
+            pp_rank (int): Pipeline-parallel rank of this process.
+            dp_rank (Optional[int]): Data-parallel rank of this process, or None if not applicable.
+        """
         self.server_args = server_args
         self.tp_rank = tp_rank
         self.moe_ep_rank = moe_ep_rank
@@ -659,6 +685,23 @@ class Scheduler(
     def launch_draft_worker(
         self, gpu_id, tp_rank, moe_ep_rank, server_args, port_args, dp_rank
     ):
+        """
+        Selects and instantiates the appropriate speculative draft worker and assigns it to self.draft_worker.
+        
+        Depending on the scheduler's speculative algorithm and overlap setting, creates an instance of:
+        - EAGLEWorker or EAGLEWorkerV2 when the algorithm is Eagle (EAGLEWorkerV2 used when overlap is enabled),
+        - StandaloneWorker for standalone spec algorithm,
+        - NGRAMWorker for n-gram spec algorithm,
+        or sets self.draft_worker to None if no supported spec algorithm is selected.
+        
+        Parameters:
+            gpu_id (int): GPU identifier for the worker process.
+            tp_rank (int): tensor-parallel rank.
+            moe_ep_rank (int): MOE expert parallel rank.
+            server_args: server configuration object passed to the worker.
+            port_args: port configuration object providing nccl_port.
+            dp_rank (int): data-parallel rank.
+        """
         if self.spec_algorithm.is_eagle():
             from sglang.srt.speculative.eagle_worker import EAGLEWorker
             from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
@@ -702,7 +745,14 @@ class Scheduler(
             self.draft_worker = None
 
     def init_deterministic_inference_config(self):
-        """Initialize deterministic inference configuration for different attention backends."""
+        """
+        Configure deterministic inference truncation alignment based on the selected attention backend.
+        
+        When deterministic inference is disabled, sets `self.truncation_align_size` to None.
+        When enabled, sets `self.truncation_align_size` from an environment variable specific to the attention backend (or a backend-specific default):
+        - "flashinfer": uses SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE (default 4096)
+        - "triton": uses SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE (default 4096)
+        """
         if not self.server_args.enable_deterministic_inference:
             self.truncation_align_size = None
             return
@@ -971,6 +1021,20 @@ class Scheduler(
             self.disagg_prefill_inflight_queue: List[Req] = []
 
     def init_overlap(self):
+        """
+        Initialize resources required for overlapped GPU/CPU scheduling.
+        
+        When overlap is enabled, create CUDA streams and their context managers, instantiate the FutureMap used to track in-flight requests, and initialize lightweight batch-record bookkeeping used by the overlap scheduler.
+        
+        Attributes created:
+            forward_stream: CUDA stream used for forward executions.
+            forward_stream_ctx: context manager for the forward stream.
+            copy_stream: CUDA stream used for asynchronous device-host/device-device copies.
+            copy_stream_ctx: context manager for the copy stream.
+            future_map: FutureMap instance for coordinating futures across running requests.
+            batch_record_buf: two-slot buffer for storing recent batch records.
+            batch_record_ct: counter for batch record rotations.
+        """
         if not self.enable_overlap:
             return
 
@@ -2102,7 +2166,24 @@ class Scheduler(
     def run_batch(
         self, batch: ScheduleBatch
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
-        """Run a batch."""
+        """
+        Execute a scheduled batch (generation or embedding) and produce its result.
+        
+        For generation batches this runs the model forward pass (with optional overlapped execution),
+        populates batch.output_ids, and returns a GenerationBatchResult containing logits/next-token
+        information, copy/synchronization metadata, and any draft-relay data. Overlapped execution
+        may allocate future indices and delay CPU-copying of outputs; the function may also update
+        batch.spec_info and batch.seq_lens for Eagle-style speculative drafting and sets per-request
+        extension metadata inside the returned result.
+        
+        Parameters:
+            batch (ScheduleBatch): The scheduled batch to execute.
+        
+        Returns:
+            GenerationBatchResult: For generation requests — generation outputs, synchronization
+                handles, and auxiliary metadata.
+            EmbeddingBatchResult: For embedding requests — the computed embeddings.
+        """
         self.forward_ct += 1
 
         # Whether to run the profiler
@@ -2213,6 +2294,11 @@ class Scheduler(
     def launch_last_batch_sample_if_needed(
         self,
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
+        """
+        Ensure sampling is launched for the earliest queued result if its sampling was previously delayed.
+        
+        If the scheduler's result queue is non-empty and the first GenerationBatchResult has `delay_sample_launch` set, this method starts sampling for that result using the model runner, updates the result's `next_token_ids`, stores the result in the future map for downstream coordination, invokes the result's `copy_to_cpu` to move necessary tensors to host memory, and places the result back at the front of the queue. If the queue is empty or the first result is not marked for delayed sampling, the method returns without side effects.
+        """
         if len(self.result_queue) == 0:
             return
 

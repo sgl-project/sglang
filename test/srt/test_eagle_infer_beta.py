@@ -16,6 +16,9 @@ class TestEagleBS1(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
+        """
+        Prepare the test class by setting model and base URL and launching a server process configured for EAGLE speculative inference; the launched process is stored on cls.process.
+        """
         cls.model = "meta-llama/Llama-2-7b-chat-hf"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
@@ -44,9 +47,17 @@ class TestEagleBS1(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
+        """
+        Terminate the server process started in setUpClass, including any child processes.
+        """
         kill_process_tree(cls.process.pid)
 
     def test_gsm8k(self):
+        """
+        Run GSM8K-style evaluation against the launched model server and assert the accuracy meets the expected threshold.
+        
+        Constructs evaluation arguments (5-shot, specified number of questions, max_new_tokens=512, parallel=128) using the test's base URL, executes run_eval, prints the resulting metrics, and asserts that `metrics["accuracy"]` is greater than 0.33.
+        """
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,
@@ -91,6 +102,11 @@ class TestEagleLargeBS(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
+        """
+        Prepare the test class by starting the model server and recording connection and process details.
+        
+        Sets the class attributes `model` and `base_url`, launches the model server using the class configuration, and stores the resulting server process on `cls.process` for later teardown and use by tests.
+        """
         cls.model = "meta-llama/Llama-2-7b-chat-hf"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
@@ -102,9 +118,17 @@ class TestEagleLargeBS(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
+        """
+        Terminate the server process started in setUpClass, including any child processes.
+        """
         kill_process_tree(cls.process.pid)
 
     def test_gsm8k(self):
+        """
+        Run a GSM8K-style evaluation against the launched model server and assert the model meets the accuracy threshold.
+        
+        Constructs evaluation arguments (5 shots, max_new_tokens=512, parallel=128, questions taken from self.num_questions, host and port derived from self.base_url), runs run_eval, prints the resulting metrics, and asserts that metrics["accuracy"] > 0.23.
+        """
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,

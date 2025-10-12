@@ -238,6 +238,22 @@ class TpModelWorker:
         # FIXME(lsyin): maybe remove skip_attn_backend_init in forward_batch_generation,
         #               which requires preparing replay to always be in this function
 
+        """
+        Run a forward pass for a generation batch and produce a GenerationBatchResult.
+        
+        If `model_worker_batch` is provided this method initializes a ForwardBatch from it; otherwise `forward_batch` must be supplied. The method routes data across pipeline ranks: the last pipeline rank returns logits and sampling results (or delayed sampling control), while intermediate ranks return proxy tensors for subsequent stages. The method also updates the registered hicache consumer index when a `model_worker_batch` is given.
+        
+        Parameters:
+            model_worker_batch (ModelWorkerBatch): Server-side batch metadata and inputs; when provided a ForwardBatch is created from it.
+            forward_batch (Optional[ForwardBatch]): Pre-built forward batch to use when `model_worker_batch` is None.
+            is_verify (bool): If true, skip sampling and return logits for verification.
+            skip_attn_backend_init (bool): When true, instruct the model runner to skip attention backend initialization for this forward.
+        
+        Returns:
+            GenerationBatchResult: Result containing one of:
+                - For last PP rank: `logits_output`, optional `next_token_ids`, `can_run_cuda_graph`, and optionally `delay_sample_launch` with attached `forward_batch`.
+                - For non-last PP ranks: `pp_hidden_states_proxy_tensors` and `can_run_cuda_graph`.
+        """
         if model_worker_batch is not None:
             # update the consumer index of hicache to the running batch
             self.set_hicache_consumer(model_worker_batch.hicache_consumer_index)

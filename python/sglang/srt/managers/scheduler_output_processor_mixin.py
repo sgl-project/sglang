@@ -39,6 +39,26 @@ class SchedulerOutputProcessorMixin:
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        """
+        Process prefill decoding or embedding batch results and update each request's state for subsequent streaming.
+        
+        This updates request outputs, logprob and hidden-state containers, grammar state, chunking counters, caching (finished/unfinished) in the tree cache, and may schedule a request to be skipped for the current stream; finally it emits streaming output for the batch.
+        
+        Parameters:
+            batch (ScheduleBatch): The scheduled batch of requests being processed.
+            result (GenerationBatchResult | EmbeddingBatchResult): The model result for the batch. For generation mode this must contain logits, next-token ids, optional input/logprob extension lengths and an optional CUDA copy synchronization handle; for embedding/reward mode this must contain embeddings.
+        
+        Side effects:
+            - Appends generated token ids (or a dummy token for embeddings) to req.output_ids.
+            - Updates req.finished state and records completion time for finished requests.
+            - Caches finished/unfinished requests via tree_cache.
+            - For generation mode when batch.return_logprob is true, computes and appends input/output logprob values (and top/token-id logprobs when configured).
+            - Appends hidden states to req.hidden_states when requested.
+            - Calls req.grammar.accept_token(next_token_id) when a grammar is present; on ValueError logs the error and aborts the request.
+            - Decrements req.is_chunked for chunked requests and sets skip_stream_req to avoid streaming the currently chunked request.
+            - Synchronizes any provided copy_done handle before accessing CPU tensors.
+            - Calls stream_output(...) to emit results to the detokenizer.
+        """
         skip_stream_req = None
 
         if self.is_generation:
@@ -204,6 +224,21 @@ class SchedulerOutputProcessorMixin:
     ):
         # TODO(lsyin): try use a copy stream to share SMs with forward
         # FIXME(lsyin): better organize this token free logic in eagle-overlap
+        """
+        Assemble per-request draft token sequences and related allocation lengths for Eagle overlap decoding.
+        
+        Converts the generation result's allocation and acceptance lengths and token IDs into CPU-native lists, builds a list of predicted tokens for each request using the speculative draft size and each request's accepted length, and increments each request's speculative verification counter as a side effect.
+        
+        Parameters:
+            result (GenerationBatchResult): Generation result containing `last_batch_allocate_lens`, `accept_lens`, and `next_token_ids`.
+            batch (ScheduleBatch): Batch whose `reqs` align with the result's per-request outputs.
+        
+        Returns:
+            tuple: A three-element tuple containing:
+                - last_batch_allocate_lens_cpu (list[int]): CPU list of last-batch allocation lengths.
+                - accept_lens_cpu (list[int]): CPU list of accepted token counts per request.
+                - predict_tokens (list[list[int]]): Per-request lists of predicted token IDs, each sliced to the corresponding accept length.
+        """
         last_batch_allocate_lens_cpu = result.last_batch_allocate_lens.tolist()
         accept_lens_cpu = result.accept_lens.tolist()
         next_token_ids = result.next_token_ids.tolist()
@@ -226,6 +261,14 @@ class SchedulerOutputProcessorMixin:
         batch: ScheduleBatch,
         result: GenerationBatchResult,
     ):
+        """
+        Process a decoding batch result: integrate generated tokens (including speculative Eagle variants) into requests, update metrics and caches, handle logprobs/hidden-states/grammar, free KV allocations, and stream outputs.
+        
+        Parameters:
+            batch (ScheduleBatch): The scheduled batch that produced the result; may indicate speculative decoding mode and contains the associated requests.
+            result (GenerationBatchResult): The model inference result delivering logits, next-token data, and auxiliary synchronization objects.
+        
+        """
         logits_output, next_token_ids, can_run_cuda_graph, copy_done = (
             result.logits_output,
             result.next_token_ids,

@@ -55,6 +55,21 @@ def assign_draft_cache_locs_page_size_1(
     topk: tl.constexpr,
     speculative_num_steps: tl.constexpr,
 ):
+    """
+    Map and copy token cache entries for a single-page (page size 1) layout from a request-specific token pool into per-program output cache slots used for draft top-k speculative steps.
+    
+    Parameters:
+        req_pool_indices: Pointer/array of indices mapping each program to its token pool index.
+        req_to_token: Base pointer to concatenated token pools; per-request pool entries are offset from this base.
+        seq_lens: Array of start offsets (kv start positions) into each request's token pool for the current sequence length.
+        out_cache_loc: Output pointer/array where per-program cache locations are written; each program writes `topk * speculative_num_steps` entries.
+        pool_len: Compile-time constant giving the length (stride) of each token pool in `req_to_token`.
+        topk: Compile-time constant number of top tokens per speculative step.
+        speculative_num_steps: Compile-time constant number of speculative steps to copy for each top-k.
+    
+    Notes:
+        - Copies `topk * speculative_num_steps` consecutive entries starting at `req_to_token[req_pool_indices[pid] * pool_len + seq_lens[pid]]` into `out_cache_loc[pid * topk * speculative_num_steps : (pid+1) * topk * speculative_num_steps]`.
+    """
     BLOCK_SIZE: tl.constexpr = 128
     pid = tl.program_id(axis=0)
 
@@ -83,6 +98,22 @@ class EagleDraftInputV2Mixin:
         topk: int,
         num_steps: int,
     ):
+        """
+        Prepare a forward batch and allocate per-draft-token cache locations for v2 speculative drafting.
+        
+        This sets up batch.out_cache_loc to hold cache locations for the top-k draft tokens across num_steps, configures capture mode and draft token positions, and returns a ForwardBatch ready for the draft forward pass along with whether a CUDA graph can be used.
+        
+        Parameters:
+            req_to_token_pool (ReqToTokenPool): Pool mapping requests to token cache entries used to populate out_cache_loc.
+            batch (ModelWorkerBatch): Batch to prepare; this function mutates batch.out_cache_loc, batch.capture_hidden_mode, and self.positions.
+            cuda_graph_runner (EAGLEDraftCudaGraphRunner): Runner used to determine CUDA-graph viability for the prepared forward batch.
+            draft_model_runner (ModelRunner): Model runner used to initialize the ForwardBatch.
+            topk (int): Number of draft token candidates per request.
+            num_steps (int): Number of speculative steps (draft length) to allocate for each candidate.
+        
+        Returns:
+            tuple[ForwardBatch, bool]: A ForwardBatch initialized for the draft model runner and a boolean indicating whether a CUDA graph can be used.
+        """
         bs = len(batch.seq_lens)
 
         # Assign cache locations
@@ -116,6 +147,20 @@ class EagleDraftInputV2Mixin:
         num_draft_tokens: int,
         draft_model_runner: Any,
     ):
+        """
+        Prepare the batch for extending draft tokens into the model KV cache and initialize forward metadata.
+        
+        This mutates the provided `batch` to reflect the appended draft tokens (updates input_ids, sequence lengths, extension bookkeeping, capture and forward modes) and returns a ForwardBatch configured for running the draft-extension forward pass. The batch is prepared for a full hidden-state capture and uses the DRAFT_EXTEND_V2 forward mode.
+        
+        Parameters:
+            batch (ModelWorkerBatch): Batch object to modify and extend for draft tokens.
+            predict (torch.Tensor): Token indices to use as the new input_ids for the extension.
+            num_draft_tokens (int): Number of draft tokens appended per sequence in the batch.
+            draft_model_runner (Any): Model runner whose attention backend will be used to initialize forward metadata.
+        
+        Returns:
+            ForwardBatch: A forward batch initialized for the draft-extension pass with forward metadata prepared by the draft model runner.
+        """
         seq_lens_cpu_backup = batch.seq_lens_cpu
         extend_num_tokens = len(batch.seq_lens) * num_draft_tokens
 
@@ -144,6 +189,19 @@ class EagleVerifyInputV2Mixin:
         target_worker: TpModelWorker,
     ):
         # Assign cache locations
+        """
+        Prepare the batch and forward metadata for v2 draft verification.
+        
+        This assigns cache locations for draft tokens into batch.out_cache_loc, sets the batch into TARGET_VERIFY mode with full hidden capture, initializes a ForwardBatch for the target worker's model runner, and prepares or replays any CUDA graph/attention-backend metadata required to run the verification forward pass.
+        
+        Parameters:
+            req_to_token_pool (ReqToTokenPool): Mapping from requests to token pools used to fill cache locations.
+            batch (ModelWorkerBatch): The worker batch to prepare; its input_ids and out_cache_loc are updated in-place.
+            target_worker (TpModelWorker): The worker whose ModelRunner will execute the verification forward pass.
+        
+        Returns:
+            tuple[ForwardBatch, bool]: A tuple with the initialized ForwardBatch for verification and a boolean indicating whether a CUDA graph can be used (`True` if CUDA graph replay was prepared).
+        """
         bs = len(batch.req_pool_indices)
         batch.input_ids = self.draft_token
         device = batch.input_ids.device
@@ -188,8 +246,18 @@ class EagleVerifyInputV2Mixin:
         logits_output: LogitsProcessorOutput,
     ):
         """
-        Verify and find accepted tokens based on logits output and batch
-        (which contains spec decoding information).
+        Verify draft tokens and produce selected predictions with per-request acceptance indices and acceptance lengths.
+        
+        Performs either deterministic (greedy) verification or probabilistic sampling according to the batch's sampling_info, optionally simulates additional accepted lengths, and increments each accept length by one to include a bonus token.
+        
+        Parameters:
+            batch: ModelWorkerBatch containing speculative decoding state and sampling_info used to drive verification.
+            logits_output: LogitsProcessorOutput whose `next_token_logits` are used to derive candidate probabilities or greedy targets.
+        
+        Returns:
+            predict (torch.Tensor): Flattened predicted token ids for all programs and speculative steps with shape (bs * (spec_steps + 1),).
+            accept_length (torch.Tensor): Per-request accepted token counts (after adding the bonus token) with shape (bs,).
+            accept_index (torch.Tensor): Per-request indices of accepted draft tokens with shape (bs, spec_steps + 1), where invalid entries are -1.
         """
         bs = len(batch.seq_lens)
         sampling_info = batch.sampling_info
@@ -306,6 +374,32 @@ def build_tree_kernel_efficient_tmp(
 ):
     # TODO(lsyin): make it compatible with default code path
     # TODO(lsyin): support cuda graph graph padding for eagle
+    """
+    Construct tree-related buffers used by the efficient tree-building kernel and return them together with the flattened draft token sequence.
+    
+    Parameters:
+        verified_id (torch.Tensor): Tensor of verified token ids with shape (bs,).
+        parent_list (List[torch.Tensor]): List of parent indices per draft token used to build tree adjacency.
+        top_scores_index (torch.Tensor): Top-score token indices for each candidate used to populate retrieval buffers.
+        draft_tokens (torch.Tensor): Draft token ids with shape (bs, num_draft_tokens).
+        seq_lens (torch.Tensor): Sequence lengths for each batch element (without draft tokens).
+        seq_lens_sum (int): Sum of values in `seq_lens`.
+        topk (int): Number of top candidates per step.
+        spec_steps (int): Number of speculative steps used for tree construction.
+        num_verify_tokens (int): Number of tokens to verify per batch element.
+        tree_mask_mode (TreeMaskMode): Mode controlling layout/packing of the tree attention mask.
+        tree_mask_buf (Optional[torch.Tensor]): Optional preallocated buffer to write the tree mask into.
+        position_buf (Optional[torch.Tensor]): Optional preallocated buffer to write per-token positions into.
+    
+    Returns:
+        tuple: (tree_mask, positions, retrive_index, retrive_next_token, retrive_next_sibling, draft_tokens)
+            - tree_mask (torch.Tensor): Attention mask for draft tokens in the layout determined by `tree_mask_mode`.
+            - positions (torch.Tensor): Flattened position indices indicating where each draft/verify token is placed in the sequence.
+            - retrive_index (torch.Tensor): Retrieval index buffer of shape (bs, num_verify_tokens) used to locate nodes.
+            - retrive_next_token (torch.Tensor): Retrieval buffer containing next-token indices for each node.
+            - retrive_next_sibling (torch.Tensor): Retrieval buffer containing next-sibling indices for each node.
+            - draft_tokens (torch.Tensor): Flattened tensor of draft tokens with the verified id prepended.
+    """
     draft_tokens = torch.cat((verified_id.unsqueeze(1), draft_tokens), dim=1).flatten()
 
     # seq_lens_sum == sum(seq_lens); seq_lens: sequence length without draft tokens
@@ -404,6 +498,27 @@ def select_top_k_tokens_tmp(
     topk: int,
 ):
     # FIXME(lsyin): remove this duplicate code
+    """
+    Selects top-k token candidates for a decoding step and prepares corresponding input ids, hidden states, scores, and tree metadata for tree-based speculative decoding.
+    
+    Parameters:
+        i (int): Decoding step index since extension; 0 indicates the first step after extension.
+        topk_p (torch.Tensor): Per-step top-k probabilities for each batch (shape: (batch, topk) for i==0 or shape compatible for later steps).
+        topk_index (torch.Tensor): Token indices corresponding to top-k probabilities (shape: (batch, topk) for i==0; reshaped internally for later steps).
+        hidden_states (torch.Tensor): Candidate hidden states aligned with current top-k candidates; repeated or reindexed depending on step.
+        scores (torch.Tensor): Current scores for candidate paths (shape: (batch, topk) for i>0).
+        topk (int): The top-k value used for selection and reshaping.
+    
+    Returns:
+        tuple:
+            input_ids (torch.Tensor): Flattened token ids selected for the next forward pass.
+            hidden_states (torch.Tensor): Hidden states aligned with the returned input_ids.
+            scores (torch.Tensor): Updated scores for the selected top-k candidates (shape: (batch, topk)).
+            tree_info (tuple): Metadata for reconstructing/speculative tree traversal containing:
+                - probabilities tensor used for tree expansion (shape varies by step),
+                - flattened token-index buffer used for gathering,
+                - integer indices used for tree position mapping (shape: (batch, topk)).
+    """
     if i == 0:
         # The first step after extend
         input_ids = topk_index.flatten()
@@ -453,6 +568,18 @@ def fill_new_verified_id(
 ):
     # NOTE: we cannot fuse any in-place operations of `accept_lens` inside this kernel
     # because this kernel reads accept_lens
+    """
+    Copy each program's verified token id at the current accepted length into the corresponding slot of `new_verified_id`.
+    
+    Parameters:
+        verified_id (Tensor): Flattened tensor of verified token ids organized as [program0_tokens..., program1_tokens..., ...].
+        accept_lens (Tensor): 1-D tensor of per-program accepted lengths; the kernel reads the value for the current program.
+        new_verified_id (Tensor): 1-D output tensor where the selected verified id for each program will be stored (written in-place).
+        num_draft_tokens (tl.constexpr): Compile-time constant number of draft tokens allocated per program.
+    
+    Returns:
+        None
+    """
     pid = tl.program_id(axis=0)
     accept_length = tl.load(accept_lens + pid)
 
@@ -468,6 +595,17 @@ def fill_accepted_out_cache_loc(
     accepted_out_cache_loc,
     size_upper: tl.constexpr,
 ):
+    """
+    Place the cache location corresponding to the program's accepted token into the compacted accepted cache array.
+    
+    For the current program (pid), count how many entries in `accept_index` at positions 0..pid-1 are valid (not -1); if `accept_index[pid]` is valid, load the corresponding entry from `out_cache_loc` and store it into `accepted_out_cache_loc` at the slot indexed by that count.
+    
+    Parameters:
+        accept_index (tensor): 1-D tensor of accepted indices per program where -1 indicates an invalid/missing entry.
+        out_cache_loc (tensor): Tensor of cache-location entries to copy from.
+        accepted_out_cache_loc (tensor): Destination tensor to receive compacted accepted cache locations.
+        size_upper (tl.constexpr): Compile-time upper bound for the length scanned in `accept_index`.
+    """
     pid = tl.program_id(axis=0)
     offset = tl.arange(0, size_upper)
 
@@ -489,6 +627,20 @@ def assign_extend_cache_locs(
     pool_len: tl.constexpr,
     bs_upper: tl.constexpr,
 ):
+    """
+    Assign cache locations for extended draft tokens by copying token data from per-request token pools into a contiguous output cache.
+    
+    For each program (batch element) this kernel copies the token entries in the range [start_offset[pid], end_offset[pid]) from the token pool referenced by req_pool_indices[pid] into out_cache_loc. Copies are concatenated across earlier batch elements to compute the destination offset so the result is a packed, per-batch contiguous block of extended token cache locations.
+    
+    Parameters:
+        req_pool_indices (tensor): Per-request indices selecting which token pool to use for each program.
+        req_to_token (tensor): Base pointer/array containing all token pools; an index into this plus req_pool_indices selects the pool start.
+        start_offset (tensor): Per-program start indices (inclusive) into the selected token pool.
+        end_offset (tensor): Per-program end indices (exclusive) into the selected token pool.
+        out_cache_loc (tensor): Output buffer that will be filled with the copied token entries; writes are packed per-batch.
+        pool_len (tl.constexpr): Length (stride) of a single token pool used to compute pool base pointers.
+        bs_upper (tl.constexpr): Upper bound on batch size used for internal indexing and masking.
+    """
     BLOCK_SIZE: tl.constexpr = 32
     pid = tl.program_id(axis=0)
     kv_start = tl.load(start_offset + pid)

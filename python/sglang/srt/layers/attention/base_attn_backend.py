@@ -52,14 +52,22 @@ class AttentionBackend(ABC):
         raise NotImplementedError()
 
     def get_cuda_graph_seq_len_fill_value(self):
-        """Get the fill value for padded seq lens. Typically, it is 0 or 1."""
+        """
+        Return the integer used to fill padded sequence lengths in CUDA graph captures (typically 0 or 1).
+        
+        Returns:
+            int: Fill value used for padded sequence lengths (e.g., 0 or 1).
+        """
         raise NotImplementedError()
 
     def get_verify_buffers_to_fill_after_draft(self):
         """
-        Return buffers of verify attention kernels that needs to be filled after draft.
-
-        Typically, these are tree mask and position buffers.
+        Identify buffers for verify-attention kernels that must be populated after a draft step.
+        
+        By default returns a two-element list with no mandated buffers; subclasses may override to provide the actual buffer objects (for example, tree mask and position buffers).
+        
+        Returns:
+            list: Two-element list of buffers to fill after draft; each element is a buffer object or `None`.
         """
         return [None, None]
 
@@ -67,10 +75,16 @@ class AttentionBackend(ABC):
         self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
     ):
         """
-        Update the buffers returned by get_verify_fill_after_draft_buffers if needed.
-
-        Here, we need to redo the computation of all metadata of the attention backend
-        that depends on tree mask and position buffers.
+        Update any backend metadata that depends on tree mask or position buffers after a draft step.
+        
+        This method should recompute or refresh internal buffers and metadata (for example, any verify-related buffers) that were returned by get_verify_buffers_to_fill_after_draft and which require new values once draft-stage buffers are available.
+        
+        Parameters:
+            spec_info (SpecInput): Specification object providing input shapes, masks, or other per-request metadata required to recompute buffers.
+            cuda_graph_bs (Optional[int]): CUDA-graph batch size used when capturing/replaying graphs, or None if not using CUDA graphs.
+        
+        Raises:
+            NotImplementedError: If the backend does not implement this update behavior.
         """
         raise NotImplementedError()
 
@@ -84,7 +98,15 @@ class AttentionBackend(ABC):
         save_kv_cache: bool = True,
         **kwargs,
     ):
-        """Run forward on an attention layer."""
+        """
+        Dispatches the appropriate attention forward path based on the forward batch mode.
+        
+        If forward_batch.forward_mode is idle, returns an empty tensor with shape (batch_size, layer.tp_q_head_num * layer.v_head_dim).
+        If forward_batch.forward_mode is decode, delegates to forward_decode; otherwise delegates to forward_extend.
+        
+        Returns:
+            torch.Tensor: Attention output from the chosen path. For idle mode, an empty tensor with the shape described above.
+        """
         if forward_batch.forward_mode.is_idle():
             return q.new_empty(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
         elif forward_batch.forward_mode.is_decode():

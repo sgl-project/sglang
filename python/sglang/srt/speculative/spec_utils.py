@@ -394,6 +394,29 @@ def select_top_k_tokens(
     scores: torch.Tensor,
     topk: int,
 ):
+    """
+    Select and expand the top-k token hypotheses for the current decode step and prepare tree bookkeeping.
+    
+    When i == 0, initializes repeated hidden states, flattened input ids from topk_index, and scores from topk_p for the first extension step; builds initial tree_info containing per-hypothesis probabilities, token indices, and a relative index array. For i > 0, computes pairwise expanded scores between existing hypotheses and candidate continuations, selects the top-k combined hypotheses, gathers corresponding input ids and hidden states, updates scores, and builds tree_info containing the expanded score tensor, flattened parent-token index map, and adjusted top-k indices.
+    
+    Parameters:
+        i (int): Decode step index (0 for the first step after extend, >0 for subsequent steps).
+        topk_p (torch.Tensor): Per-batch candidate probabilities for this step with shape (batch, topk) when i == 0, or used for expansion when i > 0.
+        topk_index (torch.Tensor): Candidate token indices per batch; shape (batch, topk) for i == 0 and (batch, topk*topk) for i > 0 after reshaping.
+        hidden_states (torch.Tensor): Hidden states corresponding to current hypotheses; may be empty. Rows align with hypotheses in multiples of `topk`.
+        scores (torch.Tensor): Current hypothesis scores with shape (batch, topk) for i > 0, ignored for i == 0.
+        topk (int): Number of hypotheses to keep per batch.
+    
+    Returns:
+        tuple:
+            input_ids (torch.Tensor): Flattened token ids for the selected top-k hypotheses across the batch.
+            hidden_states (torch.Tensor): Hidden states reindexed to match the selected hypotheses.
+            scores (torch.Tensor): Updated scores for the selected hypotheses with shape (batch, topk).
+            tree_info (tuple): A tuple carrying bookkeeping information:
+                - expand_scores (torch.Tensor) : For i==0, a tensor of shape (batch, 1, topk) containing topk_p; for i>0, the expanded score tensor of shape (batch, topk, topk).
+                - topk_index (torch.Tensor) : Token index map (shape varies by step).
+                - topk_cs_index (torch.Tensor) : Adjusted indices used to trace selected hypotheses (shape (batch, topk)).
+    """
     if i == 0:
         # The first step after extend
         input_ids = topk_index.flatten()
@@ -444,6 +467,28 @@ def generate_simulated_accept_index(
     simulate_acc_len: float = SIMULATE_ACC_LEN,
     simulate_acc_method: str = SIMULATE_ACC_METHOD,
 ):
+    """
+    Generate a simulated accept index matrix for benchmarking and update accept/predict tensors accordingly.
+    
+    Parameters:
+        accept_index (Tensor): Tensor of shape (bs, >=1) containing base accept indices; first column is used as the starting offset.
+        predict (Tensor): Tensor that will be filled in-place with a placeholder token id to mark valid predictions.
+        accept_length (Tensor): Tensor updated in-place to the simulated acceptance length - 1 for every batch entry.
+        bs (int): Batch size.
+        spec_steps (int): Maximum number of speculative steps.
+        simulate_acc_len (float): Expected simulated acceptance length (must be > 0).
+        simulate_acc_method (str): Method to derive the simulated length; supported values are "multinomial" and "match-expected".
+    
+    Returns:
+        Tensor: An int32 tensor of shape (bs, spec_steps + 1) containing simulated accept indices with unused positions set to -1.
+    
+    Side effects:
+        - Modifies `accept_length` in-place to all be `simulated_length - 1`.
+        - Modifies `predict` in-place by filling it with a placeholder token id (100).
+    
+    Raises:
+        ValueError: If `simulate_acc_method` is not one of the supported methods.
+    """
     assert simulate_acc_len > 0.0
 
     if simulate_acc_method == "multinomial":

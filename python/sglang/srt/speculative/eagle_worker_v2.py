@@ -38,6 +38,11 @@ class EAGLEWorkerV2(EAGLEWorker):
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
+        """
+        Initialize an EAGLEWorkerV2 and configure speculative-drafting and CUDA plan stream state.
+        
+        Sets up per-decode allocation sizing for draft inputs, selects the tree mask mode for drafting, and creates a dedicated CUDA plan stream and its context used for verification/draft planning and synchronization.
+        """
         super().__init__(
             server_args,
             gpu_id,
@@ -56,6 +61,17 @@ class EAGLEWorkerV2(EAGLEWorker):
         self.plan_stream_ctx = torch.cuda.stream(self.plan_stream)
 
     def forward_batch_generation(self, model_worker_batch: ModelWorkerBatch):
+        """
+        Dispatches the forward pass for a generation batch, using the speculative draft/verify flow for decode and a two-stage prefill for non-decode.
+        
+        For decode mode: expects model_worker_batch.spec_info to be an EagleDraftInput, runs a draft to produce an EagleVerifyInput, replaces model_worker_batch.spec_info with that verify input, and performs verification; returns the verification batch result. For non-decode mode: runs a target prefill with full hidden capture, then runs a draft prefill with last-hidden capture, attaches the resulting draft input to the returned batch output as `next_draft_input`.
+        
+        Parameters:
+            model_worker_batch: the ModelWorkerBatch to process; in decode mode its `spec_info` must be an EagleDraftInput and will be replaced with an EagleVerifyInput as a side effect.
+        
+        Returns:
+            The batch processing result containing logits and generation state; in non-decode mode the result will include `next_draft_input`.
+        """
         if model_worker_batch.forward_mode.is_decode():
             # FIXME(lsyin): why shall we use spec_info for both draft and verify?
             draft_input: EagleDraftInput = model_worker_batch.spec_info
@@ -82,6 +98,14 @@ class EAGLEWorkerV2(EAGLEWorker):
             return batch_output
 
     def draft(self, model_worker_batch: ModelWorkerBatch):
+        """
+        Prepare and execute a speculative draft pass for the provided batch and build an EagleVerifyInput for the subsequent verification stage.
+        
+        Runs the draft forward (using a CUDA graph replay when available or the draft_forward path), builds tree-based verify buffers (mask and positions), and returns an EagleVerifyInput populated with the selected draft tokens, mask, positions, and retrieval metadata required by the verifier.
+        
+        Returns:
+            EagleVerifyInput: Contains `draft_token`, `custom_mask`, `positions`, `retrive_index`, `retrive_next_token`, `retrive_next_sibling`, and related speculative parameters used for verification.
+        """
         draft_input: EagleDraftInput = model_worker_batch.spec_info
         forward_batch, can_cuda_graph = draft_input.prepare_for_v2_draft(
             self.req_to_token_pool,
@@ -149,6 +173,17 @@ class EAGLEWorkerV2(EAGLEWorker):
 
     def draft_forward(self, forward_batch: ForwardBatch):
         # Parse args
+        """
+        Selects speculative draft tokens and their parent indices across multiple speculative steps.
+        
+        Parameters:
+            forward_batch (ForwardBatch): Input batch for draft extension; must include a populated `spec_info` (EagleDraftInput) and `out_cache_loc`.
+        
+        Returns:
+            parent_list (torch.Tensor): Concatenated parent indices for each selected draft token (shape: batch_size x num_parents).
+            top_scores_index (torch.Tensor): Sorted indices of the chosen top-scoring entries per batch used to pick draft tokens (shape: batch_size x (speculative_num_draft_tokens - 1)).
+            draft_tokens (torch.Tensor): Selected draft token IDs per batch (shape: batch_size x (speculative_num_draft_tokens - 1)).
+        """
         spec_info: EagleDraftInput = forward_batch.spec_info
         out_cache_loc = forward_batch.out_cache_loc
         topk_p, topk_index, hidden_states = (
@@ -231,6 +266,22 @@ class EAGLEWorkerV2(EAGLEWorker):
         pre_draft_allocate_lens: torch.Tensor,
     ):
         # Parse args
+        """
+        Run target verification for a generation batch, move accepted tokens into the target KV cache, perform a draft extension, and return results needed for the next speculative step.
+        
+        Parameters:
+            batch (ModelWorkerBatch): The batch to verify; must contain an EagleVerifyInput in batch.spec_info.
+            pre_draft_allocate_lens (torch.Tensor): Allocation lengths used for the draft stage prior to verification; preserved and returned as last_batch_allocate_lens.
+        
+        Returns:
+            GenerationBatchResult: Contains:
+                - logits_output: the target model's logits and hidden states from verification,
+                - next_token_ids: sampled token ids from verification,
+                - can_run_cuda_graph: whether the prepared verify forward batch can use a CUDA graph,
+                - next_draft_input: an EagleDraftInput prepopulated with top-k probabilities/indices, hidden states, verified ids, updated sequence lengths, allocate_lens, and a CUDA event marking verify completion,
+                - accept_lens: lengths accepted by verification for each sequence,
+                - last_batch_allocate_lens: the provided pre_draft_allocate_lens tensor.
+        """
         verify_input: EagleVerifyInput = batch.spec_info
         seq_lens_backup = batch.seq_lens
         bs = len(batch.seq_lens)
@@ -371,12 +422,15 @@ class EAGLEWorkerV2(EAGLEWorker):
         next_token_ids: torch.Tensor,
     ):
         """
-        Run draft model extend to correctly fill the KV cache.
-
-        Args:
-            batch: The batch to run.
-            target_hidden_states: Hidden states from the target model forward
-            next_token_ids: Next token ids generated from the target forward.
+        Extend the draft model by one step to populate the draft KV cache and produce the next draft input.
+        
+        Parameters:
+            batch: ModelWorkerBatch whose input_ids are updated in-place to append the provided next tokens per sequence and whose spec_info is set to the returned draft input.
+            target_hidden_states: Hidden states produced by the target model, aligned with the batch sequences.
+            next_token_ids: 1-D tensor of next-token ids, one entry per sequence in the batch.
+        
+        Returns:
+            EagleDraftInput: A draft input prepared for the next speculative step with updated `topk_p`, `topk_index`, `hidden_states`, `verified_id`, `new_seq_lens`, and `allocate_lens`.
         """
         # Construct input_ids
         pt = 0
@@ -415,12 +469,14 @@ class EAGLEWorkerV2(EAGLEWorker):
         accept_length: torch.Tensor,
     ):
         """
-        Move accepted tokens to the target KV cache.
-
-        Args:
-            batch: The batch to run.
-            accept_index: The index of the accepted tokens.
-            accept_length: The length of the accepted tokens.
+        Move KV-cache entries for accepted speculative draft tokens into the target model's KV cache.
+        
+        This computes per-request target cache locations and source (accepted) out-cache locations for all speculative draft tokens (using the batch, the worker's speculative_num_draft_tokens and req-to-token pool mapping), then instructs the token-to-KV allocator to move those KV cache entries into the target KV cache.
+        
+        Parameters:
+            batch (ModelWorkerBatch): Batch containing sequence lengths, request pool indices, and out-cache locations used to compute cache addresses.
+            accept_index (torch.Tensor): Indices of accepted tokens within the draft out-cache for each accepted position.
+            accept_length (torch.Tensor): Number of accepted tokens per batch element; used to compute ranges of tokens to move.
         """
         bs = len(batch.seq_lens)
         size = bs * self.speculative_num_draft_tokens
@@ -453,6 +509,17 @@ class EAGLEWorkerV2(EAGLEWorker):
         )
 
     def _detect_nan_if_needed(self, logits_output: LogitsProcessorOutput):
+        """
+        Check the logits for NaN values when NaN detection is enabled and raise an error if any are found.
+        
+        When `self.enable_nan_detection` is true, inspects `logits_output.next_token_logits`. If any NaN values are present, an error is logged and a ValueError is raised.
+        
+        Parameters:
+            logits_output (LogitsProcessorOutput): Object containing `next_token_logits` to be checked.
+        
+        Raises:
+            ValueError: If any NaN values are found in `logits_output.next_token_logits`.
+        """
         if self.enable_nan_detection:
             logits = logits_output.next_token_logits
             if torch.any(torch.isnan(logits)):
@@ -470,6 +537,21 @@ def free_spec_dec_tokens_page_size_1(
     # FIXME(lsyin): move this function elsewhere
 
     # free extra allocated tokens
+    """
+    Free extra speculative decode token slots allocated for a request by releasing their indices back to the KV pool allocator.
+    
+    Parameters:
+        req_to_token_pool (ReqToTokenPool): Mapping from request pool indices to allocated token index lists.
+        token_to_kv_pool_allocator (TokenToKVPoolAllocator): Allocator used to free token indices.
+        req (Req): Request whose allocated tokens are to be trimmed; its `req_pool_idx` selects the allocation row.
+        allocate_len (int): Total number of token slots that were allocated for this request.
+        new_seq_len (int | None): The sequence length actually used. If `None`, computes the start of unused slots as
+            `allocate_len - EagleDraftInput.ALLOC_LEN_PER_DECODE`; otherwise uses `new_seq_len` as the start.
+    
+    Side effects:
+        Calls `token_to_kv_pool_allocator.free` with the slice of indices from the selected allocation between
+        the computed start and `allocate_len`.
+    """
     if new_seq_len is None:
         # True only for overlap eagle and the current batch is decode. This seq will be part of the decode, so the final iteration's allocation is not used (i.e. this case).
         start_len = allocate_len - EagleDraftInput.ALLOC_LEN_PER_DECODE

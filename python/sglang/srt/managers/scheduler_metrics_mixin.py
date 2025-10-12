@@ -64,12 +64,25 @@ class SchedulerMetricsMixin:
             self.metrics_collector = SchedulerMetricsCollector(labels=labels)
 
     def init_kv_events(self: Scheduler, kv_events_config: Optional[str]):
+        """
+        Initialize KV cache event publishing when KV events are enabled.
+        
+        Parameters:
+            kv_events_config (Optional[str]): Configuration string or connection info passed to the EventPublisherFactory to create the KV event publisher. If None, a default publisher configuration is used.
+        """
         if self.enable_kv_cache_events:
             self.kv_event_publisher = EventPublisherFactory.create(
                 kv_events_config, self.attn_dp_rank
             )
 
     def update_spec_metrics(self: Scheduler, bs: int, num_accepted_tokens: int):
+        """
+        Update speculative-generation counters for the current step.
+        
+        Parameters:
+            bs (int): Number of sequences in the current batch (batch size); increments forward-count and contributes to total accepted tokens.
+            num_accepted_tokens (int): Number of tokens accepted by speculative decoding for this step; increments total accepted and generated token counters.
+        """
         self.spec_num_total_accepted_tokens += num_accepted_tokens + bs
         self.spec_num_total_forward_ct += bs
         self.num_generated_tokens += num_accepted_tokens

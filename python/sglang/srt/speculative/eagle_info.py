@@ -190,14 +190,24 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         vocab_mask: Optional[torch.Tensor] = None,  # For grammar
     ) -> torch.Tensor:
         """
-        Verify and find accepted tokens based on logits output and batch
-        (which contains spec decoding information).
-
-        WARNING: This API in-place modifies the states of logits_output
-
-        This API updates values inside logits_output based on the accepted
-        tokens. I.e., logits_output.next_token_logits only contains
-        accepted token logits.
+        Perform speculative verification on a batch using provided logits and produce the next draft input.
+        
+        This function determines accepted tokens from logits_output for speculative decoding, updates logits_output in place so that next_token_logits only contains logits for accepted tokens, frees or rearranges KV cache slots via token_to_kv_pool_allocator, updates batch sequence lengths and request states, and returns an EagleVerifyOutput describing the drafted continuation (or an idle draft when all requests finished). The function also applies custom logit processors, penalties, and optional grammar masking before sampling/verification and supports both greedy and tree-speculative sampling paths (falling back to greedy when the tree kernel is unavailable).
+        
+        Parameters:
+            batch: ScheduleBatch containing the requests, KV cache locations, spec info, and sampling_info used for verification.
+            logits_output: LogitsProcessorOutput whose `next_token_logits` will be modified in place to reflect accepted-token logits and which is returned inside the output.
+            token_to_kv_pool_allocator: Allocator used to free or move KV cache slots corresponding to unaccepted tokens.
+            page_size: Page size used by the KV cache allocator; affects eviction and movement behavior.
+            vocab_mask: Optional tensor used for grammar-based vocabulary masking; when provided the function expects batch or self to provide a corresponding grammar to apply the mask.
+        
+        Returns:
+            EagleVerifyOutput: Result object containing:
+              - draft_input: EagleDraftInput for the next draft/extend step (or an idle draft when all requests finished).
+              - logits_output: The same LogitsProcessorOutput instance passed in (mutated).
+              - verified_id: Tensor of the accepted token ids.
+              - accept_length_per_req_cpu: List[int] of per-request accepted lengths on CPU.
+              - accepted_indices: Tensor of indices indicating accepted tokens per request.
         """
         if batch.forward_mode.is_idle():
             return EagleVerifyOutput(
@@ -613,6 +623,9 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     ALLOC_LEN_PER_DECODE: ClassVar[int] = None
 
     def __post_init__(self):
+        """
+        Perform post-initialization by registering this instance as an EAGLE_DRAFT SpecInput.
+        """
         super().__init__(SpecInputType.EAGLE_DRAFT)
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
@@ -692,6 +705,21 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         paged_kernel_lens_sum: int,
         req_to_token: torch.Tensor,
     ):
+        """
+        Builds attention-prefill index structures required by the prefill kernel for verification.
+        
+        Parameters:
+            req_pool_indices (torch.Tensor): Index mapping from each request's pool slot to its global token slot.
+            paged_kernel_lens (torch.Tensor): 1-D tensor of per-request KV lengths (number of KV entries per request).
+            paged_kernel_lens_sum (int | None): Total sum of `paged_kernel_lens`, or `None` to compute it.
+            req_to_token (torch.Tensor): Request-to-token mapping tensor used by the triton kernel (shape: batch_size x tokens_per_request).
+        
+        Returns:
+            kv_indices (torch.Tensor): Flat int32 tensor of KV indices arranged for the prefill kernel.
+            cum_kv_seq_len (torch.Tensor): 1-D int32 tensor of cumulative KV lengths with a leading zero (size batch_size+1).
+            qo_indptr (torch.Tensor): 1-D int32 tensor of cumulative accept lengths with a leading zero (size batch_size+1).
+            None: Placeholder for a custom mask (always `None` here).
+        """
         bs = self.accept_length.numel()
         qo_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device="cuda")
         qo_indptr[1:] = torch.cumsum(self.accept_length, dim=0)
@@ -717,6 +745,16 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         return kv_indices, cum_kv_seq_len, qo_indptr, None
 
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
+        """
+        Filter internal batch buffers to retain only entries specified by `new_indices`.
+        
+        If `future_indices` is set, updates that structure and `allocate_lens` and returns. Otherwise, either trims (when `has_been_filtered=True`) or indexes (when `has_been_filtered=False`) the per-candidate tensors: `topk_p`, `topk_index`, `hidden_states`, and `verified_id`.
+        
+        Parameters:
+            new_indices (torch.Tensor): 1D index tensor selecting which entries to keep.
+            has_been_filtered (bool): When True, the batch has already been pre-filtered by external logic and the buffers
+                should be trimmed to the length of `new_indices`; when False, buffers should be indexed by `new_indices`.
+        """
         if self.future_indices is not None:
             self.future_indices.indices = self.future_indices.indices[new_indices]
             self.allocate_lens = self.allocate_lens[new_indices]
@@ -741,6 +779,20 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             self.verified_id = self.verified_id[new_indices]
 
     def merge_batch(self, spec_info: "EagleDraftInput"):
+        """
+        Merge another EagleDraftInput into this instance, updating internal buffers in-place.
+        
+        If this instance has `future_indices` set, the other's `future_indices` and `allocate_lens`
+        are concatenated onto this instance (an assertion requires the other's `future_indices`
+        to be present). Otherwise, hidden-state and candidate buffers are merged:
+        - If this instance has no `hidden_states`, it adopts the other's `hidden_states`,
+          `verified_id`, `topk_p`, and `topk_index`.
+        - If both have `hidden_states`, those tensors plus `verified_id`, `topk_p`, and
+          `topk_index` are concatenated along the batch dimension.
+        
+        Parameters:
+            spec_info (EagleDraftInput): The draft input whose buffers will be merged into this one.
+        """
         if self.future_indices is not None:
             assert spec_info.future_indices is not None
             self.future_indices = FutureIndices(

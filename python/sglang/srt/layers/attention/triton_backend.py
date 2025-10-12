@@ -59,6 +59,14 @@ class TritonAttnBackend(AttentionBackend):
         kv_indptr_buf: Optional[torch.Tensor] = None,
     ):
         # Lazy import to avoid the initialization of cuda context
+        """
+        Initialize a Triton-based attention backend, configure runtime options from the model runner, and allocate necessary KV/indexing buffers and forward metadata placeholders.
+        
+        Parameters:
+            model_runner (ModelRunner): Runner providing model configuration, device information, token pools, and server runtime settings.
+            skip_prefill (bool): If True, do not allocate per-request prefill buffers (qo_indptr and mask_indptr).
+            kv_indptr_buf (Optional[torch.Tensor]): Optional external buffer to use for KV indirection pointers; when provided it will be used for self.kv_indptr (and cloned for the sliding-window secondary buffer if required).
+        """
         from sglang.srt.layers.attention.triton_ops.decode_attention import (
             decode_attention_fwd,
         )
@@ -169,6 +177,25 @@ class TritonAttnBackend(AttentionBackend):
         num_kv_splits: torch.Tensor,
         seq_lens: torch.Tensor,
     ):
+        """
+        Compute and fill per-token KV split counts based on sequence lengths and backend configuration.
+        
+        Parameters:
+            num_kv_splits (torch.Tensor): 1D int32 tensor to be filled in-place with the number of KV splits for each token group (length = num_token).
+            seq_lens (torch.Tensor): 1D int32 tensor of sequence lengths for each sequence in the batch (length = num_seq).
+        
+        Behavior:
+            - Validates that num_kv_splits represents an integer number of groups per sequence.
+            - In legacy (non-deterministic) mode or when static splits are requested, fills `num_kv_splits` with `self.max_kv_splits`.
+            - In deterministic mode with a configured `self.split_tile_size`, computes splits per (possibly repeated) sequence length using ceiling division by the tile size.
+            - Otherwise invokes a Triton kernel to compute an adaptive per-token split schedule based on hardware and sequence statistics.
+        
+        Returns:
+            None (modifies `num_kv_splits` in place).
+        
+        Raises:
+            AssertionError: if `num_kv_splits` length is not an integer multiple of `seq_lens` length.
+        """
         num_token, num_seq = num_kv_splits.shape[0], seq_lens.shape[0]
         # NOTE(alcanderian): Considering speculative_decodeing,
         # num_kv_splits.shape[0] will be topk * real_num_token.
@@ -755,19 +782,35 @@ class TritonAttnBackend(AttentionBackend):
             )
 
     def get_cuda_graph_seq_len_fill_value(self):
+        """
+        Return the integer used to fill sequence-length placeholders when preparing CUDA graph inputs.
+        
+        Returns:
+            int: The fill value `1`.
+        """
         return 1
 
     def get_verify_buffers_to_fill_after_draft(self):
         """
-        Return buffers for verify attention kernels that needs to be filled after draft.
-
-        Typically, these are tree mask and position buffers.
+        List buffers that must be populated after a draft phase for verification attention kernels.
+        
+        Returns:
+            list: A two-element list of buffers to fill after draft: the first element is the custom mask buffer (`self.cuda_graph_custom_mask`) or `None`, the second element is reserved for future use (currently `None`).
         """
         return [self.cuda_graph_custom_mask, None]
 
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
     ):
+        """
+        Update buffers that must be filled after a drafting phase for CUDA-graph verification.
+        
+        Called with the speculative decoding metadata and the CUDA-graph batch size to allow the backend to populate or record any buffers (for example, custom masks) that must be written after drafting and before verification. The default implementation performs no action.
+        
+        Parameters:
+            spec_info (SpecInput): Speculative decoding metadata for the current draft.
+            cuda_graph_bs (Optional[int]): Batch size used for CUDA-graph capture/replay, or None if not applicable.
+        """
         pass
 
     def forward_extend(
@@ -781,6 +824,25 @@ class TritonAttnBackend(AttentionBackend):
         sinks=None,
     ):
         # TODO: reuse the buffer across layers
+        """
+        Compute the attention output for an extend decoding step and invoke the Triton extend attention kernel.
+        
+        Parameters:
+            q (torch.Tensor): Query tensor shaped (tokens, tp_q_head_num * qk_head_dim) or compatible view.
+            k (torch.Tensor): Key tensor for the current token(s).
+            v (torch.Tensor): Value tensor for the current token(s).
+            layer (RadixAttention): Attention layer metadata (head dims, scaling, sliding window config, logit capping, etc.).
+            forward_batch (ForwardBatch): Per-request buffers and utilities (including token-to-KV pool and forward metadata).
+            save_kv_cache (bool): If True, store the provided k/v into the forward_batch's KV pool for later reuse.
+            sinks (optional): Diagnostic or auxiliary sink object forwarded to the triton kernel (may be None).
+        
+        Returns:
+            torch.Tensor: Output tensor `o` containing the attention result for the provided queries. Shape is either
+            (tokens, tp_q_head_num * v_head_dim) when qk and v head dims differ, or matches `q` when they are equal.
+        
+        Side effects:
+            When `save_kv_cache` is True, writes the k/v tensors into forward_batch.token_to_kv_pool for the layer.
+        """
         if layer.qk_head_dim != layer.v_head_dim:
             o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
         else:

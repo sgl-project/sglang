@@ -1093,6 +1093,27 @@ class ServerArgs:
                 )
 
     def _handle_speculative_decoding(self):
+        """
+        Normalize and validate speculative decoding configuration and apply related side-effecting defaults on the ServerArgs instance.
+        
+        This method:
+        - Normalizes legacy algorithm name "NEXTN" to "EAGLE".
+        - For EAGLE/EAGLE3/STANDALONE:
+          - Enforces that STANDALONE cannot be used with data-parallel attention.
+          - Sets a default max_running_requests when unset.
+          - Toggles overlap scheduling according to the new beta-spec flag and disables mixed-chunk prefill.
+          - Sets a draft model path for specific DeepSeek/MoE architectures if not provided.
+          - Auto-selects speculative parameters (num steps, top-k, draft tokens) when unset.
+          - Validates compatibility constraints with certain attention backends and page sizes and adjusts speculative_draft_tokens when top-k == 1.
+        - For NGRAM:
+          - Restricts usage to CUDA devices, sets defaults, disables overlap scheduling and mixed-chunk prefill, and maps ngram parameters to eagle_topk/draft tokens.
+          - Rejects use with data-parallel attention.
+        - Emits warnings when it changes scheduling, mixed-chunk, or draft-token settings.
+        - May raise ValueError when configuration combinations are unsupported:
+          - Using STANDALONE or NGRAM with DP attention.
+          - trtllm_mha backend with speculative_eagle_topk > 1.
+          - speculative_eagle_topk > 1 combined with page_size > 1 on non-flashinfer backends.
+        """
         if self.speculative_algorithm == "NEXTN":
             self.speculative_algorithm = "EAGLE"
 
@@ -1341,6 +1362,14 @@ class ServerArgs:
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
         # Model and tokenizer
+        """
+        Register command-line arguments on the given ArgumentParser for configuring the model serving server.
+        
+        This function adds a comprehensive set of CLI options covering model and tokenizer selection, HTTP server settings, quantization and data types, memory and scheduling, runtime and device options, logging and metrics, API behavior, data/multi-node parallelism, LoRA, kernel and attention backends, speculative decoding, expert-parallelism (MoE) settings, hierarchical and mamba caches, double-sparsity, offloading, optimization and debug flags, PD disaggregation and PD-multiplexing, custom weight loader options, deterministic inference, several deprecated flags that raise errors, and configuration-file support.
+        
+        Parameters:
+            parser (argparse.ArgumentParser): The argument parser to which the CLI options will be added.
+        """
         parser.add_argument(
             "--model-path",
             "--model",

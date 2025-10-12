@@ -107,13 +107,31 @@ class ForwardMode(IntEnum):
         return self == ForwardMode.TARGET_VERIFY
 
     def is_draft_extend(self):
+        """
+        Determine whether this ForwardMode represents a draft-extend operation.
+        
+        Returns:
+            `True` if the mode is `DRAFT_EXTEND`, `False` otherwise.
+        """
         return self == ForwardMode.DRAFT_EXTEND
 
     def is_draft_extend_v2(self):
         # For fixed shape logits output in v2 eagle worker
+        """
+        Indicates whether the forward mode is the DRAFT_EXTEND_V2 variant.
+        
+        Returns:
+            True if the mode is DRAFT_EXTEND_V2, False otherwise.
+        """
         return self == ForwardMode.DRAFT_EXTEND_V2
 
     def is_extend_or_draft_extend_or_mixed(self):
+        """
+        Check whether the mode represents an extend-like operation (EXTEND, DRAFT_EXTEND, MIXED, or SPLIT_PREFILL).
+        
+        Returns:
+            True if the mode is EXTEND, DRAFT_EXTEND, MIXED, or SPLIT_PREFILL, False otherwise.
+        """
         return (
             self == ForwardMode.EXTEND
             or self == ForwardMode.DRAFT_EXTEND

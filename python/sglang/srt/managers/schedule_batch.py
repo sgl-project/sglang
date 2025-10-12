@@ -36,7 +36,6 @@ TODO(lmzheng): ModelWorkerBatch seems a bit redundant and we consider removing i
 import copy
 import dataclasses
 import logging
-import re
 import threading
 import time
 from enum import Enum, auto
@@ -149,18 +148,6 @@ class FINISH_MATCHED_TOKEN(BaseFinishReason):
 
 
 class FINISH_MATCHED_STR(BaseFinishReason):
-    def __init__(self, matched: str):
-        super().__init__()
-        self.matched = matched
-
-    def to_json(self):
-        return {
-            "type": "stop",  # to match OpenAI API's return value
-            "matched": self.matched,
-        }
-
-
-class FINISHED_MATCHED_REGEX(BaseFinishReason):
     def __init__(self, matched: str):
         super().__init__()
         self.matched = matched
@@ -753,17 +740,8 @@ class Req:
         return self.surr_and_decode_ids, self.read_offset - self.surr_offset
 
     def tail_str(self) -> str:
-        # Check stop strings and stop regex patterns together
-        if (
-            len(self.sampling_params.stop_strs) > 0
-            or len(self.sampling_params.stop_regex_strs) > 0
-        ):
-            max_len_tail_str = max(
-                self.sampling_params.stop_str_max_len + 1,
-                self.sampling_params.stop_regex_max_len + 1,
-            )
-
-        tail_len = min((max_len_tail_str + 1), len(self.output_ids))
+        tail_len = self.sampling_params.stop_str_max_len + 1
+        tail_len = min(tail_len, len(self.output_ids))
         return self.tokenizer.decode(self.output_ids[-tail_len:])
 
     def check_match_stop_str_prefix(self) -> bool:
@@ -844,27 +822,14 @@ class Req:
             self.finished_reason = FINISH_MATCHED_STR(matched="NaN happened")
             return
 
-        if (
-            len(self.sampling_params.stop_strs) > 0
-            or len(self.sampling_params.stop_regex_strs) > 0
-        ):
+        # Check stop strings
+        if len(self.sampling_params.stop_strs) > 0:
             tail_str = self.tail_str()
 
-            # Check stop strings
-            if len(self.sampling_params.stop_strs) > 0:
-                for stop_str in self.sampling_params.stop_strs:
-                    if stop_str in tail_str or stop_str in self.decoded_text:
-                        self.finished_reason = FINISH_MATCHED_STR(matched=stop_str)
-                        return
-
-            # Check stop regex
-            if len(self.sampling_params.stop_regex_strs) > 0:
-                for stop_regex_str in self.sampling_params.stop_regex_strs:
-                    if re.search(stop_regex_str, tail_str):
-                        self.finished_reason = FINISHED_MATCHED_REGEX(
-                            matched=stop_regex_str
-                        )
-                        return
+            for stop_str in self.sampling_params.stop_strs:
+                if stop_str in tail_str or stop_str in self.decoded_text:
+                    self.finished_reason = FINISH_MATCHED_STR(matched=stop_str)
+                    return
 
     def reset_for_retract(self):
         self.prefix_indices = torch.empty((0,), dtype=torch.int64)
@@ -1070,9 +1035,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return len(self.reqs)
 
     def is_empty(self):
+        """
+        Check whether this ScheduleBatch contains no requests.
+        
+        Returns:
+            True if the batch contains no requests, False otherwise.
+        """
         return len(self.reqs) == 0
 
     def allocate_for_eagle_v2(self):
+        """
+        Allocate and assign additional token slots for an Eagle v2 speculative draft before decode.
+        
+        This method waits for draft verification if pending, computes the new per-request allocation lengths for one decode step, reserves the required token slots from the tree cache, assigns requests to those token pool slots, updates the draft's allocation lengths, and refreshes the batch's CPU-side sequence length view and total sequence length.
+        """
         from sglang.srt.speculative.eagle_info import EagleDraftInput
         from sglang.srt.speculative.spec_utils import assign_req_to_token_pool
 
@@ -1105,6 +1081,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_sum = self.seq_lens_cpu.sum().item()
 
     def prepare_encoder_info_extend(self, input_ids: List[int], seq_lens: List[int]):
+        """
+        Prepare and separate encoder-side and decoder-side inputs for extend mode, updating batch tensors and cache locations accordingly.
+        
+        This computes per-request encoder lengths from multimodal inputs, marks whether encoder output is already cached, removes encoder tokens from per-request input lists and sequence lengths, and rebuilds the batch tensors used for decoder forwarding (input_ids, seq_lens, seq_lens_cpu, out_cache_loc) as well as encoder-side cache locations (encoder_out_cache_loc) and encoder length tensors.
+        
+        Parameters:
+            input_ids (List[List[int]]): Per-request lists of token ids; encoder tokens will be removed in-place from each request's list.
+            seq_lens (List[int]): Per-request sequence lengths corresponding to the original input_ids; values will be decremented in-place to reflect removal of encoder tokens.
+        """
         self.encoder_lens_cpu = []
         self.encoder_cached = []
 
@@ -1530,6 +1515,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.encoder_cached = [True] * len(self.reqs)
 
     def prepare_for_idle(self):
+        """
+        Reset the ScheduleBatch to an idle state, clearing all per-batch tensors and counters.
+        
+        Reinitializes tensors that hold input ids, sequence lengths (both device and CPU views), original sequence lengths, output cache locations, and request pool indices, and resets aggregate counters such as `seq_lens_sum` and `extend_num_tokens`. Also rebuilds `sampling_info` for the cleared batch.
+        """
         self.forward_mode = ForwardMode.IDLE
         self.input_ids = torch.empty(0, dtype=torch.int64, device=self.device)
         self.seq_lens = torch.empty(0, dtype=torch.int64, device=self.device)
@@ -1547,9 +1537,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     @property
     def is_v2_eagle(self):
         # FIXME: finally deprecate is_v2_eagle
+        """
+        Indicates whether this ScheduleBatch is using Eagle v2 overlap-based decoding.
+        
+        Returns:
+            bool: `True` if overlap scheduling is enabled and the configured speculative algorithm reports Eagle mode, `False` otherwise.
+        """
         return self.enable_overlap and self.spec_algorithm.is_eagle()
 
     def prepare_for_decode(self):
+        """
+        Prepare the schedule batch for decoding: switch to decode mode, handle Eagle v2 allocation and speculative-decoding early-exit, apply sampling penalizer updates, move current outputs to inputs, prepare encoder-related decode state if needed, allocate decode KV cache slots, and increment per-request sequence lengths and their sum.
+        """
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
 
@@ -1609,6 +1608,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_sum += bs
 
     def maybe_wait_verify_done(self):
+        """
+        Waits for speculative Eagle v2 draft verification to complete when applicable.
+        
+        If this batch is running in Eagle v2 speculative mode and its `spec_info` contains a `verify_done` synchronization primitive, this method blocks until that verification is finished.
+        """
         if self.is_v2_eagle:
             from sglang.srt.speculative.eagle_info import EagleDraftInput
 
@@ -1623,6 +1627,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     ):
         # FIXME(lsyin): used here to get the correct seq_lens
         # The batch has been launched but we need it verified to get correct next batch info
+        """
+        Filter the batch's requests and associated tensors to keep only active entries.
+        
+        Waits for any pending verification for v2 Eagle drafts, then selects which requests to keep (by explicit keep_indices or by excluding finished requests and any provided chunked requests) and updates per-batch state accordingly. This mutates the ScheduleBatch in place: it replaces self.reqs, slices tensors and lists such as seq_lens, seq_lens_cpu, orig_seq_lens, req_pool_indices, output_ids, encoder_lens/encoder_lens_cpu, multimodal_inputs, and adjusts seq_lens_sum, return_logprob/top_logprobs/token_ids_logprobs, has_stream, has_grammar. It also updates sampling_info and spec_info to reflect the filtered subset.
+        
+        Parameters:
+            chunked_req_to_exclude (Optional[Req | List[Req]]): A request or list of requests that must be excluded from the batch (typically the chunked prefill request). If a single Req is provided it will be treated as a one-element list. Ignored when keep_indices is provided.
+            keep_indices (Optional[List[int]]): Explicit list of request indices to retain. When provided, filtering uses these indices directly and skips the finished/exclusion logic.
+        """
         self.maybe_wait_verify_done()
 
         if keep_indices is None:
@@ -1694,6 +1707,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
         # needs to be called with pre-merged Batch.reqs.
+        """
+        Merge another ScheduleBatch into this one, combining their requests, tensors, and metadata.
+        
+        Merges sampling and speculative information, concatenates per-request tensors and lists (sequence lengths, request pool indices, original sequence lengths, encoder lengths when applicable), extends request list and multimodal inputs, updates aggregated counters (seq_lens_sum), and merges or propagates per-batch flags (return_logprob, has_stream, has_grammar, return_hidden_states). The out_cache_loc is cleared on merge.
+        
+        Parameters:
+            other (ScheduleBatch): The batch to merge into this batch. Its requests and batch-level state will be appended to this batch.
+        
+        Notes:
+            - sampling_info.merge_batch is invoked before combining requests because penalizer preparation may depend on the pre-merged request list.
+            - In v2 Eagle mode, no additional verification wait is required before merging because prefill and decode timing guarantees hold.
+        """
         self.sampling_info.merge_batch(other.sampling_info)
 
         # Encoder-decoder infos
@@ -1802,6 +1827,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def copy(self):
         # Only contain fields that will be used by process_batch_result
+        """
+        Create a lightweight copy of this ScheduleBatch containing only the fields required by batch result processing.
+        
+        Returns:
+            ScheduleBatch: A new ScheduleBatch instance populated with a subset of fields from the original batch: reqs, model_config, forward_mode, out_cache_loc, return_logprob, decoding_reqs, spec_algorithm, global_num_tokens, global_num_tokens_for_logprob, can_run_dp_cuda_graph, is_extend_in_batch, is_prefill_only, seq_lens_cpu, and enable_overlap.
+        """
         return ScheduleBatch(
             reqs=self.reqs,
             model_config=self.model_config,
@@ -1820,6 +1851,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
     def _evict_tree_cache_if_needed(self, num_tokens: int):
+        """
+        Evicts entries from the prefix/KV tree cache when the token pools lack sufficient free slots.
+        
+        If the underlying tree cache is an SWAChunkCache or ChunkCache, no eviction is performed. For hybrid mode, compares both full and SWA available sizes to the requested `num_tokens`, computes deficits for each, and calls `tree_cache.evict(full_deficit, swa_deficit)` when the cache exists. For non-hybrid mode, evicts `num_tokens` when the single pool's available size is insufficient.
+        
+        Parameters:
+            num_tokens (int): Number of token slots required; eviction is triggered only if available capacity is less than this.
+        """
         if isinstance(self.tree_cache, (SWAChunkCache, ChunkCache)):
             return
 

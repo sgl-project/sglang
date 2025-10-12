@@ -675,6 +675,14 @@ class CudaGraphRunner:
         # If the required capture_hidden_mode changes, we need to recapture the graph
 
         # These are the different factors that can influence the capture_hidden_mode
+        """
+        Ensure the CUDA graph's hidden-state capture mode matches the requirements for the given forward batch and trigger a recapture if it does not.
+        
+        Determines the required capture-hidden-mode by considering, in order of precedence: the batch's explicit `capture_hidden_mode`, any `capture_hidden_mode` specified in `forward_batch.spec_info` (treated as NULL when absent), and the global server setting for returning hidden states. If the runner's current `capture_hidden_mode` differs from the computed requirement, updates `self.capture_hidden_mode` and invokes `self.capture()` to re-create the CUDA graphs with the new mode.
+        
+        Parameters:
+            forward_batch (ForwardBatch): The forward batch whose `capture_hidden_mode` and optional `spec_info.capture_hidden_mode` are used to compute the required capture mode.
+        """
         capture_hidden_mode_required_by_forward_batch = (
             forward_batch.capture_hidden_mode
         )

@@ -368,6 +368,23 @@ class LogitsProcessor(nn.Module):
         logits_metadata: Union[LogitsMetadata, ForwardBatch],
         aux_hidden_states: Optional[torch.Tensor] = None,
     ) -> LogitsProcessorOutput:
+        """
+        Process hidden states to produce next-token logits and, when requested, compute and normalize log probabilities and optional hidden-state captures.
+        
+        Parameters:
+            input_ids (torch.Tensor): Batch token ids used for multi-item scoring detection.
+            hidden_states (torch.Tensor): Model hidden states from which logits are computed.
+            lm_head (VocabParallelEmbedding): Language-model output head or quantized equivalent used to convert hidden states to logits.
+            logits_metadata (LogitsMetadata | ForwardBatch): Metadata or a ForwardBatch describing decoding mode, which logprob/top-k/token-id outputs to produce, temperature/top-p settings, DP/TP attention metadata, and whether the batch is prefill-only. If a ForwardBatch is supplied, it will be converted to a LogitsMetadata.
+            aux_hidden_states (Optional[torch.Tensor]): Additional hidden-state tensors concatenated to the main hidden states when capture of combined representations is requested.
+        
+        Returns:
+            LogitsProcessorOutput: Container with:
+              - next_token_logits: logits for the selected next-token positions (or None for prefill-only multi-item scoring),
+              - hidden_states: captured hidden states if capture was requested,
+              - input_token_logprobs / input_top_logprobs_val / input_top_logprobs_idx: per-position log probabilities and optional top-k values/indices when extend_return_logprob is enabled,
+              - input_token_ids_logprobs_val / input_token_ids_logprobs_idx: log probabilities and indices for requested token IDs when extend_token_ids_logprob is enabled.
+        """
         if isinstance(logits_metadata, ForwardBatch):
             logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
 
