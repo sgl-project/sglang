@@ -1,5 +1,7 @@
 """Global configurations"""
 
+# FIXME: deprecate this file and move all usage to sglang.srt.environ or sglang.__init__.py
+
 
 class GlobalConfig:
     """
