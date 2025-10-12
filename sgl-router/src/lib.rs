@@ -34,7 +34,7 @@ pub enum PolicyType {
 #[derive(Clone, PartialEq, Debug)]
 pub enum BackendType {
     Sglang,
-    Openai
+    Openai,
 }
 
 #[pyclass(eq)]
