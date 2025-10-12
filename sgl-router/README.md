@@ -219,7 +219,7 @@ Store conversation and response data for tracking, debugging, or analytics.
 
 **NOTE: This feature is currently only supported in OpenAI router mode.**
 
-#### Available options for conversation storage
+#### Available options for history storage
 
 - **Memory** (default): In-memory storage, fast but ephemeral
 - **None**: No storage, minimal overhead
