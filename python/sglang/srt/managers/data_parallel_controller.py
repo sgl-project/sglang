@@ -138,14 +138,14 @@ class DataParallelController:
         # Launch data parallel workers
         self.scheduler_procs = []
         self.workers: List[zmq.Socket] = [None] * server_args.dp_size
+        self.worker_ports: List[int] = [0] * server_args.dp_size
 
         if server_args.node_rank == 0 and server_args.enable_dp_attention_port_picking:
-            self.workers_port = {}
             for dp_rank in range(server_args.dp_size):
                 port_and_socket = get_zmq_socket(
                     self.context, zmq.PUSH
                 )
-                self.workers_port[dp_rank] = port_and_socket[0]
+                self.worker_ports[dp_rank] = port_and_socket[0]
                 self.workers[dp_rank] = port_and_socket[1]
                 logger.debug(f"Port assign to worker {dp_rank}: {port_and_socket[0]}")
 
@@ -253,7 +253,7 @@ class DataParallelController:
         while True:
             time.sleep(30 * 24 * 3600)
 
-    def _dispatch_dp_attn_ctrl_zmq_port(self, server_args: ServerArgs):
+    def _dispatch_dp_attn_ctrl_zmq_port(self, server_args: ServerArgs) -> List[int]:
         ex_endpoint = None
         if server_args.dist_init_addr is None:
             ex_endpoint = f"tcp://127.0.0.1:{server_args.port + DP_ATTENTION_HANDSHAKE_PORT_DELTA}"
@@ -261,8 +261,8 @@ class DataParallelController:
             ex_endpoint = f"tcp://{server_args.dist_init_addr}"
 
         if server_args.node_rank == 0:
-            free_ports = {i: port for i, port in self.workers_port.items()}
-            logger.debug(f"Free ports: {free_ports}")
+            worker_ports = self.worker_ports
+            logger.debug(f"Worker ports: {worker_ports}")
 
             # broadcast dp_port_args to all dp ranks
             rep_socket = get_zmq_socket(self.context, zmq.REP, ex_endpoint, True)
@@ -277,7 +277,7 @@ class DataParallelController:
                 msg = rep_socket.recv()
                 logger.debug(f"Node 0 received handshake from node {msg.decode()}")
                 # send dp_port_args to the node
-                rep_socket.send_pyobj(free_ports)
+                rep_socket.send_pyobj(worker_ports)
                 connected_nodes += 1
                 logger.debug(
                     f"DP Controller: {connected_nodes}/{expected_nodes} nodes connected."
@@ -293,23 +293,23 @@ class DataParallelController:
 
             try:
                 req_socket.send(str(server_args.node_rank).encode())
-                free_ports = req_socket.recv_pyobj()
+                worker_ports = req_socket.recv_pyobj()
                 logger.debug(
-                    f"Node {server_args.node_rank} received handshake from node 0, len {len(free_ports)}"
+                    f"Node {server_args.node_rank} received handshake from node 0, len {len(worker_ports)}"
                 )
             except zmq.Again:
                 logger.error("Handshake timeout with node 0")
                 raise
-        return free_ports
+        return worker_ports
 
     def launch_dp_attention_schedulers(self, server_args, port_args):
-        dp_port_mapping = None
+        worker_ports = None
         if server_args.enable_dp_attention_port_picking:
-            dp_port_mapping = self._dispatch_dp_attn_ctrl_zmq_port(server_args)
+            worker_ports = self._dispatch_dp_attn_ctrl_zmq_port(server_args)
         dp_port_args = []
         for dp_rank in range(server_args.dp_size):
-            dp_port_args.append(PortArgs.init_new(server_args, dp_rank, dp_port_mapping))
-        self.launch_tensor_parallel_group(server_args, port_args, 0, None, dp_port_mapping)
+            dp_port_args.append(PortArgs.init_new(server_args, dp_rank, worker_ports))
+        self.launch_tensor_parallel_group(server_args, port_args, 0, None, worker_ports)
         return dp_port_args
 
     def launch_tensor_parallel_group(
@@ -318,7 +318,7 @@ class DataParallelController:
         port_args: PortArgs,
         base_gpu_id: int,
         dp_rank: Optional[int],
-        dp_port_mapping: Optional[dict[int, int]] = None,
+        worker_ports: Optional[List[int]] = None,
     ):
         if not server_args.enable_dp_attention:
             logger.info(f"Launch DP{dp_rank} starting at GPU #{base_gpu_id}.")
@@ -355,7 +355,7 @@ class DataParallelController:
                         server_args.dp_size,
                     )
                     # compute zmq ports for this dp rank
-                    rank_port_args = PortArgs.init_new(server_args, dp_rank, dp_port_mapping)
+                    rank_port_args = PortArgs.init_new(server_args, dp_rank, worker_ports)
                     # Data parallelism reuses the tensor parallelism group,
                     # so all dp ranks should use the same nccl port.
                     rank_port_args.nccl_port = port_args.nccl_port
