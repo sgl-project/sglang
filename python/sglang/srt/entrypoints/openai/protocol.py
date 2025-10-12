@@ -38,6 +38,7 @@ from pydantic import (
 )
 from typing_extensions import Literal
 
+from sglang.srt.entrypoints.openai.json_schema_utils import normalize_json_schema
 from sglang.utils import convert_json_schema_to_str
 
 logger = logging.getLogger(__name__)
@@ -556,28 +557,34 @@ class ChatCompletionRequest(BaseModel):
         if not response_format:
             return values
 
-        if response_format.get("type") != "json_schema":
-            return values
+        if isinstance(response_format, dict):
+            if response_format.get("type") != "json_schema":
+                return values
 
-        schema = response_format.pop("schema", None)
-        json_schema = response_format.get("json_schema")
+            payload = response_format.get("json_schema") or {}
+            schema = payload.get("schema") if isinstance(payload, dict) else None
+            if not isinstance(schema, dict):
+                schema = response_format.get("schema")
+                if not isinstance(schema, dict):
+                    return values
 
-        if json_schema:
-            return values
+            name_ = (
+                payload.get("name")
+                or schema.get("title")
+                or "Schema"
+            )
+            strict_flag = payload.get("strict")
+            if strict_flag is None:
+                strict_flag = True
 
-        if schema:
-            name_ = schema.get("title", "Schema")
-            strict_ = False
-            if "properties" in schema and "strict" in schema["properties"]:
-                item = schema["properties"].pop("strict", None)
-                if item and item.get("default", False):
-                    strict_ = True
-
+            normalized_schema = normalize_json_schema(schema, strict_flag)
+            response_format.pop("schema", None)
             response_format["json_schema"] = {
                 "name": name_,
-                "schema": schema,
-                "strict": strict_,
+                "schema": normalized_schema,
+                "strict": strict_flag,
             }
+            values["response_format"] = response_format
 
         return values
 
