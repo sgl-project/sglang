@@ -354,7 +354,7 @@ def alloc_for_extend(
             (
                 t[-1:]
                 if len(t) > 0
-                else torch.tensor([-1], device=batch.tree_cache.device)
+                else torch.tensor([-1], device=batch.device)
             )
             for t in prefix_tensors
         ]
