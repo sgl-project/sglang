@@ -20,6 +20,8 @@ def policy_from_str(policy_str: Optional[str]) -> PolicyType:
 
 def backend_from_str(backend_str: Optional[str]) -> BackendType:
     """Convert backend string to BackendType enum."""
+    if isinstance(backend_str, BackendType):
+        return backend_str
     if backend_str is None:
         return BackendType.Sglang
     backend_map = {"sglang": BackendType.Sglang, "openai": BackendType.Openai}
@@ -33,6 +35,8 @@ def backend_from_str(backend_str: Optional[str]) -> BackendType:
 
 def history_backend_from_str(backend_str: Optional[str]) -> HistoryBackendType:
     """Convert history backend string to HistoryBackendType enum."""
+    if isinstance(backend_str, HistoryBackendType):
+        return backend_str
     if backend_str is None:
         return HistoryBackendType.Memory
     backend_lower = backend_str.lower()
