@@ -833,7 +833,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
         Current policy:
         - Respect explicit server flag `enable_tokenizer_batch_encode`.
-        - Or, if every request only carries `input_ids` (no raw text/embeds), we still batch.
+        - Or, if no request has text or multimodal input (all use pre-tokenized input_ids or input_embeds), batch the requests without tokenization.
         """
         return (
             self.server_args.enable_tokenizer_batch_encode
