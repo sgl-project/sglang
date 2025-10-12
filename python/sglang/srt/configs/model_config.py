@@ -25,7 +25,7 @@ from transformers import PretrainedConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import is_hip, retry
+from sglang.srt.utils import is_hip, is_remote_url, retry
 from sglang.srt.utils.hf_transformers_utils import (
     get_config,
     get_context_length,
@@ -103,6 +103,10 @@ class ModelConfig:
         self.revision = revision
         self.quantization = quantization
         self.modelopt_quant = modelopt_quant
+        self.modelopt_checkpoint_restore_path = modelopt_checkpoint_restore_path
+        self.modelopt_checkpoint_save_path = modelopt_checkpoint_save_path
+        self.modelopt_export_path = modelopt_export_path
+        self.quantize_and_serve = quantize_and_serve
         self.is_draft_model = is_draft_model
         self.model_impl = model_impl
         self.sampling_defaults = sampling_defaults
