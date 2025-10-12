@@ -127,7 +127,7 @@ class TestLoRAQwen3(CustomTestCase):
                 ]
 
                 print(
-                    f"\n========== Testing multiple batches on base '{base_path}' with backend={backend}, dtype={torch_dtype} ---"
+                    f"\n========== Testing multiple batches on base '{base_path}', dtype={torch_dtype} ---"
                 )
 
                 # Initialize runners
@@ -181,7 +181,7 @@ class TestLoRAQwen3(CustomTestCase):
                             if rouge_score < rouge_tol:
                                 raise AssertionError(
                                     f"ROUGE-L score {rouge_score} below tolerance {rouge_tol} "
-                                    f"for base '{base_path}', adaptor '{lora_paths}', backend '{backend}', prompt: '{prompts}...'"
+                                    f"for base '{base_path}', adaptor '{lora_paths}', prompt: '{prompts}...'"
                                 )
 
                         print(f"--- Batch {i+1} Comparison Passed --- ")
