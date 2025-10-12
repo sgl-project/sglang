@@ -8,6 +8,7 @@ from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import StreamingParseResult
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
 from sglang.srt.function_call.deepseekv31_detector import DeepSeekV31Detector
+from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.glm4_moe_detector import Glm4MoeDetector
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.kimik2_detector import KimiK2Detector
@@ -17,7 +18,6 @@ from sglang.srt.function_call.mistral_detector import MistralDetector
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 from sglang.srt.function_call.qwen25_detector import Qwen25Detector
-from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
@@ -696,8 +696,11 @@ class TestEBNFGeneration(unittest.TestCase):
 
         # Check that the EBNF contains expected patterns
         self.assertIn("<longcat_tool_call>", ebnf)
-        self.assertIn('\\"name\\"" ":" "\\"get_weather\\"', ebnf)
-        self.assertIn('"\\"arguments\\"" ":"', ebnf)
+        self.assertIn(
+            'call_get_weather ::= "{" ws "\\"name\\"" ws ":" ws "\\"get_weather\\""',
+            ebnf,
+        )
+        self.assertIn('"\\"arguments\\"" ws ":" ws', ebnf)
 
         # Validate that the EBNF can be compiled by GrammarCompiler
         try:
@@ -1662,7 +1665,7 @@ class TestDeepSeekV31Detector(unittest.TestCase):
     def test_streaming_ignores_unknown_tool(self):
         """Ensure streaming parser ignores unknown tool names and can recover."""
         chunks = [
-            "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>img_gen<｜tool▁sep｜>{\"prompt\": \"test\"}<｜tool▁call▁end｜><｜tool▁calls▁end｜>"
+            '<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>img_gen<｜tool▁sep｜>{"prompt": "test"}<｜tool▁call▁end｜><｜tool▁calls▁end｜>'
         ]
 
         for chunk in chunks:
@@ -1674,7 +1677,7 @@ class TestDeepSeekV31Detector(unittest.TestCase):
         )
 
         follow_up = [
-            "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>{\"city\": \"Osaka\"}<｜tool▁call▁end｜><｜tool▁calls▁end｜>"
+            '<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>{"city": "Osaka"}<｜tool▁call▁end｜><｜tool▁calls▁end｜>'
         ]
 
         seen = []

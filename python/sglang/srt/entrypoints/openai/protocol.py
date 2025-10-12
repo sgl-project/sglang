@@ -568,11 +568,7 @@ class ChatCompletionRequest(BaseModel):
                 if not isinstance(schema, dict):
                     return values
 
-            name_ = (
-                payload.get("name")
-                or schema.get("title")
-                or "Schema"
-            )
+            name_ = payload.get("name") or schema.get("title") or "Schema"
             strict_flag = payload.get("strict")
             if strict_flag is None:
                 strict_flag = True
