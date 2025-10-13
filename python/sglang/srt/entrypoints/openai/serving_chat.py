@@ -7,6 +7,7 @@ import time
 import uuid
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
 
+import orjson
 from cllmv import generate as get_chutes_verification_value
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
@@ -306,7 +307,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     if "arguments" in item["function"] and isinstance(
                         item["function"]["arguments"], str
                     ):
-                        item["function"]["arguments"] = json.loads(
+                        item["function"]["arguments"] = orjson.loads(
                             item["function"]["arguments"]
                         )
 
@@ -909,7 +910,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 finish_reason["matched"] = None
             try:
                 # For required tool choice, we expect a JSON array of tool calls
-                tool_call_data = json.loads(text)
+                tool_call_data = orjson.loads(text)
                 tool_calls = []
                 for i, tool in enumerate(tool_call_data):
                     # Create a ToolCallItem from the JSON data

@@ -33,7 +33,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
 )
-from sglang.srt.managers.schedule_batch import ModelWorkerBatch, global_server_args_dict
+from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -168,9 +168,6 @@ class TpModelWorker:
         )[0]
         set_random_seed(self.random_seed)
 
-        # A reference make this class has the same member as TpModelWorkerClient
-        self.worker = self
-
         self.hicache_layer_transfer_counter = None
 
     def register_hicache_layer_transfer_counter(self, counter: LayerDoneCounter):
@@ -190,7 +187,6 @@ class TpModelWorker:
             self.max_req_input_len,
             self.random_seed,
             self.device,
-            global_server_args_dict,
             self.model_runner.req_to_token_pool.size,
             self.model_runner.req_to_token_pool.max_context_len,
             self.model_runner.token_to_kv_pool.size,
