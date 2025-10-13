@@ -32,7 +32,7 @@ class TestDisaggregationBase(CustomTestCase):
         cls.process_lb, cls.process_decode, cls.process_prefill = None, None, None
 
         # config transfer backend and rdma devices
-        if True:
+        if is_in_ci():
             cls.transfer_backend = ["--disaggregation-transfer-backend", "mooncake"]
             cls.rdma_devices = ["--disaggregation-ib-device", get_rdma_devices_args()]
         else:
