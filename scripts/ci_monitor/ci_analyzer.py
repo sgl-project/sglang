@@ -31,9 +31,10 @@ class SGLangCIAnalyzer:
         self.session = requests.Session()
         self.session.headers.update(self.headers)
 
-    def get_recent_runs(self, limit: int = 100) -> List[Dict]:
+    def get_recent_runs(self, limit: int = 100, branch: str = None) -> List[Dict]:
         """Get recent CI run data"""
-        print(f"Fetching {limit} recent CI runs...")
+        branch_info = f" from branch '{branch}'" if branch else ""
+        print(f"Fetching {limit} recent CI runs{branch_info}...")
 
         all_runs = []
         page = 1
@@ -42,6 +43,8 @@ class SGLangCIAnalyzer:
         while len(all_runs) < limit:
             url = f"{self.base_url}/repos/{self.repo}/actions/runs"
             params = {"per_page": min(per_page, limit - len(all_runs)), "page": page}
+            if branch:
+                params["branch"] = branch
 
             try:
                 response = self.session.get(url, params=params)
@@ -407,6 +410,11 @@ def main():
         default="ci_analysis.json",
         help="Output file (default: ci_analysis.json)",
     )
+    parser.add_argument(
+        "--branch",
+        default="main",
+        help="Filter runs by branch (default: 'main'). Set to empty string '' to analyze all branches.",
+    )
 
     args = parser.parse_args()
 
@@ -415,7 +423,9 @@ def main():
 
     try:
         # Get CI run data
-        runs = analyzer.get_recent_runs(args.limit)
+        # Use None for branch if empty string is provided (to scan all branches)
+        branch = args.branch if args.branch else None
+        runs = analyzer.get_recent_runs(args.limit, branch)
 
         if not runs:
             print("No CI run data found")
