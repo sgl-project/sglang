@@ -25,7 +25,7 @@ concurrency:
 jobs:
   per-commit-1-ascend-npu:
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
-    runs-on: linux-arm64-npu-1
+    runs-on: linux-aarch64-a2b4-1
     container:
       image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.2.rc1-910b-ubuntu22.04-py3.11
     steps:
@@ -40,7 +40,7 @@ jobs:
           pip config set global.index-url http://${CACHING_URL}/pypi/simple
           pip config set global.trusted-host ${CACHING_URL}
 
-          bash scripts/ci/npu_ci_install_dependency.sh
+          bash scripts/ci/npu_ci_install_dependency.sh 910b
           # copy required file from our daily cache
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
           # copy download through proxy
@@ -53,13 +53,20 @@ jobs:
           SGLANG_IS_IN_CI: true
           HF_ENDPOINT: https://hf-mirror.com
           TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
+          PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+          STREAMS_PER_DEVICE: 32
         run: |
+          source /usr/local/Ascend/8.3.RC1/bisheng_toolkit/set_env.sh
           cd test/srt
           python3 run_suite.py --suite per-commit-1-ascend-npu
 
   per-commit-2-ascend-npu:
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
-    runs-on: linux-arm64-npu-2
+    runs-on: linux-aarch64-a2b4-2
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [0, 1, 2]
     container:
       image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.2.rc1-910b-ubuntu22.04-py3.11
     steps:
@@ -74,7 +81,7 @@ jobs:
           pip config set global.index-url http://${CACHING_URL}/pypi/simple
           pip config set global.trusted-host ${CACHING_URL}
 
-          bash scripts/ci/npu_ci_install_dependency.sh
+          bash scripts/ci/npu_ci_install_dependency.sh 910b
           # copy required file from our daily cache
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
           # copy download through proxy
@@ -87,13 +94,16 @@ jobs:
           SGLANG_IS_IN_CI: true
           HF_ENDPOINT: https://hf-mirror.com
           TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
+          PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+          STREAMS_PER_DEVICE: 32
         run: |
+          source /usr/local/Ascend/8.3.RC1/bisheng_toolkit/set_env.sh
           cd test/srt
-          python3 run_suite.py --suite per-commit-2-ascend-npu
+          python3 run_suite.py --suite per-commit-2-ascend-npu --auto-partition-id ${{ matrix.part }} --auto-partition-size 3
 
   per-commit-4-ascend-npu:
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
-    runs-on: linux-arm64-npu-4
+    runs-on: linux-aarch64-a2b4-4
     container:
       image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.2.rc1-910b-ubuntu22.04-py3.11
     steps:
@@ -108,7 +118,7 @@ jobs:
           pip config set global.index-url http://${CACHING_URL}/pypi/simple
           pip config set global.trusted-host ${CACHING_URL}
 
-          bash scripts/ci/npu_ci_install_dependency.sh
+          bash scripts/ci/npu_ci_install_dependency.sh 910b
           # copy required file from our daily cache
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
           # copy download through proxy
@@ -121,7 +131,10 @@ jobs:
           SGLANG_IS_IN_CI: true
           HF_ENDPOINT: https://hf-mirror.com
           TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
+          PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+          STREAMS_PER_DEVICE: 32
         run: |
+          source /usr/local/Ascend/8.3.RC1/bisheng_toolkit/set_env.sh
           cd test/srt
           python3 run_suite.py --suite per-commit-4-ascend-npu --timeout-per-file 3600
 
@@ -142,7 +155,7 @@ jobs:
           pip config set global.index-url http://${CACHING_URL}/pypi/simple
           pip config set global.trusted-host ${CACHING_URL}
 
-          bash scripts/ci/npu_ci_install_dependency.sh
+          bash scripts/ci/npu_ci_install_dependency.sh a3
           # copy required file from our daily cache
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
           # copy download through proxy
@@ -155,6 +168,9 @@ jobs:
           SGLANG_IS_IN_CI: true
           HF_ENDPOINT: https://hf-mirror.com
           TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
+          PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+          STREAMS_PER_DEVICE: 32
         run: |
+          source /usr/local/Ascend/8.3.RC1/bisheng_toolkit/set_env.sh
           cd test/srt
           python3 run_suite.py --suite per-commit-16-ascend-a3 --timeout-per-file 5400
