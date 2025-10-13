@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang"
-version = "0.5.3"
+version = "0.5.3.post1"
 description = "SGLang is a fast serving framework for large language models and vision language models."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -24,7 +24,7 @@ dependencies = [
   "datasets",
   "einops",
   "fastapi",
-  "flashinfer_python==0.4.0rc3",
+  "flashinfer_python==0.4.0",
   "hf_transfer",
   "huggingface_hub",
   "interegular",
@@ -76,6 +76,7 @@ decord = ["decord"]
 test = [
   "accelerate",
   "expecttest",
+  "gguf",
   "jsonlines",
   "matplotlib",
   "pandas",
@@ -85,10 +86,10 @@ test = [
   "tabulate",
 ]
 tracing = [
-    "opentelemetry-api",
-    "opentelemetry-exporter-otlp",
-    "opentelemetry-exporter-otlp-proto-grpc",
-    "opentelemetry-sdk",
+  "opentelemetry-api",
+  "opentelemetry-exporter-otlp",
+  "opentelemetry-exporter-otlp-proto-grpc",
+  "opentelemetry-sdk",
 ]
 all = ["sglang[test]", "sglang[decord]"]
 all_aarch64 = ["sglang[test]"]

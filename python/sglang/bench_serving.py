@@ -12,7 +12,6 @@ python3 -m sglang.bench_serving --backend sglang --dataset-name random --num-pro
 
 import argparse
 import asyncio
-import base64
 import io
 import json
 import os
@@ -671,7 +670,7 @@ def get_processor(
     if pretrained_model_name_or_path.endswith(
         ".json"
     ) or pretrained_model_name_or_path.endswith(".model"):
-        from sglang.srt.hf_transformers_utils import get_processor
+        from sglang.srt.utils.hf_transformers_utils import get_processor
 
         return get_processor(pretrained_model_name_or_path)
 
@@ -935,7 +934,7 @@ async def get_mooncake_request_over_time(
         for i in range(num_rounds):
             # Add user query for the current round
             chat_history.append(
-                {"role": "user", "content": f"Round {i+1}: {user_query_base}"}
+                {"role": "user", "content": f"Round {i + 1}: {user_query_base}"}
             )
 
             # Form the full prompt from history
@@ -964,7 +963,7 @@ async def get_mooncake_request_over_time(
 
 def sample_mmmu_requests(
     num_requests: int,
-    processor: AutoProcessor,
+    processor: AutoProcessor | AutoTokenizer,
     fixed_output_len: Optional[int] = None,
     random_sample: bool = True,
 ) -> List[DatasetRow]:
@@ -973,9 +972,7 @@ def sample_mmmu_requests(
 
     Args:
         num_requests: Number of requests to sample.
-        tokenizer: Tokenizer to use for token counting.
         fixed_output_len: If provided, use this fixed output length for all requests.
-        apply_chat_template: Whether to apply the chat template to the prompt.
         random_sample: Whether to randomly sample or take the first N.
 
     Returns:
@@ -1282,11 +1279,11 @@ def parse_image_resolution(image_resolution: str) -> Tuple[int, int]:
     )
 
 
-def create_mm_data_row(text_prompt, images, images_base64, output_len, processor):
+def create_mm_data_row(text_prompt, images: list, images_base64, output_len, processor):
     try:
         content_items = [
-            {"type": "image_url", "image_url": {"url": img_url}}
-            for img_url in images_base64
+            {"type": "image", "image": {"url": image_base64}}
+            for image_base64 in images_base64
         ]
         content_items.append({"type": "text", "text": text_prompt})
         prompt_str = processor.apply_chat_template(
@@ -1294,7 +1291,9 @@ def create_mm_data_row(text_prompt, images, images_base64, output_len, processor
             add_generation_prompt=True,
             tokenize=False,
         )
-    except Exception:
+    except Exception as e:
+        # Note (Xinyuan): This is a workaround for an issue where some tokenizers do not support content as a list. (e.g. InternVL)
+        print(f"Error applying chat template: {e}, fallback to <image> tag")
         # Some tokenizers do not support list content; fall back to a placeholder in the text
         prompt_str = f"<image>{text_prompt}"
 
@@ -1425,7 +1424,7 @@ def sample_image_requests(
     print(f"#Input tokens: {np.sum([x.prompt_len for x in dataset])}")
     print(f"#Output tokens: {np.sum([x.output_len for x in dataset])}")
     print(
-        f"\nCreated {len(dataset)} {image_content} {image_format} images with average {total_image_bytes//num_requests} bytes per request"
+        f"\nCreated {len(dataset)} {image_content} {image_format} images with average {total_image_bytes // num_requests} bytes per request"
     )
     return dataset
 
@@ -1837,9 +1836,15 @@ async def benchmark(
             server_info_json = server_info.json()
             if "decode" in server_info_json:
                 server_info_json = server_info_json["decode"][0]
-            accept_length = server_info_json["internal_states"][0].get(
-                "avg_spec_accept_length", None
-            )
+            if (
+                "internal_states" in server_info_json
+                and server_info_json["internal_states"]
+            ):
+                accept_length = server_info_json["internal_states"][0].get(
+                    "avg_spec_accept_length", None
+                )
+            else:
+                accept_length = None
         else:
             accept_length = None
     else:
