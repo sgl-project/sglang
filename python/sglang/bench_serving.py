@@ -622,6 +622,48 @@ async def async_request_profile(api_url: str) -> RequestFuncOutput:
     return output
 
 
+def _build_profile_urls(
+    profile_prefill_url: Optional[List[str]],
+    profile_decode_url: Optional[List[str]],
+) -> List[Tuple[str, str]]:
+    """Build profile URLs list from prefill/decode URL arguments.
+
+    Returns:
+        List of (worker_type, url) tuples. e.g., [("Prefill-0", "http://..."), ("Decode-0", "http://...")]
+    """
+    profile_urls = []
+    if profile_prefill_url:
+        for idx, url in enumerate(profile_prefill_url):
+            profile_urls.append((f"Prefill-{idx}", url))
+    if profile_decode_url:
+        for idx, url in enumerate(profile_decode_url):
+            profile_urls.append((f"Decode-{idx}", url))
+    return profile_urls
+
+
+async def _call_profile_pd(profile_urls: List[Tuple[str, str]], mode: str) -> None:
+    """Call profile endpoint (start/stop) on PD separated workers.
+
+    Args:
+        profile_urls: List of (worker_type, url) tuples
+        mode: "start" or "stop"
+    """
+    endpoint = "/start_profile" if mode == "start" else "/stop_profile"
+    action = "Starting" if mode == "start" else "Stopping"
+    action_past = "started" if mode == "start" else "stopped"
+
+    print(f"{action} profiler...")
+
+    for worker_type, url in profile_urls:
+        profile_output = await async_request_profile(api_url=url + endpoint)
+        if profile_output.success:
+            print(f"Profiler {action_past} for {worker_type} worker at {url}")
+        else:
+            print(
+                f"Failed to {mode} profiler for {worker_type} worker at {url}: {profile_output.error}"
+            )
+
+
 def get_model(pretrained_model_name_or_path: str) -> str:
     if os.getenv("SGLANG_USE_MODELSCOPE", "false").lower() == "true":
         import huggingface_hub.constants
@@ -1766,37 +1808,23 @@ async def benchmark(
 
     time.sleep(1.0)
 
+    # Build profile URLs for PD separated mode (do this once at the beginning)
+    pd_profile_urls = []
+    if profile and pd_separated:
+        pd_profile_urls = _build_profile_urls(profile_prefill_url, profile_decode_url)
+        if not pd_profile_urls:
+            print(
+                "Warning: PD separated mode requires --profile-prefill-url or --profile-decode-url"
+            )
+            print("Skipping profiler start. Please specify worker URLs for profiling.")
+
     # Start profiler
     if profile:
-        print("Starting profiler...")
         if pd_separated:
-            profile_urls = []
-            if profile_prefill_url:
-                for idx, url in enumerate(profile_prefill_url):
-                    profile_urls.append((f"Prefill-{idx}", url))
-            if profile_decode_url:
-                for idx, url in enumerate(profile_decode_url):
-                    profile_urls.append((f"Decode-{idx}", url))
-
-            if not profile_urls:
-                print(
-                    "Warning: PD separated mode requires --profile-prefill-url or --profile-decode-url"
-                )
-                print(
-                    "Skipping profiler start. Please specify worker URLs for profiling."
-                )
-            else:
-                for worker_type, url in profile_urls:
-                    profile_output = await async_request_profile(
-                        api_url=url + "/start_profile"
-                    )
-                    if profile_output.success:
-                        print(f"Profiler started for {worker_type} worker at {url}")
-                    else:
-                        print(
-                            f"Failed to start profiler for {worker_type} worker at {url}: {profile_output.error}"
-                        )
+            if pd_profile_urls:
+                await _call_profile_pd(pd_profile_urls, "start")
         else:
+            print("Starting profiler...")
             profile_output = await async_request_profile(
                 api_url=base_url + "/start_profile"
             )
@@ -1850,27 +1878,11 @@ async def benchmark(
 
     # Stop profiler
     if profile:
-        print("Stopping profiler...")
         if pd_separated:
-            profile_urls = []
-            if profile_prefill_url:
-                for idx, url in enumerate(profile_prefill_url):
-                    profile_urls.append((f"Prefill-{idx}", url))
-            if profile_decode_url:
-                for idx, url in enumerate(profile_decode_url):
-                    profile_urls.append((f"Decode-{idx}", url))
-
-            for worker_type, url in profile_urls:
-                profile_output = await async_request_profile(
-                    api_url=url + "/stop_profile"
-                )
-                if profile_output.success:
-                    print(f"Profiler stopped for {worker_type} worker at {url}")
-                else:
-                    print(
-                        f"Failed to stop profiler for {worker_type} worker at {url}: {profile_output.error}"
-                    )
+            if pd_profile_urls:
+                await _call_profile_pd(pd_profile_urls, "stop")
         else:
+            print("Stopping profiler...")
             profile_output = await async_request_profile(
                 api_url=base_url + "/stop_profile"
             )
