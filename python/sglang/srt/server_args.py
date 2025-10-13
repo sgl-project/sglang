@@ -13,6 +13,8 @@
 # ==============================================================================
 """The arguments of the server."""
 
+from __future__ import annotations
+
 import argparse
 import dataclasses
 import json
@@ -455,7 +457,6 @@ class ServerArgs:
     debug_tensor_dump_output_folder: Optional[str] = None
     debug_tensor_dump_input_file: Optional[str] = None
     debug_tensor_dump_inject: bool = False
-    debug_tensor_dump_prefill_only: bool = False
 
     # PD disaggregation: can be "null" (not disaggregated), "prefill" (prefill-only), or "decode" (decode-only)
     disaggregation_mode: Literal["null", "prefill", "decode"] = "null"
@@ -2832,11 +2833,6 @@ class ServerArgs:
             help="Inject the outputs from jax as the input of every layer.",
         )
         parser.add_argument(
-            "--debug-tensor-dump-prefill-only",
-            action="store_true",
-            help="Only dump the tensors for prefill requests (i.e. batch size > 1).",
-        )
-        parser.add_argument(
             "--enable-dynamic-batch-tokenizer",
             action="store_true",
             help="Enable async dynamic batch tokenizer for improved performance when multiple requests arrive concurrently.",
@@ -3385,6 +3381,7 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
 
 
 ZMQ_TCP_PORT_DELTA = 233
+DP_ATTENTION_HANDSHAKE_PORT_DELTA = 5
 
 
 @dataclasses.dataclass
@@ -3409,7 +3406,11 @@ class PortArgs:
     tokenizer_worker_ipc_name: Optional[str]
 
     @staticmethod
-    def init_new(server_args, dp_rank: Optional[int] = None) -> "PortArgs":
+    def init_new(
+        server_args: ServerArgs,
+        dp_rank: Optional[int] = None,
+        worker_ports: Optional[List[int]] = None,
+    ) -> PortArgs:
         if server_args.nccl_port is None:
             nccl_port = server_args.port + random.randint(100, 1000)
             while True:
@@ -3456,8 +3457,8 @@ class PortArgs:
                 # TokenizerManager to DataParallelController
                 scheduler_input_port = port_base + 4
             else:
-                scheduler_input_port = port_base + 4 + 1 + dp_rank
-
+                assert worker_ports is not None
+                scheduler_input_port = worker_ports[dp_rank]
             return PortArgs(
                 tokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base}",
                 scheduler_input_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port}",
