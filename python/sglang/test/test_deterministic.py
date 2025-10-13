@@ -292,10 +292,10 @@ def test_deterministic(args):
             for i in range(num_prompts):
                 outputs[i].extend(ret_dict[i])
 
-            for i in range(num_prompts):
-                print(
-                    f"Prompt {i} with prefix length {len_prefix[i]}: total samples: {len(outputs[i])}, Unique samples: {len(set(outputs[i]))}"
-                )
+        for i in range(num_prompts):
+            print(
+                f"Prompt {i} with prefix length {len_prefix[i]}: total samples: {len(outputs[i])}, Unique samples: {len(set(outputs[i]))}"
+            )
 
         results = []
         for i in range(num_prompts):
