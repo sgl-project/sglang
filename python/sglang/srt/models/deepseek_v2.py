@@ -745,12 +745,14 @@ class DeepseekV2MoE(nn.Module):
         final_hidden_states = self.experts(
             hidden_states,
             topk_output,
-            forward_shared_experts=(
-                _forward_shared_experts_and_put_results
+            **(
+                dict(
+                    forward_shared_experts=_forward_shared_experts_and_put_results,
+                    alt_stream=self.alt_stream,
+                )
                 if SboFlags.fuse_shared_experts_inside_sbo()
-                else None
+                else {}
             ),
-            alt_stream=self.alt_stream,
         )
         if not _is_cuda and not _use_aiter:
             # fused in biased_grouped_topk so we can skip here
@@ -856,9 +858,7 @@ class DeepseekV2MoE(nn.Module):
             topk_weights=topk_weights,
             forward_batch=forward_batch,
             # SBO args
-            forward_shared_experts=lambda: self._forward_shared_experts(
-                hidden_states
-            ),
+            forward_shared_experts=lambda: self._forward_shared_experts(hidden_states),
             alt_stream=self.alt_stream,
             # SBO is not yet implemented for NextN
             disable_sbo=self.is_nextn,
