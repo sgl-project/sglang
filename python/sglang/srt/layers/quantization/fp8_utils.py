@@ -476,10 +476,6 @@ def quant_weight_ue8m0(
         )
     )
 
-    # print(
-    #     f"hi quant_weight_ue8m0 {weight_dequant.shape=} {out_w.shape=} {out_s.shape=} {out_w.dtype=} {out_s.dtype=}"
-    # )
-
     return out_w, out_s
 
 
