@@ -190,6 +190,41 @@ pub fn discover_chat_template_in_dir(dir: &Path) -> Option<String> {
     None
 }
 
+/// Helper function to resolve and log chat template selection
+///
+/// Resolves the final chat template to use by prioritizing provided path over auto-discovery,
+/// and logs the source for debugging purposes.
+fn resolve_and_log_chat_template(
+    provided_path: Option<&str>,
+    discovery_dir: &Path,
+    model_name: &str,
+) -> Option<String> {
+    let final_chat_template = provided_path
+        .map(|s| s.to_string())
+        .or_else(|| discover_chat_template_in_dir(discovery_dir));
+
+    match (&provided_path, &final_chat_template) {
+        (Some(provided), _) => {
+            info!("Using provided chat template: {}", provided);
+        }
+        (None, Some(discovered)) => {
+            info!(
+                "Auto-discovered chat template in '{}': {}",
+                discovery_dir.display(),
+                discovered
+            );
+        }
+        (None, None) => {
+            debug!(
+                "No chat template provided or discovered for model: {}",
+                model_name
+            );
+        }
+    }
+
+    final_chat_template
+}
+
 /// Factory function to create tokenizer from a model name or path (async version)
 pub async fn create_tokenizer_async(
     model_name_or_path: &str,
@@ -225,23 +260,12 @@ pub async fn create_tokenizer_async_with_chat_template(
             // Look for tokenizer.json in the cache directory
             let tokenizer_path = cache_dir.join("tokenizer.json");
             if tokenizer_path.exists() {
-                // Use provided chat template or auto-discover from cache directory
-                let final_chat_template = chat_template_path
-                    .map(|s| s.to_string())
-                    .or_else(|| discover_chat_template_in_dir(&cache_dir));
-
-                // Log chat template source for debugging
-                match (&chat_template_path, &final_chat_template) {
-                    (Some(provided), _) => {
-                        info!("Using provided chat template: {}", provided);
-                    }
-                    (None, Some(discovered)) => {
-                        info!("Auto-discovered chat template: {}", discovered);
-                    }
-                    (None, None) => {
-                        debug!("No chat template found for model: {}", model_name_or_path);
-                    }
-                }
+                // Resolve chat template: provided path takes precedence over auto-discovery
+                let final_chat_template = resolve_and_log_chat_template(
+                    chat_template_path,
+                    &cache_dir,
+                    model_name_or_path,
+                );
 
                 let tokenizer_path_str = tokenizer_path.to_str().ok_or_else(|| {
                     Error::msg(format!(
@@ -259,22 +283,12 @@ pub async fn create_tokenizer_async_with_chat_template(
                 for file_name in &possible_files {
                     let file_path = cache_dir.join(file_name);
                     if file_path.exists() {
-                        let final_chat_template = chat_template_path
-                            .map(|s| s.to_string())
-                            .or_else(|| discover_chat_template_in_dir(&cache_dir));
-
-                        // Log chat template source for debugging
-                        match (&chat_template_path, &final_chat_template) {
-                            (Some(provided), _) => {
-                                info!("Using provided chat template: {}", provided);
-                            }
-                            (None, Some(discovered)) => {
-                                info!("Auto-discovered chat template: {}", discovered);
-                            }
-                            (None, None) => {
-                                debug!("No chat template found for model: {}", model_name_or_path);
-                            }
-                        }
+                        // Resolve chat template: provided path takes precedence over auto-discovery
+                        let final_chat_template = resolve_and_log_chat_template(
+                            chat_template_path,
+                            &cache_dir,
+                            model_name_or_path,
+                        );
 
                         let file_path_str = file_path.to_str().ok_or_else(|| {
                             Error::msg(format!("File path is not valid UTF-8: {:?}", file_path))
