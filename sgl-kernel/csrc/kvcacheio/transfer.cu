@@ -96,8 +96,9 @@ __device__ __forceinline__ T* get_global_offset_lf_tbl_hfrg(
     int64_t head_fragment_num,
     int64_t head_fragment_id,
     int64_t /*unused*/) {
-  return reinterpret_cast<T*>(layer_base_tbl[layer_id]) + page_id * item_size_bytes
-        + item_size_bytes / head_fragment_num * head_fragment_id;
+  return reinterpret_cast<T*>(layer_base_tbl[layer_id]);
+//    + page_id * item_size_bytes
+//         + item_size_bytes / head_fragment_num * head_fragment_id;
 }
 
 template <typename T>
@@ -112,11 +113,10 @@ __device__ __forceinline__ T* get_global_offset_phf(
     int64_t head_fragment_id,
     int64_t page_size) {
   // page head first
-  return base;
-//          + page_id / page_size * page_size * page_dim
-//          + page_dim / head_fragment_num * head_fragment_id * page_size
-//          + page_id % page_size * page_dim / head_fragment_num
-//          + layer_id * item_size_bytes / head_fragment_num;
+  return base + page_id / page_size * page_size * page_dim
+         + page_dim / head_fragment_num * head_fragment_id * page_size
+         + page_id % page_size * page_dim / head_fragment_num
+         + layer_id * item_size_bytes / head_fragment_num;
 }
 
 template <auto SrcOffsetFn, auto DstOffsetFn>
