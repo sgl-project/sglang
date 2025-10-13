@@ -127,6 +127,7 @@ class MambaPool:
     class SpeculativeState(State):
         intermediate_ssm: torch.Tensor
         intermediate_conv_window: torch.Tensor
+        last_steps: torch.Tensor
 
     def __init__(
         self,
@@ -182,11 +183,15 @@ class MambaPool:
                 dtype=conv_dtype,
                 device="cuda",
             )
+            last_steps_cache = torch.empty(
+                (num_mamba_layers, size + 1), dtype=torch.int64, device="cuda"
+            ).fill_(-1)
             self.mamba_cache = self.SpeculativeState(
                 conv=conv_state,
                 temporal=temporal_state,
                 intermediate_ssm=intermediate_ssm_state_cache,
                 intermediate_conv_window=intermediate_conv_window_cache,
+                last_steps=last_steps_cache,
             )
             logger.info(
                 f"Mamba Cache is allocated. "
@@ -194,6 +199,7 @@ class MambaPool:
                 f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
                 f"intermediate_ssm_state_cache size: {get_tensor_size_bytes(intermediate_ssm_state_cache) / GB:.2f}GB "
                 f"intermediate_conv_window_cache size: {get_tensor_size_bytes(intermediate_conv_window_cache) / GB:.2f}GB "
+                f"last_steps_cache size: {get_tensor_size_bytes(last_steps_cache) / GB:.2f}GB "
             )
         else:
             self.mamba_cache = self.State(conv=conv_state, temporal=temporal_state)
@@ -233,6 +239,7 @@ class MambaPool:
         self.mamba_cache.conv[:, free_index] = self.mamba_cache.temporal[
             :, free_index
         ] = 0
+        self.mamba_cache.last_steps[:, free_index] = -1
 
     def clear(self):
         self.free_slots = list(range(self.size))

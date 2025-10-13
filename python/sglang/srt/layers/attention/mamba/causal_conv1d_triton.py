@@ -577,6 +577,7 @@ def _causal_conv1d_update_kernel(
     conv_state_ptr,
     cache_seqlens_ptr,  # circular buffer
     conv_state_indices_ptr,
+    last_steps_ptr,
     intermediate_conv_window_ptr,
     retrieve_next_token_ptr,
     retrieve_next_sibling_ptr,
@@ -647,31 +648,36 @@ def _causal_conv1d_update_kernel(
             return
 
     # STEP 1: READ init_state data
-    conv_states_base = (
-        conv_state_ptr
-        + (conv_state_batch_coord * stride_conv_state_seq)
-        + (idx_feats * stride_conv_state_dim)
-    )
-    mask_w = idx_feats < dim
-
-    prior_tokens = conv_states_base
-    if KERNEL_WIDTH >= 2:
-        conv_states_ptrs = prior_tokens  # [BLOCK_N]
-        col0 = tl.load(conv_states_ptrs, mask_w, 0.0)
-    if KERNEL_WIDTH >= 3:
-        conv_states_ptrs = prior_tokens + 1 * stride_conv_state_tok  # [BLOCK_N]
-        col1 = tl.load(conv_states_ptrs, mask_w, 0.0)
-    if KERNEL_WIDTH >= 4:
-        conv_states_ptrs = prior_tokens + 2 * stride_conv_state_tok  # [BLOCK_N]
-        col2 = tl.load(conv_states_ptrs, mask_w, 0.0)
-    if KERNEL_WIDTH == 5:
-        conv_states_ptrs = prior_tokens + 3 * stride_conv_state_tok  # [BLOCK_N]
-        col3 = tl.load(conv_states_ptrs, mask_w, 0.0)
-
     VAL = state_len - seqlen
     x_base = x_ptr + (idx_seq * stride_x_seq) + (idx_feats * stride_x_dim)  # [BLOCK_N]
 
-    if not IS_SPEC_DECODING:
+    last_step_idx = -1
+    if IS_SPEC_DECODING:
+        last_step_idx = tl.load(last_steps_ptr + conv_state_batch_coord).to(tl.int64)
+
+    # last_step_idx is either invalid (first verify after 1st target extend) or it is not spec decoding
+    if last_step_idx == -1:
+        conv_states_base = (
+            conv_state_ptr
+            + (conv_state_batch_coord * stride_conv_state_seq)
+            + (idx_feats * stride_conv_state_dim)
+        )
+        mask_w = idx_feats < dim
+
+        prior_tokens = conv_states_base
+        if KERNEL_WIDTH >= 2:
+            conv_states_ptrs = prior_tokens  # [BLOCK_N]
+            col0 = tl.load(conv_states_ptrs, mask_w, 0.0)
+        if KERNEL_WIDTH >= 3:
+            conv_states_ptrs = prior_tokens + 1 * stride_conv_state_tok  # [BLOCK_N]
+            col1 = tl.load(conv_states_ptrs, mask_w, 0.0)
+        if KERNEL_WIDTH >= 4:
+            conv_states_ptrs = prior_tokens + 2 * stride_conv_state_tok  # [BLOCK_N]
+            col2 = tl.load(conv_states_ptrs, mask_w, 0.0)
+        if KERNEL_WIDTH == 5:
+            conv_states_ptrs = prior_tokens + 3 * stride_conv_state_tok  # [BLOCK_N]
+            col3 = tl.load(conv_states_ptrs, mask_w, 0.0)
+
         # STEP 2: assume state_len > seqlen
         idx_tokens = tl.arange(0, NP2_STATELEN)  # [BLOCK_M]
 
@@ -713,6 +719,28 @@ def _causal_conv1d_update_kernel(
         )  # [BLOCK_M, BLOCK_N]
         mask = (idx_tokens < state_len)[:, None] & (idx_feats < dim)[None, :]
         tl.store(conv_state_ptrs_target, new_conv_state, mask)
+    else:
+        conv_states_base = (
+            intermediate_conv_window_ptr
+            + conv_state_batch_coord * stride_inter_seq
+            + last_step_idx * stride_inter_step
+            + idx_feats * stride_inter_dim
+        )
+        mask_w = idx_feats < dim
+
+        prior_tokens = conv_states_base
+        if KERNEL_WIDTH >= 2:
+            conv_states_ptrs = prior_tokens  # [BLOCK_N]
+            col0 = tl.load(conv_states_ptrs, mask_w, 0.0)
+        if KERNEL_WIDTH >= 3:
+            conv_states_ptrs = prior_tokens + 1 * stride_inter_win  # [BLOCK_N]
+            col1 = tl.load(conv_states_ptrs, mask_w, 0.0)
+        if KERNEL_WIDTH >= 4:
+            conv_states_ptrs = prior_tokens + 2 * stride_inter_win  # [BLOCK_N]
+            col2 = tl.load(conv_states_ptrs, mask_w, 0.0)
+        if KERNEL_WIDTH == 5:
+            conv_states_ptrs = prior_tokens + 3 * stride_inter_win  # [BLOCK_N]
+            col3 = tl.load(conv_states_ptrs, mask_w, 0.0)
 
     # STEP 3: init accumulator
     if HAS_BIAS:
@@ -956,6 +984,7 @@ def causal_conv1d_update(
     activation: Union[bool, str, None] = None,
     cache_seqlens: Optional[torch.Tensor] = None,
     conv_state_indices: Optional[torch.Tensor] = None,
+    last_steps: Optional[torch.Tensor] = None,
     intermediate_conv_window: Optional[torch.Tensor] = None,
     retrieve_next_token: Optional[torch.Tensor] = None,
     retrieve_next_sibling: Optional[torch.Tensor] = None,
@@ -1090,6 +1119,7 @@ def causal_conv1d_update(
         conv_state,
         cache_seqlens,
         conv_state_indices,
+        last_steps,
         intermediate_conv_window if intermediate_conv_window is not None else x,
         retrieve_next_token,
         retrieve_next_sibling,

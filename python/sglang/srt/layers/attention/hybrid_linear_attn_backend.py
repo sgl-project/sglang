@@ -414,6 +414,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             assert isinstance(mamba_cache_params, MambaPool.SpeculativeState)
             intermediate_state_cache = mamba_cache_params.intermediate_ssm
             intermediate_conv_window_cache = mamba_cache_params.intermediate_conv_window
+            last_steps = mamba_cache_params.last_steps
             has_initial_states = torch.ones(
                 seq_len // forward_batch.spec_info.draft_token_num,
                 dtype=torch.bool,
@@ -437,6 +438,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 bias,
                 activation,
                 conv_state_indices=cache_indices[:batch_size],
+                last_steps=last_steps,
                 intermediate_conv_window=intermediate_conv_window_cache,
                 retrieve_next_token=retrieve_next_token,
                 retrieve_next_sibling=retrieve_next_sibling,
@@ -490,6 +492,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 beta=beta,
                 initial_state_source=ssm_states,
                 initial_state_indices=cache_indices,
+                last_steps=last_steps,
                 cu_seqlens=query_start_loc,
                 use_qk_l2norm_in_kernel=True,
                 disable_state_update=True,
@@ -755,10 +758,10 @@ class HybridLinearAttnBackend(AttentionBackend):
             self.linear_attn_backend.req_to_token_pool.get_speculative_mamba2_params_all_layers()
         )
 
-        conv_states = mamba_caches.conv
-        ssm_states = mamba_caches.temporal
-        intermediate_state_cache = mamba_caches.intermediate_ssm
-        intermediate_conv_window_cache = mamba_caches.intermediate_conv_window
+        # conv_states = mamba_caches.conv
+        # ssm_states = mamba_caches.temporal
+        # intermediate_state_cache = mamba_caches.intermediate_ssm
+        # intermediate_conv_window_cache = mamba_caches.intermediate_conv_window
 
         # SSM state updates (chunked to reduce peak memory)
         valid_mask = accepted_indices >= 0
@@ -767,12 +770,13 @@ class HybridLinearAttnBackend(AttentionBackend):
         valid_state_indices = state_indices_tensor[valid_mask].to(torch.int64)  # [N]
         last_steps = accepted_indices[valid_mask].to(torch.int64)  # [N]
 
+        mamba_caches.last_steps[:, valid_state_indices] = last_steps
         # scatter into ssm_states at the chosen cache lines
-        ssm_states[:, valid_state_indices, :] = intermediate_state_cache[
-            :, valid_state_indices, last_steps
-        ].to(ssm_states.dtype, copy=False)
+        # ssm_states[:, valid_state_indices, :] = intermediate_state_cache[
+        #     :, valid_state_indices, last_steps
+        # ].to(ssm_states.dtype, copy=False)
 
         # Scatter into conv_states at the chosen cache lines
-        conv_states[:, valid_state_indices, :, :] = intermediate_conv_window_cache[
-            :, valid_state_indices, last_steps
-        ].to(conv_states.dtype, copy=False)
+        # conv_states[:, valid_state_indices, :, :] = intermediate_conv_window_cache[
+        #     :, valid_state_indices, last_steps
+        # ].to(conv_states.dtype, copy=False)
