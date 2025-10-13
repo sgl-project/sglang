@@ -34,13 +34,13 @@ from http import HTTPStatus
 from typing import Any, Awaitable, Dict, List, Optional, Tuple, Union
 
 import fastapi
+import orjson
 import torch
 import uvloop
 import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
 
-from sglang.srt.aio_rwlock import RWLock
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.lora.lora_registry import LoRARegistry
@@ -94,6 +94,7 @@ from sglang.srt.utils import (
     get_zmq_socket,
     kill_process_tree,
 )
+from sglang.srt.utils.aio_rwlock import RWLock
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -157,7 +158,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         self.log_requests = server_args.log_requests
         self.log_requests_level = server_args.log_requests_level
         self.preferred_sampling_params = (
-            json.loads(server_args.preferred_sampling_params)
+            orjson.loads(server_args.preferred_sampling_params)
             if server_args.preferred_sampling_params
             else None
         )
