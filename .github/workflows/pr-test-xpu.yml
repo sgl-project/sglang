@@ -42,8 +42,8 @@ jobs:
           PR_REPO=${{ github.event.pull_request.head.repo.clone_url }}
           PR_HEAD_REF=${{ github.head_ref }}
           docker build \
-            ${PR_REPO:+--build-arg SGLANG_REPO=$PR_REPO} \
-            ${PR_HEAD_REF:+--build-arg VER_SGLANG=$PR_HEAD_REF} \
+            ${PR_REPO:+--build-arg SG_LANG_REPO=$PR_REPO} \
+            ${PR_HEAD_REF:+--build-arg SG_LANG_BRANCH=$PR_HEAD_REF} \
             --no-cache --progress=plain -f docker/Dockerfile.xpu -t xpu_sglang_main:bmg .
 
 
