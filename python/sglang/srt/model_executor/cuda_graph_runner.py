@@ -50,12 +50,10 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
     enable_num_token_non_padded,
 )
-from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.two_batch_overlap import TboCudaGraphRunnerPlugin
 from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
-    get_bool_env_var,
     get_bool_env_var,
     get_device_memory_capacity,
     is_hip,
@@ -66,6 +64,7 @@ from sglang.srt.utils import (
     require_mlp_tp_gather,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_compile
+from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 _is_hip = is_hip()
 
