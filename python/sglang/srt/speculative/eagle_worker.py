@@ -14,7 +14,7 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import get_token_ids_logprobs, get_top_logprobs
-from sglang.srt.managers.schedule_batch import ScheduleBatch, global_server_args_dict
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.mem_cache.common import (
@@ -27,7 +27,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.server_args import ServerArgs, get_global_server_args
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
 )
@@ -264,7 +264,7 @@ class EAGLEWorker(TpModelWorker):
         )
 
     def _create_flashinfer_decode_backend(self):
-        if not global_server_args_dict["use_mla_backend"]:
+        if not get_global_server_args().use_mla_backend:
             from sglang.srt.layers.attention.flashinfer_backend import (
                 FlashInferMultiStepDraftBackend,
             )
@@ -328,7 +328,7 @@ class EAGLEWorker(TpModelWorker):
         )
 
     def _create_trtllm_mla_decode_backend(self):
-        if not global_server_args_dict["use_mla_backend"]:
+        if not get_global_server_args().use_mla_backend:
             raise ValueError(
                 "trtllm_mla backend requires MLA model (use_mla_backend=True)."
             )
@@ -343,7 +343,7 @@ class EAGLEWorker(TpModelWorker):
         )
 
     def _create_flashinfer_prefill_backend(self):
-        if not global_server_args_dict["use_mla_backend"]:
+        if not get_global_server_args().use_mla_backend:
             from sglang.srt.layers.attention.flashinfer_backend import (
                 FlashInferAttnBackend,
             )
@@ -379,7 +379,7 @@ class EAGLEWorker(TpModelWorker):
         return TRTLLMHAAttnBackend(self.draft_model_runner, skip_prefill=False)
 
     def _create_trtllm_mla_prefill_backend(self):
-        if not global_server_args_dict["use_mla_backend"]:
+        if not get_global_server_args().use_mla_backend:
             raise ValueError(
                 "trtllm_mla backend requires MLA model (use_mla_backend=True)."
             )

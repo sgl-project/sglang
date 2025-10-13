@@ -240,6 +240,7 @@ class GroupCoordinator:
         use_message_queue_broadcaster: bool = False,
         group_name: Optional[str] = None,
         torch_compile: Optional[bool] = None,
+        gloo_timeout: timedelta = timedelta(seconds=120 * 60),
     ):
         # Set group info
         group_name = group_name or "anonymous"
@@ -259,7 +260,9 @@ class GroupCoordinator:
             )
             # a group with `gloo` backend, to allow direct coordination between
             # processes through the CPU.
-            cpu_group = torch.distributed.new_group(ranks, backend="gloo")
+            cpu_group = torch.distributed.new_group(
+                ranks, backend="gloo", timeout=gloo_timeout
+            )
             if self.rank in ranks:
                 self.ranks = ranks
                 self.world_size = len(ranks)
@@ -612,8 +615,11 @@ class GroupCoordinator:
 
     def _all_reduce_in_place(self, input_: torch.Tensor) -> None:
         pynccl_comm = self.pynccl_comm
+        symm_mem_comm = self.symm_mem_comm
         if pynccl_comm is not None and not pynccl_comm.disabled:
             pynccl_comm.all_reduce(input_)
+        elif symm_mem_comm is not None and not symm_mem_comm.disabled:
+            symm_mem_comm.all_reduce(input_)
         else:
             torch.distributed.all_reduce(input_, group=self.device_group)
 

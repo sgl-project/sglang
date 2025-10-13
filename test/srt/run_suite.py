@@ -13,7 +13,7 @@ class TestFile:
 
 # NOTE: please sort the test cases alphabetically by the test file name
 suites = {
-    "per-commit": [
+    "per-commit-1-gpu": [
         TestFile("function_call/test_json_schema_constraint.py", 30),
         TestFile("hicache/test_hicache.py", 116),
         TestFile("hicache/test_hicache_eagle.py", 150),
@@ -29,7 +29,7 @@ suites = {
         TestFile("models/test_compressed_tensors_models.py", 42),
         TestFile("models/test_cross_encoder_models.py", 100),
         TestFile("models/test_embedding_models.py", 73),
-        TestFile("models/test_encoder_embedding_models.py", 100),
+        TestFile("models/test_encoder_embedding_models.py", 460),
         TestFile("models/test_generation_models.py", 103),
         TestFile("models/test_nvidia_nemotron_nano_v2.py", 180),
         TestFile("models/test_qwen_models.py", 82),
@@ -80,11 +80,12 @@ suites = {
         TestFile("test_gpt_oss_1gpu.py", 600),
         TestFile("test_harmony_parser.py", 20),
         TestFile("test_hidden_states.py", 55),
-        TestFile("test_hybrid_attn_backend.py", 100),
+        TestFile("test_hybrid_attn_backend.py", 379),
         TestFile("test_input_embeddings.py", 38),
         TestFile("test_io_struct.py", 8),
         TestFile("test_jinja_template_utils.py", 1),
         TestFile("test_logprobs.py", 55),
+        TestFile("test_mamba_unittest.py", 4),
         TestFile("test_metrics.py", 32),
         TestFile("test_metrics_utils.py", 1),
         TestFile("test_mla.py", 167),
@@ -108,7 +109,7 @@ suites = {
         TestFile("test_regex_constrained.py", 64),
         TestFile("test_request_queue_validation.py", 30),
         TestFile("test_retract_decode.py", 54),
-        TestFile("test_score_api.py", 180),
+        TestFile("test_score_api.py", 310),
         TestFile("test_server_args.py", 1),
         TestFile("test_skip_tokenizer_init.py", 117),
         TestFile("test_srt_endpoint.py", 130),
@@ -180,6 +181,9 @@ suites = {
         TestFile("test_vllm_dependency.py", 185),
         # TestFile("test_gguf.py", 96),
     ],
+    # If the test cases take too long, considering adding them to nightly tests instead of per-commit tests
+    "nightly-1-gpu": [],
+    "nightly-8-gpu": [],
 }
 
 # Add AMD tests
