@@ -94,16 +94,11 @@ impl AppContext {
                     })?;
 
                 let tokenizer = Some(
-                    if let Some(ref chat_template) = router_config.chat_template {
-                        tokenizer_factory::create_tokenizer_with_chat_template(
-                            &tokenizer_path,
-                            Some(chat_template),
-                        )
-                        .map_err(|e| format!("Failed to create tokenizer: {e}"))?
-                    } else {
-                        tokenizer_factory::create_tokenizer(&tokenizer_path)
-                            .map_err(|e| format!("Failed to create tokenizer: {e}"))?
-                    },
+                    tokenizer_factory::create_tokenizer_with_chat_template_blocking(
+                        &tokenizer_path,
+                        router_config.chat_template.as_deref(),
+                    )
+                    .map_err(|e| format!("Failed to create tokenizer: {e}"))?,
                 );
                 let reasoning_parser_factory = Some(crate::reasoning_parser::ParserFactory::new());
                 let tool_parser_factory = Some(crate::tool_parser::ParserFactory::new());

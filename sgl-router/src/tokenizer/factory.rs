@@ -193,10 +193,18 @@ pub fn discover_chat_template_in_dir(dir: &Path) -> Option<String> {
 pub async fn create_tokenizer_async(
     model_name_or_path: &str,
 ) -> Result<Arc<dyn traits::Tokenizer>> {
+    create_tokenizer_async_with_chat_template(model_name_or_path, None).await
+}
+
+/// Factory function to create tokenizer with optional chat template (async version)
+pub async fn create_tokenizer_async_with_chat_template(
+    model_name_or_path: &str,
+    chat_template_path: Option<&str>,
+) -> Result<Arc<dyn traits::Tokenizer>> {
     // Check if it's a file path
     let path = Path::new(model_name_or_path);
     if path.exists() {
-        return create_tokenizer_from_file(model_name_or_path);
+        return create_tokenizer_with_chat_template(model_name_or_path, chat_template_path);
     }
 
     // Check if it's a GPT model name that should use Tiktoken
@@ -216,8 +224,10 @@ pub async fn create_tokenizer_async(
             // Look for tokenizer.json in the cache directory
             let tokenizer_path = cache_dir.join("tokenizer.json");
             if tokenizer_path.exists() {
-                // Try to find a chat template file in the cache directory
-                let chat_template_path = discover_chat_template_in_dir(&cache_dir);
+                // Use provided chat template or auto-discover from cache directory
+                let final_chat_template = chat_template_path
+                    .map(|s| s.to_string())
+                    .or_else(|| discover_chat_template_in_dir(&cache_dir));
                 let tokenizer_path_str = tokenizer_path.to_str().ok_or_else(|| {
                     Error::msg(format!(
                         "Tokenizer path is not valid UTF-8: {:?}",
@@ -226,7 +236,7 @@ pub async fn create_tokenizer_async(
                 })?;
                 create_tokenizer_with_chat_template(
                     tokenizer_path_str,
-                    chat_template_path.as_deref(),
+                    final_chat_template.as_deref(),
                 )
             } else {
                 // Try other common tokenizer file names
@@ -234,13 +244,15 @@ pub async fn create_tokenizer_async(
                 for file_name in &possible_files {
                     let file_path = cache_dir.join(file_name);
                     if file_path.exists() {
-                        let chat_template_path = discover_chat_template_in_dir(&cache_dir);
+                        let final_chat_template = chat_template_path
+                            .map(|s| s.to_string())
+                            .or_else(|| discover_chat_template_in_dir(&cache_dir));
                         let file_path_str = file_path.to_str().ok_or_else(|| {
                             Error::msg(format!("File path is not valid UTF-8: {:?}", file_path))
                         })?;
                         return create_tokenizer_with_chat_template(
                             file_path_str,
-                            chat_template_path.as_deref(),
+                            final_chat_template.as_deref(),
                         );
                     }
                 }
@@ -259,10 +271,18 @@ pub async fn create_tokenizer_async(
 
 /// Factory function to create tokenizer from a model name or path (blocking version)
 pub fn create_tokenizer(model_name_or_path: &str) -> Result<Arc<dyn traits::Tokenizer>> {
+    create_tokenizer_with_chat_template_blocking(model_name_or_path, None)
+}
+
+/// Factory function to create tokenizer with optional chat template (blocking version)
+pub fn create_tokenizer_with_chat_template_blocking(
+    model_name_or_path: &str,
+    chat_template_path: Option<&str>,
+) -> Result<Arc<dyn traits::Tokenizer>> {
     // Check if it's a file path
     let path = Path::new(model_name_or_path);
     if path.exists() {
-        return create_tokenizer_from_file(model_name_or_path);
+        return create_tokenizer_with_chat_template(model_name_or_path, chat_template_path);
     }
 
     // Check if it's a GPT model name that should use Tiktoken
@@ -280,11 +300,19 @@ pub fn create_tokenizer(model_name_or_path: &str) -> Result<Arc<dyn traits::Toke
     // Check if we're already in a tokio runtime
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         // We're in a runtime, use block_in_place
-        tokio::task::block_in_place(|| handle.block_on(create_tokenizer_async(model_name_or_path)))
+        tokio::task::block_in_place(|| {
+            handle.block_on(create_tokenizer_async_with_chat_template(
+                model_name_or_path,
+                chat_template_path,
+            ))
+        })
     } else {
         // No runtime, create a temporary one
         let rt = tokio::runtime::Runtime::new()?;
-        rt.block_on(create_tokenizer_async(model_name_or_path))
+        rt.block_on(create_tokenizer_async_with_chat_template(
+            model_name_or_path,
+            chat_template_path,
+        ))
     }
 }
 
