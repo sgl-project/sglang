@@ -454,11 +454,13 @@ class Qwen3_VisionTransformer(nn.Module):
         # compute cu_seqlens
         cu_seqlens = torch.repeat_interleave(
             grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
-        ).cumsum(
-            dim=0,
-            dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
+        ).cumsum(dim=0)
+        cu_seqlens = torch.cat(
+            [
+                torch.zeros(1, dtype=torch.int32, device=cu_seqlens.device),
+                cu_seqlens.to(torch.int32),
+            ]
         )
-        cu_seqlens = torch.cat([cu_seqlens.new_zeros(1), cu_seqlens])
 
         # max_seqlen, seqlens = self.compute_attn_mask_seqlen(cu_seqlens)
         x = x.unsqueeze(1)
