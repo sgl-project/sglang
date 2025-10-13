@@ -107,6 +107,7 @@ cu130_all = [
 
 # The following will be deprecated in 2 weeks
 dev = ["sglang[test]", "sglang[decord]"]
+all_aarch64 = ["sglang[test]"]
 blackwell = ["sglang[test]", "sglang[decord]"]
 blackwell_aarch64 = ["sglang[test]"]
 
