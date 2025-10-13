@@ -919,6 +919,19 @@ class SWAKVPool(KVCache):
         # TODO MHATransposedTokenToKVPool if enable_kvcache_transpose is True
         assert not enable_kvcache_transpose
 
+        # for disagg with nvlink
+        self.enable_custom_mem_pool = get_bool_env_var(
+            "SGLANG_MOONCAKE_CUSTOM_MEM_POOL", "false"
+        )
+        if self.enable_custom_mem_pool:
+            # TODO(shangming): abstract custom allocator class for more backends
+            from mooncake.allocator import NVLinkAllocator
+
+            allocator = NVLinkAllocator.get_allocator(self.device)
+            self.custom_mem_pool = torch.cuda.MemPool(allocator.allocator())
+        else:
+            self.custom_mem_pool = None
+
         self.swa_kv_pool = token_to_kv_pool_class(
             size=size_swa,
             dtype=dtype,
