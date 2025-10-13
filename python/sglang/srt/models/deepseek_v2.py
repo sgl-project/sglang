@@ -631,6 +631,7 @@ class DeepseekV2MoE(nn.Module):
             )
 
         self._enable_deepep_moe = get_moe_a2a_backend().is_deepep()
+        self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
 
     def get_moe_weights(self):
         return [
@@ -722,7 +723,7 @@ class DeepseekV2MoE(nn.Module):
             return self.forward_cpu(hidden_states, should_allreduce_fusion)
 
         if hidden_states.shape[0] > 0:
-            if not SboFlags.fuse_shared_experts_inside_sbo():
+            if not self._fuse_shared_experts_inside_sbo:
                 shared_output = self._forward_shared_experts(
                     hidden_states, gemm_output_zero_allocator
                 )
@@ -733,7 +734,7 @@ class DeepseekV2MoE(nn.Module):
             shared_output = None
             topk_output = self.topk.empty_topk_output(hidden_states.device)
 
-        if SboFlags.fuse_shared_experts_inside_sbo():
+        if self._fuse_shared_experts_inside_sbo:
             shared_output = None
 
             def _forward_shared_experts_and_put_results():
@@ -750,7 +751,7 @@ class DeepseekV2MoE(nn.Module):
                     forward_shared_experts=_forward_shared_experts_and_put_results,
                     alt_stream=self.alt_stream,
                 )
-                if SboFlags.fuse_shared_experts_inside_sbo()
+                if self._fuse_shared_experts_inside_sbo
                 else {}
             ),
         )
@@ -837,7 +838,7 @@ class DeepseekV2MoE(nn.Module):
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
-            if not SboFlags.fuse_shared_experts_inside_sbo():
+            if not self._fuse_shared_experts_inside_sbo:
                 shared_output = self._forward_shared_experts(hidden_states)
             topk_weights, topk_idx, _ = self.topk(
                 hidden_states,
