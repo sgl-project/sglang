@@ -9,22 +9,22 @@ For an overview of the implemented features see the completed [Roadmap](https://
 
 To run DeepSeek V3.1/V3/R1 models, the recommended settings are as follows:
 
-| Weight Type | Configuration |
-|------------|-------------------|
-| **Full precision FP8**<br>*(recommended)* | 8 x H200 |
-| | 8 x MI300X |
-| | 2 x 8 x H100/800/20 |
-| | Xeon 6980P CPU |
-| **Full precision BF16** | 2 x 8 x H200 |
-| | 2 x 8 x MI300X |
-| | 4 x 8 x H100/800/20 |
-| | 4 x 8 x A100/A800 |
-| **Quantized weights (AWQ)** | 8 x H100/800/20 |
-| | 8 x A100/A800 |
-| **Quantized weights (int8)** | 16 x A100/800 |
-| | 32 x L40S |
-| | Xeon 6980P CPU |
-| | 2 x Atlas 800I A3 |
+| Weight Type                               | Configuration       |
+| ----------------------------------------- | ------------------- |
+| **Full precision FP8**<br>*(recommended)* | 8 x H200            |
+|                                           | 8 x MI300X          |
+|                                           | 2 x 8 x H100/800/20 |
+|                                           | Xeon 6980P CPU      |
+| **Full precision BF16**                   | 2 x 8 x H200        |
+|                                           | 2 x 8 x MI300X      |
+|                                           | 4 x 8 x H100/800/20 |
+|                                           | 4 x 8 x A100/A800   |
+| **Quantized weights (AWQ)**               | 8 x H100/800/20     |
+|                                           | 8 x A100/A800       |
+| **Quantized weights (int8)**              | 16 x A100/800       |
+|                                           | 32 x L40S           |
+|                                           | Xeon 6980P CPU      |
+|                                           | 2 x Atlas 800I A3   |
 
 <style>
 .md-typeset__table {
@@ -144,7 +144,7 @@ With data parallelism attention enabled, we have achieved up to **1.9x** decodin
 
 - **DeepGEMM**: The [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM) kernel library optimized for FP8 matrix multiplications.
 
-**Usage**: The activation and weight optimization above are turned on by default for DeepSeek V3 models. DeepGEMM is enabled by default on NVIDIA Hopper GPUs and disabled by default on other devices. DeepGEMM can also be manually turned off by setting the environment variable `SGL_ENABLE_JIT_DEEPGEMM=0`.
+**Usage**: The activation and weight optimization above are turned on by default for DeepSeek V3 models. DeepGEMM is enabled by default on NVIDIA Hopper GPUs and disabled by default on other devices. DeepGEMM can also be manually turned off by setting the environment variable `SGLANG_ENABLE_JIT_DEEPGEMM=0`.
 
 Before serving the DeepSeek model, precompile the DeepGEMM kernels using:
 ```bash
