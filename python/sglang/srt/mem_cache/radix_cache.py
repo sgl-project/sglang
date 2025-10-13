@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from python.sglang.srt.utils import DEFAULT_DETERMINISTIC_INFERENCE_BACKEND_SIZE
+from sglang.srt.utils import DEFAULT_DETERMINISTIC_INFERENCE_BACKEND_SIZE
 
 """
 Copyright 2023-2024 SGLang Team
