@@ -613,50 +613,6 @@ class RouterArgs:
                     f"and --decode-policy '{self.decode_policy}' for decode nodes."
                 )
 
-        # Validate Oracle config when history_backend is oracle
-        if self.history_backend == "oracle":
-            # Check that exactly one of TNS alias or connect descriptor is provided
-            if self.oracle_tns_alias and self.oracle_connect_descriptor:
-                raise ValueError(
-                    "Cannot provide both oracle_tns_alias and oracle_connect_descriptor. "
-                    "Provide only one via --oracle-tns-alias/ATP_TNS_ALIAS or --oracle-connect-descriptor/ATP_DSN"
-                )
-
-            if not self.oracle_tns_alias and not self.oracle_connect_descriptor:
-                raise ValueError(
-                    "Either oracle_tns_alias or oracle_connect_descriptor is required when history_backend='oracle'. "
-                    "Provide via --oracle-tns-alias/ATP_TNS_ALIAS or --oracle-connect-descriptor/ATP_DSN env variable"
-                )
-
-            # If using TNS alias, wallet path is required
-            if self.oracle_tns_alias and not self.oracle_wallet_path:
-                raise ValueError(
-                    "oracle_wallet_path is required when using oracle_tns_alias. "
-                    "Provide via --oracle-wallet-path or ATP_WALLET_PATH env variable"
-                )
-
-            if not self.oracle_username:
-                raise ValueError(
-                    "oracle_username is required when history_backend='oracle'. "
-                    "Provide via --oracle-username or ATP_USER env variable"
-                )
-            if not self.oracle_password:
-                raise ValueError(
-                    "oracle_password is required when history_backend='oracle'. "
-                    "Provide via --oracle-password or ATP_PASSWORD env variable"
-                )
-            if self.oracle_pool_min < 1:
-                raise ValueError("oracle_pool_min must be at least 1")
-            if self.oracle_pool_max < self.oracle_pool_min:
-                raise ValueError("oracle_pool_max must be >= oracle_pool_min")
-
-        # Validate OpenAI backend
-        if self.backend == "openai":
-            if not self.worker_urls and not self.service_discovery:
-                raise ValueError(
-                    "worker_urls required for OpenAI backend when not using service discovery"
-                )
-
     @staticmethod
     def _parse_selector(selector_list):
         if not selector_list:
