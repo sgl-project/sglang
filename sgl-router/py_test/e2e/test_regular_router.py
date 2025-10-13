@@ -9,13 +9,12 @@ from sglang.test.run_eval import run_eval
 
 
 @pytest.mark.e2e
-def test_mmlu(e2e_router_only_rr, e2e_primary_worker, e2e_model):
-    # Attach the primary worker to a fresh router-only instance (single model)
+def test_mmlu(e2e_router_only_rr, e2e_two_workers_dp2, e2e_model):
+    # Attach two dp=2 workers (total 4 GPUs) to a fresh router-only instance
     base = e2e_router_only_rr.url
-    r = requests.post(
-        f"{base}/add_worker", params={"url": e2e_primary_worker.url}, timeout=180
-    )
-    r.raise_for_status()
+    for w in e2e_two_workers_dp2:
+        r = requests.post(f"{base}/add_worker", params={"url": w.url}, timeout=180)
+        r.raise_for_status()
 
     args = SimpleNamespace(
         base_url=base,
@@ -27,6 +26,32 @@ def test_mmlu(e2e_router_only_rr, e2e_primary_worker, e2e_model):
     )
     metrics = run_eval(args)
     assert metrics["score"] >= 0.65
+
+
+@pytest.mark.e2e
+def test_genai_bench(
+    e2e_router_only_rr, e2e_two_workers_dp2, e2e_model, genai_bench_runner
+):
+    """Attach a worker to the regular router and run a short genai-bench."""
+    base = e2e_router_only_rr.url
+    for w in e2e_two_workers_dp2:
+        r = requests.post(f"{base}/add_worker", params={"url": w.url}, timeout=180)
+        r.raise_for_status()
+
+    genai_bench_runner(
+        router_url=base,
+        model_path=e2e_model,
+        experiment_folder="benchmark_round_robin_regular",
+        thresholds={
+            "ttft_mean_max": 6,
+            "e2e_latency_mean_max": 14,
+            "input_throughput_mean_min": 800,  # temp relax from 1000 to 800 for now
+            "output_throughput_mean_min": 12,
+            # Enforce GPU utilization p50 >= 99% during the run.
+            "gpu_util_p50_min": 99,
+        },
+        kill_procs=e2e_two_workers_dp2,
+    )
 
 
 @pytest.mark.e2e
@@ -104,18 +129,25 @@ def test_dp_aware_worker_expansion_and_api_key(
 
     # Attach worker; router should expand to dp_size logical workers
     r = requests.post(
-        f"{router_url}/add_worker", params={"url": worker_url}, timeout=180
+        f"{router_url}/add_worker",
+        params={"url": worker_url, "api_key": api_key},
+        headers={"Authorization": f"Bearer {api_key}"},
+        timeout=180,
     )
     r.raise_for_status()
 
-    r = requests.get(f"{router_url}/list_workers", timeout=30)
+    r = requests.get(
+        f"{router_url}/list_workers",
+        headers={"Authorization": f"Bearer {api_key}"},
+        timeout=30,
+    )
     r.raise_for_status()
     urls = r.json().get("urls", [])
     assert len(urls) == 2
     assert set(urls) == {f"{worker_url}@0", f"{worker_url}@1"}
 
-    # Verify API key enforcement path-through
-    # 1) Without Authorization -> 401 from backend
+    # Verify API key enforcement
+    # 1) Without Authorization -> Should get 401 Unauthorized
     r = requests.post(
         f"{router_url}/v1/completions",
         json={"model": e2e_model, "prompt": "hi", "max_tokens": 1},

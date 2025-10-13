@@ -27,6 +27,17 @@ class ChunkCache(BasePrefixCache):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.page_size = page_size
+        if self.token_to_kv_pool_allocator:
+            self.device = self.token_to_kv_pool_allocator.device
+        else:
+            self.device = torch.device("cpu")
+
+    # NOTE (csy): this is to determine if a cache has prefix matching feature.
+    # Chunk cache always return True to indicate no prefix matching.
+    # TODO (csy): Using a prefix cache trait to replace this
+    @property
+    def disable(self):
+        return True
 
     def reset(self):
         pass
@@ -38,7 +49,7 @@ class ChunkCache(BasePrefixCache):
             last_host_node=None,
         )
 
-    def cache_finished_req(self, req: Req):
+    def cache_finished_req(self, req: Req, insert: bool = True):
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx,
             # For decode server: if req.output_ids is empty, we want to free all req.origin_input_ids
@@ -53,7 +64,7 @@ class ChunkCache(BasePrefixCache):
         ]
 
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
-        req.prefix_indices = kv_indices
+        req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
 
     def evict(self, num_tokens: int):
         pass

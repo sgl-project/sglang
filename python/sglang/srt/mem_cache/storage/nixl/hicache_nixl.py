@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 
-from sglang.srt.mem_cache.hicache_storage import HiCacheStorage
+from sglang.srt.mem_cache.hicache_storage import HiCacheStorage, HiCacheStorageConfig
 
 from .nixl_utils import NixlBackendSelection, NixlFileManager, NixlRegistration
 
@@ -26,7 +26,12 @@ logger = logging.getLogger(__name__)
 class HiCacheNixl(HiCacheStorage):
     """HiCacheNixl provides high-performance storage using NIXL plugins."""
 
-    def __init__(self, file_path: str = "/tmp/hicache_storage", plugin: str = "auto"):
+    def __init__(
+        self,
+        storage_config: HiCacheStorageConfig,
+        file_path: str = "/tmp/hicache_storage",
+        plugin: str = "auto",
+    ):
         """Initialize NIXL storage connector."""
         # Might be better to be unified across HiCache backends and moved to HiCacheController
         file_path = os.getenv("SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR", file_path)
@@ -35,6 +40,19 @@ class HiCacheNixl(HiCacheStorage):
             if plugin not in NixlBackendSelection.OBJ_PLUGINS
             else None
         )
+
+        # Initialize suffix based on storage config
+        tp_rank, tp_size, model_name, is_mla_model = (
+            storage_config.tp_rank,
+            storage_config.tp_size,
+            storage_config.model_name,
+            storage_config.is_mla_model,
+        )
+        model_name = "-".join(model_name.split("/")) if model_name else ""
+        if is_mla_model:
+            self.config_suffix = f"_{model_name}"
+        else:
+            self.config_suffix = f"_{model_name}_{tp_rank}_{tp_size}"
 
         agent_config = nixl_agent_config(backends=[])
         self.agent_name = f"hicache_nixl_{str(uuid.uuid4())}"
@@ -45,6 +63,9 @@ class HiCacheNixl(HiCacheStorage):
             raise RuntimeError("Failed to create NIXL backend")
 
         self.registration = NixlRegistration(self.agent)
+
+    def _get_suffixed_key(self, key: str) -> str:
+        return key + self.config_suffix
 
     def register_buffers(
         self, buffers: Union[torch.Tensor, List[torch.Tensor], List[tuple]]
@@ -194,11 +215,14 @@ class HiCacheNixl(HiCacheStorage):
         else:
             dest = target_locations
 
+        # Add suffix to keys
+        suffixed_keys = [self._get_suffixed_key(key) for key in keys]
+
         if self.backend_selector.mem_type == "FILE":
-            file_paths = [self.file_manager.get_file_path(key) for key in keys]
+            file_paths = [self.file_manager.get_file_path(key) for key in suffixed_keys]
             success = self._execute_transfer(dest, file_paths, "READ")
         else:
-            success = self._execute_transfer(dest, keys, "READ")
+            success = self._execute_transfer(dest, suffixed_keys, "READ")
         return target_locations if success and not target_sizes else [None] * len(keys)
 
     def set(
@@ -227,9 +251,12 @@ class HiCacheNixl(HiCacheStorage):
         if not values:
             values = list(zip(target_locations, target_sizes))
 
+        # Add suffix to keys
+        suffixed_keys = [self._get_suffixed_key(key) for key in keys]
+
         if self.backend_selector.mem_type == "FILE":
             file_paths = []
-            for key in keys:
+            for key in suffixed_keys:
                 file_path = self.file_manager.get_file_path(key)
                 # New file per set, to be updated when partial writes is added to HiCache
                 if not self.file_manager.create_file(file_path):
@@ -238,11 +265,14 @@ class HiCacheNixl(HiCacheStorage):
                 file_paths.append(file_path)
             return self._execute_transfer(values, file_paths, "WRITE")
         else:  # mem_type == "OBJ"
-            return self._execute_transfer(values, keys, "WRITE")
+            return self._execute_transfer(values, suffixed_keys, "WRITE")
 
     def exists(self, key: str) -> bool:
+        # Add suffix to key
+        suffixed_key = self._get_suffixed_key(key)
+
         tuples = self.registration.create_query_tuples(
-            key,
+            suffixed_key,
             self.backend_selector.mem_type,
             self.file_manager if self.backend_selector.mem_type == "FILE" else None,
         )

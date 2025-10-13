@@ -15,7 +15,7 @@ from typing import List, Optional
 
 import requests
 
-PARENT_FOLDER = "/tmp/sglang-profile"
+PROFILER_DIR = os.getenv("SGLANG_TORCH_PROFILER_DIR", "/tmp")
 
 
 def _run_profile(
@@ -27,7 +27,7 @@ def _run_profile(
     profile_by_stage: bool = False,
 ) -> str:
     if output_dir is None:
-        output_dir = PARENT_FOLDER
+        output_dir = PROFILER_DIR
 
     output_dir = os.path.normpath(output_dir)
     output_dir = os.path.abspath(output_dir)

@@ -99,7 +99,7 @@ We are also providing a DeepEP-compatible Library as a drop-in replacement of de
 
 ```shell
 # Use the last release branch
-git clone -b v0.5.2rc2 https://github.com/sgl-project/sglang.git
+git clone -b v0.5.3.post1 https://github.com/sgl-project/sglang.git
 cd sglang
 
 pip install --upgrade pip
@@ -118,7 +118,7 @@ git clone https://github.com/sgl-project/sglang.git
 cd sglang/docker
 
 # Build the docker image
-docker build -t sglang-npu:main -f Dockerfile.npu .
+docker build -t <image_name> -f Dockerfile.npu .
 
 alias drun='docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
     --device=/dev/davinci0 --device=/dev/davinci1 --device=/dev/davinci2 --device=/dev/davinci3 \
@@ -132,7 +132,7 @@ alias drun='docker run -it --rm --privileged --network=host --ipc=host --shm-siz
     --volume /var/queue_schedule:/var/queue_schedule --volume ~/.cache/:/root/.cache/'
 
 drun --env "HF_TOKEN=<secret>" \
-    sglang-npu:main \
+    <image_name> \
     python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --attention-backend ascend --host 0.0.0.0 --port 30000
 ```
 
@@ -149,7 +149,7 @@ Prefill:
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export ASCEND_MF_STORE_URL="tcp://<PREFILL_HOST_IP>:<PORT>"
 
-drun sglang-npu:main \
+drun <image_name> \
     python3 -m sglang.launch_server --model-path State_Cloud/DeepSeek-R1-bf16-hfd-w8a8 \
     --trust-remote-code \
     --attention-backend ascend \
@@ -174,8 +174,9 @@ export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export ASCEND_MF_STORE_URL="tcp://<PREFILL_HOST_IP>:<PORT>"
 export HCCL_BUFFSIZE=200
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=24
+export SGLANG_NPU_USE_MLAPO=1
 
-drun sglang-npu:main \
+drun <image_name> \
     python3 -m sglang.launch_server --model-path State_Cloud/DeepSeek-R1-bf16-hfd-w8a8 \
     --trust-remote-code \
     --attention-backend ascend \
@@ -198,7 +199,7 @@ drun sglang-npu:main \
 Mini_LB:
 
 ```shell
-drun sglang-npu:main \
+drun <image_name> \
     python -m sglang.srt.disaggregation.launch_lb \
     --prefill http://<PREFILL_HOST_IP>:8000 \
     --decode http://<DECODE_HOST_IP>:8001 \

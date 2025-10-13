@@ -109,18 +109,31 @@ def sgl_per_token_group_quant_8bit(
     scale_ue8m0: bool = False,
     fuse_silu_and_mul: bool = False,
     masked_m: Optional[torch.Tensor] = None,
+    enable_v2: Optional[bool] = None,
 ) -> None:
+    if enable_v2 is None:
+        from sglang.srt.utils import get_bool_env_var
+
+        enable_v2 = get_bool_env_var("SGLANG_PER_TOKEN_GROUP_QUANT_8BIT_V2")
+
+    if enable_v2:
+        return torch.ops.sgl_kernel.sgl_per_token_group_quant_8bit_v2.default(
+            input,
+            output_q,
+            output_s,
+            group_size,
+            eps,
+            fp8_min,
+            fp8_max,
+            scale_ue8m0,
+            fuse_silu_and_mul,
+            masked_m,
+        )
+
+    assert not fuse_silu_and_mul, "only v2 support fuse_silu_and_mul"
+    assert masked_m is None, "only v2 support masked_m"
     torch.ops.sgl_kernel.sgl_per_token_group_quant_8bit.default(
-        input,
-        output_q,
-        output_s,
-        group_size,
-        eps,
-        fp8_min,
-        fp8_max,
-        scale_ue8m0,
-        fuse_silu_and_mul,
-        masked_m,
+        input, output_q, output_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
     )
 
 
