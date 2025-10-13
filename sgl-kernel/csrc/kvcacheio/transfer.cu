@@ -114,7 +114,7 @@ __device__ __forceinline__ T* get_global_offset_phf(
   // page head first
   return base + page_id / page_size * page_size * page_dim
          + page_dim / head_fragment_num * head_fragment_id * page_size
-         + page_id % page_size * page_dim / head_fragment_num
+         + (page_id % page_size) * page_dim / head_fragment_num
          + layer_id * item_size_bytes / head_fragment_num;
 }
 
