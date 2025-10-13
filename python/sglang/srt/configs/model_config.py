@@ -25,7 +25,7 @@ from transformers import PretrainedConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import is_hip, retry
+from sglang.srt.utils import is_hip
 from sglang.srt.utils.hf_transformers_utils import (
     get_config,
     get_context_length,
@@ -86,11 +86,11 @@ class ModelConfig:
         dtype: str = "auto",
         quantization: Optional[str] = None,
         modelopt_quant: Optional[Union[str, Dict]] = None,
-        modelopt_checkpoint_restore_path: Optional[str] = None,
-        modelopt_checkpoint_save_path: Optional[str] = None,
         override_config_file: Optional[str] = None,
         is_draft_model: bool = False,
-        hybrid_kvcache_ratio: Optional[float] = None,
+        hybrid_kvcache_ratio: Optional[
+            float
+        ] = None,  # TODO: remove this, it is not a model config
         model_impl: Union[str, ModelImpl] = ModelImpl.AUTO,
         sampling_defaults: str = "openai",
     ) -> None:

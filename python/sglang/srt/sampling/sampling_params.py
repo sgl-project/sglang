@@ -17,8 +17,6 @@ import logging
 import sre_parse
 from typing import Any, Dict, List, Optional, Union
 
-from sglang.srt.utils import get_bool_env_var
-
 _SAMPLING_EPS = 1e-6
 TOP_K_ALL = 1 << 30
 
