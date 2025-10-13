@@ -317,7 +317,10 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         Check the health of the inference server by sending a special request to generate one token.
         Similar to HTTP server's /health endpoint.
         """
-        logger.info("Receive health check request")
+        rid = f"HEALTH_CHECK_{time.time()}"
+        logger.info(
+            f"Receive health check request: original rid: {request.request_id}, scheduler rid: {rid}"
+        )
 
         if self.request_manager.gracefully_exit:
             logger.info(
@@ -328,7 +331,6 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             )
 
         # Create a special health check request
-        rid = f"HEALTH_CHECK_{time.time()}"
         sampling_params = SGLSamplingParams(max_new_tokens=1, temperature=0.0)
         sampling_params.normalize(tokenizer=None)
 
