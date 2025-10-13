@@ -424,22 +424,23 @@ pub struct ConcurrencyLimiter {
 impl ConcurrencyLimiter {
     /// Create new concurrency limiter with optional queue
     pub fn new(
-        token_bucket: Arc<TokenBucket>,
+        token_bucket: Option<Arc<TokenBucket>>,
         queue_size: usize,
         queue_timeout: Duration,
     ) -> (Self, Option<QueueProcessor>) {
-        if queue_size > 0 {
-            let (queue_tx, queue_rx) = mpsc::channel(queue_size);
-            let processor = QueueProcessor::new(token_bucket, queue_rx, queue_timeout);
-
-            (
-                Self {
-                    queue_tx: Some(queue_tx),
-                },
-                Some(processor),
-            )
-        } else {
-            (Self { queue_tx: None }, None)
+        match (token_bucket, queue_size) {
+            (None, _) => (Self { queue_tx: None }, None),
+            (Some(bucket), size) if size > 0 => {
+                let (queue_tx, queue_rx) = mpsc::channel(size);
+                let processor = QueueProcessor::new(bucket, queue_rx, queue_timeout);
+                (
+                    Self {
+                        queue_tx: Some(queue_tx),
+                    },
+                    Some(processor),
+                )
+            }
+            (Some(_), _) => (Self { queue_tx: None }, None),
         }
     }
 }
@@ -450,12 +451,19 @@ pub async fn concurrency_limit_middleware(
     request: Request<Body>,
     next: Next,
 ) -> Response {
+    let token_bucket = match &app_state.context.rate_limiter {
+        Some(bucket) => bucket.clone(),
+        None => {
+            // Rate limiting disabled, pass through immediately
+            return next.run(request).await;
+        }
+    };
+
     // Static counter for embeddings queue size
     static EMBEDDINGS_QUEUE_SIZE: AtomicU64 = AtomicU64::new(0);
 
     // Identify if this is an embeddings request based on path
     let is_embeddings = request.uri().path().contains("/v1/embeddings");
-    let token_bucket = app_state.context.rate_limiter.clone();
 
     // Try to acquire token immediately
     if token_bucket.try_acquire(1.0).await.is_ok() {
