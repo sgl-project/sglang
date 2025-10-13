@@ -865,15 +865,16 @@ class DeepseekV2MoE(nn.Module):
             topk_idx=topk_idx,
             topk_weights=topk_weights,
             forward_batch=forward_batch,
-            # SBO args
-            forward_shared_experts=(
-                _forward_shared_experts_and_put_results
+            **(
+                dict(
+                    forward_shared_experts=_forward_shared_experts_and_put_results,
+                    alt_stream=self.alt_stream,
+                    # SBO is not yet implemented for NextN
+                    disable_sbo=self.is_nextn,
+                )
                 if self._fuse_shared_experts_inside_sbo
-                else None
+                else {}
             ),
-            alt_stream=self.alt_stream,
-            # SBO is not yet implemented for NextN
-            disable_sbo=self.is_nextn,
         )
 
         if shared_output is not None:
