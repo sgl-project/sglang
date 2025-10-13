@@ -122,7 +122,6 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     RequestStage,
     ScheduleBatch,
-    global_server_args_dict,
 )
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
@@ -151,7 +150,7 @@ from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.parser.reasoning_parser import ReasoningParser
-from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.tracing.trace import (
@@ -448,13 +447,12 @@ class Scheduler(
             self.max_req_input_len,
             self.random_seed,
             self.device,
-            worker_global_server_args_dict,
             _,
             _,
             _,
         ) = self.tp_worker.get_worker_info()
-        if global_server_args_dict["pp_max_micro_batch_size"] is None:
-            global_server_args_dict["pp_max_micro_batch_size"] = max(
+        if get_global_server_args().pp_max_micro_batch_size is None:
+            get_global_server_args().pp_max_micro_batch_size = max(
                 self.max_running_requests // server_args.pp_size, 1
             )
 
@@ -466,14 +464,11 @@ class Scheduler(
         self.world_group = get_world_group()
 
         self.pad_input_ids_func = self.tp_worker.get_pad_input_ids_func()
-        global_server_args_dict.update(worker_global_server_args_dict)
         set_random_seed(self.random_seed)
 
         # Hybrid memory pool
         self.is_hybrid = self.tp_worker.is_hybrid
-        self.is_hybrid_gdn = (
-            self.tp_worker.worker.model_runner.hybrid_gdn_config is not None
-        )
+        self.is_hybrid_gdn = self.tp_worker.model_runner.hybrid_gdn_config is not None
 
         if self.is_hybrid:
             self.sliding_window_size = self.tp_worker.sliding_window_size
@@ -1885,7 +1880,7 @@ class Scheduler(
             chunked_req_to_exclude.add(self.chunked_req)
             self.tree_cache.cache_unfinished_req(self.chunked_req, chunked=True)
             # chunked request keeps its rid but will get a new req_pool_idx
-            if self.tp_worker.worker.model_runner.mambaish_config is not None:
+            if self.tp_worker.model_runner.mambaish_config is not None:
                 self.req_to_token_pool.free(
                     self.chunked_req.req_pool_idx, free_mamba_cache=False
                 )
@@ -1942,7 +1937,7 @@ class Scheduler(
         return ret
 
     def get_num_allocatable_reqs(self, running_bs):
-        res = global_server_args_dict["pp_max_micro_batch_size"] - running_bs
+        res = get_global_server_args().pp_max_micro_batch_size - running_bs
         if self.pp_size > 1:
             res = min(res, self.req_to_token_pool.available_size())
         return res
@@ -2686,12 +2681,10 @@ class Scheduler(
         )
 
     def get_internal_state(self, recv_req: GetInternalStateReq):
-        ret = dict(global_server_args_dict)
+        ret = vars(get_global_server_args())
         ret["last_gen_throughput"] = self.last_gen_throughput
         ret["memory_usage"] = {
-            "weight": round(
-                self.tp_worker.worker.model_runner.weight_load_mem_usage, 2
-            ),
+            "weight": round(self.tp_worker.model_runner.weight_load_mem_usage, 2),
             "kvcache": round(
                 self.token_to_kv_pool_allocator.get_kvcache().mem_usage, 2
             ),
@@ -2699,7 +2692,7 @@ class Scheduler(
         }
 
         ret["memory_usage"]["graph"] = round(
-            self.tp_worker.worker.model_runner.graph_mem_usage, 2
+            self.tp_worker.model_runner.graph_mem_usage, 2
         )
 
         if not self.spec_algorithm.is_none() and self.cum_spec_accept_count > 0:
@@ -2742,11 +2735,11 @@ class Scheduler(
                 logger.info(f"{avg_spec_accept_length=}")
             self.cum_spec_accept_length = self.cum_spec_accept_count = 0
             for k, v in server_args_dict.items():
-                global_server_args_dict[k] = v
-            logger.info(f"Global server args updated! {global_server_args_dict=}")
+                setattr(get_global_server_args(), k, v)
+            logger.info(f"Global server args updated! {get_global_server_args()=}")
         return SetInternalStateReqOutput(
             updated=True,
-            server_args=global_server_args_dict,
+            server_args=vars(get_global_server_args()),
         )
 
     def handle_rpc_request(self, recv_req: RpcReqInput):
