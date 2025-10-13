@@ -46,11 +46,13 @@ jobs:
         uses: dorny/paths-filter@v3
         with:
           filters: |
-            h20_files:
-              - "python/sglang/srt/models/deepseek*"
-              - "python/sglang/srt/layers/moe/**"
-              - ".github/workflows/pr-test-h20.yml"
-              - "python/pyproject.toml"
+            main_package:
+              - "python/**"
+              - "scripts/ci/**"
+              - "test/**"
+              - ".github/workflows/pr-test.yml"
+            sgl_kernel:
+              - "sgl-kernel/**"
 
   per-commit-8-gpu-h20:
     needs: [check-changes]
