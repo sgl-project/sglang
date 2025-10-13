@@ -50,7 +50,7 @@ def intel_xpu_benchmark(extra_args=None, min_throughput=None):
     return decorator
 
 
-class TestIntelAMXAttnBackend(CustomTestCase):
+class TestIntelXPUBackend(CustomTestCase):
 
     @intel_xpu_benchmark(min_throughput=10)
     def test_latency_qwen_model(self):
