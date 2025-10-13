@@ -798,6 +798,14 @@ class MooncakeKVManager(CommonKVManager):
 
                         if kv_chunk.is_last:
                             if kv_chunk.state_indices is not None:
+                                if not self.is_mla_backend and (
+                                    self.attn_tp_size
+                                    != target_rank_registration_info.dst_attn_tp_size
+                                ):
+                                    raise RuntimeError(
+                                        f"PD Disaggregation does NOT support PD different TP sizes for non-MLA hybrid models yet."
+                                    )
+
                                 self.maybe_send_extra(
                                     req,
                                     kv_chunk.state_indices,
