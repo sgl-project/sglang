@@ -934,6 +934,7 @@ class TritonMultiStepDraftBackend:
         kv_indices_buffer: Optional[torch.Tensor],
         call_fn: int,
     ):
+        in_cuda_graph = kv_indices_buffer is None
         if kv_indices_buffer is None:
             kv_indices_buffer = self.cuda_graph_kv_indices
 
@@ -959,11 +960,16 @@ class TritonMultiStepDraftBackend:
             self.page_size,
         )
 
+        # NOTE: Multi-step's attention backends use the slice of
+        # - kv_indptr buffer (cuda graph and non-cuda graph)
+        # - kv_indices buffer (cuda graph only)
+
         for i in range(self.speculative_num_steps):
-            forward_batch.spec_info.kv_indptr = self.kv_indptr[i, : bs + 1]
-            forward_batch.spec_info.kv_indices = kv_indices_buffer[i][
-                : seq_lens_sum * self.topk + bs * (i + 1)
-            ]
+            if not in_cuda_graph:
+                forward_batch.spec_info.kv_indptr = self.kv_indptr[i, : bs + 1]
+                forward_batch.spec_info.kv_indices = kv_indices_buffer[i][
+                    : seq_lens_sum * self.topk + bs * (i + 1)
+                ]
             call_fn(i, forward_batch)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
