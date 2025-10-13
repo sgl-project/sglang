@@ -8,6 +8,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt import single_batch_overlap
 from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
 from sglang.srt.layers.moe import (
     get_deepep_mode,
@@ -436,22 +437,22 @@ class DeepEPMoE(EPMoE):
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
         forward_batch: ForwardBatch,
-        hack_real_fn=None,
+        forward_shared_experts=None,
+        alt_stream=None,
+        disable_sbo=False,
     ):
-        if hack_real_fn is not None:
-            return hack_real_fn()
-
-        dispatch_output = self.dispatch(
-            hidden_states, topk_idx, topk_weights, forward_batch
+        # We have to call SBO inside MoE to be compatible with hooks used in offloading
+        return single_batch_overlap.execute_sbo(
+            hidden_states=hidden_states,
+            topk_idx=topk_idx,
+            topk_weights=topk_weights,
+            forward_batch=forward_batch,
+            # SBO args
+            experts=self,
+            forward_shared_experts=forward_shared_experts,
+            alt_stream=alt_stream,
+            disable_sbo=disable_sbo,
         )
-        hidden_states = self.moe_impl(dispatch_output)
-        hidden_states = self.combine(
-            hidden_states,
-            dispatch_output.topk_idx,
-            dispatch_output.topk_weights,
-            forward_batch,
-        )
-        return hidden_states
 
     def dispatch(
         self,
