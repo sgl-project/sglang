@@ -58,9 +58,6 @@ def check_environments():
     return None
 
 
-check_environments()
-
-
 def get_abs_err(x, y):
     return (x.detach() - y.detach()).flatten().abs().max().item()
 
