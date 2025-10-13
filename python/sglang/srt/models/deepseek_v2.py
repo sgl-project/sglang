@@ -1060,7 +1060,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 q_lora_rank,
                 self.num_heads * self.qk_head_dim,
                 bias=False,
-                quant_config=get_q_b_proj_quant_config(quant_config),
+                quant_config=self._get_q_b_proj_quant_config(quant_config),
                 prefix=add_prefix("q_b_proj", prefix),
                 tp_rank=attn_tp_rank,
                 tp_size=attn_tp_size,
@@ -2043,15 +2043,16 @@ class DeepseekV2AttentionMLA(nn.Module):
         return output
 
 
-def get_q_b_proj_quant_config(quant_config):
-    if get_bool_env_var("SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN"):
-        # refer to real DeepSeek V3 quant config
-        return Fp8Config(
-            is_checkpoint_fp8_serialized=True,
-            weight_block_size=[128, 128],
-        )
-    else:
-        return quant_config
+    @staticmethod
+    def _get_q_b_proj_quant_config(quant_config):
+        if get_bool_env_var("SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN"):
+            # refer to real DeepSeek V3 quant config
+            return Fp8Config(
+                is_checkpoint_fp8_serialized=True,
+                weight_block_size=[128, 128],
+            )
+        else:
+            return quant_config
 
 
 class DeepseekV2DecoderLayer(nn.Module):
