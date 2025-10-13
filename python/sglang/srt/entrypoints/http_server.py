@@ -556,7 +556,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
 async def generate_from_file_request(file: UploadFile, request: Request):
     """Handle a generate request, this is purely to work with input_embeds."""
     content = await file.read()
-    input_embeds = json.loads(content.decode("utf-8"))
+    input_embeds = orjson.loads(content.decode("utf-8"))
 
     obj = GenerateReqInput(
         input_embeds=input_embeds,

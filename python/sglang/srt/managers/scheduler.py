@@ -35,7 +35,6 @@ from torch.cuda import Stream as CudaStream
 from torch.cuda import StreamContext as CudaStreamContext
 from torch.distributed import barrier
 
-from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.base_grammar_backend import (
     INVALID_GRAMMAR_OBJ,
@@ -61,6 +60,7 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -557,18 +557,17 @@ class Scheduler(
             server_args.schedule_conservativeness >= 0
         ), "Invalid schedule_conservativeness"
         self.init_new_token_ratio = min(
-            global_config.default_init_new_token_ratio
+            envs.SGLANG_INIT_NEW_TOKEN_RATIO.get()
             * server_args.schedule_conservativeness,
             1.0,
         )
         self.min_new_token_ratio = min(
-            self.init_new_token_ratio
-            * global_config.default_min_new_token_ratio_factor,
+            self.init_new_token_ratio * envs.SGLANG_MIN_NEW_TOKEN_RATIO_FACTOR.get(),
             1.0,
         )
         self.new_token_ratio_decay = (
             self.init_new_token_ratio - self.min_new_token_ratio
-        ) / global_config.default_new_token_ratio_decay_steps
+        ) / envs.SGLANG_NEW_TOKEN_RATIO_DECAY_STEPS.get()
         self.new_token_ratio = self.init_new_token_ratio
 
         # Init watchdog thread
@@ -2902,12 +2901,13 @@ class IdleSleeper:
         for s in sockets:
             self.poller.register(s, zmq.POLLIN)
 
+        self.empty_cache_interval = envs.SGLANG_EMPTY_CACHE_INTERVAL.get()
+
     def maybe_sleep(self):
         self.poller.poll(1000)
         if (
-            global_config.torch_empty_cache_interval > 0
-            and time.time() - self.last_empty_time
-            > global_config.torch_empty_cache_interval
+            self.empty_cache_interval > 0
+            and time.time() - self.last_empty_time > self.empty_cache_interval
         ):
             self.last_empty_time = time.time()
             torch.cuda.empty_cache()
