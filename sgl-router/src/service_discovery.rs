@@ -1,3 +1,4 @@
+use crate::config::ConnectionMode;
 use crate::core::WorkerManager;
 use crate::protocols::worker_spec::WorkerConfigRequest;
 use crate::server::AppContext;
@@ -155,8 +156,8 @@ impl PodInfo {
         self.is_ready && self.status == "Running"
     }
 
-    pub fn worker_url(&self, port: u16) -> String {
-        format!("http://{}:{}", self.ip, port)
+    pub fn worker_url(&self, port: u16, connection_mode: &ConnectionMode) -> String {
+        format!("{}://{}:{}", connection_mode.protocol(), self.ip, port)
     }
 }
 
@@ -211,6 +212,9 @@ pub async fn start_service_discovery(
         );
     }
 
+    // Extract connection_mode from app_context to pass to worker URL construction
+    let connection_mode = app_context.router_config.connection_mode.clone();
+
     let handle = task::spawn(async move {
         let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
 
@@ -224,6 +228,7 @@ pub async fn start_service_discovery(
 
         let config_arc = Arc::new(config.clone());
         let port = config.port;
+        let connection_mode_arc = Arc::new(connection_mode);
 
         let mut retry_delay = Duration::from_secs(1);
         const MAX_RETRY_DELAY: Duration = Duration::from_secs(300);
@@ -255,12 +260,14 @@ pub async fn start_service_discovery(
             let tracked_pods_clone2 = Arc::clone(&tracked_pods_clone);
             let app_context_clone = Arc::clone(&app_context);
             let config_clone2 = Arc::clone(&config_arc);
+            let connection_mode_clone = Arc::clone(&connection_mode_arc);
 
             match filtered_stream
                 .try_for_each(move |pod| {
                     let tracked_pods_inner = Arc::clone(&tracked_pods_clone2);
                     let app_context_inner = Arc::clone(&app_context_clone);
                     let config_inner = Arc::clone(&config_clone2);
+                    let connection_mode_inner = Arc::clone(&connection_mode_clone);
 
                     async move {
                         let pod_info = PodInfo::from_pod(&pod, Some(&config_inner));
@@ -272,6 +279,7 @@ pub async fn start_service_discovery(
                                     tracked_pods_inner,
                                     app_context_inner,
                                     port,
+                                    &connection_mode_inner,
                                 )
                                 .await;
                             } else {
@@ -281,6 +289,7 @@ pub async fn start_service_discovery(
                                     app_context_inner,
                                     port,
                                     config_inner.pd_mode,
+                                    &connection_mode_inner,
                                 )
                                 .await;
                             }
@@ -322,8 +331,9 @@ async fn handle_pod_event(
     app_context: Arc<AppContext>,
     port: u16,
     pd_mode: bool,
+    connection_mode: &ConnectionMode,
 ) {
-    let worker_url = pod_info.worker_url(port);
+    let worker_url = pod_info.worker_url(port, connection_mode);
 
     if pod_info.is_healthy() {
         let should_add = {
@@ -405,8 +415,9 @@ async fn handle_pod_deletion(
     tracked_pods: Arc<Mutex<HashSet<PodInfo>>>,
     app_context: Arc<AppContext>,
     port: u16,
+    connection_mode: &ConnectionMode,
 ) {
-    let worker_url = pod_info.worker_url(port);
+    let worker_url = pod_info.worker_url(port, connection_mode);
 
     let was_tracked = {
         let mut tracked = match tracked_pods.lock() {
@@ -806,7 +817,14 @@ mod tests {
             pod_type: None,
             bootstrap_port: None,
         };
-        assert_eq!(pod_info.worker_url(8080), "http://1.2.3.4:8080");
+        assert_eq!(
+            pod_info.worker_url(8080, &ConnectionMode::Http),
+            "http://1.2.3.4:8080"
+        );
+        assert_eq!(
+            pod_info.worker_url(8080, &ConnectionMode::Grpc),
+            "grpc://1.2.3.4:8080"
+        );
     }
 
     #[test]
@@ -862,6 +880,7 @@ mod tests {
             Arc::clone(&app_context),
             port,
             false, // pd_mode = false
+            &ConnectionMode::Http,
         )
         .await;
 
@@ -887,6 +906,7 @@ mod tests {
             Arc::clone(&tracked_pods),
             Arc::clone(&app_context),
             port,
+            &ConnectionMode::Http,
         )
         .await;
 
@@ -915,6 +935,7 @@ mod tests {
             Arc::clone(&app_context),
             port,
             true, // pd_mode = true for PD pod
+            &ConnectionMode::Http,
         )
         .await;
 
@@ -942,6 +963,7 @@ mod tests {
             Arc::clone(&app_context),
             port,
             true, // pd_mode = true for PD pod
+            &ConnectionMode::Http,
         )
         .await;
 
@@ -975,6 +997,7 @@ mod tests {
             Arc::clone(&tracked_pods),
             Arc::clone(&app_context),
             port,
+            &ConnectionMode::Http,
         )
         .await;
 
@@ -1003,6 +1026,7 @@ mod tests {
             Arc::clone(&tracked_pods),
             Arc::clone(&app_context),
             port,
+            &ConnectionMode::Http,
         )
         .await;
 
@@ -1030,6 +1054,7 @@ mod tests {
             Arc::clone(&app_context),
             port,
             false, // pd_mode = false
+            &ConnectionMode::Http,
         )
         .await;
 
@@ -1056,6 +1081,7 @@ mod tests {
             Arc::clone(&app_context),
             port,
             true, // pd_mode = true
+            &ConnectionMode::Http,
         )
         .await;
 
@@ -1089,6 +1115,7 @@ mod tests {
             Arc::clone(&tracked_pods),
             Arc::clone(&app_context),
             port,
+            &ConnectionMode::Http,
         )
         .await;
 
