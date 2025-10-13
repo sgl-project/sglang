@@ -18,7 +18,7 @@ from sglang.srt.layers.attention.lightning_attn.lightning_attn_seg_la import (
     seg_la_fwd,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
+from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.utils import get_compiler_backend
 
 logger = logging.getLogger(__name__)
