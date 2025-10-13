@@ -64,6 +64,14 @@ def build_tree_kernel_efficient(
     # if use_partial_packed_tree_mask is True, tree_mask: num_draft_token (flattened, packed)
     if tree_mask_buf is not None:
         tree_mask = tree_mask_buf
+        if tree_mask_mode == TreeMaskMode.QLEN_ONLY:
+            tree_mask.fill_(True)
+        elif tree_mask_mode == TreeMaskMode.QLEN_ONLY_BITPACKING:
+            tree_mask.fill_(0)
+        elif tree_mask_mode == TreeMaskMode.FULL_MASK:
+            tree_mask.fill_(True)
+        else:
+            raise NotImplementedError(f"Invalid tree mask: {tree_mask_mode=}")
     elif tree_mask_mode == TreeMaskMode.QLEN_ONLY:
         tree_mask = torch.full(
             (num_verify_tokens * bs * num_verify_tokens,),
@@ -92,15 +100,10 @@ def build_tree_kernel_efficient(
         raise NotImplementedError(f"Invalid tree mask: {tree_mask_mode=}")
 
     # TODO: make them torch.empty and fuse them into `sgl_build_tree_kernel`
-    retrive_index = torch.full(
-        (bs, num_verify_tokens), -1, device=device, dtype=torch.long
+    retrive_buf = torch.full(
+        (3, bs, num_verify_tokens), -1, device=device, dtype=torch.long
     )
-    retrive_next_token = torch.full(
-        (bs, num_verify_tokens), -1, device=device, dtype=torch.long
-    )
-    retrive_next_sibling = torch.full(
-        (bs, num_verify_tokens), -1, device=device, dtype=torch.long
-    )
+    retrive_index, retrive_next_token, retrive_next_sibling = retrive_buf
     # position: where each token belongs to
     # e.g. if depth of each draft token is [0, 1, 1, 2] and the prompt length is 7
     # then, positions = [7, 8, 8, 9]
