@@ -206,6 +206,7 @@ class Envs:
     SGLANG_MOE_PADDING = EnvBool(False)
     SGLANG_CUTLASS_MOE = EnvBool(False)
     HF_HUB_DISABLE_XET = EnvBool(False)
+    HF_XET_HIGH_PERFORMANCE = EnvBool(True)
     DISABLE_OPENAPI_DOC = EnvBool(False)
     SGLANG_ENABLE_TORCH_INFERENCE_MODE = EnvBool(False)
     SGLANG_IS_FIRST_RANK_ON_NODE = EnvBool(True)
