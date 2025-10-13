@@ -69,7 +69,7 @@ class SchedulerMetricsMixin:
                 kv_events_config, self.attn_dp_rank
             )
 
-    def udpate_spec_metrics(self, bs: int, num_accepted_tokens: int):
+    def update_spec_metrics(self: Scheduler, bs: int, num_accepted_tokens: int):
         self.spec_num_total_accepted_tokens += num_accepted_tokens + bs
         self.spec_num_total_forward_ct += bs
         self.num_generated_tokens += num_accepted_tokens
@@ -103,6 +103,23 @@ class SchedulerMetricsMixin:
             token_usage_msg = (
                 f"full token usage: {full_token_usage:.2f}, "
                 f"swa token usage: {swa_token_usage:.2f}, "
+            )
+        elif self.is_hybrid_gdn:
+            (
+                full_num_used,
+                _,
+                full_token_usage,
+                mamba_usage,
+                _,
+                _,
+                _,
+                _,
+            ) = self._get_mamba_token_info()
+            num_used = full_num_used
+            token_usage = full_token_usage
+            token_usage_msg = (
+                f"full token usage: {full_token_usage:.2f}, "
+                f"mamba usage: {mamba_usage:.2f}, "
             )
         else:
             num_used, token_usage, _, _ = self._get_token_info()
@@ -202,6 +219,25 @@ class SchedulerMetricsMixin:
                 f"full token usage: {full_token_usage:.2f}, "
                 f"#swa token: {swa_num_used}, "
                 f"swa token usage: {swa_token_usage:.2f}, "
+            )
+        elif self.is_hybrid_gdn:
+            (
+                full_num_used,
+                mamba_used,
+                full_token_usage,
+                mamba_usage,
+                _,
+                _,
+                _,
+                _,
+            ) = self._get_mamba_token_info()
+            num_used = full_num_used
+            token_usage = full_token_usage
+            token_usage_msg = (
+                f"#full token: {full_num_used}, "
+                f"full token usage: {full_token_usage:.2f}, "
+                f"mamba num: {mamba_used}, "
+                f"mamba usage: {mamba_usage:.2f}, "
             )
         else:
             num_used, token_usage, _, _ = self._get_token_info()

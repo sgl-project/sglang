@@ -51,8 +51,8 @@ from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import get_int_env_var, require_mlp_sync
+from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -747,11 +747,13 @@ class SchedulerDisaggregationDecodeMixin:
 
     @torch.no_grad()
     def event_loop_overlap_disagg_decode(self: Scheduler):
-        result_queue = deque()
+        self.result_queue = deque()
         self.last_batch: Optional[ScheduleBatch] = None
         self.last_batch_in_queue = False  # last batch is modified in-place, so we need another variable to track if it's extend
 
         while True:
+            self.launch_last_batch_sample_if_needed()
+
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             # polling and allocating kv cache
@@ -774,23 +776,13 @@ class SchedulerDisaggregationDecodeMixin:
                             None, delay_process=True
                         )
                         if batch_:
-                            result_queue.append((batch_.copy(), result))
+                            self.result_queue.append((batch_.copy(), result))
                             last_batch_in_queue = True
                 else:
                     if prepare_mlp_sync_flag:
                         self.prepare_mlp_sync_batch(batch)
                     result = self.run_batch(batch)
-                    result_queue.append((batch.copy(), result))
-
-                    if (self.last_batch is None) or (not self.last_batch_in_queue):
-                        # Create a dummy first batch to start the pipeline for overlap schedule.
-                        # It is now used for triggering the sampling_info_done event.
-                        tmp_batch = ScheduleBatch(
-                            reqs=None,
-                            forward_mode=ForwardMode.DUMMY_FIRST,
-                            next_batch_sampling_info=self.tp_worker.cur_sampling_info,
-                        )
-                        self.set_next_batch_sampling_info_done(tmp_batch)
+                    self.result_queue.append((batch.copy(), result))
                     last_batch_in_queue = True
 
             elif prepare_mlp_sync_flag:
@@ -798,15 +790,12 @@ class SchedulerDisaggregationDecodeMixin:
                     None, delay_process=True
                 )
                 if batch:
-                    result_queue.append((batch.copy(), result))
+                    self.result_queue.append((batch.copy(), result))
                     last_batch_in_queue = True
 
             # Process the results of the previous batch but skip if the last batch is extend
             if self.last_batch and self.last_batch_in_queue:
-                tmp_batch, tmp_result = result_queue.popleft()
-                tmp_batch.next_batch_sampling_info = (
-                    self.tp_worker.cur_sampling_info if batch else None
-                )
+                tmp_batch, tmp_result = self.result_queue.popleft()
                 self.process_batch_result(tmp_batch, tmp_result)
 
             queue_size = (
