@@ -168,9 +168,6 @@ class TpModelWorker:
         )[0]
         set_random_seed(self.random_seed)
 
-        # A reference make this class has the same member as TpModelWorkerClient
-        self.worker = self
-
         self.enable_overlap = not server_args.disable_overlap_schedule
         self.hicache_layer_transfer_counter = None
 
