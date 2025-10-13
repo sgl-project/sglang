@@ -9,22 +9,22 @@ For an overview of the implemented features see the completed [Roadmap](https://
 
 To run DeepSeek V3.1/V3/R1 models, the recommended settings are as follows:
 
-| Weight Type                               | Configuration       |
-| ----------------------------------------- | ------------------- |
-| **Full precision FP8**<br>*(recommended)* | 8 x H200            |
-|                                           | 8 x MI300X          |
-|                                           | 2 x 8 x H100/800/20 |
-|                                           | Xeon 6980P CPU      |
-| **Full precision BF16**                   | 2 x 8 x H200        |
-|                                           | 2 x 8 x MI300X      |
-|                                           | 4 x 8 x H100/800/20 |
-|                                           | 4 x 8 x A100/A800   |
-| **Quantized weights (AWQ)**               | 8 x H100/800/20     |
-|                                           | 8 x A100/A800       |
-| **Quantized weights (int8)**              | 16 x A100/800       |
-|                                           | 32 x L40S           |
-|                                           | Xeon 6980P CPU      |
-|                                           | 2 x Atlas 800I A3   |
+| Weight Type | Configuration |
+|------------|-------------------|
+| **Full precision FP8**<br>*(recommended)* | 8 x H200 |
+| | 8 x MI300X |
+| | 2 x 8 x H100/800/20 |
+| | Xeon 6980P CPU |
+| **Full precision BF16** | 2 x 8 x H200 |
+| | 2 x 8 x MI300X |
+| | 4 x 8 x H100/800/20 |
+| | 4 x 8 x A100/A800 |
+| **Quantized weights (AWQ)** | 8 x H100/800/20 |
+| | 8 x A100/A800 |
+| **Quantized weights (int8)** | 16 x A100/800 |
+| | 32 x L40S |
+| | Xeon 6980P CPU |
+| | 2 x Atlas 800I A3 |
 
 <style>
 .md-typeset__table {
