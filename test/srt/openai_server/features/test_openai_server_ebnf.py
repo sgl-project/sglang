@@ -13,7 +13,6 @@ from sglang.test.test_utils import (
 )
 
 
-
 # -------------------------------------------------------------------------
 #    EBNF Test Class: TestOpenAIServerEBNF
 #    Launches the server with xgrammar, has only EBNF tests

@@ -81,7 +81,7 @@ def align_evict_mask_to_page_size_simple_eagle(
     initial_evict_mask = tl.load(mask_ptr + t_range, mask=io_mask, other=True)
     final_evict_mask = initial_evict_mask & (~is_on_protected_page)
 
-    tl.store(mask_ptr+t_range, final_evict_mask, mask=io_mask)
+    tl.store(mask_ptr + t_range, final_evict_mask, mask=io_mask)
 
 
 @contextmanager
