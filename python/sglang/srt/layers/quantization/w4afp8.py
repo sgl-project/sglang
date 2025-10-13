@@ -343,6 +343,9 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             dispatch_output.topk_idx,
             dispatch_output.topk_weights,
         )
+        if isinstance(hidden_states, tuple):
+            hidden_states = hidden_states[0]
+
         num_tokens = hidden_states.shape[0]
         if num_tokens > 0:
             return cutlass_w4a8_moe_deepep_normal(
