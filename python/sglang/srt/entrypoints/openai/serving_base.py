@@ -46,7 +46,7 @@ class OpenAIServingBase(ABC):
         # Split on first colon only to handle model paths with multiple colons
         parts = model.split(":", 1)
         base_model = parts[0].strip()
-        adapter_name = parts[1].strip() if len(parts) > 1 and parts[1].strip() else None
+        adapter_name = parts[1].strip() or None
 
         return base_model, adapter_name
 

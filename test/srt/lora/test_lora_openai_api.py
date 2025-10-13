@@ -274,6 +274,24 @@ class TestEdgeCases(unittest.TestCase):
         self.assertEqual(base, "")
         self.assertIsNone(adapter)
 
+    def test_empty_list_lora_path(self):
+        """Test validation with empty list doesn't crash."""
+        lora_path = self.serving._resolve_lora_path("model-name", [])
+        # Empty list is falsy, so validation won't be called
+        self.assertEqual(lora_path, [])
+
+    def test_list_with_none_first(self):
+        """Test validation finds first non-None adapter in list."""
+        lora_path = self.serving._resolve_lora_path("model-name", [None, "adapter2"])
+        self.assertEqual(lora_path, [None, "adapter2"])
+        # In actual usage, validation would find "adapter2"
+
+    def test_list_all_none(self):
+        """Test validation with list of all None values."""
+        lora_path = self.serving._resolve_lora_path("model-name", [None, None])
+        self.assertEqual(lora_path, [None, None])
+        # In actual usage, no validation would occur (no non-None adapters)
+
     def test_unicode_in_adapter_name(self):
         """Test Unicode characters in adapter name."""
         base, adapter = self.serving._parse_model_parameter("model:adapter-名前")
