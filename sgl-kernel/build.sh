@@ -22,7 +22,7 @@ fi
 
 if [ ${CUDA_VERSION} = "13.0" ]; then
    DOCKER_IMAGE="${BUILDER_NAME}:cuda${CUDA_VERSION}"
-   TORCH_INSTALL="pip install --no-cache-dir torch==2.9.0 --index-url https://download.pytorch.org/whl/cu130"
+   TORCH_INSTALL="pip install --no-cache-dir torch==2.9.0 --index-url https://download.pytorch.org/whl/test/cu130"
 elif [ ${CUDA_VERSION} = "12.9" ]; then
    DOCKER_IMAGE="${BUILDER_NAME}:cuda${CUDA_VERSION}"
    TORCH_INSTALL="pip install --no-cache-dir torch==2.8.0 --index-url https://download.pytorch.org/whl/cu129"
