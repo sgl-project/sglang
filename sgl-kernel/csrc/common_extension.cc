@@ -531,6 +531,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "bool silu_activation,"
       "int pad_slot_id) -> ()");
   m.impl("causal_conv1d_fwd", torch::kCUDA, &causal_conv1d_fwd);
+
+  /*
+   * From csrc/expert_sepcialization
+   */
+  m.def(
+      "es_fp8_blockwise_scaled_grouped_mm(Tensor output, Tensor a, Tensor b, Tensor scales_a, Tensor scales_b, Tensor "
+      "stride_a, Tensor stride_b, Tensor stride_d, Tensor problem_sizes, Tensor expert_offsets) -> ()");
+  m.impl("es_fp8_blockwise_scaled_grouped_mm", &es_fp8_blockwise_scaled_grouped_mm);
 }
 
 REGISTER_EXTENSION(common_ops)
