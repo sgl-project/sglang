@@ -19,7 +19,7 @@ jobs:
             version: 12.9.1
           - runner: arm-docker-build-node
             platform: linux/arm64
-            build_type: all_aarch64
+            build_type: all
             tag: dev-arm64
             version: 12.9.1
     steps:
