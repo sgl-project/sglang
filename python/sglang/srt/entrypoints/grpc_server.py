@@ -3,7 +3,6 @@ Standalone gRPC Server for SGLang - Fully separated from HTTP server.
 Uses GrpcRequestManager for orchestration without tokenization.
 """
 
-import argparse
 import asyncio
 import dataclasses
 import logging
@@ -36,7 +35,11 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.sampling.sampling_params import SamplingParams as SGLSamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import configure_logger, kill_process_tree, prepare_model_and_tokenizer
+from sglang.srt.utils import (
+    configure_logger,
+    kill_process_tree,
+    prepare_model_and_tokenizer,
+)
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import get_exception_traceback
 
@@ -938,7 +941,7 @@ async def serve_grpc(
 
 def _execute_grpc_server_warmup(
     server_args: ServerArgs,
-    pipe_finish_writer: Optional[multiprocessing.connection.Connection],
+    pipe_finish_writer: Optional[mp.connection.Connection],
 ):
     """Execute warmup for gRPC server by checking health and sending test request."""
     try:
@@ -988,7 +991,15 @@ def _execute_grpc_server_warmup(
             warmup_request = sglang_scheduler_pb2.GenerateRequest(
                 request_id=f"WARMUP_{time.time()}",
                 tokenized=sglang_scheduler_pb2.TokenizedInput(
-                    input_ids=[10, 11, 12],  # Simple token sequence
+                    input_ids=[
+                        954,
+                        15541,
+                        2181,
+                        23496,
+                        1476,
+                        64710,
+                        280,
+                    ],  # Simple token sequence
                     original_text="The capital city of France is",
                 ),
                 sampling_params=sglang_scheduler_pb2.SamplingParams(
@@ -1064,7 +1075,7 @@ def _execute_grpc_server_warmup(
 
 def _wait_and_warmup_grpc(
     server_args: ServerArgs,
-    pipe_finish_writer: Optional[multiprocessing.connection.Connection],
+    pipe_finish_writer: Optional[mp.connection.Connection],
 ):
     """Wait for gRPC server to be ready and execute warmup."""
     if not server_args.skip_server_warmup:
