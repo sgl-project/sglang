@@ -93,7 +93,6 @@ tracing = [
   "opentelemetry-sdk",
 ]
 all = ["sglang[test]", "sglang[decord]"]
-all_aarch64 = ["sglang[test]"]
 dev = ["sglang[test]", "sglang[decord]"]
 cu130 = [
   "torch==2.9.0",
