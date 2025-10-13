@@ -74,5 +74,3 @@ fi
 # Show current packages
 $PIP_CMD list
 python3 -c "import torch; print(torch.version.cuda)"
-
-python3 -m flashinfer clear-cache

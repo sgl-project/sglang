@@ -1170,7 +1170,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.use_deep_gemm_bmm = False
 
         self.flashinfer_mla_disable_ragged = (
-            get_global_server_args().flashinfer_mla_disable_ragged,
+            get_global_server_args().flashinfer_mla_disable_ragged
         )
         self.disable_chunked_prefix_cache = (
             get_global_server_args().disable_chunked_prefix_cache

@@ -13,6 +13,8 @@
 # ==============================================================================
 """The arguments of the server."""
 
+from __future__ import annotations
+
 import argparse
 import dataclasses
 import json
@@ -361,6 +363,7 @@ class ServerArgs:
     # Mamba cache
     max_mamba_cache_size: Optional[int] = None
     mamba_ssm_dtype: str = "float32"
+    mamba_full_memory_ratio: float = 0.2
 
     # Hierarchical cache
     enable_hierarchical_cache: bool = False
@@ -455,7 +458,6 @@ class ServerArgs:
     debug_tensor_dump_output_folder: Optional[str] = None
     debug_tensor_dump_input_file: Optional[str] = None
     debug_tensor_dump_inject: bool = False
-    debug_tensor_dump_prefill_only: bool = False
 
     # PD disaggregation: can be "null" (not disaggregated), "prefill" (prefill-only), or "decode" (decode-only)
     disaggregation_mode: Literal["null", "prefill", "decode"] = "null"
@@ -802,7 +804,32 @@ class ServerArgs:
 
         hf_config = self.get_hf_config()
         model_arch = hf_config.architectures[0]
-        if model_arch in ["GptOssForCausalLM"]:
+        if model_arch in ["DeepseekV3ForCausalLM"]:
+            if is_cuda() and is_sm100_supported():
+                if (
+                    self.attention_backend is None
+                    and self.prefill_attention_backend is None
+                    and self.decode_attention_backend is None
+                ):
+                    self.attention_backend = "trtllm_mla"
+                    logger.info(
+                        "Use trtllm_mla as attention backend on sm100 for DeepseekV3ForCausalLM"
+                    )
+                if not self.enable_dp_attention:
+                    self.enable_flashinfer_allreduce_fusion = True
+                    logger.info(
+                        "Enable FlashInfer AllReduce Fusion on sm100 for DeepseekV3ForCausalLM"
+                    )
+                if (
+                    self.quantization == "modelopt_fp4"
+                    and self.moe_runner_backend == "auto"
+                ):
+                    self.moe_runner_backend = "flashinfer_trtllm"
+                    logger.info(
+                        "Use flashinfer_trtllm as moe runner backend on sm100 for DeepseekV3ForCausalLM"
+                    )
+
+        elif model_arch in ["GptOssForCausalLM"]:
             if (
                 self.attention_backend is None
                 and self.prefill_attention_backend is None
@@ -2408,6 +2435,12 @@ class ServerArgs:
             choices=["float32", "bfloat16"],
             help="The data type of the SSM states in mamba cache.",
         )
+        parser.add_argument(
+            "--mamba-full-memory-ratio",
+            type=float,
+            default=ServerArgs.mamba_full_memory_ratio,
+            help="The ratio of mamba state memory to full kv cache memory.",
+        )
         # Args for multi-item-scoring
         parser.add_argument(
             "--multi-item-scoring-delimiter",
@@ -2830,11 +2863,6 @@ class ServerArgs:
             type=str,
             default=ServerArgs.debug_tensor_dump_inject,
             help="Inject the outputs from jax as the input of every layer.",
-        )
-        parser.add_argument(
-            "--debug-tensor-dump-prefill-only",
-            action="store_true",
-            help="Only dump the tensors for prefill requests (i.e. batch size > 1).",
         )
         parser.add_argument(
             "--enable-dynamic-batch-tokenizer",
@@ -3385,6 +3413,7 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
 
 
 ZMQ_TCP_PORT_DELTA = 233
+DP_ATTENTION_HANDSHAKE_PORT_DELTA = 5
 
 
 @dataclasses.dataclass
@@ -3409,7 +3438,11 @@ class PortArgs:
     tokenizer_worker_ipc_name: Optional[str]
 
     @staticmethod
-    def init_new(server_args, dp_rank: Optional[int] = None) -> "PortArgs":
+    def init_new(
+        server_args: ServerArgs,
+        dp_rank: Optional[int] = None,
+        worker_ports: Optional[List[int]] = None,
+    ) -> PortArgs:
         if server_args.nccl_port is None:
             nccl_port = server_args.port + random.randint(100, 1000)
             while True:
@@ -3456,8 +3489,8 @@ class PortArgs:
                 # TokenizerManager to DataParallelController
                 scheduler_input_port = port_base + 4
             else:
-                scheduler_input_port = port_base + 4 + 1 + dp_rank
-
+                assert worker_ports is not None
+                scheduler_input_port = worker_ports[dp_rank]
             return PortArgs(
                 tokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base}",
                 scheduler_input_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port}",

@@ -234,7 +234,7 @@ async fn test_openai_router_responses_with_mock() {
     let request1 = ResponsesRequest {
         model: Some("gpt-4o-mini".to_string()),
         input: ResponseInput::Text("Say hi".to_string()),
-        store: true,
+        store: Some(true),
         ..Default::default()
     };
 
@@ -250,7 +250,7 @@ async fn test_openai_router_responses_with_mock() {
     let request2 = ResponsesRequest {
         model: Some("gpt-4o-mini".to_string()),
         input: ResponseInput::Text("Thanks".to_string()),
-        store: true,
+        store: Some(true),
         previous_response_id: Some(resp1_id.clone()),
         ..Default::default()
     };
@@ -501,8 +501,8 @@ async fn test_openai_router_responses_streaming_with_mock() {
         instructions: Some("Be kind".to_string()),
         metadata: Some(metadata),
         previous_response_id: Some("resp_prev_chain".to_string()),
-        store: true,
-        stream: true,
+        store: Some(true),
+        stream: Some(true),
         ..Default::default()
     };
 
