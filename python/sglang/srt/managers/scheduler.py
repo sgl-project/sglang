@@ -1053,11 +1053,11 @@ class Scheduler(
                 # Process the results of the last batch
                 tmp_batch, tmp_result = self.result_queue.popleft()
                 self.process_batch_result(tmp_batch, tmp_result)
-                self.launch_last_batch_sample_if_needed(batch_result)
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
 
+            self.launch_last_batch_sample_if_needed(batch_result)
             self.last_batch = batch
 
     @DynamicGradMode()

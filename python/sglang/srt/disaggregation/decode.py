@@ -797,7 +797,8 @@ class SchedulerDisaggregationDecodeMixin:
             if self.last_batch and self.last_batch_in_queue:
                 tmp_batch, tmp_result = self.result_queue.popleft()
                 self.process_batch_result(tmp_batch, tmp_result)
-                self.launch_last_batch_sample_if_needed(batch_result)
+
+            self.launch_last_batch_sample_if_needed(batch_result)
 
             queue_size = (
                 len(self.waiting_queue)

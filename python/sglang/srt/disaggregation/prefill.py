@@ -341,10 +341,11 @@ class SchedulerDisaggregationPrefillMixin:
             if self.last_batch:
                 tmp_batch, tmp_result = self.result_queue.popleft()
                 self.process_batch_result_disagg_prefill(tmp_batch, tmp_result)
-                self.launch_last_batch_sample_if_needed(batch_result)
 
             if len(self.disagg_prefill_inflight_queue) > 0:
                 self.process_disagg_prefill_inflight_queue()
+
+            self.launch_last_batch_sample_if_needed(batch_result)
 
             if batch is None and len(self.disagg_prefill_inflight_queue) == 0:
                 self.self_check_during_idle()
