@@ -68,7 +68,7 @@ try:
 
     KTRANSFORMERS_AVAILABLE = True
 except ImportError:
-    KTRANSFORMERS_AVAILABLE = True
+    KTRANSFORMERS_AVAILABLE = False
 
 _is_hip = is_hip()
 

@@ -135,7 +135,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         if isinstance(layer, LinearBase):
             if CompressedTensorsConfig.DeepSeekFP8Config is not None:
                 return Fp8LinearMethod(CompressedTensorsConfig.DeepSeekFP8Config)
-            if os.environ["MOE_AMX_WEIGHT_PATH"] is not None:
+            if "MOE_AMX_WEIGHT_PATH" in os.environ:
                 return UnquantizedLinearMethod()
             scheme = self.get_scheme(layer=layer, layer_name=prefix)
             if scheme is None:
@@ -146,7 +146,7 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         if isinstance(layer, FusedMoE):
             # Ktransformers use CompressedTensorsWNA16AMXMOEMethod if AMX weights are provided
-            if os.environ["MOE_AMX_WEIGHT_PATH"] is not None and "decoder" in prefix:
+            if "MOE_AMX_WEIGHT_PATH" in os.environ and "decoder" in prefix:
                 return Fp8MoEMethod(CompressedTensorsConfig.FP8Config)
             else:
                 return CompressedTensorsMoEMethod.get_moe_method(self, layer, prefix)

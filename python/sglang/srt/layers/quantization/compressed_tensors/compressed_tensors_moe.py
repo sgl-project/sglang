@@ -19,7 +19,7 @@ try:
 
     KTRANSFORMERS_AVAILABLE = True
 except ImportError:
-    KTRANSFORMERS_AVAILABLE = True
+    KTRANSFORMERS_AVAILABLE = False
 
 import torch
 from compressed_tensors import CompressionFormat
@@ -877,21 +877,24 @@ def override_config(
     cpu_embed,
     cpu_save,
 ):
-    if num_gpu_experts is not None:
-        os.environ["MOE_NUM_GPU_EXPERTS"] = str(num_gpu_experts)
-    if cpuinfer is not None:
-        os.environ["MOE_CPUINFER"] = str(cpuinfer)
-    if subpool_count is not None:
-        os.environ["SUBPOOL_COUNT"] = str(subpool_count)
-    if amx_weight_path is not None:
-        os.environ["MOE_AMX_WEIGHT_PATH"] = str(amx_weight_path)
-    if amx_method is not None:
-        os.environ["AMX_METHOD"] = str(amx_method)
-    if cpu_embed is not None:
-        os.environ["CPU_EMBED"] = str(cpu_embed)
-    os.environ["MOE_CHUNKED_PREFILL_SIZE"] = str(chunked_prefill_size)
-    os.environ["MOE_ENABLE_DEFER"] = str(enable_defer)
-    os.environ["MOE_CPU_SAVE"] = str(cpu_save)
+    """Override MOE configuration via environment variables."""
+    # Mapping of config parameters to environment variable names
+    config_map = {
+        "MOE_NUM_GPU_EXPERTS": num_gpu_experts,
+        "MOE_CPUINFER": cpuinfer,
+        "SUBPOOL_COUNT": subpool_count,
+        "MOE_AMX_WEIGHT_PATH": amx_weight_path,
+        "AMX_METHOD": amx_method,
+        "CPU_EMBED": cpu_embed,
+        "MOE_CHUNKED_PREFILL_SIZE": chunked_prefill_size,
+        "MOE_ENABLE_DEFER": enable_defer,
+        "MOE_CPU_SAVE": cpu_save,
+    }
+
+    # Set environment variables, converting values to strings
+    for env_key, value in config_map.items():
+        if value is not None:
+            os.environ[env_key] = str(value)
 
 
 class CompressedTensorsWNA16AMXEPMoEMethod(CompressedTensorsMoEMethod):
