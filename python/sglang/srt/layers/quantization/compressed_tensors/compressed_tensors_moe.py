@@ -21,14 +21,7 @@ from sglang.srt.layers.quantization.utils import (
     per_tensor_dequantize,
     replace_parameter,
 )
-from sglang.srt.utils import (
-    get_bool_env_var,
-    is_cpu,
-    is_cuda,
-    is_hip,
-    is_npu,
-    set_weight_attrs,
-)
+from sglang.srt.utils import get_bool_env_var, is_hip, set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -49,7 +42,9 @@ if _use_aiter:
     from sglang.srt.layers.moe.rocm_moe_utils import rocm_fused_experts_tkw1
 
 try:
-    import vllm
+    from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16 import (
+        WNA16_SUPPORTED_BITS,
+    )
 
     VLLM_AVAILABLE = True
 except ImportError:
