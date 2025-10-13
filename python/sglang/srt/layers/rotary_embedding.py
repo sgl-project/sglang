@@ -1020,11 +1020,13 @@ class MRotaryEmbedding(RotaryEmbedding):
         is_neox_style: bool,
         dtype: torch.dtype,
         mrope_section: Optional[List[int]] = None,
+        mrope_interleaved: Optional[bool] = False,
     ) -> None:
         super().__init__(
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
 
+        self.mrope_interleaved = mrope_interleaved
         self.mrope_section = mrope_section
         if self.mrope_section:
             expected_sum = rotary_dim // 2
@@ -1087,14 +1089,30 @@ class MRotaryEmbedding(RotaryEmbedding):
         if positions.ndim == 2:
             assert self.mrope_section
 
-            cos = torch.cat(
-                [m[i] for i, m in enumerate(cos.split(self.mrope_section, dim=-1))],
-                dim=-1,
-            )
-            sin = torch.cat(
-                [m[i] for i, m in enumerate(sin.split(self.mrope_section, dim=-1))],
-                dim=-1,
-            )
+            if self.mrope_interleaved:
+                def apply_interleaved_rope(x, modality_num):
+                    x_t = x[0].clone()
+                    index_ranges = []
+                    for i, n in enumerate(self.mrope_section[1:], 1):
+                        beg_idx = i
+                        end_idx = n * modality_num
+                        index_ranges.append((beg_idx, end_idx))
+                    for beg_idx, end_idx in index_ranges:
+                        x_t[..., beg_idx:end_idx:modality_num] = x[beg_idx, ..., beg_idx:end_idx:modality_num]
+                    return x_t
+
+                modality_num = len(self.mrope_section)
+                cos = apply_interleaved_rope(cos, modality_num)
+                sin = apply_interleaved_rope(sin, modality_num)
+            else:
+                cos = torch.cat(
+                    [m[i] for i, m in enumerate(cos.split(self.mrope_section, dim=-1))],
+                    dim=-1,
+                )
+                sin = torch.cat(
+                    [m[i] for i, m in enumerate(sin.split(self.mrope_section, dim=-1))],
+                    dim=-1,
+                )
 
         query_shape = query.shape
         query = query.view(num_tokens, -1, self.head_size)
@@ -1768,6 +1786,7 @@ def get_rope(
                     is_neox_style,
                     dtype,
                     mrope_section=rope_scaling["mrope_section"],
+                    mrope_interleaved=rope_scaling.get("mrope_interleaved", False),
                 )
             else:
                 rotary_emb = RotaryEmbedding(
