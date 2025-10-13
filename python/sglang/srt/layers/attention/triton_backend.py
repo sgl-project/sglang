@@ -867,7 +867,7 @@ class TritonAttnBackend(AttentionBackend):
         extend_start_loc_cpu = forward_batch.extend_start_loc[:bs].cpu()
         extend_seq_lens_cpu = forward_batch.extend_seq_lens[:bs].cpu()
 
-        # Compute prefix lengths on GPU (vectorized)
+        # Compute prefix lengths on CPU (vectorized)
         prefix_lens = (prefix_kv_indptr_cpu[1:] - prefix_kv_indptr_cpu[:-1]).to(
             torch.int32
         )
