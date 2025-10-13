@@ -55,6 +55,7 @@ from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
 
+
 # Define constants
 LOAD_FORMAT_CHOICES = [
     "auto",
@@ -362,6 +363,7 @@ class ServerArgs:
     # Mamba cache
     max_mamba_cache_size: Optional[int] = None
     mamba_ssm_dtype: str = "float32"
+    mamba_full_memory_ratio: float = 0.2
 
     # Hierarchical cache
     enable_hierarchical_cache: bool = False
@@ -802,7 +804,32 @@ class ServerArgs:
 
         hf_config = self.get_hf_config()
         model_arch = hf_config.architectures[0]
-        if model_arch in ["GptOssForCausalLM"]:
+        if model_arch in ["DeepseekV3ForCausalLM"]:
+            if is_cuda() and is_sm100_supported():
+                if (
+                    self.attention_backend is None
+                    and self.prefill_attention_backend is None
+                    and self.decode_attention_backend is None
+                ):
+                    self.attention_backend = "trtllm_mla"
+                    logger.info(
+                        "Use trtllm_mla as attention backend on sm100 for DeepseekV3ForCausalLM"
+                    )
+                if not self.enable_dp_attention:
+                    self.enable_flashinfer_allreduce_fusion = True
+                    logger.info(
+                        "Enable FlashInfer AllReduce Fusion on sm100 for DeepseekV3ForCausalLM"
+                    )
+                if (
+                    self.quantization == "modelopt_fp4"
+                    and self.moe_runner_backend == "auto"
+                ):
+                    self.moe_runner_backend = "flashinfer_trtllm"
+                    logger.info(
+                        "Use flashinfer_trtllm as moe runner backend on sm100 for DeepseekV3ForCausalLM"
+                    )
+
+        elif model_arch in ["GptOssForCausalLM"]:
             if (
                 self.attention_backend is None
                 and self.prefill_attention_backend is None
@@ -2408,6 +2435,12 @@ class ServerArgs:
             choices=["float32", "bfloat16"],
             help="The data type of the SSM states in mamba cache.",
         )
+        parser.add_argument(
+            "--mamba-full-memory-ratio",
+            type=float,
+            default=ServerArgs.mamba_full_memory_ratio,
+            help="The ratio of mamba state memory to full kv cache memory.",
+        )
         # Args for multi-item-scoring
         parser.add_argument(
             "--multi-item-scoring-delimiter",
@@ -3325,6 +3358,22 @@ class ServerArgs:
         )
 
 
+# NOTE: This is a global variable to hold the server args for scheduler.
+_global_server_args: Optional[ServerArgs] = None
+
+
+def set_global_server_args_for_scheduler(server_args: ServerArgs):
+    global _global_server_args
+    _global_server_args = server_args
+
+
+def get_global_server_args() -> ServerArgs:
+    if _global_server_args is None:
+        raise ValueError("Global server args is not set yet!")
+
+    return _global_server_args
+
+
 def prepare_server_args(argv: List[str]) -> ServerArgs:
     """
     Prepare the server arguments from the command line arguments.
@@ -3359,8 +3408,8 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
     raw_args = parser.parse_args(argv)
-    server_args = ServerArgs.from_cli_args(raw_args)
-    return server_args
+
+    return ServerArgs.from_cli_args(raw_args)
 
 
 ZMQ_TCP_PORT_DELTA = 233
