@@ -46,7 +46,7 @@ dependencies = [
   "py-spy",
   "pybase64",
   "pydantic",
-  "pynvml",
+  "nvidia-ml-py",
   "python-multipart",
   "pyzmq>=25.1.2",
   "requests",
@@ -72,7 +72,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-decord = ["decord"]
+cu130 = [
+  "torch==2.9.0",
+  "torchaudio==2.9.0",
+  "torchvision==0.24.0",
+  "nvidia-cuda-nvrtc>=13,<14"
+]
+decord = ["decord2"]
 test = [
   "accelerate",
   "expecttest",
