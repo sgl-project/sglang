@@ -106,20 +106,12 @@ impl PreparationStage {
         let token_ids = encoding.token_ids().to_vec();
 
         // Step 4: Build tool constraints if needed
-        let tool_call_constraint = match body_ref.tools.as_ref() {
-            Some(tools) => {
-                match utils::generate_tool_constraints(tools, &request.tool_choice, &request.model)
-                {
-                    Ok(constraint) => constraint,
-                    Err(e) => {
-                        return Err(utils::bad_request_error(format!(
-                            "Invalid tool configuration: {}",
-                            e
-                        )));
-                    }
-                }
-            }
-            None => None,
+        let tool_call_constraint = if let Some(tools) = body_ref.tools.as_ref() {
+            utils::generate_tool_constraints(tools, &request.tool_choice, &request.model).map_err(
+                |e| utils::bad_request_error(format!("Invalid tool configuration: {}", e)),
+            )?
+        } else {
+            None
         };
 
         // Step 5: Create stop sequence decoder (build once, reuse in non-stream)
