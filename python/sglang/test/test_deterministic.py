@@ -277,7 +277,7 @@ def test_deterministic(args):
 
     elif args.test_mode == "prefix":
         # In prefix mode, we create prompts from the same long prompt, with different lengths of common prefix.
-        len_prefix = [1, 511, 2048, 4097]
+        len_prefix = [1, 2048, 10000, 20000]
         num_prompts = len(len_prefix)
         outputs = {i: [] for i in range(4)}
         prompts = [LONG_PROMPT[: len_prefix[i]] for i in range(4)]
@@ -291,10 +291,10 @@ def test_deterministic(args):
             for i in range(num_prompts):
                 outputs[i].extend(ret_dict[i])
 
-        for i in range(num_prompts):
-            print(
-                f"Prompt {i} with prefix length {len_prefix[i]}: total samples: {len(outputs[i])}, Unique samples: {len(set(outputs[i]))}"
-            )
+            for i in range(num_prompts):
+                print(
+                    f"Prompt {i} with prefix length {len_prefix[i]}: total samples: {len(outputs[i])}, Unique samples: {len(set(outputs[i]))}"
+                )
 
         results = []
         for i in range(num_prompts):
