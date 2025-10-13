@@ -578,7 +578,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         # TODO refactor to avoid code duplication
         merge_query = q_rope is not None
-        if (self.data_type == torch.float8_e4m3fn) and forward_batch.forward_mode.is_target_verify():
+        if (
+            self.data_type == torch.float8_e4m3fn
+        ) and forward_batch.forward_mode.is_target_verify():
             # For FP8 path, we quantize the query and rope parts and merge them into a single tensor
             # Note: rope application in deepseek_v2.py:forward_absorb_prepare is skipped for FP8 decode path of this trtllm_mla backend
             assert all(

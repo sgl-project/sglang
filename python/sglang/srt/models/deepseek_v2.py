@@ -2042,7 +2042,6 @@ class DeepseekV2AttentionMLA(nn.Module):
         output, _ = self.o_proj(attn_output)
         return output
 
-
     @staticmethod
     def _get_q_b_proj_quant_config(quant_config):
         if get_bool_env_var("SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN"):
