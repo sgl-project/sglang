@@ -33,8 +33,6 @@ pub use traits::{Decoder, Encoder, Encoding, SpecialTokens, Tokenizer as Tokeniz
 
 pub use huggingface::HuggingFaceTokenizer;
 
-pub use chat_template::ChatMessage;
-
 pub use tiktoken::{TiktokenModel, TiktokenTokenizer};
 
 /// Main tokenizer wrapper that provides a unified interface for different tokenizer implementations
@@ -44,7 +42,7 @@ pub struct Tokenizer(Arc<dyn traits::Tokenizer>);
 impl Tokenizer {
     /// Create a tokenizer from a file path
     pub fn from_file(file_path: &str) -> Result<Tokenizer> {
-        Ok(Tokenizer(factory::create_tokenizer_from_file(file_path)?))
+        Ok(Tokenizer(create_tokenizer_from_file(file_path)?))
     }
 
     /// Create a tokenizer from a file path with an optional chat template
@@ -52,7 +50,7 @@ impl Tokenizer {
         file_path: &str,
         chat_template_path: Option<&str>,
     ) -> Result<Tokenizer> {
-        Ok(Tokenizer(factory::create_tokenizer_with_chat_template(
+        Ok(Tokenizer(create_tokenizer_with_chat_template(
             file_path,
             chat_template_path,
         )?))

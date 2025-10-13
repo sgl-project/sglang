@@ -1,11 +1,15 @@
+use std::collections::HashMap;
+
+use anyhow::{Error, Result};
+use tokenizers::tokenizer::Tokenizer as HfTokenizer;
+
+use super::chat_template::{
+    detect_chat_template_content_format, ChatTemplateContentFormat, ChatTemplateParams,
+    ChatTemplateProcessor,
+};
 use super::traits::{
     Decoder, Encoder, Encoding, SpecialTokens, TokenIdType, Tokenizer as TokenizerTrait,
 };
-use anyhow::{Error, Result};
-use std::collections::HashMap;
-use tokenizers::tokenizer::Tokenizer as HfTokenizer;
-
-use super::chat_template::{ChatMessage, ChatTemplateProcessor};
 
 /// HuggingFace tokenizer wrapper
 pub struct HuggingFaceTokenizer {
@@ -14,12 +18,19 @@ pub struct HuggingFaceTokenizer {
     vocab: HashMap<String, TokenIdType>,
     reverse_vocab: HashMap<TokenIdType, String>,
     chat_template: Option<String>,
+    /// Detected chat template content format (computed once at initialization)
+    content_format: ChatTemplateContentFormat,
 }
 
 impl HuggingFaceTokenizer {
     /// Create a tokenizer from a HuggingFace tokenizer JSON file
     pub fn from_file(file_path: &str) -> Result<Self> {
-        Self::from_file_with_chat_template(file_path, None)
+        // Try to auto-discover chat template if not explicitly provided
+        let path = std::path::Path::new(file_path);
+        let chat_template_path = path
+            .parent()
+            .and_then(crate::tokenizer::factory::discover_chat_template_in_dir);
+        Self::from_file_with_chat_template(file_path, chat_template_path.as_deref())
     }
 
     /// Create a tokenizer from a HuggingFace tokenizer JSON file with an optional chat template
@@ -49,12 +60,20 @@ impl HuggingFaceTokenizer {
             Self::load_chat_template(file_path)
         };
 
+        // Detect content format once at initialization
+        let content_format = if let Some(ref template) = chat_template {
+            detect_chat_template_content_format(template)
+        } else {
+            ChatTemplateContentFormat::String // Default if no template
+        };
+
         Ok(HuggingFaceTokenizer {
             tokenizer,
             special_tokens,
             vocab,
             reverse_vocab,
             chat_template,
+            content_format,
         })
     }
 
@@ -73,6 +92,7 @@ impl HuggingFaceTokenizer {
             vocab,
             reverse_vocab,
             chat_template: None,
+            content_format: ChatTemplateContentFormat::String, // Default
         }
     }
 
@@ -120,13 +140,35 @@ impl HuggingFaceTokenizer {
         None
     }
 
-    /// Load chat template from a .jinja file
+    /// Load chat template from a file (.jinja or .json containing Jinja)
     fn load_chat_template_from_file(template_path: &str) -> Result<Option<String>> {
         use std::fs;
 
         let content = fs::read_to_string(template_path)
             .map_err(|e| Error::msg(format!("Failed to read chat template file: {}", e)))?;
 
+        // Check if it's a JSON file containing a Jinja template
+        if template_path.ends_with(".json") {
+            // Parse JSON and extract the template string
+            let json_value: serde_json::Value = serde_json::from_str(&content)
+                .map_err(|e| Error::msg(format!("Failed to parse chat_template.json: {}", e)))?;
+
+            if let Some(template_str) = json_value.as_str() {
+                return Ok(Some(template_str.to_string()));
+            } else if let Some(obj) = json_value.as_object() {
+                if let Some(template_value) = obj.get("chat_template") {
+                    if let Some(template_str) = template_value.as_str() {
+                        return Ok(Some(template_str.to_string()));
+                    }
+                }
+            }
+
+            return Err(Error::msg(
+                "chat_template.json does not contain a valid template",
+            ));
+        }
+
+        // Otherwise it's a plain .jinja file
         // Clean up the template (similar to Python implementation)
         let template = content.trim().replace("\\n", "\n");
 
@@ -135,32 +177,34 @@ impl HuggingFaceTokenizer {
 
     /// Set or override the chat template
     pub fn set_chat_template(&mut self, template: String) {
+        // Detect format for the new template
+        self.content_format = detect_chat_template_content_format(&template);
         self.chat_template = Some(template);
     }
 
+    /// Get the content format expected by the chat template
+    pub fn chat_template_content_format(&self) -> ChatTemplateContentFormat {
+        self.content_format
+    }
+
     /// Apply chat template if available
+    ///
+    /// Takes transformed JSON Values (already transformed based on content format)
     pub fn apply_chat_template(
         &self,
-        messages: &[ChatMessage],
-        add_generation_prompt: bool,
+        messages: &[serde_json::Value],
+        params: ChatTemplateParams,
     ) -> Result<String> {
         if let Some(ref template) = self.chat_template {
-            let processor = ChatTemplateProcessor::new(
-                template.clone(),
-                self.special_tokens.bos_token.clone(),
-                self.special_tokens.eos_token.clone(),
-            );
-            processor.apply_chat_template(messages, add_generation_prompt)
+            let processor = ChatTemplateProcessor::new(template.clone());
+            processor.apply_chat_template(messages, params)
         } else {
-            // Fallback to simple formatting if no template is available
-            let mut result = String::new();
-            for msg in messages {
-                result.push_str(&format!("{}: {}\n", msg.role, msg.content));
-            }
-            if add_generation_prompt {
-                result.push_str("assistant: ");
-            }
-            Ok(result)
+            Err(Error::msg(
+                "Cannot use chat template functions because tokenizer.chat_template is not set and no template \
+                argument was passed! For information about writing templates and setting the \
+                tokenizer.chat_template attribute, please see the documentation at \
+                https://huggingface.co/docs/transformers/main/en/chat_templating"
+            ))
         }
     }
 }
@@ -210,25 +254,14 @@ impl TokenizerTrait for HuggingFaceTokenizer {
     fn id_to_token(&self, id: TokenIdType) -> Option<String> {
         self.reverse_vocab.get(&id).cloned()
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::ChatMessage;
-
-    #[test]
-    fn test_chat_message_creation() {
-        let msg = ChatMessage::system("You are a helpful assistant");
-        assert_eq!(msg.role, "system");
-        assert_eq!(msg.content, "You are a helpful assistant");
-
-        let user_msg = ChatMessage::user("Hello!");
-        assert_eq!(user_msg.role, "user");
-
-        let assistant_msg = ChatMessage::assistant("Hi there!");
-        assert_eq!(assistant_msg.role, "assistant");
-    }
-
     // Note: Actual tokenizer tests would require a real tokenizer file
     // These would be integration tests rather than unit tests
 }

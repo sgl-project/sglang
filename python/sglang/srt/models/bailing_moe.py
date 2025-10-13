@@ -45,16 +45,16 @@ from sglang.srt.layers.dp_attention import (
     get_attention_dp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
+    is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
-    ReplicatedLinear,
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe import get_moe_a2a_backend
+from sglang.srt.layers.moe import get_deepep_mode, get_moe_a2a_backend
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.token_dispatcher import DeepEPDispatcher
@@ -72,6 +72,10 @@ from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.utils import (
+    create_fused_set_kv_buffer_arg,
+    enable_fused_set_kv_buffer,
+)
 from sglang.srt.utils import add_prefix, is_cuda, is_non_idle_and_non_empty, make_layers
 
 LoraConfig = None
@@ -289,7 +293,7 @@ class BailingMoESparseMoeBlock(nn.Module):
                 num_local_experts=config.num_experts // self.tp_size,
                 hidden_size=config.hidden_size,
                 params_dtype=config.torch_dtype,
-                deepep_mode=DeepEPMode[global_server_args_dict["deepep_mode"]],
+                deepep_mode=get_deepep_mode(),
                 async_finish=True,  # TODO
                 return_recv_hook=True,
             )
@@ -555,8 +559,27 @@ class BailingMoEAttention(nn.Module):
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         if self.use_qk_norm:
             q, k = self._apply_qk_norm(q, k)
-        q, k = self.rotary_emb(positions, q, k)
-        context_layer = self.attn(q, k, v, forward_batch)
+        q, k = self.rotary_emb(
+            positions,
+            q,
+            k,
+            fused_set_kv_buffer_arg=(
+                create_fused_set_kv_buffer_arg(
+                    value=v,
+                    layer=self.attn,
+                    forward_batch=forward_batch,
+                )
+                if enable_fused_set_kv_buffer(forward_batch)
+                else None
+            ),
+        )
+        context_layer = self.attn(
+            q,
+            k,
+            v,
+            forward_batch,
+            save_kv_cache=not enable_fused_set_kv_buffer(forward_batch),
+        )
         attn_output, _ = self.dense(context_layer)
         return attn_output
 
@@ -702,7 +725,7 @@ class BailingMoEModel(nn.Module):
                 self.embed_dim,
                 quant_config=quant_config,
                 prefix=add_prefix("word_embeddings", prefix),
-                use_attn_tp_group=global_server_args_dict["enable_dp_lm_head"],
+                enable_tp=not is_dp_attention_enabled(),
             )
         else:
             self.word_embeddings = PPMissingLayer()
