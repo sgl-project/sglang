@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 import triton
@@ -683,8 +683,6 @@ class TritonAttnBackend(AttentionBackend):
                     )
 
             else:
-                kv_indptr[: spec_info.kv_indptr.shape[0]] = spec_info.kv_indptr
-                kv_indices[: spec_info.kv_indices.shape[0]] = spec_info.kv_indices
                 num_token = spec_info.kv_indptr.shape[0] - 1
             self.get_num_kv_splits(num_kv_splits[:num_token], seq_lens[:bs])
 
