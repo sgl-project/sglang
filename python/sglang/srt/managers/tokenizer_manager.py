@@ -1312,8 +1312,6 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             BatchTokenIDOutput,
         ],
     ):
-        sent_load_update = False
-
         for i, rid in enumerate(recv_obj.rids):
             state = self.rid_to_state.get(rid, None)
             if state is None:
@@ -1372,12 +1370,6 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     "meta_info": meta_info,
                 }
 
-                # load update once for batch reqs on the same dp rank
-                if not sent_load_update:
-                    load_update_req = WatchLoadUpdateReq(loads=[recv_obj.load])
-                    self.send_to_scheduler.send_pyobj(load_update_req)
-                    sent_load_update = True
-
             elif isinstance(recv_obj, BatchTokenIDOutput):
                 if self.server_args.stream_output and state.obj.stream:
                     state.output_ids.extend(recv_obj.output_ids[i])
@@ -1417,6 +1409,14 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
             state.out_list.append(out_dict)
             state.event.set()
+
+            # When skip_tokenizer_init is enabled, tokensizer_manager receives
+            # BatchTokenIDOutput.
+            if isinstance(recv_obj, BatchStrOutput) or isinstance(
+                recv_obj, BatchTokenIDOutput
+            ):
+                load_update_req = WatchLoadUpdateReq(loads=[recv_obj.load])
+                self.send_to_scheduler.send_pyobj(load_update_req)
 
             # Log metrics and dump
             if self.enable_metrics and state.obj.log_metrics:
