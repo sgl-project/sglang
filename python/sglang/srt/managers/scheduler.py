@@ -402,9 +402,28 @@ class Scheduler(
             reasoning_parser = ReasoningParser(
                 model_type=self.server_args.reasoning_parser, stream_reasoning=False
             )
-            self.tokenizer.think_end_id = self.tokenizer.encode(
+            think_end_ids = self.tokenizer.encode(
                 reasoning_parser.detector.think_end_token, add_special_tokens=False
-            )[0]
+            )
+            if not think_end_ids:
+                logger.warning(
+                    "Failed to locate think end token '%s' in tokenizer vocab; "
+                    "reasoning-aware grammar will be disabled.",
+                    reasoning_parser.detector.think_end_token,
+                )
+                self.tokenizer.think_end_id = None
+            else:
+                self.tokenizer.think_end_id = think_end_ids[0]
+
+            think_start_ids = self.tokenizer.encode(
+                reasoning_parser.detector.think_start_token, add_special_tokens=False
+            )
+            self.tokenizer.reasoning_think_start_ids = (
+                think_start_ids if think_start_ids else None
+            )
+            self.tokenizer.reasoning_initial_in_reasoning = getattr(
+                reasoning_parser.detector, "_in_reasoning", True
+            )
 
         # Check whether overlap can be enabled
         if not self.is_generation:
@@ -1485,6 +1504,8 @@ class Scheduler(
                     if value is INVALID_GRAMMAR_OBJ:  # We hit a cached invalid grammar.
                         error_msg = f"Invalid grammar request with cache hit: {key=}"
                         req.set_finish_with_abort(error_msg)
+                    else:
+                        self._apply_reasoning_initial_state(req)
 
         if add_to_grammar_queue:
             self.grammar_queue.append(req)
@@ -1546,6 +1567,23 @@ class Scheduler(
                 req.time_stats.decode_prealloc_queue_entry_time = time.perf_counter()
         else:
             raise ValueError(f"Invalid {self.disaggregation_mode=}")
+
+    def _apply_reasoning_initial_state(self, req: Req) -> None:
+        custom_params = getattr(req.sampling_params, "custom_params", None)
+        if not isinstance(custom_params, dict):
+            return
+        initial_flag = custom_params.get("reasoning_initial_in_reasoning")
+        if initial_flag is None:
+            return
+        grammar = getattr(req, "grammar", None)
+        if grammar is None or grammar is INVALID_GRAMMAR_OBJ:
+            return
+        setter = getattr(grammar, "set_initial_reasoning_state", None)
+        if setter is not None:
+            try:
+                setter(initial_flag)
+            except Exception:
+                logger.exception("Failed to set reasoning initial state for grammar.")
 
     def _set_or_validate_priority(self, req: Req):
         """Set the default priority value, or abort the request based on the priority scheduling mode."""
@@ -2411,6 +2449,8 @@ class Scheduler(
                 if req.grammar is INVALID_GRAMMAR_OBJ:
                     error_msg = f"Invalid grammar request: {req.grammar_key=}"
                     req.set_finish_with_abort(error_msg)
+                else:
+                    self._apply_reasoning_initial_state(req)
 
                 num_ready_reqs += 1
             except futures._base.TimeoutError:
@@ -2445,6 +2485,8 @@ class Scheduler(
                 if req.grammar is INVALID_GRAMMAR_OBJ:
                     error_msg = f"Invalid grammar request: {req.grammar_key=}"
                     req.set_finish_with_abort(error_msg)
+                else:
+                    self._apply_reasoning_initial_state(req)
         else:
             num_ready_reqs_max = num_ready_reqs
             num_timeout_reqs_max = num_timeout_reqs
