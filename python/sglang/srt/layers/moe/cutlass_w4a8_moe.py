@@ -20,8 +20,6 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     run_moe_ep_preproess,
 )
 
-logger = logging.getLogger(__name__)
-
 
 def cutlass_w4a8_moe(
     a: torch.Tensor,
@@ -103,7 +101,7 @@ def cutlass_w4a8_moe(
     m = a.size(0)
     k = w1_q.size(2) * 2  # w1_q is transposed and packed
     n = w2_q.size(2) * 2  # w2_q is transposed and packed
-    topk = topk_ids_.size(1)
+    topk = topk_ids.size(1)
 
     if apply_router_weight_on_input:
         assert topk == 1, "apply_router_weight_on_input is only implemented for topk=1"
@@ -111,9 +109,9 @@ def cutlass_w4a8_moe(
     device = a.device
     topk_ids = torch.where(topk_ids == -1, num_local_experts, topk_ids)
 
-    _, src2dst, _ = run_cutlass_moe_ep_preproess(
-        local_topk_ids,
-        num_experts,
+    _, src2dst, _ = run_moe_ep_preproess(
+        topk_ids,
+        num_local_experts,
     )
 
     gateup_input = torch.empty(
@@ -126,9 +124,9 @@ def cutlass_w4a8_moe(
         a,
         gateup_input,
         src2dst,
-        local_topk_ids,
+        topk_ids,
         a1_scale,
-        total_num_experts,
+        num_local_experts,
         topk,
         k,
         BLOCK_SIZE=512,
@@ -199,12 +197,11 @@ def cutlass_w4a8_moe(
         c2,
         output,
         src2dst,
-        local_topk_ids,
+        topk_ids,
         topk_weights,
-        num_experts,
         topk,
+        num_local_experts,
         k,
-        0,
         BLOCK_SIZE=512,
     )
     return output
