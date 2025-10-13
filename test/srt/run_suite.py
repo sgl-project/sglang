@@ -13,7 +13,7 @@ class TestFile:
 
 # NOTE: please sort the test cases alphabetically by the test file name
 suites = {
-    "per-commit": [
+    "per-commit-1-gpu": [
         TestFile("function_call/test_json_schema_constraint.py", 30),
         TestFile("hicache/test_hicache.py", 116),
         TestFile("hicache/test_hicache_eagle.py", 150),
@@ -33,6 +33,7 @@ suites = {
         TestFile("models/test_generation_models.py", 103),
         TestFile("models/test_nvidia_nemotron_nano_v2.py", 180),
         TestFile("models/test_qwen_models.py", 82),
+        TestFile("batch_invariant/test_batch_invariant_ops.py", 10),
         TestFile("models/test_reward_models.py", 132),
         TestFile("models/test_transformers_models.py", 320),
         TestFile("models/test_vlm_models.py", 741),
@@ -68,6 +69,7 @@ suites = {
         TestFile("test_deterministic.py", 300),
         TestFile("test_eagle_infer_a.py", 370),
         TestFile("test_eagle_infer_b.py", 700),
+        TestFile("test_eagle_infer_beta.py", 300),
         TestFile("test_ebnf_constrained.py", 108),
         TestFile("test_eval_fp8_accuracy.py", 303),
         TestFile("test_fa3.py", 376),
@@ -77,7 +79,7 @@ suites = {
         TestFile("test_gpt_oss_1gpu.py", 600),
         TestFile("test_harmony_parser.py", 20),
         TestFile("test_hidden_states.py", 55),
-        TestFile("test_hybrid_attn_backend.py", 100),
+        TestFile("test_hybrid_attn_backend.py", 379),
         TestFile("test_input_embeddings.py", 38),
         TestFile("test_io_struct.py", 8),
         TestFile("test_jinja_template_utils.py", 1),
@@ -177,6 +179,9 @@ suites = {
         TestFile("test_vllm_dependency.py", 185),
         # TestFile("test_gguf.py", 96),
     ],
+    # If the test cases take too long, considering adding them to nightly tests instead of per-commit tests
+    "nightly-1-gpu": [],
+    "nightly-8-gpu": [],
 }
 
 # Add AMD tests
