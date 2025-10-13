@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Tuple
+from typing import TYPE_CHECKING, Tuple
 
 import torch
 
@@ -24,7 +24,9 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
-from sglang.srt.managers.scheduler import Scheduler
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.scheduler import Scheduler
 
 logger = logging.getLogger(__name__)
 
