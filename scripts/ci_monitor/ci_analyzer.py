@@ -150,6 +150,7 @@ class SGLangCIAnalyzer:
             "job_durations": defaultdict(
                 list
             ),  # Store timing data: [(timestamp, duration_seconds)]
+            "job_total_runs": defaultdict(int),  # Track total executions per job
         }
 
         total_runs = len(runs)
@@ -204,6 +205,9 @@ class SGLangCIAnalyzer:
                     and "-npu" not in job_name.lower()
                     and "ascend" not in job_name.lower()
                 ):
+                    # Count total job executions (only count completed jobs)
+                    if job_conclusion in ["success", "failure"]:
+                        stats["job_total_runs"][job_name] += 1
                     # Collect timing data for completed jobs
                     started_at = job.get("started_at")
                     completed_at = job.get("completed_at")
@@ -535,18 +539,94 @@ class SGLangCIAnalyzer:
             print(f"Failed to generate timing graph for {job_name}: {e}")
             return None
 
+    def _print_summary_to_console(self, stats: Dict, generated_graphs: Dict):
+        """Print summary analysis to console"""
+        print("=" * 70)
+        print("CI ANALYSIS SUMMARY")
+        print("=" * 70)
+
+        # Overall stats
+        total = stats["total_runs"]
+        failed = stats["failed_runs"]
+        success = stats["successful_runs"]
+        cancelled = stats["cancelled_runs"]
+        completed_runs = success + failed
+        success_rate = (success / completed_runs * 100) if completed_runs > 0 else 0
+
+        print(f"\n📈 Overall Statistics:")
+        print(f"  Total Runs: {total}")
+        print(f"  Successful: {success} ✅")
+        print(f"  Failed: {failed} ❌")
+        print(f"  Success Rate: {success_rate:.1f}% (excludes cancelled/skipped)")
+
+        # Top failed jobs
+        if stats["job_failures"]:
+            print(f"\n🔥 Top 10 Failed Jobs (by failure rate):")
+            job_failure_rates = []
+            for job, failure_count in stats["job_failures"].items():
+                total_count = stats["job_total_runs"].get(job, failure_count)
+                failure_rate = (
+                    (failure_count / total_count * 100) if total_count > 0 else 100.0
+                )
+                job_failure_rates.append(
+                    (job, failure_count, failure_rate, total_count)
+                )
+
+            job_failure_rates.sort(key=lambda x: (x[2], x[1]), reverse=True)
+
+            for i, (job, count, failure_rate, total_count) in enumerate(
+                job_failure_rates[:10], 1
+            ):
+                has_graph = "📊" if job in generated_graphs else ""
+                print(f"  {i:2d}. {job} {has_graph}")
+                print(
+                    f"      Failures: {count}/{total_count} runs ({failure_rate:.1f}%)"
+                )
+
+                # Show timing stats if available
+                if job in stats["job_durations"] and stats["job_durations"][job]:
+                    timing_stats = self._calculate_timing_stats(
+                        stats["job_durations"][job]
+                    )
+                    print(
+                        f"      Timing: avg={timing_stats['avg']/60:.1f}min, p90={timing_stats['p90']/60:.1f}min, p99={timing_stats['p99']/60:.1f}min"
+                    )
+
+        print(f"\n📊 Generated {len(generated_graphs)} timing graphs")
+        print("=" * 70 + "\n")
+
     def _generate_github_summary(
         self, stats: Dict, output_dir: str = "ci_analysis_graphs"
     ):
         """Generate GitHub Actions step summary with CI analysis"""
         try:
+            # Generate graphs for all jobs with timing data (not just failed ones)
+            print("\n📊 Generating timing graphs for all jobs...")
+            generated_graphs = {}
+            for job_name, timing_data in stats["job_durations"].items():
+                if len(timing_data) >= 2:  # Need at least 2 data points for a graph
+                    graph_path = self._generate_job_timing_graph(
+                        job_name, timing_data, output_dir
+                    )
+                    if graph_path:
+                        generated_graphs[job_name] = graph_path
+                        print(f"  ✅ Generated graph for: {job_name}")
+
+            print(
+                f"\nGenerated {len(generated_graphs)} timing graphs in {output_dir}/\n"
+            )
+
             # Check if running in GitHub Actions
             github_step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
             if not github_step_summary:
-                print("ℹ️  Not running in GitHub Actions, skipping summary generation")
+                print(
+                    "ℹ️  Not running in GitHub Actions, skipping summary markdown generation"
+                )
+                # Still print the summary to console
+                self._print_summary_to_console(stats, generated_graphs)
                 return
 
-            print("📊 Generating GitHub Actions summary...")
+            print("📊 Generating GitHub Actions summary markdown...")
 
             summary_lines = []
             summary_lines.append("# 📊 SGLang CI Analysis Report")
@@ -595,26 +675,27 @@ class SGLangCIAnalyzer:
                 # Calculate failure rate for each job
                 job_failure_rates = []
                 for job, failure_count in stats["job_failures"].items():
-                    # Count total occurrences (successes + failures)
-                    success_count = 1 if job in stats["job_last_success"] else 0
-                    total_count = success_count + failure_count
+                    # Get total runs for this job
+                    total_count = stats["job_total_runs"].get(job, failure_count)
                     failure_rate = (
                         (failure_count / total_count * 100)
                         if total_count > 0
                         else 100.0
                     )
-                    job_failure_rates.append((job, failure_count, failure_rate))
+                    job_failure_rates.append(
+                        (job, failure_count, failure_rate, total_count)
+                    )
 
                 # Sort by failure rate descending, then by count descending
                 job_failure_rates.sort(key=lambda x: (x[2], x[1]), reverse=True)
 
-                for i, (job, count, failure_rate) in enumerate(
+                for i, (job, count, failure_rate, total_count) in enumerate(
                     job_failure_rates[:20], 1
                 ):
                     summary_lines.append(f"### {i}. {job}")
                     summary_lines.append("")
                     summary_lines.append(
-                        f"**Failure Count:** {count} times | **Failure Rate:** {failure_rate:.1f}%"
+                        f"**Failures:** {count}/{total_count} runs | **Failure Rate:** {failure_rate:.1f}%"
                     )
                     summary_lines.append("")
 
@@ -635,14 +716,9 @@ class SGLangCIAnalyzer:
                         )
                         summary_lines.append("")
 
-                        # Generate timing graph
-                        graph_path = self._generate_job_timing_graph(
-                            job, stats["job_durations"][job], output_dir
-                        )
-                        if graph_path:
-                            # For GitHub Actions, we need to upload the graph and reference it
-                            # For now, just note that graph was generated
-                            graph_filename = os.path.basename(graph_path)
+                        # Reference already generated timing graph
+                        if job in generated_graphs:
+                            graph_filename = os.path.basename(generated_graphs[job])
                             summary_lines.append(
                                 f"**Timing Graph:** `{graph_filename}` (see artifacts)"
                             )
@@ -712,7 +788,10 @@ class SGLangCIAnalyzer:
 
             # Append summary to GitHub Actions
             with open(github_step_summary, "a", encoding="utf-8") as f:
+                # Add separator if file already has content
+                f.write("\n\n")
                 f.write("\n".join(summary_lines))
+                f.write("\n")
 
             print("✅ GitHub Actions summary generated successfully")
 
