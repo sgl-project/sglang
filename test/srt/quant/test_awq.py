@@ -63,11 +63,17 @@ class TestAWQMarlinBfloat16(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    def test_verify_model_info(self):
-        response = requests.get(f"{self.base_url}/get_model_info")
-        self.assertEqual(response.status_code, 200)
-        data = response.json()
-        self.assertEqual(data["model_path"], self.model)
+    def test_mmlu(self):
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="mmlu",
+            num_examples=64,
+            num_threads=32,
+        )
+
+        metrics = run_eval(args)
+        self.assertGreater(metrics["score"], 0.88)
 
 
 if __name__ == "__main__":
