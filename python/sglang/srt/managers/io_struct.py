@@ -16,6 +16,8 @@ The definition of objects transferred between different
 processes (TokenizerManager, DetokenizerManager, Scheduler).
 """
 
+from __future__ import annotations
+
 import copy
 import uuid
 from abc import ABC
@@ -852,7 +854,7 @@ class BatchTokenIDOutput(BaseBatchReq):
     token_steps: List[List[int]] = None
 
     # Load for DP balance
-    load: "GetLoadReqOutput"
+    load: GetLoadReqOutput = None
 
 
 @dataclass
@@ -928,7 +930,7 @@ class BatchStrOutput(BaseBatchReq):
     token_steps: List[List[int]] = None
 
     # Load for DP balance
-    load: "GetLoadReqOutput"
+    load: GetLoadReqOutput = None
 
 
 @dataclass
