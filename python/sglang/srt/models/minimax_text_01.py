@@ -682,7 +682,7 @@ class MiniMaxText01DecoderLayer(nn.Module):
         if self.expert_num == 1:
             hidden_states = self.mlp(layernorm_output)
         else:
-            moe_hidden_states = self.block_sparse_moe(copy.deepcopy(layernorm_output))
+            moe_hidden_states = self.block_sparse_moe(layernorm_output)
             if self.shared_moe:
                 before_moe_dtype = layernorm_output.dtype
                 moe_hidden_fp32 = moe_hidden_states.to(torch.float32)
@@ -968,6 +968,7 @@ class MiniMaxText01ForCausalLM(nn.Module):
                         "w13_weight" if weight_name in ["w1", "w3"] else "w2_weight",
                         f"experts.{expert_id}.{weight_name}.weight",
                         expert_id,
+                        weight_name,
                     )
                     for expert_id in range(max(self.config.num_local_experts))
                     for weight_name in ["w1", "w2", "w3"]
