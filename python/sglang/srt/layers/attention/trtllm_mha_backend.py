@@ -637,7 +637,7 @@ class TRTLLMHAAttnMultiStepDraftBackend(FlashInferMultiStepDraftBackend):
         self, model_runner: ModelRunner, topk: int, speculative_num_steps: int
     ):
         super().__init__(model_runner, topk, speculative_num_steps)
-        for i in range(speculative_num_steps):
+        for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i] = TRTLLMHAAttnBackend(
                 model_runner,
                 skip_prefill=True,
