@@ -28,7 +28,6 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
-    get_moe_expert_parallel_world_size,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
@@ -36,7 +35,6 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.layers.activation import GeluAndMul
 from sglang.srt.layers.elementwise import (
-    experts_combine_triton,
     fused_dual_residual_rmsnorm,
     fused_rmsnorm,
     gelu_and_mul_triton,
@@ -64,10 +62,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, dispose_tensor, dump_to_file
 
 logger = logging.getLogger(__name__)
@@ -866,10 +864,10 @@ class Grok1ForCausalLM(nn.Module):
 
         # Dump tensors for debugging
         global debug_tensor_dump_output_folder, debug_tensor_dump_inject
-        debug_tensor_dump_output_folder = global_server_args_dict[
-            "debug_tensor_dump_output_folder"
-        ]
-        debug_tensor_dump_inject = global_server_args_dict["debug_tensor_dump_inject"]
+        debug_tensor_dump_output_folder = (
+            get_global_server_args().debug_tensor_dump_output_folder
+        )
+        debug_tensor_dump_inject = get_global_server_args().debug_tensor_dump_inject
         warnings.filterwarnings("ignore", category=FutureWarning)
 
         if get_tensor_model_parallel_rank() == 0:
