@@ -468,9 +468,7 @@ class Scheduler(
 
         # Hybrid memory pool
         self.is_hybrid = self.tp_worker.is_hybrid
-        self.is_hybrid_gdn = (
-            self.tp_worker.worker.model_runner.hybrid_gdn_config is not None
-        )
+        self.is_hybrid_gdn = self.tp_worker.model_runner.hybrid_gdn_config is not None
 
         if self.is_hybrid:
             self.sliding_window_size = self.tp_worker.sliding_window_size
@@ -1882,7 +1880,7 @@ class Scheduler(
             chunked_req_to_exclude.add(self.chunked_req)
             self.tree_cache.cache_unfinished_req(self.chunked_req, chunked=True)
             # chunked request keeps its rid but will get a new req_pool_idx
-            if self.tp_worker.worker.model_runner.mambaish_config is not None:
+            if self.tp_worker.model_runner.mambaish_config is not None:
                 self.req_to_token_pool.free(
                     self.chunked_req.req_pool_idx, free_mamba_cache=False
                 )
@@ -2686,9 +2684,7 @@ class Scheduler(
         ret = vars(get_global_server_args())
         ret["last_gen_throughput"] = self.last_gen_throughput
         ret["memory_usage"] = {
-            "weight": round(
-                self.tp_worker.worker.model_runner.weight_load_mem_usage, 2
-            ),
+            "weight": round(self.tp_worker.model_runner.weight_load_mem_usage, 2),
             "kvcache": round(
                 self.token_to_kv_pool_allocator.get_kvcache().mem_usage, 2
             ),
@@ -2696,7 +2692,7 @@ class Scheduler(
         }
 
         ret["memory_usage"]["graph"] = round(
-            self.tp_worker.worker.model_runner.graph_mem_usage, 2
+            self.tp_worker.model_runner.graph_mem_usage, 2
         )
 
         if not self.spec_algorithm.is_none() and self.cum_spec_accept_count > 0:
