@@ -721,10 +721,8 @@ class DeepseekV2MoE(nn.Module):
         ):
             return self.forward_cpu(hidden_states, should_allreduce_fusion)
 
-        HACK_SBO_SHARED_AND_RS = SboFlags.fuse_shared_experts_inside_sbo()
-
         if hidden_states.shape[0] > 0:
-            if not HACK_SBO_SHARED_AND_RS:
+            if not SboFlags.fuse_shared_experts_inside_sbo():
                 shared_output = self._forward_shared_experts(
                     hidden_states, gemm_output_zero_allocator
                 )
@@ -735,7 +733,7 @@ class DeepseekV2MoE(nn.Module):
             shared_output = None
             topk_output = self.topk.empty_topk_output(hidden_states.device)
 
-        if HACK_SBO_SHARED_AND_RS:
+        if SboFlags.fuse_shared_experts_inside_sbo():
             shared_output = None
 
             def _forward_shared_experts_and_put_results():
@@ -749,7 +747,7 @@ class DeepseekV2MoE(nn.Module):
             topk_output,
             forward_shared_experts=(
                 _forward_shared_experts_and_put_results
-                if HACK_SBO_SHARED_AND_RS
+                if SboFlags.fuse_shared_experts_inside_sbo()
                 else None
             ),
             alt_stream=self.alt_stream,
