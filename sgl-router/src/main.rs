@@ -255,6 +255,9 @@ struct CliArgs {
     #[arg(long)]
     tokenizer_path: Option<String>,
 
+    #[arg(long)]
+    chat_template: Option<String>,
+
     #[arg(long, default_value = "memory", value_parser = ["memory", "none", "oracle"])]
     history_backend: String,
 
@@ -561,6 +564,7 @@ impl CliArgs {
             rate_limit_tokens_per_second: None,
             model_path: self.model_path.clone(),
             tokenizer_path: self.tokenizer_path.clone(),
+            chat_template: self.chat_template.clone(),
             history_backend,
             oracle,
             reasoning_parser: self.reasoning_parser.clone(),

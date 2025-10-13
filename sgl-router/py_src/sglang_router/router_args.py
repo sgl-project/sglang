@@ -83,10 +83,9 @@ class RouterArgs:
     cb_timeout_duration_secs: int = 60
     cb_window_duration_secs: int = 120
     disable_circuit_breaker: bool = False
-    # Tokenizer configuration
     model_path: Optional[str] = None
     tokenizer_path: Optional[str] = None
-    # Parser configuration
+    chat_template: Optional[str] = None
     reasoning_parser: Optional[str] = None
     tool_call_parser: Optional[str] = None
 
@@ -448,6 +447,12 @@ class RouterArgs:
             type=str,
             default=None,
             help="Explicit tokenizer path (overrides model_path tokenizer if provided)",
+        )
+        parser.add_argument(
+            f"--{prefix}chat-template",
+            type=str,
+            default=None,
+            help="Chat template path (optional)",
         )
         parser.add_argument(
             f"--{prefix}reasoning-parser",

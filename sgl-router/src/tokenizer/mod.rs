@@ -23,8 +23,9 @@ mod tests;
 
 // Re-exports
 pub use factory::{
-    create_tokenizer, create_tokenizer_async, create_tokenizer_from_file,
-    create_tokenizer_with_chat_template, TokenizerType,
+    create_tokenizer, create_tokenizer_async, create_tokenizer_async_with_chat_template,
+    create_tokenizer_from_file, create_tokenizer_with_chat_template,
+    create_tokenizer_with_chat_template_blocking, TokenizerType,
 };
 pub use sequence::Sequence;
 pub use stop::{SequenceDecoderOutput, StopSequenceConfig, StopSequenceDecoder};

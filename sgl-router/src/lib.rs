@@ -90,6 +90,7 @@ struct Router {
     connection_mode: config::ConnectionMode,
     model_path: Option<String>,
     tokenizer_path: Option<String>,
+    chat_template: Option<String>,
     reasoning_parser: Option<String>,
     tool_call_parser: Option<String>,
 }
@@ -216,6 +217,7 @@ impl Router {
             enable_igw: self.enable_igw,
             model_path: self.model_path.clone(),
             tokenizer_path: self.tokenizer_path.clone(),
+            chat_template: self.chat_template.clone(),
             history_backend: config::HistoryBackend::Memory,
             oracle: None,
             reasoning_parser: self.reasoning_parser.clone(),
@@ -284,6 +286,7 @@ impl Router {
         rate_limit_tokens_per_second = None,
         model_path = None,
         tokenizer_path = None,
+        chat_template = None,
         reasoning_parser = None,
         tool_call_parser = None,
     ))]
@@ -345,6 +348,7 @@ impl Router {
         rate_limit_tokens_per_second: Option<i32>,
         model_path: Option<String>,
         tokenizer_path: Option<String>,
+        chat_template: Option<String>,
         reasoning_parser: Option<String>,
         tool_call_parser: Option<String>,
     ) -> PyResult<Self> {
@@ -420,6 +424,7 @@ impl Router {
             connection_mode,
             model_path,
             tokenizer_path,
+            chat_template,
             reasoning_parser,
             tool_call_parser,
         })
