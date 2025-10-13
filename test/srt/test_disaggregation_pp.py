@@ -39,6 +39,8 @@ class TestDisaggregationPPAccuracy(TestDisaggregationBase):
             "--pp-size",
             "2",
             "--disable-overlap-schedule",
+            "--disaggregation-ib-device",
+            "mlx5_1,mlx5_2,mlx5_3,mlx5_4",
         ]
         prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
@@ -58,6 +60,9 @@ class TestDisaggregationPPAccuracy(TestDisaggregationBase):
             "2",
             "--base-gpu-id",
             "4",
+            "--disaggregation-ib-device",
+            "mlx5_1,mlx5_2,mlx5_3,mlx5_4",
+
         ]
         decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
