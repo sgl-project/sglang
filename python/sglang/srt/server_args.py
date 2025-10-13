@@ -13,6 +13,8 @@
 # ==============================================================================
 """The arguments of the server."""
 
+from __future__ import annotations
+
 import argparse
 import dataclasses
 import json
@@ -3362,6 +3364,7 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
 
 
 ZMQ_TCP_PORT_DELTA = 233
+DP_ATTENTION_HANDSHAKE_PORT_DELTA = 5
 
 
 @dataclasses.dataclass
@@ -3386,7 +3389,11 @@ class PortArgs:
     tokenizer_worker_ipc_name: Optional[str]
 
     @staticmethod
-    def init_new(server_args, dp_rank: Optional[int] = None) -> "PortArgs":
+    def init_new(
+        server_args: ServerArgs,
+        dp_rank: Optional[int] = None,
+        worker_ports: Optional[List[int]] = None,
+    ) -> PortArgs:
         if server_args.nccl_port is None:
             nccl_port = server_args.port + random.randint(100, 1000)
             while True:
@@ -3433,8 +3440,8 @@ class PortArgs:
                 # TokenizerManager to DataParallelController
                 scheduler_input_port = port_base + 4
             else:
-                scheduler_input_port = port_base + 4 + 1 + dp_rank
-
+                assert worker_ports is not None
+                scheduler_input_port = worker_ports[dp_rank]
             return PortArgs(
                 tokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base}",
                 scheduler_input_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port}",
