@@ -244,7 +244,7 @@ from sgl_kernel.elementwise import (
     rmsnorm,
     silu_and_mul,
 )
-from sgl_kernel.expert_specilization import es_fp8_blockwise_scaled_grouped_mm
+from sgl_kernel.expert_specialization import es_fp8_blockwise_scaled_grouped_mm
 from sgl_kernel.fused_moe import fused_marlin_moe
 from sgl_kernel.gemm import (
     awq_dequantize,
