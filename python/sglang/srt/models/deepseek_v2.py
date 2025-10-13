@@ -2868,10 +2868,8 @@ class DeepseekV2ForCausalLM(nn.Module):
                         module.weight, module.weight_scale_inv, weight_block_size
                     )
 
-    # TODO temporary code duplication before refactoring both to Fp8LinearMethod
+    # TODO move both weight_requant_ue8m0 and transform_scale_ue8m0 into Fp8LinearMethod.process_weights_after_loading
     def _transform_scale_ue8m0(self, is_nextn=False):
-        print("hi execute transform_scale_ue8m0")
-
         num_hidden_layers = 1 if is_nextn else self.config.num_hidden_layers
 
         for layer_id in range(num_hidden_layers):
@@ -2880,17 +2878,9 @@ class DeepseekV2ForCausalLM(nn.Module):
             else:
                 layer = self.model.layers[layer_id]
 
-            module_list = [
-                # layer.self_attn.kv_b_proj,
-                # layer.self_attn.o_proj,
-            ]
-
-            # if self.config.q_lora_rank is not None:
-            #     module_list.append(layer.self_attn.fused_qkv_a_proj_with_mqa)
-            module_list.append(layer.self_attn.q_b_proj)
-            # else:
-            #     module_list.append(layer.self_attn.kv_a_proj_with_mqa)
-            #     module_list.append(layer.self_attn.q_proj)
+            module_list = []
+            if self.config.q_lora_rank is not None:
+                module_list.append(layer.self_attn.q_b_proj)
 
             for module in module_list:
                 transform_scale_ue8m0_inplace(
@@ -3181,10 +3171,7 @@ class DeepseekV2ForCausalLM(nn.Module):
             desc="quant attn to fp8 ue8m0",
         ):
             for stem in [
-                # "kv_a_proj_with_mqa",
-                # "kv_b_proj",
-                # "o_proj",
-                # "q_a_proj",
+                # may put tensors like `o_proj` here for DeepSeek FP4 ckpt v1
                 "q_b_proj",
             ]:
                 partial_name = f"model.layers.{layer_id}.self_attn.{stem}"
