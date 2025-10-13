@@ -5,6 +5,12 @@ set -euxo pipefail
 IS_BLACKWELL=${IS_BLACKWELL:-0}
 CU_VERSION="cu129"
 
+if [ "$CU_VERSION" = "cu130" ]; then
+    NVRTC_SPEC="nvidia-cuda-nvrtc>=13,<14"
+else
+    NVRTC_SPEC="nvidia-cuda-nvrtc-cu12"
+fi
+
 # Kill existing processes
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 bash "${SCRIPT_DIR}/../killall_sglang.sh"
@@ -39,7 +45,7 @@ else
 fi
 
 # Install the main package
-$PIP_CMD install -e "python[dev]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} $PIP_INSTALL_SUFFIX --force-reinstall
+$PIP_CMD install -e "python[dev]" --extra-index-url https://download.pytorch.org/whl/test/${CU_VERSION} $PIP_INSTALL_SUFFIX --force-reinstall
 
 # Install router for pd-disagg test
 SGLANG_ROUTER_BUILD_NO_RUST=1 $PIP_CMD install -e "sgl-router" $PIP_INSTALL_SUFFIX
@@ -60,7 +66,7 @@ fi
 $PIP_CMD list
 
 # Install additional dependencies
-$PIP_CMD install mooncake-transfer-engine==0.3.6.post1 nvidia-cuda-nvrtc-cu12 py-spy huggingface_hub[hf_xet] $PIP_INSTALL_SUFFIX
+$PIP_CMD install mooncake-transfer-engine==0.3.6.post1 "${NVRTC_SPEC}" py-spy huggingface_hub[hf_xet] $PIP_INSTALL_SUFFIX
 
 if [ "$IS_BLACKWELL" != "1" ]; then
     # For lmms_evals evaluating MMMU
