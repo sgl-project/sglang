@@ -449,13 +449,7 @@ class TokenizerCommunicatorMixin:
 
         # Unregister the LoRA adapter from the registry to stop new requests for this adapter
         # from being started.
-        logger.info(
-            f"lora registry is: {self.lora_registry._registry} before unregistering: {obj}"
-        )
         lora_id = await self.lora_registry.unregister(obj.lora_name)
-        logger.info(
-            f"lora registry is: {self.lora_registry._registry} after unregistering: {obj.lora_name}"
-        )
         obj.lora_id = lora_id
 
         # Initiate the actual unloading operation at the backend processes only after all
@@ -493,7 +487,7 @@ class TokenizerCommunicatorMixin:
                 if self.server_args.max_loaded_loras is not None:
                     while (
                         self.lora_registry.num_registered_loras
-                        > self.server_args.max_loaded_loras
+                        >= self.server_args.max_loaded_loras
                     ):
                         lru_lora_name = await self.lora_registry.lru_lora_name(
                             exclude_pinned=True
