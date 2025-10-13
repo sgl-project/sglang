@@ -280,13 +280,13 @@ impl SglangSchedulerClient {
                 input_ids: token_ids,
             }),
             sampling_params: Some(sampling_params),
-            return_logprob: body.return_logprob,
-            logprob_start_len: -1,
-            top_logprobs_num: 0,
-            token_ids_logprob: vec![],
+            return_logprob: body.return_logprob.unwrap_or(false),
+            logprob_start_len: body.logprob_start_len.unwrap_or(-1),
+            top_logprobs_num: body.top_logprobs_num.unwrap_or(0),
+            token_ids_logprob: body.token_ids_logprob.clone().unwrap_or_default(),
             return_hidden_states: body.return_hidden_states,
             stream: body.stream,
-            log_metrics: true,
+            log_metrics: body.log_metrics,
             ..Default::default()
         };
 
