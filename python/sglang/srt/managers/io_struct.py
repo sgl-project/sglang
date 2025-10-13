@@ -1382,8 +1382,7 @@ class MultiTokenizerRegisterReq(BaseBatchReq):
 
 @dataclass
 class MultiTokenizerWrapper:
-    # DEPRECATED: This class should be removed after migration to rid-based routing
-    # See: https://github.com/sgl-project/sglang/issues/11172
+    # FIXME(lsyin): remove this
     worker_id: int
     obj: Optional[Any] = None
 

@@ -89,6 +89,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     MultiTokenizerRegisterReq,
+    MultiTokenizerWrapper,
     OpenSessionReqInput,
     OpenSessionReqOutput,
     ProfileReq,
@@ -1239,31 +1240,18 @@ class Scheduler(
                 self.return_health_check_ct += 1
                 continue
 
-            # Handle the request directly
+            # If it is a MultiTokenizerWrapper, unwrap it and handle the inner request.
+            if isinstance(recv_req, MultiTokenizerWrapper):
+                worker_id = recv_req.worker_id
+                recv_req = recv_req.obj
+                output = self._request_dispatcher(recv_req)
+                if output is not None:
+                    output = MultiTokenizerWrapper(worker_id, output)
+                    self.send_to_tokenizer.send_pyobj(output)
+                continue
+
             output = self._request_dispatcher(recv_req)
             if output is not None:
-                # For multi-tokenizer mode, we need to preserve worker_id from rid
-                if (
-                    self.server_args.tokenizer_worker_num > 1
-                    and hasattr(recv_req, "rid")
-                    and recv_req.rid
-                    and isinstance(recv_req.rid, str)
-                    and "_" in recv_req.rid
-                ):
-                    # Extract worker_id from rid format: {worker_id}_{request_id}
-                    worker_id = int(recv_req.rid.split("_")[0])
-                    # Ensure output has the correct worker_id context for routing
-                    if hasattr(output, "rids") and output.rids:
-                        # Update rids to maintain worker_id prefix
-                        output.rids = [
-                            (
-                                f"{worker_id}_{rid}"
-                                if not rid.startswith(f"{worker_id}_")
-                                else rid
-                            )
-                            for rid in output.rids
-                        ]
-
                 if isinstance(output, RpcReqOutput):
                     if self.recv_from_rpc is not None:
                         self.recv_from_rpc.send_pyobj(output)

@@ -35,6 +35,7 @@ from sglang.srt.managers.io_struct import (
     BatchStrOutput,
     BatchTokenIDOutput,
     MultiTokenizerRegisterReq,
+    MultiTokenizerWrapper,
 )
 from sglang.srt.managers.tokenizer_communicator_mixin import _Communicator
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -78,27 +79,6 @@ class SocketMapping:
             )
             return
         self._mapping[worker_id].send_pyobj(output)
-
-
-def extract_worker_id_from_rid(rid_or_rids):
-    """Extract worker_id from rid format: {worker_id}_{request_id}"""
-    if isinstance(rid_or_rids, list):
-        if len(rid_or_rids) == 0:
-            return []
-        # Use the first rid to extract worker_id
-        first_rid = rid_or_rids[0]
-        if "_" in first_rid:
-            worker_id = int(first_rid.split("_")[0])
-            return [worker_id] * len(rid_or_rids)
-        else:
-            return []
-    elif isinstance(rid_or_rids, str):
-        if "_" in rid_or_rids:
-            return [int(rid_or_rids.split("_")[0])]
-        else:
-            return []
-    else:
-        return []
 
 
 def _handle_output_by_index(output, i):
@@ -453,17 +433,14 @@ class MultiTokenizerRouter:
 
     async def _distribute_result_to_workers(self, recv_obj):
         """Distribute result to corresponding workers based on rid"""
-        # Extract worker_ids directly from rid
-        if hasattr(recv_obj, "rids"):
-            worker_ids = extract_worker_id_from_rid(recv_obj.rids)
-        elif hasattr(recv_obj, "rid"):
-            worker_ids = extract_worker_id_from_rid(recv_obj.rid)
+        if isinstance(recv_obj, MultiTokenizerWrapper):
+            worker_ids = [recv_obj.worker_id]
+            recv_obj = recv_obj.obj
         else:
-            logger.error(f"Cannot find rid/rids in recv_obj: {type(recv_obj)}")
-            return
+            worker_ids = self.get_worker_ids_from_req_rids(recv_obj.rids)
 
         if len(worker_ids) == 0:
-            logger.error(f"Cannot find worker_id from rid/rids in {recv_obj}")
+            logger.error(f"Cannot find worker_id from rids {recv_obj.rids}")
             return
 
         # Distribute result to each worker
@@ -519,6 +496,7 @@ class TokenizerWorker(TokenizerManager):
         self.auto_create_handle_loop()
         req = MultiTokenizerRegisterReq(rids=[f"{self.worker_id}_register"])
         req.ipc_name = self.tokenizer_ipc_name
+        _Communicator.enable_multi_tokenizer = True
         await self.register_multi_tokenizer_communicator(req)
 
 
