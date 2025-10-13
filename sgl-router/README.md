@@ -242,8 +242,6 @@ python -m sglang_router.launch_router --backend openai \
 # https://download.oracle.com/otn_software/linux/instantclient/2390000/instantclient-basic-linux.x64-23.9.0.25.07.zip
 export LD_LIBRARY_PATH=/home/ubuntu/instant-client/instantclient_23_9
 
-
-
 # choose ONE of the following connection methods:
 # Option 1: Using full connection descriptor
 export ATP_DSN="(description=(address=(protocol=tcps)(port=1522)(host=adb.region.oraclecloud.com))(connect_data=(service_name=service_name)))"
