@@ -104,6 +104,23 @@ class SchedulerMetricsMixin:
                 f"full token usage: {full_token_usage:.2f}, "
                 f"swa token usage: {swa_token_usage:.2f}, "
             )
+        elif self.is_hybrid_gdn:
+            (
+                full_num_used,
+                _,
+                full_token_usage,
+                mamba_usage,
+                _,
+                _,
+                _,
+                _,
+            ) = self._get_mamba_token_info()
+            num_used = full_num_used
+            token_usage = full_token_usage
+            token_usage_msg = (
+                f"full token usage: {full_token_usage:.2f}, "
+                f"mamba usage: {mamba_usage:.2f}, "
+            )
         else:
             num_used, token_usage, _, _ = self._get_token_info()
             token_usage_msg = f"token usage: {token_usage:.2f}, "
@@ -202,6 +219,25 @@ class SchedulerMetricsMixin:
                 f"full token usage: {full_token_usage:.2f}, "
                 f"#swa token: {swa_num_used}, "
                 f"swa token usage: {swa_token_usage:.2f}, "
+            )
+        elif self.is_hybrid_gdn:
+            (
+                full_num_used,
+                mamba_used,
+                full_token_usage,
+                mamba_usage,
+                _,
+                _,
+                _,
+                _,
+            ) = self._get_mamba_token_info()
+            num_used = full_num_used
+            token_usage = full_token_usage
+            token_usage_msg = (
+                f"#full token: {full_num_used}, "
+                f"full token usage: {full_token_usage:.2f}, "
+                f"mamba num: {mamba_used}, "
+                f"mamba usage: {mamba_usage:.2f}, "
             )
         else:
             num_used, token_usage, _, _ = self._get_token_info()
