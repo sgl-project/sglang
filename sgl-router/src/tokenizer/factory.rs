@@ -4,6 +4,7 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
+use tracing::{debug, info};
 
 use super::huggingface::HuggingFaceTokenizer;
 use super::tiktoken::TiktokenTokenizer;
@@ -228,6 +229,20 @@ pub async fn create_tokenizer_async_with_chat_template(
                 let final_chat_template = chat_template_path
                     .map(|s| s.to_string())
                     .or_else(|| discover_chat_template_in_dir(&cache_dir));
+
+                // Log chat template source for debugging
+                match (&chat_template_path, &final_chat_template) {
+                    (Some(provided), _) => {
+                        info!("Using provided chat template: {}", provided);
+                    }
+                    (None, Some(discovered)) => {
+                        info!("Auto-discovered chat template: {}", discovered);
+                    }
+                    (None, None) => {
+                        debug!("No chat template found for model: {}", model_name_or_path);
+                    }
+                }
+
                 let tokenizer_path_str = tokenizer_path.to_str().ok_or_else(|| {
                     Error::msg(format!(
                         "Tokenizer path is not valid UTF-8: {:?}",
@@ -247,6 +262,20 @@ pub async fn create_tokenizer_async_with_chat_template(
                         let final_chat_template = chat_template_path
                             .map(|s| s.to_string())
                             .or_else(|| discover_chat_template_in_dir(&cache_dir));
+
+                        // Log chat template source for debugging
+                        match (&chat_template_path, &final_chat_template) {
+                            (Some(provided), _) => {
+                                info!("Using provided chat template: {}", provided);
+                            }
+                            (None, Some(discovered)) => {
+                                info!("Auto-discovered chat template: {}", discovered);
+                            }
+                            (None, None) => {
+                                debug!("No chat template found for model: {}", model_name_or_path);
+                            }
+                        }
+
                         let file_path_str = file_path.to_str().ok_or_else(|| {
                             Error::msg(format!("File path is not valid UTF-8: {:?}", file_path))
                         })?;
@@ -270,6 +299,9 @@ pub async fn create_tokenizer_async_with_chat_template(
 }
 
 /// Factory function to create tokenizer from a model name or path (blocking version)
+///
+/// This delegates to `create_tokenizer_with_chat_template_blocking` with no chat template,
+/// which handles both local files and HuggingFace Hub downloads uniformly.
 pub fn create_tokenizer(model_name_or_path: &str) -> Result<Arc<dyn traits::Tokenizer>> {
     create_tokenizer_with_chat_template_blocking(model_name_or_path, None)
 }
