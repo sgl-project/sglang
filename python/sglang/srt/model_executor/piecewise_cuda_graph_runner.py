@@ -24,6 +24,9 @@ from typing import TYPE_CHECKING, Union
 import torch
 import tqdm
 
+from sglang.srt.compilation.compilation_config import CompilationConfig
+from sglang.srt.compilation.compile import install_torch_compiled, set_compiled
+from sglang.srt.compilation.piecewise_context_manager import set_forward_context
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -38,14 +41,6 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.torchao_utils import save_gemlite_cache
-from sglang.srt.model_executor.compilation.compilation_config import CompilationConfig
-from sglang.srt.model_executor.compilation.compile import (
-    install_torch_compiled,
-    set_compiled,
-)
-from sglang.srt.model_executor.compilation.piecewise_context_manager import (
-    set_forward_context,
-)
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
