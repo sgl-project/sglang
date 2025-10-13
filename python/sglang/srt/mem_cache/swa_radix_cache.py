@@ -449,7 +449,9 @@ class SWARadixCache(BasePrefixCache):
 
         if self.page_size != 1:
             page_aligned_len = actual_kv_len // self.page_size * self.page_size
-            page_aligned_kv_indices = kv_indices[:page_aligned_len].clone()
+            page_aligned_kv_indices = kv_indices[:page_aligned_len].to(
+                dtype=torch.int64, copy=True
+            )
         else:
             page_aligned_len = actual_kv_len
             page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)

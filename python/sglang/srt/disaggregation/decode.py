@@ -611,7 +611,7 @@ class DecodeTransferQueue:
                 self.scheduler.stream_output(
                     [decode_req.req], decode_req.req.return_logprob
                 )
-                # unlock the kv cache or it will have memory leak, but don't insert into the tree
+                # release pre-allocated kv cache, but don't insert into the tree since it's failed
                 self.tree_cache.cache_finished_req(decode_req.req, is_insert=False)
                 indices_to_remove.add(i)
                 if self.scheduler.enable_metrics:

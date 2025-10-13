@@ -372,11 +372,13 @@ class RadixCache(BasePrefixCache):
                 kv_indices[old_prefix_len:new_prefix_len]
             )
         else:
+            # TODO (csy): we can start from the last node to find those overlapped nodes in the tree.
+            # Compared with calling match_prefix, this is beneficial when hit rate is high.
             match_result = self.match_prefix(
                 RadixKey(token_ids[:page_aligned_token_len], req.extra_key)
             )
             new_prefix_len = len(match_result.device_indices)
-            # Free everything beyond the match since we're not inserting
+            # Free beyond the match since we're not inserting
             self.token_to_kv_pool_allocator.free(
                 kv_indices[new_prefix_len:page_aligned_len]
             )
