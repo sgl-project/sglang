@@ -391,6 +391,19 @@ class KVCache(abc.ABC):
         # default state for optional layer-wise transfer control
         self.layer_transfer_counter = None
 
+        # for disagg with nvlink
+        self.enable_custom_mem_pool = get_bool_env_var(
+            "SGLANG_MOONCAKE_CUSTOM_MEM_POOL", "false"
+        )
+        if self.enable_custom_mem_pool:
+            # TODO(shangming): abstract custom allocator class for more backends
+            from mooncake.allocator import NVLinkAllocator
+
+            allocator = NVLinkAllocator.get_allocator(self.device)
+            self.custom_mem_pool = torch.cuda.MemPool(allocator.allocator())
+        else:
+            self.custom_mem_pool = None
+
     def _finalize_allocation_log(self, num_tokens: int):
         """Common logging and mem_usage computation for KV cache allocation.
         Supports both tuple (K, V) size returns and single KV size returns.
@@ -442,6 +455,9 @@ class KVCache(abc.ABC):
     def load_cpu_copy(self, kv_cache_cpu, indices):
         raise NotImplementedError()
 
+    def maybe_get_custom_mem_pool(self):
+        return self.custom_mem_pool
+
 
 class MHATokenToKVPool(KVCache):
 
@@ -471,19 +487,6 @@ class MHATokenToKVPool(KVCache):
         )
         self.head_num = head_num
         self.head_dim = head_dim
-
-        # for disagg with nvlink
-        self.enable_custom_mem_pool = get_bool_env_var(
-            "SGLANG_MOONCAKE_CUSTOM_MEM_POOL", "false"
-        )
-        if self.enable_custom_mem_pool:
-            # TODO(shangming): abstract custom allocator class for more backends
-            from mooncake.allocator import NVLinkAllocator
-
-            allocator = NVLinkAllocator.get_allocator(self.device)
-            self.custom_mem_pool = torch.cuda.MemPool(allocator.allocator())
-        else:
-            self.custom_mem_pool = None
 
         self._create_buffers()
 
@@ -626,9 +629,6 @@ class MHATokenToKVPool(KVCache):
             for i in range(self.start_layer, self.start_layer + self.layer_num)
         ]
         return kv_data_ptrs, kv_data_lens, kv_item_lens
-
-    def maybe_get_custom_mem_pool(self):
-        return self.custom_mem_pool
 
     def get_cpu_copy(self, indices):
         torch.cuda.synchronize()
@@ -1190,19 +1190,6 @@ class MLATokenToKVPool(KVCache):
             else (kv_lora_rank + qk_rope_head_dim)
         )
 
-        # for disagg with nvlink
-        self.enable_custom_mem_pool = get_bool_env_var(
-            "SGLANG_MOONCAKE_CUSTOM_MEM_POOL", "false"
-        )
-        if self.enable_custom_mem_pool:
-            # TODO(shangming): abstract custom allocator class for more backends
-            from mooncake.allocator import NVLinkAllocator
-
-            allocator = NVLinkAllocator.get_allocator(self.device)
-            self.custom_mem_pool = torch.cuda.MemPool(allocator.allocator())
-        else:
-            self.custom_mem_pool = None
-
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
                 torch.cuda.use_mem_pool(self.custom_mem_pool)
@@ -1244,9 +1231,6 @@ class MLATokenToKVPool(KVCache):
             self.kv_buffer[i][0].nbytes * self.page_size for i in range(self.layer_num)
         ]
         return kv_data_ptrs, kv_data_lens, kv_item_lens
-
-    def maybe_get_custom_mem_pool(self):
-        return self.custom_mem_pool
 
     def get_key_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
@@ -1686,27 +1670,38 @@ class DoubleSparseTokenToKVPool(KVCache):
         )
 
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-            # [size, head_num, head_dim] for each layer
-            self.k_buffer = [
-                torch.zeros(
-                    (size + page_size, head_num, head_dim), dtype=dtype, device=device
-                )
-                for _ in range(layer_num)
-            ]
-            self.v_buffer = [
-                torch.zeros(
-                    (size + page_size, head_num, head_dim), dtype=dtype, device=device
-                )
-                for _ in range(layer_num)
-            ]
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.enable_custom_mem_pool
+                else nullcontext()
+            ):
+                # [size, head_num, head_dim] for each layer
+                self.k_buffer = [
+                    torch.zeros(
+                        (size + page_size, head_num, head_dim),
+                        dtype=dtype,
+                        device=device,
+                    )
+                    for _ in range(layer_num)
+                ]
+                self.v_buffer = [
+                    torch.zeros(
+                        (size + page_size, head_num, head_dim),
+                        dtype=dtype,
+                        device=device,
+                    )
+                    for _ in range(layer_num)
+                ]
 
-            # [size, head_num, heavy_channel_num] for each layer
-            self.label_buffer = [
-                torch.zeros(
-                    (size + 1, head_num, heavy_channel_num), dtype=dtype, device=device
-                )
-                for _ in range(layer_num)
-            ]
+                # [size, head_num, heavy_channel_num] for each layer
+                self.label_buffer = [
+                    torch.zeros(
+                        (size + 1, head_num, heavy_channel_num),
+                        dtype=dtype,
+                        device=device,
+                    )
+                    for _ in range(layer_num)
+                ]
 
     def get_key_buffer(self, layer_id: int):
         return self.k_buffer[layer_id - self.start_layer]
