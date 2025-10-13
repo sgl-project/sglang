@@ -3,10 +3,11 @@
 set -euxo pipefail
 
 IS_BLACKWELL=${IS_BLACKWELL:-0}
+RUN_DEEPSEEK_V32=${RUN_DEEPSEEK_V32:-0}
 CU_VERSION="cu129"
 
 if [ "$CU_VERSION" = "cu130" ]; then
-    NVRTC_SPEC="nvidia-cuda-nvrtc>=13,<14"
+    NVRTC_SPEC="nvidia-cuda-nvrtc"
 else
     NVRTC_SPEC="nvidia-cuda-nvrtc-cu12"
 fi
@@ -74,7 +75,31 @@ if [ "$IS_BLACKWELL" != "1" ]; then
     $PIP_CMD install -e lmms-eval/ $PIP_INSTALL_SUFFIX
 
     # Install xformers
-    $PIP_CMD install xformers --index-url https://download.pytorch.org/whl/${CU_VERSION} --no-deps $PIP_INSTALL_SUFFIX --force-reinstall
+    $PIP_CMD install xformers --index-url https://download.pytorch.org/whl/${CU_VERSION} --no-deps $PIP_INSTALL_SUFFIX
+fi
+
+# Install dependencies for deepseek-v3.2
+if [ "$RUN_DEEPSEEK_V32" = "1" ]; then
+    # Install flashmla
+    FLASHMLA_COMMIT="1408756a88e52a25196b759eaf8db89d2b51b5a1"
+    FLASH_MLA_DISABLE_SM100="0"
+    if [ "$IS_BLACKWELL" != "1" ]; then
+        FLASH_MLA_DISABLE_SM100="1"
+    fi
+    git clone https://github.com/deepseek-ai/FlashMLA.git flash-mla
+    cd flash-mla
+    git checkout ${FLASHMLA_COMMIT}
+    git submodule update --init --recursive
+    FLASH_MLA_DISABLE_SM100=${FLASH_MLA_DISABLE_SM100} $PIP_CMD install -v . $PIP_INSTALL_SUFFIX --no-build-isolation
+    cd ..
+
+    # Install fast-hadamard-transform
+    FAST_HADAMARD_TRANSFORM_COMMIT="7fd811c2b47f63b0b08d2582619f939e14dad77c"
+    git clone https://github.com/Dao-AILab/fast-hadamard-transform
+    cd fast-hadamard-transform
+    git checkout ${FAST_HADAMARD_TRANSFORM_COMMIT}
+    $PIP_CMD install . $PIP_INSTALL_SUFFIX --no-build-isolation
+    cd ..
 fi
 
 # Show current packages

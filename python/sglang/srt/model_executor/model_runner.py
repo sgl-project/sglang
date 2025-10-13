@@ -648,7 +648,8 @@ class ModelRunner:
                     // (self.tp_size // self.moe_ep_size)
                 ) % weight_block_size_n != 0:
                     raise ValueError(
-                        f"For qwen3-vl-fp8 models, please make sure ({text_config.moe_intermediate_size=} // ({self.tp_size=} // {self.moe_ep_size=})) % {weight_block_size_n=} == 0"
+                        f"For qwen3-vl-fp8 models, please make sure ({text_config.moe_intermediate_size=} // ({self.tp_size=} // {self.moe_ep_size=})) % {weight_block_size_n=} == 0. "
+                        f"You can fix this by using arguments such as `--tp-size 8 --ep-size 8`"
                     )
 
     def init_torch_distributed(self):

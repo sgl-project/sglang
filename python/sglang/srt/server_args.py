@@ -804,7 +804,7 @@ class ServerArgs:
 
         hf_config = self.get_hf_config()
         model_arch = hf_config.architectures[0]
-        if model_arch in ["DeepseekV3ForCausalLM"]:
+        if model_arch in ["DeepseekV3ForCausalLM"] and not is_deepseek_nsa(hf_config):
             if is_cuda() and is_sm100_supported():
                 if (
                     self.attention_backend is None
