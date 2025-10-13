@@ -240,7 +240,7 @@ class RadixCache(BasePrefixCache):
         self._record_all_cleared_event()
 
     def match_prefix(
-        self, key: RadixKey, align_split_size: bool = True, **kwargs
+        self, key: RadixKey, is_cache_unfinished: bool = False, **kwargs
     ) -> MatchResult:
         """Find the longest cached prefix of ``key`` in the radix tree.
 
@@ -303,9 +303,8 @@ class RadixCache(BasePrefixCache):
             return empty_match_result()
 
         value, last_node = self._match_prefix_helper(
-            self.root_node, key, align_split_size=align_split_size
+            self.root_node, key, is_cache_unfinished=is_cache_unfinished
         )
-        value, last_node = self._match_prefix_helper(self.root_node, key)
         if value:
             value = torch.cat(value)
         else:
@@ -429,7 +428,7 @@ class RadixCache(BasePrefixCache):
         # The prefix indices could be updated, reuse it
         new_indices, new_last_node, _, _ = self.match_prefix(
             RadixKey(token_ids=page_aligned_token_ids, extra_key=req.extra_key),
-            align_split_size=False,
+            is_cache_unfinished=True,
         )
         self.req_to_token_pool.write(
             (req.req_pool_idx, slice(old_prefix_len, len(new_indices))),
@@ -546,15 +545,17 @@ class RadixCache(BasePrefixCache):
     ##### Internal Helper Functions #####
 
     def _match_prefix_helper(
-        self, node: TreeNode, key: RadixKey, align_split_size: bool = True
+        self, node: TreeNode, key: RadixKey, is_cache_unfinished: bool
     ):
         node.last_access_time = time.monotonic()
 
         child_key = self.get_child_key_fn(key)
 
         value = []
-        match_history = [node] if align_split_size else None
-        align_split_size = align_split_size and self.enable_deterministic_inference
+        match_history = [node] if not is_cache_unfinished else None
+        align_split_size = (
+            not is_cache_unfinished and self.enable_deterministic_inference
+        )
 
         if align_split_size and len(key) < self.split_size:
             # fast path: directly return the root node if the split point is 0
