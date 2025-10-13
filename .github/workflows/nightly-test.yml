@@ -62,7 +62,7 @@ jobs:
 
   nightly-test-eval-vlms:
     if: github.repository == 'sgl-project/sglang'
-    runs-on: 1-gpu-runner
+    runs-on: 2-gpu-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -79,7 +79,7 @@ jobs:
 
   nightly-test-perf-vlms:
     if: github.repository == 'sgl-project/sglang'
-    runs-on: 1-gpu-runner
+    runs-on: 2-gpu-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
