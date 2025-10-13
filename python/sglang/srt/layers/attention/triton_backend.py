@@ -424,6 +424,7 @@ class TritonAttnBackend(AttentionBackend):
         max_bs: int,
         max_num_tokens: int,
         kv_indices_buf: Optional[torch.Tensor] = None,
+        cuda_graph_num_kv_splits_buf: Optional[torch.Tensor] = None,
     ):
         self.cuda_graph_attn_logits = torch.zeros(
             (max_num_tokens, self.num_head, self.max_kv_splits, self.v_head_dim),
@@ -435,9 +436,17 @@ class TritonAttnBackend(AttentionBackend):
             dtype=torch.float32,
             device=self.device,
         )
-        self.cuda_graph_num_kv_splits = torch.full(
-            (max_num_tokens,), self.max_kv_splits, dtype=torch.int32, device=self.device
-        )
+
+        if cuda_graph_num_kv_splits_buf is None:
+            self.cuda_graph_num_kv_splits = torch.full(
+                (max_num_tokens,),
+                self.max_kv_splits,
+                dtype=torch.int32,
+                device=self.device,
+            )
+        else:
+            self.cuda_graph_num_kv_splits = cuda_graph_num_kv_splits_buf
+
         if kv_indices_buf is None:
             self.cuda_graph_kv_indices = torch.zeros(
                 (max_num_tokens * self.max_context_len),
@@ -684,11 +693,7 @@ class TritonAttnBackend(AttentionBackend):
                     )
 
             else:
-                # NOTE: Multi-step's attention backends use the slice of
-                # - kv_indptr buffer (cuda graph and non-cuda graph)
-                # - kv_indices buffer (cuda graph only)
-                # So we don't need a extra copy here.
-                num_token = spec_info.kv_indptr.shape[0] - 1
+                assert False, "Multi-step cuda graph init is not done here."
             self.get_num_kv_splits(num_kv_splits[:num_token], seq_lens[:bs])
 
         elif forward_mode.is_target_verify():
@@ -961,6 +966,9 @@ class TritonMultiStepDraftBackend:
             self.page_size,
         )
 
+        if call_fn is None:
+            return
+
         for i in range(self.speculative_num_steps):
             forward_batch.spec_info.kv_indptr = self.kv_indptr[i, : bs + 1]
             forward_batch.spec_info.kv_indices = kv_indices_buffer[i][
@@ -995,9 +1003,18 @@ class TritonMultiStepDraftBackend:
             dtype=torch.int64,
             device=self.device,
         )
+        self.cuda_graph_num_kv_splits = torch.full(
+            (max_num_tokens,),
+            self.attn_backends[0].max_kv_splits,
+            dtype=torch.int32,
+            device=self.device,
+        )
         for i in range(self.speculative_num_steps):
             self.attn_backends[i].init_cuda_graph_state(
-                max_bs, max_num_tokens, kv_indices_buf=self.cuda_graph_kv_indices[i]
+                max_bs,
+                max_num_tokens,
+                kv_indices_buf=self.cuda_graph_kv_indices[i],
+                cuda_graph_num_kv_splits_buf=self.cuda_graph_num_kv_splits,
             )
 
     def init_forward_metadata_capture_cuda_graph(self, forward_batch: ForwardBatch):
@@ -1017,19 +1034,19 @@ class TritonMultiStepDraftBackend:
     def init_forward_metadata_replay_cuda_graph(
         self, forward_batch: ForwardBatch, bs: int
     ):
-        def call_fn(i, forward_batch):
-            self.attn_backends[i].init_forward_metadata_replay_cuda_graph(
-                bs,
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                seq_lens_sum=-1,
-                encoder_lens=None,
-                forward_mode=ForwardMode.DECODE,
-                spec_info=forward_batch.spec_info,
-                seq_lens_cpu=None,
-            )
+        self.common_template(forward_batch, None, None)
 
-        self.common_template(forward_batch, None, call_fn)
+        # NOTE: Multi-step's attention backends use the slice of
+        # - kv_indptr buffer (cuda graph and non-cuda graph)
+        # - kv_indices buffer (cuda graph only)
+        # So we don't need to assign the KV indices inside the attention backend.
+
+        # Compute num_kv_splits only once
+        num_token = forward_batch.batch_size * self.topk
+        self.attn_backends[-1].get_num_kv_splits(
+            self.attn_backends[-1].cuda_graph_num_kv_splits[:num_token],
+            forward_batch.seq_lens[:bs],
+        )
 
 
 @triton.jit
