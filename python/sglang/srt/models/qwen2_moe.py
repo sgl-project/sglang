@@ -25,12 +25,14 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
+    get_moe_expert_parallel_world_size,
     get_pp_group,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
@@ -50,6 +52,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
@@ -82,6 +85,8 @@ class Qwen2MoeMLP(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         reduce_results: bool = True,
         prefix: str = "",
+        tp_rank: Optional[int] = None,
+        tp_size: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
@@ -90,6 +95,8 @@ class Qwen2MoeMLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("gate_up_proj", prefix),
+            tp_rank=tp_rank,
+            tp_size=tp_size,
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -98,6 +105,8 @@ class Qwen2MoeMLP(nn.Module):
             quant_config=quant_config,
             reduce_results=reduce_results,
             prefix=add_prefix("down_proj", prefix),
+            tp_rank=tp_rank,
+            tp_size=tp_size,
         )
         if hidden_act != "silu":
             raise ValueError(
@@ -146,7 +155,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self.experts = get_moe_impl_class(quant_config)(
             layer_id=self.layer_id,
             top_k=config.num_experts_per_tok,
-            num_experts=config.num_experts,
+            num_experts=config.num_experts
+            + global_server_args_dict["ep_num_redundant_experts"],
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             quant_config=quant_config,
@@ -168,10 +178,30 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 quant_config=quant_config,
                 reduce_results=False,
                 prefix=add_prefix("shared_expert", prefix),
+                **(
+                    dict(tp_rank=0, tp_size=1)
+                    if get_moe_a2a_backend().is_deepep()
+                    else {}
+                ),
             )
         else:
             self.shared_expert = None
         self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
+
+        if get_moe_a2a_backend().is_deepep():
+            # TODO: we will support tp < ep in the future
+            self.ep_size = get_moe_expert_parallel_world_size()
+            self.num_experts = (
+                config.num_experts + global_server_args_dict["ep_num_redundant_experts"]
+            )
+            self.top_k = config.num_experts_per_tok
+
+    def get_moe_weights(self):
+        return [
+            x.data
+            for name, x in self.experts.named_parameters()
+            if name not in ["correction_bias"]
+        ]
 
     def _forward_shared_experts(self, hidden_states: torch.Tensor):
         shared_output = None
@@ -182,6 +212,36 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_output
                 )
         return shared_output
+
+    def _forward_deepep(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
+        shared_output = None
+        if hidden_states.shape[0] > 0:
+            # router_logits: (num_tokens, n_experts)
+            router_logits, _ = self.gate(hidden_states)
+            shared_output = self._forward_shared_experts(hidden_states)
+            topk_weights, topk_idx, _ = self.topk(
+                hidden_states,
+                router_logits,
+                num_token_non_padded=forward_batch.num_token_non_padded,
+                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                    layer_id=self.layer_id,
+                ),
+            )
+        else:
+            topk_weights, topk_idx, _ = self.topk.empty_topk_output(
+                hidden_states.device
+            )
+        final_hidden_states = self.experts(
+            hidden_states=hidden_states,
+            topk_idx=topk_idx,
+            topk_weights=topk_weights,
+            forward_batch=forward_batch,
+        )
+
+        if shared_output is not None:
+            final_hidden_states.add_(shared_output)
+
+        return final_hidden_states
 
     def _forward_router_experts(self, hidden_states: torch.Tensor):
         # router_logits: (num_tokens, n_experts)
@@ -212,6 +272,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
     ) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
+
+        if get_moe_a2a_backend().is_deepep():
+            return self._forward_deepep(hidden_states, forward_batch)
 
         DUAL_STREAM_TOKEN_THRESHOLD = 1024
         if (

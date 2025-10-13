@@ -5,6 +5,7 @@ import copy
 import logging
 import os
 import time
+import uuid
 from collections import deque
 from typing import (
     TYPE_CHECKING,
@@ -24,8 +25,12 @@ import zmq
 from sglang.srt.managers.io_struct import (
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
+    CloseSessionReqInput,
+    DestroyWeightsUpdateGroupReqInput,
+    DestroyWeightsUpdateGroupReqOutput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
+    ExpertDistributionReqType,
     FlushCacheReqInput,
     FlushCacheReqOutput,
     GetInternalStateReq,
@@ -40,8 +45,9 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqOutput,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
-    LoRAUpdateResult,
+    LoRAUpdateOutput,
     MultiTokenizerWrapper,
+    OpenSessionReqInput,
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
@@ -151,6 +157,9 @@ class TokenizerCommunicatorMixin:
         self.init_weights_update_group_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.destroy_weights_update_group_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.update_weights_from_distributed_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -213,6 +222,10 @@ class TokenizerCommunicatorMixin:
                     self.init_weights_update_group_communicator.handle_recv,
                 ),
                 (
+                    DestroyWeightsUpdateGroupReqOutput,
+                    self.destroy_weights_update_group_communicator.handle_recv,
+                ),
+                (
                     UpdateWeightsFromDistributedReqOutput,
                     self.update_weights_from_distributed_communicator.handle_recv,
                 ),
@@ -273,7 +286,7 @@ class TokenizerCommunicatorMixin:
                     self.expert_distribution_communicator.handle_recv,
                 ),
                 (
-                    LoRAUpdateResult,
+                    LoRAUpdateOutput,
                     self.update_lora_adapter_communicator.handle_recv,
                 ),
                 (
@@ -332,15 +345,18 @@ class TokenizerCommunicatorMixin:
 
     async def start_expert_distribution_record(self: TokenizerManager):
         self.auto_create_handle_loop()
-        await self.expert_distribution_communicator(ExpertDistributionReq.START_RECORD)
+        req = ExpertDistributionReq(action=ExpertDistributionReqType.START_RECORD)
+        await self.expert_distribution_communicator(req)
 
     async def stop_expert_distribution_record(self: TokenizerManager):
         self.auto_create_handle_loop()
-        await self.expert_distribution_communicator(ExpertDistributionReq.STOP_RECORD)
+        req = ExpertDistributionReq(action=ExpertDistributionReqType.STOP_RECORD)
+        await self.expert_distribution_communicator(req)
 
     async def dump_expert_distribution_record(self: TokenizerManager):
         self.auto_create_handle_loop()
-        await self.expert_distribution_communicator(ExpertDistributionReq.DUMP_RECORD)
+        req = ExpertDistributionReq(action=ExpertDistributionReqType.DUMP_RECORD)
+        await self.expert_distribution_communicator(req)
 
     async def init_weights_update_group(
         self: TokenizerManager,
@@ -352,6 +368,18 @@ class TokenizerCommunicatorMixin:
             self.server_args.dp_size == 1
         ), "dp_size must be 1 for init parameter update group"
         result = (await self.init_weights_update_group_communicator(obj))[0]
+        return result.success, result.message
+
+    async def destroy_weights_update_group(
+        self,
+        obj: DestroyWeightsUpdateGroupReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        self.auto_create_handle_loop()
+        assert (
+            self.server_args.dp_size == 1
+        ), "dp_size must be 1 for destroy parameter update group"
+        result = (await self.destroy_weights_update_group_communicator(obj))[0]
         return result.success, result.message
 
     async def update_weights_from_distributed(
@@ -598,3 +626,81 @@ class TokenizerCommunicatorMixin:
     async def get_load(self: TokenizerManager) -> List[GetLoadReqOutput]:
         req = GetLoadReqInput()
         return await self.get_load_communicator(req)
+
+    async def open_session(
+        self, obj: OpenSessionReqInput, request: Optional[fastapi.Request] = None
+    ):
+        self.auto_create_handle_loop()
+
+        if obj.session_id is None:
+            obj.session_id = uuid.uuid4().hex
+        elif obj.session_id in self.session_futures:
+            return None
+
+        if self.server_args.tokenizer_worker_num > 1:
+            obj = MultiTokenizerWrapper(self.worker_id, obj)
+        self.send_to_scheduler.send_pyobj(obj)
+
+        self.session_futures[obj.session_id] = asyncio.Future()
+        session_id = await self.session_futures[obj.session_id]
+        del self.session_futures[obj.session_id]
+        return session_id
+
+    async def close_session(
+        self, obj: CloseSessionReqInput, request: Optional[fastapi.Request] = None
+    ):
+        await self.send_to_scheduler.send_pyobj(obj)
+
+    def get_log_request_metadata(self):
+        max_length = None
+        skip_names = None
+        out_skip_names = None
+        if self.log_requests:
+            if self.log_requests_level == 0:
+                max_length = 1 << 30
+                skip_names = set(
+                    [
+                        "text",
+                        "input_ids",
+                        "input_embeds",
+                        "image_data",
+                        "audio_data",
+                        "lora_path",
+                        "sampling_params",
+                    ]
+                )
+                out_skip_names = set(
+                    [
+                        "text",
+                        "output_ids",
+                        "embedding",
+                    ]
+                )
+            elif self.log_requests_level == 1:
+                max_length = 1 << 30
+                skip_names = set(
+                    [
+                        "text",
+                        "input_ids",
+                        "input_embeds",
+                        "image_data",
+                        "audio_data",
+                        "lora_path",
+                    ]
+                )
+                out_skip_names = set(
+                    [
+                        "text",
+                        "output_ids",
+                        "embedding",
+                    ]
+                )
+            elif self.log_requests_level == 2:
+                max_length = 2048
+            elif self.log_requests_level == 3:
+                max_length = 1 << 30
+            else:
+                raise ValueError(
+                    f"Invalid --log-requests-level: {self.log_requests_level=}"
+                )
+        return max_length, skip_names, out_skip_names

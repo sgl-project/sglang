@@ -1,36 +1,125 @@
 use async_trait::async_trait;
+use serde_json::Value;
 
-use super::json_parser::JsonParser;
+use crate::protocols::spec::Tool;
+
 use crate::tool_parser::{
-    errors::ToolParserResult,
-    state::ParseState,
+    errors::{ParserError, ParserResult},
+    parsers::helpers,
+    partial_json::PartialJson,
     traits::ToolParser,
-    types::{StreamResult, TokenConfig, ToolCall},
+    types::{FunctionCall, StreamingParseResult, ToolCall},
 };
 
 /// Llama 3.2 format parser for tool calls
 ///
 /// Handles the Llama 3.2 specific format:
-/// `<|python_tag|>{"name": "func", "arguments": {...}}`
+/// `<|python_tag|>{"name": "func", "parameters": {...}}`
 ///
 /// Also supports plain JSON without the python_tag prefix
 pub struct LlamaParser {
-    /// Underlying JSON parser with Llama-specific configuration
-    json_parser: JsonParser,
+    /// Parser for handling incomplete JSON during streaming
+    partial_json: PartialJson,
+
+    /// Buffer for accumulating incomplete patterns across chunks
+    buffer: String,
+
+    /// Stores complete tool call info (name and arguments) for each tool being parsed
+    prev_tool_call_arr: Vec<Value>,
+
+    /// Index of currently streaming tool call (-1 means no active tool)
+    current_tool_id: i32,
+
+    /// Flag for whether current tool's name has been sent to client
+    current_tool_name_sent: bool,
+
+    /// Tracks raw JSON string content streamed to client for each tool's arguments
+    streamed_args_for_tool: Vec<String>,
+
+    /// Token configuration
+    bot_token: &'static str,
+    tool_call_separator: &'static str,
 }
 
 impl LlamaParser {
     /// Create a new Llama parser
     pub fn new() -> Self {
-        // Configure JSON parser with Llama's python_tag token
-        // Note: No end token for python_tag format
-        let json_parser = JsonParser::with_config(TokenConfig {
-            start_tokens: vec!["<|python_tag|>".to_string()],
-            end_tokens: vec!["".to_string()], // Empty end token
-            separator: ";".to_string(), // Llama uses semicolon for multiple calls (though not well supported)
-        });
+        Self {
+            partial_json: PartialJson::default(),
+            buffer: String::new(),
+            prev_tool_call_arr: Vec::new(),
+            current_tool_id: -1,
+            current_tool_name_sent: false,
+            streamed_args_for_tool: Vec::new(),
+            bot_token: "<|python_tag|>",
+            tool_call_separator: ";",
+        }
+    }
 
-        Self { json_parser }
+    /// Extract content after python_tag token
+    fn extract_content_after_python_tag(&self, text: &str) -> Option<(String, String)> {
+        const PYTHON_TAG: &str = "<|python_tag|>";
+
+        if let Some(tag_pos) = text.find(PYTHON_TAG) {
+            let normal_text = text[..tag_pos].to_string();
+            let json_content = text[tag_pos + PYTHON_TAG.len()..].to_string();
+            Some((normal_text, json_content))
+        } else {
+            None
+        }
+    }
+
+    /// Parse a single JSON object into a ToolCall (Llama format: name + parameters)
+    fn parse_single_object(&self, obj: &Value) -> ParserResult<Option<ToolCall>> {
+        // Llama format only: {"name": "function_name", "parameters": {...}}
+        let name = obj.get("name").and_then(|v| v.as_str());
+
+        if let Some(name) = name {
+            // Llama uses "parameters" key
+            let empty_obj = Value::Object(serde_json::Map::new());
+            let parameters = obj.get("parameters").unwrap_or(&empty_obj);
+
+            // Convert parameters to JSON string
+            let arguments = serde_json::to_string(parameters)
+                .map_err(|e| ParserError::ParsingFailed(e.to_string()))?;
+
+            Ok(Some(ToolCall {
+                function: FunctionCall {
+                    name: name.to_string(),
+                    arguments,
+                },
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Parse semicolon-separated JSON objects
+    fn parse_semicolon_separated(&self, content: &str) -> ParserResult<Vec<ToolCall>> {
+        let mut all_tools = Vec::new();
+
+        // Split by semicolon and parse each JSON object
+        for part in content.split(';') {
+            let trimmed = part.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            // Try to parse this part as a single JSON object
+            match serde_json::from_str::<Value>(trimmed) {
+                Ok(value) => {
+                    if let Some(tool) = self.parse_single_object(&value)? {
+                        all_tools.push(tool);
+                    }
+                }
+                Err(e) => {
+                    // Skip invalid JSON parts in semicolon-separated list
+                    tracing::warn!("Failed to parse tool call: {}", e);
+                }
+            }
+        }
+
+        Ok(all_tools)
     }
 }
 
@@ -42,115 +131,114 @@ impl Default for LlamaParser {
 
 #[async_trait]
 impl ToolParser for LlamaParser {
-    async fn parse_complete(&self, text: &str) -> ToolParserResult<Vec<ToolCall>> {
-        // First try with the configured python_tag parser
-        let result = self.json_parser.parse_complete(text).await?;
+    async fn parse_complete(&self, text: &str) -> ParserResult<(String, Vec<ToolCall>)> {
+        // Extract normal text and JSON content
+        let (normal_text, json_content) =
+            if let Some((normal, json)) = self.extract_content_after_python_tag(text) {
+                (normal, json)
+            } else if text.trim_start().starts_with('{') {
+                (String::new(), text.to_string())
+            } else {
+                // No JSON structure found
+                return Ok((text.to_string(), vec![]));
+            };
 
-        if !result.is_empty() {
-            return Ok(result);
+        // Parse the JSON content (may contain semicolon-separated objects)
+        let tools = if json_content.contains(';') {
+            self.parse_semicolon_separated(&json_content)?
+        } else {
+            // Try single JSON object
+            let parsed = serde_json::from_str::<Value>(json_content.trim())
+                .map_err(|e| ParserError::ParsingFailed(e.to_string()))
+                .and_then(|v| {
+                    self.parse_single_object(&v)
+                        .map(|opt| opt.map_or_else(Vec::new, |tool| vec![tool]))
+                });
+
+            parsed.unwrap_or_else(|e| {
+                tracing::warn!("Failed to parse tool call: {:?}", e);
+                vec![]
+            })
+        };
+
+        // If we couldn't parse any tools, return the original text
+        if tools.is_empty() {
+            return Ok((text.to_string(), vec![]));
         }
 
-        // If no results and text starts with '{', try plain JSON
-        if text.trim_start().starts_with('{') {
-            // Create a temporary plain JSON parser
-            let plain_parser = JsonParser::new();
-            return plain_parser.parse_complete(text).await;
-        }
-
-        Ok(vec![])
+        Ok((normal_text, tools))
     }
 
     async fn parse_incremental(
-        &self,
+        &mut self,
         chunk: &str,
-        state: &mut ParseState,
-    ) -> ToolParserResult<StreamResult> {
-        // Try with the python_tag parser first
-        let result = self.json_parser.parse_incremental(chunk, state).await?;
+        tools: &[Tool],
+    ) -> ParserResult<StreamingParseResult> {
+        // Append new text to buffer
+        self.buffer.push_str(chunk);
+        let current_text = &self.buffer.clone();
 
-        // If we get Incomplete and buffer starts with '{', might be plain JSON
-        if matches!(result, StreamResult::Incomplete) && state.buffer.trim_start().starts_with('{')
-        {
-            // Check if we have python_tag in the buffer
-            if !state.buffer.contains("<|python_tag|>") {
-                // Likely plain JSON, create temporary parser
-                let plain_parser = JsonParser::new();
-                return plain_parser.parse_incremental("", state).await;
+        // Check if current_text has tool_call
+        let has_tool_start = self.has_tool_markers(current_text)
+            || (self.current_tool_id >= 0 && current_text.starts_with(self.tool_call_separator));
+
+        if !has_tool_start {
+            // Only clear buffer if we're sure no tool call is starting
+            if helpers::ends_with_partial_token(&self.buffer, self.bot_token).is_none() {
+                let normal_text = self.buffer.clone();
+                self.buffer.clear();
+
+                return Ok(StreamingParseResult {
+                    normal_text,
+                    calls: vec![],
+                });
+            } else {
+                // Might be partial bot_token, keep buffering
+                return Ok(StreamingParseResult::default());
             }
         }
 
-        Ok(result)
+        // Build tool indices
+        let tool_indices = helpers::get_tool_indices(tools);
+
+        // Determine start index for JSON parsing
+        let start_idx = if let Some(pos) = current_text.find(self.bot_token) {
+            pos + self.bot_token.len()
+        } else if self.current_tool_id >= 0 && current_text.starts_with(self.tool_call_separator) {
+            self.tool_call_separator.len()
+        } else {
+            0
+        };
+
+        helpers::handle_json_tool_streaming(
+            current_text,
+            start_idx,
+            &mut self.partial_json,
+            &tool_indices,
+            &mut self.buffer,
+            &mut self.current_tool_id,
+            &mut self.current_tool_name_sent,
+            &mut self.streamed_args_for_tool,
+            &mut self.prev_tool_call_arr,
+        )
     }
 
-    fn detect_format(&self, text: &str) -> bool {
+    fn has_tool_markers(&self, text: &str) -> bool {
         // Llama format if contains python_tag or starts with JSON object
-        text.contains("<|python_tag|>")
-            || (text.trim_start().starts_with('{')
-                && (text.contains(r#""name""#) || text.contains(r#""function""#)))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_parse_with_python_tag() {
-        let parser = LlamaParser::new();
-        let input = r#"<|python_tag|>{"name": "search", "arguments": {"query": "weather"}}"#;
-
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.name, "search");
-        assert!(result[0].function.arguments.contains("weather"));
+        text.contains("<|python_tag|>") || text.trim_start().starts_with('{')
     }
 
-    #[tokio::test]
-    async fn test_parse_plain_json() {
-        let parser = LlamaParser::new();
-        let input = r#"{"name": "calculate", "arguments": {"x": 5, "y": 10}}"#;
-
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.name, "calculate");
+    fn get_unstreamed_tool_args(&self) -> Option<Vec<crate::tool_parser::types::ToolCallItem>> {
+        helpers::get_unstreamed_args(&self.prev_tool_call_arr, &self.streamed_args_for_tool)
     }
 
-    #[tokio::test]
-    async fn test_parse_with_text_before() {
-        let parser = LlamaParser::new();
-        let input = r#"Let me help you with that. <|python_tag|>{"name": "get_time", "arguments": {"timezone": "UTC"}}"#;
-
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.name, "get_time");
-    }
-
-    #[test]
-    fn test_detect_format() {
-        let parser = LlamaParser::new();
-
-        assert!(parser.detect_format(r#"<|python_tag|>{"name": "test"}"#));
-        assert!(parser.detect_format(r#"{"name": "test", "arguments": {}}"#));
-        assert!(!parser.detect_format("plain text"));
-        assert!(!parser.detect_format(r#"{"key": "value"}"#)); // No name field
-    }
-
-    #[tokio::test]
-    async fn test_single_call_with_semicolon() {
-        let parser = LlamaParser::new();
-        // Note: Llama 3.2 doesn't handle multiple calls well
-        // Test that we can at least parse a single call followed by semicolon
-        let input = r#"<|python_tag|>{"name": "func1", "arguments": {"x": 1}};"#;
-
-        let result = parser.parse_complete(input).await.unwrap();
-
-        // We expect this to either parse the first JSON object or fail gracefully
-        // Since the semicolon makes it invalid JSON, it will likely return empty
-        // This is acceptable as Llama 3.2 doesn't reliably support parallel calls
-
-        // If it parses anything, it should be func1
-        if !result.is_empty() {
-            assert_eq!(result[0].function.name, "func1");
-        }
+    fn reset(&mut self) {
+        helpers::reset_parser_state(
+            &mut self.buffer,
+            &mut self.prev_tool_call_arr,
+            &mut self.current_tool_id,
+            &mut self.current_tool_name_sent,
+            &mut self.streamed_args_for_tool,
+        );
     }
 }
