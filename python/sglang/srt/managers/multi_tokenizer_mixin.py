@@ -252,6 +252,11 @@ def _handle_output_by_index(output, i):
             spec_verify_ct=(
                 [output.spec_verify_ct[i]] if len(output.spec_verify_ct) > i else None
             ),
+            spec_accepted_tokens=(
+                [output.spec_accepted_tokens[i]]
+                if len(output.spec_accepted_tokens) > i
+                else None
+            ),
             input_token_logprobs_val=(
                 [output.input_token_logprobs_val[i]]
                 if output.input_token_logprobs_val
