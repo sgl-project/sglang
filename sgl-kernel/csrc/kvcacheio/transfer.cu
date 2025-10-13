@@ -112,10 +112,11 @@ __device__ __forceinline__ T* get_global_offset_phf(
     int64_t head_fragment_id,
     int64_t page_size) {
   // page head first
-  return base + page_id / page_size * page_size * page_dim
-         + page_dim / head_fragment_num * head_fragment_id * page_size
-         + page_id % page_size * page_dim / head_fragment_num
-         + layer_id * item_size_bytes / head_fragment_num;
+  return base;
+//          + page_id / page_size * page_size * page_dim
+//          + page_dim / head_fragment_num * head_fragment_id * page_size
+//          + page_id % page_size * page_dim / head_fragment_num
+//          + layer_id * item_size_bytes / head_fragment_num;
 }
 
 template <auto SrcOffsetFn, auto DstOffsetFn>
@@ -154,11 +155,11 @@ __global__ void transfer_flex_tp_kernel_impl(
     // Loop over layers if necessary
     for (int64_t layer_id = start_layer_id; layer_id < start_layer_id + num_layers_to_process; ++layer_id) {
       for (int64_t head_fragment_id = 0; head_fragment_id < head_fragment_num; ++head_fragment_id) {
-        const char* src_ptr = SrcOffsetFn(
+        const char* src_k_ptr = SrcOffsetFn(
             static_cast<const char*>(src_k), src_k_layer_tbl, layer_id, src_layout_dim, src_page_id, item_size_bytes, head_fragment_num, head_fragment_id, page_size);
-        char* dst_ptr = DstOffsetFn(
+        char* dst_k_ptr = DstOffsetFn(
             static_cast<char*>(dst_k), dst_k_layer_tbl, layer_id, dst_layout_dim, dst_page_id, item_size_bytes, head_fragment_num, head_fragment_id, page_size);
-        transfer_item_warp(lane_id, src_ptr, dst_ptr, item_size_bytes / head_fragment_num);
+        transfer_item_warp(lane_id, src_k_ptr, dst_k_ptr, item_size_bytes / head_fragment_num);
         const char* src_v_ptr = SrcOffsetFn(
             static_cast<const char*>(src_v), src_v_layer_tbl, layer_id, src_layout_dim, src_page_id, item_size_bytes, head_fragment_num, head_fragment_id, page_size);
         char* dst_v_ptr = DstOffsetFn(
@@ -490,7 +491,7 @@ void transfer_kv_all_layer_lf_phf(
     int64_t head_num,
     int64_t block_quota,
     int64_t num_warps_per_block) {
-//   TORCH_CHECK(num_layers == src_k_layers.size(0), "Number of layers in source k tensor does not match num_layers");
+  TORCH_CHECK(num_layers == src_k_layers.size(0), "Number of layers in source k tensor does not match num_layers");
   at::Tensor empty;
   transfer_kv_launcher<get_global_offset_lf_tbl_hfrg<const char>, get_global_offset_phf<char>, false, true>(
       empty,
