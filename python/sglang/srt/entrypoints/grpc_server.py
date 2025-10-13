@@ -1069,6 +1069,10 @@ def _execute_grpc_server_warmup(
         logger.error(error_msg)
         if pipe_finish_writer is not None:
             pipe_finish_writer.send(error_msg)
+        try:
+            channel.close()
+        except Exception:
+            pass
         kill_process_tree(os.getpid())
         return False
 
