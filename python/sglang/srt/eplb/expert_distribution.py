@@ -16,21 +16,20 @@ from __future__ import annotations
 
 import logging
 import math
-import os
 import time
 from abc import ABC
 from collections import deque
 from contextlib import contextmanager
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple, Type
 
 import einops
 import torch
 import torch.distributed
 
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import Withable, get_bool_env_var, is_npu
+from sglang.srt.utils import Withable, is_npu
 
 _is_npu = is_npu()
 
@@ -839,7 +838,7 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
 
 
 def _dump_to_file(name, data):
-    save_dir = Path(os.environ.get("SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR", "/tmp"))
+    save_dir = envs.SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR.get()
     path_output = save_dir / name
     logger.info(f"Write expert distribution to {path_output}")
     if not save_dir.exists():

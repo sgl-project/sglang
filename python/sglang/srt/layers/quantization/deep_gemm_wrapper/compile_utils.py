@@ -7,11 +7,12 @@ from typing import Dict, List, Tuple
 import torch
 from tqdm import tqdm
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.deep_gemm_wrapper.configurer import (
     ENABLE_JIT_DEEPGEMM,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import ceil_div, get_bool_env_var, get_int_env_var
+from sglang.srt.utils import ceil_div, get_bool_env_var
 
 logger = logging.getLogger(__name__)
 
@@ -20,12 +21,9 @@ if ENABLE_JIT_DEEPGEMM:
 
 
 _BUILTIN_M_LIST = list(range(1, 1024 * 16 + 1))
-_ENABLE_JIT_DEEPGEMM_PRECOMPILE = get_bool_env_var(
-    "SGL_JIT_DEEPGEMM_PRECOMPILE", "true"
-)
+_ENABLE_JIT_DEEPGEMM_PRECOMPILE = envs.SGLANG_JIT_DEEPGEMM_PRECOMPILE.get()
 _DO_COMPILE_ALL = True
 _IS_FIRST_RANK_ON_NODE = get_bool_env_var("SGL_IS_FIRST_RANK_ON_NODE", "true")
-_COMPILE_WORKERS = get_int_env_var("SGL_JIT_DEEPGEMM_COMPILE_WORKERS", 4)
 _IN_PRECOMPILE_STAGE = get_bool_env_var("SGL_IN_DEEPGEMM_PRECOMPILE_STAGE", "false")
 
 # Force redirect deep_gemm cache_dir

@@ -1,6 +1,7 @@
 import logging
 
-from sglang.srt.utils import get_bool_env_var, get_device_sm, is_blackwell
+from sglang.srt.environ import envs
+from sglang.srt.utils import get_device_sm, is_blackwell
 
 logger = logging.getLogger(__name__)
 
@@ -15,7 +16,7 @@ def _compute_enable_deep_gemm():
     except ImportError:
         return False
 
-    return get_bool_env_var("SGL_ENABLE_JIT_DEEPGEMM", default="true")
+    return envs.SGLANG_ENABLE_JIT_DEEPGEMM.get()
 
 
 ENABLE_JIT_DEEPGEMM = _compute_enable_deep_gemm()
