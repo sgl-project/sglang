@@ -92,10 +92,7 @@ class DPBudget:
 
         # update self.loads
         for new_load in loads:
-            load_idx = new_load.dp_rank
-            self.loads[load_idx].num_reqs = new_load.num_reqs
-            self.loads[load_idx].num_waiting_reqs = new_load.num_waiting_reqs
-            self.loads[load_idx].num_tokens = new_load.num_tokens
+            self.loads[new_load.dp_rank] = new_load
 
         # ready to update budget_queue, load_idx equals to dp_rank
         num_reqs = [load.num_reqs for load in self.loads]
