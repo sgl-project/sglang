@@ -2,8 +2,7 @@ ARG CUDA_VERSION=12.9.1
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04 AS base
 ARG TARGETARCH
 
-# Set --build-arg BLACKWELL=1 to set the right architectures for kernel compilation
-ARG BLACKWELL=0
+ARG GRACE_BLACKWELL=0
 ARG BUILD_TYPE=all
 ARG BRANCH_TYPE=remote
 ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
@@ -118,7 +117,7 @@ RUN set -eux; \
       NVSHMEM_TARBALL="nvshmem_src_cuda12-all-all-${NVSHMEM_VERSION}.tar.gz"; \
     fi; \
     wget "https://developer.download.nvidia.com/compute/redist/nvshmem/${NVSHMEM_VERSION}/source/${NVSHMEM_TARBALL}" && \
-    if [ "$BLACKWELL" = "1" ]; then \
+    if [ "$GRACE_BLACKWELL" = "1" ]; then \
       git clone https://github.com/fzyzcjy/DeepEP.git && \
       cd DeepEP && \
       git checkout 1b14ad661c7640137fcfe93cccb2694ede1220b0 && \
@@ -137,7 +136,7 @@ RUN set -eux; \
 
 # Build and install NVSHMEM
 RUN cd /sgl-workspace/nvshmem && \
-    if [ "$BLACKWELL" = "1" ]; then CUDA_ARCH="90;100;103;120"; else CUDA_ARCH="90"; fi && \
+    if [ "$GRACE_BLACKWELL" = "1" ]; then CUDA_ARCH="90;100;103;120"; else CUDA_ARCH="90"; fi && \
     NVSHMEM_SHMEM_SUPPORT=0 \
     NVSHMEM_UCX_SUPPORT=0 \
     NVSHMEM_USE_NCCL=0 \
