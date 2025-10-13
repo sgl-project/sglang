@@ -262,9 +262,7 @@ class GroupCoordinator:
             # a cpu_group to allow direct coordination between processes through
             # the CPU. The backend is chosen based on `torch_distributed_backend`
             if "mooncake" in torch_distributed_backend:
-                cpu_group = torch.distributed.new_group(
-                    ranks, backend="mooncake-cpu"
-                )
+                cpu_group = torch.distributed.new_group(ranks, backend="mooncake-cpu")
             else:
                 cpu_group = torch.distributed.new_group(
                     ranks, backend="gloo", timeout=gloo_timeout
