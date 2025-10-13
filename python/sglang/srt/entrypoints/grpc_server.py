@@ -22,8 +22,8 @@ from grpc_reflection.v1alpha import reflection
 
 import sglang
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
-from sglang.srt.grpc.grpc_request_manager import GrpcRequestManager
 from sglang.srt.grpc import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
+from sglang.srt.grpc.grpc_request_manager import GrpcRequestManager
 from sglang.srt.managers.data_parallel_controller import (
     run_data_parallel_controller_process,
 )

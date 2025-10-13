@@ -13,9 +13,11 @@ if __name__ == "__main__":
     try:
         if server_args.grpc_mode:
             from sglang.srt.entrypoints.grpc_server import serve_grpc
+
             asyncio.run(serve_grpc(server_args))
         else:
             from sglang.srt.entrypoints.http_server import launch_server
+
             launch_server(server_args)
     finally:
         kill_process_tree(os.getpid(), include_parent=False)
