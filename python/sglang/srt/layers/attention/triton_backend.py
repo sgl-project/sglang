@@ -929,8 +929,14 @@ class TritonMultiStepDraftBackend:
         self.page_size = model_runner.server_args.page_size
 
     def common_template(
-        self, forward_batch: ForwardBatch, kv_indices_buffer: torch.Tensor, call_fn: int
+        self,
+        forward_batch: ForwardBatch,
+        kv_indices_buffer: Optional[torch.Tensor],
+        call_fn: int,
     ):
+        if kv_indices_buffer is None:
+            kv_indices_buffer = self.cuda_graph_kv_indices
+
         num_seqs = forward_batch.batch_size
         bs = self.topk * num_seqs
         seq_lens_sum = forward_batch.seq_lens_sum
@@ -1004,7 +1010,7 @@ class TritonMultiStepDraftBackend:
                 spec_info=forward_batch.spec_info,
             )
 
-        self.common_template(forward_batch, self.cuda_graph_kv_indices, call_fn)
+        self.common_template(forward_batch, None, call_fn)
 
     def init_forward_metadata_replay_cuda_graph(
         self, forward_batch: ForwardBatch, bs: int
@@ -1021,7 +1027,7 @@ class TritonMultiStepDraftBackend:
                 seq_lens_cpu=None,
             )
 
-        self.common_template(forward_batch, self.cuda_graph_kv_indices, call_fn)
+        self.common_template(forward_batch, None, call_fn)
 
 
 @triton.jit
