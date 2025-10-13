@@ -171,6 +171,7 @@ class TpModelWorker:
         # A reference make this class has the same member as TpModelWorkerClient
         self.worker = self
 
+        self.enable_overlap = not server_args.disable_overlap_schedule
         self.hicache_layer_transfer_counter = None
 
     def register_hicache_layer_transfer_counter(self, counter: LayerDoneCounter):
@@ -269,9 +270,18 @@ class TpModelWorker:
                 # Skip sampling and return logits for target forward
                 return batch_result
 
-            if model_worker_batch.delay_sample_launch:
-                batch_result.delay_sample_launch = True
-                batch_result.forward_batch = forward_batch
+            if (
+                self.enable_overlap
+                and model_worker_batch.sampling_info.grammars is not None
+            ):
+
+                def sample_batch_func():
+                    batch_result.next_token_ids = self.model_runner.sample(
+                        logits_output, forward_batch
+                    )
+                    return batch_result
+
+                batch_result.delay_sample_func = sample_batch_func
                 return batch_result
 
             if model_worker_batch.is_prefill_only:

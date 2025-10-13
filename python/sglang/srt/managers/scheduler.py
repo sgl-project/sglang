@@ -212,8 +212,7 @@ class GenerationBatchResult:
 
     # For overlap scheduling
     copy_done: Optional[torch.cuda.Event] = None
-    delay_sample_launch: bool = False
-    forward_batch: Optional[ForwardBatch] = None
+    delay_sample_func: Optional[callable] = None
     future_indices: Optional[FutureIndices] = None
 
     # FIXME(lsyin): maybe move to <BetterPlace> ?
@@ -2209,8 +2208,6 @@ class Scheduler(
                 with self.forward_stream_ctx:
                     self.forward_stream.wait_stream(self.default_stream)
                     self.future_map.resolve_future(model_worker_batch)
-                    if batch.sampling_info.grammars is not None:
-                        model_worker_batch.delay_sample_launch = True
                     batch_result = self.model_worker.forward_batch_generation(
                         model_worker_batch
                     )
@@ -2218,7 +2215,7 @@ class Scheduler(
                     batch_result.copy_done = torch.get_device_module(
                         self.device
                     ).Event()
-                    if not model_worker_batch.delay_sample_launch:
+                    if batch_result.delay_sample_func is None:
                         self.future_map.store_to_map(future_indices, batch_result)
                         batch_result.copy_to_cpu()
                     else:
@@ -2287,15 +2284,13 @@ class Scheduler(
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         # TODO(lsyin): make the delayed sample a default behavior after
         # unifying the forward_batch_generation interface (related to spec V2).
-        if batch_result is None or not batch_result.delay_sample_launch:
+        if batch_result is None or batch_result.delay_sample_func is None:
             return
 
         with self.forward_stream_ctx:
             self.forward_stream.wait_stream(self.default_stream)
-            batch_result.next_token_ids = self.model_worker.model_runner.sample(
-                batch_result.logits_output,
-                batch_result.forward_batch,
-            )
+            _batch_result = batch_result.delay_sample_func()
+            assert _batch_result is batch_result
             self.future_map.store_to_map(batch_result.future_indices, batch_result)
             batch_result.copy_to_cpu()
 
