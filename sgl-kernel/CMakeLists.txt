@@ -334,6 +334,8 @@ set(SOURCES
     "csrc/speculative/packbit.cu"
     "csrc/speculative/speculative_sampling.cu"
 
+    "csrc/expert_specialization/es_fp8_blockwise.cu"
+
     "${repo-flashinfer_SOURCE_DIR}/csrc/norm.cu"
     "${repo-flashinfer_SOURCE_DIR}/csrc/renorm.cu"
     "${repo-flashinfer_SOURCE_DIR}/csrc/sampling.cu"

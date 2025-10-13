@@ -362,6 +362,7 @@ class ServerArgs:
     # Mamba cache
     max_mamba_cache_size: Optional[int] = None
     mamba_ssm_dtype: str = "float32"
+    mamba_full_memory_ratio: float = 0.2
 
     # Hierarchical cache
     enable_hierarchical_cache: bool = False
@@ -802,7 +803,32 @@ class ServerArgs:
 
         hf_config = self.get_hf_config()
         model_arch = hf_config.architectures[0]
-        if model_arch in ["GptOssForCausalLM"]:
+        if model_arch in ["DeepseekV3ForCausalLM"]:
+            if is_cuda() and is_sm100_supported():
+                if (
+                    self.attention_backend is None
+                    and self.prefill_attention_backend is None
+                    and self.decode_attention_backend is None
+                ):
+                    self.attention_backend = "trtllm_mla"
+                    logger.info(
+                        "Use trtllm_mla as attention backend on sm100 for DeepseekV3ForCausalLM"
+                    )
+                if not self.enable_dp_attention:
+                    self.enable_flashinfer_allreduce_fusion = True
+                    logger.info(
+                        "Enable FlashInfer AllReduce Fusion on sm100 for DeepseekV3ForCausalLM"
+                    )
+                if (
+                    self.quantization == "modelopt_fp4"
+                    and self.moe_runner_backend == "auto"
+                ):
+                    self.moe_runner_backend = "flashinfer_trtllm"
+                    logger.info(
+                        "Use flashinfer_trtllm as moe runner backend on sm100 for DeepseekV3ForCausalLM"
+                    )
+
+        elif model_arch in ["GptOssForCausalLM"]:
             if (
                 self.attention_backend is None
                 and self.prefill_attention_backend is None
@@ -2407,6 +2433,12 @@ class ServerArgs:
             default=ServerArgs.mamba_ssm_dtype,
             choices=["float32", "bfloat16"],
             help="The data type of the SSM states in mamba cache.",
+        )
+        parser.add_argument(
+            "--mamba-full-memory-ratio",
+            type=float,
+            default=ServerArgs.mamba_full_memory_ratio,
+            help="The ratio of mamba state memory to full kv cache memory.",
         )
         # Args for multi-item-scoring
         parser.add_argument(
