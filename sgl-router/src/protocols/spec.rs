@@ -335,7 +335,7 @@ pub struct ChatCompletionRequest {
 
     /// Path to LoRA adapter(s) for model customization
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub lora_path: Option<LoRAPath>,
+    pub lora_path: Option<String>,
 
     /// Session parameters for continual prompting
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -599,7 +599,7 @@ pub struct CompletionRequest {
 
     /// Path to LoRA adapter(s) for model customization
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub lora_path: Option<LoRAPath>,
+    pub lora_path: Option<String>,
 
     /// Session parameters for continual prompting
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2032,7 +2032,7 @@ pub struct GenerateRequest {
 
     /// Path to LoRA adapter(s) for model customization
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub lora_path: Option<LoRAPath>,
+    pub lora_path: Option<String>,
 
     /// LoRA adapter ID (if pre-loaded)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2492,14 +2492,6 @@ impl StringOrArray {
             StringOrArray::Array(arr) => arr.clone(),
         }
     }
-}
-
-/// LoRA adapter path - can be single path or batch of paths (SGLang extension)
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(untagged)]
-pub enum LoRAPath {
-    Single(Option<String>),
-    Batch(Vec<Option<String>>),
 }
 
 #[cfg(test)]
