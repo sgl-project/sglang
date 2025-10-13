@@ -190,6 +190,11 @@ def _handle_output_by_index(output, i):
                 if output.output_token_ids_logprobs_idx
                 else None
             ),
+            output_token_entropy_val=(
+                [output.output_token_entropy_val[i]]
+                if output.output_token_entropy_val
+                else None
+            ),
             output_hidden_states=(
                 [output.output_hidden_states[i]]
                 if output.output_hidden_states
@@ -197,6 +202,7 @@ def _handle_output_by_index(output, i):
             ),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
+            token_steps=([output.token_steps[i]] if output.token_steps else None),
         )
     elif isinstance(output, BatchEmbeddingOutput):
         new_output = BatchEmbeddingOutput(
@@ -245,11 +251,6 @@ def _handle_output_by_index(output, i):
             ),
             spec_verify_ct=(
                 [output.spec_verify_ct[i]] if len(output.spec_verify_ct) > i else None
-            ),
-            spec_accepted_tokens=(
-                [output.spec_accepted_tokens[i]]
-                if len(output.spec_accepted_tokens) > i
-                else None
             ),
             input_token_logprobs_val=(
                 [output.input_token_logprobs_val[i]]
@@ -311,6 +312,11 @@ def _handle_output_by_index(output, i):
                 if output.output_token_ids_logprobs_idx
                 else None
             ),
+            output_token_entropy_val=(
+                [output.output_token_entropy_val[i]]
+                if output.output_token_entropy_val
+                else None
+            ),
             output_hidden_states=(
                 [output.output_hidden_states[i]]
                 if output.output_hidden_states
@@ -318,6 +324,7 @@ def _handle_output_by_index(output, i):
             ),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
+            token_steps=([output.token_steps[i]] if output.token_steps else None),
         )
     elif isinstance(output, BatchMultimodalOutput):
         new_output = BatchMultimodalOutput(

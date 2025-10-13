@@ -33,7 +33,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
 )
-from sglang.srt.managers.schedule_batch import ModelWorkerBatch, global_server_args_dict
+from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -168,9 +168,6 @@ class TpModelWorker:
         )[0]
         set_random_seed(self.random_seed)
 
-        # A reference make this class has the same member as TpModelWorkerClient
-        self.worker = self
-
         self.hicache_layer_transfer_counter = None
 
     def register_hicache_layer_transfer_counter(self, counter: LayerDoneCounter):
@@ -190,7 +187,6 @@ class TpModelWorker:
             self.max_req_input_len,
             self.random_seed,
             self.device,
-            global_server_args_dict,
             self.model_runner.req_to_token_pool.size,
             self.model_runner.req_to_token_pool.max_context_len,
             self.model_runner.token_to_kv_pool.size,
@@ -231,12 +227,21 @@ class TpModelWorker:
     def forward_batch_generation(
         self,
         model_worker_batch: ModelWorkerBatch,
+        forward_batch: Optional[ForwardBatch] = None,
         is_verify: bool = False,
+        skip_attn_backend_init=False,
     ) -> GenerationBatchResult:
-        # update the consumer index of hicache to the running batch
-        self.set_hicache_consumer(model_worker_batch.hicache_consumer_index)
+        # FIXME(lsyin): maybe remove skip_attn_backend_init in forward_batch_generation,
+        #               which requires preparing replay to always be in this function
 
-        forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+        if model_worker_batch is not None:
+            # update the consumer index of hicache to the running batch
+            self.set_hicache_consumer(model_worker_batch.hicache_consumer_index)
+
+            forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+        else:
+            # FIXME(lsyin): unify the interface of forward_batch
+            assert forward_batch is not None
 
         pp_proxy_tensors = None
         if not self.pp_group.is_first_rank:
@@ -248,7 +253,9 @@ class TpModelWorker:
 
         if self.pp_group.is_last_rank:
             logits_output, can_run_cuda_graph = self.model_runner.forward(
-                forward_batch, pp_proxy_tensors=pp_proxy_tensors
+                forward_batch,
+                pp_proxy_tensors=pp_proxy_tensors,
+                skip_attn_backend_init=skip_attn_backend_init,
             )
             batch_result = GenerationBatchResult(
                 logits_output=logits_output,
@@ -290,6 +297,7 @@ class TpModelWorker:
             pp_proxy_tensors, can_run_cuda_graph = self.model_runner.forward(
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
+                skip_attn_backend_init=skip_attn_backend_init,
             )
             return GenerationBatchResult(
                 pp_hidden_states_proxy_tensors=pp_proxy_tensors,
