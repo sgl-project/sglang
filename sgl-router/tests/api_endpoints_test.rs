@@ -30,6 +30,7 @@ impl TestContext {
     async fn new(worker_configs: Vec<MockWorkerConfig>) -> Self {
         // Create default router config
         let config = RouterConfig {
+            chat_template: None,
             mode: RoutingMode::Regular {
                 worker_urls: vec![],
             },
@@ -63,6 +64,8 @@ impl TestContext {
             tokenizer_path: None,
             history_backend: sglang_router_rs::config::HistoryBackend::Memory,
             oracle: None,
+            reasoning_parser: None,
+            tool_call_parser: None,
         };
 
         Self::new_with_config(config, worker_configs).await
@@ -1363,6 +1366,7 @@ mod error_tests {
     async fn test_payload_too_large() {
         // Create context with small payload limit
         let config = RouterConfig {
+            chat_template: None,
             mode: RoutingMode::Regular {
                 worker_urls: vec![],
             },
@@ -1396,6 +1400,8 @@ mod error_tests {
             tokenizer_path: None,
             history_backend: sglang_router_rs::config::HistoryBackend::Memory,
             oracle: None,
+            reasoning_parser: None,
+            tool_call_parser: None,
         };
 
         let ctx = TestContext::new_with_config(
@@ -1719,6 +1725,7 @@ mod pd_mode_tests {
             .unwrap_or(9000);
 
         let config = RouterConfig {
+            chat_template: None,
             mode: RoutingMode::PrefillDecode {
                 prefill_urls: vec![(prefill_url, Some(prefill_port))],
                 decode_urls: vec![decode_url],
@@ -1755,6 +1762,8 @@ mod pd_mode_tests {
             tokenizer_path: None,
             history_backend: sglang_router_rs::config::HistoryBackend::Memory,
             oracle: None,
+            reasoning_parser: None,
+            tool_call_parser: None,
         };
 
         // Create app context
@@ -1882,6 +1891,7 @@ mod request_id_tests {
     async fn test_request_id_with_custom_headers() {
         // Create config with custom request ID headers
         let config = RouterConfig {
+            chat_template: None,
             mode: RoutingMode::Regular {
                 worker_urls: vec![],
             },
@@ -1915,6 +1925,8 @@ mod request_id_tests {
             tokenizer_path: None,
             history_backend: sglang_router_rs::config::HistoryBackend::Memory,
             oracle: None,
+            reasoning_parser: None,
+            tool_call_parser: None,
         };
 
         let ctx = TestContext::new_with_config(

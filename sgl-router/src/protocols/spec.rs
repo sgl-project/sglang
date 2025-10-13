@@ -2,6 +2,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{to_value, Map, Number, Value};
 use std::collections::HashMap;
 
+// Default model value when not specified
+fn default_model() -> String {
+    "unknown".to_string()
+}
+
 // # Protocol Specifications
 //
 // This module contains all protocol definitions for OpenAI and SGLang APIs.
@@ -72,8 +77,6 @@ pub enum ChatMessage {
         name: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         tool_calls: Option<Vec<ToolCall>>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        function_call: Option<FunctionCallResponse>,
         /// Reasoning content for O1-style models (SGLang extension)
         #[serde(skip_serializing_if = "Option::is_none")]
         reasoning_content: Option<String>,
@@ -140,8 +143,6 @@ pub struct ChatMessageDelta {
     pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCallDelta>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub function_call: Option<FunctionCallDelta>,
     /// Reasoning content delta for O1-style models (SGLang extension)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
@@ -173,6 +174,7 @@ pub struct ChatCompletionRequest {
     pub messages: Vec<ChatMessage>,
 
     /// ID of the model to use
+    #[serde(default = "default_model")]
     pub model: String,
 
     /// Number between -2.0 and 2.0. Positive values penalize new tokens based on their existing frequency in the text so far
@@ -473,6 +475,8 @@ pub struct ChatStreamChoice {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logprobs: Option<ChatLogProbs>,
     pub finish_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched_stop: Option<Value>,
 }
 
 // Completions API request types (v1/completions) - DEPRECATED but still supported
@@ -723,7 +727,10 @@ pub enum ResponseToolType {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ResponseReasoningParam {
     #[serde(default = "default_reasoning_effort")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<ReasoningEffort>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<ReasoningSummary>,
 }
 
 fn default_reasoning_effort() -> Option<ReasoningEffort> {
@@ -736,6 +743,14 @@ pub enum ReasoningEffort {
     Low,
     Medium,
     High,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningSummary {
+    Auto,
+    Concise,
+    Detailed,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -797,6 +812,17 @@ pub enum ResponseReasoningContent {
     ReasoningText { text: String },
 }
 
+/// MCP Tool information for the mcp_list_tools output item
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct McpToolInfo {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub input_schema: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<Value>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
@@ -825,6 +851,25 @@ pub enum ResponseOutputItem {
         #[serde(skip_serializing_if = "Option::is_none")]
         output: Option<String>,
         status: String,
+    },
+    #[serde(rename = "mcp_list_tools")]
+    McpListTools {
+        id: String,
+        server_label: String,
+        tools: Vec<McpToolInfo>,
+    },
+    #[serde(rename = "mcp_call")]
+    McpCall {
+        id: String,
+        status: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        approval_request_id: Option<String>,
+        arguments: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+        name: String,
+        output: String,
+        server_label: String,
     },
 }
 
@@ -1028,8 +1073,8 @@ fn generate_request_id() -> String {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ResponsesRequest {
     /// Run the request in the background
-    #[serde(default)]
-    pub background: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub background: Option<bool>,
 
     /// Fields to include in the response
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1058,9 +1103,13 @@ pub struct ResponsesRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
 
+    /// Optional conversation id to persist input/output as items
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversation: Option<String>,
+
     /// Whether to enable parallel tool calls
-    #[serde(default = "default_true")]
-    pub parallel_tool_calls: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
 
     /// ID of previous response to continue from
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1071,40 +1120,40 @@ pub struct ResponsesRequest {
     pub reasoning: Option<ResponseReasoningParam>,
 
     /// Service tier
-    #[serde(default)]
-    pub service_tier: ServiceTier,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<ServiceTier>,
 
     /// Whether to store the response
-    #[serde(default = "default_true")]
-    pub store: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub store: Option<bool>,
 
     /// Whether to stream the response
-    #[serde(default)]
-    pub stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream: Option<bool>,
 
     /// Temperature for sampling
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
 
     /// Tool choice behavior
-    #[serde(default)]
-    pub tool_choice: ToolChoice,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<ToolChoice>,
 
     /// Available tools
-    #[serde(default)]
-    pub tools: Vec<ResponseTool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<ResponseTool>>,
 
     /// Number of top logprobs to return
-    #[serde(default)]
-    pub top_logprobs: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_logprobs: Option<u32>,
 
     /// Top-p sampling parameter
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
 
     /// Truncation behavior
-    #[serde(default)]
-    pub truncation: Truncation,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub truncation: Option<Truncation>,
 
     /// User identifier
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1119,12 +1168,12 @@ pub struct ResponsesRequest {
     pub priority: i32,
 
     /// Frequency penalty
-    #[serde(default)]
-    pub frequency_penalty: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f32>,
 
     /// Presence penalty
-    #[serde(default)]
-    pub presence_penalty: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f32>,
 
     /// Stop sequences
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1161,7 +1210,7 @@ fn default_repetition_penalty() -> f32 {
 impl Default for ResponsesRequest {
     fn default() -> Self {
         Self {
-            background: false,
+            background: None,
             include: None,
             input: ResponseInput::Text(String::new()),
             instructions: None,
@@ -1169,23 +1218,24 @@ impl Default for ResponsesRequest {
             max_tool_calls: None,
             metadata: None,
             model: None,
-            parallel_tool_calls: true,
+            conversation: None,
+            parallel_tool_calls: None,
             previous_response_id: None,
             reasoning: None,
-            service_tier: ServiceTier::default(),
-            store: true,
-            stream: false,
+            service_tier: None,
+            store: None,
+            stream: None,
             temperature: None,
-            tool_choice: ToolChoice::default(),
-            tools: Vec::new(),
-            top_logprobs: 0,
+            tool_choice: None,
+            tools: None,
+            top_logprobs: None,
             top_p: None,
-            truncation: Truncation::default(),
+            truncation: None,
             user: None,
             request_id: generate_request_id(),
             priority: 0,
-            frequency_penalty: 0.0,
-            presence_penalty: 0.0,
+            frequency_penalty: None,
+            presence_penalty: None,
             stop: None,
             top_k: default_top_k(),
             min_p: 0.0,
@@ -1249,14 +1299,18 @@ impl ResponsesRequest {
             "top_p".to_string(),
             Value::Number(Number::from_f64(top_p as f64).unwrap()),
         );
-        params.insert(
-            "frequency_penalty".to_string(),
-            Value::Number(Number::from_f64(self.frequency_penalty as f64).unwrap()),
-        );
-        params.insert(
-            "presence_penalty".to_string(),
-            Value::Number(Number::from_f64(self.presence_penalty as f64).unwrap()),
-        );
+        if let Some(fp) = self.frequency_penalty {
+            params.insert(
+                "frequency_penalty".to_string(),
+                Value::Number(Number::from_f64(fp as f64).unwrap()),
+            );
+        }
+        if let Some(pp) = self.presence_penalty {
+            params.insert(
+                "presence_penalty".to_string(),
+                Value::Number(Number::from_f64(pp as f64).unwrap()),
+            );
+        }
         params.insert("top_k".to_string(), Value::Number(Number::from(self.top_k)));
         params.insert(
             "min_p".to_string(),
@@ -1287,7 +1341,7 @@ impl ResponsesRequest {
 
 impl GenerationRequest for ResponsesRequest {
     fn is_stream(&self) -> bool {
-        self.stream
+        self.stream.unwrap_or(false)
     }
 
     fn get_model(&self) -> Option<&str> {
@@ -1473,13 +1527,13 @@ impl ResponsesResponse {
             max_output_tokens: request.max_output_tokens,
             model: model_name,
             output,
-            parallel_tool_calls: request.parallel_tool_calls,
+            parallel_tool_calls: request.parallel_tool_calls.unwrap_or(true),
             previous_response_id: request.previous_response_id.clone(),
             reasoning: request.reasoning.as_ref().map(|r| ReasoningInfo {
                 effort: r.effort.as_ref().map(|e| format!("{:?}", e)),
                 summary: None,
             }),
-            store: request.store,
+            store: request.store.unwrap_or(false),
             temperature: request.temperature,
             text: Some(ResponseTextFormat {
                 format: TextFormatType {
@@ -1487,16 +1541,19 @@ impl ResponsesResponse {
                 },
             }),
             tool_choice: match &request.tool_choice {
-                ToolChoice::Value(ToolChoiceValue::Auto) => "auto".to_string(),
-                ToolChoice::Value(ToolChoiceValue::Required) => "required".to_string(),
-                ToolChoice::Value(ToolChoiceValue::None) => "none".to_string(),
-                ToolChoice::Function { .. } => "function".to_string(),
+                Some(ToolChoice::Value(ToolChoiceValue::Auto)) => "auto".to_string(),
+                Some(ToolChoice::Value(ToolChoiceValue::Required)) => "required".to_string(),
+                Some(ToolChoice::Value(ToolChoiceValue::None)) => "none".to_string(),
+                Some(ToolChoice::Function { .. }) => "function".to_string(),
+                Some(ToolChoice::AllowedTools { mode, .. }) => mode.clone(),
+                None => "auto".to_string(),
             },
-            tools: request.tools.clone(),
+            tools: request.tools.clone().unwrap_or_default(),
             top_p: request.top_p,
             truncation: match &request.truncation {
-                Truncation::Auto => Some("auto".to_string()),
-                Truncation::Disabled => Some("disabled".to_string()),
+                Some(Truncation::Auto) => Some("auto".to_string()),
+                Some(Truncation::Disabled) => Some("disabled".to_string()),
+                None => None,
             },
             usage: usage.map(ResponsesUsage::Classic),
             user: request.user.clone(),
@@ -1718,6 +1775,12 @@ pub enum ToolChoice {
         tool_type: String, // "function"
         function: FunctionChoice,
     },
+    AllowedTools {
+        #[serde(rename = "type")]
+        tool_type: String, // "allowed_tools"
+        mode: String, // "auto" | "required" TODO: need validation
+        tools: Vec<ToolReference>,
+    },
 }
 
 impl Default for ToolChoice {
@@ -1729,6 +1792,14 @@ impl Default for ToolChoice {
 /// Function choice specification for ToolChoice::Function
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct FunctionChoice {
+    pub name: String,
+}
+
+/// Tool reference for ToolChoice::AllowedTools
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ToolReference {
+    #[serde(rename = "type")]
+    pub tool_type: String, // "function"
     pub name: String,
 }
 
@@ -1911,6 +1982,8 @@ pub struct SamplingParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub no_stop_trim: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub n: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub sampling_seed: Option<u64>,
 }
 
@@ -2002,6 +2075,65 @@ impl GenerationRequest for GenerateRequest {
         // No text input found
         String::new()
     }
+}
+
+// ============================================================================
+// SGLang Generate Response Types
+// ============================================================================
+
+/// SGLang generate response (single completion or array for n>1)
+///
+/// Format for n=1:
+/// ```json
+/// {
+///   "text": "...",
+///   "output_ids": [...],
+///   "meta_info": { ... }
+/// }
+/// ```
+///
+/// Format for n>1:
+/// ```json
+/// [
+///   {"text": "...", "output_ids": [...], "meta_info": {...}},
+///   {"text": "...", "output_ids": [...], "meta_info": {...}}
+/// ]
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GenerateResponse {
+    pub text: String,
+    pub output_ids: Vec<u32>,
+    pub meta_info: GenerateMetaInfo,
+}
+
+/// Metadata for a single generate completion
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GenerateMetaInfo {
+    pub id: String,
+    pub finish_reason: GenerateFinishReason,
+    pub prompt_tokens: u32,
+    pub weight_version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_token_logprobs: Option<Vec<Vec<Option<f64>>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_token_logprobs: Option<Vec<Vec<Option<f64>>>>,
+    pub completion_tokens: u32,
+    pub cached_tokens: u32,
+    pub e2e_latency: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched_stop: Option<Value>,
+}
+
+/// Finish reason for generate endpoint
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum GenerateFinishReason {
+    Length {
+        length: u32,
+    },
+    Stop,
+    #[serde(untagged)]
+    Other(Value),
 }
 
 // Constants for rerank API
