@@ -302,7 +302,7 @@ suite_xeon = {
     ],
 }
 
-# Add Intel Xeon tests
+# Add Intel XPU tests
 suite_xpu = {
     "per-commit-xpu": [
         TestFile("test_intel_xpu_backend.py"),
