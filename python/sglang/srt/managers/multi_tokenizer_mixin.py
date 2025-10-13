@@ -354,13 +354,14 @@ def _handle_output_by_index(output, i):
 
 
 def get_worker_ids_from_req_rids(rids):
-        if isinstance(rids, list):
-            worker_ids = [int(rid.split("_")[0]) for rid in rids]
-        elif isinstance(rids, str):
-            worker_ids = [int(rids.split("_")[0])]
-        else:
-            worker_ids = []
-        return worker_ids
+    if isinstance(rids, list):
+        worker_ids = [int(rid.split("_")[0]) for rid in rids]
+    elif isinstance(rids, str):
+        worker_ids = [int(rids.split("_")[0])]
+    else:
+        worker_ids = []
+    return worker_ids
+
 
 class MultiHttpWorkerDetokenizerMixin:
     """Mixin class for DetokenizerManager"""
@@ -448,7 +449,7 @@ class MultiTokenizerRouter:
             rids = recv_obj.rids
         elif hasattr(recv_obj, "rid"):
             rids = recv_obj.rid
-        if  rids is not None:
+        if rids is not None:
             worker_ids = get_worker_ids_from_req_rids(rids)
             if len(worker_ids) == 0:
                 logger.error(f"Cannot find worker_id from rids {rids}")
