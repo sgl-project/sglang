@@ -45,7 +45,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import apply_rotary_pos_emb
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.utils import add_prefix
 
 ROTARY_EMBED_CLASSES = {
@@ -468,7 +468,7 @@ class VisionAttention(nn.Module):
         _passed_backend = qkv_backend
         qkv_backend = self._determine_attention_backend(_passed_backend)
         if (
-            get_global_server_args().mm_attention_backend is None
+            global_server_args_dict["mm_attention_backend"] is None
             and _passed_backend is None
         ):
             print_info_once(f"Multimodal attention backend not set. Use {qkv_backend}.")
@@ -528,7 +528,7 @@ class VisionAttention(nn.Module):
         - CUDA: "triton_attn"
         - Non-CUDA: "sdpa"
         """
-        override_backend = get_global_server_args().mm_attention_backend
+        override_backend = global_server_args_dict["mm_attention_backend"]
         if override_backend is not None:
             backend = override_backend
         elif passed_backend is not None:

@@ -13,6 +13,8 @@
 # ==============================================================================
 """The arguments of the server."""
 
+from __future__ import annotations
+
 import argparse
 import dataclasses
 import json
@@ -52,7 +54,6 @@ from sglang.srt.utils.hf_transformers_utils import check_gguf_file, get_config
 from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
-
 
 # Define constants
 LOAD_FORMAT_CHOICES = [
@@ -361,6 +362,7 @@ class ServerArgs:
     # Mamba cache
     max_mamba_cache_size: Optional[int] = None
     mamba_ssm_dtype: str = "float32"
+    mamba_full_memory_ratio: float = 0.2
 
     # Hierarchical cache
     enable_hierarchical_cache: bool = False
@@ -801,7 +803,32 @@ class ServerArgs:
 
         hf_config = self.get_hf_config()
         model_arch = hf_config.architectures[0]
-        if model_arch in ["GptOssForCausalLM"]:
+        if model_arch in ["DeepseekV3ForCausalLM"]:
+            if is_cuda() and is_sm100_supported():
+                if (
+                    self.attention_backend is None
+                    and self.prefill_attention_backend is None
+                    and self.decode_attention_backend is None
+                ):
+                    self.attention_backend = "trtllm_mla"
+                    logger.info(
+                        "Use trtllm_mla as attention backend on sm100 for DeepseekV3ForCausalLM"
+                    )
+                if not self.enable_dp_attention:
+                    self.enable_flashinfer_allreduce_fusion = True
+                    logger.info(
+                        "Enable FlashInfer AllReduce Fusion on sm100 for DeepseekV3ForCausalLM"
+                    )
+                if (
+                    self.quantization == "modelopt_fp4"
+                    and self.moe_runner_backend == "auto"
+                ):
+                    self.moe_runner_backend = "flashinfer_trtllm"
+                    logger.info(
+                        "Use flashinfer_trtllm as moe runner backend on sm100 for DeepseekV3ForCausalLM"
+                    )
+
+        elif model_arch in ["GptOssForCausalLM"]:
             if (
                 self.attention_backend is None
                 and self.prefill_attention_backend is None
@@ -2407,6 +2434,12 @@ class ServerArgs:
             choices=["float32", "bfloat16"],
             help="The data type of the SSM states in mamba cache.",
         )
+        parser.add_argument(
+            "--mamba-full-memory-ratio",
+            type=float,
+            default=ServerArgs.mamba_full_memory_ratio,
+            help="The ratio of mamba state memory to full kv cache memory.",
+        )
         # Args for multi-item-scoring
         parser.add_argument(
             "--multi-item-scoring-delimiter",
@@ -3324,22 +3357,6 @@ class ServerArgs:
         )
 
 
-# NOTE: This is a global variable to hold the server args for scheduler.
-_global_server_args: Optional[ServerArgs] = None
-
-
-def set_global_server_args_for_scheduler(server_args: ServerArgs):
-    global _global_server_args
-    _global_server_args = server_args
-
-
-def get_global_server_args() -> ServerArgs:
-    if _global_server_args is None:
-        raise ValueError("Global server args is not set yet!")
-
-    return _global_server_args
-
-
 def prepare_server_args(argv: List[str]) -> ServerArgs:
     """
     Prepare the server arguments from the command line arguments.
@@ -3374,11 +3391,12 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
     raw_args = parser.parse_args(argv)
-
-    return ServerArgs.from_cli_args(raw_args)
+    server_args = ServerArgs.from_cli_args(raw_args)
+    return server_args
 
 
 ZMQ_TCP_PORT_DELTA = 233
+DP_ATTENTION_HANDSHAKE_PORT_DELTA = 5
 
 
 @dataclasses.dataclass
@@ -3403,7 +3421,11 @@ class PortArgs:
     tokenizer_worker_ipc_name: Optional[str]
 
     @staticmethod
-    def init_new(server_args, dp_rank: Optional[int] = None) -> "PortArgs":
+    def init_new(
+        server_args: ServerArgs,
+        dp_rank: Optional[int] = None,
+        worker_ports: Optional[List[int]] = None,
+    ) -> PortArgs:
         if server_args.nccl_port is None:
             nccl_port = server_args.port + random.randint(100, 1000)
             while True:
@@ -3450,8 +3472,8 @@ class PortArgs:
                 # TokenizerManager to DataParallelController
                 scheduler_input_port = port_base + 4
             else:
-                scheduler_input_port = port_base + 4 + 1 + dp_rank
-
+                assert worker_ports is not None
+                scheduler_input_port = worker_ports[dp_rank]
             return PortArgs(
                 tokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base}",
                 scheduler_input_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port}",

@@ -31,7 +31,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.utils import is_layer_skipped
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.utils import (
     direct_register_custom_op,
     is_cuda,
@@ -265,9 +265,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.use_triton_kernels = get_moe_runner_backend().is_triton_kernel()
         self.with_bias = False
         self.use_flashinfer = get_moe_runner_backend().is_flashinfer_mxfp4()
-        self.flashinfer_mxfp4_moe_precision = (
-            get_global_server_args().flashinfer_mxfp4_moe_precision
-        )
+        self.flashinfer_mxfp4_moe_precision = global_server_args_dict[
+            "flashinfer_mxfp4_moe_precision"
+        ]
 
         self.triton_kernel_moe_forward = None
         self.triton_kernel_moe_with_bias_forward = None
