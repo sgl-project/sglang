@@ -10,6 +10,7 @@ from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST_MLA,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     popen_launch_pd_server,
+    try_cached_model,
 )
 
 
@@ -21,7 +22,7 @@ class TestDisaggregationMooncakePrefillLargerTP(TestDisaggregationBase):
         cls.original_jit_deepgemm = os.environ.get("SGL_ENABLE_JIT_DEEPGEMM")
         os.environ["SGL_ENABLE_JIT_DEEPGEMM"] = "false"
 
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
+        cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST_MLA)
 
         # Non blocking start servers
         cls.start_prefill()
@@ -93,7 +94,7 @@ class TestDisaggregationMooncakeDecodeLargerTP(TestDisaggregationBase):
         cls.original_jit_deepgemm = os.environ.get("SGL_ENABLE_JIT_DEEPGEMM")
         os.environ["SGL_ENABLE_JIT_DEEPGEMM"] = "false"
 
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
+        cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST_MLA)
 
         # Non blocking start servers
         cls.start_prefill()
@@ -165,7 +166,7 @@ class TestDisaggregationMooncakeMHAPrefillLargerTP(TestDisaggregationBase):
         cls.original_jit_deepgemm = os.environ.get("SGL_ENABLE_JIT_DEEPGEMM")
         os.environ["SGL_ENABLE_JIT_DEEPGEMM"] = "false"
 
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST)
 
         # Non blocking start servers
         cls.start_prefill()
@@ -237,7 +238,7 @@ class TestDisaggregationMooncakeMHADecodeLargerTP(TestDisaggregationBase):
         cls.original_jit_deepgemm = os.environ.get("SGL_ENABLE_JIT_DEEPGEMM")
         os.environ["SGL_ENABLE_JIT_DEEPGEMM"] = "false"
 
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST)
 
         # Non blocking start servers
         cls.start_prefill()
