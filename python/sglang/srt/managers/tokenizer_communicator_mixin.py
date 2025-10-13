@@ -46,7 +46,6 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     LoRAUpdateOutput,
-    MultiTokenizerWrapper,
     OpenSessionReqInput,
     ProfileReq,
     ProfileReqOutput,
@@ -104,8 +103,6 @@ class _Communicator(Generic[T]):
             assert self._result_values is None
 
         if obj:
-            if _Communicator.enable_multi_tokenizer:
-                obj = MultiTokenizerWrapper(worker_id=os.getpid(), obj=obj)
             self._sender.send_pyobj(obj)
 
         self._result_event = asyncio.Event()
@@ -126,8 +123,6 @@ class _Communicator(Generic[T]):
             self._result_event = asyncio.Event()
 
             if obj:
-                if _Communicator.enable_multi_tokenizer:
-                    obj = MultiTokenizerWrapper(worker_id=os.getpid(), obj=obj)
                 self._sender.send_pyobj(obj)
 
         await self._result_event.wait()
@@ -606,8 +601,6 @@ class TokenizerCommunicatorMixin:
         elif obj.session_id in self.session_futures:
             return None
 
-        if self.server_args.tokenizer_worker_num > 1:
-            obj = MultiTokenizerWrapper(self.worker_id, obj)
         self.send_to_scheduler.send_pyobj(obj)
 
         self.session_futures[obj.session_id] = asyncio.Future()

@@ -35,7 +35,6 @@ from sglang.srt.managers.io_struct import (
     BatchStrOutput,
     BatchTokenIDOutput,
     MultiTokenizerRegisterReq,
-    MultiTokenizerWrapper,
 )
 from sglang.srt.managers.tokenizer_communicator_mixin import _Communicator
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -433,11 +432,7 @@ class MultiTokenizerRouter:
 
     async def _distribute_result_to_workers(self, recv_obj):
         """Distribute result to corresponding workers based on rid"""
-        if isinstance(recv_obj, MultiTokenizerWrapper):
-            worker_ids = [recv_obj.worker_id]
-            recv_obj = recv_obj.obj
-        else:
-            worker_ids = self.get_worker_ids_from_req_rids(recv_obj.rids)
+        worker_ids = self.get_worker_ids_from_req_rids(recv_obj.rids)
 
         if len(worker_ids) == 0:
             logger.error(f"Cannot find worker_id from rids {recv_obj.rids}")

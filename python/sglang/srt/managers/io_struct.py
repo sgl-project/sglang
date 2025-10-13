@@ -1380,13 +1380,6 @@ class MultiTokenizerRegisterReq(BaseBatchReq):
     ipc_name: Optional[str] = None
 
 
-@dataclass
-class MultiTokenizerWrapper:
-    # FIXME(lsyin): remove this
-    worker_id: int
-    obj: Optional[Any] = None
-
-
 class BlockReqType(Enum):
     BLOCK = 1
     UNBLOCK = 2
