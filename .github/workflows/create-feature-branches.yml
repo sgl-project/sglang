@@ -15,7 +15,7 @@ jobs:
   check-tag:
     runs-on: ubuntu-latest
     outputs:
-      is_prerelease: ${{ steps.check.outputs.is_prerelease }}
+      skip_feature_branch_creation: ${{ steps.check.outputs.skip_feature_branch_creation }}
       tag: ${{ steps.check.outputs.tag }}
       branch_name: ${{ steps.check.outputs.branch_name }}
     steps:
@@ -31,30 +31,30 @@ jobs:
           # Check if this is a pre-release tag
           if [[ "$TAG" =~ [\.-]?(rc|alpha|beta|pre|dev)[0-9]*$ ]]; then
             # Extract base version (e.g., v0.10.0 from v0.10.0rc1)
-            BASE_VERSION=$(echo "$TAG" | sed -E 's/[\.-]?(rc|alpha|beta|pre|dev)[0-9]*$//')
+            BASE_VERSION=$(bash scripts/extract_base_version.sh "$TAG")
 
             # Check if corresponding full release exists
             if git ls-remote --tags https://${{ secrets.ORG_ADMIN_TOKEN || secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git | grep -q "refs/tags/$BASE_VERSION$"; then
               echo "::notice::Skipping pre-release tag $TAG because full release $BASE_VERSION exists"
-              echo "is_prerelease=true" >> $GITHUB_OUTPUT
+              echo "skip_feature_branch_creation=true" >> $GITHUB_OUTPUT
               echo "tag=$TAG" >> $GITHUB_OUTPUT
               echo "branch_name=" >> $GITHUB_OUTPUT
             else
               echo "::notice::Processing pre-release tag $TAG (no full release $BASE_VERSION found)"
-              echo "is_prerelease=false" >> $GITHUB_OUTPUT
+              echo "skip_feature_branch_creation=false" >> $GITHUB_OUTPUT
               echo "tag=$TAG" >> $GITHUB_OUTPUT
               echo "branch_name=features-based-on-$TAG" >> $GITHUB_OUTPUT
             fi
           else
             echo "::notice::Processing stable release tag: $TAG"
-            echo "is_prerelease=false" >> $GITHUB_OUTPUT
+            echo "skip_feature_branch_creation=false" >> $GITHUB_OUTPUT
             echo "tag=$TAG" >> $GITHUB_OUTPUT
             echo "branch_name=features-based-on-$TAG" >> $GITHUB_OUTPUT
           fi
 
   create-feature-branch:
     needs: check-tag
-    if: needs.check-tag.outputs.is_prerelease == 'false'
+    if: needs.check-tag.outputs.skip_feature_branch_creation == 'false'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -99,7 +99,7 @@ jobs:
               # Check if this is a pre-release tag
               if [[ "$tag" =~ [\.-]?(rc|alpha|beta|pre|dev)[0-9]*$ ]]; then
                 # Extract base version (e.g., v0.10.0 from v0.10.0rc1)
-                BASE_VERSION=$(echo "$tag" | sed -E 's/[\.-]?(rc|alpha|beta|pre|dev)[0-9]*$//')
+                BASE_VERSION=$(bash scripts/extract_base_version.sh "$tag")
 
                 # Check if corresponding full release exists
                 if git ls-remote --tags origin | grep -q "refs/tags/$BASE_VERSION$"; then
