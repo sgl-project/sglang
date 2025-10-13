@@ -1057,7 +1057,7 @@ class Scheduler(
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
 
-            self.launch_last_batch_sample_if_needed(batch_result)
+            self.launch_batch_sample_if_needed(batch_result)
             self.last_batch = batch
 
     @DynamicGradMode()
@@ -2282,7 +2282,7 @@ class Scheduler(
             ret = EmbeddingBatchResult(embeddings=embeddings)
         return ret
 
-    def launch_last_batch_sample_if_needed(
+    def launch_batch_sample_if_needed(
         self, batch_result: GenerationBatchResult
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         if batch_result is None or not batch_result.delay_sample_launch:
