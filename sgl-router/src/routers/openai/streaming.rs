@@ -572,7 +572,7 @@ pub(super) fn apply_event_transformations_inplace(
             .get_mut("response")
             .and_then(|v| v.as_object_mut())
         {
-            let desired_store = Value::Bool(original_request.store);
+            let desired_store = Value::Bool(original_request.store.unwrap_or(false));
             if response_obj.get("store") != Some(&desired_store) {
                 response_obj.insert("store".to_string(), desired_store);
                 changed = true;
@@ -597,8 +597,13 @@ pub(super) fn apply_event_transformations_inplace(
             if response_obj.get("tools").is_some() {
                 let requested_mcp = original_request
                     .tools
-                    .iter()
-                    .any(|t| matches!(t.r#type, ResponseToolType::Mcp));
+                    .as_ref()
+                    .map(|tools| {
+                        tools
+                            .iter()
+                            .any(|t| matches!(t.r#type, ResponseToolType::Mcp))
+                    })
+                    .unwrap_or(false);
 
                 if requested_mcp {
                     if let Some(mcp_tools) = build_mcp_tools_value(original_request) {
@@ -658,8 +663,8 @@ pub(super) fn apply_event_transformations_inplace(
 
 /// Helper to build MCP tools value
 fn build_mcp_tools_value(original_body: &ResponsesRequest) -> Option<Value> {
-    let mcp_tool = original_body
-        .tools
+    let tools = original_body.tools.as_ref()?;
+    let mcp_tool = tools
         .iter()
         .find(|t| matches!(t.r#type, ResponseToolType::Mcp) && t.server_url.is_some())?;
 
@@ -1000,7 +1005,7 @@ pub(super) async fn handle_simple_streaming_passthrough(
 
     let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, io::Error>>();
 
-    let should_store = original_body.store;
+    let should_store = original_body.store.unwrap_or(false);
     let original_request = original_body.clone();
     let persist_needed = original_request.conversation.is_some();
     let previous_response_id = original_previous_response_id.clone();
@@ -1134,7 +1139,7 @@ pub(super) async fn handle_streaming_with_tool_interception(
     prepare_mcp_payload_for_streaming(&mut payload, active_mcp);
 
     let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, io::Error>>();
-    let should_store = original_body.store;
+    let should_store = original_body.store.unwrap_or(false);
     let original_request = original_body.clone();
     let persist_needed = original_request.conversation.is_some();
     let previous_response_id = original_previous_response_id.clone();
@@ -1161,9 +1166,13 @@ pub(super) async fn handle_streaming_with_tool_interception(
 
         let server_label = original_request
             .tools
-            .iter()
-            .find(|t| matches!(t.r#type, ResponseToolType::Mcp))
-            .and_then(|t| t.server_label.as_deref())
+            .as_ref()
+            .and_then(|tools| {
+                tools
+                    .iter()
+                    .find(|t| matches!(t.r#type, ResponseToolType::Mcp))
+                    .and_then(|t| t.server_label.as_deref())
+            })
             .unwrap_or("mcp");
 
         loop {
@@ -1488,7 +1497,11 @@ pub(super) async fn handle_streaming_response(
     original_previous_response_id: Option<String>,
 ) -> Response {
     // Check if MCP is active for this request
-    let req_mcp_manager = mcp_manager_from_request_tools(&original_body.tools).await;
+    let req_mcp_manager = if let Some(ref tools) = original_body.tools {
+        mcp_manager_from_request_tools(tools.as_slice()).await
+    } else {
+        None
+    };
     let active_mcp = req_mcp_manager.as_ref().or(mcp_manager);
 
     // If no MCP is active, use simple pass-through streaming
