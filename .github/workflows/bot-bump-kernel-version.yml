@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       new_version:
-        description: 'New sgl-kernel version (e.g., 0.3.12)'
+        description: 'New sgl-kernel version (e.g., 0.3.15)'
         required: true
         type: string
 

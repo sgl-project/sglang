@@ -14,7 +14,7 @@ from sglang.srt.distributed import GroupCoordinator, patch_tensor_parallel_group
 from sglang.srt.layers.dp_attention import disable_dp_size
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import get_token_ids_logprobs, get_top_logprobs
-from sglang.srt.managers.schedule_batch import ScheduleBatch, get_last_loc
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,

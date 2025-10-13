@@ -12,7 +12,7 @@ def main():
     )
     parser.add_argument(
         "new_version",
-        help="New version (e.g., 0.3.12, 0.3.11rc0, or 0.3.11.post1)",
+        help="New version (e.g., 0.3.15, 0.3.11rc0, or 0.3.11.post1)",
     )
     args = parser.parse_args()
 
