@@ -17,11 +17,10 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import is_layer_skipped
-from sglang.srt.utils import is_npu, is_xpu, set_weight_attrs
+from sglang.srt.utils import is_npu, set_weight_attrs
 
 _is_npu = is_npu()
-_is_xpu = is_xpu()
-if not (_is_npu or _is_xpu):
+if not _is_npu:
     from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
 
 if TYPE_CHECKING:
