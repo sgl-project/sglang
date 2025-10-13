@@ -17,14 +17,9 @@ Unit tests for LoRA eviction policies.
 Tests LRU and FIFO eviction behavior.
 """
 
-import multiprocessing as mp
 import unittest
 
-import torch
-
 from sglang.srt.lora.eviction_policy import get_eviction_policy
-from sglang.test.runners import SRTRunner
-from sglang.test.test_utils import CustomTestCase
 
 
 class TestLoRAEvictionPolicy(unittest.TestCase):
@@ -191,55 +186,5 @@ class TestLoRAEvictionPolicy(unittest.TestCase):
         self.assertEqual(fifo_victim, "lora1")
 
 
-class TestLoRAEvictionPolicyIntegration(CustomTestCase):
-    """Integration tests for LoRA eviction policies with SRTRunner."""
-
-    BASE_MODEL = "/workspace/models/llama3-1-8-b"
-    ADAPTER_PATH = "/workspace/adapters/llama_3_1_8B_adapter"
-    ADAPTER_NAMES = ["adapter_1", "adapter_2", "adapter_3"]
-    PROMPT = "What is artificial intelligence?"
-
-    def _get_runner_config(self, eviction_policy: str, max_loras: int = 2):
-        """Get common SRTRunner configuration."""
-        return {
-            "model_path": self.BASE_MODEL,
-            "torch_dtype": torch.float16,
-            "model_type": "generation",
-            "lora_paths": None,
-            "max_loras_per_batch": max_loras,
-            "lora_backend": "triton",
-            "enable_lora": True,
-            "max_lora_rank": 256,
-            "lora_target_modules": ["all"],
-            "lora_eviction_policy": eviction_policy,
-        }
-
-    def _run_eviction_test(self, eviction_policy: str):
-        """Run eviction test with specified policy."""
-        with SRTRunner(**self._get_runner_config(eviction_policy)) as runner:
-            for name in self.ADAPTER_NAMES:
-                runner.load_lora_adapter(lora_name=name, lora_path=self.ADAPTER_PATH)
-
-            for adapter_name in self.ADAPTER_NAMES:
-                output = runner.forward(
-                    [self.PROMPT], max_new_tokens=32, lora_paths=[adapter_name]
-                )
-                self.assertIsNotNone(output.output_strs[0])
-                self.assertGreater(len(output.output_strs[0]), 0)
-
-    def test_lru_eviction(self):
-        """Test LRU eviction policy with actual inference."""
-        self._run_eviction_test("lru")
-
-    def test_fifo_eviction(self):
-        """Test FIFO eviction policy with actual inference."""
-        self._run_eviction_test("fifo")
-
-
 if __name__ == "__main__":
-    try:
-        mp.set_start_method("spawn")
-    except RuntimeError:
-        pass
-
     unittest.main(verbosity=2)
