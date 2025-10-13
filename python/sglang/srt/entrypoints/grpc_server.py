@@ -68,6 +68,8 @@ def _launch_scheduler_process_only(
     # Configure global environment
     configure_logger(server_args)
     server_args.check_server_args()
+    # Fix CUDA multiprocessing issues - must be called before any CUDA operations
+    mp.set_start_method("spawn", force=True)
 
     # Allocate ports for inter-process communications
     if port_args is None:
@@ -919,25 +921,3 @@ async def serve_grpc(
                     proc.join(timeout=1.0)
 
         logger.info("All scheduler processes terminated")
-
-
-def main():
-    """Main entry point for standalone gRPC server."""
-    # Fix CUDA multiprocessing issues - must be called before any CUDA operations
-    mp.set_start_method("spawn", force=True)
-
-    parser = argparse.ArgumentParser(description="SGLang Standalone gRPC Server")
-    ServerArgs.add_cli_args(parser)
-    args = parser.parse_args()
-    server_args = ServerArgs.from_cli_args(args)
-
-    # Run server
-    asyncio.run(
-        serve_grpc(
-            server_args=server_args,
-        )
-    )
-
-
-if __name__ == "__main__":
-    main()
