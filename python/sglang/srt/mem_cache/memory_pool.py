@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 from sglang.srt.layers.attention.nsa import index_buf_accessor
 from sglang.srt.layers.attention.nsa.quant_k_cache import quantize_k_cache
-from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 """
 Memory pool.
@@ -190,6 +190,7 @@ class MambaPool:
             )
             logger.info(
                 f"Mamba Cache is allocated. "
+                f"max_mamba_cache_size: {size}, "
                 f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.2f}GB, "
                 f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
                 f"intermediate_ssm_state_cache size: {get_tensor_size_bytes(intermediate_ssm_state_cache) / GB:.2f}GB "
@@ -199,11 +200,13 @@ class MambaPool:
             self.mamba_cache = self.State(conv=conv_state, temporal=temporal_state)
             logger.info(
                 f"Mamba Cache is allocated. "
+                f"max_mamba_cache_size: {size}, "
                 f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.2f}GB, "
                 f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
             )
         self.size = size
-        self.free_slots = list(range(size))
+        self.device = device
+        self.free_slots = torch.arange(self.size, dtype=torch.int64, device=self.device)
         self.mem_usage = self.mamba_cache.mem_usage_bytes() / GB
 
     def get_speculative_mamba2_params_all_layers(self) -> SpeculativeState:
@@ -216,7 +219,7 @@ class MambaPool:
     def available_size(self):
         return len(self.free_slots)
 
-    def alloc(self, need_size: int) -> Optional[List[int]]:
+    def alloc(self, need_size: int) -> Optional[torch.Tensor]:
         if need_size > len(self.free_slots):
             return None
 
@@ -225,17 +228,30 @@ class MambaPool:
 
         return select_index
 
-    def free(self, free_index: Union[int, List[int]]):
-        if isinstance(free_index, (int,)):
-            self.free_slots.append(free_index)
-        else:
-            self.free_slots.extend(free_index)
+    def free(self, free_index: torch.Tensor):
+        if free_index.numel() == 0:
+            return
+        self.free_slots = torch.cat((self.free_slots, free_index))
         self.mamba_cache.conv[:, free_index] = self.mamba_cache.temporal[
             :, free_index
         ] = 0
 
     def clear(self):
-        self.free_slots = list(range(self.size))
+        self.free_slots = torch.arange(self.size, dtype=torch.int64, device=self.device)
+
+    def copy_from(self, src_index: torch.Tensor, dst_index: torch.Tensor):
+        self.mamba_cache.conv[:, dst_index] = self.mamba_cache.conv[:, src_index]
+        self.mamba_cache.temporal[:, dst_index] = self.mamba_cache.temporal[
+            :, src_index
+        ]
+        return
+
+    def fork_from(self, src_index: torch.Tensor) -> Optional[torch.Tensor]:
+        dst_index = self.alloc(1)
+        if dst_index == None:
+            return None
+        self.copy_from(src_index, dst_index)
+        return dst_index
 
 
 class HybridReqToTokenPool(ReqToTokenPool):
@@ -245,6 +261,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         self,
         *,
         size: int,
+        mamba_size: int,
         max_context_len: int,
         device: str,
         enable_memory_saver: bool,
@@ -259,7 +276,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         )
 
         self.mamba_pool = MambaPool(
-            size=size,
+            size=mamba_size,
             cache_params=cache_params,
             device=device,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
@@ -270,9 +287,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
         self.req_index_to_mamba_index_mapping: torch.Tensor = torch.zeros(
             size, dtype=torch.int32, device=self.device
         )
-
-        self.rid_to_mamba_index_mapping: Dict[str, int] = {}
-        self.mamba_index_to_rid_mapping: Dict[int, str] = {}
 
     # For chunk prefill req, we do not need to allocate mamba cache,
     # We could use allocated mamba cache instead.
@@ -285,14 +299,14 @@ class HybridReqToTokenPool(ReqToTokenPool):
 
         mamba_index = []
         for req in reqs:
-            rid = req.rid
-            if rid in self.rid_to_mamba_index_mapping:
-                mid = self.rid_to_mamba_index_mapping[rid]
-            elif (mid := self.mamba_pool.alloc(1)) is not None:
-                mid = mid[0]
-                self.rid_to_mamba_index_mapping[rid] = mid
-                self.mamba_index_to_rid_mapping[mid] = rid
-            mamba_index.append(mid)
+            mid = None
+            if req.mamba_pool_idx is not None:  # for radix cache
+                mid = req.mamba_pool_idx
+            else:
+                mid = self.mamba_pool.alloc(1)[0]
+                req.mamba_pool_idx = mid
+            if mid is not None:
+                mamba_index.append(mid)
         assert len(select_index) == len(
             mamba_index
         ), f"Not enough space for mamba cache, try to increase --max-mamba-cache-size."
@@ -313,17 +327,12 @@ class HybridReqToTokenPool(ReqToTokenPool):
 
     # For chunk prefill, we can not free mamba cache, we need use it in the future
     def free(self, free_index: Union[int, List[int]], free_mamba_cache: bool = True):
+        if isinstance(free_index, (int,)):
+            free_index = [free_index]
         super().free(free_index)
         if free_mamba_cache:
             mamba_index = self.req_index_to_mamba_index_mapping[free_index]
-            mamba_index_list = mamba_index.tolist()
-            if isinstance(mamba_index_list, int):
-                mamba_index_list = [mamba_index_list]
-            self.mamba_pool.free(mamba_index_list)
-            for mid in mamba_index_list:
-                rid = self.mamba_index_to_rid_mapping[mid]
-                self.mamba_index_to_rid_mapping.pop(mid)
-                self.rid_to_mamba_index_mapping.pop(rid)
+            self.mamba_pool.free(mamba_index)
 
     def clear(self):
         super().clear()
@@ -1177,7 +1186,9 @@ class MLATokenToKVPool(KVCache):
             dtype=torch.uint64,
             device=self.device,
         )
-        self._finalize_allocation_log(size)
+        if not use_nsa:
+            # NSA will allocate indexer KV cache later and then log the total size
+            self._finalize_allocation_log(size)
 
     def get_kv_size_bytes(self):
         assert hasattr(self, "kv_buffer")
@@ -1298,6 +1309,9 @@ class MLATokenToKVPool(KVCache):
 
 
 class NSATokenToKVPool(MLATokenToKVPool):
+    quant_block_size = 128
+    index_k_with_scale_buffer_dtype = torch.uint8
+
     def __init__(
         self,
         size: int,
@@ -1331,8 +1345,6 @@ class NSATokenToKVPool(MLATokenToKVPool):
         # num head == 1 and head dim == 128 for index_k in NSA
         assert index_head_dim == 128
 
-        self.quant_block_size = 128
-
         assert self.page_size == 64
         self.index_k_with_scale_buffer = [
             torch.zeros(
@@ -1347,11 +1359,12 @@ class NSATokenToKVPool(MLATokenToKVPool):
                     self.page_size
                     * (index_head_dim + index_head_dim // self.quant_block_size * 4),
                 ),
-                dtype=torch.uint8,
+                dtype=self.index_k_with_scale_buffer_dtype,
                 device=device,
             )
             for _ in range(layer_num)
         ]
+        self._finalize_allocation_log(size)
 
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
         if self.layer_transfer_counter is not None:
@@ -1392,6 +1405,12 @@ class NSATokenToKVPool(MLATokenToKVPool):
         index_buf_accessor.SetKAndS.execute(
             pool=self, buf=buf, loc=loc, index_k=index_k, index_k_scale=index_k_scale
         )
+
+    def get_kv_size_bytes(self):
+        kv_size_bytes = super().get_kv_size_bytes()
+        for index_k_cache in self.index_k_with_scale_buffer:
+            kv_size_bytes += get_tensor_size_bytes(index_k_cache)
+        return kv_size_bytes
 
 
 class AscendMLAPagedTokenToKVPool(MLATokenToKVPool):

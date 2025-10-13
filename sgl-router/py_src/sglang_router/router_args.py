@@ -54,8 +54,8 @@ class RouterArgs:
     request_id_headers: Optional[List[str]] = None
     # Request timeout in seconds
     request_timeout_secs: int = 1800
-    # Max concurrent requests for rate limiting
-    max_concurrent_requests: int = 256
+    # Max concurrent requests for rate limiting (-1 to disable)
+    max_concurrent_requests: int = -1
     # Queue size for pending requests when max concurrent limit reached
     queue_size: int = 100
     # Maximum time (in seconds) a request can wait in queue before timing out
@@ -83,10 +83,9 @@ class RouterArgs:
     cb_timeout_duration_secs: int = 60
     cb_window_duration_secs: int = 120
     disable_circuit_breaker: bool = False
-    # Tokenizer configuration
     model_path: Optional[str] = None
     tokenizer_path: Optional[str] = None
-    # Parser configuration
+    chat_template: Optional[str] = None
     reasoning_parser: Optional[str] = None
     tool_call_parser: Optional[str] = None
 
@@ -409,7 +408,7 @@ class RouterArgs:
             f"--{prefix}max-concurrent-requests",
             type=int,
             default=RouterArgs.max_concurrent_requests,
-            help="Maximum number of concurrent requests allowed (for rate limiting)",
+            help="Maximum number of concurrent requests allowed (for rate limiting). Set to -1 to disable rate limiting.",
         )
         parser.add_argument(
             f"--{prefix}queue-size",
@@ -448,6 +447,12 @@ class RouterArgs:
             type=str,
             default=None,
             help="Explicit tokenizer path (overrides model_path tokenizer if provided)",
+        )
+        parser.add_argument(
+            f"--{prefix}chat-template",
+            type=str,
+            default=None,
+            help="Chat template path (optional)",
         )
         parser.add_argument(
             f"--{prefix}reasoning-parser",
