@@ -78,6 +78,10 @@ cu130 = [
   "torchaudio==2.9.0",
   "torchvision==0.24.0",
 ]
+cu130_all = [
+  "sglang[cu130]",
+  "decord2"
+]
 decord = ["decord2"]
 test = [
   "accelerate",
