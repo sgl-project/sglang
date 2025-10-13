@@ -5,6 +5,13 @@ from enum import Enum
 from typing import List, Optional, Tuple
 
 import torch
+import torch.distributed as dist
+
+from sglang.srt.utils import is_flashinfer_available
+
+_is_flashinfer_available = is_flashinfer_available()
+
+logger = logging.getLogger(__name__)
 
 from sglang.srt.distributed import (
     get_moe_expert_parallel_rank,
@@ -52,6 +59,18 @@ if is_flashinfer_available():
         shuffle_matrix_a,
         shuffle_matrix_sf_a,
     )
+
+has_triton_kernels = importlib.util.find_spec("triton_kernels") is not None
+
+if torch.cuda.is_available():
+    from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
+
+    if has_triton_kernels:
+        from sglang.srt.layers.moe.fused_moe_triton.triton_kernels_moe import (
+            triton_kernel_moe_forward,
+        )
+else:
+    fused_experts = None  # type: ignore
 
 _is_hip = is_hip()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -843,6 +862,15 @@ class FusedMoE(torch.nn.Module):
 
         if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+
+        elif (
+            _is_flashinfer_available
+            and global_server_args_dict["enable_flashinfer_allreduce"]
+            and hidden_states.shape[0] <= 128
+        ):
+            from sglang.srt.layers.flashinfer_comm import flashinfer_allreduce
+
+            final_hidden_states = flashinfer_allreduce(final_hidden_states)
 
         return final_hidden_states
 

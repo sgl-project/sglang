@@ -343,6 +343,7 @@ class ServerArgs:
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
     enable_flashinfer_allreduce_fusion: bool = False
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
+    enable_flashinfer_allreduce: bool = False
     ep_num_redundant_experts: int = 0
     ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
     init_expert_location: str = "trivial"
@@ -2309,6 +2310,11 @@ class ServerArgs:
             "--enable-flashinfer-allreduce-fusion",
             action="store_true",
             help="Enable FlashInfer allreduce fusion with Residual RMSNorm.",
+        )
+        parser.add_argument(
+            "--enable-flashinfer-allreduce",
+            action="store_true",
+            help="Enable FlashInfer allreduce for MoE.",
         )
         parser.add_argument(
             "--deepep-mode",
