@@ -68,6 +68,7 @@ WORKDIR /opt/sglang/sgl-router
 
 # build the rust dependencies
 RUN cargo clean \
+    && rm -rf dist/ \
     && cargo build --release \
     && uv build \
     && rm -rf /root/.cache
