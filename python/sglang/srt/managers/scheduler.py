@@ -2285,6 +2285,8 @@ class Scheduler(
     def launch_batch_sample_if_needed(
         self, batch_result: GenerationBatchResult
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
+        # TODO(lsyin): make the delayed sample a default behavior after
+        # unifying the forward_batch_generation interface (related to spec V2).
         if batch_result is None or not batch_result.delay_sample_launch:
             return
 
