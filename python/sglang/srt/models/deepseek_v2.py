@@ -2075,7 +2075,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.speculative_algorithm = global_server_args_dict["speculative_algorithm"]
         self.layer_id = layer_id
         self.is_nextn = is_nextn
-
         self.self_attn = DeepseekV2AttentionMLA(
             config=config,
             hidden_size=self.hidden_size,
@@ -2656,14 +2655,11 @@ class DeepseekV2ForCausalLM(nn.Module):
                 torch.float8_e4m3fn,
                 torch.float8_e4m3fnuz,
             ):
-                # TODO
-                # self_attn_quant_config = get_self_attn_quant_config(self.quant_config)
-                self_attn_quant_config = self.quant_config
                 if (
-                    hasattr(self_attn_quant_config, "weight_block_size")
-                    and self_attn_quant_config.weight_block_size is not None
+                    hasattr(self.quant_config, "weight_block_size")
+                    and self.quant_config.weight_block_size is not None
                 ):
-                    weight_block_size = self_attn_quant_config.weight_block_size
+                    weight_block_size = self.quant_config.weight_block_size
                     assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
                     if _is_fp8_fnuz:
                         weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
