@@ -26,8 +26,11 @@ import numpy as np
 import requests
 from pydantic import BaseModel
 
-from sglang.bench_serving import sample_mmmu_requests, sample_random_requests
-from sglang.benchmark.utils import get_tokenizer
+from sglang.bench_serving import (
+    get_tokenizer,
+    sample_mmmu_requests,
+    sample_random_requests,
+)
 from sglang.profiler import run_profile
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs

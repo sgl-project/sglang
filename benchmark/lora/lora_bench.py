@@ -30,11 +30,16 @@ from launch_server import LORA_PATH, NUM_LORAS
 from tqdm.asyncio import tqdm
 from transformers import PreTrainedTokenizerBase
 
-from sglang.bench_serving import calculate_metrics, get_request, sample_random_requests
-from sglang.benchmark.datasets.common import RequestFuncInput, RequestFuncOutput
-from sglang.benchmark.utils import get_tokenizer, remove_prefix
-
-AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
+from sglang.bench_serving import (
+    AIOHTTP_TIMEOUT,
+    RequestFuncInput,
+    RequestFuncOutput,
+    calculate_metrics,
+    get_request,
+    get_tokenizer,
+    remove_prefix,
+    sample_random_requests,
+)
 
 global args
 

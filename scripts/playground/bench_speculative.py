@@ -18,20 +18,18 @@ import numpy as np
 import requests
 from transformers import AutoTokenizer
 
-from sglang.bench_serving import benchmark, sample_mmmu_requests
-from sglang.benchmark.datasets.common import DatasetRow
+from sglang.bench_serving import (
+    DatasetRow,
+    benchmark,
+    sample_mmmu_requests,
+    set_global_args,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     kill_process_tree,
     popen_launch_server,
 )
-
-
-def set_global_args(args_: argparse.Namespace):
-    """Set the global args."""
-    global args
-    args = args_
 
 
 def node0_print(msg):

@@ -23,9 +23,13 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
-from sglang.bench_serving import get_dataset, sample_random_requests
-from sglang.benchmark.datasets.common import DatasetRow
-from sglang.benchmark.utils import get_tokenizer, set_ulimit
+from sglang.bench_serving import (
+    DatasetRow,
+    get_dataset,
+    get_tokenizer,
+    sample_random_requests,
+    set_ulimit,
+)
 from sglang.lang.backend.runtime_endpoint import Runtime
 from sglang.srt.entrypoints.engine import Engine
 from sglang.srt.server_args import ServerArgs

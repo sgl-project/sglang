@@ -14,7 +14,7 @@ from transformers import PreTrainedTokenizerBase
 
 SHAREGPT_URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
 
-from sglang.benchmark.utils import (
+from sglang.bench_serving import (
     download_and_cache_file,
     gen_prompt,
     get_gen_prefix_cache_path,
