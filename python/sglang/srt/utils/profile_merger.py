@@ -21,6 +21,21 @@ class ProfileMerger:
             output_dir, f"merged-{profile_id}.trace.json.gz"
         )
 
+        # Rank types in priority order (used for sorting and labeling)
+        self.rank_types = ["tp", "dp", "pp", "ep"]
+
+        # Sort index multipliers: DP (highest) > EP > PP > TP (lowest)
+        # These ensure proper visual ordering in trace viewer
+        self.sort_index_multipliers = {
+            "dp_rank": 100_000_000,
+            "ep_rank": 1_000_000,
+            "pp_rank": 10_000,
+            "tp_rank": 100,
+        }
+
+        # PID threshold for sort_index updates (only update for system PIDs < 1000)
+        self.pid_sort_index_threshold = 1000
+
     def merge_chrome_traces(self) -> str:
         """Merge Chrome traces from all ranks into a single trace.
 
@@ -90,17 +105,16 @@ class ProfileMerger:
         basename = os.path.basename(filename)
         rank_info = {}
 
-        for rank_type in ["TP", "DP", "PP", "EP"]:
-            match = re.search(rf"{rank_type}-(\d+)", basename)
+        for rank_type in self.rank_types:
+            match = re.search(rf"{rank_type.upper()}-(\d+)", basename)
             if match:
-                rank_info[f"{rank_type.lower()}_rank"] = int(match.group(1))
+                rank_info[f"{rank_type}_rank"] = int(match.group(1))
 
         return rank_info
 
     def _create_rank_label(self, rank_info: Dict[str, int]) -> str:
-        """Create rank label like [TP00-DP01-PP02-EP03]."""
         parts = []
-        for rank_type in ["tp", "dp", "pp", "ep"]:
+        for rank_type in self.rank_types:
             rank_key = f"{rank_type}_rank"
             if rank_key in rank_info:
                 parts.append(f"{rank_type.upper()}{rank_info[rank_key]:02d}")
@@ -135,7 +149,7 @@ class ProfileMerger:
         for event in events:
             if event.get("name") == "process_sort_index":
                 pid = self._maybe_cast_int(event.get("pid"))
-                if pid is not None and pid < 1000:
+                if pid is not None and pid < self.pid_sort_index_threshold:
                     event["args"]["sort_index"] = self._calculate_sort_index(
                         rank_info, pid
                     )
@@ -145,17 +159,12 @@ class ProfileMerger:
         return events
 
     def _calculate_sort_index(self, rank_info: Dict[str, int], pid: int) -> int:
-        """Calculate sort index with LLM-aligned weighting: DP (10k) > EP (100) > PP (100) > TP (100)."""
-        return (
-            rank_info.get("dp_rank", 0) * 100000000
-            + rank_info.get("ep_rank", 0) * 1000000
-            + rank_info.get("pp_rank", 0) * 10000
-            + rank_info.get("tp_rank", 0) * 100
-            + pid
-        )
+        sort_index = pid
+        for rank_type, multiplier in self.sort_index_multipliers.items():
+            sort_index += rank_info.get(rank_type, 0) * multiplier
+        return sort_index
 
     def _get_rank_sort_key(self, path: str) -> Tuple[int, int, int, int]:
-        """Sort key for files: (DP, EP, PP, TP) ordering."""
         rank_info = self._extract_rank_info(path)
         return tuple(
             rank_info.get(f"{rank_type}_rank", 0)
@@ -163,7 +172,6 @@ class ProfileMerger:
         )
 
     def _maybe_cast_int(self, x) -> Optional[int]:
-        """Safely cast to int, return None on failure."""
         try:
             return int(x)
         except (ValueError, TypeError):
