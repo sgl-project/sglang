@@ -22,8 +22,13 @@ from sglang.utils import logger
 
 IMAGE_FACTOR = 28
 MIN_PIXELS = 4 * 28 * 28
-MAX_PIXELS = 16384 * 28 * 28
+MAX_PIXELS = int(os.environ.get("IMAGE_MAX_PIXELS", 16384 * 28 * 28))
 MAX_RATIO = 200
+RESIZE_RESAMPLE = (
+    getattr(Image, env_val)
+    if (env_val := os.environ.get("RESIZE_RESAMPLE", ""))
+    else None
+)
 VIDEO_TOTAL_PIXELS = int(
     float(os.environ.get("VIDEO_MAX_PIXELS", 128000 * 28 * 28 * 0.9))
 )
@@ -85,7 +90,7 @@ def resize_image(
         min_pixels=min_pixels,
         max_pixels=max_pixels,
     )
-    image = image.resize((resized_width, resized_height))
+    image = image.resize((resized_width, resized_height), resample=RESIZE_RESAMPLE)
     return image
 
 
