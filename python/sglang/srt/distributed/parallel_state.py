@@ -47,6 +47,7 @@ from sglang.srt.utils import (
     is_cuda_alike,
     is_hip,
     is_npu,
+    is_xpu,
     is_shm_available,
     supports_custom_op,
 )
@@ -274,6 +275,8 @@ class GroupCoordinator:
             self.device = torch.device(f"cuda:{device_id}")
         elif _is_npu:
             self.device = torch.device(f"npu:{device_id}")
+        elif is_xpu:
+            self.device = torch.device(f"xpu:{device_id}")
         else:
             self.device = torch.device("cpu")
         self.device_module = torch.get_device_module(self.device)
