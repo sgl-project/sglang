@@ -21,8 +21,8 @@ jobs:
     if: github.repository == 'sgl-project/sglang'
     strategy:
       matrix:
-        python-version: [ "3.10" ]
-        cuda-version: [ "12.9" ]
+        python-version: ["3.10"]
+        cuda-version: ["12.9"]
         include:
           - arch: x86_64
             runner: x64-kernel-build-node
@@ -106,13 +106,13 @@ jobs:
           git commit -m "update whl index"
           git push
 
-
+  # for now we do not release CUDA 13.0 wheels to pypi
   build-cu130-matrix:
     if: github.repository == 'sgl-project/sglang'
     strategy:
       matrix:
-        python-version: [ "3.10" ]
-        cuda-version: [ "13.0" ]
+        python-version: ["3.10"]
+        cuda-version: ["13.0"]
         include:
           - arch: x86_64
             runner: x64-kernel-build-node
@@ -134,12 +134,6 @@ jobs:
           cd sgl-kernel
           chmod +x ./build.sh
           ./build.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}" ${{ matrix.arch == 'aarch64' && 'aarch64' || '' }}
-
-      - name: Upload to PyPI
-        working-directory: sgl-kernel
-        run: |
-          pip install twine
-          python3 -m twine upload --skip-existing dist/* -u __token__ -p ${{ secrets.PYPI_TOKEN }}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
