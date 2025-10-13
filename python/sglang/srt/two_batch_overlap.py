@@ -22,7 +22,7 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.moe.token_dispatcher import DeepEPDispatcher
 from sglang.srt.layers.quantization import deep_gemm_wrapper
-from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.schedule_batch import ScheduleBatch, global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
@@ -30,7 +30,6 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.operations import execute_operations, execute_overlapped_operations
 from sglang.srt.operations_strategy import OperationsStrategy
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import BumpAllocator, empty_context, get_bool_env_var, is_hip
 
@@ -154,7 +153,7 @@ def _update_device_and_sum_field_from_cpu_field(
         cpu_value
         if isinstance(cpu_value, torch.Tensor)
         else torch.tensor(cpu_value, dtype=old_device_value.dtype)
-    ).to(device=get_global_server_args().device, non_blocking=True)
+    ).to(device=global_server_args_dict["device"], non_blocking=True)
     setattr(batch, device_field, new_device_value)
 
     if sum_field is not None:
@@ -583,7 +582,7 @@ class TboForwardBatchPreparer:
             sum_field=None,
         )
         _, child_b.extend_start_loc = compute_position(
-            get_global_server_args().attention_backend,
+            global_server_args_dict["attention_backend"],
             child_b.extend_prefix_lens,
             child_b.extend_seq_lens,
             child_b.extend_num_tokens,
@@ -688,7 +687,7 @@ class TboForwardBatchPreparer:
 
         # TODO improve, e.g. unify w/ `init_raw`
         if (
-            get_global_server_args().moe_dense_tp_size == 1
+            global_server_args_dict["moe_dense_tp_size"] == 1
             and batch.global_dp_buffer_len is not None
         ):
             sum_len = end_token_index - start_token_index
@@ -756,7 +755,7 @@ class TboForwardBatchPreparer:
         value_a = min(tbo_split_token_index, num_token_non_padded)
         value_b = max(0, num_token_non_padded - tbo_split_token_index)
         return torch.tensor([value_a, value_b], dtype=torch.int32).to(
-            device=get_global_server_args().device, non_blocking=True
+            device=global_server_args_dict["device"], non_blocking=True
         )
 
     @classmethod

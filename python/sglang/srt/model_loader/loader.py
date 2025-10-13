@@ -4,6 +4,7 @@ from __future__ import annotations
 
 # ruff: noqa: SIM117
 import collections
+import concurrent
 import dataclasses
 import fnmatch
 import glob
@@ -11,10 +12,12 @@ import json
 import logging
 import math
 import os
+import re
 import socket
 import threading
 import time
 from abc import ABC, abstractmethod
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, suppress
 from typing import (
     TYPE_CHECKING,
@@ -30,9 +33,9 @@ from typing import (
 
 import huggingface_hub
 import numpy as np
+import requests
+import safetensors.torch
 import torch
-
-from sglang.srt.server_args import get_global_server_args
 
 # Try to import accelerate (optional dependency)
 try:
@@ -78,6 +81,8 @@ DEFAULT_GPU_MEMORY_FRACTION_FOR_CALIBRATION = (
     0.8  # Reserve 20% GPU memory headroom for ModelOpt calibration
 )
 from sglang.srt.model_loader.weight_utils import (
+    _BAR_FORMAT,
+    default_weight_loader,
     download_safetensors_index_file_from_hf,
     download_weights_from_hf,
     filter_duplicate_safetensors_files,
@@ -440,8 +445,10 @@ class DefaultModelLoader(BaseModelLoader):
                 hf_weights_files,
             )
         elif use_safetensors:
-            weight_loader_disable_mmap = (
-                get_global_server_args().weight_loader_disable_mmap
+            from sglang.srt.managers.schedule_batch import global_server_args_dict
+
+            weight_loader_disable_mmap = global_server_args_dict.get(
+                "weight_loader_disable_mmap"
             )
 
             if extra_config.get("enable_multithread_load"):
@@ -609,9 +616,9 @@ class LayeredModelLoader(DefaultModelLoader):
         device_config: DeviceConfig,
     ) -> nn.Module:
         from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
-        from sglang.srt.server_args import get_global_server_args
+        from sglang.srt.managers.schedule_batch import global_server_args_dict
 
-        torchao_config = get_global_server_args().torchao_config
+        torchao_config = global_server_args_dict.get("torchao_config")
         target_device = torch.device(device_config.device)
 
         with set_default_torch_dtype(model_config.dtype):
