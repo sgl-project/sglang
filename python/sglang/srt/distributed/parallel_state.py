@@ -47,8 +47,8 @@ from sglang.srt.utils import (
     is_cuda_alike,
     is_hip,
     is_npu,
-    is_xpu,
     is_shm_available,
+    is_xpu,
     supports_custom_op,
 )
 
