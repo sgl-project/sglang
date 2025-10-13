@@ -1955,7 +1955,6 @@ pub struct SamplingParams {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GenerateRequest {
-
     /// Text input - SGLang native format
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
@@ -1994,7 +1993,7 @@ pub struct GenerateRequest {
     /// Whether to return logprobs
     #[serde(skip_serializing_if = "Option::is_none")]
     pub return_logprob: Option<bool>,
-    
+
     /// If return logprobs, the start location in the prompt for returning logprobs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logprob_start_len: Option<i32>,
@@ -2018,7 +2017,7 @@ pub struct GenerateRequest {
     /// Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
     #[serde(default = "default_true")]
     pub log_metrics: bool,
-    
+
     /// Return model hidden states
     #[serde(default)]
     pub return_hidden_states: bool,

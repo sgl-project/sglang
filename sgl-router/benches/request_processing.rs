@@ -4,8 +4,8 @@ use std::time::Instant;
 
 use sglang_router_rs::core::{BasicWorker, BasicWorkerBuilder, Worker, WorkerType};
 use sglang_router_rs::protocols::spec::{
-    ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateRequest,
-    SamplingParams, StringOrArray, UserMessageContent,
+    ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateRequest, SamplingParams,
+    StringOrArray, UserMessageContent,
 };
 use sglang_router_rs::routers::http::pd_types::{generate_room_id, RequestWithBootstrap};
 
