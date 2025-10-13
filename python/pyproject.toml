@@ -77,6 +77,7 @@ decord = ["decord"]
 test = [
   "accelerate",
   "expecttest",
+  "gguf",
   "jsonlines",
   "matplotlib",
   "pandas",
@@ -86,10 +87,10 @@ test = [
   "tabulate",
 ]
 tracing = [
-    "opentelemetry-api",
-    "opentelemetry-exporter-otlp",
-    "opentelemetry-exporter-otlp-proto-grpc",
-    "opentelemetry-sdk",
+  "opentelemetry-api",
+  "opentelemetry-exporter-otlp",
+  "opentelemetry-exporter-otlp-proto-grpc",
+  "opentelemetry-sdk",
 ]
 all = ["sglang[test]", "sglang[decord]"]
 all_aarch64 = ["sglang[test]"]
