@@ -183,6 +183,12 @@ RUN if [ "$TARGETARCH" = "amd64" ]; then \
       pip install . ; \
     fi
 
+# Modify Triton source file to support cuda 13
+RUN if [ "${CUDA_VERSION%%.*}" = "13" ]; then \
+      TRITON_DIR=/usr/local/lib/python3.12/dist-packages/triton && \
+      grep -q 'if major >= 13:' ${TRITON_DIR}/backends/nvidia/compiler.py || bash -lc $'sed -i \'/^def ptx_get_version(cuda_version) -> int:/,/^[[:space:]]*raise RuntimeError/s/^\\([[:space:]]*\\)raise RuntimeError.*/\\1if major >= 13:\\n\\1    base_ptx = 90\\n\\1    return base_ptx + (major - 13) * 10 + minor\\n\\n\\1raise RuntimeError("Triton only support CUDA 10.0 or higher, but got CUDA version: " + cuda_version)/\' ${TRITON_DIR}/backends/nvidia/compiler.py'; \
+    fi
+
 # Python tools
 RUN python3 -m pip install --no-cache-dir \
     datamodel_code_generator \
