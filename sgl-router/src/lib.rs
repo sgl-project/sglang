@@ -51,11 +51,11 @@ pub struct PyOracleConfig {
     #[pyo3(get, set)]
     pub wallet_path: Option<String>,
     #[pyo3(get, set)]
-    pub connect_descriptor: String,
+    pub connect_descriptor: Option<String>,
     #[pyo3(get, set)]
-    pub username: String,
+    pub username: Option<String>,
     #[pyo3(get, set)]
-    pub password: String,
+    pub password: Option<String>,
     #[pyo3(get, set)]
     pub pool_min: usize,
     #[pyo3(get, set)]
@@ -82,18 +82,18 @@ impl std::fmt::Debug for PyOracleConfig {
 impl PyOracleConfig {
     #[new]
     #[pyo3(signature = (
-        connect_descriptor,
-        username,
-        password,
+        password = None,
+        username = None,
+        connect_descriptor = None,
         wallet_path = None,
         pool_min = 1,
         pool_max = 16,
         pool_timeout_secs = 30,
     ))]
     fn new(
-        connect_descriptor: String,
-        username: String,
-        password: String,
+        password: Option<String>,
+        username: Option<String>,
+        connect_descriptor: Option<String>,
         wallet_path: Option<String>,
         pool_min: usize,
         pool_max: usize,
@@ -124,11 +124,12 @@ impl PyOracleConfig {
 
 impl PyOracleConfig {
     fn to_config_oracle(&self) -> config::OracleConfig {
+        // Simple conversion - validation happens later in validate_oracle()
         config::OracleConfig {
             wallet_path: self.wallet_path.clone(),
-            connect_descriptor: self.connect_descriptor.clone(),
-            username: self.username.clone(),
-            password: self.password.clone(),
+            connect_descriptor: self.connect_descriptor.clone().unwrap_or_default(),
+            username: self.username.clone().unwrap_or_default(),
+            password: self.password.clone().unwrap_or_default(),
             pool_min: self.pool_min,
             pool_max: self.pool_max,
             pool_timeout_secs: self.pool_timeout_secs,

@@ -170,9 +170,9 @@ class Router:
             final_descriptor = tns_alias if tns_alias else connect_descriptor
 
             oracle_config = PyOracleConfig(
+                password=args_dict.get("oracle_password"),
+                username=args_dict.get("oracle_username"),
                 connect_descriptor=final_descriptor,
-                username=args_dict["oracle_username"],
-                password=args_dict["oracle_password"],
                 wallet_path=args_dict.get("oracle_wallet_path"),
                 pool_min=args_dict.get("oracle_pool_min", 1),
                 pool_max=args_dict.get("oracle_pool_max", 16),
