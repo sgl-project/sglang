@@ -21,7 +21,6 @@ from typing import Dict, Iterable, List, Optional, Set, Tuple
 import torch
 
 from sglang.srt.configs.load_config import LoadConfig
-from sglang.srt.hf_transformers_utils import AutoConfig
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend, get_backend_from_name
 from sglang.srt.lora.layers import BaseLayerWithLoRA, get_lora_layer
 from sglang.srt.lora.lora import LoRAAdapter
@@ -35,9 +34,11 @@ from sglang.srt.lora.utils import (
     get_normalized_target_modules,
     get_target_module_name,
 )
-from sglang.srt.managers.io_struct import LoRAUpdateResult
+from sglang.srt.managers.io_struct import LoRAUpdateOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import replace_submodule
+from sglang.srt.utils.hf_transformers_utils import AutoConfig
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +57,7 @@ class LoRAManager:
         max_lora_rank: Optional[int] = None,
         target_modules: Optional[Iterable[str]] = None,
         lora_paths: Optional[List[LoRARef]] = None,
+        server_args: Optional[ServerArgs] = None,
     ):
         self.base_model: torch.nn.Module = base_model
         self.base_hf_config: AutoConfig = base_hf_config
@@ -72,6 +74,7 @@ class LoRAManager:
         self.lora_backend: BaseLoRABackend = backend_type(
             max_loras_per_batch=max_loras_per_batch,
             device=self.device,
+            server_args=server_args,
         )
 
         # Initialize mutable internal state of the LoRAManager.
@@ -104,8 +107,8 @@ class LoRAManager:
 
     def create_lora_update_result(
         self, success: bool, error_message: str = ""
-    ) -> LoRAUpdateResult:
-        return LoRAUpdateResult(
+    ) -> LoRAUpdateOutput:
+        return LoRAUpdateOutput(
             success=success,
             error_message=error_message,
             loaded_adapters={
@@ -114,7 +117,7 @@ class LoRAManager:
             },
         )
 
-    def load_lora_adapter(self, lora_ref: LoRARef) -> LoRAUpdateResult:
+    def load_lora_adapter(self, lora_ref: LoRARef) -> LoRAUpdateOutput:
         """
         Load a single LoRA adapter from the specified path.
 
@@ -153,6 +156,15 @@ class LoRAManager:
         Validate if an adapter can be loaded into the current LoRA memory pool and generate error if it is incompatible.
         """
 
+        # Check if this LoRA adapter is already loaded
+        if any(
+            lora_ref.lora_name == existing_lora_ref.lora_name
+            for existing_lora_ref in self.lora_refs.values()
+        ):
+            raise ValueError(
+                f"Failed to load LoRA adapter {lora_ref.lora_name} because it is already loaded"
+            )
+
         # Check if the LoRA adapter shape is compatible with the current LoRA memory pool configuration.
         memory_pool = getattr(self, "memory_pool", None)
         incompatible = memory_pool and not memory_pool.can_support(lora_config)
@@ -171,7 +183,7 @@ class LoRAManager:
                 "`--max-loras-per-batch` or load it as unpinned LoRA adapters."
             )
 
-    def unload_lora_adapter(self, lora_ref: LoRARef) -> LoRAUpdateResult:
+    def unload_lora_adapter(self, lora_ref: LoRARef) -> LoRAUpdateOutput:
         """
         Unload LoRA adapters by their names. This will remove the adapters from the memory pool and
         delete the corresponding LoRA modules.
@@ -415,10 +427,6 @@ class LoRAManager:
         replace_submodule(self.base_model, module_name, lora_module)
         return lora_module
 
-    def should_skip_lora_for_vision_model(self, module_name):
-        # TODO: support different vision models
-        return module_name.find("vision_model.model") != -1
-
     def init_lora_modules(self):
         # Look-up table that essentially maps (layer_index, module_name) to the corresponding LoRA module.
         self.lora_modules: List[Dict[str, BaseLayerWithLoRA]] = [
@@ -434,10 +442,6 @@ class LoRAManager:
             if getattr(
                 self.base_model, "should_apply_lora", None
             ) and not self.base_model.should_apply_lora(module_name):
-                continue
-
-            # Skip vision model
-            if self.should_skip_lora_for_vision_model(module_name):
                 continue
 
             # The module should be converted if it is included in target_names

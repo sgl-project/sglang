@@ -1,14 +1,14 @@
-use super::circuit_breaker::CircuitBreakerConfig;
-use super::worker::{BasicWorker, ConnectionMode, DPAwareWorker, HealthConfig, WorkerType};
-use crate::grpc::client::SglangSchedulerClient;
+use super::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
+use super::worker::{
+    BasicWorker, ConnectionMode, DPAwareWorker, HealthConfig, WorkerMetadata, WorkerType,
+};
+use crate::grpc_client::SglangSchedulerClient;
 use std::collections::HashMap;
 
 /// Builder for creating BasicWorker instances with fluent API
 pub struct BasicWorkerBuilder {
-    // Required fields
     url: String,
-
-    // Optional fields with defaults
+    api_key: Option<String>,
     worker_type: WorkerType,
     connection_mode: ConnectionMode,
     labels: HashMap<String, String>,
@@ -18,10 +18,11 @@ pub struct BasicWorkerBuilder {
 }
 
 impl BasicWorkerBuilder {
-    /// Create a new builder with only the URL (defaults to Regular worker type)
+    /// Create a new builder with only the URL
     pub fn new(url: impl Into<String>) -> Self {
         Self {
             url: url.into(),
+            api_key: None,
             worker_type: WorkerType::Regular,
             connection_mode: ConnectionMode::Http,
             labels: HashMap::new(),
@@ -35,6 +36,7 @@ impl BasicWorkerBuilder {
     pub fn new_with_type(url: impl Into<String>, worker_type: WorkerType) -> Self {
         Self {
             url: url.into(),
+            api_key: None,
             worker_type,
             connection_mode: ConnectionMode::Http,
             labels: HashMap::new(),
@@ -42,6 +44,12 @@ impl BasicWorkerBuilder {
             circuit_breaker_config: CircuitBreakerConfig::default(),
             grpc_client: None,
         }
+    }
+
+    /// Set the API key
+    pub fn api_key(mut self, api_key: impl Into<String>) -> Self {
+        self.api_key = Some(api_key.into());
+        self
     }
 
     /// Set the worker type (Regular, Prefill, or Decode)
@@ -88,34 +96,74 @@ impl BasicWorkerBuilder {
 
     /// Build the BasicWorker instance
     pub fn build(self) -> BasicWorker {
-        // Use the existing constructor methods for now
-        let mut worker =
-            BasicWorker::with_connection_mode(self.url, self.worker_type, self.connection_mode);
+        use std::sync::{
+            atomic::{AtomicBool, AtomicUsize},
+            Arc,
+        };
+        use tokio::sync::{Mutex, RwLock};
 
-        // Apply optional configurations using existing methods
-        if !self.labels.is_empty() {
-            worker = worker.with_labels(self.labels);
+        let bootstrap_host = match url::Url::parse(&self.url) {
+            Ok(parsed) => parsed.host_str().unwrap_or("localhost").to_string(),
+            Err(_) if !self.url.contains("://") => {
+                match url::Url::parse(&format!("http://{}", self.url)) {
+                    Ok(parsed) => parsed.host_str().unwrap_or("localhost").to_string(),
+                    Err(_) => {
+                        tracing::warn!(
+                            "Failed to parse URL '{}', defaulting to localhost",
+                            self.url
+                        );
+                        "localhost".to_string()
+                    }
+                }
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "Failed to parse URL '{}', defaulting to localhost",
+                    self.url
+                );
+                "localhost".to_string()
+            }
+        };
+
+        let bootstrap_port = match self.worker_type {
+            WorkerType::Prefill { bootstrap_port } => bootstrap_port,
+            _ => None,
+        };
+
+        let metadata = WorkerMetadata {
+            url: self.url.clone(),
+            api_key: self.api_key,
+            worker_type: self.worker_type,
+            connection_mode: self.connection_mode,
+            labels: self.labels,
+            health_config: self.health_config,
+            bootstrap_host,
+            bootstrap_port,
+        };
+
+        let grpc_client = Arc::new(RwLock::new(
+            self.grpc_client.map(|client| Arc::new(Mutex::new(client))),
+        ));
+
+        BasicWorker {
+            metadata,
+            load_counter: Arc::new(AtomicUsize::new(0)),
+            processed_counter: Arc::new(AtomicUsize::new(0)),
+            healthy: Arc::new(AtomicBool::new(true)),
+            consecutive_failures: Arc::new(AtomicUsize::new(0)),
+            consecutive_successes: Arc::new(AtomicUsize::new(0)),
+            circuit_breaker: CircuitBreaker::with_config(self.circuit_breaker_config),
+            grpc_client,
         }
-
-        worker = worker.with_health_config(self.health_config);
-        worker = worker.with_circuit_breaker_config(self.circuit_breaker_config);
-
-        if let Some(client) = self.grpc_client {
-            worker = worker.with_grpc_client(client);
-        }
-
-        worker
     }
 }
 
 /// Builder for creating DPAwareWorker instances with fluent API
 pub struct DPAwareWorkerBuilder {
-    // Required fields
     base_url: String,
+    api_key: Option<String>,
     dp_rank: usize,
     dp_size: usize,
-
-    // Optional fields with defaults
     worker_type: WorkerType,
     connection_mode: ConnectionMode,
     labels: HashMap<String, String>,
@@ -125,10 +173,11 @@ pub struct DPAwareWorkerBuilder {
 }
 
 impl DPAwareWorkerBuilder {
-    /// Create a new DP-aware worker builder (defaults to Regular worker type)
+    /// Create a new DP-aware worker builder
     pub fn new(base_url: impl Into<String>, dp_rank: usize, dp_size: usize) -> Self {
         Self {
             base_url: base_url.into(),
+            api_key: None,
             dp_rank,
             dp_size,
             worker_type: WorkerType::Regular,
@@ -149,6 +198,7 @@ impl DPAwareWorkerBuilder {
     ) -> Self {
         Self {
             base_url: base_url.into(),
+            api_key: None,
             dp_rank,
             dp_size,
             worker_type,
@@ -158,6 +208,12 @@ impl DPAwareWorkerBuilder {
             circuit_breaker_config: CircuitBreakerConfig::default(),
             grpc_client: None,
         }
+    }
+
+    /// Set the API key
+    pub fn api_key(mut self, api_key: impl Into<String>) -> Self {
+        self.api_key = Some(api_key.into());
+        self
     }
 
     /// Set the worker type (Regular, Prefill, or Decode)
@@ -204,10 +260,7 @@ impl DPAwareWorkerBuilder {
 
     /// Build the DPAwareWorker instance
     pub fn build(self) -> DPAwareWorker {
-        // Create URL with DP rank suffix for identification
         let worker_url = format!("{}@{}", self.base_url, self.dp_rank);
-
-        // Use BasicWorkerBuilder to create a properly configured base worker
         let mut builder = BasicWorkerBuilder::new(worker_url)
             .worker_type(self.worker_type)
             .connection_mode(self.connection_mode)
@@ -215,14 +268,14 @@ impl DPAwareWorkerBuilder {
             .health_config(self.health_config)
             .circuit_breaker_config(self.circuit_breaker_config);
 
-        // Add gRPC client if provided
         if let Some(client) = self.grpc_client {
             builder = builder.grpc_client(client);
         }
+        if let Some(api_key) = self.api_key {
+            builder = builder.api_key(api_key);
+        }
 
         let base_worker = builder.build();
-
-        // Create the DPAwareWorker with the configured base worker
         DPAwareWorker::with_base_worker(base_worker, self.base_url, self.dp_rank, self.dp_size)
     }
 }
@@ -235,7 +288,6 @@ mod tests {
 
     #[test]
     fn test_basic_worker_builder_minimal() {
-        // Using new API - defaults to Regular type
         let worker = BasicWorkerBuilder::new("http://localhost:8080").build();
 
         assert_eq!(worker.url(), "http://localhost:8080");
@@ -246,7 +298,6 @@ mod tests {
 
     #[test]
     fn test_basic_worker_builder_with_type() {
-        // Test setting worker type explicitly
         let worker = BasicWorkerBuilder::new("http://localhost:8080")
             .worker_type(WorkerType::Decode)
             .build();
@@ -300,7 +351,6 @@ mod tests {
             ConnectionMode::Grpc { port: Some(50051) }
         );
         assert_eq!(worker.metadata().labels, labels);
-        // Can't directly compare HealthConfig without PartialEq, so check individual fields
         assert_eq!(
             worker.metadata().health_config.endpoint,
             health_config.endpoint
@@ -343,13 +393,11 @@ mod tests {
 
     #[test]
     fn test_dp_aware_worker_builder_minimal() {
-        // Using new API - defaults to Regular type
         let worker = DPAwareWorkerBuilder::new("http://localhost:8080", 2, 8).build();
 
         assert_eq!(worker.url(), "http://localhost:8080@2");
         assert_eq!(worker.dp_rank(), Some(2));
         assert_eq!(worker.dp_size(), Some(8));
-        // Note: base_url is a private field, we can only test through the url() method
         assert_eq!(worker.worker_type(), WorkerType::Regular);
     }
 
@@ -373,13 +421,13 @@ mod tests {
             .connection_mode(ConnectionMode::Http)
             .labels(labels.clone())
             .health_config(health_config.clone())
+            .api_key("test_api_key")
             .build();
 
         assert_eq!(worker.url(), "http://localhost:8080@3");
         assert_eq!(worker.dp_rank(), Some(3));
         assert_eq!(worker.dp_size(), Some(16));
         assert_eq!(worker.metadata().labels, labels);
-        // Can't directly compare HealthConfig without PartialEq, so check individual fields
         assert_eq!(
             worker.metadata().health_config.endpoint,
             health_config.endpoint
@@ -404,7 +452,6 @@ mod tests {
 
     #[test]
     fn test_dp_aware_worker_with_grpc() {
-        // Test that DPAwareWorkerBuilder can set a gRPC client
         let worker = DPAwareWorkerBuilder::new("grpc://cluster.local", 1, 4)
             .worker_type(WorkerType::Decode)
             .connection_mode(ConnectionMode::Grpc { port: Some(50051) })
@@ -423,9 +470,5 @@ mod tests {
             worker.metadata().labels.get("transport"),
             Some(&"grpc".to_string())
         );
-
-        // Note: We can't directly test the grpc_client as it's private,
-        // but the fact that the worker builds successfully with grpc connection mode
-        // validates that the configuration is properly passed through
     }
 }

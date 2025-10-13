@@ -43,11 +43,16 @@ _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 
 if _is_cuda:
-    if _is_flashinfer_available:
-        from flashinfer.norm import fused_add_rmsnorm
-    else:
-        from sgl_kernel import fused_add_rmsnorm
-    from sgl_kernel import gemma_fused_add_rmsnorm, gemma_rmsnorm, rmsnorm
+    # if _is_flashinfer_available:
+    #     from flashinfer.norm import fused_add_rmsnorm
+    # else:
+    from sgl_kernel import (
+        fused_add_rmsnorm,
+        gemma_fused_add_rmsnorm,
+        gemma_rmsnorm,
+        rmsnorm,
+    )
+
 
 if _use_aiter:
     from aiter import rmsnorm2d_fwd as rms_norm
@@ -80,6 +85,8 @@ class RMSNorm(CustomOp):
         )
         if _use_aiter:
             self._forward_method = self.forward_aiter
+        if get_bool_env_var("SGLANG_ENABLE_DETERMINISTIC_INFERENCE"):
+            self._forward_method = self.forward_native
 
     def forward_cuda(
         self,

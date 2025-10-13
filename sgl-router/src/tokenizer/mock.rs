@@ -109,4 +109,8 @@ impl TokenizerTrait for MockTokenizer {
     fn id_to_token(&self, id: u32) -> Option<String> {
         self.reverse_vocab.get(&id).cloned()
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
