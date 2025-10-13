@@ -485,7 +485,7 @@ class DecodePreallocQueue:
             if isinstance(self.token_to_kv_pool, HybridLinearKVPool):
                 # Mamba hybrid model: single mamba state index
                 state_indices = [
-                    self.req_to_token_pool.rid_to_mamba_index_mapping[
+                    self.req_to_token_pool.req_index_to_mamba_index_mapping[
                         decode_req.req.rid
                     ]
                 ]

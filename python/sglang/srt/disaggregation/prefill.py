@@ -656,7 +656,7 @@ class SchedulerDisaggregationPrefillMixin:
             ):
                 # Mamba hybrid model: send single mamba state index
                 state_indices = [
-                    self.req_to_token_pool.rid_to_mamba_index_mapping[req.rid]
+                    self.req_to_token_pool.req_index_to_mamba_index_mapping[req.rid]
                 ]
             elif isinstance(self.token_to_kv_pool_allocator.get_kvcache(), SWAKVPool):
                 # SWA hybrid model: send last window KV indices
