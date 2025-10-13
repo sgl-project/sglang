@@ -552,10 +552,10 @@ class RadixCache(BasePrefixCache):
         child_key = self.get_child_key_fn(key)
 
         value = []
-        match_history = [node] if not is_cache_unfinished else None
         align_split_size = (
             not is_cache_unfinished and self.enable_deterministic_inference
         )
+        match_history = [node] if align_split_size else None
 
         if align_split_size and len(key) < self.split_size:
             # fast path: directly return the root node if the split point is 0
