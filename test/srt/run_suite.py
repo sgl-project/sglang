@@ -13,7 +13,7 @@ class TestFile:
 
 # NOTE: please sort the test cases alphabetically by the test file name
 suites = {
-    "per-commit": [
+    "per-commit-1-gpu": [
         TestFile("function_call/test_json_schema_constraint.py", 30),
         TestFile("hicache/test_hicache.py", 116),
         TestFile("hicache/test_hicache_eagle.py", 150),
@@ -84,6 +84,7 @@ suites = {
         TestFile("test_io_struct.py", 8),
         TestFile("test_jinja_template_utils.py", 1),
         TestFile("test_logprobs.py", 55),
+        TestFile("test_mamba_unittest.py", 4),
         TestFile("test_metrics.py", 32),
         TestFile("test_metrics_utils.py", 1),
         TestFile("test_mla.py", 167),
@@ -179,6 +180,9 @@ suites = {
         TestFile("test_vllm_dependency.py", 185),
         # TestFile("test_gguf.py", 96),
     ],
+    # If the test cases take too long, considering adding them to nightly tests instead of per-commit tests
+    "nightly-1-gpu": [],
+    "nightly-8-gpu": [],
 }
 
 # Add AMD tests
