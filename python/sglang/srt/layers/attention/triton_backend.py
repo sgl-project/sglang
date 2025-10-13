@@ -684,6 +684,10 @@ class TritonAttnBackend(AttentionBackend):
                     )
 
             else:
+                # NOTE: Multi-step's attention backends use the slice of
+                # - kv_indptr buffer (cuda graph and non-cuda graph)
+                # - kv_indices buffer (cuda graph only)
+                # So we don't need a extra copy here.
                 num_token = spec_info.kv_indptr.shape[0] - 1
             self.get_num_kv_splits(num_kv_splits[:num_token], seq_lens[:bs])
 
@@ -956,10 +960,6 @@ class TritonMultiStepDraftBackend:
             next_power_of_2(bs),
             self.page_size,
         )
-
-        # NOTE: Multi-step's attention backends use the slice of
-        # - kv_indptr buffer (cuda graph and non-cuda graph)
-        # - kv_indices buffer (cuda graph only)
 
         for i in range(self.speculative_num_steps):
             forward_batch.spec_info.kv_indptr = self.kv_indptr[i, : bs + 1]
