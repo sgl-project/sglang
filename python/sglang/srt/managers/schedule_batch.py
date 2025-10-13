@@ -1907,8 +1907,5 @@ class ModelWorkerBatch:
     capture_hidden_mode: CaptureHiddenMode = None
     hicache_consumer_index: int = -1
 
-    # Overlap scheduler related
-    delay_sample_launch: bool = False
-
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
