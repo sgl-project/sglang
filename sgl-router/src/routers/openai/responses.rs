@@ -1,35 +1,16 @@
 //! Response storage, patching, and extraction utilities
 
-use crate::data_connector::{ResponseId, SharedResponseStorage, StoredResponse};
+use crate::data_connector::{ResponseId, StoredResponse};
 use crate::protocols::spec::{ResponseInput, ResponseToolType, ResponsesRequest};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use tracing::{info, warn};
+use tracing::warn;
 
 use super::utils::event_types;
 
 // ============================================================================
 // Response Storage Operations
 // ============================================================================
-
-/// Store a response internally (checks if storage is enabled)
-pub(super) async fn store_response_internal(
-    response_storage: &SharedResponseStorage,
-    response_json: &Value,
-    original_body: &ResponsesRequest,
-) -> Result<(), String> {
-    if !original_body.store {
-        return Ok(());
-    }
-
-    match store_response_impl(response_storage, response_json, original_body).await {
-        Ok(response_id) => {
-            info!(response_id = %response_id.0, "Stored response locally");
-            Ok(())
-        }
-        Err(e) => Err(e),
-    }
-}
 
 /// Build a StoredResponse from response JSON and original request
 pub(super) fn build_stored_response(
@@ -98,20 +79,6 @@ pub(super) fn build_stored_response(
     stored_response
 }
 
-/// Store response implementation (public for use across modules)
-pub(super) async fn store_response_impl(
-    response_storage: &SharedResponseStorage,
-    response_json: &Value,
-    original_body: &ResponsesRequest,
-) -> Result<ResponseId, String> {
-    let stored_response = build_stored_response(response_json, original_body);
-
-    response_storage
-        .store_response(stored_response)
-        .await
-        .map_err(|e| format!("Failed to store response: {}", e))
-}
-
 // ============================================================================
 // Response JSON Patching
 // ============================================================================
@@ -162,7 +129,10 @@ pub(super) fn patch_streaming_response_json(
             }
         }
 
-        obj.insert("store".to_string(), Value::Bool(original_body.store));
+        obj.insert(
+            "store".to_string(),
+            Value::Bool(original_body.store.unwrap_or(false)),
+        );
 
         if obj
             .get("model")
@@ -238,7 +208,7 @@ pub(super) fn rewrite_streaming_block(
 
     let mut changed = false;
     if let Some(response_obj) = parsed.get_mut("response").and_then(|v| v.as_object_mut()) {
-        let desired_store = Value::Bool(original_body.store);
+        let desired_store = Value::Bool(original_body.store.unwrap_or(false));
         if response_obj.get("store") != Some(&desired_store) {
             response_obj.insert("store".to_string(), desired_store);
             changed = true;
@@ -300,10 +270,11 @@ pub(super) fn rewrite_streaming_block(
 
 /// Mask function tools as MCP tools in response for client
 pub(super) fn mask_tools_as_mcp(resp: &mut Value, original_body: &ResponsesRequest) {
-    let mcp_tool = original_body
-        .tools
-        .iter()
-        .find(|t| matches!(t.r#type, ResponseToolType::Mcp) && t.server_url.is_some());
+    let mcp_tool = original_body.tools.as_ref().and_then(|tools| {
+        tools
+            .iter()
+            .find(|t| matches!(t.r#type, ResponseToolType::Mcp) && t.server_url.is_some())
+    });
     let Some(t) = mcp_tool else {
         return;
     };
