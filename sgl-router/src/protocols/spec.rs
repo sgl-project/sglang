@@ -1965,24 +1965,28 @@ pub struct GenerateRequest {
 
     /// Input embeddings for direct embedding input
     /// Can be a 2D array (single request) or 3D array (batch of requests)
+    /// Placeholder for future use
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_embeds: Option<Value>,
 
     /// Image input data
     /// Can be an image instance, file name, URL, or base64 encoded string
     /// Supports single images, lists of images, or nested lists for batch processing
+    /// Placeholder for future use
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_data: Option<Value>,
 
     /// Video input data
     /// Can be a file name, URL, or base64 encoded string
     /// Supports single videos, lists of videos, or nested lists for batch processing
+    /// Placeholder for future use
     #[serde(skip_serializing_if = "Option::is_none")]
     pub video_data: Option<Value>,
 
     /// Audio input data
     /// Can be a file name, URL, or base64 encoded string
     /// Supports single audio files, lists of audio, or nested lists for batch processing
+    /// Placeholder for future use
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio_data: Option<Value>,
 
