@@ -12,6 +12,7 @@ import torch
 from PIL import Image
 from transformers import BaseImageProcessorFast
 
+from sglang.srt.managers.mm_utils import TransportProxyTensor
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.utils import is_npu, load_audio, load_image, load_video, logger
 
@@ -251,10 +252,11 @@ class BaseMultimodalProcessor(ABC):
         if not self.server_args.keep_mm_feature_on_device:
             # move feature tensors to cpu
             for feature_name in self.FEATURE_NAMES:
-                if feature_name in result and isinstance(
-                    result[feature_name], torch.Tensor
-                ):
-                    result[feature_name] = result[feature_name].to("cpu")
+                pass
+                # if feature_name in result and isinstance(
+                #     result[feature_name], torch.Tensor
+                # ):
+                #     result[feature_name] = result[feature_name].to("cpu")
 
         return result
 
@@ -657,5 +659,21 @@ class BaseMultimodalProcessor(ABC):
                 input_ids=input_ids,
                 mm_token_id=mm_token_id,
             )
+
+        # # post-process
+        for item in all_collected_items:
+            print("self.transport_mode {}".format(self.transport_mode))
+            # replace the feature tensor with a proxy
+            if isinstance(item.feature, torch.Tensor) and item.feature.is_cuda:
+                item.feature = TransportProxyTensor(
+                    transport_mode=self.transport_mode, data=item.feature
+                )
+            elif (
+                isinstance(item.precomputed_embeddings, torch.Tensor)
+                and item.precomputed_embeddings.is_cuda
+            ):
+                item.precomputed_embeddings = TransportProxyTensor(
+                    transport_mode=self.transport_mode, data=item.precomputed_embeddings
+                )
 
         return all_collected_items, input_ids, ret
