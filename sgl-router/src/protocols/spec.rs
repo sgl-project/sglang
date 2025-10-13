@@ -2,6 +2,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{to_value, Map, Number, Value};
 use std::collections::HashMap;
 
+// Default model value when not specified
+fn default_model() -> String {
+    "unknown".to_string()
+}
+
 // # Protocol Specifications
 //
 // This module contains all protocol definitions for OpenAI and SGLang APIs.
@@ -49,12 +54,6 @@ use std::collections::HashMap;
 //    - StringOrArray & LoRAPath types
 //    - Helper functions
 
-// ==================================================================
-// =            OPENAI SPEC - Chat Completions API                  =
-// ==================================================================
-
-// ============= Message Types =============
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum ChatMessage {
@@ -78,8 +77,6 @@ pub enum ChatMessage {
         name: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         tool_calls: Option<Vec<ToolCall>>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        function_call: Option<FunctionCallResponse>,
         /// Reasoning content for O1-style models (SGLang extension)
         #[serde(skip_serializing_if = "Option::is_none")]
         reasoning_content: Option<String>,
@@ -119,8 +116,6 @@ pub struct ImageUrl {
     pub detail: Option<String>, // "auto", "low", or "high"
 }
 
-// ============= Response Format Types =============
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type")]
 pub enum ResponseFormat {
@@ -140,8 +135,6 @@ pub struct JsonSchemaFormat {
     pub strict: Option<bool>,
 }
 
-// ============= Streaming Delta Types =============
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChatMessageDelta {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -150,8 +143,6 @@ pub struct ChatMessageDelta {
     pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCallDelta>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub function_call: Option<FunctionCallDelta>,
     /// Reasoning content delta for O1-style models (SGLang extension)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
@@ -177,14 +168,13 @@ pub struct FunctionCallDelta {
     pub arguments: Option<String>,
 }
 
-// ============= Request =============
-
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct ChatCompletionRequest {
     /// A list of messages comprising the conversation so far
     pub messages: Vec<ChatMessage>,
 
     /// ID of the model to use
+    #[serde(default = "default_model")]
     pub model: String,
 
     /// Number between -2.0 and 2.0. Positive values penalize new tokens based on their existing frequency in the text so far
@@ -299,7 +289,6 @@ pub struct ChatCompletionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verbosity: Option<i32>,
 
-    // ============= SGLang Extensions =============
     /// Top-k sampling parameter (-1 to disable)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_k: Option<i32>,
@@ -326,7 +315,7 @@ pub struct ChatCompletionRequest {
 
     /// Specific token IDs to use as stop conditions
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub stop_token_ids: Option<Vec<i32>>,
+    pub stop_token_ids: Option<Vec<u32>>,
 
     /// Skip trimming stop tokens from output
     #[serde(default)]
@@ -423,8 +412,6 @@ impl GenerationRequest for ChatCompletionRequest {
     }
 }
 
-// ============= Regular Response =============
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChatCompletionResponse {
     pub id: String,
@@ -438,10 +425,25 @@ pub struct ChatCompletionResponse {
     pub system_fingerprint: Option<String>,
 }
 
+/// Response message structure for ChatCompletionResponse (different from request ChatMessage)
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChatCompletionMessage {
+    pub role: String, // Always "assistant" for responses
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+    /// Reasoning content for O1-style models (SGLang extension)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+    // Note: function_call is deprecated and not included
+    // Note: refusal, annotations, audio are not added yet
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChatChoice {
     pub index: u32,
-    pub message: ChatMessage,
+    pub message: ChatCompletionMessage,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logprobs: Option<ChatLogProbs>,
     pub finish_reason: Option<String>, // "stop", "length", "tool_calls", "content_filter", "function_call"
@@ -452,8 +454,6 @@ pub struct ChatChoice {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hidden_states: Option<Vec<f32>>,
 }
-
-// ============= Streaming Response =============
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChatCompletionStreamResponse {
@@ -475,11 +475,10 @@ pub struct ChatStreamChoice {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logprobs: Option<ChatLogProbs>,
     pub finish_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched_stop: Option<Value>,
 }
 
-// ==================================================================
-// =            OPENAI SPEC - Completions API                       =
-// ==================================================================
 // Completions API request types (v1/completions) - DEPRECATED but still supported
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -554,7 +553,6 @@ pub struct CompletionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seed: Option<i64>,
 
-    // ============= SGLang Extensions =============
     /// Top-k sampling parameter (-1 to disable)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_k: Option<i32>,
@@ -585,7 +583,7 @@ pub struct CompletionRequest {
 
     /// Specific token IDs to use as stop conditions
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub stop_token_ids: Option<Vec<i32>>,
+    pub stop_token_ids: Option<Vec<u32>>,
 
     /// Skip trimming stop tokens from output
     #[serde(default)]
@@ -599,7 +597,6 @@ pub struct CompletionRequest {
     #[serde(default = "default_true")]
     pub skip_special_tokens: bool,
 
-    // ============= SGLang Extensions =============
     /// Path to LoRA adapter(s) for model customization
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lora_path: Option<LoRAPath>,
@@ -638,8 +635,6 @@ impl GenerationRequest for CompletionRequest {
     }
 }
 
-// ============= Regular Response =============
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CompletionResponse {
     pub id: String,
@@ -668,8 +663,6 @@ pub struct CompletionChoice {
     pub hidden_states: Option<Vec<f32>>,
 }
 
-// ============= Streaming Response =============
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CompletionStreamResponse {
     pub id: String,
@@ -690,16 +683,37 @@ pub struct CompletionStreamChoice {
     pub finish_reason: Option<String>,
 }
 
-// ==================================================================
-// =            OPENAI SPEC - Responses API                         =
-// ==================================================================
-
-// ============= Tool Definitions =============
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ResponseTool {
     #[serde(rename = "type")]
     pub r#type: ResponseToolType,
+    // MCP-specific fields (used when type == "mcp")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authorization: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub require_approval: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_tools: Option<Vec<String>>,
+}
+
+impl Default for ResponseTool {
+    fn default() -> Self {
+        Self {
+            r#type: ResponseToolType::WebSearchPreview,
+            server_url: None,
+            authorization: None,
+            server_label: None,
+            server_description: None,
+            require_approval: None,
+            allowed_tools: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -707,14 +721,16 @@ pub struct ResponseTool {
 pub enum ResponseToolType {
     WebSearchPreview,
     CodeInterpreter,
+    Mcp,
 }
-
-// ============= Reasoning Configuration =============
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ResponseReasoningParam {
     #[serde(default = "default_reasoning_effort")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<ReasoningEffort>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<ReasoningSummary>,
 }
 
 fn default_reasoning_effort() -> Option<ReasoningEffort> {
@@ -729,7 +745,13 @@ pub enum ReasoningEffort {
     High,
 }
 
-// ============= Input/Output Items =============
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningSummary {
+    Auto,
+    Concise,
+    Detailed,
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type")]
@@ -790,7 +812,16 @@ pub enum ResponseReasoningContent {
     ReasoningText { text: String },
 }
 
-// ============= Output Items for Response =============
+/// MCP Tool information for the mcp_list_tools output item
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct McpToolInfo {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub input_schema: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<Value>,
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type")]
@@ -821,9 +852,26 @@ pub enum ResponseOutputItem {
         output: Option<String>,
         status: String,
     },
+    #[serde(rename = "mcp_list_tools")]
+    McpListTools {
+        id: String,
+        server_label: String,
+        tools: Vec<McpToolInfo>,
+    },
+    #[serde(rename = "mcp_call")]
+    McpCall {
+        id: String,
+        status: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        approval_request_id: Option<String>,
+        arguments: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+        name: String,
+        output: String,
+        server_label: String,
+    },
 }
-
-// ============= Service Tier =============
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -841,8 +889,6 @@ impl Default for ServiceTier {
     }
 }
 
-// ============= Truncation =============
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Truncation {
@@ -856,8 +902,6 @@ impl Default for Truncation {
     }
 }
 
-// ============= Response Status =============
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResponseStatus {
@@ -868,8 +912,6 @@ pub enum ResponseStatus {
     Cancelled,
 }
 
-// ============= Reasoning Info =============
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ReasoningInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -877,8 +919,6 @@ pub struct ReasoningInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
 }
-
-// ============= Text Format =============
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ResponseTextFormat {
@@ -890,8 +930,6 @@ pub struct TextFormatType {
     #[serde(rename = "type")]
     pub format_type: String,
 }
-
-// ============= Include Fields =============
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -910,8 +948,6 @@ pub enum IncludeField {
     ReasoningEncryptedContent,
 }
 
-// ============= Usage Info =============
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct UsageInfo {
     pub prompt_tokens: u32,
@@ -927,8 +963,6 @@ pub struct UsageInfo {
 pub struct PromptTokenUsageInfo {
     pub cached_tokens: u32,
 }
-
-// ============= Response Usage Format =============
 
 /// OpenAI Responses API usage format (different from standard UsageInfo)
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1038,10 +1072,9 @@ fn generate_request_id() -> String {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ResponsesRequest {
-    // ============= Core OpenAI API fields =============
     /// Run the request in the background
-    #[serde(default)]
-    pub background: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub background: Option<bool>,
 
     /// Fields to include in the response
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1070,9 +1103,13 @@ pub struct ResponsesRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
 
+    /// Optional conversation id to persist input/output as items
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversation: Option<String>,
+
     /// Whether to enable parallel tool calls
-    #[serde(default = "default_true")]
-    pub parallel_tool_calls: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
 
     /// ID of previous response to continue from
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1083,46 +1120,45 @@ pub struct ResponsesRequest {
     pub reasoning: Option<ResponseReasoningParam>,
 
     /// Service tier
-    #[serde(default)]
-    pub service_tier: ServiceTier,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<ServiceTier>,
 
     /// Whether to store the response
-    #[serde(default = "default_true")]
-    pub store: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub store: Option<bool>,
 
     /// Whether to stream the response
-    #[serde(default)]
-    pub stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream: Option<bool>,
 
     /// Temperature for sampling
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
 
     /// Tool choice behavior
-    #[serde(default)]
-    pub tool_choice: ToolChoice,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<ToolChoice>,
 
     /// Available tools
-    #[serde(default)]
-    pub tools: Vec<ResponseTool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<ResponseTool>>,
 
     /// Number of top logprobs to return
-    #[serde(default)]
-    pub top_logprobs: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_logprobs: Option<u32>,
 
     /// Top-p sampling parameter
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
 
     /// Truncation behavior
-    #[serde(default)]
-    pub truncation: Truncation,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub truncation: Option<Truncation>,
 
     /// User identifier
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
 
-    // ============= SGLang Extensions =============
     /// Request ID
     #[serde(default = "generate_request_id")]
     pub request_id: String,
@@ -1132,12 +1168,12 @@ pub struct ResponsesRequest {
     pub priority: i32,
 
     /// Frequency penalty
-    #[serde(default)]
-    pub frequency_penalty: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f32>,
 
     /// Presence penalty
-    #[serde(default)]
-    pub presence_penalty: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f32>,
 
     /// Stop sequences
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1174,7 +1210,7 @@ fn default_repetition_penalty() -> f32 {
 impl Default for ResponsesRequest {
     fn default() -> Self {
         Self {
-            background: false,
+            background: None,
             include: None,
             input: ResponseInput::Text(String::new()),
             instructions: None,
@@ -1182,23 +1218,24 @@ impl Default for ResponsesRequest {
             max_tool_calls: None,
             metadata: None,
             model: None,
-            parallel_tool_calls: true,
+            conversation: None,
+            parallel_tool_calls: None,
             previous_response_id: None,
             reasoning: None,
-            service_tier: ServiceTier::default(),
-            store: true,
-            stream: false,
+            service_tier: None,
+            store: None,
+            stream: None,
             temperature: None,
-            tool_choice: ToolChoice::default(),
-            tools: Vec::new(),
-            top_logprobs: 0,
+            tool_choice: None,
+            tools: None,
+            top_logprobs: None,
             top_p: None,
-            truncation: Truncation::default(),
+            truncation: None,
             user: None,
             request_id: generate_request_id(),
             priority: 0,
-            frequency_penalty: 0.0,
-            presence_penalty: 0.0,
+            frequency_penalty: None,
+            presence_penalty: None,
             stop: None,
             top_k: default_top_k(),
             min_p: 0.0,
@@ -1262,14 +1299,18 @@ impl ResponsesRequest {
             "top_p".to_string(),
             Value::Number(Number::from_f64(top_p as f64).unwrap()),
         );
-        params.insert(
-            "frequency_penalty".to_string(),
-            Value::Number(Number::from_f64(self.frequency_penalty as f64).unwrap()),
-        );
-        params.insert(
-            "presence_penalty".to_string(),
-            Value::Number(Number::from_f64(self.presence_penalty as f64).unwrap()),
-        );
+        if let Some(fp) = self.frequency_penalty {
+            params.insert(
+                "frequency_penalty".to_string(),
+                Value::Number(Number::from_f64(fp as f64).unwrap()),
+            );
+        }
+        if let Some(pp) = self.presence_penalty {
+            params.insert(
+                "presence_penalty".to_string(),
+                Value::Number(Number::from_f64(pp as f64).unwrap()),
+            );
+        }
         params.insert("top_k".to_string(), Value::Number(Number::from(self.top_k)));
         params.insert(
             "min_p".to_string(),
@@ -1300,7 +1341,7 @@ impl ResponsesRequest {
 
 impl GenerationRequest for ResponsesRequest {
     fn is_stream(&self) -> bool {
-        self.stream
+        self.stream.unwrap_or(false)
     }
 
     fn get_model(&self) -> Option<&str> {
@@ -1486,13 +1527,13 @@ impl ResponsesResponse {
             max_output_tokens: request.max_output_tokens,
             model: model_name,
             output,
-            parallel_tool_calls: request.parallel_tool_calls,
+            parallel_tool_calls: request.parallel_tool_calls.unwrap_or(true),
             previous_response_id: request.previous_response_id.clone(),
             reasoning: request.reasoning.as_ref().map(|r| ReasoningInfo {
                 effort: r.effort.as_ref().map(|e| format!("{:?}", e)),
                 summary: None,
             }),
-            store: request.store,
+            store: request.store.unwrap_or(false),
             temperature: request.temperature,
             text: Some(ResponseTextFormat {
                 format: TextFormatType {
@@ -1500,16 +1541,19 @@ impl ResponsesResponse {
                 },
             }),
             tool_choice: match &request.tool_choice {
-                ToolChoice::Value(ToolChoiceValue::Auto) => "auto".to_string(),
-                ToolChoice::Value(ToolChoiceValue::Required) => "required".to_string(),
-                ToolChoice::Value(ToolChoiceValue::None) => "none".to_string(),
-                ToolChoice::Function { .. } => "function".to_string(),
+                Some(ToolChoice::Value(ToolChoiceValue::Auto)) => "auto".to_string(),
+                Some(ToolChoice::Value(ToolChoiceValue::Required)) => "required".to_string(),
+                Some(ToolChoice::Value(ToolChoiceValue::None)) => "none".to_string(),
+                Some(ToolChoice::Function { .. }) => "function".to_string(),
+                Some(ToolChoice::AllowedTools { mode, .. }) => mode.clone(),
+                None => "auto".to_string(),
             },
-            tools: request.tools.clone(),
+            tools: request.tools.clone().unwrap_or_default(),
             top_p: request.top_p,
             truncation: match &request.truncation {
-                Truncation::Auto => Some("auto".to_string()),
-                Truncation::Disabled => Some("disabled".to_string()),
+                Some(Truncation::Auto) => Some("auto".to_string()),
+                Some(Truncation::Disabled) => Some("disabled".to_string()),
+                None => None,
             },
             usage: usage.map(ResponsesUsage::Classic),
             user: request.user.clone(),
@@ -1605,8 +1649,6 @@ impl ResponsesResponse {
         response
     }
 }
-
-// ============= Helper Functions =============
 
 impl ResponseOutputItem {
     /// Create a new message output item
@@ -1708,19 +1750,11 @@ impl UsageInfo {
     }
 }
 
-// ==================================================================
-// =            OPENAI SPEC - Common                                =
-// ==================================================================
-
-// ============= Shared Request Components =============
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct StreamOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub include_usage: Option<bool>,
 }
-
-// ============= Tool Choice Types =============
 
 /// Tool choice value for simple string options
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1741,6 +1775,12 @@ pub enum ToolChoice {
         tool_type: String, // "function"
         function: FunctionChoice,
     },
+    AllowedTools {
+        #[serde(rename = "type")]
+        tool_type: String, // "allowed_tools"
+        mode: String, // "auto" | "required" TODO: need validation
+        tools: Vec<ToolReference>,
+    },
 }
 
 impl Default for ToolChoice {
@@ -1752,6 +1792,14 @@ impl Default for ToolChoice {
 /// Function choice specification for ToolChoice::Function
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct FunctionChoice {
+    pub name: String,
+}
+
+/// Tool reference for ToolChoice::AllowedTools
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ToolReference {
+    #[serde(rename = "type")]
+    pub tool_type: String, // "function"
     pub name: String,
 }
 
@@ -1793,8 +1841,6 @@ pub struct FunctionCallResponse {
     pub arguments: Option<String>, // JSON string
 }
 
-// ============= Usage Tracking =============
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Usage {
     pub prompt_tokens: u32,
@@ -1808,8 +1854,6 @@ pub struct Usage {
 pub struct CompletionTokensDetails {
     pub reasoning_tokens: Option<u32>,
 }
-
-// ============= Logprobs Types =============
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LogProbs {
@@ -1859,10 +1903,6 @@ pub struct ErrorDetail {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
 }
-
-// ==================================================================
-// =            SGLANG SPEC - GENERATE API                          =
-// ==================================================================
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
@@ -1938,9 +1978,11 @@ pub struct SamplingParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub min_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub stop_token_ids: Option<Vec<i32>>,
+    pub stop_token_ids: Option<Vec<u32>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub no_stop_trim: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub n: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sampling_seed: Option<u64>,
 }
@@ -1975,7 +2017,6 @@ pub struct GenerateRequest {
     #[serde(default)]
     pub return_logprob: bool,
 
-    // ============= SGLang Extensions =============
     /// Path to LoRA adapter(s) for model customization
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lora_path: Option<LoRAPath>,
@@ -2036,9 +2077,64 @@ impl GenerationRequest for GenerateRequest {
     }
 }
 
-// ==================================================================
-// =            SGLANG SPEC - RERANK API                            =
-// ==================================================================
+// ============================================================================
+// SGLang Generate Response Types
+// ============================================================================
+
+/// SGLang generate response (single completion or array for n>1)
+///
+/// Format for n=1:
+/// ```json
+/// {
+///   "text": "...",
+///   "output_ids": [...],
+///   "meta_info": { ... }
+/// }
+/// ```
+///
+/// Format for n>1:
+/// ```json
+/// [
+///   {"text": "...", "output_ids": [...], "meta_info": {...}},
+///   {"text": "...", "output_ids": [...], "meta_info": {...}}
+/// ]
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GenerateResponse {
+    pub text: String,
+    pub output_ids: Vec<u32>,
+    pub meta_info: GenerateMetaInfo,
+}
+
+/// Metadata for a single generate completion
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GenerateMetaInfo {
+    pub id: String,
+    pub finish_reason: GenerateFinishReason,
+    pub prompt_tokens: u32,
+    pub weight_version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_token_logprobs: Option<Vec<Vec<Option<f64>>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_token_logprobs: Option<Vec<Vec<Option<f64>>>>,
+    pub completion_tokens: u32,
+    pub cached_tokens: u32,
+    pub e2e_latency: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched_stop: Option<Value>,
+}
+
+/// Finish reason for generate endpoint
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum GenerateFinishReason {
+    Length {
+        length: u32,
+    },
+    Stop,
+    #[serde(untagged)]
+    Other(Value),
+}
 
 // Constants for rerank API
 pub const DEFAULT_MODEL_NAME: &str = "default";
@@ -2237,10 +2333,6 @@ impl RerankResponse {
     }
 }
 
-// ==================================================================
-// =            OPENAI SPEC - Embeddings API                        =
-// ==================================================================
-
 /// Embeddings request compatible with OpenAI API
 /// We intentionally keep fields flexible to pass through to workers.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -2291,10 +2383,6 @@ impl GenerationRequest for EmbeddingRequest {
         }
     }
 }
-
-// ==================================================================
-// =            COMMON                                              =
-// ==================================================================
 
 /// Helper function for serde default value
 pub fn default_true() -> bool {
@@ -2358,10 +2446,6 @@ pub enum LoRAPath {
 mod tests {
     use super::*;
     use serde_json::{from_str, json, to_string};
-
-    // ==================================================================
-    // =            RERANK REQUEST TESTS                                =
-    // ==================================================================
 
     #[test]
     fn test_rerank_request_serialization() {
@@ -2534,10 +2618,6 @@ mod tests {
         assert_eq!(request.effective_top_k(), 3);
     }
 
-    // ==================================================================
-    // =            RERANK RESPONSE TESTS                               =
-    // ==================================================================
-
     #[test]
     fn test_rerank_response_creation() {
         let results = vec![
@@ -2709,10 +2789,6 @@ mod tests {
         assert_eq!(response.results[0].document, None);
     }
 
-    // ==================================================================
-    // =            RERANK RESULT TESTS                                 =
-    // ==================================================================
-
     #[test]
     fn test_rerank_result_serialization() {
         let result = RerankResult {
@@ -2755,10 +2831,6 @@ mod tests {
         assert_eq!(deserialized.meta_info, result.meta_info);
     }
 
-    // ==================================================================
-    // =            V1 COMPATIBILITY TESTS                              =
-    // ==================================================================
-
     #[test]
     fn test_v1_rerank_req_input_serialization() {
         let v1_input = V1RerankReqInput {
@@ -2791,10 +2863,6 @@ mod tests {
         assert_eq!(request.user, None);
     }
 
-    // ==================================================================
-    // =            GENERATION REQUEST TRAIT TESTS                      =
-    // ==================================================================
-
     #[test]
     fn test_rerank_request_generation_request_trait() {
         let request = RerankRequest {
@@ -2811,10 +2879,6 @@ mod tests {
         assert!(!request.is_stream());
         assert_eq!(request.extract_text_for_routing(), "test query");
     }
-
-    // ==================================================================
-    // =            EDGE CASES AND STRESS TESTS                         =
-    // ==================================================================
 
     #[test]
     fn test_rerank_request_very_long_query() {
@@ -2918,10 +2982,6 @@ mod tests {
         assert_eq!(usage.total_tokens, 150);
     }
 
-    // ==================================================================
-    // =            INTEGRATION TESTS                                   =
-    // ==================================================================
-
     #[test]
     fn test_full_rerank_workflow() {
         // Create request
@@ -2980,7 +3040,6 @@ mod tests {
         // Apply top_k
         response.apply_top_k(request.effective_top_k());
 
-        // Verify results
         assert_eq!(response.results.len(), 2);
         assert_eq!(response.results[0].score, 0.95);
         assert_eq!(response.results[0].index, 0);
@@ -2994,10 +3053,6 @@ mod tests {
         assert_eq!(deserialized.results.len(), 2);
         assert_eq!(deserialized.model, response.model);
     }
-
-    // ==================================================================
-    // =            EMBEDDINGS REQUEST TESTS                             =
-    // ==================================================================
 
     #[test]
     fn test_embedding_request_serialization_string_input() {

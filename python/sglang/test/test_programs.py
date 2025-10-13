@@ -551,7 +551,7 @@ def test_gen_min_new_tokens():
     We verify that the number of tokens in the answer is >= the min_tokens threshold.
     """
     import sglang as sgl
-    from sglang.srt.hf_transformers_utils import get_tokenizer
+    from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
     model_path = sgl.global_config.default_backend.endpoint.get_model_name()
     MIN_TOKENS, MAX_TOKENS = 64, 128

@@ -38,14 +38,14 @@ pub struct RouterConfig {
     pub log_level: Option<String>,
     /// Custom request ID headers to check (defaults to common headers)
     pub request_id_headers: Option<Vec<String>>,
-    /// Maximum concurrent requests allowed (for rate limiting)
-    pub max_concurrent_requests: usize,
+    /// Maximum concurrent requests allowed (for rate limiting). Set to -1 to disable rate limiting.
+    pub max_concurrent_requests: i32,
     /// Queue size for pending requests when max concurrent limit reached (0 = no queue, return 429 immediately)
     pub queue_size: usize,
     /// Maximum time (in seconds) a request can wait in queue before timing out
     pub queue_timeout_secs: u64,
     /// Token bucket refill rate (tokens per second). If not set, defaults to max_concurrent_requests
-    pub rate_limit_tokens_per_second: Option<usize>,
+    pub rate_limit_tokens_per_second: Option<i32>,
     /// CORS allowed origins
     pub cors_allowed_origins: Vec<String>,
     /// Retry configuration
@@ -73,6 +73,10 @@ pub struct RouterConfig {
     /// Oracle history backend configuration (required when `history_backend` = "oracle")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oracle: Option<OracleConfig>,
+    /// Parser for reasoning models (e.g., deepseek-r1, qwen3)
+    pub reasoning_parser: Option<String>,
+    /// Parser for handling tool-call interactions
+    pub tool_call_parser: Option<String>,
 }
 
 fn default_history_backend() -> HistoryBackend {
@@ -205,7 +209,6 @@ impl RoutingMode {
                 decode_urls,
                 ..
             } => prefill_urls.len() + decode_urls.len(),
-            // OpenAI mode represents a single upstream
             RoutingMode::OpenAI { .. } => 1,
         }
     }
@@ -408,7 +411,7 @@ impl Default for MetricsConfig {
     fn default() -> Self {
         Self {
             port: 29000,
-            host: "127.0.0.1".to_string(),
+            host: "0.0.0.0".to_string(),
         }
     }
 }
@@ -420,7 +423,7 @@ impl Default for RouterConfig {
                 worker_urls: vec![],
             },
             policy: PolicyConfig::Random,
-            host: "127.0.0.1".to_string(),
+            host: "0.0.0.0".to_string(),
             port: 3001,
             max_payload_size: 536_870_912, // 512MB
             request_timeout_secs: 1800,    // 30 minutes
@@ -433,7 +436,7 @@ impl Default for RouterConfig {
             log_dir: None,
             log_level: None,
             request_id_headers: None,
-            max_concurrent_requests: 256,
+            max_concurrent_requests: -1,
             queue_size: 100,
             queue_timeout_secs: 60,
             rate_limit_tokens_per_second: None,
@@ -449,6 +452,8 @@ impl Default for RouterConfig {
             tokenizer_path: None,
             history_backend: default_history_backend(),
             oracle: None,
+            reasoning_parser: None,
+            tool_call_parser: None,
         }
     }
 }
@@ -515,8 +520,6 @@ impl RouterConfig {
 mod tests {
     use super::*;
 
-    // ============= RouterConfig Tests =============
-
     #[test]
     fn test_router_config_default() {
         let config = RouterConfig::default();
@@ -525,7 +528,7 @@ mod tests {
             matches!(config.mode, RoutingMode::Regular { worker_urls } if worker_urls.is_empty())
         );
         assert!(matches!(config.policy, PolicyConfig::Random));
-        assert_eq!(config.host, "127.0.0.1");
+        assert_eq!(config.host, "0.0.0.0");
         assert_eq!(config.port, 3001);
         assert_eq!(config.max_payload_size, 536_870_912);
         assert_eq!(config.request_timeout_secs, 1800);
@@ -556,8 +559,7 @@ mod tests {
         }
 
         assert!(matches!(config.policy, PolicyConfig::RoundRobin));
-        // Other fields should be default
-        assert_eq!(config.host, "127.0.0.1");
+        assert_eq!(config.host, "0.0.0.0");
         assert_eq!(config.port, 3001);
     }
 
@@ -583,12 +585,9 @@ mod tests {
         assert_eq!(config.max_payload_size, deserialized.max_payload_size);
         assert_eq!(config.log_dir, deserialized.log_dir);
         assert_eq!(config.log_level, deserialized.log_level);
-        // discovery and metrics are None in Default implementation
         assert!(deserialized.discovery.is_none());
         assert!(deserialized.metrics.is_none());
     }
-
-    // ============= RoutingMode Tests =============
 
     #[test]
     fn test_routing_mode_is_pd_mode() {
@@ -640,7 +639,6 @@ mod tests {
 
     #[test]
     fn test_routing_mode_serialization() {
-        // Test Regular mode
         let regular = RoutingMode::Regular {
             worker_urls: vec!["http://worker1".to_string()],
         };
@@ -648,7 +646,6 @@ mod tests {
         assert!(json.contains("\"type\":\"regular\""));
         assert!(json.contains("\"worker_urls\""));
 
-        // Test PrefillDecode mode
         let pd = RoutingMode::PrefillDecode {
             prefill_urls: vec![("http://prefill1".to_string(), Some(8001))],
             decode_urls: vec!["http://decode1".to_string()],
@@ -660,8 +657,6 @@ mod tests {
         assert!(json.contains("\"prefill_urls\""));
         assert!(json.contains("\"decode_urls\""));
     }
-
-    // ============= PolicyConfig Tests =============
 
     #[test]
     fn test_policy_config_name() {
@@ -685,12 +680,10 @@ mod tests {
 
     #[test]
     fn test_policy_config_serialization() {
-        // Test Random
         let random = PolicyConfig::Random;
         let json = serde_json::to_string(&random).unwrap();
         assert_eq!(json, r#"{"type":"random"}"#);
 
-        // Test CacheAware with all parameters
         let cache_aware = PolicyConfig::CacheAware {
             cache_threshold: 0.8,
             balance_abs_threshold: 10,
@@ -703,7 +696,6 @@ mod tests {
         assert!(json.contains("\"cache_threshold\":0.8"));
         assert!(json.contains("\"balance_abs_threshold\":10"));
 
-        // Test PowerOfTwo
         let power_of_two = PolicyConfig::PowerOfTwo {
             load_check_interval_secs: 60,
         };
@@ -756,8 +748,6 @@ mod tests {
         }
     }
 
-    // ============= DiscoveryConfig Tests =============
-
     #[test]
     fn test_discovery_config_default() {
         let config = DiscoveryConfig::default();
@@ -798,14 +788,12 @@ mod tests {
 
     #[test]
     fn test_discovery_config_namespace() {
-        // Test None namespace (all namespaces)
         let config = DiscoveryConfig {
             namespace: None,
             ..Default::default()
         };
         assert!(config.namespace.is_none());
 
-        // Test specific namespace
         let config = DiscoveryConfig {
             namespace: Some("production".to_string()),
             ..Default::default()
@@ -813,14 +801,12 @@ mod tests {
         assert_eq!(config.namespace, Some("production".to_string()));
     }
 
-    // ============= MetricsConfig Tests =============
-
     #[test]
     fn test_metrics_config_default() {
         let config = MetricsConfig::default();
 
         assert_eq!(config.port, 29000);
-        assert_eq!(config.host, "127.0.0.1");
+        assert_eq!(config.host, "0.0.0.0");
     }
 
     #[test]
@@ -833,8 +819,6 @@ mod tests {
         assert_eq!(config.port, 9090);
         assert_eq!(config.host, "0.0.0.0");
     }
-
-    // ============= RouterConfig Utility Methods Tests =============
 
     #[test]
     fn test_mode_type() {
@@ -894,8 +878,6 @@ mod tests {
         assert!(config.has_metrics());
     }
 
-    // ============= Edge Cases =============
-
     #[test]
     fn test_large_worker_lists() {
         let large_urls: Vec<String> = (0..1000).map(|i| format!("http://worker{}", i)).collect();
@@ -906,7 +888,6 @@ mod tests {
 
         assert_eq!(mode.worker_count(), 1000);
 
-        // Test serialization with large list
         let config = RouterConfig {
             mode,
             ..Default::default()
@@ -960,8 +941,6 @@ mod tests {
         assert_eq!(config.log_dir, Some("".to_string()));
         assert_eq!(config.log_level, Some("".to_string()));
     }
-
-    // ============= Complex Configuration Tests =============
 
     #[test]
     fn test_full_pd_mode_config() {
@@ -1017,6 +996,8 @@ mod tests {
             tokenizer_path: None,
             history_backend: default_history_backend(),
             oracle: None,
+            reasoning_parser: None,
+            tool_call_parser: None,
         };
 
         assert!(config.mode.is_pd_mode());
@@ -1082,6 +1063,8 @@ mod tests {
             tokenizer_path: None,
             history_backend: default_history_backend(),
             oracle: None,
+            reasoning_parser: None,
+            tool_call_parser: None,
         };
 
         assert!(!config.mode.is_pd_mode());
@@ -1143,13 +1126,14 @@ mod tests {
             tokenizer_path: None,
             history_backend: default_history_backend(),
             oracle: None,
+            reasoning_parser: None,
+            tool_call_parser: None,
         };
 
         assert!(config.has_service_discovery());
         assert!(config.has_metrics());
         assert_eq!(config.mode_type(), "regular");
 
-        // Test round-trip serialization
         let json = serde_json::to_string_pretty(&config).unwrap();
         let deserialized: RouterConfig = serde_json::from_str(&json).unwrap();
 
@@ -1161,11 +1145,8 @@ mod tests {
         );
     }
 
-    // ============= Policy Fallback Tests =============
-
     #[test]
     fn test_pd_policy_fallback_both_specified() {
-        // When both prefill and decode policies are specified, they should be used
         let pd = RoutingMode::PrefillDecode {
             prefill_urls: vec![("http://prefill1".to_string(), None)],
             decode_urls: vec!["http://decode1".to_string()],
@@ -1183,21 +1164,19 @@ mod tests {
 
         let main_policy = PolicyConfig::Random;
 
-        // Both specific policies should be used
         match pd.get_prefill_policy(&main_policy) {
-            PolicyConfig::CacheAware { .. } => {} // Success
+            PolicyConfig::CacheAware { .. } => {}
             _ => panic!("Expected CacheAware for prefill"),
         }
 
         match pd.get_decode_policy(&main_policy) {
-            PolicyConfig::PowerOfTwo { .. } => {} // Success
+            PolicyConfig::PowerOfTwo { .. } => {}
             _ => panic!("Expected PowerOfTwo for decode"),
         }
     }
 
     #[test]
     fn test_pd_policy_fallback_only_prefill() {
-        // When only prefill policy is specified, decode should use main policy
         let pd = RoutingMode::PrefillDecode {
             prefill_urls: vec![("http://prefill1".to_string(), None)],
             decode_urls: vec!["http://decode1".to_string()],
@@ -1213,22 +1192,19 @@ mod tests {
 
         let main_policy = PolicyConfig::RoundRobin;
 
-        // Prefill should use specific policy
         match pd.get_prefill_policy(&main_policy) {
-            PolicyConfig::CacheAware { .. } => {} // Success
+            PolicyConfig::CacheAware { .. } => {}
             _ => panic!("Expected CacheAware for prefill"),
         }
 
-        // Decode should fall back to main policy
         match pd.get_decode_policy(&main_policy) {
-            PolicyConfig::RoundRobin => {} // Success
+            PolicyConfig::RoundRobin => {}
             _ => panic!("Expected RoundRobin for decode"),
         }
     }
 
     #[test]
     fn test_pd_policy_fallback_only_decode() {
-        // When only decode policy is specified, prefill should use main policy
         let pd = RoutingMode::PrefillDecode {
             prefill_urls: vec![("http://prefill1".to_string(), None)],
             decode_urls: vec!["http://decode1".to_string()],
@@ -1240,22 +1216,19 @@ mod tests {
 
         let main_policy = PolicyConfig::Random;
 
-        // Prefill should fall back to main policy
         match pd.get_prefill_policy(&main_policy) {
-            PolicyConfig::Random => {} // Success
+            PolicyConfig::Random => {}
             _ => panic!("Expected Random for prefill"),
         }
 
-        // Decode should use specific policy
         match pd.get_decode_policy(&main_policy) {
-            PolicyConfig::PowerOfTwo { .. } => {} // Success
+            PolicyConfig::PowerOfTwo { .. } => {}
             _ => panic!("Expected PowerOfTwo for decode"),
         }
     }
 
     #[test]
     fn test_pd_policy_fallback_none_specified() {
-        // When no specific policies are specified, both should use main policy
         let pd = RoutingMode::PrefillDecode {
             prefill_urls: vec![("http://prefill1".to_string(), None)],
             decode_urls: vec!["http://decode1".to_string()],
@@ -1271,7 +1244,6 @@ mod tests {
             max_tree_size: 2000,
         };
 
-        // Both should fall back to main policy
         match pd.get_prefill_policy(&main_policy) {
             PolicyConfig::CacheAware {
                 cache_threshold, ..
@@ -1293,21 +1265,19 @@ mod tests {
 
     #[test]
     fn test_regular_mode_policy_fallback() {
-        // For regular mode, the helper methods should just return the main policy
         let regular = RoutingMode::Regular {
             worker_urls: vec!["http://worker1".to_string()],
         };
 
         let main_policy = PolicyConfig::RoundRobin;
 
-        // Both methods should return main policy for regular mode
         match regular.get_prefill_policy(&main_policy) {
-            PolicyConfig::RoundRobin => {} // Success
+            PolicyConfig::RoundRobin => {}
             _ => panic!("Expected RoundRobin for regular mode"),
         }
 
         match regular.get_decode_policy(&main_policy) {
-            PolicyConfig::RoundRobin => {} // Success
+            PolicyConfig::RoundRobin => {}
             _ => panic!("Expected RoundRobin for regular mode"),
         }
     }
