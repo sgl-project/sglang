@@ -15,13 +15,13 @@ jobs:
                       platform: linux/amd64
                       build_type: all
                       grace_blackwell: 0
-                      tag: dev-x86
+                      tag: dev-cu13-x86
                       version: 13.0.2
                     - runner: arm-docker-build-node
                       platform: linux/arm64
                       build_type: all
                       grace_blackwell: 1
-                      tag: dev-arm64
+                      tag: dev-cu13-arm64
                       version: 13.0.2
         steps:
             - name: Delete huge unnecessary tools folder
@@ -71,7 +71,7 @@ jobs:
         strategy:
             matrix:
                 variant:
-                    - tag: dev
+                    - tag: dev-cu13
                       x86_tag: dev-cu13-x86
                       arm64_tag: dev-cu13-arm64
         steps:
