@@ -1675,6 +1675,8 @@ async def benchmark(
     use_trace_timestamps: bool = False,
     mooncake_slowdown_factor=1.0,
     mooncake_num_rounds=1,
+    profile_prefill_url: Optional[List[str]] = None,
+    profile_decode_url: Optional[List[str]] = None,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -1767,11 +1769,39 @@ async def benchmark(
     # Start profiler
     if profile:
         print("Starting profiler...")
-        profile_output = await async_request_profile(
-            api_url=base_url + "/start_profile"
-        )
-        if profile_output.success:
-            print("Profiler started")
+        if pd_separated:
+            profile_urls = []
+            if profile_prefill_url:
+                for idx, url in enumerate(profile_prefill_url):
+                    profile_urls.append((f"Prefill-{idx}", url))
+            if profile_decode_url:
+                for idx, url in enumerate(profile_decode_url):
+                    profile_urls.append((f"Decode-{idx}", url))
+
+            if not profile_urls:
+                print(
+                    "Warning: PD separated mode requires --profile-prefill-url or --profile-decode-url"
+                )
+                print(
+                    "Skipping profiler start. Please specify worker URLs for profiling."
+                )
+            else:
+                for worker_type, url in profile_urls:
+                    profile_output = await async_request_profile(
+                        api_url=url + "/start_profile"
+                    )
+                    if profile_output.success:
+                        print(f"Profiler started for {worker_type} worker at {url}")
+                    else:
+                        print(
+                            f"Failed to start profiler for {worker_type} worker at {url}: {profile_output.error}"
+                        )
+        else:
+            profile_output = await async_request_profile(
+                api_url=base_url + "/start_profile"
+            )
+            if profile_output.success:
+                print("Profiler started")
 
     # Run all requests
     benchmark_start_time = time.perf_counter()
@@ -1821,9 +1851,31 @@ async def benchmark(
     # Stop profiler
     if profile:
         print("Stopping profiler...")
-        profile_output = await async_request_profile(api_url=base_url + "/stop_profile")
-        if profile_output.success:
-            print("Profiler stopped")
+        if pd_separated:
+            profile_urls = []
+            if profile_prefill_url:
+                for idx, url in enumerate(profile_prefill_url):
+                    profile_urls.append((f"Prefill-{idx}", url))
+            if profile_decode_url:
+                for idx, url in enumerate(profile_decode_url):
+                    profile_urls.append((f"Decode-{idx}", url))
+
+            for worker_type, url in profile_urls:
+                profile_output = await async_request_profile(
+                    api_url=url + "/stop_profile"
+                )
+                if profile_output.success:
+                    print(f"Profiler stopped for {worker_type} worker at {url}")
+                else:
+                    print(
+                        f"Failed to stop profiler for {worker_type} worker at {url}: {profile_output.error}"
+                    )
+        else:
+            profile_output = await async_request_profile(
+                api_url=base_url + "/stop_profile"
+            )
+            if profile_output.success:
+                print("Profiler stopped")
 
     if pbar is not None:
         pbar.close()
@@ -2204,6 +2256,8 @@ def run_benchmark(args_: argparse.Namespace):
             use_trace_timestamps=args.use_trace_timestamps,
             mooncake_slowdown_factor=args.mooncake_slowdown_factor,
             mooncake_num_rounds=args.mooncake_num_rounds,
+            profile_prefill_url=getattr(args, "profile_prefill_url", None),
+            profile_decode_url=getattr(args, "profile_decode_url", None),
         )
     )
 
@@ -2428,6 +2482,30 @@ if __name__ == "__main__":
         "--pd-separated",
         action="store_true",
         help="Benchmark PD disaggregation server",
+    )
+
+    # Create a mutually exclusive group for profiling URLs
+    # In PD separated mode, prefill and decode workers must be profiled separately
+    profile_url_group = parser.add_mutually_exclusive_group()
+    profile_url_group.add_argument(
+        "--profile-prefill-url",
+        type=str,
+        nargs="*",
+        default=None,
+        help="URL(s) of the prefill worker(s) for profiling in PD separated mode. "
+        "Can specify multiple URLs: --profile-prefill-url http://localhost:30000 http://localhost:30001. "
+        "NOTE: Cannot be used together with --profile-decode-url. "
+        "In PD separated mode, prefill and decode workers must be profiled separately.",
+    )
+    profile_url_group.add_argument(
+        "--profile-decode-url",
+        type=str,
+        nargs="*",
+        default=None,
+        help="URL(s) of the decode worker(s) for profiling in PD separated mode. "
+        "Can specify multiple URLs: --profile-decode-url http://localhost:30010 http://localhost:30011. "
+        "NOTE: Cannot be used together with --profile-prefill-url. "
+        "In PD separated mode, prefill and decode workers must be profiled separately.",
     )
     parser.add_argument(
         "--flush-cache",
