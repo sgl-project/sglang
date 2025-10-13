@@ -85,7 +85,6 @@ from sglang.srt.layers.quantization.fp8_utils import (
     normalize_e4m3fn_to_e4m3fnuz,
     quant_weight_ue8m0,
     requant_weight_ue8m0_inplace,
-    transform_scale_ue8m0,
     transform_scale_ue8m0_inplace,
 )
 from sglang.srt.layers.quantization.int8_utils import (

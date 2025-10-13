@@ -448,7 +448,7 @@ def _requant_weight_ue8m0(
         weight_block_size=weight_block_size,
     )
 
-    out_s = transform_scale_ue8m0(out_s, mn=out_w.shape[-2])
+    out_s = _transform_scale_ue8m0(out_s, mn=out_w.shape[-2])
 
     return out_w, out_s
 
@@ -480,11 +480,11 @@ def quant_weight_ue8m0(
 
 
 def transform_scale_ue8m0_inplace(param, mn):
-    param.data = transform_scale_ue8m0(param.data, mn=mn)
+    param.data = _transform_scale_ue8m0(param.data, mn=mn)
 
 
 # NOTE copy and modified from DeepGEMM
-def transform_scale_ue8m0(sf, mn):
+def _transform_scale_ue8m0(sf, mn):
     import deep_gemm.utils.layout
 
     sf = sf.index_select(-2, torch.arange(mn, device=sf.device) // 128)
