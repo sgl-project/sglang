@@ -347,7 +347,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_idx = topk_idx.to(torch.int64)
         if (
             deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-            and not get_moe_runner_backend().is_cutlass_w4afp8()
+            and not get_moe_runner_backend().is_cutlass()
         ):
             # TODO hard code 128 block quant,use fp8 communication
             hidden_states = sglang_per_token_group_quant_fp8(
@@ -416,12 +416,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             previous_event=previous_event,
             async_finish=self.async_finish,
             allocate_on_comm_stream=(previous_event is not None) and self.async_finish,
-            expert_alignment=(
-                128
-                if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                and not get_moe_runner_backend().is_cutlass_w4afp8()
-                else 1
-            ),
+            expert_alignment=(128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM else 1),
             config=DeepEPConfig.get_instance().normal_dispatch_config,
         )
         get_global_expert_distribution_recorder().on_deepep_dispatch_normal(
@@ -446,6 +441,10 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_weights: torch.Tensor,
         overlap_args: Optional["CombineOverlapArgs"],
     ):
+        from sglang.srt.layers.moe.ep_moe.kernels import (
+            deepep_post_reorder_triton_kernel,
+        )
+
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM or _use_aiter:
             output = hidden_states
         else:
