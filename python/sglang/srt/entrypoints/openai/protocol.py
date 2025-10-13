@@ -221,6 +221,7 @@ class CompletionRequest(BaseModel):
     ebnf: Optional[str] = None
     repetition_penalty: float = 1.0
     stop_token_ids: Optional[List[int]] = None
+    stop_regex: Optional[Union[str, List[str]]] = None
     no_stop_trim: bool = False
     ignore_eos: bool = False
     skip_special_tokens: bool = True
@@ -474,6 +475,7 @@ class ChatCompletionRequest(BaseModel):
     ebnf: Optional[str] = None
     repetition_penalty: Optional[float] = None
     stop_token_ids: Optional[List[int]] = None
+    stop_regex: Optional[Union[str, List[str]]] = None
     no_stop_trim: bool = False
     ignore_eos: bool = False
     continue_final_message: bool = False
@@ -602,6 +604,7 @@ class ChatCompletionRequest(BaseModel):
             "min_new_tokens": self.min_tokens,
             "stop": stop,
             "stop_token_ids": self.stop_token_ids,
+            "stop_regex": self.stop_regex,
             "top_p": get_param("top_p"),
             "top_k": get_param("top_k"),
             "min_p": get_param("min_p"),
@@ -801,12 +804,50 @@ class RerankResponse(BaseModel):
     meta_info: Optional[dict] = None
 
 
+class TokenizeRequest(BaseModel):
+    """Request schema for the /tokenize endpoint."""
+
+    model: str = DEFAULT_MODEL_NAME
+    prompt: Union[str, List[str]]
+    add_special_tokens: bool = Field(
+        default=True,
+        description="whether to add model-specific special tokens (e.g. BOS/EOS) during encoding.",
+    )
+
+
+class TokenizeResponse(BaseModel):
+    """Response schema for the /tokenize endpoint."""
+
+    tokens: Union[List[int], List[List[int]]]
+    count: Union[int, List[int]]
+    max_model_len: int
+
+
+class DetokenizeRequest(BaseModel):
+    """Request schema for the /detokenize endpoint."""
+
+    model: str = DEFAULT_MODEL_NAME
+    tokens: Union[List[int], List[List[int]]]
+    skip_special_tokens: bool = Field(
+        default=True,
+        description="whether to exclude special tokens (e.g. padding or EOS) during decoding.",
+    )
+
+
+class DetokenizeResponse(BaseModel):
+    """Response schema for the /detokenize endpoint."""
+
+    text: Union[str, List[str]]
+
+
 OpenAIServingRequest = Union[
     ChatCompletionRequest,
     CompletionRequest,
     EmbeddingRequest,
     ScoringRequest,
     V1RerankReqInput,
+    TokenizeRequest,
+    DetokenizeRequest,
 ]
 
 

@@ -11,6 +11,7 @@ The SGLang Router is a high-performance request distribution system that routes 
 - **Kubernetes Integration**: Native service discovery and pod management
 - **Prefill-Decode Disaggregation**: Support for disaggregated serving load balancing
 - **Prometheus Metrics**: Built-in observability and monitoring
+- **Rate Limiter**: Token-bucket rate limiter to shield workers from overload
 
 ## Installation
 
@@ -228,6 +229,35 @@ python -m sglang_router.launch_router \
 - Worker is marked unhealthy after `cb-failure-threshold` consecutive failures
 - Returns to service after `cb-success-threshold` successful health checks
 - Circuit breaker can be disabled with `--disable-circuit-breaker`
+
+### Rate Limiter
+
+Use the token-bucket rate limiter to cap requests before they overwhelm downstream workers.
+
+- Enable rate limiting by setting `--max-concurrent-requests` to a positive integer. A bucket with that many tokens (concurrent leases) is created; `-1` keeps it disabled.
+- Optionally override the refill rate with `--rate-limit-tokens-per-second`. If omitted, the refill rate matches `max-concurrent-requests`.
+- Overflow traffic can wait in a FIFO queue controlled by:
+  - `--queue-size`: pending-request buffer (0 disables queuing; defaults to 100).
+  - `--queue-timeout-secs`: maximum wait time for queued requests before returning `429` (defaults to 60 seconds).
+
+Example:
+
+```bash
+python -m sglang_router.launch_router \
+    --worker-urls http://worker1:8000 http://worker2:8001 \
+    --max-concurrent-requests 256 \
+    --rate-limit-tokens-per-second 512 \
+    --queue-size 128 \
+    --queue-timeout-secs 30
+```
+
+**Behavior**:
+
+This configuration allows up to 256 concurrent requests, refills 512 tokens (requests) per second, and keeps up to 128 overflow requests queued for 30 seconds before timing out.
+
+**Responses**:
+- Returns **429** when the router cannot enqueue the request (queue disabled or full).
+- Returns **408** when a queued request waits longer than `--queue-timeout-secs` or no token becomes available before the timeout.
 
 ## Routing Policies
 

@@ -9,6 +9,7 @@ use axum::{
     Json, Router,
 };
 use serde_json::json;
+use sglang_router_rs::data_connector::MemoryConversationItemStorage;
 use sglang_router_rs::{
     config::{
         ConfigError, ConfigValidator, HistoryBackend, OracleConfig, RouterConfig, RoutingMode,
@@ -21,7 +22,7 @@ use sglang_router_rs::{
         ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateRequest, ResponseInput,
         ResponsesGetParams, ResponsesRequest, UserMessageContent,
     },
-    routers::{openai_router::OpenAIRouter, RouterTrait},
+    routers::{openai::OpenAIRouter, RouterTrait},
 };
 use std::collections::HashMap;
 use std::sync::{
@@ -95,6 +96,7 @@ async fn test_openai_router_creation() {
         None,
         Arc::new(MemoryResponseStorage::new()),
         Arc::new(MemoryConversationStorage::new()),
+        Arc::new(MemoryConversationItemStorage::new()),
     )
     .await;
 
@@ -113,6 +115,7 @@ async fn test_openai_router_server_info() {
         None,
         Arc::new(MemoryResponseStorage::new()),
         Arc::new(MemoryConversationStorage::new()),
+        Arc::new(MemoryConversationItemStorage::new()),
     )
     .await
     .unwrap();
@@ -143,6 +146,7 @@ async fn test_openai_router_models() {
         None,
         Arc::new(MemoryResponseStorage::new()),
         Arc::new(MemoryConversationStorage::new()),
+        Arc::new(MemoryConversationItemStorage::new()),
     )
     .await
     .unwrap();
@@ -222,6 +226,7 @@ async fn test_openai_router_responses_with_mock() {
         None,
         storage.clone(),
         Arc::new(MemoryConversationStorage::new()),
+        Arc::new(MemoryConversationItemStorage::new()),
     )
     .await
     .unwrap();
@@ -229,7 +234,7 @@ async fn test_openai_router_responses_with_mock() {
     let request1 = ResponsesRequest {
         model: Some("gpt-4o-mini".to_string()),
         input: ResponseInput::Text("Say hi".to_string()),
-        store: true,
+        store: Some(true),
         ..Default::default()
     };
 
@@ -245,7 +250,7 @@ async fn test_openai_router_responses_with_mock() {
     let request2 = ResponsesRequest {
         model: Some("gpt-4o-mini".to_string()),
         input: ResponseInput::Text("Thanks".to_string()),
-        store: true,
+        store: Some(true),
         previous_response_id: Some(resp1_id.clone()),
         ..Default::default()
     };
@@ -482,6 +487,7 @@ async fn test_openai_router_responses_streaming_with_mock() {
         None,
         storage.clone(),
         Arc::new(MemoryConversationStorage::new()),
+        Arc::new(MemoryConversationItemStorage::new()),
     )
     .await
     .unwrap();
@@ -495,8 +501,8 @@ async fn test_openai_router_responses_streaming_with_mock() {
         instructions: Some("Be kind".to_string()),
         metadata: Some(metadata),
         previous_response_id: Some("resp_prev_chain".to_string()),
-        store: true,
-        stream: true,
+        store: Some(true),
+        stream: Some(true),
         ..Default::default()
     };
 
@@ -586,6 +592,7 @@ async fn test_unsupported_endpoints() {
         None,
         Arc::new(MemoryResponseStorage::new()),
         Arc::new(MemoryConversationStorage::new()),
+        Arc::new(MemoryConversationItemStorage::new()),
     )
     .await
     .unwrap();
@@ -627,6 +634,7 @@ async fn test_openai_router_chat_completion_with_mock() {
         None,
         Arc::new(MemoryResponseStorage::new()),
         Arc::new(MemoryConversationStorage::new()),
+        Arc::new(MemoryConversationItemStorage::new()),
     )
     .await
     .unwrap();
@@ -669,6 +677,7 @@ async fn test_openai_e2e_with_server() {
         None,
         Arc::new(MemoryResponseStorage::new()),
         Arc::new(MemoryConversationStorage::new()),
+        Arc::new(MemoryConversationItemStorage::new()),
     )
     .await
     .unwrap();
@@ -739,6 +748,7 @@ async fn test_openai_router_chat_streaming_with_mock() {
         None,
         Arc::new(MemoryResponseStorage::new()),
         Arc::new(MemoryConversationStorage::new()),
+        Arc::new(MemoryConversationItemStorage::new()),
     )
     .await
     .unwrap();
@@ -792,6 +802,7 @@ async fn test_openai_router_circuit_breaker() {
         Some(cb_config),
         Arc::new(MemoryResponseStorage::new()),
         Arc::new(MemoryConversationStorage::new()),
+        Arc::new(MemoryConversationItemStorage::new()),
     )
     .await
     .unwrap();
@@ -820,6 +831,7 @@ async fn test_openai_router_models_auth_forwarding() {
         None,
         Arc::new(MemoryResponseStorage::new()),
         Arc::new(MemoryConversationStorage::new()),
+        Arc::new(MemoryConversationItemStorage::new()),
     )
     .await
     .unwrap();

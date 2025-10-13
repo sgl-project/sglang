@@ -1,6 +1,5 @@
 import json
 import os
-import time
 import unittest
 from types import SimpleNamespace
 
@@ -40,10 +39,9 @@ class TestDisaggregationAccuracy(TestDisaggregationBase):
             "--disaggregation-mode",
             "prefill",
             "--tp",
-            "2",
-            "--disaggregation-ib-device",
-            "mlx5_roce0,mlx5_roce1",
+            "1",
         ]
+        prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
             cls.model,
             cls.prefill_url,
@@ -58,12 +56,11 @@ class TestDisaggregationAccuracy(TestDisaggregationBase):
             "--disaggregation-mode",
             "decode",
             "--tp",
-            "2",
+            "1",
             "--base-gpu-id",
-            "2",
-            "--disaggregation-ib-device",
-            "mlx5_roce2,mlx5_roce3",
+            "1",
         ]
+        decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
             cls.model,
             cls.decode_url,
@@ -171,10 +168,9 @@ class TestDisaggregationMooncakeFailure(TestDisaggregationBase):
             "--disaggregation-mode",
             "prefill",
             "--tp",
-            "2",
-            "--disaggregation-ib-device",
-            "mlx5_roce0,mlx5_roce1",
+            "1",
         ]
+        prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
             cls.model,
             cls.prefill_url,
@@ -189,12 +185,11 @@ class TestDisaggregationMooncakeFailure(TestDisaggregationBase):
             "--disaggregation-mode",
             "decode",
             "--tp",
-            "2",
+            "1",
             "--base-gpu-id",
-            "2",
-            "--disaggregation-ib-device",
-            "mlx5_roce2,mlx5_roce3",
+            "1",
         ]
+        decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
             cls.model,
             cls.decode_url,
@@ -270,10 +265,9 @@ class TestDisaggregationMooncakeSpec(TestDisaggregationBase):
             "--disaggregation-mode",
             "prefill",
             "--tp",
-            "2",
-            "--disaggregation-ib-device",
-            "mlx5_roce0,mlx5_roce1",
+            "1",
         ] + cls.spec_args
+        prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
             cls.model,
             cls.prefill_url,
@@ -288,12 +282,11 @@ class TestDisaggregationMooncakeSpec(TestDisaggregationBase):
             "--disaggregation-mode",
             "decode",
             "--tp",
-            "2",
+            "1",
             "--base-gpu-id",
-            "2",
-            "--disaggregation-ib-device",
-            "mlx5_roce2,mlx5_roce3",
+            "1",
         ] + cls.spec_args
+        decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
             cls.model,
             cls.decode_url,
@@ -346,10 +339,9 @@ class TestDisaggregationSimulatedRetract(TestDisaggregationBase):
             "--disaggregation-mode",
             "prefill",
             "--tp",
-            "2",
-            "--disaggregation-ib-device",
-            "mlx5_roce0,mlx5_roce1",
+            "1",
         ]
+        prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
             cls.model,
             cls.prefill_url,
@@ -364,12 +356,11 @@ class TestDisaggregationSimulatedRetract(TestDisaggregationBase):
             "--disaggregation-mode",
             "decode",
             "--tp",
-            "2",
+            "1",
             "--base-gpu-id",
-            "2",
-            "--disaggregation-ib-device",
-            "mlx5_roce2,mlx5_roce3",
+            "1",
         ]
+        decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
             cls.model,
             cls.decode_url,
