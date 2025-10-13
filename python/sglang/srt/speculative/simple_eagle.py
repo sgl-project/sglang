@@ -6,9 +6,9 @@ from typing import List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
-from huggingface_hub import snapshot_download
 import triton
 import triton.language as tl
+from huggingface_hub import snapshot_download
 
 from sglang.srt.distributed import GroupCoordinator, patch_tensor_parallel_group
 from sglang.srt.layers.dp_attention import disable_dp_size
@@ -32,7 +32,10 @@ from sglang.srt.speculative.simple_eagle_cuda_graph_runner import (
     SimpleEAGLECudaGraphRunner,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.spec_utils import assign_req_to_token_pool,create_draft_kv_indices
+from sglang.srt.speculative.spec_utils import (
+    assign_req_to_token_pool,
+    create_draft_kv_indices,
+)
 from sglang.srt.utils import (
     empty_context,
     fast_topk,
@@ -48,7 +51,7 @@ logger = logging.getLogger(__name__)
 
 
 @triton.jit
-def align_evict_mask_to_page_size_simple_eagle( 
+def align_evict_mask_to_page_size_simple_eagle(
     out_cache_loc,
     evict_mask,
     page_size: tl.constexpr,
@@ -61,22 +64,25 @@ def align_evict_mask_to_page_size_simple_eagle(
 
     loc_ptr = out_cache_loc + bid * num_draft_tokens
     mask_ptr = evict_mask + bid * num_draft_tokens
-    
+
     slot_locs = tl.load(loc_ptr + t_range, mask=io_mask, other=0)
     page_ids = slot_locs // page_size
 
     is_on_protected_page = tl.zeros((BLOCK_SIZE,), dtype=tl.int1)
     for i in range(0, BLOCK_SIZE):
         if i < num_draft_tokens:
-            is_accepted_scalar = (tl.load(mask_ptr + i) == 0)
+            is_accepted_scalar = tl.load(mask_ptr + i) == 0
             page_id_scalar = tl.load(loc_ptr + i) // page_size
             protected_page_candidate = tl.where(is_accepted_scalar, page_id_scalar, -1)
-            is_on_protected_page = is_on_protected_page | (page_ids == protected_page_candidate)
-            
+            is_on_protected_page = is_on_protected_page | (
+                page_ids == protected_page_candidate
+            )
+
     initial_evict_mask = tl.load(mask_ptr + t_range, mask=io_mask, other=True)
     final_evict_mask = initial_evict_mask & (~is_on_protected_page)
-    
+
     tl.store(mask_ptr+t_range, final_evict_mask, mask=io_mask)
+
 
 @contextmanager
 def draft_tp_context(tp_group: GroupCoordinator):
