@@ -280,6 +280,7 @@ def test_deterministic(args):
         len_prefix = [1, 2048, 10000, 20000]
         num_prompts = len(len_prefix)
         outputs = {i: [] for i in range(4)}
+        assert all(i <= len(LONG_PROMPT) for i in len_prefix)
         prompts = [LONG_PROMPT[: len_prefix[i]] for i in range(4)]
         for i in range(args.n_start, args.n_start + args.n_trials):
             batch_size = i
