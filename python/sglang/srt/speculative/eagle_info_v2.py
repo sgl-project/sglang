@@ -11,6 +11,7 @@ import triton.language as tl
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
+from sglang.srt.managers.scheduler import global_server_args_dict
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -18,7 +19,6 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.build_eagle_tree import TreeMaskMode
 from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
@@ -265,8 +265,12 @@ class EagleVerifyInputV2Mixin:
                 uniform_samples_for_final_sampling=coins_for_final_sampling,
                 target_probs=target_probs,
                 draft_probs=draft_probs,
-                threshold_single=get_global_server_args().speculative_accept_threshold_single,
-                threshold_acc=get_global_server_args().speculative_accept_threshold_acc,
+                threshold_single=global_server_args_dict[
+                    "speculative_accept_threshold_single"
+                ],
+                threshold_acc=global_server_args_dict[
+                    "speculative_accept_threshold_acc"
+                ],
                 deterministic=True,
             )
 

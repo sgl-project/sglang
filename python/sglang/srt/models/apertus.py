@@ -46,14 +46,15 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     kv_cache_scales_loader,
     maybe_remap_kv_scale_name,
 )
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, make_layers
+from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
 
@@ -446,7 +447,7 @@ class ApertusForCausalLM(nn.Module):
                 config.hidden_size,
                 quant_config=quant_config,
                 prefix=add_prefix("lm_head", prefix),
-                use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+                use_attn_tp_group=global_server_args_dict["enable_dp_lm_head"],
             )
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)

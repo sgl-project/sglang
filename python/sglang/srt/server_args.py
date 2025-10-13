@@ -53,7 +53,6 @@ from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
 
-
 # Define constants
 LOAD_FORMAT_CHOICES = [
     "auto",
@@ -3324,22 +3323,6 @@ class ServerArgs:
         )
 
 
-# NOTE: This is a global variable to hold the server args for scheduler.
-_global_server_args: Optional[ServerArgs] = None
-
-
-def set_global_server_args_for_scheduler(server_args: ServerArgs):
-    global _global_server_args
-    _global_server_args = server_args
-
-
-def get_global_server_args() -> ServerArgs:
-    if _global_server_args is None:
-        raise ValueError("Global server args is not set yet!")
-
-    return _global_server_args
-
-
 def prepare_server_args(argv: List[str]) -> ServerArgs:
     """
     Prepare the server arguments from the command line arguments.
@@ -3374,8 +3357,8 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
     raw_args = parser.parse_args(argv)
-
-    return ServerArgs.from_cli_args(raw_args)
+    server_args = ServerArgs.from_cli_args(raw_args)
+    return server_args
 
 
 ZMQ_TCP_PORT_DELTA = 233
