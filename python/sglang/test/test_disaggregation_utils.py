@@ -110,7 +110,7 @@ def get_rdma_devices_args():
     def _pick_default_pair(rdma_all_devices):
         return [rdma_all_devices[0], rdma_all_devices[len(rdma_all_devices) // 2]]
 
-    rdma_all_devices = _parse_list_env("SGLANG_RDMA_ALL_DEVICES") or [
+    rdma_all_devices = _parse_list_env("SGLANG_CI_RDMA_ALL_DEVICES") or [
         f"mlx5_roce{i}" for i in range(8)
     ]
 
