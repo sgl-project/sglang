@@ -1,6 +1,8 @@
 import unittest
 from types import SimpleNamespace
 
+import requests
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
@@ -39,6 +41,33 @@ class TestAWQ(CustomTestCase):
 
         metrics = run_eval(args)
         self.assertGreater(metrics["score"], 0.64)
+
+
+class TestAWQMarlinBfloat16(CustomTestCase):
+    """
+    Verify that the model can be loaded with bfloat16 dtype and awq_marlin quantization
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=["--dtype", "bfloat16", "--quantization", "awq_marlin"],
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_verify_model_info(self):
+        response = requests.get(f"{self.base_url}/get_model_info")
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(data["model_path"], self.model)
 
 
 if __name__ == "__main__":
