@@ -321,8 +321,6 @@ class SchedulerDisaggregationPrefillMixin:
         self.result_queue = deque()
 
         while True:
-            self.launch_last_batch_sample_if_needed()
-
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             self.waiting_queue.extend(
@@ -334,9 +332,11 @@ class SchedulerDisaggregationPrefillMixin:
             if require_mlp_sync(self.server_args):
                 batch = self.prepare_mlp_sync_batch(batch)
             self.cur_batch = batch
+
+            batch_result = None
             if batch:
-                result = self.run_batch(batch)
-                self.result_queue.append((batch.copy(), result))
+                batch_result = self.run_batch(batch)
+                self.result_queue.append((batch.copy(), batch_result))
 
             if self.last_batch:
                 tmp_batch, tmp_result = self.result_queue.popleft()
@@ -344,6 +344,8 @@ class SchedulerDisaggregationPrefillMixin:
 
             if len(self.disagg_prefill_inflight_queue) > 0:
                 self.process_disagg_prefill_inflight_queue()
+
+            self.launch_batch_sample_if_needed(batch_result)
 
             if batch is None and len(self.disagg_prefill_inflight_queue) == 0:
                 self.self_check_during_idle()
