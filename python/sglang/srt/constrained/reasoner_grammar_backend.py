@@ -21,17 +21,61 @@ from .base_grammar_backend import BaseGrammarBackend, BaseGrammarObject
 
 
 class ReasonerGrammarObject(BaseGrammarObject):
-    def __init__(self, grammar: BaseGrammarObject, think_end_id):
+    def __init__(
+        self,
+        grammar: BaseGrammarObject,
+        think_end_id: Optional[int],
+        think_start_ids: Optional[List[int]] = None,
+        initial_in_reasoning: bool = True,
+    ):
         super().__init__()
         self.grammar = grammar
         self.think_end_id = think_end_id
-        self.is_in_reasoning = True
+        self.think_start_ids = tuple(think_start_ids or [])
+        self.is_in_reasoning = initial_in_reasoning
+        self._start_match_index = 0
+        self._pending_start_tokens: List[int] = []
+
+    def set_initial_reasoning_state(self, is_in_reasoning: bool):
+        self.is_in_reasoning = bool(is_in_reasoning)
+        self._start_match_index = 0
+        self._pending_start_tokens.clear()
 
     def accept_token(self, token: int):
-        if token == self.think_end_id:
+        if self.think_end_id is not None and token == self.think_end_id:
             self.is_in_reasoning = False
+            self._start_match_index = 0
+            self._pending_start_tokens.clear()
+            return
 
-        if not self.is_in_reasoning and token != self.think_end_id:
+        if self.is_in_reasoning:
+            return
+
+        if self.think_start_ids:
+            expected = self.think_start_ids[self._start_match_index]
+            if token == expected:
+                self._pending_start_tokens.append(token)
+                self._start_match_index += 1
+                if self._start_match_index == len(self.think_start_ids):
+                    # We have fully matched the start token sequence; enter reasoning.
+                    self.is_in_reasoning = True
+                    self._start_match_index = 0
+                    self._pending_start_tokens.clear()
+                    return
+            else:
+                if self._start_match_index > 0:
+                    # Flush previously buffered tokens since the sequence broke.
+                    for buffered_token in self._pending_start_tokens:
+                        self.grammar.accept_token(buffered_token)
+                    self._pending_start_tokens.clear()
+                    self._start_match_index = 0
+                    # The current token might be the first token of the sequence again.
+                    if token == self.think_start_ids[0]:
+                        self._pending_start_tokens.append(token)
+                        self._start_match_index = 1
+                        return
+
+        if self._start_match_index == 0:
             self.grammar.accept_token(token)
 
     def allocate_vocab_mask(
@@ -51,7 +95,15 @@ class ReasonerGrammarObject(BaseGrammarObject):
         return self.grammar.apply_vocab_mask
 
     def copy(self) -> BaseGrammarObject:
-        return ReasonerGrammarObject(self.grammar.copy(), self.think_end_id)
+        copied = ReasonerGrammarObject(
+            self.grammar.copy(),
+            self.think_end_id,
+            list(self.think_start_ids),
+            self.is_in_reasoning,
+        )
+        copied._start_match_index = self._start_match_index
+        copied._pending_start_tokens = list(self._pending_start_tokens)
+        return copied
 
     @property
     def finished(self):
@@ -76,10 +128,18 @@ class ReasonerGrammarObject(BaseGrammarObject):
 
 
 class ReasonerGrammarBackend(BaseGrammarBackend):
-    def __init__(self, grammar_backend: BaseGrammarBackend, think_end_id):
+    def __init__(
+        self,
+        grammar_backend: BaseGrammarBackend,
+        think_end_id: Optional[int],
+        think_start_ids: Optional[List[int]] = None,
+        initial_in_reasoning: bool = True,
+    ):
         super().__init__()
         self.grammar_backend = grammar_backend
         self.think_end_id = think_end_id
+        self.think_start_ids = think_start_ids or []
+        self.initial_in_reasoning = initial_in_reasoning
 
     def _init_value_dispatch(
         self, key: Tuple[str, str]
@@ -87,4 +147,11 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
         ret = self.grammar_backend._init_value_dispatch(key)
         if ret is None:
             return None
-        return ReasonerGrammarObject(ret, self.think_end_id)
+        if self.think_end_id is None:
+            return ret
+        return ReasonerGrammarObject(
+            ret,
+            self.think_end_id,
+            self.think_start_ids,
+            self.initial_in_reasoning,
+        )
