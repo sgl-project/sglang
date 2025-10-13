@@ -2957,7 +2957,10 @@ class DeepseekV2ForCausalLM(nn.Module):
                     cur_quant_config = self.quant_config.DeepSeekFP8Config
                 else:
                     cur_quant_config = self.quant_config
-                if hasattr(cur_quant_config, "weight_block_size"):
+                if (
+                    hasattr(cur_quant_config, "weight_block_size")
+                    and cur_quant_config.weight_block_size is not None
+                ):
                     weight_block_size = cur_quant_config.weight_block_size
                     if weight_block_size is not None:
                         assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
