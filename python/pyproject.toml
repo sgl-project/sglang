@@ -101,7 +101,7 @@ cu130 = [
   "torchvision==0.24.0",
 ]
 cu130_all = [
-  "sglang[test]".
+  "sglang[test]",
   "sglang[decord]",
   "sglang[cu130]"
 ]
