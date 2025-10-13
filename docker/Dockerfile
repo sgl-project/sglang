@@ -90,12 +90,15 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5li
       13.0.2) CUINDEX=130 ;; \
       *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
- && if [ "$CUDA_VERSION" = "12.6.1" ]; then \
-      python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}+cu124-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps ; \
-    fi \
- && if [ "$CUDA_VERSION" = "12.8.1" ] || [ "$CUDA_VERSION" = "12.9.1" ] || [ "$CUDA_VERSION" = "13.0.2" ]; then \
-      python3 -m pip install --no-cache-dir sgl-kernel==${SGL_KERNEL_VERSION} ; \
-    fi \
+&& if [ "$CUDA_VERSION" = "12.6.1" ]; then \
+     python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}+cu124-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps ; \
+   fi \
+&& if [ "$CUDA_VERSION" = "12.8.1" ] || [ "$CUDA_VERSION" = "12.9.1" ]; then \
+     python3 -m pip install --no-cache-dir sgl-kernel==${SGL_KERNEL_VERSION} ; \
+   fi \
+&& if [ "$CUDA_VERSION" = "13.0.2" ]; then \
+     python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}+cu130-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps ; \
+   fi \
  && python3 -m pip install --no-cache-dir -e "python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
  && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
       python3 -m pip install --no-cache-dir nvidia-nccl-cu12==2.28.3 --force-reinstall --no-deps ; \
