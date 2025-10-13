@@ -1399,24 +1399,31 @@ class NSATokenToKVPool(MLATokenToKVPool):
         assert index_head_dim == 128
 
         assert self.page_size == 64
-        self.index_k_with_scale_buffer = [
-            torch.zeros(
-                # Layout:
-                #     ref: test_attention.py :: kv_cache_cast_to_fp8
-                #     shape: (num_pages, page_size 64 * head_dim 128 + page_size 64 * fp32_nbytes 4)
-                #     data: for page i,
-                #         * buf[i, :page_size * head_dim] for fp8 data
-                #         * buf[i, page_size * head_dim:].view(float32) for scale
-                (
-                    (size + page_size + 1) // self.page_size,
-                    self.page_size
-                    * (index_head_dim + index_head_dim // self.quant_block_size * 4),
-                ),
-                dtype=self.index_k_with_scale_buffer_dtype,
-                device=device,
-            )
-            for _ in range(layer_num)
-        ]
+        with (
+            torch.cuda.use_mem_pool(self.custom_mem_pool)
+            if self.custom_mem_pool
+            else nullcontext()
+        ):
+            self.index_k_with_scale_buffer = [
+                torch.zeros(
+                    # Layout:
+                    #     ref: test_attention.py :: kv_cache_cast_to_fp8
+                    #     shape: (num_pages, page_size 64 * head_dim 128 + page_size 64 * fp32_nbytes 4)
+                    #     data: for page i,
+                    #         * buf[i, :page_size * head_dim] for fp8 data
+                    #         * buf[i, page_size * head_dim:].view(float32) for scale
+                    (
+                        (size + page_size + 1) // self.page_size,
+                        self.page_size
+                        * (
+                            index_head_dim + index_head_dim // self.quant_block_size * 4
+                        ),
+                    ),
+                    dtype=self.index_k_with_scale_buffer_dtype,
+                    device=device,
+                )
+                for _ in range(layer_num)
+            ]
         self._finalize_allocation_log(size)
 
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
