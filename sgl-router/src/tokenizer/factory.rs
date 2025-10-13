@@ -44,6 +44,31 @@ pub fn create_tokenizer_with_chat_template(
         return Err(Error::msg(format!("File not found: {}", file_path)));
     }
 
+    // If path is a directory, search for tokenizer files
+    if path.is_dir() {
+        let tokenizer_json = path.join("tokenizer.json");
+        if tokenizer_json.exists() {
+            let chat_template_path = chat_template_path
+                .map(|s| s.to_string())
+                .or_else(|| discover_chat_template_in_dir(path));
+            let tokenizer_path_str = tokenizer_json.to_str().ok_or_else(|| {
+                Error::msg(format!(
+                    "Tokenizer path is not valid UTF-8: {:?}",
+                    tokenizer_json
+                ))
+            })?;
+            return create_tokenizer_with_chat_template(
+                tokenizer_path_str,
+                chat_template_path.as_deref(),
+            );
+        }
+
+        return Err(Error::msg(format!(
+            "Directory '{}' does not contain a valid tokenizer file (tokenizer.json, tokenizer_config.json, or vocab.json)",
+            file_path
+        )));
+    }
+
     // Try to determine tokenizer type from extension
     let extension = path
         .extension()
