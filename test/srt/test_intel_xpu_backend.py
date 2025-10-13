@@ -1,6 +1,6 @@
 """
 Usage:
-python3 -m unittest test_intel_amx_attention_backend.TestIntelAMXAttnBackend.test_mmlu
+python3 -m unittest test_intel_xpu_backend.TestIntelAMXAttnBackend.test_latency_qwen_model
 """
 
 import os
