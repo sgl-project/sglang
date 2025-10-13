@@ -426,6 +426,11 @@ curl -X POST http://localhost:8080/add_worker?url=http://worker3:8000&api_key=wo
 #### Authentication
 - `--api-key`: API key for router authentication (clients must provide this as Bearer token)
 
+#### Concurrency and Rate Limiting
+- `--queue-size`: Size of the pending-request queue when concurrency limits are reached (default: 100; set to 0 to disable queuing)
+- `--queue-timeout-secs`: Maximum time a request may wait in the queue before timing out (default: 60; must be > 0 when queue is enabled)
+- `--rate-limit-tokens-per-second`: Override token bucket refill rate for rate limiting (defaults to `--max-concurrent-requests` when omitted)
+
 ## Development
 
 ### Build Process

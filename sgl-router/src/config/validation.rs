@@ -205,6 +205,24 @@ impl ConfigValidator {
             });
         }
 
+        if config.queue_size > 0 && config.queue_timeout_secs == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "queue_timeout_secs".to_string(),
+                value: config.queue_timeout_secs.to_string(),
+                reason: "Must be > 0 when queue_size > 0".to_string(),
+            });
+        }
+
+        if let Some(tokens_per_second) = config.rate_limit_tokens_per_second {
+            if tokens_per_second <= 0 {
+                return Err(ConfigError::InvalidValue {
+                    field: "rate_limit_tokens_per_second".to_string(),
+                    value: tokens_per_second.to_string(),
+                    reason: "Must be > 0 when specified".to_string(),
+                });
+            }
+        }
+
         if config.worker_startup_timeout_secs == 0 {
             return Err(ConfigError::InvalidValue {
                 field: "worker_startup_timeout_secs".to_string(),
