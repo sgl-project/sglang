@@ -103,6 +103,7 @@ def run_eval(args):
         categories = args.categories.split(",") if args.categories else None
 
         eval_obj = LongBenchV2Eval(
+            model=args.model,
             data_source=data_source,
             num_examples=args.num_examples,
             num_threads=args.num_threads,
