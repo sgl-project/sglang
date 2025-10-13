@@ -257,16 +257,16 @@ pub async fn start_service_discovery(
                 }
             });
 
-            let tracked_pods_clone2 = Arc::clone(&tracked_pods_clone);
             let app_context_clone = Arc::clone(&app_context);
-            let config_clone2 = Arc::clone(&config_arc);
+            let config_clone = Arc::clone(&config_arc);
             let connection_mode_clone = Arc::clone(&connection_mode_arc);
 
             match filtered_stream
                 .try_for_each(move |pod| {
-                    let tracked_pods_inner = Arc::clone(&tracked_pods_clone2);
+                    // `tracked_pods_clone` is from L241 and is captured by this `move` closure.
+                    let tracked_pods_inner = Arc::clone(&tracked_pods_clone);
                     let app_context_inner = Arc::clone(&app_context_clone);
-                    let config_inner = Arc::clone(&config_clone2);
+                    let config_inner = Arc::clone(&config_clone);
                     let connection_mode_inner = Arc::clone(&connection_mode_clone);
 
                     async move {
