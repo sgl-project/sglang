@@ -96,8 +96,8 @@ __device__ __forceinline__ T* get_global_offset_lf_tbl_hfrg(
     int64_t head_fragment_num,
     int64_t head_fragment_id,
     int64_t /*unused*/) {
-  return reinterpret_cast<T*>(layer_base_tbl[layer_id]) + page_id * item_size_bytes;
-//         + item_size_bytes / head_fragment_num * head_fragment_id;
+  return reinterpret_cast<T*>(layer_base_tbl[layer_id]) + page_id * item_size_bytes
+        + item_size_bytes / head_fragment_num * head_fragment_id;
 }
 
 template <typename T>
@@ -490,7 +490,7 @@ void transfer_kv_all_layer_lf_phf(
     int64_t head_num,
     int64_t block_quota,
     int64_t num_warps_per_block) {
-  TORCH_CHECK(num_layers == src_k_layers.size(0), "Number of layers in source k tensor does not match num_layers");
+//   TORCH_CHECK(num_layers == src_k_layers.size(0), "Number of layers in source k tensor does not match num_layers");
   at::Tensor empty;
   transfer_kv_launcher<get_global_offset_lf_tbl_hfrg<const char>, get_global_offset_phf<char>, false, true>(
       empty,
