@@ -853,19 +853,28 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states.device
             )
 
-        final_hidden_states, sbo_shared_output = self.experts(
+        if self._fuse_shared_experts_inside_sbo:
+            shared_output = None
+
+            def _forward_shared_experts_and_put_results():
+                nonlocal shared_output
+                shared_output = self._forward_shared_experts(hidden_states)
+
+        final_hidden_states = self.experts(
             hidden_states=hidden_states,
             topk_idx=topk_idx,
             topk_weights=topk_weights,
             forward_batch=forward_batch,
             # SBO args
-            forward_shared_experts=lambda: self._forward_shared_experts(hidden_states),
+            forward_shared_experts=(
+                _forward_shared_experts_and_put_results
+                if self._fuse_shared_experts_inside_sbo
+                else None
+            ),
             alt_stream=self.alt_stream,
             # SBO is not yet implemented for NextN
             disable_sbo=self.is_nextn,
         )
-        if sbo_shared_output is not None:
-            shared_output = sbo_shared_output
 
         if shared_output is not None:
             x = shared_output
