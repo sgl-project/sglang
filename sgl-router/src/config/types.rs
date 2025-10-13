@@ -169,6 +169,15 @@ pub enum ConnectionMode {
     Grpc,
 }
 
+impl ConnectionMode {
+    pub fn protocol(&self) -> &'static str {
+        match self {
+            ConnectionMode::Http => "http",
+            ConnectionMode::Grpc => "grpc",
+        }
+    }
+}
+
 /// Routing mode configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -659,6 +668,12 @@ mod tests {
         assert!(json.contains("\"type\":\"prefill_decode\""));
         assert!(json.contains("\"prefill_urls\""));
         assert!(json.contains("\"decode_urls\""));
+    }
+
+    #[test]
+    fn test_connection_mode_protocol() {
+        assert_eq!(ConnectionMode::Http.protocol(), "http");
+        assert_eq!(ConnectionMode::Grpc.protocol(), "grpc");
     }
 
     #[test]
