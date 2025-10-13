@@ -6,9 +6,6 @@
 class GlobalConfig:
     """
     Store some global constants.
-
-    See also python/sglang/srt/managers/schedule_batch.py::global_server_args_dict, which stores
-    many global runtime arguments as well.
     """
 
     def __init__(self):

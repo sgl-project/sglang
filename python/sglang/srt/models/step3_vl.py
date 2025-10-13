@@ -57,7 +57,6 @@ from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
     MultimodalInputs,
-    global_server_args_dict,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -300,7 +299,7 @@ class Step3TextDecoderLayer(nn.Module):
         # self.n_shared_experts = 1
         # self.num_fused_shared_experts = (
         #     0
-        #     if global_server_args_dict["disable_shared_experts_fusion"]
+        #     if global_server_args.disable_shared_experts_fusion
         #     else self.n_shared_experts
         # )
         self.num_fused_shared_experts = 0
@@ -774,7 +773,7 @@ class Step3VLForConditionalGeneration(nn.Module):
         # self.n_shared_experts = 1
         # self.num_fused_shared_experts = (
         #     0
-        #     if global_server_args_dict["disable_shared_experts_fusion"]
+        #     if global_server_args.disable_shared_experts_fusion
         #     else self.n_shared_experts
         # )
         self.num_fused_shared_experts = 0

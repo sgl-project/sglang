@@ -17,7 +17,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-""" SGLang BailingMoE model."""
+"""SGLang BailingMoE model."""
 import logging
 from typing import Any, Dict, Iterable, Optional, Tuple, Union
 
@@ -68,7 +68,6 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -76,6 +75,7 @@ from sglang.srt.models.utils import (
     create_fused_set_kv_buffer_arg,
     enable_fused_set_kv_buffer,
 )
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, is_cuda, is_non_idle_and_non_empty, make_layers
 
 LoraConfig = None
@@ -204,8 +204,8 @@ class BailingMoESparseMoeBlock(nn.Module):
         else:
             self.router_dtype = torch.bfloat16
 
-        # TODO global_server_args_dict["ep_num_redundant_experts"] is used for eplb, not supported now
-        assert global_server_args_dict["ep_num_redundant_experts"] == 0
+        # TODO global_server_args.ep_num_redundant_experts is used for eplb, not supported now
+        assert get_global_server_args().ep_num_redundant_experts == 0
         # check group topk
         self.num_expert_group = getattr(config, "n_group", 0)
         self.topk_group = getattr(config, "topk_group", 0)
@@ -220,7 +220,7 @@ class BailingMoESparseMoeBlock(nn.Module):
             self.use_grouped_topk = False
 
         self.num_experts = (
-            config.num_experts + global_server_args_dict["ep_num_redundant_experts"]
+            config.num_experts + get_global_server_args().ep_num_redundant_experts
         )
 
         self.gate = BailingMoEGate(
@@ -824,7 +824,7 @@ class BailingMoEForCausalLM(nn.Module):
                 config.hidden_size,
                 quant_config=quant_config,
                 prefix=add_prefix("lm_head", prefix),
-                use_attn_tp_group=global_server_args_dict["enable_dp_lm_head"],
+                use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
             )
         self.logits_processor = LogitsProcessor(config)
 
