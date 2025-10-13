@@ -46,7 +46,7 @@ dependencies = [
   "py-spy",
   "pybase64",
   "pydantic",
-  "pynvml",
+  "nvidia-ml-py",
   "python-multipart",
   "pyzmq>=25.1.2",
   "requests",
@@ -73,7 +73,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-decord = ["decord"]
+decord = ["decord2"]
 test = [
   "accelerate",
   "expecttest",
@@ -93,11 +93,21 @@ tracing = [
   "opentelemetry-sdk",
 ]
 all = ["sglang[test]", "sglang[decord]"]
-all_aarch64 = ["sglang[test]"]
-dev = ["sglang[test]", "sglang[decord]"]
+cu130 = [
+  "torch==2.9.0",
+  "torchaudio==2.9.0",
+  "torchvision==0.24.0",
+]
+cu130_all = [
+  "sglang[test]",
+  "sglang[decord]",
+  "sglang[cu130]"
+]
 
 
 # The following will be deprecated in 2 weeks
+dev = ["sglang[test]", "sglang[decord]"]
+all_aarch64 = ["sglang[test]"]
 blackwell = ["sglang[test]", "sglang[decord]"]
 blackwell_aarch64 = ["sglang[test]"]
 
