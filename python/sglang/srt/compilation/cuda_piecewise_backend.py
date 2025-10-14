@@ -9,11 +9,9 @@ from unittest.mock import patch
 import torch
 import torch.fx as fx
 
-import sglang.srt.model_executor.compilation.weak_ref_tensor_jit
-from sglang.srt.model_executor.compilation.compilation_config import CompilationConfig
-from sglang.srt.model_executor.compilation.compilation_counter import (
-    compilation_counter,
-)
+import sglang.srt.compilation.weak_ref_tensor_jit
+from sglang.srt.compilation.compilation_config import CompilationConfig
+from sglang.srt.compilation.compilation_counter import compilation_counter
 
 logger = logging.getLogger(__name__)
 

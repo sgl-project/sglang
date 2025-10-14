@@ -20,14 +20,12 @@ from typing import TYPE_CHECKING, Optional
 import torch
 from torch import nn
 
+from sglang.srt.compilation.piecewise_context_manager import get_forward_context
+from sglang.srt.utils import direct_register_custom_op
+
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-
-from sglang.srt.model_executor.compilation.piecewise_context_manager import (
-    get_forward_context,
-)
-from sglang.srt.utils import direct_register_custom_op
 
 
 class AttentionType(Enum):
@@ -112,7 +110,7 @@ class RadixAttention(nn.Module):
                 k = k.view(-1, self.tp_k_head_num, self.v_head_dim)
 
         if forward_batch.forward_mode.is_extend() and get_forward_context() is not None:
-            output = torch.zeros_like(q)
+            output = torch.empty_like(q)
             torch.ops.sglang.unified_attention_with_output(
                 q, k, v, output, save_kv_cache, self.layer_id
             )
