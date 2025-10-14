@@ -119,7 +119,7 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
         top_p: None,
         truncation: Some(Truncation::Disabled),
         user: None,
-        request_id: "resp_test_mcp_e2e".to_string(),
+        request_id: Some("resp_test_mcp_e2e".to_string()),
         priority: 0,
         frequency_penalty: Some(0.0),
         presence_penalty: Some(0.0),
@@ -367,7 +367,7 @@ fn test_responses_request_creation() {
         top_p: Some(0.9),
         truncation: Some(Truncation::Disabled),
         user: Some("test-user".to_string()),
-        request_id: "resp_test123".to_string(),
+        request_id: Some("resp_test123".to_string()),
         priority: 0,
         frequency_penalty: Some(0.0),
         presence_penalty: Some(0.0),
@@ -409,7 +409,7 @@ fn test_responses_request_sglang_extensions() {
         top_p: Some(0.95),
         truncation: Some(Truncation::Auto),
         user: None,
-        request_id: "resp_test456".to_string(),
+        request_id: Some("resp_test456".to_string()),
         priority: 0,
         frequency_penalty: Some(0.1),
         presence_penalty: Some(0.2),
@@ -530,7 +530,7 @@ fn test_json_serialization() {
         top_p: Some(0.8),
         truncation: Some(Truncation::Auto),
         user: Some("test_user".to_string()),
-        request_id: "resp_comprehensive_test".to_string(),
+        request_id: Some("resp_comprehensive_test".to_string()),
         priority: 1,
         frequency_penalty: Some(0.3),
         presence_penalty: Some(0.4),
@@ -545,7 +545,7 @@ fn test_json_serialization() {
     let parsed: ResponsesRequest =
         serde_json::from_str(&json).expect("Deserialization should work");
 
-    assert_eq!(parsed.request_id, "resp_comprehensive_test");
+    assert_eq!(parsed.request_id, Some("resp_comprehensive_test".to_string()));
     assert_eq!(parsed.model, Some("gpt-4".to_string()));
     assert_eq!(parsed.background, Some(true));
     assert_eq!(parsed.stream, Some(true));
@@ -659,7 +659,7 @@ async fn test_multi_turn_loop_with_mcp() {
         top_p: Some(1.0),
         truncation: Some(Truncation::Disabled),
         user: None,
-        request_id: "resp_multi_turn_test".to_string(),
+        request_id: Some("resp_multi_turn_test".to_string()),
         priority: 0,
         frequency_penalty: Some(0.0),
         presence_penalty: Some(0.0),
@@ -834,7 +834,7 @@ async fn test_max_tool_calls_limit() {
         top_p: Some(1.0),
         truncation: Some(Truncation::Disabled),
         user: None,
-        request_id: "resp_max_calls_test".to_string(),
+        request_id: Some("resp_max_calls_test".to_string()),
         priority: 0,
         frequency_penalty: Some(0.0),
         presence_penalty: Some(0.0),
@@ -1031,7 +1031,7 @@ async fn test_streaming_with_mcp_tool_calls() {
         top_p: Some(1.0),
         truncation: Some(Truncation::Disabled),
         user: None,
-        request_id: "resp_streaming_mcp_test".to_string(),
+        request_id: Some("resp_streaming_mcp_test".to_string()),
         priority: 0,
         frequency_penalty: Some(0.0),
         presence_penalty: Some(0.0),
@@ -1310,7 +1310,7 @@ async fn test_streaming_multi_turn_with_mcp() {
         top_p: Some(1.0),
         truncation: Some(Truncation::Disabled),
         user: None,
-        request_id: "resp_streaming_multiturn_test".to_string(),
+        request_id: Some("resp_streaming_multiturn_test".to_string()),
         priority: 0,
         frequency_penalty: Some(0.0),
         presence_penalty: Some(0.0),

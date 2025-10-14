@@ -1372,10 +1372,6 @@ impl ResponsesUsage {
     }
 }
 
-fn generate_request_id() -> String {
-    format!("resp_{}", uuid::Uuid::new_v4().simple())
-}
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ResponsesRequest {
     /// Run the request in the background
@@ -1465,9 +1461,9 @@ pub struct ResponsesRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
 
-    /// Request ID
-    #[serde(default = "generate_request_id")]
-    pub request_id: String,
+    /// Request ID (injected by middleware if not provided)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
 
     /// Request priority
     #[serde(default)]
@@ -1541,7 +1537,7 @@ impl Default for ResponsesRequest {
             top_p: None,
             truncation: None,
             user: None,
-            request_id: generate_request_id(),
+            request_id: None,
             priority: 0,
             frequency_penalty: None,
             presence_penalty: None,
@@ -1733,7 +1729,7 @@ impl ResponsesResponse {
         usage: Option<UsageInfo>,
     ) -> Self {
         Self {
-            id: request.request_id.clone(),
+            id: request.request_id.clone().expect("request_id should be set by middleware"),
             object: "response".to_string(),
             created_at: created_time,
             status,
