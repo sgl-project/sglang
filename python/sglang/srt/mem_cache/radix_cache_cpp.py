@@ -154,7 +154,9 @@ class RadixCacheCpp(BasePrefixCache):
     def cache_finished_req(self, req: Req, is_insert: bool = True):
         """Cache request when it finishes."""
         assert req.req_pool_idx is not None
-        token_ids = (req.origin_input_ids + req.output_ids)[:-1]
+        # token_ids = (req.origin_input_ids + req.output_ids)[:-1]
+        all_token_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+        token_ids = (req.origin_input_ids + req.output_ids)[:all_token_len]
         overall_len = len(token_ids)  # prefill + decode
         kv_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx, :overall_len]
 
