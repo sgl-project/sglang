@@ -57,41 +57,41 @@ def _copy_unified_indices_kernel(
     Each thread block processes one sequence with vectorized loads/stores.
     """
     pid = tl.program_id(0)
-    
+
     if pid >= bs:
         return
-    
+
     # Load sequence info
     prefix_start = tl.load(prefix_kv_indptr + pid)
     prefix_end = tl.load(prefix_kv_indptr + pid + 1)
     extend_start = tl.load(extend_start_loc + pid)
     extend_len = tl.load(extend_seq_lens + pid)
-    
+
     prefix_len = prefix_end - prefix_start
     unified_start = tl.load(unified_kv_indptr + pid)
-    
+
     # Copy indices in vectorized chunks
     BLOCK_SIZE: tl.constexpr = 128
-    
+
     # Process prefix indices
     for block_start in range(0, prefix_len, BLOCK_SIZE):
         offs = block_start + tl.arange(0, BLOCK_SIZE)
         mask = offs < prefix_len
-        
+
         src_idx = prefix_start + offs
         dst_idx = unified_start + offs
-        
+
         vals = tl.load(prefix_kv_indices + src_idx, mask=mask, other=0)
         tl.store(unified_kv_indices + dst_idx, vals, mask=mask)
-    
+
     # Process extend indices
     for block_start in range(0, extend_len, BLOCK_SIZE):
         offs = block_start + tl.arange(0, BLOCK_SIZE)
         mask = offs < extend_len
-        
+
         src_idx = extend_start + offs
         dst_idx = unified_start + prefix_len + offs
-        
+
         vals = tl.load(extend_kv_indices + src_idx, mask=mask, other=0)
         tl.store(unified_kv_indices + dst_idx, vals, mask=mask)
 
@@ -108,26 +108,25 @@ def build_unified_kv_indices(
     Build unified KV indices efficiently:
     - Use PyTorch's optimized cumsum (NVIDIA CUB) for indptr
     - Use Triton kernel for parallel index copying
-    
+
     Returns:
         (unified_kv_indptr, unified_kv_indices, prefix_lens)
     """
     device = prefix_kv_indptr.device
 
-    prefix_lens = prefix_kv_indptr[1:bs+1] - prefix_kv_indptr[:bs]
-    
+    prefix_lens = prefix_kv_indptr[1 : bs + 1] - prefix_kv_indptr[:bs]
+
     unified_kv_indptr = torch.empty(bs + 1, dtype=torch.int32, device=device)
     unified_kv_indptr[0] = 0
     unified_kv_indptr[1:] = prefix_lens + extend_seq_lens[:bs]
-    
+
     # Compute cumsum in-place
     torch.cumsum(unified_kv_indptr[1:], dim=0, out=unified_kv_indptr[1:])
-    
-  
+
     max_unified_len = len(prefix_kv_indices) + len(extend_kv_indices)
-    
+
     unified_kv_indices = torch.empty(max_unified_len, dtype=torch.int64, device=device)
-    
+
     # Launch Triton kernel for parallel index copying
     _copy_unified_indices_kernel[(bs,)](
         prefix_kv_indptr,
@@ -139,7 +138,7 @@ def build_unified_kv_indices(
         unified_kv_indices,
         bs,
     )
-    
+
     return unified_kv_indptr, unified_kv_indices, prefix_lens
 
 

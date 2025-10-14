@@ -881,16 +881,18 @@ class TritonAttnBackend(AttentionBackend):
 
         # Build unified kv_indices using fused Triton kernel
         extend_kv_indices = forward_batch.out_cache_loc
-        
-        unified_kv_indptr, unified_kv_indices, prefix_lens = self.build_unified_kv_indices(
-            prefix_kv_indptr,
-            prefix_kv_indices,
-            forward_batch.extend_start_loc,
-            forward_batch.extend_seq_lens,
-            extend_kv_indices,
-            bs,
+
+        unified_kv_indptr, unified_kv_indices, prefix_lens = (
+            self.build_unified_kv_indices(
+                prefix_kv_indptr,
+                prefix_kv_indices,
+                forward_batch.extend_start_loc,
+                forward_batch.extend_seq_lens,
+                extend_kv_indices,
+                bs,
+            )
         )
-        
+
         # Convert prefix_lens to int32 for the kernel
         prefix_lens = prefix_lens.to(torch.int32)
 
