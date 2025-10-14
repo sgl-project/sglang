@@ -181,6 +181,12 @@ class BaseTpWorker(ABC):
     def can_run_lora_batch(self, lora_ids: list[str]) -> bool:
         return self.model_runner.lora_manager.validate_lora_batch(lora_ids)
 
+    def forward_batch_embedding(self, model_worker_batch: ModelWorkerBatch):
+        forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+        logits_output, _ = self.model_runner.forward(forward_batch)
+        embeddings = logits_output.embeddings
+        return embeddings
+
 
 class TpModelWorker(BaseTpWorker):
     """A tensor parallel model worker."""
@@ -409,9 +415,3 @@ class TpModelWorker(BaseTpWorker):
                 pp_hidden_states_proxy_tensors=pp_proxy_tensors,
                 can_run_cuda_graph=can_run_cuda_graph,
             )
-
-    def forward_batch_embedding(self, model_worker_batch: ModelWorkerBatch):
-        forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
-        logits_output, _ = self.model_runner.forward(forward_batch)
-        embeddings = logits_output.embeddings
-        return embeddings
