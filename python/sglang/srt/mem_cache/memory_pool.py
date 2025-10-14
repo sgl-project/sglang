@@ -22,8 +22,6 @@ from sglang.srt.layers.attention.nsa import index_buf_accessor
 from sglang.srt.layers.attention.nsa.quant_k_cache import quantize_k_cache
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
-from benchmark.hf3fs.bench_zerocopy import device
-
 """
 Memory pool.
 
