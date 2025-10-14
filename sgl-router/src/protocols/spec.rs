@@ -58,22 +58,22 @@ fn default_model() -> String {
 //    - Helper functions
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(untagged)]
+#[serde(tag = "role")]
 pub enum ChatMessage {
+    #[serde(rename = "system")]
     System {
-        role: String,
         content: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         name: Option<String>,
     },
+    #[serde(rename = "user")]
     User {
-        role: String, // "user"
         content: UserMessageContent,
         #[serde(skip_serializing_if = "Option::is_none")]
         name: Option<String>,
     },
+    #[serde(rename = "assistant")]
     Assistant {
-        role: String, // "assistant"
         #[serde(skip_serializing_if = "Option::is_none")]
         content: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -84,13 +84,13 @@ pub enum ChatMessage {
         #[serde(skip_serializing_if = "Option::is_none")]
         reasoning_content: Option<String>,
     },
+    #[serde(rename = "tool")]
     Tool {
-        role: String, // "tool"
         content: String,
         tool_call_id: String,
     },
+    #[serde(rename = "function")]
     Function {
-        role: String, // "function"
         content: String,
         name: String,
     },
@@ -498,9 +498,9 @@ fn validate_chat_cross_parameters(
         req.ebnf.is_some(),
         matches!(req.response_format, Some(ResponseFormat::JsonSchema { .. })),
     ]
-    .iter()
-    .filter(|&&x| x)
-    .count();
+        .iter()
+        .filter(|&&x| x)
+        .count();
 
     if constraint_count > 1 {
         return Err(validator::ValidationError::new(
