@@ -12,6 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
+import os
 import random
 from dataclasses import dataclass
 from typing import Literal, Optional
@@ -21,7 +22,8 @@ import torch
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.server_args import get_global_server_args
 
-DUMMY_MAX_TOPK_SHAPE = (256, 8)  # (max batch size, topk)
+max_batch_size = int(os.getenv("MAX_BATCH_SIZE", 256))
+DUMMY_MAX_TOPK_SHAPE = (max_batch_size, 8)  # (max batch size, topk)
 
 
 @dataclass
@@ -51,7 +53,7 @@ class ExpertLocationDispatchInfo:
             node_rank = get_global_server_args().node_rank
             device = get_global_server_args().device
             num_physical_experts = expert_location_metadata.num_physical_experts
-            dispatch_node = get_global_server_args().fake_node
+            dispatch_node = get_global_server_args().ep_dispatch_fake_num_node
             dummy_topk_ids_shape = DUMMY_MAX_TOPK_SHAPE
             balanced_tensor = generate_balanced_expert_selection(
                 dummy_topk_ids_shape,
