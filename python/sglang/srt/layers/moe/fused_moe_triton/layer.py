@@ -806,7 +806,7 @@ class FusedMoE(torch.nn.Module):
                 f"Unsupported weight_name {weight_name} for FusedMoE weight_loader_fused. Nothing is loaded."
             )
 
-    def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
+    def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput, **kwargs):
         origin_hidden_states_dim = hidden_states.shape[-1]
         assert self.quant_method is not None
 
@@ -831,6 +831,7 @@ class FusedMoE(torch.nn.Module):
         combine_input = self.quant_method.apply(
             layer=self,
             dispatch_output=dispatch_output,
+            **kwargs,
         )
 
         final_hidden_states = self.dispatcher.combine(combine_input)
