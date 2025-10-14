@@ -453,7 +453,7 @@ class _attention(torch.autograd.Function):
         E_FBLOCK = e // NUM_FBLOCK
         assert e % NUM_FBLOCK == 0
 
-        CBLOCK = 64
+        CBLOCK = 32
         NUM_CBLOCK = BLOCK // CBLOCK
         assert BLOCK % CBLOCK == 0, "BLOCK must be a multiple of CBLOCK"
 
