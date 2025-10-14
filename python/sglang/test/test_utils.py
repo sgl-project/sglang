@@ -121,7 +121,7 @@ def is_in_ci():
 
 def is_in_amd_ci():
     """Return whether it is in an AMD CI runner."""
-    return get_bool_env_var("SGLANG_AMD_CI")
+    return get_bool_env_var("SGLANG_IS_IN_CI_AMD")
 
 
 def _use_cached_default_models(model_repo: str):
