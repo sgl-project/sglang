@@ -173,11 +173,8 @@ class RadixCacheCpp(BasePrefixCache):
             if old_prefix_len < new_prefix_len:
                 self.token_to_kv_pool.free(kv_indices[old_prefix_len:new_prefix_len])
         else:
-            match_result = self.match_prefix(RadixKey(token_ids, req.extra_key))
-            new_prefix_len = len(match_result.device_indices)
-            # Free everything beyond the match since we're not inserting
             self.token_to_kv_pool.free(
-                kv_indices[new_prefix_len:page_aligned_overall_len]
+                kv_indices[old_prefix_len:page_aligned_overall_len]
             )
 
         # need to free the unaligned part, since it cannot be inserted into the radix tree

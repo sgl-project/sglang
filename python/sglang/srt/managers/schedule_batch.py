@@ -1455,6 +1455,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             idx = sorted_indices.pop()
             req = self.reqs[idx]
             retracted_reqs.append(req)
+            # release memory and don't insert into the tree because we need the space instantly
             self.release_req(idx, len(sorted_indices), server_args)
 
             if len(retracted_reqs) == 0:
@@ -1484,7 +1485,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.offload_kv_cache(
                 self.req_to_token_pool, self.token_to_kv_pool_allocator
             )
-        # release memory and don't insert into the tree because we need the space
+        # TODO (csy): for preempted requests, we may want to insert into the tree
         self.tree_cache.cache_finished_req(req, is_insert=False)
         # NOTE(lsyin): we should use the newly evictable memory instantly.
         num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
