@@ -615,7 +615,7 @@ class ModelRunner:
 
         if (
             not self.use_mla_backend
-            and server_args.attention_backend
+            or server_args.attention_backend
             not in CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS
         ):
             server_args.disable_chunked_prefix_cache = True
