@@ -224,7 +224,29 @@ python -m sglang_router.launch_router \
     --cb-window-duration-secs 60
 ```
 
-![Circuit Breaker](../_static/image/sgl-router-circuit-breaker.jpg)
+```mermaid
+flowchart TD
+    Closed(["Closed"])
+    Open(["Open"])
+    HalfOpen(["HalfOpen"])
+
+    Closed -- "Consecutive Failures >=<br/>cb-failure-threshold" --> Open;
+    Closed --> HalfOpen;
+    linkStyle 1 stroke:transparent;
+    Open -- "After cb-timeout-duration-secs" --> HalfOpen;
+    HalfOpen -- "Fail any test request" --> Open;
+    HalfOpen -- "After cb-success-threshold<br/>test requests" --> Closed;
+    Closed -- "Failures < cb-failure-threshold" --> Closed;
+    
+    %% --- Node Styling ---
+    classDef closed fill:#dff0d8,stroke:#3c763d,stroke-width:2px;
+    classDef open fill:#f2dede,stroke:#a94442,stroke-width:2px;
+    classDef halfopen fill:#fcf8e3,stroke:#8a6d3b,stroke-width:2px;
+    
+    class Closed closed;
+    class Open open;
+    class HalfOpen halfopen;
+```
 
 **Behavior**:
 - Worker is marked unhealthy after `cb-failure-threshold` consecutive failures
