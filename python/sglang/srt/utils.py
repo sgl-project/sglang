@@ -1507,6 +1507,32 @@ def get_npu_memory_capacity():
         raise ImportError("torch_npu is required when run on npu device.")
 
 
+def get_cpu_memory_capacity():
+    # Per-rank memory capacity cannot be determined for customized core settings
+    if os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", ""):
+        return None
+    n_numa_node: int = len(get_cpu_ids_by_node())
+    if n_numa_node == 0:
+        # Cannot determine NUMA config, fallback to total memory and avoid ZeroDivisionError.
+        return float(psutil.virtual_memory().total // (1 << 20))
+    try:
+        numa_mem_list = list()
+        file_prefix = "/sys/devices/system/node/"
+        for numa_id in range(n_numa_node):
+            file_meminfo = f"node{numa_id}/meminfo"
+            with open(os.path.join(file_prefix, file_meminfo), "r") as f:
+                # 1st line contains 'MemTotal'
+                line = f.read().split("\n")[0]
+                numa_mem_list.append(int(line.split()[3]))
+        # Retrieved value in KB, need MB
+        numa_mem = float(min(numa_mem_list) // 1024)
+        return numa_mem
+    except FileNotFoundError:
+        numa_mem = psutil.virtual_memory().total / n_numa_node
+        # Retrieved value in Byte, need MB
+        return float(numa_mem // (1 << 20))
+
+
 def get_device_memory_capacity(device: str = None):
     if is_cuda():
         gpu_mem = get_nvgpu_memory_capacity()
@@ -1516,6 +1542,8 @@ def get_device_memory_capacity(device: str = None):
         gpu_mem = get_hpu_memory_capacity()
     elif device == "npu":
         gpu_mem = get_npu_memory_capacity()
+    elif device == "cpu":
+        gpu_mem = get_cpu_memory_capacity()
     else:
         # GPU memory is not known yet or no GPU is available.
         gpu_mem = None

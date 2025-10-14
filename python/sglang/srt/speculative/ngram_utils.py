@@ -405,7 +405,7 @@ class NgramVerifyInput:
 
         return logits_output, self.verified_id, self.accept_length.sum().item()
 
-    def filter_batch(self, new_indices: torch.Tensor):
+    def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
         pass
 
     def merge_batch(self, spec_info: NgramVerifyInput):

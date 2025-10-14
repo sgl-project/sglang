@@ -36,6 +36,20 @@ logger = logging.getLogger(__name__)
 HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
 
 
+def _run_scheduler_with_signal_handling(*args, **kwargs):
+    """
+    Wrapper for run_scheduler_process that ignores SIGINT.
+
+    The scheduler process should not handle Ctrl+C - it should only terminate
+    when the parent gRPC server exits (via kill_itself_when_parent_died).
+    """
+    # Ignore SIGINT in this subprocess - let the parent handle it
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+    # Now run the actual scheduler process
+    run_scheduler_process(*args, **kwargs)
+
+
 def _launch_scheduler_process_only(
     server_args: ServerArgs,
     port_args: Optional[PortArgs] = None,
@@ -88,7 +102,7 @@ def _launch_scheduler_process_only(
                 )
                 moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
                 proc = mp.Process(
-                    target=run_scheduler_process,
+                    target=_run_scheduler_with_signal_handling,
                     args=(
                         server_args,
                         port_args,
@@ -676,19 +690,28 @@ async def serve_grpc(
         await stop_event.wait()
     finally:
         logger.info("Shutting down gRPC server")
+
+        # Shutdown request manager first - this closes ZMQ sockets and stops background tasks
         await servicer.shutdown()
+
+        # Stop the gRPC server
         await server.stop(5.0)
 
-        # Terminate scheduler processes
+        # Terminate scheduler processes before exiting to avoid atexit hang
+        # The scheduler processes have SIGINT ignored, so they won't get KeyboardInterrupt
         for i, proc in enumerate(scheduler_procs):
-            if proc and proc.is_alive():
+            if proc.is_alive():
                 logger.info(f"Terminating scheduler process {i}...")
                 proc.terminate()
-                proc.join(timeout=5.0)
+                proc.join(timeout=2.0)
                 if proc.is_alive():
-                    logger.warning(f"Force killing scheduler process {i}...")
+                    logger.warning(
+                        f"Scheduler process {i} did not terminate, killing..."
+                    )
                     proc.kill()
-                    proc.join()
+                    proc.join(timeout=1.0)
+
+        logger.info("All scheduler processes terminated")
 
 
 def main():

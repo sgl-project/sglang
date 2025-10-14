@@ -116,16 +116,16 @@ class GrpcRequestManager:
         self.port_args = port_args
 
         # ZMQ Communication Setup (same pattern as TokenizerManager)
-        context = zmq.asyncio.Context(2)
+        self.context = zmq.asyncio.Context(2)
 
         # Socket for receiving outputs from scheduler
         self.recv_from_scheduler = get_zmq_socket(
-            context, zmq.PULL, port_args.detokenizer_ipc_name, bind=True
+            self.context, zmq.PULL, port_args.detokenizer_ipc_name, bind=True
         )
 
         # Socket for sending requests to scheduler
         self.send_to_scheduler = get_zmq_socket(
-            context, zmq.PUSH, port_args.scheduler_input_ipc_name, bind=True
+            self.context, zmq.PUSH, port_args.scheduler_input_ipc_name, bind=True
         )
 
         # State Management (from TokenizerManager)
@@ -472,6 +472,15 @@ class GrpcRequestManager:
                 if self.gracefully_exit:
                     break
                 continue
+            except zmq.error.ZMQError as e:
+                # Socket closed or other ZMQ error - exit cleanly if shutting down
+                if self.gracefully_exit:
+                    logger.debug(f"ZMQ recv interrupted during shutdown: {e}")
+                    break
+                logger.error(
+                    f"ZMQ error in handle loop: {e}\n{get_exception_traceback()}"
+                )
+                break
             except Exception as e:
                 logger.error(f"Handle loop error: {e}\n{get_exception_traceback()}")
                 if self.gracefully_exit:
@@ -722,8 +731,17 @@ class GrpcRequestManager:
         logger.info("Shutting down GrpcRequestManager")
         self.gracefully_exit = True
 
+        # Cancel all asyncio tasks FIRST - this will interrupt blocked recv() calls
+        for task in list(self.asyncio_tasks):
+            if not task.done():
+                task.cancel()
+
+        # Give tasks a moment to process cancellation
+        if self.asyncio_tasks:
+            await asyncio.gather(*list(self.asyncio_tasks), return_exceptions=True)
+
         # Cancel all pending requests
-        for rid, state in self.rid_to_state.items():
+        for rid, state in list(self.rid_to_state.items()):
             if not state.finished:
                 await state.out_queue.put(
                     {"error": "Server shutting down", "shutdown": True}
@@ -731,13 +749,12 @@ class GrpcRequestManager:
                 state.finished = True
                 state.event.set()
 
-        # Wait for tasks to complete
-        if self.asyncio_tasks:
-            await asyncio.gather(*list(self.asyncio_tasks), return_exceptions=True)
-
         # Close ZMQ sockets
         self.recv_from_scheduler.close()
         self.send_to_scheduler.close()
+
+        # Terminate the ZMQ context - this is critical for asyncio loop to exit cleanly
+        self.context.term()
 
         logger.info("GrpcRequestManager shutdown complete")
 
