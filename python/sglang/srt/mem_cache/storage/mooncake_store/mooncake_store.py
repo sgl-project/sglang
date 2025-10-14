@@ -275,10 +275,10 @@ class MooncakeStore(HiCacheStorage):
         set_buffer_ptrs = []
         set_buffer_sizes = []
         set_indices = []
-        set_results = [-1] * len(keys)
-        for i in range(len(keys)):
+        set_results = [-1] * len(key_strs)
+        for i in range(len(key_strs)):
             if exist_result[i] != 1:
-                set_keys.append(keys[i])
+                set_keys.append(key_strs[i])
                 set_buffer_ptrs.append(buffer_ptrs[i])
                 set_buffer_sizes.append(buffer_sizes[i])
                 set_indices.append(i)
@@ -288,7 +288,7 @@ class MooncakeStore(HiCacheStorage):
         # Only set non-existing keys to storage
         if len(set_keys) > 0:
             put_results = self._put_batch_zero_copy_impl(
-                key_strs, buffer_ptrs, buffer_sizes
+                set_keys, set_buffer_ptrs, set_buffer_sizes
             )
             for i in range(len(set_indices)):
                 set_results[set_indices[i]] = put_results[i]
