@@ -200,10 +200,56 @@ mod test_pd_routing {
                 tool_call_parser: None,
             };
 
-            let app_context =
-                sglang_router_rs::server::AppContext::new(config, reqwest::Client::new(), 64, None)
-                    .expect("Failed to create AppContext");
-            let app_context = std::sync::Arc::new(app_context);
+            let app_context = {
+                use sglang_router_rs::core::{LoadMonitor, WorkerRegistry};
+                use sglang_router_rs::data_connector::{
+                    MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
+                };
+                use sglang_router_rs::middleware::TokenBucket;
+                use sglang_router_rs::policies::PolicyRegistry;
+                use std::sync::{Arc, OnceLock};
+
+                let client = reqwest::Client::new();
+
+                // Initialize rate limiter
+                let rate_limiter = Some(Arc::new(TokenBucket::new(64, 64)));
+
+                // Initialize registries
+                let worker_registry = Arc::new(WorkerRegistry::new());
+                let policy_registry = Arc::new(PolicyRegistry::new(config.policy.clone()));
+
+                // Initialize storage backends
+                let response_storage = Arc::new(MemoryResponseStorage::new());
+                let conversation_storage = Arc::new(MemoryConversationStorage::new());
+                let conversation_item_storage = Arc::new(MemoryConversationItemStorage::new());
+
+                // Initialize load monitor
+                let load_monitor = Some(Arc::new(LoadMonitor::new(
+                    worker_registry.clone(),
+                    policy_registry.clone(),
+                    client.clone(),
+                    config.worker_startup_check_interval_secs,
+                )));
+
+                // Create empty OnceLock for worker job queue
+                let worker_job_queue = Arc::new(OnceLock::new());
+
+                Arc::new(sglang_router_rs::server::AppContext::new(
+                    config,
+                    client,
+                    rate_limiter,
+                    None, // tokenizer
+                    None, // reasoning_parser_factory
+                    None, // tool_parser_factory
+                    worker_registry,
+                    policy_registry,
+                    response_storage,
+                    conversation_storage,
+                    conversation_item_storage,
+                    load_monitor,
+                    worker_job_queue,
+                ))
+            };
             let result = RouterFactory::create_router(&app_context).await;
             assert!(
                 result.is_ok(),

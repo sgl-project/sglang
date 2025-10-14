@@ -83,9 +83,14 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
       - run: |
+          SHORT_SHA="${{ github.sha }}"
           docker buildx imagetools create \
             -t lmsysorg/sglang:${{ matrix.variant.tag }} \
+<<<<<<< HEAD
             -t lmsysorg/sglang:nightly-${{ matrix.variant.tag }}-$(date +%Y%m%d)-${GITHUB_SHA:0:8} \
+=======
+            -t lmsysorg/sglang:nightly-${{ matrix.variant.tag }}-$(date +%Y%m%d)-${SHORT_SHA:0:8} \
+>>>>>>> main
             lmsysorg/sglang:${{ matrix.variant.x86_tag }} \
             lmsysorg/sglang:${{ matrix.variant.arm64_tag }}
 
