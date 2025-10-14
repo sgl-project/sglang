@@ -33,7 +33,9 @@ The support matrix is split into two parts: MHA (standard attention) and MLA (mu
 | **FlashInfer MLA**         | 1                         | ✅               | ✅                       | ✅              | ❌              |
 | **FlashMLA**               | 64                        | ❌               | ✅                       | ✅              | ❌              |
 | **Cutlass MLA**            | 128                       | ✅               | ✅                       | ✅              | ❌              |
-| **TRTLLM MLA (Blackwell)** | 32 or 64                  | ✅               | ✅                       | ✅              | ✅              |
+| **TRTLLM MLA (Blackwell)** | 32 or 64                  | ✅               | ✅                       | ✅              | ❌              |
+| **FA3 (FlashAttention 3)** | n/a                       | ✅               | ✅                       | ✅              | ⚠️ (page_size=1 only) |
+| **Triton**                 | n/a                       | ❌               | ✅                       | ✅              | ⚠️ (page_size=1 only) |
 | **FA4**                    | n/a                       | ❌               | ❌                       | ❌              | ❌              |
 | **Ascend MLA (NPU)**       | 128                       | ❌               | ✅                       | ❌              | ❌              |
 
