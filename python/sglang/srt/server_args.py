@@ -13,6 +13,8 @@
 # ==============================================================================
 """The arguments of the server."""
 
+from __future__ import annotations
+
 import argparse
 import dataclasses
 import json
@@ -21,6 +23,8 @@ import os
 import random
 import tempfile
 from typing import Dict, List, Literal, Optional, Union
+
+import orjson
 
 from sglang.srt.connector import ConnectorType
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -50,6 +54,7 @@ from sglang.srt.utils.hf_transformers_utils import check_gguf_file, get_config
 from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
+
 
 # Define constants
 LOAD_FORMAT_CHOICES = [
@@ -117,6 +122,8 @@ GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 
 DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton"]
 
+DEFAULT_LORA_EVICTION_POLICY = "lru"
+
 NSA_CHOICES = ["flashmla_prefill", "flashmla_decode", "fa3", "tilelang", "aiter"]
 
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu"]
@@ -178,6 +185,8 @@ class ServerArgs:
     model_loader_extra_config: str = "{}"
     trust_remote_code: bool = False
     modelopt_quant: Optional[Union[str, Dict]] = None
+    modelopt_checkpoint_restore_path: Optional[str] = None
+    modelopt_checkpoint_save_path: Optional[str] = None
     context_length: Optional[int] = None
     is_embedding: bool = False
     enable_multimodal: Optional[bool] = None
@@ -187,6 +196,7 @@ class ServerArgs:
     # HTTP server
     host: str = "127.0.0.1"
     port: int = 30000
+    grpc_mode: bool = False
     skip_server_warmup: bool = False
     warmups: Optional[str] = None
     nccl_port: Optional[int] = None
@@ -225,6 +235,7 @@ class ServerArgs:
     stream_output: bool = False
     random_seed: Optional[int] = None
     constrained_json_whitespace_pattern: Optional[str] = None
+    constrained_json_disable_any_whitespace: bool = False
     watchdog_timeout: float = 300
     dist_timeout: Optional[int] = None  # timeout for torch.distributed
     download_dir: Optional[str] = None
@@ -238,6 +249,7 @@ class ServerArgs:
     log_requests: bool = False
     log_requests_level: int = 2
     crash_dump_folder: Optional[str] = None
+    crash_on_nan: bool = False
     show_time_cost: bool = False
     enable_metrics: bool = False
     enable_metrics_for_all_schedulers: bool = False
@@ -298,6 +310,7 @@ class ServerArgs:
     ] = None
     max_loaded_loras: Optional[int] = None
     max_loras_per_batch: int = 8
+    lora_eviction_policy: str = DEFAULT_LORA_EVICTION_POLICY
     lora_backend: str = "triton"
     max_lora_chunk_size: Optional[int] = 16
 
@@ -312,9 +325,11 @@ class ServerArgs:
     nsa_decode: str = "fa3"
 
     # Speculative decoding
+    enable_beta_spec: bool = False
     speculative_algorithm: Optional[str] = None
     speculative_draft_model_path: Optional[str] = None
     speculative_draft_model_revision: Optional[str] = None
+    speculative_draft_load_format: Optional[str] = None
     speculative_num_steps: Optional[int] = None
     speculative_eagle_topk: Optional[int] = None
     speculative_num_draft_tokens: Optional[int] = None
@@ -357,6 +372,7 @@ class ServerArgs:
     # Mamba cache
     max_mamba_cache_size: Optional[int] = None
     mamba_ssm_dtype: str = "float32"
+    mamba_full_memory_ratio: float = 0.2
 
     # Hierarchical cache
     enable_hierarchical_cache: bool = False
@@ -416,7 +432,10 @@ class ServerArgs:
     enable_single_batch_overlap: bool = False
     tbo_token_distribution_threshold: float = 0.48
     enable_torch_compile: bool = False
+    enable_piecewise_cuda_graph: bool = False
     torch_compile_max_bs: int = 32
+    piecewise_cuda_graph_max_tokens: int = 4096
+    piecewise_cuda_graph_tokens: Optional[List[int]] = None
     torchao_config: str = ""
     enable_nan_detection: bool = False
     enable_p2p_check: bool = False
@@ -448,7 +467,6 @@ class ServerArgs:
     debug_tensor_dump_output_folder: Optional[str] = None
     debug_tensor_dump_input_file: Optional[str] = None
     debug_tensor_dump_inject: bool = False
-    debug_tensor_dump_prefill_only: bool = False
 
     # PD disaggregation: can be "null" (not disaggregated), "prefill" (prefill-only), or "decode" (decode-only)
     disaggregation_mode: Literal["null", "prefill", "decode"] = "null"
@@ -472,7 +490,8 @@ class ServerArgs:
 
     # For PD-Multiplexing
     enable_pdmux: bool = False
-    sm_group_num: int = 3
+    pdmux_config_path: Optional[str] = None
+    sm_group_num: int = 8
 
     def get_attention_backends(server_args):
         prefill_attention_backend_str = (
@@ -676,6 +695,11 @@ class ServerArgs:
         else:
             self.cuda_graph_max_bs = max(self.cuda_graph_bs)
 
+        if self.piecewise_cuda_graph_tokens is None:
+            self.piecewise_cuda_graph_tokens = (
+                self._generate_piecewise_cuda_graph_tokens()
+            )
+
         if self.mem_fraction_static is None:
             # Constant meta data (e.g., from attention backend)
             reserved_mem = 512
@@ -754,6 +778,25 @@ class ServerArgs:
 
         return capture_bs
 
+    def _generate_piecewise_cuda_graph_tokens(self):
+        """
+        Generate the list of batch sizes for piecewise CUDA graph capture
+        based on piecewise_cuda_graph_max_tokens.
+        """
+        capture_sizes = (
+            list(range(4, 33, 4))
+            + list(range(48, 257, 16))
+            + list(range(288, 513, 32))
+            + list(range(640, 4096 + 1, 128))
+            + list(range(4352, self.piecewise_cuda_graph_max_tokens + 1, 256))
+        )
+
+        capture_sizes = [
+            s for s in capture_sizes if s <= self.piecewise_cuda_graph_max_tokens
+        ]
+
+        return capture_sizes
+
     def _handle_hpu_backends(self):
         if self.device == "hpu":
             self.attention_backend = "torch_native"
@@ -773,7 +816,32 @@ class ServerArgs:
 
         hf_config = self.get_hf_config()
         model_arch = hf_config.architectures[0]
-        if model_arch in ["GptOssForCausalLM"]:
+        if model_arch in ["DeepseekV3ForCausalLM"] and not is_deepseek_nsa(hf_config):
+            if is_cuda() and is_sm100_supported():
+                if (
+                    self.attention_backend is None
+                    and self.prefill_attention_backend is None
+                    and self.decode_attention_backend is None
+                ):
+                    self.attention_backend = "trtllm_mla"
+                    logger.info(
+                        "Use trtllm_mla as attention backend on sm100 for DeepseekV3ForCausalLM"
+                    )
+                if not self.enable_dp_attention:
+                    self.enable_flashinfer_allreduce_fusion = True
+                    logger.info(
+                        "Enable FlashInfer AllReduce Fusion on sm100 for DeepseekV3ForCausalLM"
+                    )
+                if (
+                    self.quantization == "modelopt_fp4"
+                    and self.moe_runner_backend == "auto"
+                ):
+                    self.moe_runner_backend = "flashinfer_trtllm"
+                    logger.info(
+                        "Use flashinfer_trtllm as moe runner backend on sm100 for DeepseekV3ForCausalLM"
+                    )
+
+        elif model_arch in ["GptOssForCausalLM"]:
             if (
                 self.attention_backend is None
                 and self.prefill_attention_backend is None
@@ -1105,11 +1173,19 @@ class ServerArgs:
                 )
             if self.max_running_requests is None:
                 self.max_running_requests = 48
-            self.disable_overlap_schedule = True
-            logger.warning(
-                "Overlap scheduler is disabled because of using "
-                "eagle speculative decoding."
-            )
+
+            if self.speculative_algorithm == "EAGLE" and self.enable_beta_spec:
+                self.disable_overlap_schedule = False
+                logger.warning(
+                    "Beta spec is enabled for eagle speculative decoding and overlap schedule is turned on."
+                )
+
+            if not self.enable_beta_spec:
+                self.disable_overlap_schedule = True
+                logger.warning(
+                    "Overlap scheduler is disabled because of using eagle3 and standalone speculative decoding."
+                )
+
             if self.enable_mixed_chunk:
                 self.enable_mixed_chunk = False
                 logger.warning(
@@ -1313,13 +1389,6 @@ class ServerArgs:
                     f"Currently only {DETERMINISTIC_ATTENTION_BACKEND_CHOICES} attention backends are supported for deterministic inference."
                 )
 
-            # Currently, only FA3 supports radix cache. Support for other backends is in progress
-            if self.attention_backend != "fa3":
-                self.disable_radix_cache = True
-                logger.warning(
-                    f"Currently radix cache is not compatible with {self.attention_backend} attention backend for deterministic inference. It will be supported in the future."
-                )
-
             # Check TP size
             if self.tp_size > 1:
                 os.environ["NCCL_ALGO"] = "allreduce:tree"
@@ -1460,6 +1529,11 @@ class ServerArgs:
             help="The port of the HTTP server.",
         )
         parser.add_argument(
+            "--grpc-mode",
+            action="store_true",
+            help="If set, use gRPC server instead of HTTP server.",
+        )
+        parser.add_argument(
             "--skip-server-warmup",
             action="store_true",
             help="If set, skip warmup.",
@@ -1516,6 +1590,21 @@ class ServerArgs:
             help="The ModelOpt quantization configuration. "
             "Supported values: 'fp8', 'int4_awq', 'w4a8_awq', 'nvfp4', 'nvfp4_awq'. "
             "This requires the NVIDIA Model Optimizer library to be installed: pip install nvidia-modelopt",
+        )
+        parser.add_argument(
+            "--modelopt-checkpoint-restore-path",
+            type=str,
+            default=ServerArgs.modelopt_checkpoint_restore_path,
+            help="Path to restore a previously saved ModelOpt quantized checkpoint. "
+            "If provided, the quantization process will be skipped and the model "
+            "will be loaded from this checkpoint.",
+        )
+        parser.add_argument(
+            "--modelopt-checkpoint-save-path",
+            type=str,
+            default=ServerArgs.modelopt_checkpoint_save_path,
+            help="Path to save the ModelOpt quantized checkpoint after quantization. "
+            "This allows reusing the quantized model in future runs.",
         )
         parser.add_argument(
             "--kv-cache-dtype",
@@ -1678,7 +1767,12 @@ class ServerArgs:
             "--constrained-json-whitespace-pattern",
             type=str,
             default=ServerArgs.constrained_json_whitespace_pattern,
-            help="(outlines backend only) Regex pattern for syntactic whitespaces allowed in JSON constrained output. For example, to allow the model generate consecutive whitespaces, set the pattern to [\n\t ]*",
+            help="(outlines and llguidance backends only) Regex pattern for syntactic whitespaces allowed in JSON constrained output. For example, to allow the model generate consecutive whitespaces, set the pattern to [\n\t ]*",
+        )
+        parser.add_argument(
+            "--constrained-json-disable-any-whitespace",
+            action="store_true",
+            help="(xgrammar and llguidance backends only) Enforce compact representation in JSON constrained output.",
         )
         parser.add_argument(
             "--watchdog-timeout",
@@ -1746,6 +1840,12 @@ class ServerArgs:
             type=str,
             default=ServerArgs.crash_dump_folder,
             help="Folder path to dump requests from the last 5 min before a crash (if any). If not specified, crash dumping is disabled.",
+        )
+        parser.add_argument(
+            "--crash-on-nan",
+            type=str,
+            default=ServerArgs.crash_on_nan,
+            help="Crash the server on nan logprobs.",
         )
         parser.add_argument(
             "--show-time-cost",
@@ -2052,6 +2152,13 @@ class ServerArgs:
             help="If specified, it limits the maximum number of LoRA adapters loaded in CPU memory at a time. The value must be greater than or equal to `--max-loras-per-batch`.",
         )
         parser.add_argument(
+            "--lora-eviction-policy",
+            type=str,
+            default=DEFAULT_LORA_EVICTION_POLICY,
+            choices=["lru", "fifo"],
+            help="LoRA adapter eviction policy when memory pool is full. 'lru': Least Recently Used (default, better cache efficiency). 'fifo': First-In-First-Out.",
+        )
+        parser.add_argument(
             "--lora-backend",
             type=str,
             choices=LORA_BACKEND_CHOICES,
@@ -2123,6 +2230,7 @@ class ServerArgs:
         )
 
         # Speculative decoding
+        parser.add_argument("--enable-beta-spec", action="store_true")
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
@@ -2142,6 +2250,15 @@ class ServerArgs:
             help="The specific draft model version to use. It can be a branch "
             "name, a tag name, or a commit id. If unspecified, will use "
             "the default version.",
+        )
+        parser.add_argument(
+            "--speculative-draft-load-format",
+            type=str,
+            default=ServerArgs.speculative_draft_load_format,
+            choices=LOAD_FORMAT_CHOICES,
+            help="The format of the draft model weights to load. "
+            "If not specified, will use the same format as --load-format. "
+            "Use 'dummy' to initialize draft model weights with random values for profiling.",
         )
         parser.add_argument(
             "--speculative-num-steps",
@@ -2363,6 +2480,12 @@ class ServerArgs:
             default=ServerArgs.mamba_ssm_dtype,
             choices=["float32", "bfloat16"],
             help="The data type of the SSM states in mamba cache.",
+        )
+        parser.add_argument(
+            "--mamba-full-memory-ratio",
+            type=float,
+            default=ServerArgs.mamba_full_memory_ratio,
+            help="The ratio of mamba state memory to full kv cache memory.",
         )
         # Args for multi-item-scoring
         parser.add_argument(
@@ -2636,10 +2759,27 @@ class ServerArgs:
             help="Optimize the model with torch.compile. Experimental feature.",
         )
         parser.add_argument(
+            "--enable-piecewise-cuda-graph",
+            action="store_true",
+            help="Optimize the model with piecewise cuda graph for extend/prefill only. Experimental feature.",
+        )
+        parser.add_argument(
+            "--piecewise-cuda-graph-tokens",
+            type=json_list_type,
+            default=ServerArgs.piecewise_cuda_graph_tokens,
+            help="Set the list of tokens when using piecewise cuda graph.",
+        )
+        parser.add_argument(
             "--torch-compile-max-bs",
             type=int,
             default=ServerArgs.torch_compile_max_bs,
             help="Set the maximum batch size when using torch compile.",
+        )
+        parser.add_argument(
+            "--piecewise-cuda-graph-max-tokens",
+            type=int,
+            default=ServerArgs.piecewise_cuda_graph_max_tokens,
+            help="Set the maximum tokens when using piecewise cuda graph.",
         )
         parser.add_argument(
             "--torchao-config",
@@ -2771,11 +2911,6 @@ class ServerArgs:
             help="Inject the outputs from jax as the input of every layer.",
         )
         parser.add_argument(
-            "--debug-tensor-dump-prefill-only",
-            action="store_true",
-            help="Only dump the tensors for prefill requests (i.e. batch size > 1).",
-        )
-        parser.add_argument(
             "--enable-dynamic-batch-tokenizer",
             action="store_true",
             help="Enable async dynamic batch tokenizer for improved performance when multiple requests arrive concurrently.",
@@ -2896,6 +3031,12 @@ class ServerArgs:
             action="store_true",
             help="Enable PD-Multiplexing, PD running on greenctx stream.",
         )
+        parser.add_argument(
+            "--pdmux-config-path",
+            type=str,
+            default=None,
+            help="The path of the PD-Multiplexing config file.",
+        )
 
         parser.add_argument(
             "--sm-group-num",
@@ -2977,7 +3118,7 @@ class ServerArgs:
             self.model_path,
             trust_remote_code=self.trust_remote_code,
             revision=self.revision,
-            model_override_args=json.loads(self.json_model_override_args),
+            model_override_args=orjson.loads(self.json_model_override_args),
             **kwargs,
         )
         return hf_config
@@ -3023,6 +3164,34 @@ class ServerArgs:
             assert (
                 self.chunked_prefill_size % self.page_size == 0
             ), "chunked_prefill_size must be divisible by page_size"
+
+        # Check pdmux
+        if self.enable_pdmux:
+            assert (
+                self.pp_size == 1
+            ), "PD-Multiplexing is only supported with pipeline parallelism disabled (pp_size=1)."
+            assert (
+                self.chunked_prefill_size == -1
+            ), "PD-Multiplexing is not compatible with chunked prefill."
+            assert (
+                self.disaggregation_mode == "null"
+            ), "PD-Multiplexing is not compatible with disaggregation mode."
+            assert (
+                self.disable_overlap_schedule
+            ), "PD-Multiplexing is not compatible with overlap schedule."
+
+            # NOTE: CUDA Green Context may encounter potential issues with CudaGraph on torch 2.7.x – 2.8.x, leading to performance degradation.
+            import torch
+
+            parts = torch.__version__.split("+", 1)[0].split(".")
+            major = int(parts[0]) if len(parts) > 0 and parts[0].isdigit() else 0
+            minor = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+            if (major, minor) > (2, 6):
+                logger.warning(
+                    "WARNING: PD-Multiplexing may experience performance degradation with torch versions > 2.6.x.\n"
+                    f"  Current torch version is {torch.__version__}.\n"
+                    "  Please manually install torch 2.6.x."
+                )
 
         # Check multi tokenizer
         assert self.tokenizer_worker_num > 0, "Tokenizer worker num must >= 1"
@@ -3235,6 +3404,22 @@ class ServerArgs:
         )
 
 
+# NOTE: This is a global variable to hold the server args for scheduler.
+_global_server_args: Optional[ServerArgs] = None
+
+
+def set_global_server_args_for_scheduler(server_args: ServerArgs):
+    global _global_server_args
+    _global_server_args = server_args
+
+
+def get_global_server_args() -> ServerArgs:
+    if _global_server_args is None:
+        raise ValueError("Global server args is not set yet!")
+
+    return _global_server_args
+
+
 def prepare_server_args(argv: List[str]) -> ServerArgs:
     """
     Prepare the server arguments from the command line arguments.
@@ -3269,11 +3454,12 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
     raw_args = parser.parse_args(argv)
-    server_args = ServerArgs.from_cli_args(raw_args)
-    return server_args
+
+    return ServerArgs.from_cli_args(raw_args)
 
 
 ZMQ_TCP_PORT_DELTA = 233
+DP_ATTENTION_HANDSHAKE_PORT_DELTA = 5
 
 
 @dataclasses.dataclass
@@ -3298,7 +3484,11 @@ class PortArgs:
     tokenizer_worker_ipc_name: Optional[str]
 
     @staticmethod
-    def init_new(server_args, dp_rank: Optional[int] = None) -> "PortArgs":
+    def init_new(
+        server_args: ServerArgs,
+        dp_rank: Optional[int] = None,
+        worker_ports: Optional[List[int]] = None,
+    ) -> PortArgs:
         if server_args.nccl_port is None:
             nccl_port = server_args.port + random.randint(100, 1000)
             while True:
@@ -3345,8 +3535,8 @@ class PortArgs:
                 # TokenizerManager to DataParallelController
                 scheduler_input_port = port_base + 4
             else:
-                scheduler_input_port = port_base + 4 + 1 + dp_rank
-
+                assert worker_ports is not None
+                scheduler_input_port = worker_ports[dp_rank]
             return PortArgs(
                 tokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base}",
                 scheduler_input_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port}",

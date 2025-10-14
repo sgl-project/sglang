@@ -22,8 +22,8 @@ from grpc_reflection.v1alpha import reflection
 
 import sglang
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
-from sglang.srt.entrypoints.grpc_request_manager import GrpcRequestManager
 from sglang.srt.grpc import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
+from sglang.srt.grpc.grpc_request_manager import GrpcRequestManager
 from sglang.srt.managers.data_parallel_controller import (
     run_data_parallel_controller_process,
 )
@@ -35,8 +35,8 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.sampling.sampling_params import SamplingParams as SGLSamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import configure_logger, prepare_model_and_tokenizer
+from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -68,6 +68,8 @@ def _launch_scheduler_process_only(
     # Configure global environment
     configure_logger(server_args)
     server_args.check_server_args()
+    # Fix CUDA multiprocessing issues - must be called before any CUDA operations
+    mp.set_start_method("spawn", force=True)
 
     # Allocate ports for inter-process communications
     if port_args is None:
@@ -211,13 +213,6 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             )
 
             async for output in response_generator:
-                # Check if client cancelled before processing/yielding
-                if context.cancelled():
-                    logger.info(f"Client cancelled request {request.request_id}")
-                    # Explicitly abort the request to notify scheduler
-                    await self.request_manager.abort_request(request.request_id)
-                    break
-
                 # Handle batch responses (for n>1 non-streaming)
                 if isinstance(output, list):
                     for batch_output in output:
@@ -324,7 +319,8 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         Check the health of the inference server by sending a special request to generate one token.
         Similar to HTTP server's /health endpoint.
         """
-        logger.info("Receive health check request")
+        rid = f"HEALTH_CHECK_{time.time()}"
+        logger.info(f"Receive health check request: {rid}")
 
         if self.request_manager.gracefully_exit:
             logger.info(
@@ -335,7 +331,6 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             )
 
         # Create a special health check request
-        rid = f"HEALTH_CHECK_{time.time()}"
         sampling_params = SGLSamplingParams(max_new_tokens=1, temperature=0.0)
         sampling_params.normalize(tokenizer=None)
 
@@ -926,25 +921,3 @@ async def serve_grpc(
                     proc.join(timeout=1.0)
 
         logger.info("All scheduler processes terminated")
-
-
-def main():
-    """Main entry point for standalone gRPC server."""
-    # Fix CUDA multiprocessing issues - must be called before any CUDA operations
-    mp.set_start_method("spawn", force=True)
-
-    parser = argparse.ArgumentParser(description="SGLang Standalone gRPC Server")
-    ServerArgs.add_cli_args(parser)
-    args = parser.parse_args()
-    server_args = ServerArgs.from_cli_args(args)
-
-    # Run server
-    asyncio.run(
-        serve_grpc(
-            server_args=server_args,
-        )
-    )
-
-
-if __name__ == "__main__":
-    main()
