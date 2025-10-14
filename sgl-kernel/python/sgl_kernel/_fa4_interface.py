@@ -1,14 +1,14 @@
 # Adapted from https://github.com/Dao-AILab/flash-attention/blob/203b9b3dba39d5d08dffb49c09aa622984dff07d/flash_attn/cute/interface.py
 
 # Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
-# [2025-07-04] Version in Cute-DSL, for Hopper and Blackwell. You'd need to install nvidia-cutlass-dsl==4.1.0.
+# [2025-14-10] Version in Cute-DSL, for Hopper and Blackwell. You'd need to install nvidia-cutlass-dsl==4.2.1.
 
 
 import copy
 import gc
 import logging
 import math
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -20,26 +20,11 @@ import torch
 from cutlass.cute.runtime import from_dlpack
 from flash_attn.cute.flash_fwd import FlashAttentionForwardSm90
 from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
+from flash_attn.cute import utils
 
 
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
-
-
-def _reason_recompile(compile_key, jit_func):
-    compile_cache = jit_func.compile_cache
-    compile_key_map = jit_func.compile_key_map
-    if not compile_cache:
-        return "not compiled yet"
-    for k, v in compile_cache.items():
-        if k == compile_key:
-            continue
-        if len(k) != len(compile_key):
-            continue
-        for i in range(len(k)):
-            if k[i] != compile_key[i]:
-                return f"diff at '{compile_key_map[i]}': {k[i]} vs {compile_key[i]} "
-    return "unknown reason"
 
 
 torch2cute_dtype_map = {
@@ -72,7 +57,11 @@ def _flash_attn_fwd(
     num_threads: int = 384,
     pack_gqa: Optional[bool] = None,
     _compute_capability: Optional[int] = None,
-    return_softmax_lse: Optional[bool] = False,
+    score_mod: Callable | None = None,
+    return_lse: bool = False,
+    out: Optional[torch.Tensor] = None,
+    lse: Optional[torch.Tensor] = None,
+    buffers: Optional[list[torch.Tensor]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
     num_head, head_dim = q.shape[-2:]
@@ -169,23 +158,35 @@ def _flash_attn_fwd(
     q_batch_seqlen_shape = (
         (batch_size, seqlen_q) if cu_seqlens_q is None else (total_q,)
     )
-    out = torch.empty(
-        *q_batch_seqlen_shape,
-        num_head,
-        head_dim_v,
-        dtype=out_torch_dtype,
-        device=device,
-    )
     lse_shape = (
         (batch_size, num_head, seqlen_q)
         if cu_seqlens_q is None
         else (num_head, total_q)
     )
-    lse = (
-        torch.empty(lse_shape, dtype=torch.float32, device=device)
-        if return_softmax_lse
-        else None
-    )
+    requires_grad = q.requires_grad or k.requires_grad or v.requires_grad
+
+    if out is None:
+        out = torch.empty(
+            *q_batch_seqlen_shape,
+            num_head,
+            head_dim_v,
+            dtype=out_torch_dtype,
+            device=device,
+        )
+    else:
+        expected_out_shape = (*q_batch_seqlen_shape, num_head, head_dim_v)
+        assert out.shape == expected_out_shape, f"out tensor shape {out.shape} does not match expected shape {expected_out_shape}"
+        assert out.dtype == out_torch_dtype, f"out tensor dtype {out.dtype} does not match expected dtype {out_torch_dtype}"
+        assert out.device == device, f"out tensor device {out.device} does not match input device {device}"
+        assert out.is_cuda, "out tensor must be on CUDA device"
+
+    if lse is None:
+        lse = torch.empty(lse_shape, dtype=torch.float32, device=device) if requires_grad or return_lse else None
+    elif lse is not None:
+        assert lse.shape == lse_shape, f"lse tensor shape {lse.shape} does not match expected shape {lse_shape}"
+        assert lse.dtype == torch.float32, f"lse tensor dtype {lse.dtype} does not match expected dtype torch.float32"
+        assert lse.device == device, f"lse tensor device {lse.device} does not match input device {device}"
+        assert lse.is_cuda, "lse tensor must be on CUDA device"
 
     dtype = torch2cute_dtype_map[q.dtype]
     q_tensor, k_tensor, v_tensor, o_tensor = [
@@ -253,13 +254,29 @@ def _flash_attn_fwd(
         ):
             pack_gqa = False
 
+    if softcap is not None:
+        assert score_mod is None, "softcap and score_mod cannot be used together"
+        score_mod = utils.create_softcap_scoremod(softcap)
+
+    if score_mod is not None:
+        is_varlen = cu_seqlens_q is not None or cu_seqlens_k is not None or seqused_q is not None or seqused_k is not None
+        if is_varlen:
+            raise NotImplementedError("score_mod with buffers is not yet supported for varlen sequences. This will be fixed in a future PR.")
+        if pack_gqa:
+            raise NotImplementedError("score_mod with buffers is not yet supported with pack_gqa=True. This will be fixed in a future PR.")
+
+    cute_buffers = None
+    if buffers is not None:
+        cute_buffers = [from_dlpack(buf) for buf in buffers]
+
     compile_key = (
         dtype,
         head_dim,
         head_dim_v,
         qhead_per_kvhead,
         causal,
-        softcap is not None,
+        utils.hash_callable(score_mod) if score_mod is not None else None,
+        buffers is not None,
         lse is None,
         cu_seqlens_q is None,
         cu_seqlens_k is None,
@@ -276,9 +293,6 @@ def _flash_attn_fwd(
         compute_capability,
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
-        logger.info(
-            f"Compiling FA4 kernel with reason: {_reason_recompile(compile_key, _flash_attn_fwd)}"
-        )
         if compute_capability == 9:
             assert page_table is None, "paged KV not supported on SM 9.0"
             # fa_fwd = FlashAttentionForwardSm80(
@@ -290,12 +304,14 @@ def _flash_attn_fwd(
                 is_causal=causal,
                 is_local=local,
                 pack_gqa=pack_gqa,
-                m_block_size=m_block_size,
-                n_block_size=n_block_size,
+                tile_m=m_block_size,
+                tile_n=n_block_size,
                 # num_stages=1,
                 num_stages=2,
                 num_threads=num_threads,
                 Q_in_regs=False,
+                score_mod=score_mod,
+                has_buffers=buffers is not None,
             )
         elif compute_capability == 10:
             assert page_size in [
@@ -313,12 +329,15 @@ def _flash_attn_fwd(
                 and not local
                 and cu_seqlens_q is None
                 and seqused_q is None,
+                score_mod=score_mod,
+                has_buffers=buffers is not None,
             )
         else:
             raise ValueError(
                 f"Unsupported compute capability: {compute_capability}. Supported: 9.x, 10.x"
             )
         # TODO: check @can_implement
+        # TODO caching for buffers; cute_buffers
         _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
             fa_fwd,
             q_tensor,
@@ -333,10 +352,10 @@ def _flash_attn_fwd(
             seqused_q_tensor,
             seqused_k_tensor,
             page_table_tensor,
-            softcap,
             window_size_left,
             window_size_right,
             learnable_sink_tensor,
+            cute_buffers,
         )
     _flash_attn_fwd.compile_cache[compile_key](
         q_tensor,
@@ -351,37 +370,15 @@ def _flash_attn_fwd(
         seqused_q_tensor,
         seqused_k_tensor,
         page_table_tensor,
-        softcap,
         window_size_left,
         window_size_right,
         learnable_sink_tensor,
+        cute_buffers,
     )
     return out, lse
 
 
 _flash_attn_fwd.compile_cache = {}
-_flash_attn_fwd.compile_key_map = [
-    "dtype",
-    "head_dim",
-    "head_dim_v",
-    "qhead_per_kvhead",
-    "causal",
-    "softcap is not None",
-    "lse is None",
-    "cu_seqlens_q is None",
-    "cu_seqlens_k is None",
-    "seqused_q is None",
-    "seqused_k is None",
-    "page_table is not None",
-    "window_size_left is not None",
-    "window_size_right is not None",
-    "learnable_sink is not None",
-    "m_block_size",
-    "n_block_size",
-    "num_threads",
-    "pack_gqa",
-    "compute_capability",
-]
 
 
 def warmup_flash_attn(f):
@@ -472,7 +469,7 @@ def flash_attn_varlen_func(
         learnable_sink=learnable_sink,
         softcap=softcap,
         pack_gqa=pack_gqa,
-        return_softmax_lse=return_softmax_lse,
+        return_lse=return_softmax_lse,
     )
 
     return (out, lse) if return_softmax_lse else out
