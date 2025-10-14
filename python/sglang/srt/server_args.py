@@ -189,6 +189,7 @@ class ServerArgs:
     modelopt_quant: Optional[Union[str, Dict]] = None
     modelopt_checkpoint_restore_path: Optional[str] = None
     modelopt_checkpoint_save_path: Optional[str] = None
+    modelopt_export_path: Optional[str] = None
     context_length: Optional[int] = None
     is_embedding: bool = False
     enable_multimodal: Optional[bool] = None
@@ -1662,6 +1663,14 @@ class ServerArgs:
             default=ServerArgs.modelopt_checkpoint_save_path,
             help="Path to save the ModelOpt quantized checkpoint after quantization. "
             "This allows reusing the quantized model in future runs.",
+        )
+        parser.add_argument(
+            "--modelopt-export-path",
+            type=str,
+            default=ServerArgs.modelopt_export_path,
+            help="Path to export the quantized model in HuggingFace format after ModelOpt quantization. "
+            "The exported model can then be used directly with SGLang for inference. "
+            "If not provided, the model will not be exported.",
         )
         parser.add_argument(
             "--kv-cache-dtype",
