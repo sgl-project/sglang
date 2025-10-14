@@ -57,10 +57,8 @@ dependencies = [
   "soundfile==0.13.1",
   "tiktoken",
   "timm==1.0.16",
-  "torch==2.8.0",
   "torch_memory_saver==0.0.9rc2",
   "torchao==0.9.0",
-  "torchaudio==2.8.0",
   "torchvision",
   "tqdm",
   "transformers==4.57.0",
@@ -92,7 +90,12 @@ tracing = [
   "opentelemetry-exporter-otlp-proto-grpc",
   "opentelemetry-sdk",
 ]
-all = ["sglang[test]", "sglang[decord]"]
+all = ["sglang[test]", "sglang[decord]", "sglang[cu120]"]
+cu120 = [
+  "torch==2.8.0",
+  "torchaudio==2.8.0",
+  "torchvision==0.24.0",
+]
 cu130 = [
   "torch==2.9.0",
   "torchaudio==2.9.0",
