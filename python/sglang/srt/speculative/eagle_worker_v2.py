@@ -262,7 +262,7 @@ class EAGLEWorkerV2(EAGLEWorker):
 
         # Run target verify batch in the main compute stream
         forward_batch_output = self.target_worker.forward_batch_generation(
-            model_worker_batch=None,
+            forward_batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
             skip_attn_backend_init=True,
