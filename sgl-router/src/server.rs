@@ -82,28 +82,40 @@ impl AppContext {
             }
         };
 
-        let (tokenizer, reasoning_parser_factory, tool_parser_factory) =
-            if router_config.connection_mode == ConnectionMode::Grpc {
-                let tokenizer_path = router_config
-                    .tokenizer_path
-                    .clone()
-                    .or_else(|| router_config.model_path.clone())
-                    .ok_or_else(|| {
-                        "gRPC mode requires either --tokenizer-path or --model-path to be specified"
-                            .to_string()
-                    })?;
+        let (tokenizer, reasoning_parser_factory, tool_parser_factory) = if router_config
+            .connection_mode
+            == ConnectionMode::Grpc
+        {
+            let tokenizer_path = router_config
+                .tokenizer_path
+                .clone()
+                .or_else(|| router_config.model_path.clone())
+                .ok_or_else(|| {
+                    "gRPC mode requires either --tokenizer-path or --model-path to be specified"
+                        .to_string()
+                })?;
 
-                let tokenizer = Some(
-                    tokenizer_factory::create_tokenizer(&tokenizer_path)
-                        .map_err(|e| format!("Failed to create tokenizer: {e}"))?,
+            let tokenizer = Some(
+                    tokenizer_factory::create_tokenizer_with_chat_template_blocking(
+                        &tokenizer_path,
+                        router_config.chat_template.as_deref(),
+                    )
+                    .map_err(|e| {
+                        format!(
+                            "Failed to create tokenizer from '{}': {}. \
+                            Ensure the path is valid and points to a tokenizer file (tokenizer.json) \
+                            or a HuggingFace model ID. For directories, ensure they contain tokenizer files.",
+                            tokenizer_path, e
+                        )
+                    })?,
                 );
-                let reasoning_parser_factory = Some(crate::reasoning_parser::ParserFactory::new());
-                let tool_parser_factory = Some(crate::tool_parser::ParserFactory::new());
+            let reasoning_parser_factory = Some(crate::reasoning_parser::ParserFactory::new());
+            let tool_parser_factory = Some(crate::tool_parser::ParserFactory::new());
 
-                (tokenizer, reasoning_parser_factory, tool_parser_factory)
-            } else {
-                (None, None, None)
-            };
+            (tokenizer, reasoning_parser_factory, tool_parser_factory)
+        } else {
+            (None, None, None)
+        };
 
         let worker_registry = Arc::new(WorkerRegistry::new());
         let policy_registry = Arc::new(PolicyRegistry::new(router_config.policy.clone()));
