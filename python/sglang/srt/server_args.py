@@ -213,8 +213,8 @@ class ServerArgs:
     show_time_cost: bool = False
     enable_metrics: bool = False
     enable_metrics_for_all_schedulers: bool = False
-    tokenizer_metrics_custom_labels_header: str = "x-customer-labels"
-    tokenizer_metrics_allowed_customer_labels: Optional[List[str]] = None
+    tokenizer_metrics_custom_labels_header: str = "x-custom-labels"
+    tokenizer_metrics_allowed_custom_labels: Optional[List[str]] = None
     bucket_time_to_first_token: Optional[List[float]] = None
     bucket_inter_token_latency: Optional[List[float]] = None
     bucket_e2e_request_latency: Optional[List[float]] = None
@@ -1078,10 +1078,10 @@ class ServerArgs:
     def _handle_metrics_labels(self):
         if (
             not self.tokenizer_metrics_custom_labels_header
-            and self.tokenizer_metrics_allowed_customer_labels
+            and self.tokenizer_metrics_allowed_custom_labels
         ):
             raise ValueError(
-                "Please set --tokenizer-metrics-custom-labels-header when setting --tokenizer-metrics-allowed-customer-labels."
+                "Please set --tokenizer-metrics-custom-labels-header when setting --tokenizer-metrics-allowed-custom-labels."
             )
 
     def _handle_deterministic_inference(self):
@@ -1536,16 +1536,16 @@ class ServerArgs:
             "--tokenizer-metrics-custom-labels-header",
             type=str,
             default=ServerArgs.tokenizer_metrics_custom_labels_header,
-            help="Specify the HTTP header for passing customer labels for tokenizer metrics.",
+            help="Specify the HTTP header for passing custom labels for tokenizer metrics.",
         )
         parser.add_argument(
-            "--tokenizer-metrics-allowed-customer-labels",
+            "--tokenizer-metrics-allowed-custom-labels",
             type=str,
             nargs="+",
-            default=ServerArgs.tokenizer_metrics_allowed_customer_labels,
-            help="The customer labels allowed for tokenizer metrics. The labels are specified via a dict in "
+            default=ServerArgs.tokenizer_metrics_allowed_custom_labels,
+            help="The custom labels allowed for tokenizer metrics. The labels are specified via a dict in "
             "'--tokenizer-metrics-custom-labels-header' field in HTTP requests, e.g., {'label1': 'value1', 'label2': "
-            "'value2'} is allowed if '--tokenizer-metrics-allowed-labels label1 label2' is set.",
+            "'value2'} is allowed if '--tokenizer-metrics-allowed-custom-labels label1 label2' is set.",
         )
         parser.add_argument(
             "--bucket-time-to-first-token",
@@ -1577,8 +1577,8 @@ class ServerArgs:
         bucket_rule = (
             "Supports 3 rule types: 'default' uses predefined buckets; 'tse <middle> <base> <count>' "
             "generates two sides exponential distributed buckets (e.g., 'tse 1000 2 8' generates buckets "
-            "[984.0, 992.0, 996.0, 998.0, 1000.0, 1002.0, 1004.0, 1008.0, 1016.0]).); 'customer <value1> "
-            "<value2> ...' uses custom bucket values (e.g., 'customer 10 50 100 500')."
+            "[984.0, 992.0, 996.0, 998.0, 1000.0, 1002.0, 1004.0, 1008.0, 1016.0]).); 'custom <value1> "
+            "<value2> ...' uses custom bucket values (e.g., 'custom 10 50 100 500')."
         )
         parser.add_argument(
             "--prompt-tokens-buckets",
@@ -2863,8 +2863,8 @@ class ServerArgs:
         assert rule in [
             "tse",
             "default",
-            "customer",
-        ], f"Unsupported {arg_name} rule type: '{rule}'. Must be one of: 'tse', 'default', 'customer'"
+            "custom",
+        ], f"Unsupported {arg_name} rule type: '{rule}'. Must be one of: 'tse', 'default', 'custom'"
 
         if rule == "tse":
             assert (
@@ -2887,20 +2887,20 @@ class ServerArgs:
                 len(buckets_rule) == 1
             ), f"{arg_name} default rule should only have one parameter: ['default'], got {len(buckets_rule)}"
 
-        elif rule == "customer":
+        elif rule == "custom":
             assert (
                 len(buckets_rule) >= 2
-            ), f"{arg_name} customer rule requires at least one bucket value: ['customer', value1, ...]"
+            ), f"{arg_name} custom rule requires at least one bucket value: ['custom', value1, ...]"
             try:
                 bucket_values = [float(x) for x in buckets_rule[1:]]
             except ValueError:
-                assert False, f"{arg_name} customer rule bucket values must be numeric"
+                assert False, f"{arg_name} custom rule bucket values must be numeric"
             assert len(set(bucket_values)) == len(
                 bucket_values
-            ), f"{arg_name} customer rule bucket values should not contain duplicates"
+            ), f"{arg_name} custom rule bucket values should not contain duplicates"
             assert all(
                 val >= 0 for val in bucket_values
-            ), f"{arg_name} customer rule bucket values should be non-negative"
+            ), f"{arg_name} custom rule bucket values should be non-negative"
 
     def adjust_mem_fraction_for_vlm(self, model_config):
         vision_config = getattr(model_config.hf_config, "vision_config", None)

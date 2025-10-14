@@ -2,7 +2,7 @@ use super::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use super::worker::{
     BasicWorker, ConnectionMode, DPAwareWorker, HealthConfig, WorkerMetadata, WorkerType,
 };
-use crate::grpc::client::SglangSchedulerClient;
+use crate::grpc_client::SglangSchedulerClient;
 use std::collections::HashMap;
 
 /// Builder for creating BasicWorker instances with fluent API

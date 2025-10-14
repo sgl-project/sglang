@@ -143,8 +143,8 @@ class GenerateReqInput:
     # Image gen grpc migration
     return_bytes: bool = False
 
-    # For customer metric labels
-    customer_labels: Optional[Dict[str, str]] = None
+    # For custom metric labels
+    custom_labels: Optional[Dict[str, str]] = None
 
     def contains_mm_input(self) -> bool:
         return (
