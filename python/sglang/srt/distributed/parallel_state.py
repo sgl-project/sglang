@@ -337,7 +337,6 @@ class GroupCoordinator:
             else:
                 ca_max_size = 8 * 1024 * 1024
             try:
-                # print(f"ca_max_size: {ca_max_size}")
                 self.ca_comm = CustomAllreduce(
                     group=self.cpu_group,
                     device=self.device,

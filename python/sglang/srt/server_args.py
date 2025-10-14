@@ -122,6 +122,8 @@ GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 
 DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton"]
 
+DEFAULT_LORA_EVICTION_POLICY = "lru"
+
 NSA_CHOICES = ["flashmla_prefill", "flashmla_decode", "fa3", "tilelang", "aiter"]
 
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu"]
@@ -194,6 +196,7 @@ class ServerArgs:
     # HTTP server
     host: str = "127.0.0.1"
     port: int = 30000
+    grpc_mode: bool = False
     skip_server_warmup: bool = False
     warmups: Optional[str] = None
     nccl_port: Optional[int] = None
@@ -303,6 +306,7 @@ class ServerArgs:
     ] = None
     max_loaded_loras: Optional[int] = None
     max_loras_per_batch: int = 8
+    lora_eviction_policy: str = DEFAULT_LORA_EVICTION_POLICY
     lora_backend: str = "triton"
     max_lora_chunk_size: Optional[int] = 16
 
@@ -1517,6 +1521,11 @@ class ServerArgs:
             help="The port of the HTTP server.",
         )
         parser.add_argument(
+            "--grpc-mode",
+            action="store_true",
+            help="If set, use gRPC server instead of HTTP server.",
+        )
+        parser.add_argument(
             "--skip-server-warmup",
             action="store_true",
             help="If set, skip warmup.",
@@ -2120,6 +2129,13 @@ class ServerArgs:
             type=int,
             default=ServerArgs.max_loaded_loras,
             help="If specified, it limits the maximum number of LoRA adapters loaded in CPU memory at a time. The value must be greater than or equal to `--max-loras-per-batch`.",
+        )
+        parser.add_argument(
+            "--lora-eviction-policy",
+            type=str,
+            default=DEFAULT_LORA_EVICTION_POLICY,
+            choices=["lru", "fifo"],
+            help="LoRA adapter eviction policy when memory pool is full. 'lru': Least Recently Used (default, better cache efficiency). 'fifo': First-In-First-Out.",
         )
         parser.add_argument(
             "--lora-backend",
