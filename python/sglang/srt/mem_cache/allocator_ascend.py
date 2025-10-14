@@ -161,3 +161,4 @@ class AscendPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
 
         self.free_pages = self.free_pages[num_new_pages:]
         return out_indices.int()
+    
