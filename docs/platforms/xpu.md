@@ -38,10 +38,11 @@ cd sglang
 git checkout <YOUR-DESIRED-VERSION>
 
 # Use dedicated toml file
-cp python/pyproject_xpu.toml python/pyproject.toml
+cd python
+cp pyproject_xpu.toml pyproject.toml
 # Install SGLang dependent libs, and build SGLang main package
 pip install --upgrade pip setuptools
-pip install -e "python[all_xpu]"
+pip install -v .
 ```
 
 ### Install Using Docker
