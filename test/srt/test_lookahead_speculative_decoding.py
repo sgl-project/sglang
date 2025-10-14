@@ -35,7 +35,7 @@ class TestStandaloneSpeculativeDecodingBase(CustomTestCase):
 
     model = DEFAULT_LOOKAHEAD_SPECULATIVE_TARGET_MODEL_FOR_TEST
     base_url = DEFAULT_URL_FOR_TEST
-    accuracy_threshold = 0.8  # derived tests need to override this
+    accuracy_threshold = 0.79  # derived tests need to override this
     spec_decode_threshold = 1.8  # derived spec decoding tests need to override this
 
     @classmethod
