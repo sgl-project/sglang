@@ -15,15 +15,11 @@ import torch
 import torch.fx as fx
 from torch._dispatch.python import enable_python_dispatcher
 
-from sglang.srt.model_executor.compilation.compilation_config import CompilationConfig
-from sglang.srt.model_executor.compilation.compilation_counter import (
-    compilation_counter,
-)
-from sglang.srt.model_executor.compilation.compiler_interface import InductorAdaptor
-from sglang.srt.model_executor.compilation.cuda_piecewise_backend import (
-    CUDAPiecewiseBackend,
-)
-from sglang.srt.model_executor.compilation.pass_manager import PostGradPassManager
+from sglang.srt.compilation.compilation_config import CompilationConfig
+from sglang.srt.compilation.compilation_counter import compilation_counter
+from sglang.srt.compilation.compiler_interface import InductorAdaptor
+from sglang.srt.compilation.cuda_piecewise_backend import CUDAPiecewiseBackend
+from sglang.srt.compilation.pass_manager import PostGradPassManager
 
 logger = logging.getLogger(__name__)
 
