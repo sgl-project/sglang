@@ -467,7 +467,7 @@ class Indexer(CustomOp):
         assert logits.shape[0] == len(seq_lens_expanded)
         raw_topk_result = metadata.topk_transform(logits, self.index_topk)
         topk_result = torch.full(
-            (token_nums, 2048), -1, device=q_fp8.device, dtype=torch.int32
+            (token_nums, self.index_topk), -1, device=q_fp8.device, dtype=torch.int32
         )
         topk_result[:offset] = raw_topk_result
         return topk_result

@@ -565,7 +565,7 @@ class NativeSparseAttnBackend(AttentionBackend):
         metadata = NSAMetadata(
             page_size=self.real_page_size,
             cache_seqlens_int32=cache_seqlens_int32,
-            max_seq_len_q=self.speculative_num_draft_tokens,
+            max_seq_len_q=max_seqlen_q,
             max_seq_len_k=max_seqlen_k,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
@@ -574,7 +574,6 @@ class NativeSparseAttnBackend(AttentionBackend):
             nsa_cache_seqlens_int32=nsa_cache_seqlens_int32,
             nsa_cu_seqlens_q=nsa_cu_seqlens_q,
             nsa_cu_seqlens_k=nsa_cu_seqlens_k,
-            nsa_seqlens_expanded=seqlens_expanded,
             nsa_seqlens_expanded=seqlens_expanded,
             real_page_table=real_page_table,
             nsa_extend_seq_lens_list=nsa_extend_seq_lens_list,
@@ -697,11 +696,15 @@ class NativeSparseAttnBackend(AttentionBackend):
                     )
                 ]
             )
-            metadata.nsa_seqlens_expanded.copy_(seqlens_expanded)
+            metadata.nsa_seqlens_expanded[: seqlens_expanded.size(0)].copy_(
+                seqlens_expanded
+            )
             nsa_cache_seqlens = compute_nsa_seqlens(
                 seqlens_expanded, self.nsa_index_topk
             )
-            metadata.nsa_cache_seqlens_int32.copy_(nsa_cache_seqlens)
+            metadata.nsa_cache_seqlens_int32[: seqlens_expanded.size(0)].copy_(
+                nsa_cache_seqlens
+            )
         seqlens_expanded_size = seqlens_expanded.size(0)
         assert (
             metadata.nsa_cache_seqlens_int32 is not None
@@ -709,7 +712,7 @@ class NativeSparseAttnBackend(AttentionBackend):
             and self.nsa_index_topk is not None
         )
 
-        metadata.nsa_cu_seqlens_k[1:].copy_(
+        metadata.nsa_cu_seqlens_k[1 : 1 + seqlens_expanded_size].copy_(
             torch.cumsum(nsa_cache_seqlens, dim=0, dtype=torch.int32)
         )
         # NOTE(dark): (nsa-) cu_seqlens_q is always arange, no need to copy
