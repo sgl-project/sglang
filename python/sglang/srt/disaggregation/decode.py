@@ -483,8 +483,10 @@ class DecodePreallocQueue:
                 # Mamba hybrid model: single mamba state index
                 state_indices = [
                     self.req_to_token_pool.req_index_to_mamba_index_mapping[
-                        decode_req.req.rid
+                        decode_req.req.req_pool_idx
                     ]
+                    .cpu()
+                    .numpy()
                 ]
             elif isinstance(self.token_to_kv_pool, SWAKVPool):
                 # SWA hybrid model: send decode-side SWA window indices
