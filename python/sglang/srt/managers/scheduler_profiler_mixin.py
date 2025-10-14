@@ -41,11 +41,8 @@ class SchedulerProfilerMixin:
         self.profile_steps: Optional[int] = None
         self.profile_in_progress: bool = False
         self.rpd_profiler = None
-        # New flags for separate stage profiling
         self.profile_stage: str = "all"  # "prefill", "decode", or "all" (default)
-        self.current_profiling_stage: Optional[str] = (
-            None  # Track which stage is being profiled
-        )
+        self.current_profiling_stage: Optional[str] = None 
 
     def init_profile(
         self,
@@ -207,7 +204,6 @@ class SchedulerProfilerMixin:
     def stop_profile(
         self, stage: Optional[ForwardMode] = None
     ) -> ProfileReqOutput | None:
-        # If profiling is not in progress, it's already stopped - return success
         if not self.profile_in_progress:
             # Check if there's any configuration to clear
             profiling_configured = (
@@ -218,12 +214,12 @@ class SchedulerProfilerMixin:
 
             if profiling_configured:
                 return ProfileReqOutput(
-                    success=True,
+                    success=False,
                     message="Profiler stopped (was configured but not running).",
                 )
             else:
                 return ProfileReqOutput(
-                    success=True,
+                    success=False,
                     message="Profiler stopped (was already stopped).",
                 )
 
@@ -408,9 +404,6 @@ class SchedulerProfilerMixin:
 
     def profile(self, recv_req: ProfileReq):
         if recv_req.type == ProfileReqType.START_PROFILE:
-            # Extract profile_stage from request if available, default to "decode"
-            profile_stage = getattr(recv_req, "profile_stage", "all")
-
             if recv_req.profile_by_stage or recv_req.start_step:
                 return self.init_profile(
                     recv_req.output_dir,
@@ -421,7 +414,7 @@ class SchedulerProfilerMixin:
                     recv_req.record_shapes,
                     recv_req.profile_by_stage,
                     recv_req.profile_id,
-                    profile_stage,
+                    recv_req.profile_stage,
                 )
             else:
                 self.init_profile(
@@ -433,7 +426,7 @@ class SchedulerProfilerMixin:
                     recv_req.record_shapes,
                     recv_req.profile_by_stage,
                     recv_req.profile_id,
-                    profile_stage,
+                    recv_req.profile_stage,
                 )
                 return self.start_profile()
         else:
