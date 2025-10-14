@@ -99,7 +99,7 @@ Examples:
 
 "#)]
 struct CliArgs {
-    #[arg(long, default_value = "127.0.0.1")]
+    #[arg(long, default_value = "0.0.0.0")]
     host: String,
 
     #[arg(long, default_value_t = 30000)]
@@ -183,7 +183,7 @@ struct CliArgs {
     #[arg(long, default_value_t = 29000)]
     prometheus_port: u16,
 
-    #[arg(long, default_value = "127.0.0.1")]
+    #[arg(long, default_value = "0.0.0.0")]
     prometheus_host: String,
 
     #[arg(long, num_args = 0..)]

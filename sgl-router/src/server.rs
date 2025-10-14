@@ -807,9 +807,12 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         config.router_config.cors_allowed_origins.clone(),
     );
 
-    let addr = format!("{}:{}", config.host, config.port);
-    let listener = TcpListener::bind(&addr).await?;
-    info!("Starting server on {}", addr);
+    // TcpListener::bind accepts &str and handles IPv4/IPv6 via ToSocketAddrs
+    let bind_addr = format!("{}:{}", config.host, config.port);
+    info!("Starting server on {}", bind_addr);
+    let listener = TcpListener::bind(&bind_addr)
+        .await
+        .map_err(|e| format!("Failed to bind to {}: {}", bind_addr, e))?;
     serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await

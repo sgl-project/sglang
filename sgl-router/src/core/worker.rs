@@ -356,17 +356,22 @@ impl fmt::Debug for BasicWorker {
 impl BasicWorker {
     pub fn normalised_url(&self) -> WorkerResult<&str> {
         if self.url().contains("@") {
-            let parts: Vec<&str> = self.url().split('@').collect();
-            if parts.len() != 2 {
-                return Err(WorkerError::InvalidUrl {
-                    url: self.url().to_string(),
-                });
-            }
-            match parts[1].parse::<usize>() {
-                Ok(_) => Ok(parts[0]),
-                Err(_) => Err(WorkerError::InvalidUrl {
-                    url: self.url().to_string(),
-                }),
+            // Use rfind to split from the right, handling IPv6 addresses with brackets
+            // e.g., "http://[::1]:8080@0" -> "http://[::1]:8080" and "0"
+            if let Some(at_pos) = self.url().rfind('@') {
+                let base_url = &self.url()[..at_pos];
+                let rank_str = &self.url()[at_pos + 1..];
+
+                // Validate that the rank part is actually a number
+                match rank_str.parse::<usize>() {
+                    Ok(_) => Ok(base_url),
+                    Err(_) => {
+                        // The '@' is not a DP rank separator, return full URL
+                        Ok(self.url())
+                    }
+                }
+            } else {
+                Ok(self.url())
             }
         } else {
             Ok(self.url())

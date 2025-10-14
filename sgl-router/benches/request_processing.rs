@@ -7,9 +7,7 @@ use sglang_router_rs::protocols::spec::{
     ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateParameters, GenerateRequest,
     SamplingParams, StringOrArray, UserMessageContent,
 };
-use sglang_router_rs::routers::http::pd_types::{
-    generate_room_id, get_hostname, RequestWithBootstrap,
-};
+use sglang_router_rs::routers::http::pd_types::{generate_room_id, RequestWithBootstrap};
 
 fn create_test_worker() -> BasicWorker {
     BasicWorkerBuilder::new("http://test-server:8000")
@@ -21,11 +19,8 @@ fn create_test_worker() -> BasicWorker {
 
 // Helper function to get bootstrap info from worker
 fn get_bootstrap_info(worker: &BasicWorker) -> (String, Option<u16>) {
-    let hostname = get_hostname(worker.url());
-    let bootstrap_port = match worker.worker_type() {
-        WorkerType::Prefill { bootstrap_port } => bootstrap_port,
-        _ => None,
-    };
+    let hostname = worker.bootstrap_host().to_string();
+    let bootstrap_port = worker.bootstrap_port();
     (hostname, bootstrap_port)
 }
 

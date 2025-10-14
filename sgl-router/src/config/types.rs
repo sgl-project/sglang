@@ -407,7 +407,7 @@ impl Default for MetricsConfig {
     fn default() -> Self {
         Self {
             port: 29000,
-            host: "127.0.0.1".to_string(),
+            host: "0.0.0.0".to_string(),
         }
     }
 }
@@ -419,7 +419,7 @@ impl Default for RouterConfig {
                 worker_urls: vec![],
             },
             policy: PolicyConfig::Random,
-            host: "127.0.0.1".to_string(),
+            host: "0.0.0.0".to_string(),
             port: 3001,
             max_payload_size: 536_870_912, // 512MB
             request_timeout_secs: 1800,    // 30 minutes
@@ -522,7 +522,7 @@ mod tests {
             matches!(config.mode, RoutingMode::Regular { worker_urls } if worker_urls.is_empty())
         );
         assert!(matches!(config.policy, PolicyConfig::Random));
-        assert_eq!(config.host, "127.0.0.1");
+        assert_eq!(config.host, "0.0.0.0");
         assert_eq!(config.port, 3001);
         assert_eq!(config.max_payload_size, 536_870_912);
         assert_eq!(config.request_timeout_secs, 1800);
@@ -553,7 +553,7 @@ mod tests {
         }
 
         assert!(matches!(config.policy, PolicyConfig::RoundRobin));
-        assert_eq!(config.host, "127.0.0.1");
+        assert_eq!(config.host, "0.0.0.0");
         assert_eq!(config.port, 3001);
     }
 
@@ -800,7 +800,7 @@ mod tests {
         let config = MetricsConfig::default();
 
         assert_eq!(config.port, 29000);
-        assert_eq!(config.host, "127.0.0.1");
+        assert_eq!(config.host, "0.0.0.0");
     }
 
     #[test]
