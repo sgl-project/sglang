@@ -227,8 +227,8 @@ def send_prefix(args, batch_size: int, prompts: List[str]):
 
 def test_deterministic(args):
     # First do some warmups
-    for i in range(3):
-        send_single(args, 16, args.profile)
+    # for i in range(3):
+    #     send_single(args, 16, args.profile)
 
     if args.test_mode == "single":
         # In single mode, we test the deterministic behavior by sending the same prompt in batch sizes ranging from 1 to n_trials.
