@@ -457,21 +457,27 @@ class SGLangCIAnalyzer:
             return None
 
         try:
+            # Filter to only include success and failure (exclude cancelled, skipped, etc.)
+            filtered_data = [
+                d for d in timing_data if d["conclusion"] in ["success", "failure"]
+            ]
+
+            if len(filtered_data) < 2:
+                return None
+
             # Sort by timestamp
-            timing_data_sorted = sorted(timing_data, key=lambda x: x["timestamp"])
+            timing_data_sorted = sorted(filtered_data, key=lambda x: x["timestamp"])
 
             timestamps = [d["timestamp"] for d in timing_data_sorted]
             durations_minutes = [d["duration_seconds"] / 60 for d in timing_data_sorted]
 
-            # Color by conclusion
+            # Color by conclusion (only success and failure after filtering)
             colors = []
             for d in timing_data_sorted:
                 if d["conclusion"] == "success":
                     colors.append("green")
                 elif d["conclusion"] == "failure":
                     colors.append("red")
-                else:
-                    colors.append("gray")
 
             # Create graph
             plt.figure(figsize=(12, 6))
@@ -788,9 +794,20 @@ class SGLangCIAnalyzer:
                 summary_lines.append("")
 
             # Append summary to GitHub Actions
+            # Check if file has content already
+            file_has_content = False
+            try:
+                if os.path.exists(github_step_summary):
+                    with open(github_step_summary, "r", encoding="utf-8") as f:
+                        content = f.read().strip()
+                        file_has_content = len(content) > 0
+            except:
+                pass
+
             with open(github_step_summary, "a", encoding="utf-8") as f:
-                # Add separator if file already has content
-                f.write("\n\n")
+                # Add separator only if file already has content
+                if file_has_content:
+                    f.write("\n\n")
                 f.write("\n".join(summary_lines))
                 f.write("\n")
 
