@@ -1,6 +1,9 @@
 use crate::{
     config::{ConnectionMode, HistoryBackend, RouterConfig, RoutingMode},
-    core::{LoadMonitor, WorkerManager, WorkerRegistry, WorkerType},
+    core::{
+        worker_to_info, Job, JobQueue, JobQueueConfig, LoadMonitor, WorkerManager, WorkerRegistry,
+        WorkerType,
+    },
     data_connector::{
         MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
         NoOpConversationStorage, NoOpResponseStorage, OracleConversationItemStorage,
@@ -16,7 +19,8 @@ use crate::{
             ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest,
             RerankRequest, ResponsesGetParams, ResponsesRequest, V1RerankReqInput,
         },
-        worker_spec::{WorkerApiResponse, WorkerConfigRequest, WorkerErrorResponse},
+        validated::ValidatedJson,
+        worker_spec::{WorkerConfigRequest, WorkerErrorResponse, WorkerInfo},
     },
     reasoning_parser::ParserFactory as ReasoningParserFactory,
     routers::{router_manager::RouterManager, RouterTrait},
@@ -34,6 +38,7 @@ use axum::{
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::sync::OnceLock;
 use std::{
     sync::atomic::{AtomicBool, Ordering},
     sync::Arc,
@@ -48,7 +53,7 @@ use tracing::{error, info, warn, Level};
 pub struct AppContext {
     pub client: Client,
     pub router_config: RouterConfig,
-    pub rate_limiter: Arc<TokenBucket>,
+    pub rate_limiter: Option<Arc<TokenBucket>>,
     pub tokenizer: Option<Arc<dyn Tokenizer>>,
     pub reasoning_parser_factory: Option<ReasoningParserFactory>,
     pub tool_parser_factory: Option<ToolParserFactory>,
@@ -61,40 +66,62 @@ pub struct AppContext {
     pub load_monitor: Option<Arc<LoadMonitor>>,
     pub configured_reasoning_parser: Option<String>,
     pub configured_tool_parser: Option<String>,
+    pub worker_job_queue: Arc<OnceLock<Arc<JobQueue>>>,
 }
 
 impl AppContext {
     pub fn new(
         router_config: RouterConfig,
         client: Client,
-        max_concurrent_requests: usize,
-        rate_limit_tokens_per_second: Option<usize>,
+        max_concurrent_requests: i32,
+        rate_limit_tokens_per_second: Option<i32>,
     ) -> Result<Self, String> {
-        let rate_limit_tokens = rate_limit_tokens_per_second.unwrap_or(max_concurrent_requests);
-        let rate_limiter = Arc::new(TokenBucket::new(max_concurrent_requests, rate_limit_tokens));
+        let rate_limiter = match max_concurrent_requests {
+            n if n <= 0 => None,
+            n => {
+                let rate_limit_tokens =
+                    rate_limit_tokens_per_second.filter(|&t| t > 0).unwrap_or(n);
+                Some(Arc::new(TokenBucket::new(
+                    n as usize,
+                    rate_limit_tokens as usize,
+                )))
+            }
+        };
 
-        let (tokenizer, reasoning_parser_factory, tool_parser_factory) =
-            if router_config.connection_mode == ConnectionMode::Grpc {
-                let tokenizer_path = router_config
-                    .tokenizer_path
-                    .clone()
-                    .or_else(|| router_config.model_path.clone())
-                    .ok_or_else(|| {
-                        "gRPC mode requires either --tokenizer-path or --model-path to be specified"
-                            .to_string()
-                    })?;
+        let (tokenizer, reasoning_parser_factory, tool_parser_factory) = if router_config
+            .connection_mode
+            == ConnectionMode::Grpc
+        {
+            let tokenizer_path = router_config
+                .tokenizer_path
+                .clone()
+                .or_else(|| router_config.model_path.clone())
+                .ok_or_else(|| {
+                    "gRPC mode requires either --tokenizer-path or --model-path to be specified"
+                        .to_string()
+                })?;
 
-                let tokenizer = Some(
-                    tokenizer_factory::create_tokenizer(&tokenizer_path)
-                        .map_err(|e| format!("Failed to create tokenizer: {e}"))?,
+            let tokenizer = Some(
+                    tokenizer_factory::create_tokenizer_with_chat_template_blocking(
+                        &tokenizer_path,
+                        router_config.chat_template.as_deref(),
+                    )
+                    .map_err(|e| {
+                        format!(
+                            "Failed to create tokenizer from '{}': {}. \
+                            Ensure the path is valid and points to a tokenizer file (tokenizer.json) \
+                            or a HuggingFace model ID. For directories, ensure they contain tokenizer files.",
+                            tokenizer_path, e
+                        )
+                    })?,
                 );
-                let reasoning_parser_factory = Some(crate::reasoning_parser::ParserFactory::new());
-                let tool_parser_factory = Some(crate::tool_parser::ParserFactory::new());
+            let reasoning_parser_factory = Some(crate::reasoning_parser::ParserFactory::new());
+            let tool_parser_factory = Some(crate::tool_parser::ParserFactory::new());
 
-                (tokenizer, reasoning_parser_factory, tool_parser_factory)
-            } else {
-                (None, None, None)
-            };
+            (tokenizer, reasoning_parser_factory, tool_parser_factory)
+        } else {
+            (None, None, None)
+        };
 
         let worker_registry = Arc::new(WorkerRegistry::new());
         let policy_registry = Arc::new(PolicyRegistry::new(router_config.policy.clone()));
@@ -156,6 +183,9 @@ impl AppContext {
         let configured_reasoning_parser = router_config.reasoning_parser.clone();
         let configured_tool_parser = router_config.tool_call_parser.clone();
 
+        // Create empty OnceLock for worker job queue (will be initialized in startup())
+        let worker_job_queue = Arc::new(OnceLock::new());
+
         Ok(Self {
             client,
             router_config,
@@ -172,6 +202,7 @@ impl AppContext {
             load_monitor,
             configured_reasoning_parser,
             configured_tool_parser,
+            worker_job_queue,
         })
     }
 }
@@ -270,7 +301,7 @@ async fn generate(
 async fn v1_chat_completions(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    Json(body): Json<ChatCompletionRequest>,
+    ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
 ) -> Response {
     state.router.route_chat(Some(&headers), &body, None).await
 }
@@ -440,6 +471,47 @@ async fn v1_conversations_list_items(
         .await
 }
 
+#[derive(Deserialize, Default)]
+struct GetItemQuery {
+    /// Additional fields to include in response (not yet implemented)
+    include: Option<Vec<String>>,
+}
+
+async fn v1_conversations_create_items(
+    State(state): State<Arc<AppState>>,
+    Path(conversation_id): Path<String>,
+    headers: http::HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    state
+        .router
+        .create_conversation_items(Some(&headers), &conversation_id, &body)
+        .await
+}
+
+async fn v1_conversations_get_item(
+    State(state): State<Arc<AppState>>,
+    Path((conversation_id, item_id)): Path<(String, String)>,
+    Query(query): Query<GetItemQuery>,
+    headers: http::HeaderMap,
+) -> Response {
+    state
+        .router
+        .get_conversation_item(Some(&headers), &conversation_id, &item_id, query.include)
+        .await
+}
+
+async fn v1_conversations_delete_item(
+    State(state): State<Arc<AppState>>,
+    Path((conversation_id, item_id)): Path<(String, String)>,
+    headers: http::HeaderMap,
+) -> Response {
+    state
+        .router
+        .delete_conversation_item(Some(&headers), &conversation_id, &item_id)
+        .await
+}
+
 #[derive(Deserialize)]
 struct AddWorkerQuery {
     url: String,
@@ -573,52 +645,42 @@ async fn create_worker(
         );
     }
 
-    let result = WorkerManager::add_worker_from_config(&config, &state.context).await;
+    // Submit job for async processing
+    let worker_url = config.url.clone();
+    let job = Job::AddWorker {
+        config: Box::new(config),
+    };
 
-    match result {
-        Ok(message) => {
-            let response = WorkerApiResponse {
-                success: true,
-                message,
-                worker: None,
-            };
-            (StatusCode::OK, Json(response)).into_response()
+    let job_queue = state
+        .context
+        .worker_job_queue
+        .get()
+        .expect("JobQueue not initialized");
+    match job_queue.submit(job).await {
+        Ok(_) => {
+            let response = json!({
+                "status": "accepted",
+                "worker_id": worker_url,
+                "message": "Worker addition queued for background processing"
+            });
+            (StatusCode::ACCEPTED, Json(response)).into_response()
         }
         Err(error) => {
             let error_response = WorkerErrorResponse {
                 error,
-                code: "ADD_WORKER_FAILED".to_string(),
+                code: "INTERNAL_SERVER_ERROR".to_string(),
             };
-            (StatusCode::BAD_REQUEST, Json(error_response)).into_response()
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(error_response)).into_response()
         }
     }
 }
 
 async fn list_workers_rest(State(state): State<Arc<AppState>>) -> Response {
     let workers = state.context.worker_registry.get_all();
-    let response = serde_json::json!({
-        "workers": workers.iter().map(|worker| {
-            let mut worker_info = serde_json::json!({
-                "url": worker.url(),
-                "model_id": worker.model_id(),
-                "worker_type": match worker.worker_type() {
-                    WorkerType::Regular => "regular",
-                    WorkerType::Prefill { .. } => "prefill",
-                    WorkerType::Decode => "decode",
-                },
-                "is_healthy": worker.is_healthy(),
-                "load": worker.load(),
-                "connection_mode": format!("{:?}", worker.connection_mode()),
-                "priority": worker.priority(),
-                "cost": worker.cost(),
-            });
+    let worker_infos: Vec<WorkerInfo> = workers.iter().map(worker_to_info).collect();
 
-            if let WorkerType::Prefill { bootstrap_port } = worker.worker_type() {
-                worker_info["bootstrap_port"] = serde_json::json!(bootstrap_port);
-            }
-
-            worker_info
-        }).collect::<Vec<_>>(),
+    let response = json!({
+        "workers": worker_infos,
         "total": workers.len(),
         "stats": {
             "prefill_count": state.context.worker_registry.get_prefill_workers().len(),
@@ -630,41 +692,77 @@ async fn list_workers_rest(State(state): State<Arc<AppState>>) -> Response {
 }
 
 async fn get_worker(State(state): State<Arc<AppState>>, Path(url): Path<String>) -> Response {
-    let workers = WorkerManager::get_worker_urls(&state.context.worker_registry);
-    if workers.contains(&url) {
-        Json(json!({
-            "url": url,
-            "model_id": "unknown",
-            "is_healthy": true
-        }))
-        .into_response()
-    } else {
-        let error = WorkerErrorResponse {
-            error: format!("Worker {url} not found"),
-            code: "WORKER_NOT_FOUND".to_string(),
-        };
-        (StatusCode::NOT_FOUND, Json(error)).into_response()
+    let job_queue = state
+        .context
+        .worker_job_queue
+        .get()
+        .expect("JobQueue not initialized");
+
+    if let Some(worker) = state.context.worker_registry.get_by_url(&url) {
+        // Worker exists in registry, get its full info and attach job status if any
+        let mut worker_info = worker_to_info(&worker);
+        if let Some(status) = job_queue.get_status(&url) {
+            worker_info.job_status = Some(status);
+        }
+        return Json(worker_info).into_response();
     }
+
+    // Worker not in registry, check job queue for its status
+    if let Some(status) = job_queue.get_status(&url) {
+        // Create a partial WorkerInfo to report the job status
+        let worker_info = WorkerInfo {
+            id: url.clone(),
+            url: url.clone(),
+            model_id: "unknown".to_string(),
+            priority: 0,
+            cost: 1.0,
+            worker_type: "unknown".to_string(),
+            is_healthy: false,
+            load: 0,
+            connection_mode: "unknown".to_string(),
+            tokenizer_path: None,
+            reasoning_parser: None,
+            tool_parser: None,
+            chat_template: None,
+            bootstrap_port: None,
+            metadata: std::collections::HashMap::new(),
+            job_status: Some(status),
+        };
+        return Json(worker_info).into_response();
+    }
+
+    // Worker not found in registry or job queue
+    let error = WorkerErrorResponse {
+        error: format!("Worker {url} not found"),
+        code: "WORKER_NOT_FOUND".to_string(),
+    };
+    (StatusCode::NOT_FOUND, Json(error)).into_response()
 }
 
 async fn delete_worker(State(state): State<Arc<AppState>>, Path(url): Path<String>) -> Response {
-    let result = WorkerManager::remove_worker(&url, &state.context);
+    let worker_id = url.clone();
+    let job = Job::RemoveWorker { url };
 
-    match result {
-        Ok(message) => {
-            let response = WorkerApiResponse {
-                success: true,
-                message,
-                worker: None,
-            };
-            (StatusCode::OK, Json(response)).into_response()
+    let job_queue = state
+        .context
+        .worker_job_queue
+        .get()
+        .expect("JobQueue not initialized");
+    match job_queue.submit(job).await {
+        Ok(_) => {
+            let response = json!({
+                "status": "accepted",
+                "worker_id": worker_id,
+                "message": "Worker removal queued for background processing"
+            });
+            (StatusCode::ACCEPTED, Json(response)).into_response()
         }
         Err(error) => {
             let error_response = WorkerErrorResponse {
                 error,
-                code: "REMOVE_WORKER_FAILED".to_string(),
+                code: "INTERNAL_SERVER_ERROR".to_string(),
             };
-            (StatusCode::BAD_REQUEST, Json(error_response)).into_response()
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(error_response)).into_response()
         }
     }
 }
@@ -716,7 +814,11 @@ pub fn build_app(
         )
         .route(
             "/v1/conversations/{conversation_id}/items",
-            get(v1_conversations_list_items),
+            get(v1_conversations_list_items).post(v1_conversations_create_items),
+        )
+        .route(
+            "/v1/conversations/{conversation_id}/items/{item_id}",
+            get(v1_conversations_get_item).delete(v1_conversations_delete_item),
         )
         .route_layer(axum::middleware::from_fn_with_state(
             app_state.clone(),
@@ -831,6 +933,13 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     let app_context = Arc::new(app_context);
 
+    let weak_context = Arc::downgrade(&app_context);
+    let worker_job_queue = JobQueue::new(JobQueueConfig::default(), weak_context);
+    app_context
+        .worker_job_queue
+        .set(worker_job_queue)
+        .expect("JobQueue should only be initialized once");
+
     info!(
         "Initializing workers for routing mode: {:?}",
         config.router_config.mode
@@ -871,12 +980,24 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         Duration::from_secs(config.router_config.queue_timeout_secs),
     );
 
-    if let Some(processor) = processor {
-        spawn(processor.run());
-        info!(
-            "Started request queue with size: {}, timeout: {}s",
-            config.router_config.queue_size, config.router_config.queue_timeout_secs
-        );
+    if app_context.rate_limiter.is_none() {
+        info!("Rate limiting is disabled (max_concurrent_requests = -1)");
+    }
+
+    match processor {
+        Some(proc) => {
+            spawn(proc.run());
+            info!(
+                "Started request queue (size: {}, timeout: {}s)",
+                config.router_config.queue_size, config.router_config.queue_timeout_secs
+            );
+        }
+        None => {
+            info!(
+                "Rate limiting enabled (max_concurrent_requests = {}, queue disabled)",
+                config.router_config.max_concurrent_requests
+            );
+        }
     }
 
     let app_state = Arc::new(AppState {
