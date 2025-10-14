@@ -88,7 +88,7 @@ impl PDRouter {
 
                 match res.bytes().await {
                     Ok(body) => {
-                        let mut response = Response::new(axum::body::Body::from(body));
+                        let mut response = Response::new(Body::from(body));
                         *response.status_mut() = StatusCode::OK;
                         *response.headers_mut() = response_headers;
                         response
@@ -150,11 +150,6 @@ impl PDRouter {
     }
 
     fn get_generate_batch_size(req: &GenerateRequest) -> Option<usize> {
-        if let Some(StringOrArray::Array(arr)) = &req.prompt {
-            if !arr.is_empty() {
-                return Some(arr.len());
-            }
-        }
         if let Some(text) = &req.text {
             if text.contains("[") && text.contains("]") {
                 return None;
@@ -201,7 +196,7 @@ impl PDRouter {
             }
             obj.insert(
                 "bootstrap_host".to_string(),
-                Value::Array(hosts.into_iter().map(serde_json::Value::from).collect()),
+                Value::Array(hosts.into_iter().map(Value::from).collect()),
             );
             obj.insert(
                 "bootstrap_port".to_string(),
@@ -209,7 +204,7 @@ impl PDRouter {
                     ports
                         .into_iter()
                         .map(|p| match p {
-                            Some(v) => serde_json::Value::from(v),
+                            Some(v) => Value::from(v),
                             None => Value::Null,
                         })
                         .collect(),
@@ -217,23 +212,23 @@ impl PDRouter {
             );
             obj.insert(
                 "bootstrap_room".to_string(),
-                Value::Array(rooms.into_iter().map(serde_json::Value::from).collect()),
+                Value::Array(rooms.into_iter().map(Value::from).collect()),
             );
         } else {
             obj.insert(
                 "bootstrap_host".to_string(),
-                serde_json::Value::from(prefill_worker.bootstrap_host()),
+                Value::from(prefill_worker.bootstrap_host()),
             );
             obj.insert(
                 "bootstrap_port".to_string(),
                 match prefill_worker.bootstrap_port() {
-                    Some(v) => serde_json::Value::from(v),
+                    Some(v) => Value::from(v),
                     None => Value::Null,
                 },
             );
             obj.insert(
                 "bootstrap_room".to_string(),
-                serde_json::Value::from(super::pd_types::generate_room_id()),
+                Value::from(super::pd_types::generate_room_id()),
             );
         }
         Ok(original)
@@ -508,8 +503,7 @@ impl PDRouter {
 
                         match res.bytes().await {
                             Ok(decode_body) => {
-                                let mut response =
-                                    Response::new(axum::body::Body::from(decode_body));
+                                let mut response = Response::new(Body::from(decode_body));
                                 *response.status_mut() = status;
                                 *response.headers_mut() = response_headers;
                                 response
@@ -1062,18 +1056,10 @@ impl RouterTrait for PDRouter {
         model_id: Option<&str>,
     ) -> Response {
         let is_stream = body.stream;
-        let return_logprob = body.return_logprob;
+        let return_logprob = body.return_logprob.unwrap_or(false);
 
         let request_text = if self.policies_need_request_text() {
-            body.text
-                .as_deref()
-                .or_else(|| {
-                    body.prompt.as_ref().and_then(|p| match p {
-                        StringOrArray::String(s) => Some(s.as_str()),
-                        StringOrArray::Array(v) => v.first().map(|s| s.as_str()),
-                    })
-                })
-                .map(|s| s.to_string())
+            body.text.as_deref().map(|s| s.to_string())
         } else {
             None
         };
@@ -1365,7 +1351,7 @@ mod tests {
         assert_eq!(decode_ref.load(), 0);
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
+        let stream = UnboundedReceiverStream::new(rx);
 
         let _response = router.create_streaming_response(
             stream.map(Ok),

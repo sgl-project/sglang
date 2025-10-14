@@ -23,8 +23,9 @@ mod tests;
 
 // Re-exports
 pub use factory::{
-    create_tokenizer, create_tokenizer_async, create_tokenizer_from_file,
-    create_tokenizer_with_chat_template, TokenizerType,
+    create_tokenizer, create_tokenizer_async, create_tokenizer_async_with_chat_template,
+    create_tokenizer_from_file, create_tokenizer_with_chat_template,
+    create_tokenizer_with_chat_template_blocking, TokenizerType,
 };
 pub use sequence::Sequence;
 pub use stop::{SequenceDecoderOutput, StopSequenceConfig, StopSequenceDecoder};
@@ -42,7 +43,7 @@ pub struct Tokenizer(Arc<dyn traits::Tokenizer>);
 impl Tokenizer {
     /// Create a tokenizer from a file path
     pub fn from_file(file_path: &str) -> Result<Tokenizer> {
-        Ok(Tokenizer(factory::create_tokenizer_from_file(file_path)?))
+        Ok(Tokenizer(create_tokenizer_from_file(file_path)?))
     }
 
     /// Create a tokenizer from a file path with an optional chat template
@@ -50,7 +51,7 @@ impl Tokenizer {
         file_path: &str,
         chat_template_path: Option<&str>,
     ) -> Result<Tokenizer> {
-        Ok(Tokenizer(factory::create_tokenizer_with_chat_template(
+        Ok(Tokenizer(create_tokenizer_with_chat_template(
             file_path,
             chat_template_path,
         )?))
