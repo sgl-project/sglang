@@ -619,7 +619,6 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         return hidden_states, event, hook, overlap_args
 
     def combine_b(self, hidden_states, event, hook, overlap_args):
-        # NOTE HACK
         if overlap_args is not None:
             overlap_args.stream.wait_stream(self.device_module.current_stream())
 
