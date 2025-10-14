@@ -1461,7 +1461,7 @@ pub struct ResponsesRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
 
-    /// Request ID (injected by middleware if not provided)
+    /// Request ID
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
 
@@ -1481,9 +1481,6 @@ pub struct ResponsesRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop: Option<StringOrArray>,
 
-    // SGLang-specific sampling parameters (extensions to OpenAI Responses API)
-    // These parameters are forwarded to the SGLang backend for sampling control
-    // and are not part of the official OpenAI Responses API specification.
     /// Top-k sampling parameter (SGLang extension)
     #[serde(default = "default_top_k")]
     pub top_k: i32,
@@ -1548,8 +1545,6 @@ impl Default for ResponsesRequest {
         }
     }
 }
-
-impl ResponsesRequest {}
 
 impl GenerationRequest for ResponsesRequest {
     fn is_stream(&self) -> bool {
@@ -1729,7 +1724,10 @@ impl ResponsesResponse {
         usage: Option<UsageInfo>,
     ) -> Self {
         Self {
-            id: request.request_id.clone().expect("request_id should be set by middleware"),
+            id: request
+                .request_id
+                .clone()
+                .expect("request_id should be set by middleware"),
             object: "response".to_string(),
             created_at: created_time,
             status,

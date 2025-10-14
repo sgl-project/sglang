@@ -545,7 +545,10 @@ fn test_json_serialization() {
     let parsed: ResponsesRequest =
         serde_json::from_str(&json).expect("Deserialization should work");
 
-    assert_eq!(parsed.request_id, Some("resp_comprehensive_test".to_string()));
+    assert_eq!(
+        parsed.request_id,
+        Some("resp_comprehensive_test".to_string())
+    );
     assert_eq!(parsed.model, Some("gpt-4".to_string()));
     assert_eq!(parsed.background, Some(true));
     assert_eq!(parsed.stream, Some(true));
