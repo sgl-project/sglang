@@ -139,7 +139,7 @@ def generate_baseline(
         enable_deterministic_inference=True,
         random_seed=42,
         skip_tokenizer_init=True,
-        mem_fraction_static=0.6,
+        mem_fraction_static=0.8,
         max_running_requests=1,
     )
 
@@ -242,8 +242,8 @@ class TestLogprobsDense(unittest.TestCase):
                 records = pickle.load(f)
             print(f"Successfully loaded {len(records)} records from local baseline")
             return records
-        except Exception as e:
-            raise Exception(f"Failed to load local baseline: {e}")
+        except (IOError, pickle.PickleError) as e:
+            raise Exception(f"Failed to load local baseline: {e}") from e
 
     def compare_meta(self, baseline_meta, sglang_meta):
         """Compare metadata between two outputs and return max and mean differences."""
