@@ -342,6 +342,12 @@ impl SglangSchedulerClient {
                 .map_err(|_| "min_tokens must fit into a 32-bit signed integer".to_string())?;
         }
 
+        // Handle n with conversion
+        if let Some(n) = p.n {
+            sampling.n = i32::try_from(n)
+                .map_err(|_| "n must fit into a 32-bit signed integer".to_string())?;
+        }
+
         // Handle constraints (exactly one allowed)
         sampling.constraint = Self::build_single_constraint_from_plain(p)?;
 

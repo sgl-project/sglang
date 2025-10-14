@@ -19,7 +19,6 @@ import grpc
 import zmq
 import zmq.asyncio
 
-from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOutput,
@@ -111,6 +110,7 @@ class GrpcRequestManager:
         self,
         server_args: ServerArgs,
         port_args: PortArgs,
+        bootstrap_server=None,
     ):
         """Initialize the gRPC request manager."""
         self.server_args = server_args
@@ -147,8 +147,8 @@ class GrpcRequestManager:
         self.crash_dump_request_list = []
         self.crash_dump_performed = False
 
-        # Bootstrap server for disaggregation mode
-        self.bootstrap_server = start_disagg_service(server_args)
+        # Bootstrap server (passed from serve_grpc, not started here)
+        self.bootstrap_server = bootstrap_server
 
         logger.info(
             f"GrpcRequestManager initialized with ZMQ IPC: "
@@ -157,7 +157,7 @@ class GrpcRequestManager:
         )
         if self.bootstrap_server:
             logger.info(
-                f"Bootstrap server started for disaggregation mode: "
+                f"Bootstrap server initialized for disaggregation mode: "
                 f"{server_args.disaggregation_mode}"
             )
 
