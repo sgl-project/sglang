@@ -374,7 +374,7 @@ def handle_attention_nsa(attn, forward_batch):
 def handle_attention_triton(attn, forward_batch):
     if (
         _is_extend_without_speculative(forward_batch)
-        and sum(forward_batch.extend_prefix_lens_cpu) == 0
+        # and sum(forward_batch.extend_prefix_lens_cpu) == 0
     ):
         return AttnForwardMethod.MHA
     else:
@@ -2518,12 +2518,18 @@ class DeepseekV2DecoderLayer(nn.Module):
             quant_format,
         )
 
+        if residual is not None:
+            assert hidden_states.shape == residual.shape
+
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             zero_allocator=zero_allocator,
         )
+
+        if residual is not None:
+            assert hidden_states.shape == residual.shape 
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
@@ -2787,16 +2793,16 @@ class DeepseekV2Model(nn.Module):
                 normal_end_layer = normal_start_layer = 0
 
         for i in range(normal_start_layer, normal_end_layer):
-            with get_global_expert_distribution_recorder().with_current_layer(i):
-                layer = self.layers[i]
-                hidden_states, residual = layer(
-                    positions,
-                    hidden_states,
-                    forward_batch,
-                    residual,
-                    zero_allocator,
-                    gemm_output_zero_allocator,
-                )
+            # with get_global_expert_distribution_recorder().with_current_layer(i):
+            layer = self.layers[i]
+            hidden_states, residual = layer(
+                positions,
+                hidden_states,
+                forward_batch,
+                residual,
+                zero_allocator,
+                gemm_output_zero_allocator,
+            )
 
         if normal_end_layer != self.end_layer:
             hidden_states, residual = model_forward_maybe_tbo(

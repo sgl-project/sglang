@@ -329,8 +329,13 @@ class ModelRunner:
         ):
             self.attention_layers = []
             for layer in self.model.model.layers:
-                if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "attn"):
-                    self.attention_layers.append(layer.self_attn.attn)
+                if hasattr(layer, "self_attn"):
+                    if hasattr(layer.self_attn, "attn"):
+                        self.attention_layers.append(layer.self_attn.attn)
+                    elif hasattr(layer.self_attn, "attn_mha"):
+                        # For DeepSeek model
+                        self.attention_layers.append(layer.self_attn.attn_mha)
+
             if len(self.attention_layers) < self.model_config.num_hidden_layers:
                 # TODO(yuwei): support Non-Standard GQA
                 log_info_on_rank0(

@@ -166,7 +166,6 @@ class PiecewiseCudaGraphRunner:
         if model_runner.server_args.enable_return_hidden_states:
             self.capture_hidden_mode = CaptureHiddenMode.FULL
 
-        # Attention backend
         self.max_num_tokens = max(self.capture_num_tokens)
 
         # Graph inputs
