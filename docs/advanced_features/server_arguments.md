@@ -294,6 +294,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--enable-dp-lm-head` | Enable vocabulary parallel across the attention TP group to avoid all-gather across DP groups, optimizing performance under DP attention. | False |
 | `--enable-two-batch-overlap` | Enabling two micro batches to overlap. | False |
 | `--tbo-token-distribution-threshold` | The threshold of token distribution between two batches in micro-batch-overlap, determines whether to two-batch-overlap or two-chunk-overlap. Set to 0 denote disable two-chunk-overlap. | 0.48 |
+| `--enable-single-batch-overlap` | Enabling single batch overlap. | False |
 | `--enable-torch-compile` | Optimize the model with torch.compile. Experimental feature. | False |
 | `--torch-compile-max-bs` | Set the maximum batch size when using torch compile. | 32 |
 | `--torchao-config` | Optimize the model with torchao. Experimental feature. Current choices are: int8dq, int8wo, int4wo-<group_size>, fp8wo, fp8dq-per_tensor, fp8dq-per_row. |  |
