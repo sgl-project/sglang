@@ -1074,7 +1074,7 @@ class InitWeightsSendGroupForRemoteInstanceReqInput(BaseReq):
     backend: str = "nccl"
 
 @dataclass
-class UpdateWeightsFromIPCReqInput:
+class UpdateWeightsFromIPCReqInput(BaseReq):
     # ZMQ socket paths for each device UUID
     zmq_handles: Dict[str, str]
     # Whether to flush cache after weight update
@@ -1082,7 +1082,7 @@ class UpdateWeightsFromIPCReqInput:
 
 
 @dataclass
-class UpdateWeightsFromIPCReqOutput:
+class UpdateWeightsFromIPCReqOutput(BaseReq):
     success: bool
     message: str
 
