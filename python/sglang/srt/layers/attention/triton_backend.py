@@ -867,10 +867,15 @@ class TritonAttnBackend(AttentionBackend):
             # Note: for unified kernel, we use full kv_indptr (not window)
             prefix_kv_indptr = self.forward_metadata.window_kv_indptr
             prefix_kv_indices = self.forward_metadata.window_kv_indices
+            # Compute window start positions (absolute position of first key in window)
+            # window_start_pos = seq_len - window_len
+            window_kv_lens = prefix_kv_indptr[1 : bs + 1] - prefix_kv_indptr[:bs]
+            window_start_pos = forward_batch.extend_prefix_lens[:bs] - window_kv_lens
         else:
             sliding_window_size = -1
             prefix_kv_indptr = self.forward_metadata.kv_indptr
             prefix_kv_indices = self.forward_metadata.kv_indices
+            window_start_pos = None
 
         # Build unified kv_indices (prefix + extend)
         # Extend tokens are already in cache (written above)
@@ -952,6 +957,7 @@ class TritonAttnBackend(AttentionBackend):
             is_causal=causal,
             sliding_window_size=sliding_window_size,
             sinks=sinks,
+            window_start_pos=window_start_pos,
             xai_temperature_len=layer.xai_temperature_len,
         )
 
