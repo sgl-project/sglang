@@ -23,6 +23,8 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::{watch, Mutex};
+use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
 static HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
@@ -1173,6 +1175,139 @@ impl WorkerManager {
             total_workers,
             successful,
             failed,
+        }
+    }
+}
+
+/// Load monitoring service that periodically fetches worker loads
+pub struct LoadMonitor {
+    worker_registry: Arc<WorkerRegistry>,
+    policy_registry: Arc<PolicyRegistry>,
+    client: reqwest::Client,
+    interval: Duration,
+    tx: watch::Sender<HashMap<String, isize>>,
+    rx: watch::Receiver<HashMap<String, isize>>,
+    monitor_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+}
+
+impl LoadMonitor {
+    /// Create a new load monitor
+    pub fn new(
+        worker_registry: Arc<WorkerRegistry>,
+        policy_registry: Arc<PolicyRegistry>,
+        client: reqwest::Client,
+        interval_secs: u64,
+    ) -> Self {
+        let (tx, rx) = watch::channel(HashMap::new());
+
+        Self {
+            worker_registry,
+            policy_registry,
+            client,
+            interval: Duration::from_secs(interval_secs),
+            tx,
+            rx,
+            monitor_handle: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Start monitoring worker loads
+    pub async fn start(&self) {
+        let mut handle_guard = self.monitor_handle.lock().await;
+        if handle_guard.is_some() {
+            debug!("Load monitoring already running");
+            return;
+        }
+
+        info!(
+            "Starting load monitoring with interval: {:?}",
+            self.interval
+        );
+
+        let worker_registry = Arc::clone(&self.worker_registry);
+        let policy_registry = Arc::clone(&self.policy_registry);
+        let client = self.client.clone();
+        let interval = self.interval;
+        let tx = self.tx.clone();
+
+        let handle = tokio::spawn(async move {
+            Self::monitor_loop(worker_registry, policy_registry, client, interval, tx).await;
+        });
+
+        *handle_guard = Some(handle);
+    }
+
+    /// Stop monitoring worker loads
+    pub async fn stop(&self) {
+        let mut handle_guard = self.monitor_handle.lock().await;
+        if let Some(handle) = handle_guard.take() {
+            info!("Stopping load monitoring");
+            handle.abort();
+            let _ = handle.await; // Wait for task to finish
+        }
+    }
+
+    /// Get a receiver for load updates
+    pub fn subscribe(&self) -> watch::Receiver<HashMap<String, isize>> {
+        self.rx.clone()
+    }
+
+    /// The main monitoring loop
+    async fn monitor_loop(
+        worker_registry: Arc<WorkerRegistry>,
+        policy_registry: Arc<PolicyRegistry>,
+        client: reqwest::Client,
+        interval: Duration,
+        tx: watch::Sender<HashMap<String, isize>>,
+    ) {
+        let mut interval_timer = tokio::time::interval(interval);
+
+        loop {
+            interval_timer.tick().await;
+
+            let power_of_two_policies = policy_registry.get_all_power_of_two_policies();
+
+            if power_of_two_policies.is_empty() {
+                debug!("No PowerOfTwo policies found, skipping load fetch");
+                continue;
+            }
+
+            let result = WorkerManager::get_all_worker_loads(&worker_registry, &client).await;
+
+            let mut loads = HashMap::new();
+            for load_info in result.loads {
+                loads.insert(load_info.worker, load_info.load);
+            }
+
+            if !loads.is_empty() {
+                debug!(
+                    "Fetched loads from {} workers, updating {} PowerOfTwo policies",
+                    loads.len(),
+                    power_of_two_policies.len()
+                );
+                for policy in &power_of_two_policies {
+                    policy.update_loads(&loads);
+                }
+                let _ = tx.send(loads);
+            } else {
+                warn!("No loads fetched from workers");
+            }
+        }
+    }
+
+    /// Check if monitoring is currently active
+    pub async fn is_running(&self) -> bool {
+        let handle_guard = self.monitor_handle.lock().await;
+        handle_guard.is_some()
+    }
+}
+
+impl Drop for LoadMonitor {
+    fn drop(&mut self) {
+        if let Ok(mut handle_guard) = self.monitor_handle.try_lock() {
+            if let Some(handle) = handle_guard.take() {
+                handle.abort();
+            }
         }
     }
 }

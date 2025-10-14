@@ -1,10 +1,9 @@
 use crate::config::types::RetryConfig;
 use crate::core::{
-    is_retryable_status, ConnectionMode, RetryExecutor, Worker, WorkerManager, WorkerRegistry,
-    WorkerType,
+    is_retryable_status, ConnectionMode, RetryExecutor, Worker, WorkerRegistry, WorkerType,
 };
 use crate::metrics::RouterMetrics;
-use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
+use crate::policies::PolicyRegistry;
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, GenerationRequest,
     RerankRequest, RerankResponse, RerankResult, ResponsesGetParams, ResponsesRequest,
@@ -23,9 +22,8 @@ use axum::{
 };
 use futures_util::StreamExt;
 use reqwest::Client;
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error};
 
@@ -38,8 +36,6 @@ pub struct Router {
     dp_aware: bool,
     enable_igw: bool,
     retry_config: RetryConfig,
-    _worker_loads: Arc<tokio::sync::watch::Receiver<HashMap<String, isize>>>,
-    _load_monitor_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
 }
 
 impl Router {
@@ -54,42 +50,6 @@ impl Router {
 
         RouterMetrics::set_active_workers(workers.len());
 
-        let worker_urls: Vec<String> = workers.iter().map(|w| w.url().to_string()).collect();
-
-        let (tx, rx) = tokio::sync::watch::channel(HashMap::new());
-        let worker_loads = Arc::new(rx);
-
-        let default_policy = ctx.policy_registry.get_default_policy();
-
-        let load_monitor_handle = if default_policy.name() == "power_of_two" {
-            let monitor_urls = worker_urls.clone();
-            let monitor_api_keys = monitor_urls
-                .iter()
-                .map(|url| {
-                    ctx.worker_registry
-                        .get_by_url(url)
-                        .and_then(|w| w.api_key().clone())
-                })
-                .collect::<Vec<Option<String>>>();
-            let monitor_interval = ctx.router_config.worker_startup_check_interval_secs;
-            let policy_clone = default_policy.clone();
-            let client_clone = ctx.client.clone();
-
-            Some(Arc::new(tokio::spawn(async move {
-                Self::monitor_worker_loads(
-                    monitor_urls,
-                    monitor_api_keys,
-                    tx,
-                    monitor_interval,
-                    policy_clone,
-                    client_clone,
-                )
-                .await;
-            })))
-        } else {
-            None
-        };
-
         Ok(Router {
             worker_registry: ctx.worker_registry.clone(),
             policy_registry: ctx.policy_registry.clone(),
@@ -97,8 +57,6 @@ impl Router {
             dp_aware: ctx.router_config.dp_aware,
             enable_igw: ctx.router_config.enable_igw,
             retry_config: ctx.router_config.effective_retry_config(),
-            _worker_loads: worker_loads,
-            _load_monitor_handle: load_monitor_handle,
         })
     }
 
@@ -661,42 +619,6 @@ impl Router {
         }
     }
 
-    // Background task to monitor worker loads
-    async fn monitor_worker_loads(
-        worker_urls: Vec<String>,
-        worker_api_keys: Vec<Option<String>>,
-        tx: tokio::sync::watch::Sender<HashMap<String, isize>>,
-        interval_secs: u64,
-        policy: Arc<dyn LoadBalancingPolicy>,
-        client: Client,
-    ) {
-        let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
-
-        loop {
-            interval.tick().await;
-
-            let mut loads = HashMap::new();
-            for (url, api_key) in worker_urls.iter().zip(worker_api_keys.iter()) {
-                // Use WorkerManager for consistent load fetching
-                if let Some(load) =
-                    WorkerManager::get_worker_load(url, api_key.as_deref(), &client).await
-                {
-                    loads.insert(url.clone(), load);
-                }
-            }
-
-            if !loads.is_empty() {
-                // Update policy with new loads
-                policy.update_loads(&loads);
-
-                // Send to watchers
-                if let Err(e) = tx.send(loads) {
-                    error!("Failed to send load update: {}", e);
-                }
-            }
-        }
-    }
-
     async fn build_rerank_response(
         req: &RerankRequest,
         response: Response,
@@ -858,7 +780,6 @@ impl RouterTrait for Router {
 mod tests {
     use super::*;
     use crate::core::BasicWorkerBuilder;
-    use std::collections::HashMap;
 
     fn create_test_regular_router() -> Router {
         // Create registries
@@ -877,15 +798,12 @@ mod tests {
         worker_registry.register(Arc::new(worker1));
         worker_registry.register(Arc::new(worker2));
 
-        let (_, rx) = tokio::sync::watch::channel(HashMap::new());
         Router {
             worker_registry,
             policy_registry,
             dp_aware: false,
             client: Client::new(),
             retry_config: RetryConfig::default(),
-            _worker_loads: Arc::new(rx),
-            _load_monitor_handle: None,
             enable_igw: false,
         }
     }

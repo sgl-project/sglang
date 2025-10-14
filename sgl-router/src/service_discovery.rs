@@ -584,6 +584,7 @@ mod tests {
             tool_parser_registry: None,     // HTTP mode doesn't need tool parser
             router_manager: None,           // Test doesn't need router manager
             response_storage: Arc::new(crate::data_connector::MemoryResponseStorage::new()),
+            load_monitor: None,
         })
     }
 

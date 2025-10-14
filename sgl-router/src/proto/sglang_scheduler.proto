@@ -47,24 +47,24 @@ message SamplingParams {
     string regex = 13;
     string json_schema = 14;
     string ebnf_grammar = 15;
+    string structural_tag = 16;
   }
 
   // LoRA adapter
-  string lora_path = 16;
+  string lora_path = 17;
 
   // Speculative decoding
-  int32 n = 17;  // Number of samples
+  int32 n = 18;  // Number of samples
 
   // Token healing
-  bool token_healing = 18;
+  bool token_healing = 19;
 
   // Additional parameters
-  int32 min_new_tokens = 19;
-  bool ignore_eos = 20;
-  bool no_stop_trim = 21;
-  int32 stream_interval = 22;
-  map<string, float> logit_bias = 23;
-  string structural_tag = 24;
+  int32 min_new_tokens = 20;
+  bool ignore_eos = 21;
+  bool no_stop_trim = 22;
+  int32 stream_interval = 23;
+  map<string, float> logit_bias = 24;
 
   // Custom parameters for extensibility
   google.protobuf.Struct custom_params = 25;

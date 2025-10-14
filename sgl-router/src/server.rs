@@ -1,6 +1,6 @@
 use crate::{
     config::{ConnectionMode, HistoryBackend, RouterConfig, RoutingMode},
-    core::{WorkerManager, WorkerRegistry, WorkerType},
+    core::{LoadMonitor, WorkerManager, WorkerRegistry, WorkerType},
     data_connector::{
         MemoryResponseStorage, NoOpResponseStorage, OracleResponseStorage, SharedResponseStorage,
     },
@@ -51,6 +51,7 @@ pub struct AppContext {
     pub policy_registry: Arc<PolicyRegistry>,
     pub router_manager: Option<Arc<RouterManager>>,
     pub response_storage: SharedResponseStorage,
+    pub load_monitor: Option<Arc<LoadMonitor>>,
 }
 
 impl AppContext {
@@ -107,6 +108,13 @@ impl AppContext {
             }
         };
 
+        let load_monitor = Some(Arc::new(LoadMonitor::new(
+            worker_registry.clone(),
+            policy_registry.clone(),
+            client.clone(),
+            router_config.worker_startup_check_interval_secs,
+        )));
+
         Ok(Self {
             client,
             router_config,
@@ -118,6 +126,7 @@ impl AppContext {
             policy_registry,
             router_manager,
             response_storage,
+            load_monitor,
         })
     }
 }
@@ -726,6 +735,11 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         "Started health checker for workers with {}s interval",
         config.router_config.health_check.check_interval_secs
     );
+
+    if let Some(ref load_monitor) = app_context.load_monitor {
+        load_monitor.start().await;
+        info!("Started LoadMonitor for PowerOfTwo policies");
+    }
 
     let (limiter, processor) = middleware::ConcurrencyLimiter::new(
         app_context.rate_limiter.clone(),
