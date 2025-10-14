@@ -1,4 +1,4 @@
-# SGLang Classification API
+# Classification API
 
 This document describes the `/v1/classify` API endpoint implementation in SGLang, which is compatible with vLLM's classification API format.
 
