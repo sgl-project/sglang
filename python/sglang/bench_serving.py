@@ -1709,7 +1709,6 @@ async def benchmark(
         profile_params = {}
         if profile_by_stage:
             profile_params["profile_by_stage"] = True
-            # Pass stage directly (None means profile all stages)
             profile_params["profile_stage"] = profile_stage
 
         profile_output = await async_request_profile(
