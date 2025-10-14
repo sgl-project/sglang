@@ -169,8 +169,8 @@ impl SglangSchedulerClient {
         &self,
     ) -> Result<proto::HealthCheckResponse, Box<dyn std::error::Error + Send + Sync>> {
         debug!("Sending health check request");
-        // Server ignores the request body and creates its own health check internally
-        let request = Request::new(proto::HealthCheckRequest { tokenized: None });
+        // HealthCheckRequest is now empty - server generates its own health check internally
+        let request = Request::new(proto::HealthCheckRequest {});
 
         let mut client = self.client.clone();
         let response = client.health_check(request).await?;
@@ -510,13 +510,8 @@ mod tests {
 
     #[test]
     fn test_proto_types_compilation() {
-        let health_req = proto::HealthCheckRequest {
-            tokenized: Some(proto::TokenizedInput {
-                original_text: "test".to_string(),
-                input_ids: vec![1296],
-            }),
-        };
-        assert!(health_req.tokenized.is_some());
+        let _health_req = proto::HealthCheckRequest {};
+        // HealthCheckRequest is now empty - no fields to test
     }
 
     #[test]
@@ -558,13 +553,8 @@ mod tests {
 
     #[test]
     fn test_health_check_request() {
-        let health_req = proto::HealthCheckRequest {
-            tokenized: Some(proto::TokenizedInput {
-                original_text: "test".to_string(),
-                input_ids: vec![1296], // Mock token ID for "test"
-            }),
-        };
-        assert!(health_req.tokenized.is_some());
+        let _health_req = proto::HealthCheckRequest {};
+        // HealthCheckRequest is now empty - server generates its own test internally
     }
 
     #[test]

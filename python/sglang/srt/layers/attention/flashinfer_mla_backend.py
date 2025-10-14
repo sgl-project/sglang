@@ -22,14 +22,14 @@ if os.environ["SGLANG_ENABLE_TORCH_COMPILE"] == "1":
     torch._logging.set_logs(dynamo=logging.ERROR)
     torch._dynamo.config.suppress_errors = True
 
-from sglang.global_config import global_config
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.flashinfer_backend import (
     create_flashinfer_kv_indices_triton,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import (
     is_flashinfer_available,
@@ -193,9 +193,9 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.skip_prefill = skip_prefill
         self.enable_chunk_kv = (
             not skip_prefill
-            and global_server_args_dict["disaggregation_mode"] != "decode"
-            and not global_server_args_dict["disable_chunked_prefix_cache"]
-            and not global_server_args_dict["flashinfer_mla_disable_ragged"]
+            and get_global_server_args().disaggregation_mode != "decode"
+            and not get_global_server_args().disable_chunked_prefix_cache
+            and not get_global_server_args().flashinfer_mla_disable_ragged
         )
         self.page_size = model_runner.page_size
 
@@ -204,7 +204,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         if global_workspace_buffer is None:
             # different from flashinfer zero_init_global_workspace_buffer
             global_workspace_buffer = torch.empty(
-                global_config.flashinfer_workspace_size,
+                envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
                 dtype=torch.uint8,
                 device=model_runner.device,
             )
@@ -306,7 +306,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             prefix_lens = forward_batch.extend_prefix_lens
             extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
             use_ragged = (
-                not global_server_args_dict["flashinfer_mla_disable_ragged"]
+                not get_global_server_args().flashinfer_mla_disable_ragged
                 and extend_no_prefix
             )
 
