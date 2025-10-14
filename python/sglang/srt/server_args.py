@@ -252,6 +252,7 @@ class ServerArgs:
     reasoning_parser: Optional[str] = None
     tool_call_parser: Optional[str] = None
     tool_server: Optional[str] = None
+    sampling_defaults: str = "model"
 
     # Data parallelism
     dp_size: int = 1
@@ -528,7 +529,13 @@ class ServerArgs:
         self._handle_other_validations()
 
     def _handle_deprecated_args(self):
-        pass
+        # handle deprecated tool call parsers
+        deprecated_tool_call_parsers = {"qwen25": "qwen", "glm45": "glm"}
+        if self.tool_call_parser in deprecated_tool_call_parsers:
+            logger.warning(
+                f"The tool_call_parser '{self.tool_call_parser}' is deprecated. Please use '{deprecated_tool_call_parsers[self.tool_call_parser]}' instead."
+            )
+            self.tool_call_parser = deprecated_tool_call_parsers[self.tool_call_parser]
 
     def _handle_missing_default_values(self):
         if self.tokenizer_path is None:
@@ -1865,6 +1872,16 @@ class ServerArgs:
             choices=tool_call_parser_choices,
             default=ServerArgs.tool_call_parser,
             help=f"Specify the parser for handling tool-call interactions. Options include: {tool_call_parser_choices}.",
+        )
+        parser.add_argument(
+            "--sampling-defaults",
+            type=str,
+            choices=["openai", "model"],
+            default=ServerArgs.sampling_defaults,
+            help="Where to get default sampling parameters. "
+            "'openai' uses SGLang/OpenAI defaults (temperature=1.0, top_p=1.0, etc.). "
+            "'model' uses the model's generation_config.json to get the recommended "
+            "sampling parameters if available. Default is 'model'.",
         )
         parser.add_argument(
             "--tool-server",

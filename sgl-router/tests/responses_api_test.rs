@@ -239,6 +239,100 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
     mcp.stop().await;
 }
 
+#[tokio::test]
+async fn test_conversations_crud_basic() {
+    // Router in OpenAI mode (no actual upstream calls in these tests)
+    let router_cfg = RouterConfig {
+        mode: RoutingMode::OpenAI {
+            worker_urls: vec!["http://localhost".to_string()],
+        },
+        connection_mode: ConnectionMode::Http,
+        policy: PolicyConfig::Random,
+        host: "127.0.0.1".to_string(),
+        port: 0,
+        max_payload_size: 8 * 1024 * 1024,
+        request_timeout_secs: 60,
+        worker_startup_timeout_secs: 1,
+        worker_startup_check_interval_secs: 1,
+        dp_aware: false,
+        api_key: None,
+        discovery: None,
+        metrics: None,
+        log_dir: None,
+        log_level: Some("warn".to_string()),
+        request_id_headers: None,
+        max_concurrent_requests: 8,
+        queue_size: 0,
+        queue_timeout_secs: 5,
+        rate_limit_tokens_per_second: None,
+        cors_allowed_origins: vec![],
+        retry: RetryConfig::default(),
+        circuit_breaker: CircuitBreakerConfig::default(),
+        disable_retries: false,
+        disable_circuit_breaker: false,
+        health_check: HealthCheckConfig::default(),
+        enable_igw: false,
+        model_path: None,
+        tokenizer_path: None,
+        history_backend: sglang_router_rs::config::HistoryBackend::Memory,
+        oracle: None,
+        reasoning_parser: None,
+        tool_call_parser: None,
+    };
+
+    let ctx = AppContext::new(router_cfg, reqwest::Client::new(), 8, None).expect("ctx");
+    let router = RouterFactory::create_router(&Arc::new(ctx))
+        .await
+        .expect("router");
+
+    // Create
+    let create_body = serde_json::json!({ "metadata": { "project": "alpha" } });
+    let create_resp = router.create_conversation(None, &create_body).await;
+    assert_eq!(create_resp.status(), axum::http::StatusCode::OK);
+    let create_bytes = axum::body::to_bytes(create_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let create_json: serde_json::Value = serde_json::from_slice(&create_bytes).unwrap();
+    let conv_id = create_json["id"].as_str().expect("id missing");
+    assert!(conv_id.starts_with("conv_"));
+    assert_eq!(create_json["object"], "conversation");
+
+    // Get
+    let get_resp = router.get_conversation(None, conv_id).await;
+    assert_eq!(get_resp.status(), axum::http::StatusCode::OK);
+    let get_bytes = axum::body::to_bytes(get_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let get_json: serde_json::Value = serde_json::from_slice(&get_bytes).unwrap();
+    assert_eq!(get_json["metadata"]["project"], serde_json::json!("alpha"));
+
+    // Update (merge)
+    let update_body = serde_json::json!({ "metadata": { "owner": "alice" } });
+    let upd_resp = router
+        .update_conversation(None, conv_id, &update_body)
+        .await;
+    assert_eq!(upd_resp.status(), axum::http::StatusCode::OK);
+    let upd_bytes = axum::body::to_bytes(upd_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let upd_json: serde_json::Value = serde_json::from_slice(&upd_bytes).unwrap();
+    assert_eq!(upd_json["metadata"]["project"], serde_json::json!("alpha"));
+    assert_eq!(upd_json["metadata"]["owner"], serde_json::json!("alice"));
+
+    // Delete
+    let del_resp = router.delete_conversation(None, conv_id).await;
+    assert_eq!(del_resp.status(), axum::http::StatusCode::OK);
+    let del_bytes = axum::body::to_bytes(del_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let del_json: serde_json::Value = serde_json::from_slice(&del_bytes).unwrap();
+    assert_eq!(del_json["deleted"], serde_json::json!(true));
+
+    // Get again -> 404
+    let not_found = router.get_conversation(None, conv_id).await;
+    assert_eq!(not_found.status(), axum::http::StatusCode::NOT_FOUND);
+}
+
 #[test]
 fn test_responses_request_creation() {
     let request = ResponsesRequest {

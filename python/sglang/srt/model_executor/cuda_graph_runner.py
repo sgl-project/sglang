@@ -849,7 +849,7 @@ class CudaGraphRunner:
                 )
 
         elif self.model_runner.spec_algorithm.is_ngram():
-            from sglang.srt.speculative.ngram_utils import NgramVerifyInput
+            from sglang.srt.speculative.ngram_info import NgramVerifyInput
 
             spec_info = NgramVerifyInput(
                 draft_token=None,

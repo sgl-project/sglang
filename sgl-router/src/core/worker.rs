@@ -9,11 +9,14 @@ use serde_json;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
+use std::time::Duration;
+use std::time::Instant;
 use tokio::sync::{Mutex, RwLock};
+use tokio::time;
 
 static WORKER_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(Duration::from_secs(30))
         .build()
         .expect("Failed to create worker HTTP client")
 });
@@ -227,6 +230,8 @@ pub trait Worker: Send + Sync + fmt::Debug {
     async fn reset_grpc_client(&self) -> WorkerResult<()> {
         Ok(())
     }
+    async fn grpc_health_check(&self) -> WorkerResult<bool>;
+    async fn http_health_check(&self) -> WorkerResult<bool>;
 }
 
 /// Connection mode for worker communication
@@ -407,66 +412,9 @@ impl Worker for BasicWorker {
     }
 
     async fn check_health_async(&self) -> WorkerResult<()> {
-        use std::time::Duration;
-
         let health_result = match &self.metadata.connection_mode {
-            ConnectionMode::Http => {
-                let url = self.normalised_url()?;
-                let health_url = format!("{}{}", url, self.metadata.health_config.endpoint);
-                let timeout = Duration::from_secs(self.metadata.health_config.timeout_secs);
-
-                let mut request = WORKER_CLIENT.get(&health_url).timeout(timeout);
-
-                if let Some(ref api_key) = self.metadata.api_key {
-                    request = request.header("Authorization", format!("Bearer {}", api_key));
-                }
-
-                match request.send().await {
-                    Ok(response) => response.status().is_success(),
-                    Err(_) => false,
-                }
-            }
-            ConnectionMode::Grpc { .. } => {
-                // Use the new get_grpc_client() method for lazy initialization
-                match self.get_grpc_client().await {
-                    Ok(Some(grpc_client)) => {
-                        let mut client = grpc_client.lock().await;
-                        match client.health_check().await {
-                            Ok(response) => {
-                                tracing::debug!(
-                                    "gRPC health check succeeded for {}: healthy={}",
-                                    self.metadata.url,
-                                    response.healthy
-                                );
-                                response.healthy
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "gRPC health check RPC failed for {}: {:?}",
-                                    self.metadata.url,
-                                    e
-                                );
-                                false
-                            }
-                        }
-                    }
-                    Ok(None) => {
-                        tracing::error!(
-                            "Worker {} is not a gRPC worker but has gRPC connection mode",
-                            self.metadata.url
-                        );
-                        false
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            "Failed to get gRPC client for worker {}: {:?}",
-                            self.metadata.url,
-                            e
-                        );
-                        false
-                    }
-                }
-            }
+            ConnectionMode::Http => self.http_health_check().await?,
+            ConnectionMode::Grpc { .. } => self.grpc_health_check().await?,
         };
 
         if health_result {
@@ -591,6 +539,61 @@ impl Worker for BasicWorker {
                     *client_guard = None;
                 }
                 Ok(())
+            }
+        }
+    }
+
+    async fn grpc_health_check(&self) -> WorkerResult<bool> {
+        let timeout = Duration::from_secs(self.metadata.health_config.timeout_secs);
+        let maybe = self.get_grpc_client().await?;
+        let Some(grpc_client) = maybe else {
+            tracing::error!(
+                "Worker {} is not a gRPC worker but connection mode is gRPC",
+                self.metadata.url
+            );
+            return Ok(false);
+        };
+
+        let mut client = grpc_client.lock().await;
+        match time::timeout(timeout, client.health_check()).await {
+            Ok(Ok(resp)) => {
+                tracing::debug!(
+                    "gRPC health OK for {}: healthy={}",
+                    self.metadata.url,
+                    resp.healthy
+                );
+                Ok(resp.healthy)
+            }
+            Ok(Err(err)) => {
+                tracing::warn!("gRPC health RPC error for {}: {err:?}", self.metadata.url);
+                Ok(false)
+            }
+            Err(_) => {
+                tracing::warn!("gRPC health timed out for {}", self.metadata.url);
+                Ok(false)
+            }
+        }
+    }
+
+    async fn http_health_check(&self) -> WorkerResult<bool> {
+        let timeout = Duration::from_secs(self.metadata.health_config.timeout_secs);
+
+        let url = self.normalised_url()?;
+        let health_url = format!("{}{}", url, self.metadata.health_config.endpoint);
+
+        let mut req = WORKER_CLIENT.get(health_url).timeout(timeout);
+        if let Some(api_key) = &self.metadata.api_key {
+            req = req.bearer_auth(api_key);
+        }
+
+        match req.send().await {
+            Ok(resp) => Ok(resp.status().is_success()),
+            Err(err) => {
+                tracing::warn!(
+                    "HTTP health check failed for {}: {err:?}",
+                    self.metadata.url
+                );
+                Ok(false)
             }
         }
     }
@@ -730,6 +733,14 @@ impl Worker for DPAwareWorker {
     async fn reset_grpc_client(&self) -> WorkerResult<()> {
         self.base_worker.reset_grpc_client().await
     }
+
+    async fn grpc_health_check(&self) -> WorkerResult<bool> {
+        self.base_worker.grpc_health_check().await
+    }
+
+    async fn http_health_check(&self) -> WorkerResult<bool> {
+        self.base_worker.http_health_check().await
+    }
 }
 
 /// Worker factory for creating workers of different types
@@ -755,10 +766,8 @@ impl WorkerFactory {
     /// Static health validation before creating a worker
     /// This replaces wait_for_worker_health in handlers
     pub async fn validate_health(url: &str, timeout_secs: u64) -> WorkerResult<()> {
-        use std::time::Instant;
-
         let start_time = Instant::now();
-        let timeout = std::time::Duration::from_secs(timeout_secs);
+        let timeout = Duration::from_secs(timeout_secs);
 
         loop {
             if start_time.elapsed() > timeout {
@@ -775,7 +784,7 @@ impl WorkerFactory {
             // API key authentication is handled in the worker instance's check_health_async method
             match WORKER_CLIENT
                 .get(format!("{}/health", url))
-                .timeout(std::time::Duration::from_secs(5))
+                .timeout(Duration::from_secs(5))
                 .send()
                 .await
             {
@@ -795,7 +804,7 @@ impl WorkerFactory {
                 }
             }
 
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
         }
     }
 }
@@ -891,8 +900,7 @@ pub fn start_health_checker(
     let shutdown_clone = shutdown.clone();
 
     let handle = tokio::spawn(async move {
-        let mut interval =
-            tokio::time::interval(tokio::time::Duration::from_secs(check_interval_secs));
+        let mut interval = tokio::time::interval(Duration::from_secs(check_interval_secs));
 
         // Counter for periodic load reset (every 10 health check cycles)
         let mut check_count = 0u64;
