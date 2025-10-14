@@ -19,7 +19,7 @@ High-performance inference gateway control and data plane for SGLang deployments
 
 **Data Plane**
 - SGLang HTTP routers for regular and PD (prefill/decode) traffic with policy-aware selection.
-- SGLang gRPC router and pipeline that stream tokenized requests through SRT gRPC workers with fully Rust tokenizer, reasoning parser, and tool parser implementations for maximal OpenAI API performance.
+- SGLang gRPC router and pipeline that stream tokenized requests through SRT gRPC workers with fully Rust tokenizer, reasoning parser, and tool parser implementations for maximal OpenAI API performance, supporting both single-stage and PD serving topologies.
 - OpenAI router that proxies OpenAI-style requests, responses, and conversations to remote vendors (OpenAI, xAI, Gemini, and other OpenAI-compatible providers) while preserving streaming/SSE semantics.
 - Router Manager coordinates multiple router implementations when IGW is enabled.
 - Resilience layer delivers token-bucket rate limiting, request queuing, retry executor, and per-worker circuit breakers to keep traffic flowing through failures.
@@ -288,13 +288,21 @@ Prefill pods can expose bootstrap ports via the `sglang.ai/bootstrap-port` annot
 
 ## Data Plane
 
-### HTTP Routers
-- **Regular Router** handles single-worker requests, uses load balancing policies, and drives retries/circuit breakers.
-- **Prefill/Decode Router** orchestrates prefill and decode workers, merges metadata, and coordinates streaming.
-- Routers record metrics per request, report running loads, and respect DP-aware scheduling when enabled.
+### Router Capabilities (HTTP & gRPC)
+Both router stacks:
+- Share load-balancing policies (random, round-robin, cache-aware, power-of-two) with DP-aware scheduling, retries, circuit breakers, and rate limiting.
+- Record metrics per request, track running load, and integrate with the router-wide policy registry.
 
-### gRPC Router
-Runs a request pipeline that tokenizes inputs via the configured tokenizer, applies optional reasoning/tool parsers, streams responses, and supports DP-aware worker selection. Currently `route_chat` and `route_generate` are implemented; other endpoints return `501` until implemented.
+The HTTP router exposes the full OpenAI-compatible surface area (`/generate`, `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/responses`, `/v1/rerank`, etc.). The gRPC router delivers blazing-fast `/generate` and `/v1/chat/completions` today, with the remaining endpoints returning `501 Not Implemented` until their pipelines are finalised.
+
+#### HTTP Router specifics
+- **Regular router** handles classic single-stage workers with per-model policy overrides.
+- **Prefill/Decode router** coordinates disaggregated prefill and decode workers, merges metadata, and manages streaming fan-in.
+
+#### gRPC Router specifics
+- Industry-first fully Rust implementation of an OpenAI-compatible gRPC inference gateway, including tokenizer, reasoning parser, and tool parser execution in-process for maximum throughput.
+- Supports both single-stage and PD (prefill/decode) worker topologies; the router automatically selects the appropriate pipeline per model.
+- Provides the same `/v1/*` APIs as the HTTP router while streaming tokenized requests/responses directly to SRT gRPC workers.
 
 ### OpenAI Router
 - Proxies OpenAI-compatible payloads, preserving headers and SSE streams.
