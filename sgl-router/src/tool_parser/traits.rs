@@ -21,6 +21,12 @@ pub trait ToolParser: Send + Sync {
 
     /// Check if text contains tool calls in this parser's format
     fn detect_format(&self, text: &str) -> bool;
+
+    /// Optionally expose a token-aware parser implementation.
+    /// Default returns `None`, meaning the parser only supports text input.
+    fn as_token_parser(&self) -> Option<&dyn TokenToolParser> {
+        None
+    }
 }
 
 /// Trait for partial JSON parsing
@@ -33,4 +39,20 @@ pub trait PartialJsonParser: Send + Sync {
 
     /// Get the maximum parsing depth
     fn max_depth(&self) -> usize;
+}
+
+#[async_trait]
+pub trait TokenToolParser: ToolParser {
+    /// Parse complete tool calls when provided with raw token IDs.
+    async fn parse_complete_tokens(
+        &self,
+        tokens: &[u32],
+    ) -> ToolParserResult<(String, Vec<ToolCall>)>;
+
+    /// Streaming parser entrypoint for token chunks.
+    async fn parse_incremental_tokens(
+        &self,
+        tokens: &[u32],
+        state: &mut ParseState,
+    ) -> ToolParserResult<StreamResult>;
 }

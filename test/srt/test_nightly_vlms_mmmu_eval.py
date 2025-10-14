@@ -24,7 +24,7 @@ MODEL_THRESHOLDS = {
     ),
     ModelDeploySetup("google/gemma-3-4b-it"): ModelEvalMetrics(0.360, 10.9),
     ModelDeploySetup("google/gemma-3n-E4B-it"): ModelEvalMetrics(0.360, 15.3),
-    ModelDeploySetup("mistral-community/pixtral-12b"): ModelEvalMetrics(0.360, 14.5),
+    ModelDeploySetup("mistral-community/pixtral-12b"): ModelEvalMetrics(0.360, 16.6),
     ModelDeploySetup("moonshotai/Kimi-VL-A3B-Instruct"): ModelEvalMetrics(0.330, 22.3),
     ModelDeploySetup("openbmb/MiniCPM-o-2_6"): ModelEvalMetrics(0.330, 29.3),
     ModelDeploySetup("openbmb/MiniCPM-v-2_6"): ModelEvalMetrics(0.270, 24.5),

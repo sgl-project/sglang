@@ -51,7 +51,6 @@ from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
 
-
 # Define constants
 LOAD_FORMAT_CHOICES = [
     "auto",
@@ -932,8 +931,15 @@ class ServerArgs:
 
     def _handle_hicache(self):
         if self.hicache_storage_backend == "mooncake":
-            self.hicache_io_backend = "kernel"
-            self.hicache_mem_layout = "page_first"
+            if self.hicache_mem_layout == "layer_first":
+                if self.hicache_io_backend == "direct":
+                    self.hicache_mem_layout = "page_first_direct"
+                elif self.hicache_io_backend == "kernel":
+                    self.hicache_mem_layout = "page_first"
+                logger.warning(
+                    f"Mooncake storage backend does not support layer_first layout, "
+                    f"switching to {self.hicache_mem_layout} layout for {self.hicache_io_backend} io backend"
+                )
 
         if self.hicache_mem_layout == "page_first_direct":
             if self.hicache_io_backend != "direct":

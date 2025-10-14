@@ -154,8 +154,18 @@ impl ToolParser for DeepSeekParser {
 
         // Check for tool markers
         if !self.has_tool_markers(&state.buffer) {
-            // No markers found, return as incomplete
-            return Ok(StreamResult::Incomplete);
+            // No tool markers detected - return all buffered content as normal text
+            let normal_text = std::mem::take(&mut state.buffer);
+            return Ok(StreamResult::NormalText(normal_text));
+        }
+
+        // Check for text before tool markers and extract it as normal text
+        if let Some(marker_pos) = state.buffer.find("<｜tool▁calls▁begin｜>") {
+            if marker_pos > 0 {
+                // We have text before the tool marker - extract it as normal text
+                let normal_text: String = state.buffer.drain(..marker_pos).collect();
+                return Ok(StreamResult::NormalText(normal_text));
+            }
         }
 
         // Look for start of tool calls
@@ -220,7 +230,7 @@ impl ToolParser for DeepSeekParser {
                                             });
                                         }
                                         Err(_) => {
-                                            // Can't parse yet, keep buffering
+                                            // Can't parse yet, continue waiting for more data
                                         }
                                     }
                                 }

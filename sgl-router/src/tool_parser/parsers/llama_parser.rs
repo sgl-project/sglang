@@ -75,16 +75,18 @@ impl ToolParser for LlamaParser {
         chunk: &str,
         state: &mut ParseState,
     ) -> ToolParserResult<StreamResult> {
-        // Try with the python_tag parser first
+        // First, try with the configured json_parser (which handles python_tag)
         let result = self.json_parser.parse_incremental(chunk, state).await?;
 
-        // If we get Incomplete and buffer starts with '{', might be plain JSON
-        if matches!(result, StreamResult::Incomplete) && state.buffer.trim_start().starts_with('{')
-        {
-            // Check if we have python_tag in the buffer
-            if !state.buffer.contains("<|python_tag|>") {
-                // Likely plain JSON, create temporary parser
+        // If we get Incomplete and no python_tag in buffer, might be plain JSON
+        if matches!(result, StreamResult::Incomplete) {
+            let trimmed = state.buffer.trim_start();
+            if trimmed.starts_with('{') && !state.buffer.contains("<|python_tag|>") {
+                // Likely plain JSON, try with a plain parser
+                // Note: We need to be careful not to double-add the chunk
                 let plain_parser = JsonParser::new();
+                // The chunk was already added to state.buffer by json_parser above
+                // So we call with empty string to just process what's in the buffer
                 return plain_parser.parse_incremental("", state).await;
             }
         }

@@ -1,11 +1,10 @@
 use crate::tool_parser::parsers::{
-    DeepSeekParser, Glm4MoeParser, GptOssParser, JsonParser, KimiK2Parser, LlamaParser,
-    MistralParser, PythonicParser, QwenParser, Step3Parser,
+    DeepSeekParser, Glm4MoeParser, GptOssHarmonyParser, GptOssParser, JsonParser, KimiK2Parser,
+    LlamaParser, MistralParser, PythonicParser, QwenParser, Step3Parser,
 };
 use crate::tool_parser::traits::ToolParser;
 use once_cell::sync::Lazy;
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, env, sync::Arc};
 
 /// Global singleton registry instance - created once and reused
 pub static GLOBAL_REGISTRY: Lazy<ParserRegistry> = Lazy::new(ParserRegistry::new_internal);
@@ -139,8 +138,18 @@ impl ParserRegistry {
         // Kimi K2 parser - Token-based with indexed functions
         self.register_parser("kimik2", Arc::new(KimiK2Parser::new()));
 
-        // GPT-OSS parser - Channel format
-        self.register_parser("gpt_oss", Arc::new(GptOssParser::new()));
+        // GPT-OSS parsers - register legacy and Harmony variants
+        let gpt_oss_legacy = Arc::new(GptOssParser::new());
+        let gpt_oss_harmony = Arc::new(GptOssHarmonyParser::new());
+
+        self.register_parser("gpt_oss_legacy", gpt_oss_legacy.clone());
+        self.register_parser("gpt_oss_harmony", gpt_oss_harmony.clone());
+
+        if use_harmony_gpt_oss() {
+            self.register_parser("gpt_oss", gpt_oss_harmony);
+        } else {
+            self.register_parser("gpt_oss", gpt_oss_legacy);
+        }
     }
 
     /// Register default model mappings
@@ -180,10 +189,9 @@ impl ParserRegistry {
         self.map_model("deepseek-*", "pythonic");
 
         // GLM models
-        // GLM-4 MoE uses XML-style format
-        self.map_model("glm-4-moe*", "glm4_moe");
-        self.map_model("THUDM/glm-4-moe*", "glm4_moe");
+        // GLM-4.5 and GLM-4.6 uses XML-style format
         self.map_model("glm-4.5*", "glm4_moe");
+        self.map_model("glm-4.6*", "glm4_moe");
         // Other GLM models may use JSON
         self.map_model("glm-*", "json");
 
@@ -215,6 +223,19 @@ impl ParserRegistry {
     pub fn has_parser(&self, name: &str) -> bool {
         self.parsers.contains_key(name)
     }
+}
+
+fn use_harmony_gpt_oss() -> bool {
+    env::var("ROUTER_USE_HARMONY_GPT_OSS")
+        .ok()
+        .map(|value| {
+            let normalized = value.trim();
+            matches!(
+                normalized,
+                "1" | "true" | "TRUE" | "True" | "yes" | "YES" | "Yes" | "on" | "ON" | "On"
+            )
+        })
+        .unwrap_or(false)
 }
 
 impl Default for &'static ParserRegistry {

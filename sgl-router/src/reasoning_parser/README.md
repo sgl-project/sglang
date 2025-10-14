@@ -325,7 +325,7 @@ classDiagram
 - `qwen3`: Qwen3 base model (initial_in_reasoning=false)
 - `qwen3_thinking`: Qwen3 thinking variant (initial_in_reasoning=true)
 - `kimi`: Kimi with Unicode tokens
-- `glm45`: GLM-4.5 parser
+- `glm45`: GLM-4.5 / GLM-4.6 parser
 - `step3`: Step3 parser
 - `passthrough`: No-op fallback parser
 
