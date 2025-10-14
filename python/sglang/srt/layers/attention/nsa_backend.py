@@ -30,9 +30,6 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInput
 
-import logging
-
-logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
 
@@ -338,7 +335,7 @@ class NativeSparseAttnBackend(AttentionBackend):
             flashmla_metadata=(
                 self._compute_flashmla_metadata(
                     cache_seqlens=nsa_cache_seqlens_int32,
-                    seq_len_q=1,  # TODO handle MTP which is not 1
+                    seq_len_q=1,
                 )
                 if NSA_DECODE_IMPL == "flashmla_decode"
                 else None
@@ -385,7 +382,7 @@ class NativeSparseAttnBackend(AttentionBackend):
                     cache_seqlens=torch.ones(
                         max_num_tokens, dtype=torch.int32, device=self.device
                     ),
-                    seq_len_q=1,  # TODO handle MTP which is not 1
+                    seq_len_q=1,
                 )
                 if NSA_DECODE_IMPL == "flashmla_decode"
                 else None
@@ -403,11 +400,6 @@ class NativeSparseAttnBackend(AttentionBackend):
         spec_info: Optional[SpecInput],
     ):
         """Initialize forward metadata for capturing CUDA graph."""
-        # assert forward_mode.is_decode_or_idle(), "Only support decode for now"
-        # assert (
-        #     spec_info is None
-        # ), "Speculative decoding is not supported for NSA backend now"
-
         if forward_mode.is_decode_or_idle():
             # Normal Decode
             # Get sequence information
@@ -428,7 +420,6 @@ class NativeSparseAttnBackend(AttentionBackend):
                 cache_seqlens_int32, nsa_index_topk=self.nsa_index_topk
             )
 
-            # real_page_table = self._transform_table_1_to_real(page_table_1)
             seqlens_expanded = cache_seqlens_int32
             nsa_extend_seq_lens_list = [1] * num_tokens
             if NSA_DECODE_IMPL == "flashmla_decode":
@@ -438,7 +429,7 @@ class NativeSparseAttnBackend(AttentionBackend):
                 flashmla_metadata.copy_(
                     self._compute_flashmla_metadata(
                         cache_seqlens=nsa_cache_seqlens_int32,
-                        seq_len_q=1,  # TODO handle MTP which is not 1
+                        seq_len_q=1,
                     )
                 )
             else:
@@ -496,7 +487,7 @@ class NativeSparseAttnBackend(AttentionBackend):
                 flashmla_metadata.copy_(
                     self._compute_flashmla_metadata(
                         cache_seqlens=nsa_cache_seqlens_int32,
-                        seq_len_q=1,  # TODO handle MTP which is not 1
+                        seq_len_q=1,
                     )
                 )
             else:
@@ -552,7 +543,7 @@ class NativeSparseAttnBackend(AttentionBackend):
                 flashmla_metadata.copy_(
                     self._compute_flashmla_metadata(
                         cache_seqlens=nsa_cache_seqlens_int32,
-                        seq_len_q=1,  # TODO handle MTP which is not 1
+                        seq_len_q=1,
                     )
                 )
             else:
@@ -595,10 +586,7 @@ class NativeSparseAttnBackend(AttentionBackend):
     ):
         """Initialize forward metadata for replaying CUDA graph."""
         assert seq_lens_cpu is not None
-        # assert forward_mode.is_decode_or_idle(), "Only support decode for now"
-        # assert (
-        #     spec_info is None
-        # ), "Speculative decoding is not supported for NSA backend now"
+
         seq_lens = seq_lens[:bs]
         seq_lens_cpu = seq_lens_cpu[:bs]
         req_pool_indices = req_pool_indices[:bs]
@@ -666,7 +654,6 @@ class NativeSparseAttnBackend(AttentionBackend):
             metadata.nsa_cache_seqlens_int32.copy_(nsa_cache_seqlens)
         elif forward_mode.is_draft_extend():
             max_seqlen_k = int(seq_lens_cpu.max().item())
-            # metadata.max_seq_len_k = max_seqlen_k
             cache_seqlens = seq_lens.to(torch.int32)
             metadata.cache_seqlens_int32.copy_(cache_seqlens)
             metadata.cu_seqlens_k[1:].copy_(
@@ -731,7 +718,7 @@ class NativeSparseAttnBackend(AttentionBackend):
             flashmla_metadata.copy_(
                 self._compute_flashmla_metadata(
                     cache_seqlens=nsa_cache_seqlens,
-                    seq_len_q=1,  # TODO handle MTP which is not 1
+                    seq_len_q=1,
                 )
             )
 
@@ -750,10 +737,7 @@ class NativeSparseAttnBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # assert (
-        #     not forward_batch.forward_mode.is_target_verify()
-        #     and not forward_batch.forward_mode.is_draft_extend()
-        # ), "NSA backend doesn't support speculative decoding"
+
         if k is not None:
             assert v is not None
             if save_kv_cache:
