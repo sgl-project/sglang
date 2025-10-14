@@ -185,7 +185,7 @@ def flash_attn_with_kvcache(
             window_size=window_size,
             softcap=softcap,
             pack_gqa=pack_gqa,
-            return_lse=return_softmax_lse,
+            return_softmax_lse=return_softmax_lse,
             learnable_sink=sinks,
             page_table=page_table,
         )
@@ -313,7 +313,7 @@ def flash_attn_varlen_func(
             # num_splits=num_splits,
             pack_gqa=pack_gqa,
             # sm_margin=sm_margin,
-            return_lse=return_softmax_lse,
+            return_softmax_lse=return_softmax_lse,
             learnable_sink=sinks,
         )
 
