@@ -1,7 +1,7 @@
 # Adapted from https://github.com/Dao-AILab/flash-attention/blob/203b9b3dba39d5d08dffb49c09aa622984dff07d/flash_attn/cute/interface.py
 
 # Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
-# [2025-14-10] Version in Cute-DSL, for Hopper and Blackwell. You'd need to install nvidia-cutlass-dsl==4.2.1.
+# [2025-10-14] Version in Cute-DSL, for Hopper and Blackwell. You'd need to install nvidia-cutlass-dsl==4.2.1.
 
 
 import copy
@@ -243,6 +243,7 @@ def _flash_attn_fwd(
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     if compute_capability == 9:  # TODO: tune block size according to hdim
+        # Perf heuristic from upstream: hdim=128, noncausal, non-local benefits from larger n_block
         if head_dim == head_dim_v == 128 and not causal and not local:
             n_block_size = 192
     if compute_capability == 10:
@@ -384,10 +385,15 @@ _flash_attn_fwd.compile_cache = {}
 def warmup_flash_attn(f):
     """
     Decorator for flash_attn_varlen_func:
-    - On the first call, run several warmup passes with different flag combinations
-    - Warmups are executed sequentially to minimize peak GPU memory usage
-    - Does not modify user-provided tensors (clones data)
-    - Easy to extend with more compile-key dimensions
+    - On first call, run several warmup passes with different flag combinations:
+        * return_softmax_lse in {False, True}
+        * global noncausal (window_size=(None,None))
+        * causal (window_size=(None,0))
+        * local sliding window (window_size=(64,64))
+        * optionally pack_gqa=True if qheads > kvheads and allowed
+    - No score_mod / softcap (not supported for varlen yet)
+    - Executes sequentially to minimize peak GPU mem
+    - Does not modify user tensors (clones)
     """
     done = False
 
@@ -396,30 +402,72 @@ def warmup_flash_attn(f):
 
         def maybe_clone(x):
             if isinstance(x, torch.Tensor):
-                return x.clone()
+                return x.detach().clone()  # detach to avoid autograd edges
             return copy.deepcopy(x)
 
         return tuple(maybe_clone(a) for a in args), {
             k: maybe_clone(v) for k, v in kwargs.items()
         }
 
+    def _infer_heads(args, kwargs):
+        """Infer q and kv head counts from arguments."""
+        # Expect signature: (q, k, v, cu_seqlens_q, cu_seqlens_k, ...)
+        q = args[0] if len(args) > 0 else kwargs.get("q")
+        k = args[1] if len(args) > 1 else kwargs.get("k")
+        try:
+            qh = int(q.shape[-2])
+            kvh = int(k.shape[-2])
+            return qh, kvh
+        except Exception:
+            return None, None
+
     def _run_warmups(args, kwargs):
         """Run warmup calls sequentially and release memory after each."""
         base_args, base_kwargs = _clone_args(args, kwargs)
 
-        # Warmup combinations for return_softmax_lse and causal
-        combos = [
-            dict(return_softmax_lse=False, causal=False),
-            dict(return_softmax_lse=False, causal=True),
-            dict(return_softmax_lse=True, causal=False),
-            dict(return_softmax_lse=True, causal=True),
+        qh, kvh = _infer_heads(base_args, base_kwargs)
+        can_pack_gqa = (qh is not None and kvh is not None and qh % kvh == 0 and qh // kvh > 1)
+        has_page_table = "page_table" in base_kwargs and base_kwargs["page_table"] is not None
+
+        # Window presets covering global, causal, and local
+        window_presets = [
+            (None, None),   # global noncausal
+            (None, 0),      # causal
+            (64, 64),       # local sliding window
         ]
 
+        lse_flags = [False, True]
+
+        # Base combo list
+        combos = []
+        for ws in window_presets:
+            for rlse in lse_flags:
+                combos.append(dict(window_size=ws, return_softmax_lse=rlse))
+
+        # Optionally add a pack_gqa=True variant (FA4 may disable it internally for some varlen shapes/SMs)
+        if can_pack_gqa:
+            for ws in window_presets:
+                combos.append(dict(window_size=ws, return_softmax_lse=False, pack_gqa=True))
+
+        # If page_table is present, warm one combo with it (page_table in compile key for SM100)
+        if has_page_table:
+            combos.append(dict(window_size=(None, None), return_softmax_lse=False))
+
+        # Run sequentially
         for combo in combos:
             wa, wk = _clone_args(base_args, base_kwargs)
+            # Keep user-provided softcap/score_mod OUT (varlen+score_mod unsupported)
+            wk.pop("score_mod", None)
+            if "softcap" in wk and wk["softcap"]:
+                wk["softcap"] = 0.0
+            # Apply combo
             wk.update(combo)
             with torch.cuda.stream(torch.cuda.current_stream()):
-                f(*wa, **wk)
+                try:
+                    f(*wa, **wk)
+                except Exception as e:
+                    # Some combos can be invalid for specific head dims / arch. Ignore and continue.
+                    logger.debug("Warmup combo skipped: %s", e)
             del wa, wk
             torch.cuda.empty_cache()
             gc.collect()
@@ -427,7 +475,7 @@ def warmup_flash_attn(f):
     def wrapper(*args, **kwargs):
         nonlocal done
         if not done:
-            logger.info("Running flash_attn_varlen_func warmup passes...")
+            logger.info("Running FA4 warmup (global/causal/local, LSE on/off, optional GQA pack)...")
             _run_warmups(args, kwargs)
             done = True
         return f(*args, **kwargs)
