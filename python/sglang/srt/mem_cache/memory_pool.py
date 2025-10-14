@@ -22,6 +22,8 @@ from sglang.srt.layers.attention.nsa import index_buf_accessor
 from sglang.srt.layers.attention.nsa.quant_k_cache import quantize_k_cache
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
+from benchmark.hf3fs.bench_zerocopy import device
+
 """
 Memory pool.
 
@@ -904,19 +906,31 @@ class SWAKVPool(KVCache):
         size: int,
         size_swa: int,
         dtype: torch.dtype,
+        head_num: int,
+        head_dim: int,
         swa_attention_layer_ids: List[int],
         full_attention_layer_ids: List[int],
         enable_kvcache_transpose: bool,
+        device: str,
         token_to_kv_pool_class: KVCache = MHATokenToKVPool,
         **kwargs,
     ):
         self.size = size
         self.size_swa = size_swa
         self.dtype = dtype
+        self.head_num = head_num
+        self.head_dim = head_dim
+        self.device = device
         self.swa_layer_nums = len(swa_attention_layer_ids)
         self.full_layer_nums = len(full_attention_layer_ids)
+        self.start_layer = 0
+        self.page_size = 1
+
         kwargs["page_size"] = 1
         kwargs["enable_memory_saver"] = False
+        kwargs["head_num"] = head_num
+        kwargs["head_dim"] = head_dim
+        kwargs["device"] = device
         # TODO MHATransposedTokenToKVPool if enable_kvcache_transpose is True
         assert not enable_kvcache_transpose
 

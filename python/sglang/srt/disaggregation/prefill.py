@@ -161,9 +161,6 @@ class PrefillBootstrapQueue:
 
             if isinstance(self.token_to_kv_pool, SWAKVPool):
                 kv_args.state_type = "swa"
-                raise RuntimeError(
-                    "PD Disaggregation does not support sliding window attention (SWA) at the moment."
-                )
             elif isinstance(self.token_to_kv_pool, HybridLinearKVPool):
                 kv_args.state_type = "mamba"
             elif isinstance(self.token_to_kv_pool, NSATokenToKVPool):

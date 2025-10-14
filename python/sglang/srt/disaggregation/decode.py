@@ -267,9 +267,6 @@ class DecodePreallocQueue:
 
             if isinstance(self.token_to_kv_pool, SWAKVPool):
                 kv_args.state_type = "swa"
-                raise RuntimeError(
-                    "PD Disaggregation does not support sliding window attention (SWA) at the moment."
-                )
             elif isinstance(self.token_to_kv_pool, HybridLinearKVPool):
                 kv_args.state_type = "mamba"
             elif isinstance(self.token_to_kv_pool, NSATokenToKVPool):
@@ -508,7 +505,6 @@ class DecodePreallocQueue:
                 )
                 state_indices = window_kv_indices_swa.cpu().numpy()
                 state_indices = kv_to_page_indices(state_indices, page_size)
-                logger.info(f"Extra pool indices: {len(state_indices)}")
             elif isinstance(self.token_to_kv_pool, NSATokenToKVPool):
                 seq_len = len(decode_req.req.origin_input_ids)
                 kv_indices_full = self.req_to_token_pool.req_to_token[
