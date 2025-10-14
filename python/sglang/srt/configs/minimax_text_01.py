@@ -3,6 +3,7 @@ import numpy as np
 import torch
 from transformers.configuration_utils import PretrainedConfig
 
+from sglang.srt.configs.mamba_utils import MinimaxCacheParams
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 
 
@@ -34,9 +35,7 @@ class MiniMaxText01Config(PretrainedConfig):
         )
 
     @property
-    def minimax_cache_per_req(self):
-        state_shape = self.state_shape
-        state_dtype = torch.float32
-        linear_layers_len = len(self.linear_layer_ids)
-
-        return (int(np.prod(state_shape)) * state_dtype.itemsize) * linear_layers_len
+    def mamba2_cache_params(self):
+        return MinimaxCacheParams(
+            shape=self.state_shape, dtype=torch.float32, layers=self.linear_layer_ids
+        )

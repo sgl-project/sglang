@@ -102,7 +102,6 @@ from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     HybridReqToTokenPool,
     MHATokenToKVPool,
-    MinimaxReqToTokenPool,
     MLATokenToKVPool,
     NSATokenToKVPool,
     ReqToTokenPool,
@@ -1351,12 +1350,10 @@ class ModelRunner:
             if server_args.speculative_num_draft_tokens is None
             else server_args.speculative_num_draft_tokens
         )
-        mamba_cache_per_req = (
-            config.mamba2_cache_params.mamba_cache_per_req
-            if self.minimax_config is None
-            else config.minimax_cache_per_req
-        )
-        if server_args.disable_radix_cache or mamba_cache_per_req == 0:
+        if (
+            server_args.disable_radix_cache
+            or config.mamba2_cache_params.mamba_cache_per_req == 0
+        ):
             # with disable radix cache, sets the max_mamba_cache_size based on the max_running_requests
             if server_args.max_mamba_cache_size is None:
                 if server_args.max_running_requests is not None:
@@ -1376,7 +1373,7 @@ class ModelRunner:
             # calculate the max_mamba_cache_size based on the given total mamba memory
             server_args.max_mamba_cache_size = int(
                 (mamba_state_memory_raw * (1 << 30))
-                // mamba_cache_per_req
+                // config.mamba2_cache_params.mamba_cache_per_req
                 // (1 + speculativa_ratio)
             )
 
@@ -1386,7 +1383,7 @@ class ModelRunner:
             )
         mamba_state_memory = (
             server_args.max_mamba_cache_size
-            * mamba_cache_per_req
+            * config.mamba2_cache_params.mamba_cache_per_req
             * (1 + speculativa_ratio)
             / (1 << 30)
         )
@@ -1661,28 +1658,16 @@ class ModelRunner:
                     pre_alloc_size=pre_alloc_size,
                 )
             elif config := self.mambaish_config:
-                if self.minimax_config is not None:
-                    self.req_to_token_pool = MinimaxReqToTokenPool(
-                        size=max_num_reqs,
-                        max_context_len=self.model_config.context_len
-                        + extra_max_context_len,
-                        device=self.device,
-                        state_dtype=torch.float32,
-                        state_shape=config.state_shape,
-                        enable_memory_saver=self.server_args.enable_memory_saver,
-                        linear_layers=config.linear_layer_ids,
-                    )
-                else:
-                    self.req_to_token_pool = HybridReqToTokenPool(
-                        size=max_num_reqs,
-                        mamba_size=self.server_args.max_mamba_cache_size,
-                        max_context_len=self.model_config.context_len
-                        + extra_max_context_len,
-                        device=self.device,
-                        enable_memory_saver=self.server_args.enable_memory_saver,
-                        cache_params=config.mamba2_cache_params,
-                        speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
-                    )
+                self.req_to_token_pool = HybridReqToTokenPool(
+                    size=max_num_reqs,
+                    mamba_size=self.server_args.max_mamba_cache_size,
+                    max_context_len=self.model_config.context_len
+                    + extra_max_context_len,
+                    device=self.device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                    cache_params=config.mamba2_cache_params,
+                    speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
+                )
             else:
                 self.req_to_token_pool = ReqToTokenPool(
                     size=max_num_reqs,

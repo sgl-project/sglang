@@ -29,11 +29,7 @@ from sglang.srt.layers.lightning_attn import (
     linear_decode_forward_triton,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.mem_cache.memory_pool import (
-    HybridReqToTokenPool,
-    MambaPool,
-    MinimaxReqToTokenPool,
-)
+from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.models.qwen3_next import fused_gdn_gating
@@ -582,7 +578,7 @@ class LightningBackend(AttentionBackend):
         super().__init__()
         self.pad_slot_id = PAD_SLOT_ID
         self.device = model_runner.device
-        self.req_to_token_pool: MinimaxReqToTokenPool = model_runner.req_to_token_pool
+        self.req_to_token_pool: HybridReqToTokenPool = model_runner.req_to_token_pool
         self.forward_metadata: ForwardMetadata = None
         self.state_indices_list = []
         self.query_start_loc_list = []
@@ -609,7 +605,7 @@ class LightningBackend(AttentionBackend):
                 )
         else:
             raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode=}")
-        mamba_cache_indices = self.req_to_token_pool.get_minimax_indices(
+        mamba_cache_indices = self.req_to_token_pool.get_mamba_indices(
             forward_batch.req_pool_indices
         )
         return ForwardMetadata(
@@ -677,7 +673,7 @@ class LightningBackend(AttentionBackend):
             raise ValueError("Target verify mode is not implemented")
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
-        mamba_indices = self.req_to_token_pool.get_minimax_indices(req_pool_indices)
+        mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
         self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
         return ForwardMetadata(
             query_start_loc=self.query_start_loc_list[bs - 1],
@@ -697,7 +693,7 @@ class LightningBackend(AttentionBackend):
         )
         # Make sure forward metadata is correctly handled for padding reqs
         req_pool_indices[bs - num_padding :] = 0
-        mamba_indices = self.req_to_token_pool.get_minimax_indices(req_pool_indices)
+        mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
         mamba_indices[bs - num_padding :] = -1
         self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
         if forward_mode.is_decode_or_idle():
@@ -743,10 +739,12 @@ class LightningBackend(AttentionBackend):
         k = k[num_prefill_tokens:].unsqueeze(2).contiguous()
         v = v[num_prefill_tokens:].unsqueeze(2).contiguous()
 
-        (state,) = self.req_to_token_pool.get_minimax_params(layer_id)
+        state_cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
         slot_id = self.forward_metadata.mamba_cache_indices
 
-        hidden = linear_decode_forward_triton(q, k, v, state, slope_rate, slot_id, 32)
+        hidden = linear_decode_forward_triton(
+            q, k, v, state_cache, slope_rate, slot_id, 32
+        )
         return hidden
 
     def forward_extend(
@@ -763,7 +761,7 @@ class LightningBackend(AttentionBackend):
         slope_rate = kwargs["slope_rate"]
         block_size = kwargs.get("BLOCK", 256)
 
-        (state,) = self.req_to_token_pool.get_minimax_params(layer_id)
+        state_cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
         query_start_loc = self.forward_metadata.query_start_loc
 
         hidden = []
@@ -790,7 +788,7 @@ class LightningBackend(AttentionBackend):
             qs = q[_start:_end].transpose(0, 1).contiguous()
             ks = k[_start:_end].transpose(0, 1).contiguous()
             vs = v[_start:_end].transpose(0, 1).contiguous()
-            slice_layer_cache = state[slot_id, ...]
+            slice_layer_cache = state_cache[slot_id, ...]
 
             def jit_linear_forward_prefix(
                 q: torch.Tensor,

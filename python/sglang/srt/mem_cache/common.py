@@ -10,11 +10,7 @@ import triton.language as tl
 from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
-from sglang.srt.mem_cache.memory_pool import (
-    HybridReqToTokenPool,
-    MinimaxReqToTokenPool,
-    ReqToTokenPool,
-)
+from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import support_triton
 
@@ -298,7 +294,7 @@ def alloc_req_slots(
     reqs: list[Req] | None,
 ) -> list[int]:
     """Allocate request slots from the pool."""
-    if isinstance(req_to_token_pool, (HybridReqToTokenPool, MinimaxReqToTokenPool)):
+    if isinstance(req_to_token_pool, HybridReqToTokenPool):
         req_pool_indices = req_to_token_pool.alloc(num_reqs, reqs)
     else:
         req_pool_indices = req_to_token_pool.alloc(num_reqs)
