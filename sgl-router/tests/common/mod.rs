@@ -119,6 +119,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                         "query": {"type": "string"}
                     }
                 }),
+                strict: None,
             },
         },
         Tool {
@@ -135,6 +136,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                         "units": {"type": "string"}
                     }
                 }),
+                strict: None,
             },
         },
         Tool {
@@ -149,6 +151,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                         "y": {"type": "number"}
                     }
                 }),
+                strict: None,
             },
         },
         Tool {
@@ -164,6 +167,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                         "target_lang": {"type": "string"}
                     }
                 }),
+                strict: None,
             },
         },
         Tool {
@@ -178,6 +182,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                         "format": {"type": "string"}
                     }
                 }),
+                strict: None,
             },
         },
         Tool {
@@ -192,6 +197,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                         "format": {"type": "string"}
                     }
                 }),
+                strict: None,
             },
         },
         Tool {
@@ -206,6 +212,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                         "notifications": {"type": "boolean"}
                     }
                 }),
+                strict: None,
             },
         },
         Tool {
@@ -214,6 +221,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                 name: "ping".to_string(),
                 description: Some("Ping service".to_string()),
                 parameters: json!({"type": "object", "properties": {}}),
+                strict: None,
             },
         },
         Tool {
@@ -222,6 +230,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                 name: "test".to_string(),
                 description: Some("Test function".to_string()),
                 parameters: json!({"type": "object", "properties": {}}),
+                strict: None,
             },
         },
         Tool {
@@ -239,6 +248,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                         "text": {"type": "string"}
                     }
                 }),
+                strict: None,
             },
         },
         Tool {
@@ -254,6 +264,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                         "search_type": {"type": "string"}
                     }
                 }),
+                strict: None,
             },
         },
         Tool {
@@ -267,6 +278,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                         "city": {"type": "string"}
                     }
                 }),
+                strict: None,
             },
         },
         Tool {
@@ -282,6 +294,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                         "optional": {"type": "null"}
                     }
                 }),
+                strict: None,
             },
         },
         Tool {
@@ -297,6 +310,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                         "none_val": {"type": "null"}
                     }
                 }),
+                strict: None,
             },
         },
         Tool {
@@ -311,6 +325,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                         "email": {"type": "string"}
                     }
                 }),
+                strict: None,
             },
         },
         Tool {
@@ -325,6 +340,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                         "y": {"type": "number"}
                     }
                 }),
+                strict: None,
             },
         },
         Tool {
@@ -338,6 +354,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                         "x": {"type": "number"}
                     }
                 }),
+                strict: None,
             },
         },
         Tool {
@@ -346,6 +363,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                 name: "func1".to_string(),
                 description: Some("Function 1".to_string()),
                 parameters: json!({"type": "object", "properties": {}}),
+                strict: None,
             },
         },
         Tool {
@@ -359,6 +377,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                         "y": {"type": "number"}
                     }
                 }),
+                strict: None,
             },
         },
         Tool {
@@ -367,6 +386,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                 name: "tool1".to_string(),
                 description: Some("Tool 1".to_string()),
                 parameters: json!({"type": "object", "properties": {}}),
+                strict: None,
             },
         },
         Tool {
@@ -380,6 +400,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                         "y": {"type": "number"}
                     }
                 }),
+                strict: None,
             },
         },
     ]
