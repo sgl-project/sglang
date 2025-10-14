@@ -466,24 +466,24 @@ fn validate_chat_cross_parameters(
 ) -> Result<(), validator::ValidationError> {
     // 1. Validate logprobs dependency
     if req.top_logprobs.is_some() && !req.logprobs {
-        return Err(validator::ValidationError::new(
-            "top_logprobs is only allowed when logprobs is enabled",
-        ));
+        let mut e = validator::ValidationError::new("top_logprobs_requires_logprobs");
+        e.message = Some("top_logprobs is only allowed when logprobs is enabled".into());
+        return Err(e);
     }
 
     // 2. Validate stream_options dependency
     if req.stream_options.is_some() && !req.stream {
-        return Err(validator::ValidationError::new(
-            "The 'stream_options' parameter is only allowed when 'stream' is enabled",
-        ));
+        let mut e = validator::ValidationError::new("stream_options_requires_stream");
+        e.message = Some("The 'stream_options' parameter is only allowed when 'stream' is enabled".into());
+        return Err(e);
     }
 
     // 3. Validate token limits - min <= max
     if let (Some(min), Some(max)) = (req.min_tokens, req.max_completion_tokens) {
         if min > max {
-            return Err(validator::ValidationError::new(
-                "min_tokens cannot exceed max_tokens/max_completion_tokens",
-            ));
+            let mut e = validator::ValidationError::new("min_tokens_exceeds_max");
+            e.message = Some("min_tokens cannot exceed max_tokens/max_completion_tokens".into());
+            return Err(e);
         }
     }
 
@@ -494,15 +494,15 @@ fn validate_chat_cross_parameters(
     );
 
     if has_json_format && req.regex.is_some() {
-        return Err(validator::ValidationError::new(
-            "cannot use regex constraint with JSON response format",
-        ));
+        let mut e = validator::ValidationError::new("regex_conflicts_with_json");
+        e.message = Some("cannot use regex constraint with JSON response format".into());
+        return Err(e);
     }
 
     if has_json_format && req.ebnf.is_some() {
-        return Err(validator::ValidationError::new(
-            "cannot use EBNF constraint with JSON response format",
-        ));
+        let mut e = validator::ValidationError::new("ebnf_conflicts_with_json");
+        e.message = Some("cannot use EBNF constraint with JSON response format".into());
+        return Err(e);
     }
 
     // 5. Validate mutually exclusive structured output constraints
@@ -516,17 +516,17 @@ fn validate_chat_cross_parameters(
     .count();
 
     if constraint_count > 1 {
-        return Err(validator::ValidationError::new(
-            "only one structured output constraint (regex, ebnf, or json_schema) can be active at a time",
-        ));
+        let mut e = validator::ValidationError::new("multiple_constraints");
+        e.message = Some("only one structured output constraint (regex, ebnf, or json_schema) can be active at a time".into());
+        return Err(e);
     }
 
     // 6. Validate response format JSON schema name
     if let Some(ResponseFormat::JsonSchema { json_schema }) = &req.response_format {
         if json_schema.name.is_empty() {
-            return Err(validator::ValidationError::new(
-                "JSON schema name cannot be empty",
-            ));
+            let mut e = validator::ValidationError::new("json_schema_name_empty");
+            e.message = Some("JSON schema name cannot be empty".into());
+            return Err(e);
         }
     }
 
@@ -538,9 +538,9 @@ fn validate_chat_cross_parameters(
         let is_some_choice = !matches!(tool_choice, ToolChoice::Value(ToolChoiceValue::None));
 
         if is_some_choice && !has_tools {
-            return Err(validator::ValidationError::new(
-                "Invalid value for 'tool_choice': 'tool_choice' is only allowed when 'tools' are specified.",
-            ));
+            let mut e = validator::ValidationError::new("tool_choice_requires_tools");
+            e.message = Some("Invalid value for 'tool_choice': 'tool_choice' is only allowed when 'tools' are specified.".into());
+            return Err(e);
         }
 
         // Additional validation when tools are present
@@ -555,16 +555,12 @@ fn validate_chat_cross_parameters(
                     });
 
                     if !function_exists {
-                        let mut err =
-                            validator::ValidationError::new("tool_choice_function_not_found");
-                        err.message = Some(
-                            format!(
+                        let mut e = validator::ValidationError::new("tool_choice_function_not_found");
+                        e.message = Some(format!(
                             "Invalid value for 'tool_choice': function '{}' not found in 'tools'.",
                             function.name
-                        )
-                            .into(),
-                        );
-                        return Err(err);
+                        ).into());
+                        return Err(e);
                     }
                 }
                 ToolChoice::AllowedTools {
@@ -574,12 +570,12 @@ fn validate_chat_cross_parameters(
                 } => {
                     // Validate mode is "auto" or "required"
                     if mode != "auto" && mode != "required" {
-                        let mut err = validator::ValidationError::new("tool_choice_invalid_mode");
-                        err.message = Some(format!(
+                        let mut e = validator::ValidationError::new("tool_choice_invalid_mode");
+                        e.message = Some(format!(
                             "Invalid value for 'tool_choice.mode': must be 'auto' or 'required', got '{}'.",
                             mode
                         ).into());
-                        return Err(err);
+                        return Err(e);
                     }
 
                     // Validate that all referenced tool names exist in tools
@@ -590,13 +586,12 @@ fn validate_chat_cross_parameters(
                         });
 
                         if !tool_exists {
-                            let mut err =
-                                validator::ValidationError::new("tool_choice_tool_not_found");
-                            err.message = Some(format!(
+                            let mut e = validator::ValidationError::new("tool_choice_tool_not_found");
+                            e.message = Some(format!(
                                 "Invalid value for 'tool_choice.tools': tool '{}' not found in 'tools'.",
                                 tool_ref.name
                             ).into());
-                            return Err(err);
+                            return Err(e);
                         }
                     }
                 }
