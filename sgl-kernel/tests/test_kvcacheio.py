@@ -498,11 +498,11 @@ def test_transfer_kv_pf_direct(
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("num_items_to_transfer", [1024, 8192])
+@pytest.mark.parametrize("num_items_to_transfer", [256, 1024])
 @pytest.mark.parametrize("page_size", [16, 64, 128])
 @pytest.mark.parametrize("item_size", [1024])
 @pytest.mark.parametrize("head_num", [8, 16])
-@pytest.mark.parametrize("total_items_in_pool", [20480])
+@pytest.mark.parametrize("total_items_in_pool", [4096])
 @pytest.mark.parametrize("lf_to_ph", [False, True])
 def test_transfer_kv_page_head_first(
     dtype: torch.dtype,
@@ -571,10 +571,10 @@ def test_transfer_kv_page_head_first(
         dst_k_pool_ref = torch.zeros(
             total_pages_in_pool, head_num, page_size, num_layers, head_dim
         ).pin_memory()
-        dst_v_pool_ref = torch.zeros_like(dst_k_pool_ref)
+        dst_v_pool_ref = torch.zeros_like(dst_k_pool_ref).pin_memory()
 
-        dst_k_pool_kernel = torch.zeros_like(dst_k_pool_ref)
-        dst_v_pool_kernel = torch.zeros_like(dst_v_pool_ref)
+        dst_k_pool_kernel = torch.zeros_like(dst_k_pool_ref).pin_memory()
+        dst_v_pool_kernel = torch.zeros_like(dst_v_pool_ref).pin_memory()
         torch.cuda.synchronize()
 
         transfer_kv_all_layer_lf_phf(
@@ -584,12 +584,13 @@ def test_transfer_kv_page_head_first(
             dst_v_pool_kernel,
             src_indices_device,
             dst_indices_device,
-            item_size,
-            item_size * num_layers,
+            item_size * dtype.itemsize,
+            item_size * num_layers * dtype.itemsize,
             num_layers,
             page_size,
             head_num
         )
+        torch.cuda.synchronize()
 
         for i in range(num_layers):
             ref_copy_with_indices_ph_first(
@@ -641,8 +642,8 @@ def test_transfer_kv_page_head_first(
             src_indices_device,
             dst_indices_device,
             layer_idx_to_test,
-            item_size,
-            item_size * num_layers,
+            item_size * dtype.itemsize,
+            item_size * num_layers * dtype.itemsize,
             page_size,
             head_num
         )

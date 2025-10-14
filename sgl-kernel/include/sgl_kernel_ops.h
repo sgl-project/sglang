@@ -541,21 +541,6 @@ void transfer_kv_per_layer_phf_lf(
     int64_t block_quota,
     int64_t num_warps_per_block);
 
-void transfer_kv_per_layer_lf_phf(
-    const at::Tensor src_k,
-    at::Tensor dst_k,
-    const at::Tensor src_v,
-    at::Tensor dst_v,
-    const at::Tensor src_indices,
-    const at::Tensor dst_indices,
-    int64_t layer_id,
-    int64_t item_size,
-    int64_t dst_layout_dim,
-    int64_t page_size,
-    int64_t head_num,
-    int64_t block_quota,
-    int64_t num_warps_per_block);
-
 void transfer_kv_all_layer(
     const at::Tensor src_k_layers,
     const at::Tensor dst_k_layers,

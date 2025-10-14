@@ -410,43 +410,6 @@ void transfer_kv_per_layer_phf_lf(
       head_num);
 }
 
-void transfer_kv_per_layer_lf_phf(
-    const at::Tensor src_k,
-    at::Tensor dst_k,
-    const at::Tensor src_v,
-    at::Tensor dst_v,
-    const at::Tensor src_indices,
-    const at::Tensor dst_indices,
-    int64_t layer_id,
-    int64_t item_size,
-    int64_t dst_layout_dim,
-    int64_t page_size,
-    int64_t head_num,
-    int64_t block_quota,
-    int64_t num_warps_per_block) {
-  at::Tensor empty;
-  transfer_kv_launcher<get_global_offset_lf_hfrg<const char>, get_global_offset_phf<char>, false, true>(
-      src_k,
-      dst_k,
-      src_v,
-      dst_v,
-      src_indices,
-      dst_indices,
-      layer_id,
-      1,
-      item_size,
-      0,
-      dst_layout_dim,
-      empty,
-      empty,
-      empty,
-      empty,
-      block_quota,
-      num_warps_per_block,
-      page_size,
-      head_num);
-}
-
 void transfer_kv_all_layer(
     const at::Tensor src_k_layers,
     const at::Tensor dst_k_layers,
