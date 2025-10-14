@@ -2390,9 +2390,6 @@ pub enum GenerateFinishReason {
     Other(Value),
 }
 
-// Constants for rerank API
-pub const DEFAULT_MODEL_NAME: &str = "default";
-
 /// Rerank request for scoring documents against a query
 /// Used for RAG systems and document relevance scoring
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2404,7 +2401,7 @@ pub struct RerankRequest {
     pub documents: Vec<String>,
 
     /// Model to use for reranking
-    #[serde(default = "default_model_name")]
+    #[serde(default = "default_model")]
     pub model: String,
 
     /// Maximum number of documents to return (optional)
@@ -2420,10 +2417,6 @@ pub struct RerankRequest {
 
     /// User identifier
     pub user: Option<String>,
-}
-
-pub fn default_model_name() -> String {
-    DEFAULT_MODEL_NAME.to_string()
 }
 
 fn default_return_documents() -> bool {
@@ -2489,7 +2482,7 @@ impl From<V1RerankReqInput> for RerankRequest {
         RerankRequest {
             query: v1.query,
             documents: v1.documents,
-            model: default_model_name(),
+            model: default_model(),
             top_k: None,
             return_documents: true,
             rid: None,
