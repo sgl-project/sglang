@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from collections import deque
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional, Type
@@ -263,9 +264,10 @@ class PrefillBootstrapQueue:
             num_pages = kv_to_page_num(num_kv_indices, self.token_to_kv_pool.page_size)
             req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
 
-            req.add_latency(RequestStage.PREFILL_BOOTSTRAP)
             bootstrapped_reqs.append(req)
             indices_to_remove.add(i)
+            req.time_stats.wait_queue_entry_time = time.perf_counter()
+            req.add_latency(RequestStage.PREFILL_BOOTSTRAP)
 
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
@@ -407,7 +409,6 @@ class SchedulerDisaggregationPrefillMixin:
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
-            req: Req
             if req.is_chunked <= 0:
                 # There is no output_ids for prefill
                 req.output_ids.append(next_token_id)
@@ -450,6 +451,7 @@ class SchedulerDisaggregationPrefillMixin:
                     )
                     logprob_pt += num_input_logprobs
                 self.send_kv_chunk(req, last_chunk=True)
+                req.time_stats.prefill_transfer_queue_entry_time = time.perf_counter()
 
                 if req.grammar is not None:
                     # FIXME: this try-except block is for handling unexpected xgrammar issue.
@@ -546,6 +548,9 @@ class SchedulerDisaggregationPrefillMixin:
                     self.metrics_collector.increment_transfer_failed_reqs()
             else:
                 assert False, f"Unexpected polling state {poll=}"
+
+        for req in done_reqs:
+            req.time_stats.completion_time = time.perf_counter()
 
         # Stream requests which have finished transfer
         self.stream_output(
