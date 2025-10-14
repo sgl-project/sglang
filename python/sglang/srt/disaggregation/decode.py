@@ -787,7 +787,7 @@ class DecodeTransferQueue:
                     )
                     self.tree_cache.cache_finished_req(decode_req.req)
                     trace_slice_end(
-                        "quick_finish", decode_req.req.rid, thread_finish_flag=True
+                        RequestStage.DECODE_QUICK_FINISH, decode_req.req.rid, thread_finish_flag=True
                     )
                 else:
                     transferred_reqs.append(decode_req.req)

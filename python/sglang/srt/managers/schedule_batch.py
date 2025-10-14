@@ -417,6 +417,7 @@ class RequestStage(str, enum.Enum):
     DECODE_WAITING = "decode_waiting"
     DECODE_TRANSFERRED = "decode_transferred"
     DECODE_FAKE_OUTPUT = "fake_output"
+    DECODE_QUICK_FINISH = "quick_finish"
 
 
 class Req:
