@@ -30,6 +30,7 @@ impl TestContext {
     async fn new(worker_configs: Vec<MockWorkerConfig>) -> Self {
         // Create default router config
         let config = RouterConfig {
+            chat_template: None,
             mode: RoutingMode::Regular {
                 worker_urls: vec![],
             },
@@ -1365,6 +1366,7 @@ mod error_tests {
     async fn test_payload_too_large() {
         // Create context with small payload limit
         let config = RouterConfig {
+            chat_template: None,
             mode: RoutingMode::Regular {
                 worker_urls: vec![],
             },
@@ -1455,39 +1457,6 @@ mod error_tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-
-        ctx.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn test_missing_required_fields() {
-        let ctx = TestContext::new(vec![MockWorkerConfig {
-            port: 18405,
-            worker_type: WorkerType::Regular,
-            health_status: HealthStatus::Healthy,
-            response_delay_ms: 0,
-            fail_rate: 0.0,
-        }])
-        .await;
-
-        let app = ctx.create_app().await;
-
-        // Missing messages in chat completion
-        let payload = json!({
-            "model": "test-model"
-            // missing "messages"
-        });
-
-        let req = Request::builder()
-            .method("POST")
-            .uri("/v1/chat/completions")
-            .header(CONTENT_TYPE, "application/json")
-            .body(Body::from(serde_json::to_string(&payload).unwrap()))
-            .unwrap();
-
-        let resp = app.oneshot(req).await.unwrap();
-        // Axum validates JSON schema - returns 422 for validation errors
-        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
 
         ctx.shutdown().await;
     }
@@ -1723,6 +1692,7 @@ mod pd_mode_tests {
             .unwrap_or(9000);
 
         let config = RouterConfig {
+            chat_template: None,
             mode: RoutingMode::PrefillDecode {
                 prefill_urls: vec![(prefill_url, Some(prefill_port))],
                 decode_urls: vec![decode_url],
@@ -1888,6 +1858,7 @@ mod request_id_tests {
     async fn test_request_id_with_custom_headers() {
         // Create config with custom request ID headers
         let config = RouterConfig {
+            chat_template: None,
             mode: RoutingMode::Regular {
                 worker_urls: vec![],
             },

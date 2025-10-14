@@ -15,8 +15,6 @@ use sglang_router_rs::config::{
     RouterConfig, RoutingMode,
 };
 use sglang_router_rs::routers::RouterFactory;
-use sglang_router_rs::server::AppContext;
-use std::sync::Arc;
 
 #[tokio::test]
 async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
@@ -44,6 +42,7 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
 
     // Build router config (HTTP OpenAI mode)
     let router_cfg = RouterConfig {
+        chat_template: None,
         mode: RoutingMode::OpenAI {
             worker_urls: vec![worker_url],
         },
@@ -82,14 +81,12 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
     };
 
     // Create router and context
-    let ctx = AppContext::new(router_cfg, reqwest::Client::new(), 64, None).expect("ctx");
-    let router = RouterFactory::create_router(&Arc::new(ctx))
-        .await
-        .expect("router");
+    let ctx = common::create_test_context(router_cfg);
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Build a simple ResponsesRequest that will trigger the tool call
     let req = ResponsesRequest {
-        background: false,
+        background: Some(false),
         include: None,
         input: ResponseInput::Text("search something".to_string()),
         instructions: Some("Be brief".to_string()),
@@ -97,15 +94,15 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
         max_tool_calls: None,
         metadata: None,
         model: Some("mock-model".to_string()),
-        parallel_tool_calls: true,
+        parallel_tool_calls: Some(true),
         previous_response_id: None,
         reasoning: None,
-        service_tier: ServiceTier::Auto,
-        store: true,
-        stream: false,
+        service_tier: Some(ServiceTier::Auto),
+        store: Some(true),
+        stream: Some(false),
         temperature: Some(0.2),
-        tool_choice: ToolChoice::default(),
-        tools: vec![ResponseTool {
+        tool_choice: Some(ToolChoice::default()),
+        tools: Some(vec![ResponseTool {
             r#type: ResponseToolType::Mcp,
             server_url: Some(mcp.url()),
             authorization: None,
@@ -113,15 +110,15 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
             server_description: None,
             require_approval: None,
             allowed_tools: None,
-        }],
-        top_logprobs: 0,
+        }]),
+        top_logprobs: Some(0),
         top_p: None,
-        truncation: Truncation::Disabled,
+        truncation: Some(Truncation::Disabled),
         user: None,
         request_id: "resp_test_mcp_e2e".to_string(),
         priority: 0,
-        frequency_penalty: 0.0,
-        presence_penalty: 0.0,
+        frequency_penalty: Some(0.0),
+        presence_penalty: Some(0.0),
         stop: None,
         top_k: -1,
         min_p: 0.0,
@@ -245,6 +242,7 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
 async fn test_conversations_crud_basic() {
     // Router in OpenAI mode (no actual upstream calls in these tests)
     let router_cfg = RouterConfig {
+        chat_template: None,
         mode: RoutingMode::OpenAI {
             worker_urls: vec!["http://localhost".to_string()],
         },
@@ -282,10 +280,8 @@ async fn test_conversations_crud_basic() {
         tool_call_parser: None,
     };
 
-    let ctx = AppContext::new(router_cfg, reqwest::Client::new(), 8, None).expect("ctx");
-    let router = RouterFactory::create_router(&Arc::new(ctx))
-        .await
-        .expect("router");
+    let ctx = common::create_test_context(router_cfg);
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create
     let create_body = serde_json::json!({ "metadata": { "project": "alpha" } });
@@ -338,7 +334,7 @@ async fn test_conversations_crud_basic() {
 #[test]
 fn test_responses_request_creation() {
     let request = ResponsesRequest {
-        background: false,
+        background: Some(false),
         include: None,
         input: ResponseInput::Text("Hello, world!".to_string()),
         instructions: Some("Be helpful".to_string()),
@@ -346,29 +342,29 @@ fn test_responses_request_creation() {
         max_tool_calls: None,
         metadata: None,
         model: Some("test-model".to_string()),
-        parallel_tool_calls: true,
+        parallel_tool_calls: Some(true),
         previous_response_id: None,
         reasoning: Some(ResponseReasoningParam {
             effort: Some(ReasoningEffort::Medium),
             summary: None,
         }),
-        service_tier: ServiceTier::Auto,
-        store: true,
-        stream: false,
+        service_tier: Some(ServiceTier::Auto),
+        store: Some(true),
+        stream: Some(false),
         temperature: Some(0.7),
-        tool_choice: ToolChoice::Value(ToolChoiceValue::Auto),
-        tools: vec![ResponseTool {
+        tool_choice: Some(ToolChoice::Value(ToolChoiceValue::Auto)),
+        tools: Some(vec![ResponseTool {
             r#type: ResponseToolType::WebSearchPreview,
             ..Default::default()
-        }],
-        top_logprobs: 5,
+        }]),
+        top_logprobs: Some(5),
         top_p: Some(0.9),
-        truncation: Truncation::Disabled,
+        truncation: Some(Truncation::Disabled),
         user: Some("test-user".to_string()),
         request_id: "resp_test123".to_string(),
         priority: 0,
-        frequency_penalty: 0.0,
-        presence_penalty: 0.0,
+        frequency_penalty: Some(0.0),
+        presence_penalty: Some(0.0),
         stop: None,
         top_k: -1,
         min_p: 0.0,
@@ -385,7 +381,7 @@ fn test_responses_request_creation() {
 #[test]
 fn test_sampling_params_conversion() {
     let request = ResponsesRequest {
-        background: false,
+        background: Some(false),
         include: None,
         input: ResponseInput::Text("Test".to_string()),
         instructions: None,
@@ -393,23 +389,23 @@ fn test_sampling_params_conversion() {
         max_tool_calls: None,
         metadata: None,
         model: Some("test-model".to_string()),
-        parallel_tool_calls: true, // Use default true
+        parallel_tool_calls: Some(true), // Use default true
         previous_response_id: None,
         reasoning: None,
-        service_tier: ServiceTier::Auto,
-        store: true, // Use default true
-        stream: false,
+        service_tier: Some(ServiceTier::Auto),
+        store: Some(true), // Use default true
+        stream: Some(false),
         temperature: Some(0.8),
-        tool_choice: ToolChoice::Value(ToolChoiceValue::Auto),
-        tools: vec![],
-        top_logprobs: 0, // Use default 0
+        tool_choice: Some(ToolChoice::Value(ToolChoiceValue::Auto)),
+        tools: Some(vec![]),
+        top_logprobs: Some(0), // Use default 0
         top_p: Some(0.95),
-        truncation: Truncation::Auto,
+        truncation: Some(Truncation::Auto),
         user: None,
         request_id: "resp_test456".to_string(),
         priority: 0,
-        frequency_penalty: 0.1,
-        presence_penalty: 0.2,
+        frequency_penalty: Some(0.1),
+        presence_penalty: Some(0.2),
         stop: None,
         top_k: 10,
         min_p: 0.05,
@@ -493,7 +489,7 @@ fn test_reasoning_param_default() {
 #[test]
 fn test_json_serialization() {
     let request = ResponsesRequest {
-        background: true,
+        background: Some(true),
         include: None,
         input: ResponseInput::Text("Test input".to_string()),
         instructions: Some("Test instructions".to_string()),
@@ -501,29 +497,29 @@ fn test_json_serialization() {
         max_tool_calls: Some(5),
         metadata: None,
         model: Some("gpt-4".to_string()),
-        parallel_tool_calls: false,
+        parallel_tool_calls: Some(false),
         previous_response_id: None,
         reasoning: Some(ResponseReasoningParam {
             effort: Some(ReasoningEffort::High),
             summary: None,
         }),
-        service_tier: ServiceTier::Priority,
-        store: false,
-        stream: true,
+        service_tier: Some(ServiceTier::Priority),
+        store: Some(false),
+        stream: Some(true),
         temperature: Some(0.9),
-        tool_choice: ToolChoice::Value(ToolChoiceValue::Required),
-        tools: vec![ResponseTool {
+        tool_choice: Some(ToolChoice::Value(ToolChoiceValue::Required)),
+        tools: Some(vec![ResponseTool {
             r#type: ResponseToolType::CodeInterpreter,
             ..Default::default()
-        }],
-        top_logprobs: 10,
+        }]),
+        top_logprobs: Some(10),
         top_p: Some(0.8),
-        truncation: Truncation::Auto,
+        truncation: Some(Truncation::Auto),
         user: Some("test_user".to_string()),
         request_id: "resp_comprehensive_test".to_string(),
         priority: 1,
-        frequency_penalty: 0.3,
-        presence_penalty: 0.4,
+        frequency_penalty: Some(0.3),
+        presence_penalty: Some(0.4),
         stop: None,
         top_k: 50,
         min_p: 0.1,
@@ -537,9 +533,9 @@ fn test_json_serialization() {
 
     assert_eq!(parsed.request_id, "resp_comprehensive_test");
     assert_eq!(parsed.model, Some("gpt-4".to_string()));
-    assert!(parsed.background);
-    assert!(parsed.stream);
-    assert_eq!(parsed.tools.len(), 1);
+    assert_eq!(parsed.background, Some(true));
+    assert_eq!(parsed.stream, Some(true));
+    assert_eq!(parsed.tools.as_ref().map(|t| t.len()), Some(1));
 }
 
 #[tokio::test]
@@ -576,6 +572,7 @@ async fn test_multi_turn_loop_with_mcp() {
 
     // Build router config
     let router_cfg = RouterConfig {
+        chat_template: None,
         mode: RoutingMode::OpenAI {
             worker_urls: vec![worker_url],
         },
@@ -613,14 +610,12 @@ async fn test_multi_turn_loop_with_mcp() {
         tool_call_parser: None,
     };
 
-    let ctx = AppContext::new(router_cfg, reqwest::Client::new(), 64, None).expect("ctx");
-    let router = RouterFactory::create_router(&Arc::new(ctx))
-        .await
-        .expect("router");
+    let ctx = common::create_test_context(router_cfg);
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Build request with MCP tools
     let req = ResponsesRequest {
-        background: false,
+        background: Some(false),
         include: None,
         input: ResponseInput::Text("search for SGLang".to_string()),
         instructions: Some("Be helpful".to_string()),
@@ -628,30 +623,30 @@ async fn test_multi_turn_loop_with_mcp() {
         max_tool_calls: None, // No limit - test unlimited
         metadata: None,
         model: Some("mock-model".to_string()),
-        parallel_tool_calls: true,
+        parallel_tool_calls: Some(true),
         previous_response_id: None,
         reasoning: None,
-        service_tier: ServiceTier::Auto,
-        store: true,
-        stream: false,
+        service_tier: Some(ServiceTier::Auto),
+        store: Some(true),
+        stream: Some(false),
         temperature: Some(0.7),
-        tool_choice: ToolChoice::Value(ToolChoiceValue::Auto),
-        tools: vec![ResponseTool {
+        tool_choice: Some(ToolChoice::Value(ToolChoiceValue::Auto)),
+        tools: Some(vec![ResponseTool {
             r#type: ResponseToolType::Mcp,
             server_url: Some(mcp.url()),
             server_label: Some("mock".to_string()),
             server_description: Some("Mock MCP server for testing".to_string()),
             require_approval: Some("never".to_string()),
             ..Default::default()
-        }],
-        top_logprobs: 0,
+        }]),
+        top_logprobs: Some(0),
         top_p: Some(1.0),
-        truncation: Truncation::Disabled,
+        truncation: Some(Truncation::Disabled),
         user: None,
         request_id: "resp_multi_turn_test".to_string(),
         priority: 0,
-        frequency_penalty: 0.0,
-        presence_penalty: 0.0,
+        frequency_penalty: Some(0.0),
+        presence_penalty: Some(0.0),
         stop: None,
         top_k: 50,
         min_p: 0.0,
@@ -753,6 +748,7 @@ async fn test_max_tool_calls_limit() {
     let worker_url = worker.start().await.expect("start worker");
 
     let router_cfg = RouterConfig {
+        chat_template: None,
         mode: RoutingMode::OpenAI {
             worker_urls: vec![worker_url],
         },
@@ -790,13 +786,11 @@ async fn test_max_tool_calls_limit() {
         tool_call_parser: None,
     };
 
-    let ctx = AppContext::new(router_cfg, reqwest::Client::new(), 64, None).expect("ctx");
-    let router = RouterFactory::create_router(&Arc::new(ctx))
-        .await
-        .expect("router");
+    let ctx = common::create_test_context(router_cfg);
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     let req = ResponsesRequest {
-        background: false,
+        background: Some(false),
         include: None,
         input: ResponseInput::Text("test max calls".to_string()),
         instructions: None,
@@ -804,28 +798,28 @@ async fn test_max_tool_calls_limit() {
         max_tool_calls: Some(1), // Limit to 1 call
         metadata: None,
         model: Some("mock-model".to_string()),
-        parallel_tool_calls: true,
+        parallel_tool_calls: Some(true),
         previous_response_id: None,
         reasoning: None,
-        service_tier: ServiceTier::Auto,
-        store: false,
-        stream: false,
+        service_tier: Some(ServiceTier::Auto),
+        store: Some(false),
+        stream: Some(false),
         temperature: Some(0.7),
-        tool_choice: ToolChoice::Value(ToolChoiceValue::Auto),
-        tools: vec![ResponseTool {
+        tool_choice: Some(ToolChoice::Value(ToolChoiceValue::Auto)),
+        tools: Some(vec![ResponseTool {
             r#type: ResponseToolType::Mcp,
             server_url: Some(mcp.url()),
             server_label: Some("mock".to_string()),
             ..Default::default()
-        }],
-        top_logprobs: 0,
+        }]),
+        top_logprobs: Some(0),
         top_p: Some(1.0),
-        truncation: Truncation::Disabled,
+        truncation: Some(Truncation::Disabled),
         user: None,
         request_id: "resp_max_calls_test".to_string(),
         priority: 0,
-        frequency_penalty: 0.0,
-        presence_penalty: 0.0,
+        frequency_penalty: Some(0.0),
+        presence_penalty: Some(0.0),
         stop: None,
         top_k: 50,
         min_p: 0.0,
@@ -896,6 +890,7 @@ async fn setup_streaming_mcp_test() -> (
     let worker_url = worker.start().await.expect("start worker");
 
     let router_cfg = RouterConfig {
+        chat_template: None,
         mode: RoutingMode::OpenAI {
             worker_urls: vec![worker_url],
         },
@@ -933,10 +928,8 @@ async fn setup_streaming_mcp_test() -> (
         tool_call_parser: None,
     };
 
-    let ctx = AppContext::new(router_cfg, reqwest::Client::new(), 64, None).expect("ctx");
-    let router = RouterFactory::create_router(&Arc::new(ctx))
-        .await
-        .expect("router");
+    let ctx = common::create_test_context(router_cfg);
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     (mcp, worker, router, dir)
 }
@@ -990,7 +983,7 @@ async fn test_streaming_with_mcp_tool_calls() {
 
     // Build streaming request with MCP tools
     let req = ResponsesRequest {
-        background: false,
+        background: Some(false),
         include: None,
         input: ResponseInput::Text("search for something interesting".to_string()),
         instructions: Some("Use tools when needed".to_string()),
@@ -998,30 +991,30 @@ async fn test_streaming_with_mcp_tool_calls() {
         max_tool_calls: Some(3),
         metadata: None,
         model: Some("mock-model".to_string()),
-        parallel_tool_calls: true,
+        parallel_tool_calls: Some(true),
         previous_response_id: None,
         reasoning: None,
-        service_tier: ServiceTier::Auto,
-        store: true,
-        stream: true, // KEY: Enable streaming
+        service_tier: Some(ServiceTier::Auto),
+        store: Some(true),
+        stream: Some(true), // KEY: Enable streaming
         temperature: Some(0.7),
-        tool_choice: ToolChoice::Value(ToolChoiceValue::Auto),
-        tools: vec![ResponseTool {
+        tool_choice: Some(ToolChoice::Value(ToolChoiceValue::Auto)),
+        tools: Some(vec![ResponseTool {
             r#type: ResponseToolType::Mcp,
             server_url: Some(mcp.url()),
             server_label: Some("mock".to_string()),
             server_description: Some("Mock MCP for streaming test".to_string()),
             require_approval: Some("never".to_string()),
             ..Default::default()
-        }],
-        top_logprobs: 0,
+        }]),
+        top_logprobs: Some(0),
         top_p: Some(1.0),
-        truncation: Truncation::Disabled,
+        truncation: Some(Truncation::Disabled),
         user: None,
         request_id: "resp_streaming_mcp_test".to_string(),
         priority: 0,
-        frequency_penalty: 0.0,
-        presence_penalty: 0.0,
+        frequency_penalty: Some(0.0),
+        presence_penalty: Some(0.0),
         stop: None,
         top_k: 50,
         min_p: 0.0,
@@ -1271,7 +1264,7 @@ async fn test_streaming_multi_turn_with_mcp() {
     let (mut mcp, mut worker, router, _dir) = setup_streaming_mcp_test().await;
 
     let req = ResponsesRequest {
-        background: false,
+        background: Some(false),
         include: None,
         input: ResponseInput::Text("complex query requiring multiple tool calls".to_string()),
         instructions: Some("Be thorough".to_string()),
@@ -1279,28 +1272,28 @@ async fn test_streaming_multi_turn_with_mcp() {
         max_tool_calls: Some(5), // Allow multiple rounds
         metadata: None,
         model: Some("mock-model".to_string()),
-        parallel_tool_calls: true,
+        parallel_tool_calls: Some(true),
         previous_response_id: None,
         reasoning: None,
-        service_tier: ServiceTier::Auto,
-        store: true,
-        stream: true,
+        service_tier: Some(ServiceTier::Auto),
+        store: Some(true),
+        stream: Some(true),
         temperature: Some(0.8),
-        tool_choice: ToolChoice::Value(ToolChoiceValue::Auto),
-        tools: vec![ResponseTool {
+        tool_choice: Some(ToolChoice::Value(ToolChoiceValue::Auto)),
+        tools: Some(vec![ResponseTool {
             r#type: ResponseToolType::Mcp,
             server_url: Some(mcp.url()),
             server_label: Some("mock".to_string()),
             ..Default::default()
-        }],
-        top_logprobs: 0,
+        }]),
+        top_logprobs: Some(0),
         top_p: Some(1.0),
-        truncation: Truncation::Disabled,
+        truncation: Some(Truncation::Disabled),
         user: None,
         request_id: "resp_streaming_multiturn_test".to_string(),
         priority: 0,
-        frequency_penalty: 0.0,
-        presence_penalty: 0.0,
+        frequency_penalty: Some(0.0),
+        presence_penalty: Some(0.0),
         stop: None,
         top_k: 50,
         min_p: 0.0,
@@ -1338,6 +1331,7 @@ async fn test_streaming_multi_turn_with_mcp() {
 async fn test_conversation_items_create_and_get() {
     // Test creating items and getting a specific item
     let router_cfg = RouterConfig {
+        chat_template: None,
         mode: RoutingMode::OpenAI {
             worker_urls: vec!["http://localhost".to_string()],
         },
@@ -1375,10 +1369,8 @@ async fn test_conversation_items_create_and_get() {
         tool_call_parser: None,
     };
 
-    let ctx = AppContext::new(router_cfg, reqwest::Client::new(), 8, None).expect("ctx");
-    let router = RouterFactory::create_router(&Arc::new(ctx))
-        .await
-        .expect("router");
+    let ctx = common::create_test_context(router_cfg);
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create conversation
     let create_conv = serde_json::json!({});
@@ -1440,6 +1432,7 @@ async fn test_conversation_items_create_and_get() {
 async fn test_conversation_items_delete() {
     // Test deleting an item from a conversation
     let router_cfg = RouterConfig {
+        chat_template: None,
         mode: RoutingMode::OpenAI {
             worker_urls: vec!["http://localhost".to_string()],
         },
@@ -1477,10 +1470,8 @@ async fn test_conversation_items_delete() {
         tool_call_parser: None,
     };
 
-    let ctx = AppContext::new(router_cfg, reqwest::Client::new(), 8, None).expect("ctx");
-    let router = RouterFactory::create_router(&Arc::new(ctx))
-        .await
-        .expect("router");
+    let ctx = common::create_test_context(router_cfg);
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create conversation
     let create_conv = serde_json::json!({});
@@ -1548,6 +1539,7 @@ async fn test_conversation_items_delete() {
 async fn test_conversation_items_max_limit() {
     // Test that creating > 20 items returns error
     let router_cfg = RouterConfig {
+        chat_template: None,
         mode: RoutingMode::OpenAI {
             worker_urls: vec!["http://localhost".to_string()],
         },
@@ -1585,10 +1577,8 @@ async fn test_conversation_items_max_limit() {
         tool_call_parser: None,
     };
 
-    let ctx = AppContext::new(router_cfg, reqwest::Client::new(), 8, None).expect("ctx");
-    let router = RouterFactory::create_router(&Arc::new(ctx))
-        .await
-        .expect("router");
+    let ctx = common::create_test_context(router_cfg);
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create conversation
     let create_conv = serde_json::json!({});
@@ -1626,6 +1616,7 @@ async fn test_conversation_items_max_limit() {
 async fn test_conversation_items_unsupported_type() {
     // Test that unsupported item types return error
     let router_cfg = RouterConfig {
+        chat_template: None,
         mode: RoutingMode::OpenAI {
             worker_urls: vec!["http://localhost".to_string()],
         },
@@ -1663,10 +1654,8 @@ async fn test_conversation_items_unsupported_type() {
         tool_call_parser: None,
     };
 
-    let ctx = AppContext::new(router_cfg, reqwest::Client::new(), 8, None).expect("ctx");
-    let router = RouterFactory::create_router(&Arc::new(ctx))
-        .await
-        .expect("router");
+    let ctx = common::create_test_context(router_cfg);
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create conversation
     let create_conv = serde_json::json!({});
@@ -1703,6 +1692,7 @@ async fn test_conversation_items_unsupported_type() {
 async fn test_conversation_items_multi_conversation_sharing() {
     // Test that items can be shared across conversations via soft delete
     let router_cfg = RouterConfig {
+        chat_template: None,
         mode: RoutingMode::OpenAI {
             worker_urls: vec!["http://localhost".to_string()],
         },
@@ -1740,10 +1730,8 @@ async fn test_conversation_items_multi_conversation_sharing() {
         tool_call_parser: None,
     };
 
-    let ctx = AppContext::new(router_cfg, reqwest::Client::new(), 8, None).expect("ctx");
-    let router = RouterFactory::create_router(&Arc::new(ctx))
-        .await
-        .expect("router");
+    let ctx = common::create_test_context(router_cfg);
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create two conversations
     let conv_a_resp = router
