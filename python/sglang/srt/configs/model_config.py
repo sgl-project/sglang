@@ -23,16 +23,16 @@ import torch
 from transformers import PretrainedConfig
 
 from sglang.srt.environ import envs
-from sglang.srt.hf_transformers_utils import (
+from sglang.srt.layers.quantization import QUANTIZATION_METHODS
+from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import is_hip, retry
+from sglang.srt.utils.hf_transformers_utils import (
     get_config,
     get_context_length,
     get_generation_config,
     get_hf_text_config,
     get_sparse_attention_config,
 )
-from sglang.srt.layers.quantization import QUANTIZATION_METHODS
-from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import is_hip, retry
 from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)

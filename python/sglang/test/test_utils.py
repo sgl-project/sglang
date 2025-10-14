@@ -9,6 +9,7 @@ import os
 import random
 import re
 import subprocess
+import sys
 import threading
 import time
 import unittest
@@ -566,11 +567,30 @@ def popen_launch_server(
     if return_stdout_stderr:
         process = subprocess.Popen(
             command,
-            stdout=return_stdout_stderr[0],
-            stderr=return_stdout_stderr[1],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             env=env,
             text=True,
+            bufsize=1,
         )
+
+        def _dump(src, sinks):
+            for line in iter(src.readline, ""):
+                for sink in sinks:
+                    sink.write(line)
+                    sink.flush()
+            src.close()
+
+        threading.Thread(
+            target=_dump,
+            args=(process.stdout, [return_stdout_stderr[0], sys.stdout]),
+            daemon=True,
+        ).start()
+        threading.Thread(
+            target=_dump,
+            args=(process.stderr, [return_stdout_stderr[1], sys.stderr]),
+            daemon=True,
+        ).start()
     else:
         process = subprocess.Popen(command, stdout=None, stderr=None, env=env)
 
@@ -901,7 +921,7 @@ def run_score_benchmark(
     async def _run_benchmark():
 
         # Load tokenizer for generating test data
-        from sglang.srt.hf_transformers_utils import get_tokenizer
+        from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
         tokenizer = get_tokenizer(model)
 

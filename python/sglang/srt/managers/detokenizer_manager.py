@@ -24,7 +24,6 @@ import psutil
 import setproctitle
 import zmq
 
-from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
     BatchMultimodalDecodeReq,
@@ -42,6 +41,7 @@ from sglang.srt.utils import (
     get_zmq_socket,
     kill_itself_when_parent_died,
 )
+from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.utils import (
     TypeBasedDispatcher,
     find_printable_text,
