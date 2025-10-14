@@ -471,7 +471,7 @@ def is_pin_memory_available() -> bool:
 
 class LayerFn(Protocol):
 
-    def __call__(self, layer_id: int, prefix: str) -> torch.nn.Module: ...
+    def __call__(self, idx: int, prefix: str) -> torch.nn.Module: ...
 
 
 def make_layers(
@@ -482,7 +482,7 @@ def make_layers(
     prefix: str = "",
     return_tuple: bool = False,
     offloader_kwargs: Dict[str, Any] = {},
-) -> Tuple[int, int, torch.nn.ModuleList]:
+) -> Tuple[torch.nn.Module, int, int]:
     """Make a list of layers with the given layer function"""
     # circula imports
     from sglang.srt.distributed import get_pp_indices
