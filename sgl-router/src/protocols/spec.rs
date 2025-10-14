@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{to_value, Map, Number, Value};
 use std::collections::HashMap;
+use validator::Validate;
 
 // Default model value when not specified
 fn default_model() -> String {
@@ -168,9 +169,11 @@ pub struct FunctionCallDelta {
     pub arguments: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default, Validate)]
+#[validate(schema(function = "validate_chat_cross_parameters"))]
 pub struct ChatCompletionRequest {
     /// A list of messages comprising the conversation so far
+    #[validate(custom(function = "validate_messages"))]
     pub messages: Vec<ChatMessage>,
 
     /// ID of the model to use
@@ -179,6 +182,7 @@ pub struct ChatCompletionRequest {
 
     /// Number between -2.0 and 2.0. Positive values penalize new tokens based on their existing frequency in the text so far
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = -2.0, max = 2.0))]
     pub frequency_penalty: Option<f32>,
 
     /// Deprecated: Replaced by tool_choice
@@ -202,10 +206,12 @@ pub struct ChatCompletionRequest {
     /// Deprecated: Replaced by max_completion_tokens
     #[serde(skip_serializing_if = "Option::is_none")]
     #[deprecated(note = "Use max_completion_tokens instead")]
+    #[validate(range(min = 1))]
     pub max_tokens: Option<u32>,
 
     /// An upper bound for the number of tokens that can be generated for a completion
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = 1))]
     pub max_completion_tokens: Option<u32>,
 
     /// Developer-defined tags and values used for filtering completions in the dashboard
@@ -218,6 +224,7 @@ pub struct ChatCompletionRequest {
 
     /// How many chat completion choices to generate for each input message
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = 1, max = 10))]
     pub n: Option<u32>,
 
     /// Whether to enable parallel function calling during tool use
@@ -226,6 +233,7 @@ pub struct ChatCompletionRequest {
 
     /// Number between -2.0 and 2.0. Positive values penalize new tokens based on whether they appear in the text so far
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = -2.0, max = 2.0))]
     pub presence_penalty: Option<f32>,
 
     /// Cache key for prompts (beta feature)
@@ -255,6 +263,7 @@ pub struct ChatCompletionRequest {
 
     /// Up to 4 sequences where the API will stop generating further tokens
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(custom(function = "validate_stop"))]
     pub stop: Option<StringOrArray>,
 
     /// If set, partial message deltas will be sent
@@ -267,6 +276,7 @@ pub struct ChatCompletionRequest {
 
     /// What sampling temperature to use, between 0 and 2
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = 0.0, max = 2.0))]
     pub temperature: Option<f32>,
 
     /// Controls which (if any) tool is called by the model
@@ -279,10 +289,12 @@ pub struct ChatCompletionRequest {
 
     /// An integer between 0 and 20 specifying the number of most likely tokens to return
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = 0, max = 20))]
     pub top_logprobs: Option<u32>,
 
     /// An alternative to sampling with temperature
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = 0.0, max = 1.0))]
     pub top_p: Option<f32>,
 
     /// Verbosity level for debugging
@@ -295,14 +307,17 @@ pub struct ChatCompletionRequest {
 
     /// Min-p nucleus sampling parameter
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = 0.0, max = 1.0))]
     pub min_p: Option<f32>,
 
     /// Minimum number of tokens to generate
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = 1))]
     pub min_tokens: Option<u32>,
 
     /// Repetition penalty for reducing repetitive text
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = 0.0, max = 2.0))]
     pub repetition_penalty: Option<f32>,
 
     /// Regex constraint for output generation
@@ -360,6 +375,156 @@ pub struct ChatCompletionRequest {
     /// Random seed for sampling for deterministic outputs
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sampling_seed: Option<u64>,
+}
+
+// Validation functions for ChatCompletionRequest
+// These are automatically called by the validator derive macro
+
+/// Validates stop sequences (max 4, non-empty strings)
+fn validate_stop(stop: &StringOrArray) -> Result<(), validator::ValidationError> {
+    match stop {
+        StringOrArray::String(s) => {
+            if s.is_empty() {
+                return Err(validator::ValidationError::new(
+                    "stop sequences cannot be empty",
+                ));
+            }
+        }
+        StringOrArray::Array(arr) => {
+            if arr.len() > 4 {
+                return Err(validator::ValidationError::new(
+                    "maximum 4 stop sequences allowed",
+                ));
+            }
+            for s in arr {
+                if s.is_empty() {
+                    return Err(validator::ValidationError::new(
+                        "stop sequences cannot be empty",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validates messages array is not empty and has valid content
+fn validate_messages(messages: &[ChatMessage]) -> Result<(), validator::ValidationError> {
+    if messages.is_empty() {
+        return Err(validator::ValidationError::new("messages cannot be empty"));
+    }
+
+    for msg in messages.iter() {
+        if let ChatMessage::User { content, .. } = msg {
+            match content {
+                UserMessageContent::Text(text) if text.is_empty() => {
+                    return Err(validator::ValidationError::new(
+                        "message content cannot be empty",
+                    ));
+                }
+                UserMessageContent::Parts(parts) if parts.is_empty() => {
+                    return Err(validator::ValidationError::new(
+                        "message content parts cannot be empty",
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Schema-level validation for cross-field dependencies
+fn validate_chat_cross_parameters(
+    req: &ChatCompletionRequest,
+) -> Result<(), validator::ValidationError> {
+    // 1. Validate logprobs dependency
+    if req.top_logprobs.is_some() && !req.logprobs {
+        return Err(validator::ValidationError::new(
+            "top_logprobs is only allowed when logprobs is enabled",
+        ));
+    }
+
+    // 2. Validate token limits - min <= max
+    #[allow(deprecated)]
+    let effective_max = req.max_completion_tokens.or(req.max_tokens);
+    if let (Some(min), Some(max)) = (req.min_tokens, effective_max) {
+        if min > max {
+            return Err(validator::ValidationError::new(
+                "min_tokens cannot exceed max_tokens/max_completion_tokens",
+            ));
+        }
+    }
+
+    // 3. Validate conflicting token parameters
+    #[allow(deprecated)]
+    if req.max_tokens.is_some() && req.max_completion_tokens.is_some() {
+        return Err(validator::ValidationError::new(
+            "cannot specify both max_tokens and max_completion_tokens",
+        ));
+    }
+
+    // 4. Validate conflicting function/tools parameters
+    #[allow(deprecated)]
+    if req.tools.is_some() && req.functions.is_some() {
+        return Err(validator::ValidationError::new(
+            "functions is deprecated, use tools instead - cannot specify both",
+        ));
+    }
+
+    // 5. Validate structured output conflicts
+    let has_json_format = matches!(
+        req.response_format,
+        Some(ResponseFormat::JsonObject | ResponseFormat::JsonSchema { .. })
+    );
+
+    if has_json_format && req.regex.is_some() {
+        return Err(validator::ValidationError::new(
+            "cannot use regex constraint with JSON response format",
+        ));
+    }
+
+    if has_json_format && req.ebnf.is_some() {
+        return Err(validator::ValidationError::new(
+            "cannot use EBNF constraint with JSON response format",
+        ));
+    }
+
+    // 6. Validate mutually exclusive structured output constraints
+    let constraint_count = [
+        req.regex.is_some(),
+        req.ebnf.is_some(),
+        matches!(req.response_format, Some(ResponseFormat::JsonSchema { .. })),
+    ]
+    .iter()
+    .filter(|&&x| x)
+    .count();
+
+    if constraint_count > 1 {
+        return Err(validator::ValidationError::new(
+            "only one structured output constraint (regex, ebnf, or json_schema) can be active at a time",
+        ));
+    }
+
+    // 7. Validate response format JSON schema name
+    if let Some(ResponseFormat::JsonSchema { json_schema }) = &req.response_format {
+        if json_schema.name.is_empty() {
+            return Err(validator::ValidationError::new(
+                "JSON schema name cannot be empty",
+            ));
+        }
+    }
+
+    // 8. Validate top_k parameter (-1 to disable, or positive)
+    if let Some(top_k) = req.top_k {
+        if top_k != -1 && top_k <= 0 {
+            return Err(validator::ValidationError::new(
+                "top_k must be -1 (disabled) or positive",
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 impl GenerationRequest for ChatCompletionRequest {

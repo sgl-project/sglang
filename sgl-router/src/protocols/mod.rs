@@ -2,5 +2,6 @@
 // This module provides a structured approach to handling different API protocols
 
 pub mod spec;
+pub mod validated;
 pub mod validation;
 pub mod worker_spec;
