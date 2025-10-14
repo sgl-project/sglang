@@ -90,10 +90,7 @@ pub enum ChatMessage {
         tool_call_id: String,
     },
     #[serde(rename = "function")]
-    Function {
-        content: String,
-        name: String,
-    },
+    Function { content: String, name: String },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -476,7 +473,7 @@ fn validate_chat_cross_parameters(
     }
 
     // 3. Validate token limits - min <= max
-    if let (Some(min), Some(max)) = (req.min_tokens,  req.max_completion_tokens) {
+    if let (Some(min), Some(max)) = (req.min_tokens, req.max_completion_tokens) {
         if min > max {
             return Err(validator::ValidationError::new(
                 "min_tokens cannot exceed max_tokens/max_completion_tokens",
@@ -508,9 +505,9 @@ fn validate_chat_cross_parameters(
         req.ebnf.is_some(),
         matches!(req.response_format, Some(ResponseFormat::JsonSchema { .. })),
     ]
-        .iter()
-        .filter(|&&x| x)
-        .count();
+    .iter()
+    .filter(|&&x| x)
+    .count();
 
     if constraint_count > 1 {
         return Err(validator::ValidationError::new(
@@ -532,10 +529,7 @@ fn validate_chat_cross_parameters(
         let has_tools = req.tools.as_ref().map_or(false, |t| !t.is_empty());
 
         // Check if tool_choice is anything other than "none"
-        let is_some_choice = !matches!(
-            tool_choice,
-            ToolChoice::Value(ToolChoiceValue::None)
-        );
+        let is_some_choice = !matches!(tool_choice, ToolChoice::Value(ToolChoiceValue::None));
 
         if is_some_choice && !has_tools {
             return Err(validator::ValidationError::new(
@@ -555,15 +549,23 @@ fn validate_chat_cross_parameters(
                     });
 
                     if !function_exists {
-                        let mut err = validator::ValidationError::new("tool_choice_function_not_found");
-                        err.message = Some(format!(
+                        let mut err =
+                            validator::ValidationError::new("tool_choice_function_not_found");
+                        err.message = Some(
+                            format!(
                             "Invalid value for 'tool_choice': function '{}' not found in 'tools'.",
                             function.name
-                        ).into());
+                        )
+                            .into(),
+                        );
                         return Err(err);
                     }
                 }
-                ToolChoice::AllowedTools { mode, tools: allowed_tools, .. } => {
+                ToolChoice::AllowedTools {
+                    mode,
+                    tools: allowed_tools,
+                    ..
+                } => {
                     // Validate mode is "auto" or "required"
                     if mode != "auto" && mode != "required" {
                         let mut err = validator::ValidationError::new("tool_choice_invalid_mode");
@@ -577,11 +579,13 @@ fn validate_chat_cross_parameters(
                     // Validate that all referenced tool names exist in tools
                     for tool_ref in allowed_tools {
                         let tool_exists = tools.iter().any(|tool| {
-                            tool.tool_type == tool_ref.tool_type && tool.function.name == tool_ref.name
+                            tool.tool_type == tool_ref.tool_type
+                                && tool.function.name == tool_ref.name
                         });
 
                         if !tool_exists {
-                            let mut err = validator::ValidationError::new("tool_choice_tool_not_found");
+                            let mut err =
+                                validator::ValidationError::new("tool_choice_tool_not_found");
                             err.message = Some(format!(
                                 "Invalid value for 'tool_choice.tools': tool '{}' not found in 'tools'.",
                                 tool_ref.name
@@ -637,9 +641,7 @@ impl Normalizable for ChatCompletionRequest {
                 FunctionCall::Auto => ToolChoice::Value(ToolChoiceValue::Auto),
                 FunctionCall::Function { name } => ToolChoice::Function {
                     tool_type: "function".to_string(),
-                    function: FunctionChoice {
-                        name: name.clone(),
-                    },
+                    function: FunctionChoice { name: name.clone() },
                 },
             });
             self.function_call = None; // Clear deprecated field
@@ -2283,9 +2285,9 @@ fn validate_sampling_params(params: &SamplingParams) -> Result<(), validator::Va
         params.ebnf.is_some(),
         params.json_schema.is_some(),
     ]
-        .iter()
-        .filter(|&&x| x)
-        .count();
+    .iter()
+    .filter(|&&x| x)
+    .count();
 
     if constraint_count > 1 {
         return Err(validator::ValidationError::new(
@@ -2351,10 +2353,7 @@ fn validate_generate_request(req: &GenerateRequest) -> Result<(), validator::Val
     let has_text = req.text.is_some() || req.prompt.is_some();
     let has_input_ids = req.input_ids.is_some();
 
-    let count = [has_text, has_input_ids]
-        .iter()
-        .filter(|&&x| x)
-        .count();
+    let count = [has_text, has_input_ids].iter().filter(|&&x| x).count();
 
     if count == 0 {
         return Err(validator::ValidationError::new(
@@ -2809,12 +2808,10 @@ mod tests {
 
         let msg: ChatMessage = serde_json::from_value(json).unwrap();
         match msg {
-            ChatMessage::User { content, .. } => {
-                match content {
-                    UserMessageContent::Text(text) => assert_eq!(text, "Hello"),
-                    _ => panic!("Expected text content"),
-                }
-            }
+            ChatMessage::User { content, .. } => match content {
+                UserMessageContent::Text(text) => assert_eq!(text, "Hello"),
+                _ => panic!("Expected text content"),
+            },
             _ => panic!("Expected User variant"),
         }
     }
@@ -3587,9 +3584,19 @@ mod tests {
         };
 
         req.normalize();
-        assert_eq!(req.max_completion_tokens, Some(100), "max_tokens should be copied to max_completion_tokens");
-        assert!(req.max_tokens.is_none(), "Deprecated field should be cleared");
-        assert!(req.validate().is_ok(), "Should be valid after normalization");
+        assert_eq!(
+            req.max_completion_tokens,
+            Some(100),
+            "max_tokens should be copied to max_completion_tokens"
+        );
+        assert!(
+            req.max_tokens.is_none(),
+            "Deprecated field should be cleared"
+        );
+        assert!(
+            req.validate().is_ok(),
+            "Should be valid after normalization"
+        );
     }
 
     #[test]
@@ -3609,8 +3616,15 @@ mod tests {
         };
 
         req.normalize();
-        assert_eq!(req.max_completion_tokens, Some(200), "max_completion_tokens should take precedence");
-        assert!(req.validate().is_ok(), "Should be valid after normalization");
+        assert_eq!(
+            req.max_completion_tokens,
+            Some(200),
+            "max_completion_tokens should take precedence"
+        );
+        assert!(
+            req.validate().is_ok(),
+            "Should be valid after normalization"
+        );
     }
 
     #[test]
@@ -3638,8 +3652,14 @@ mod tests {
         assert!(req.tools.is_some(), "functions should be migrated to tools");
         assert_eq!(req.tools.as_ref().unwrap().len(), 1);
         assert_eq!(req.tools.as_ref().unwrap()[0].function.name, "test_func");
-        assert!(req.functions.is_none(), "Deprecated field should be cleared");
-        assert!(req.validate().is_ok(), "Should be valid after normalization");
+        assert!(
+            req.functions.is_none(),
+            "Deprecated field should be cleared"
+        );
+        assert!(
+            req.validate().is_ok(),
+            "Should be valid after normalization"
+        );
     }
 
     #[test]
@@ -3659,10 +3679,22 @@ mod tests {
         };
 
         req.normalize();
-        assert!(req.tool_choice.is_some(), "function_call should be migrated to tool_choice");
-        assert!(matches!(req.tool_choice, Some(ToolChoice::Value(ToolChoiceValue::None))));
-        assert!(req.function_call.is_none(), "Deprecated field should be cleared");
-        assert!(req.validate().is_ok(), "Should be valid after normalization");
+        assert!(
+            req.tool_choice.is_some(),
+            "function_call should be migrated to tool_choice"
+        );
+        assert!(matches!(
+            req.tool_choice,
+            Some(ToolChoice::Value(ToolChoiceValue::None))
+        ));
+        assert!(
+            req.function_call.is_none(),
+            "Deprecated field should be cleared"
+        );
+        assert!(
+            req.validate().is_ok(),
+            "Should be valid after normalization"
+        );
     }
 
     #[test]
@@ -3676,7 +3708,9 @@ mod tests {
                 content: UserMessageContent::Text("hello".to_string()),
                 name: None,
             }],
-            function_call: Some(FunctionCall::Function { name: "my_function".to_string() }),
+            function_call: Some(FunctionCall::Function {
+                name: "my_function".to_string(),
+            }),
             tool_choice: None,
             tools: Some(vec![Tool {
                 tool_type: "function".to_string(),
@@ -3691,15 +3725,24 @@ mod tests {
         };
 
         req.normalize();
-        assert!(req.tool_choice.is_some(), "function_call should be migrated to tool_choice");
+        assert!(
+            req.tool_choice.is_some(),
+            "function_call should be migrated to tool_choice"
+        );
         match &req.tool_choice {
             Some(ToolChoice::Function { function, .. }) => {
                 assert_eq!(function.name, "my_function");
             }
             _ => panic!("Expected ToolChoice::Function variant"),
         }
-        assert!(req.function_call.is_none(), "Deprecated field should be cleared");
-        assert!(req.validate().is_ok(), "Should be valid after normalization");
+        assert!(
+            req.function_call.is_none(),
+            "Deprecated field should be cleared"
+        );
+        assert!(
+            req.validate().is_ok(),
+            "Should be valid after normalization"
+        );
     }
 
     // Stream options validation tests
@@ -3722,7 +3765,10 @@ mod tests {
         };
 
         let result = req.validate();
-        assert!(result.is_err(), "Should reject stream_options when stream is false");
+        assert!(
+            result.is_err(),
+            "Should reject stream_options when stream is false"
+        );
         let err = result.unwrap_err().to_string();
         assert!(
             err.contains("stream_options") && err.contains("stream") && err.contains("enabled"),
@@ -3749,7 +3795,10 @@ mod tests {
         };
 
         let result = req.validate();
-        assert!(result.is_ok(), "Should accept stream_options when stream is true");
+        assert!(
+            result.is_ok(),
+            "Should accept stream_options when stream is true"
+        );
     }
 
     #[test]
@@ -3768,7 +3817,10 @@ mod tests {
         };
 
         let result = req.validate();
-        assert!(result.is_ok(), "Should accept no stream_options when stream is false");
+        assert!(
+            result.is_ok(),
+            "Should accept no stream_options when stream is false"
+        );
     }
 
     // Tool choice validation tests

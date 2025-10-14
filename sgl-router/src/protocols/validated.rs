@@ -48,34 +48,35 @@ where
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
         // First, extract and deserialize the JSON
-        let Json(mut data) = Json::<T>::from_request(req, state)
-            .await
-            .map_err(|err: JsonRejection| {
-                let error_message = match err {
-                    JsonRejection::JsonDataError(e) => {
-                        format!("Invalid JSON data: {}", e)
-                    }
-                    JsonRejection::JsonSyntaxError(e) => {
-                        format!("JSON syntax error: {}", e)
-                    }
-                    JsonRejection::MissingJsonContentType(_) => {
-                        "Missing Content-Type: application/json header".to_string()
-                    }
-                    _ => format!("Failed to parse JSON: {}", err),
-                };
-
-                (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({
-                        "error": {
-                            "message": error_message,
-                            "type": "invalid_request_error",
-                            "code": "json_parse_error"
+        let Json(mut data) =
+            Json::<T>::from_request(req, state)
+                .await
+                .map_err(|err: JsonRejection| {
+                    let error_message = match err {
+                        JsonRejection::JsonDataError(e) => {
+                            format!("Invalid JSON data: {}", e)
                         }
-                    })),
-                )
-                    .into_response()
-            })?;
+                        JsonRejection::JsonSyntaxError(e) => {
+                            format!("JSON syntax error: {}", e)
+                        }
+                        JsonRejection::MissingJsonContentType(_) => {
+                            "Missing Content-Type: application/json header".to_string()
+                        }
+                        _ => format!("Failed to parse JSON: {}", err),
+                    };
+
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "error": {
+                                "message": error_message,
+                                "type": "invalid_request_error",
+                                "code": "json_parse_error"
+                            }
+                        })),
+                    )
+                        .into_response()
+                })?;
 
         // Normalize the request (apply defaults based on other fields)
         data.normalize();
