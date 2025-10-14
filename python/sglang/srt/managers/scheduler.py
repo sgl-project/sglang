@@ -806,7 +806,7 @@ class Scheduler(
             self.disagg_metadata_buffers = MetadataBuffers(
                 buffer_size,
                 hidden_size=self.model_config.hf_text_config.hidden_size,
-                dtype=self.model_config.dtype,
+                hidden_states_dtype=self.model_config.dtype,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
             )
 
@@ -855,7 +855,7 @@ class Scheduler(
             self.disagg_metadata_buffers = MetadataBuffers(
                 buffer_size,
                 hidden_size=self.model_config.hf_text_config.hidden_size,
-                dtype=self.model_config.dtype,
+                hidden_states_dtype=self.model_config.dtype,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
             )
 

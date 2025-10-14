@@ -71,10 +71,10 @@ impl Default for GptOssParser {
 
 #[async_trait]
 impl ToolParser for GptOssParser {
-    async fn parse_complete(&self, text: &str) -> ToolParserResult<Vec<ToolCall>> {
+    async fn parse_complete(&self, text: &str) -> ToolParserResult<(String, Vec<ToolCall>)> {
         // Check if text contains GPT-OSS format
         if !self.has_tool_markers(text) {
-            return Ok(vec![]);
+            return Ok((text.to_string(), vec![]));
         }
 
         let mut tools = Vec::new();
@@ -119,7 +119,7 @@ impl ToolParser for GptOssParser {
             }
         }
 
-        Ok(tools)
+        Ok((String::new(), tools)) // GPT-OSS parser returns empty normal text
     }
 
     async fn parse_incremental(
@@ -239,10 +239,10 @@ mod tests {
 <|channel|>commentary to=functions.get_weather<|constrain|>json<|message|>{"location": "San Francisco"}<|call|>
 More text"#;
 
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.name, "get_weather");
-        assert!(result[0].function.arguments.contains("San Francisco"));
+        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].function.name, "get_weather");
+        assert!(tools[0].function.arguments.contains("San Francisco"));
     }
 
     #[tokio::test]
@@ -251,12 +251,12 @@ More text"#;
         let input = r#"<|channel|>commentary to=functions.get_weather<|constrain|>json<|message|>{"location": "Paris"}<|call|>commentary
 <|channel|>commentary to=functions.search<|constrain|>json<|message|>{"query": "Paris tourism"}<|call|>"#;
 
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].function.name, "get_weather");
-        assert_eq!(result[1].function.name, "search");
-        assert!(result[0].function.arguments.contains("Paris"));
-        assert!(result[1].function.arguments.contains("Paris tourism"));
+        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].function.name, "get_weather");
+        assert_eq!(tools[1].function.name, "search");
+        assert!(tools[0].function.arguments.contains("Paris"));
+        assert!(tools[1].function.arguments.contains("Paris tourism"));
     }
 
     #[tokio::test]
@@ -264,9 +264,9 @@ More text"#;
         let parser = GptOssParser::new();
         let input = r#"<|start|>assistant<|channel|>commentary to=functions.test<|constrain|>json<|message|>{"key": "value"}<|call|>"#;
 
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.name, "test");
+        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].function.name, "test");
     }
 
     #[tokio::test]
@@ -275,10 +275,10 @@ More text"#;
         let input =
             r#"<|channel|>commentary to=functions.get_time<|constrain|>json<|message|>{}<|call|>"#;
 
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.name, "get_time");
-        assert_eq!(result[0].function.arguments, "{}");
+        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].function.name, "get_time");
+        assert_eq!(tools[0].function.arguments, "{}");
     }
 
     #[test]
