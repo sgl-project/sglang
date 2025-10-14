@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, List
 
 import torch
@@ -11,6 +12,10 @@ import triton.language as tl
 from huggingface_hub import snapshot_download
 
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
+from sglang.srt.distributed.parallel_state import (
+    GroupCoordinator,
+    patch_tensor_parallel_group,
+)
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.utils import is_cuda, is_hip
@@ -616,3 +621,11 @@ def load_token_map(token_map_path: str) -> List[int]:
         token_map_path = os.path.join(cache_dir, os.path.basename(token_map_path))
     hot_token_id = torch.load(token_map_path, weights_only=True)
     return torch.tensor(hot_token_id, dtype=torch.int64)
+
+
+@contextmanager
+def draft_tp_context(tp_group: GroupCoordinator):
+    # Draft model doesn't use dp and has its own tp group.
+    # We disable mscclpp now because it doesn't support 2 comm groups.
+    with patch_tensor_parallel_group(tp_group):
+        yield

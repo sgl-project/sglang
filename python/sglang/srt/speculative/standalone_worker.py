@@ -1,15 +1,13 @@
 import logging
-from contextlib import contextmanager
 from typing import Optional
 
 import torch
 
-from sglang.srt.distributed import GroupCoordinator, patch_tensor_parallel_group
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.eagle_worker import EAGLEWorker
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.spec_utils import load_token_map
+from sglang.srt.speculative.spec_utils import draft_tp_context, load_token_map
 from sglang.srt.utils import empty_context, get_bool_env_var, is_cuda
 
 if is_cuda():
@@ -17,14 +15,6 @@ if is_cuda():
 
 logger = logging.getLogger(__name__)
 RETURN_ORIGINAL_LOGPROB = get_bool_env_var("RETURN_ORIGINAL_LOGPROB")
-
-
-@contextmanager
-def draft_tp_context(tp_group: GroupCoordinator):
-    # Draft model doesn't use dp and has its own tp group.
-    # We disable mscclpp now because it doesn't support 2 comm groups.
-    with patch_tensor_parallel_group(tp_group):
-        yield
 
 
 class StandaloneWorker(EAGLEWorker):
