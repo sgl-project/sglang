@@ -384,7 +384,6 @@ class EAGLEDraftExtendCudaGraphRunner:
             forward_mode=ForwardMode.DRAFT_EXTEND,
             spec_info=forward_batch.spec_info,
             seq_lens_cpu=self.seq_lens_cpu,
-            extend_seq_lens_cpu=self.extend_seq_lens_cpu,
         )
 
         # Replay

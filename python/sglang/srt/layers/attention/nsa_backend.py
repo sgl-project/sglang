@@ -592,7 +592,6 @@ class NativeSparseAttnBackend(AttentionBackend):
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
         out_cache_loc: Optional[torch.Tensor] = None,
-        extend_seq_lens_cpu: Optional[torch.Tensor] = None,
     ):
         """Initialize forward metadata for replaying CUDA graph."""
         assert seq_lens_cpu is not None
@@ -675,7 +674,7 @@ class NativeSparseAttnBackend(AttentionBackend):
             )
             page_indices = self.req_to_token[req_pool_indices, :max_seqlen_k]
             metadata.page_table_1[:, :max_seqlen_k].copy_(page_indices)
-            extend_seq_lens_cpu = extend_seq_lens_cpu[:bs]
+            extend_seq_lens_cpu = spec_info.accept_length[:bs].tolist()
 
             seqlens_int32_cpu = [
                 self.speculative_num_draft_tokens + kv_len
