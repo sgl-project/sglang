@@ -859,7 +859,6 @@ class SchedulerDisaggregationDecodeMixin:
         self.last_batch_in_queue = False  # last batch is modified in-place, so we need another variable to track if it's extend
 
         while True:
-            self.launch_last_batch_sample_if_needed()
 
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
@@ -871,6 +870,7 @@ class SchedulerDisaggregationDecodeMixin:
 
             prepare_mlp_sync_flag = require_mlp_sync(self.server_args)
 
+            batch_result = None
             if batch:
                 # Generate fake extend output.
                 if batch.forward_mode.is_extend():
@@ -879,31 +879,33 @@ class SchedulerDisaggregationDecodeMixin:
                         batch.reqs, any(req.return_logprob for req in batch.reqs)
                     )
                     if prepare_mlp_sync_flag:
-                        batch_, result = self._prepare_idle_batch_and_run(
+                        batch_, batch_result = self._prepare_idle_batch_and_run(
                             None, delay_process=True
                         )
                         if batch_:
-                            self.result_queue.append((batch_.copy(), result))
+                            self.result_queue.append((batch_.copy(), batch_result))
                             last_batch_in_queue = True
                 else:
                     if prepare_mlp_sync_flag:
                         self.prepare_mlp_sync_batch(batch)
-                    result = self.run_batch(batch)
-                    self.result_queue.append((batch.copy(), result))
+                    batch_result = self.run_batch(batch)
+                    self.result_queue.append((batch.copy(), batch_result))
                     last_batch_in_queue = True
 
             elif prepare_mlp_sync_flag:
-                batch, result = self._prepare_idle_batch_and_run(
+                batch, batch_result = self._prepare_idle_batch_and_run(
                     None, delay_process=True
                 )
                 if batch:
-                    self.result_queue.append((batch.copy(), result))
+                    self.result_queue.append((batch.copy(), batch_result))
                     last_batch_in_queue = True
 
             # Process the results of the previous batch but skip if the last batch is extend
             if self.last_batch and self.last_batch_in_queue:
                 tmp_batch, tmp_result = self.result_queue.popleft()
                 self.process_batch_result(tmp_batch, tmp_result)
+
+            self.launch_batch_sample_if_needed(batch_result)
 
             queue_size = (
                 len(self.waiting_queue)
