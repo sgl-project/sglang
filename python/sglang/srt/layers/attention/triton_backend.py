@@ -869,7 +869,7 @@ class TritonAttnBackend(AttentionBackend):
             prefix_kv_indices = self.forward_metadata.window_kv_indices
             # Compute window start positions (absolute position of first key in window)
             # window_start_pos = seq_len - window_len
-            window_kv_lens = prefix_kv_indptr[1:bs+1] - prefix_kv_indptr[:bs]
+            window_kv_lens = prefix_kv_indptr[1 : bs + 1] - prefix_kv_indptr[:bs]
             window_start_pos = forward_batch.extend_prefix_lens[:bs] - window_kv_lens
         else:
             sliding_window_size = -1

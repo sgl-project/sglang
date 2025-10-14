@@ -600,7 +600,7 @@ def _fwd_kernel_unified(
     cur_seq_kv_start_idx = tl.load(kv_indptr + cur_seq)
     cur_seq_kv_len = tl.load(kv_indptr + cur_seq + 1) - cur_seq_kv_start_idx
     cur_seq_prefix_len = tl.load(prefix_lens + cur_seq)
-    
+
     # Load window start position for sliding window attention
     # This is the absolute position of the first key in the window (0 if no sliding window)
     cur_window_start = 0
@@ -675,11 +675,16 @@ def _fwd_kernel_unified(
         if SLIDING_WINDOW_SIZE > 0:
             # Sliding window mask with correct absolute positions
             # Q absolute position: window_start + prefix_len + q_position_in_extend
-            q_abs_pos = cur_window_start + cur_seq_prefix_len + cur_block_m * BLOCK_M + offs_m[:, None]
-            
+            q_abs_pos = (
+                cur_window_start
+                + cur_seq_prefix_len
+                + cur_block_m * BLOCK_M
+                + offs_m[:, None]
+            )
+
             # K absolute position: window_start + k_index_in_unified_array
             k_abs_pos = cur_window_start + start_n + offs_n[None, :]
-            
+
             # Sliding window: query can attend to keys within window_size
             window_mask = q_abs_pos <= (k_abs_pos + SLIDING_WINDOW_SIZE)
             final_mask &= window_mask
@@ -865,7 +870,7 @@ def extend_attention_fwd_unified(
     kv_group_num = q.shape[1] // k_buffer.shape[1]
 
     HAS_SINK = sinks is not None
-    
+
     # For sliding window attention, window_start_pos tracks the absolute position
     # of the first key in each sequence's window
     if sliding_window_size > 0 and window_start_pos is None:
