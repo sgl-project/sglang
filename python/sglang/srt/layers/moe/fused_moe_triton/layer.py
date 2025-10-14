@@ -234,6 +234,13 @@ class FusedMoE(torch.nn.Module):
         self.quant_method.create_moe_runner(self, self.moe_runner_config)
         self.dispatcher = StandardDispatcher()
 
+        self.should_fuse_routed_scaling_factor_in_topk = isinstance(
+            self.quant_method, ModelOptNvFp4FusedMoEMethod
+        ) or (
+            isinstance(self.quant_method, Fp8MoEMethod)
+            and self.quant_method.use_cutlass_fused_experts_fp8
+        )
+
     def _load_per_tensor_weight_scale(
         self,
         shard_id: str,
@@ -936,12 +943,6 @@ class FusedMoE(torch.nn.Module):
             for expert_id in range(num_experts)
             for shard_id in ["w1", "w2", "w3"]
         ]
-
-    def should_fuse_routed_scaling_factor_in_topk(self):
-        return isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod) or (
-            isinstance(self.quant_method, Fp8MoEMethod)
-            and self.quant_method.use_cutlass_fused_experts_fp8
-        )
 
 
 class FlashInferFusedMoE(FusedMoE):
