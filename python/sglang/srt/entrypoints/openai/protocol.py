@@ -761,7 +761,7 @@ class EmbeddingObject(BaseModel):
     object: str = "embedding"
 
 
-ClassifyInput = Union[str, List[str]]
+ClassifyInput = Union[str, List[str], List[int]]
 
 
 class ClassifyRequest(BaseModel):
