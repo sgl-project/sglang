@@ -56,7 +56,8 @@ jobs:
             --build-arg CUDA_VERSION=${{ matrix.variant.cuda_version }} \
             --build-arg BUILD_TYPE=${{ matrix.variant.build_type }} \
             -t lmsysorg/sglang:${tag} \
-            --no-cache \
+            --cache-from type=local,src=/tmp/.buildx-cache \
+            --cache-to type=local,dest=/tmp/.buildx-cache-new,mode=max \
             .
 
   publish-arm64:
@@ -96,7 +97,8 @@ jobs:
             --build-arg CUDA_VERSION=${{ matrix.variant.cuda_version }} \
             --build-arg BUILD_TYPE=${{ matrix.variant.build_type }} \
             -t lmsysorg/sglang:${tag} \
-            --no-cache \
+            --cache-from type=local,src=/tmp/.buildx-cache \
+            --cache-to type=local,dest=/tmp/.buildx-cache-new,mode=max \
             .
 
   create-manifests:

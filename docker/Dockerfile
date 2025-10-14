@@ -12,7 +12,9 @@ ARG SGL_KERNEL_VERSION=0.3.12
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
     GDRCOPY_HOME=/usr/src/gdrdrv-2.4.4/ \
-    NVSHMEM_DIR=/sgl-workspace/nvshmem/install
+    NVSHMEM_DIR=/sgl-workspace/nvshmem/install \
+    CCACHE_DIR=/tmp/.ccache \
+    CCACHE_MAXSIZE=10G
 # Add GKE default lib and bin locations.
 ENV PATH="${PATH}:/usr/local/nvidia/bin" \
     LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
@@ -121,7 +123,10 @@ RUN cd /sgl-workspace/nvshmem && \
     NVSHMEM_PMIX_SUPPORT=0 \
     NVSHMEM_TIMEOUT_DEVICE_POLLING=0 \
     NVSHMEM_USE_GDRCOPY=1 \
-    cmake -S . -B build/ -DCMAKE_INSTALL_PREFIX=${NVSHMEM_DIR} -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH} && \
+    cmake -S . -B build/ -DCMAKE_INSTALL_PREFIX=${NVSHMEM_DIR} -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH} \
+        -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+        -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+        -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache && \
     cmake --build build --target install -j${CMAKE_BUILD_PARALLEL_LEVEL}
 
 # Install DeepEP
@@ -137,7 +142,12 @@ RUN cd /sgl-workspace/DeepEP && \
         echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 \
         ;; \
     esac && \
-    NVSHMEM_DIR=${NVSHMEM_DIR} TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" pip install .
+    CMAKE_C_COMPILER_LAUNCHER=ccache \
+    CMAKE_CXX_COMPILER_LAUNCHER=ccache \
+    CMAKE_CUDA_COMPILER_LAUNCHER=ccache \
+    NVSHMEM_DIR=${NVSHMEM_DIR} \
+    TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" \
+    pip install .
 
 # Install flashmla
 RUN if [ "$TARGETARCH" = "amd64" ]; then \
@@ -148,6 +158,9 @@ RUN if [ "$TARGETARCH" = "amd64" ]; then \
       if [ "$CUDA_VERSION" = "12.6.1" ]; then \
         export FLASH_MLA_DISABLE_SM100=1; \
       fi && \
+      CMAKE_C_COMPILER_LAUNCHER=ccache \
+      CMAKE_CXX_COMPILER_LAUNCHER=ccache \
+      CMAKE_CUDA_COMPILER_LAUNCHER=ccache \
       pip install -v . ; \
     fi
 
