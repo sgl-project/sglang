@@ -2,6 +2,7 @@ use axum::Router;
 use reqwest::Client;
 use sglang_router_rs::{
     config::RouterConfig,
+    middleware::AuthConfig,
     routers::RouterTrait,
     server::{build_app, AppContext, AppState},
 };
@@ -43,9 +44,15 @@ pub fn create_test_app(
         ]
     });
 
+    // Create auth config from router config
+    let auth_config = AuthConfig {
+        api_key: router_config.api_key.clone(),
+    };
+
     // Use the actual server's build_app function
     build_app(
         app_state,
+        auth_config,
         router_config.max_payload_size,
         request_id_headers,
         router_config.cors_allowed_origins.clone(),
@@ -79,9 +86,15 @@ pub fn create_test_app_with_context(
         ]
     });
 
+    // Create auth config from router config
+    let auth_config = AuthConfig {
+        api_key: router_config.api_key.clone(),
+    };
+
     // Use the actual server's build_app function
     build_app(
         app_state,
+        auth_config,
         router_config.max_payload_size,
         request_id_headers,
         router_config.cors_allowed_origins.clone(),

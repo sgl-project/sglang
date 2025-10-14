@@ -97,7 +97,7 @@ mod tests {
     fn test_generate_request_construction() {
         let sampling_params = proto::SamplingParams {
             temperature: 0.7,
-            max_new_tokens: 128,
+            max_new_tokens: Some(128),
             top_p: 0.9,
             top_k: 50,
             stop: vec!["</s>".to_string()],
@@ -126,7 +126,7 @@ mod tests {
 
         let params = gen_req.sampling_params.unwrap();
         assert_eq!(params.temperature, 0.7);
-        assert_eq!(params.max_new_tokens, 128);
+        assert_eq!(params.max_new_tokens, Some(128));
         assert_eq!(params.stop, vec!["</s>"]);
     }
 
@@ -155,7 +155,7 @@ mod tests {
     fn test_sampling_params_defaults() {
         let params = proto::SamplingParams::default();
         assert_eq!(params.temperature, 0.0);
-        assert_eq!(params.max_new_tokens, 0);
+        assert_eq!(params.max_new_tokens, None);
         assert_eq!(params.top_p, 0.0);
         assert_eq!(params.top_k, 0);
         assert!(params.stop.is_empty());

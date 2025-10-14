@@ -24,6 +24,8 @@ class LoadFormat(str, enum.Enum):
     JAX = "jax"
     REMOTE = "remote"
     REMOTE_INSTANCE = "remote_instance"
+    RDMA = "rdma"
+    LOCAL_CACHED = "local_cached"
 
 
 @dataclass
@@ -47,6 +49,7 @@ class LoadConfig:
         checkpoints.
     decryption_key_file: If set, decrypts the output files with a password read
         from this file (after PBKDF2).
+    decrypt_max_concurrency: The maximum number of concurrent processes to decrypt the safetensor files. -1 means no limit.
     """
 
     load_format: Union[str, LoadFormat] = LoadFormat.AUTO
@@ -54,6 +57,7 @@ class LoadConfig:
     model_loader_extra_config: Optional[Union[str, dict]] = field(default_factory=dict)
     ignore_patterns: Optional[Union[List[str], str]] = None
     decryption_key_file: Optional[str] = None
+    decrypt_max_concurrency: int = -1
 
     def __post_init__(self):
         model_loader_extra_config = self.model_loader_extra_config or {}

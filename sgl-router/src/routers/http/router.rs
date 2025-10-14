@@ -6,7 +6,7 @@ use crate::metrics::RouterMetrics;
 use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, GenerationRequest,
-    RerankRequest, RerankResponse, RerankResult, ResponsesRequest,
+    RerankRequest, RerankResponse, RerankResult, ResponsesGetParams, ResponsesRequest,
 };
 use crate::routers::header_utils;
 use crate::routers::RouterTrait;
@@ -903,7 +903,12 @@ impl RouterTrait for Router {
             .await
     }
 
-    async fn get_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response {
+    async fn get_response(
+        &self,
+        headers: Option<&HeaderMap>,
+        response_id: &str,
+        _params: &ResponsesGetParams,
+    ) -> Response {
         let endpoint = format!("v1/responses/{}", response_id);
         self.route_get_request(headers, &endpoint).await
     }
