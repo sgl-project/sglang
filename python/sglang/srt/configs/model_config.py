@@ -686,13 +686,12 @@ class ModelConfig:
         Returns:
             A dictionary containing the non-default sampling parameters.
         """
+
         if self.sampling_defaults != "model":
             return {}
 
         if self.hf_generation_config is None:
             return {}
-
-        config = self.hf_generation_config.to_dict()
 
         available_params = [
             "repetition_penalty",
@@ -701,10 +700,18 @@ class ModelConfig:
             "top_p",
             "min_p",
         ]
+        default_sampling_params: dict[str, Any] = {}
 
-        default_sampling_params = {
-            p: config.get(p) for p in available_params if config.get(p) is not None
-        }
+        for param in available_params:
+            value = getattr(self.hf_generation_config, param, None)
+            if value is None:
+                continue
+            from transformers import GenerationConfig
+
+            base = GenerationConfig()
+            base_default = getattr(base, param, None)
+            if base_default is None or value != base_default:
+                default_sampling_params[param] = value
 
         return default_sampling_params
 
