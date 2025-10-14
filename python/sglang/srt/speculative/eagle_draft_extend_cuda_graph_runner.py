@@ -71,6 +71,7 @@ class EAGLEDraftExtendCudaGraphRunner:
         self.seq_lens_cpu = torch.full(
             (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
         )
+        self.extend_seq_lens_cpu = [self.num_tokens_per_bs] * self.max_num_token
 
         if self.enable_torch_compile:
             set_torch_compile_config()
@@ -189,7 +190,9 @@ class EAGLEDraftExtendCudaGraphRunner:
         input_ids = self.input_ids[:num_tokens]
         req_pool_indices = self.req_pool_indices[:bs]
         seq_lens = self.seq_lens[:bs]
+        seq_lens_cpu = self.seq_lens_cpu[:bs]
         extend_seq_lens = self.extend_seq_lens[:bs]
+        extend_seq_lens_cpu = self.extend_seq_lens_cpu[:bs]
         accept_length = self.accept_length[:bs]
         out_cache_loc = self.out_cache_loc[:num_tokens]
         positions = self.positions[:num_tokens]
@@ -245,6 +248,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             input_ids=input_ids,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
             next_token_logits_buffer=next_token_logits_buffer,
             req_to_token_pool=self.model_runner.req_to_token_pool,
             token_to_kv_pool=self.model_runner.token_to_kv_pool,
@@ -262,6 +266,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             capture_hidden_mode=CaptureHiddenMode.LAST,
             attn_backend=self.eagle_worker.draft_extend_attn_backend,
             extend_seq_lens=extend_seq_lens,
+            extend_seq_lens_cpu=extend_seq_lens_cpu,
             padded_static_len=self.padded_static_len,
         )
 
@@ -361,6 +366,9 @@ class EAGLEDraftExtendCudaGraphRunner:
             if bs != raw_bs:
                 self.seq_lens_cpu.fill_(self.seq_len_fill_value)
             self.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
+
+        if forward_batch.extend_seq_lens_cpu is not None:
+            self.extend_seq_lens_cpu[:raw_bs] = forward_batch.extend_seq_lens_cpu
 
         if bs != raw_bs:
             forward_batch.spec_info.positions = self.positions[:num_tokens]

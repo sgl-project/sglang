@@ -17,6 +17,8 @@ if is_cuda():
     except ImportError as e:
         deep_gemm = e
 
+import logging
+
 from sglang.srt.layers.attention.nsa.utils import NSA_DUAL_STREAM, NSA_USE_REAL_INDEXER
 from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -26,6 +28,8 @@ from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import get_global_server_args
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
@@ -336,6 +340,65 @@ class Indexer(CustomOp):
         topk_result = metadata.topk_transform(logits, self.index_topk)
         return topk_result
 
+    def _get_verify_topk_paged(
+        self,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        metadata: BaseIndexerMetadata,
+    ) -> torch.Tensor:
+        if TYPE_CHECKING:
+            assert isinstance(forward_batch.token_to_kv_pool, NSATokenToKVPool)
+
+        page_size = forward_batch.token_to_kv_pool.page_size
+        # NOTE(dark): blocksize = 64 is hardcoded in deep_gemm_v32
+        assert page_size == 64, "only support page size 64"
+
+        # NOTE(dark): this support extend/decode/decode+graph
+        block_tables = metadata.get_page_table_64()
+
+        max_seq_len = block_tables.shape[1] * page_size
+        kv_cache_fp8 = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
+            layer_id=layer_id
+        )
+
+        blocksize = page_size
+        seqlens_32 = metadata.get_seqlens_expanded()
+        # NOTE(dark): 132 is SM count on H200/B200, not magic number
+        schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+            seqlens_32, blocksize, self.sm_count
+        )
+
+        assert len(weights.shape) == 3
+        weights = weights.squeeze(2)
+
+        assert len(q_fp8.shape) == 3
+        q_fp8 = q_fp8.unsqueeze(1)  # the next_n dim is 1 now
+
+        assert len(kv_cache_fp8.shape) == 2
+        block_kv = 64
+        num_heads_kv = 1
+        head_dim_with_sf = 132
+        kv_cache_fp8 = kv_cache_fp8.view(
+            kv_cache_fp8.shape[0], block_kv, num_heads_kv, head_dim_with_sf
+        )
+
+        logits = deep_gemm.fp8_paged_mqa_logits(
+            q_fp8,
+            kv_cache_fp8,
+            weights,
+            seqlens_32,
+            block_tables,
+            schedule_metadata,
+            max_seq_len,
+            clean_logits=False,
+        )
+
+        # NOTE(dark): logits should be cleaned in topk_transform
+        topk_result = metadata.topk_transform(logits, self.index_topk)
+        return topk_result
+
     def _get_topk_ragged(
         self,
         forward_batch: ForwardBatch,
@@ -354,8 +417,9 @@ class Indexer(CustomOp):
         k_fp8_list = []
         k_scale_list = []
         ks_list = []
+        ke_list = []
         offset = 0
-
+        seq_lens_expanded = metadata.get_seqlens_expanded()
         block_tables = metadata.get_page_table_64()
 
         assert (
@@ -378,30 +442,34 @@ class Indexer(CustomOp):
             )
             extend_seq_len = forward_batch.extend_seq_lens_cpu[i]
             ks = torch.full((extend_seq_len,), offset, dtype=torch.int32, device="cuda")
+            ke = ks + seq_lens_expanded[offset : offset + extend_seq_len]
             k_fp8_list.append(k_fp8)
             k_scale_list.append(k_scale)
             ks_list.append(ks)
+            ke_list.append(ke)
             offset += extend_seq_len
 
         k_fp8 = torch.cat(k_fp8_list, dim=0).view(torch.float8_e4m3fn)
         k_scale = torch.cat(k_scale_list, dim=0).view(torch.float32).squeeze(-1)
         kv_fp8 = (k_fp8, k_scale)
         ks = torch.cat(ks_list, dim=0)
-        seq_lens_expanded = metadata.get_seqlens_expanded()
-        ke = ks + seq_lens_expanded
+        ke = torch.cat(ke_list, dim=0)
 
         logits = deep_gemm.fp8_mqa_logits(
-            q_fp8,
+            q_fp8[:offset],
             kv_fp8,
-            weights,
+            weights[:offset],
             ks,
             ke,
             clean_logits=False,
         )
-
+        token_nums, _, _ = q_fp8.shape
         assert logits.shape[0] == len(seq_lens_expanded)
-        topk_result = metadata.topk_transform(logits, self.index_topk)
-
+        raw_topk_result = metadata.topk_transform(logits, self.index_topk)
+        topk_result = torch.full(
+            (token_nums, self.index_topk), -1, device=q_fp8.device, dtype=torch.int32
+        )
+        topk_result[:offset] = raw_topk_result
         return topk_result
 
     def forward_indexer_bs_1(
@@ -551,6 +619,8 @@ class Indexer(CustomOp):
         # k_buffer: (num_total_tokens + page_size, head_dim) fp8_e4m3fn
         # k_scale: (seq_len, head_dim // block_size = 1) fp8_e4m3fn
         # k_scale_cache: (num_total_tokens + page_size, head_dim // block_size = 1) fp8_e4m3fn
+        if not forward_batch.out_cache_loc.is_contiguous():
+            forward_batch.out_cache_loc = forward_batch.out_cache_loc.contiguous()
         forward_batch.token_to_kv_pool.set_index_k_and_scale_buffer(
             layer_id=layer_id,
             loc=forward_batch.out_cache_loc,
@@ -574,6 +644,10 @@ class Indexer(CustomOp):
 
             if forward_batch.forward_mode.is_decode_or_idle():
                 topk_result = self._get_topk_paged(
+                    forward_batch, layer_id, q_fp8, weights, metadata
+                )
+            elif forward_batch.forward_mode.is_target_verify():
+                topk_result = self._get_verify_topk_paged(
                     forward_batch, layer_id, q_fp8, weights, metadata
                 )
             else:
