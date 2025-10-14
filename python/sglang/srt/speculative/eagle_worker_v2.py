@@ -56,7 +56,6 @@ class EAGLEWorkerV2(EAGLEWorker):
 
     def forward_batch_generation(self, model_worker_batch: ModelWorkerBatch):
         if model_worker_batch.forward_mode.is_decode():
-            # FIXME(lsyin): why shall we use spec_info for both draft and verify?
             draft_input: EagleDraftInput = model_worker_batch.spec_info
             assert draft_input.is_draft_input()
             verify_input: EagleVerifyInput = self.draft(model_worker_batch)
