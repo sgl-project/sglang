@@ -61,10 +61,8 @@ def _run_profile(
         "num_steps": str(num_steps),
         "activities": activities,
         "profile_by_stage": profile_by_stage,
+        "profile_stage": profile_stage,
     }
-
-    # Add profile_stage (always included, defaults to "all")
-    json_data["profile_stage"] = profile_stage
 
     response = requests.post(url=url + "/start_profile", json=json_data)
     response.raise_for_status()
