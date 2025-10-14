@@ -18,7 +18,7 @@ dependencies = [
     "torch==2.8.0",
     "torchaudio==2.8.0",
     "torchvision",
-    "sgl-kernel @ git+https://github.com/sgl-project/sgl-kernel-xpu.git@cutlass_attntion",
+    "sgl-kernel @ git+https://github.com/sgl-project/sgl-kernel-xpu.git",
     "aiohttp",
     "anthropic>=0.20.0",
     "blobfile==3.0.0",
