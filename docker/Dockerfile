@@ -90,18 +90,20 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5li
       13.0.1) CUINDEX=130 ;; \
       *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
-&& if [ "$CUDA_VERSION" = "12.6.1" ]; then \
-     python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}+cu124-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
-     && python3 -m pip install --no-cache-dir -e "python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} ; \
+ && if [ "$CUDA_VERSION" = "12.6.1" ]; then \
+      python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}+cu124-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
+   ; \
+   elif [ "$CUDA_VERSION" = "12.8.1" ] || [ "$CUDA_VERSION" = "12.9.1" ]; then \
+      python3 -m pip install --no-cache-dir sgl-kernel==${SGL_KERNEL_VERSION} \
+   ; \
+   elif [ "$CUDA_VERSION" = "13.0.1" ]; then \
+      python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}+cu130-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
+   ; \
+   else \
+      echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 \
+   ; \
    fi \
-&& if [ "$CUDA_VERSION" = "12.8.1" ] || [ "$CUDA_VERSION" = "12.9.1" ]; then \
-     python3 -m pip install --no-cache-dir sgl-kernel==${SGL_KERNEL_VERSION} \
-     && python3 -m pip install --no-cache-dir -e "python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} ; \
-   fi \
-&& if [ "$CUDA_VERSION" = "13.0.1" ]; then \
-     python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}+cu130-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
-     && python3 -m pip install --no-cache-dir -e "python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/test/cu${CUINDEX} ; \
-   fi \
+ && python3 -m pip install --no-cache-dir -e "python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
  && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
       python3 -m pip install --no-cache-dir nvidia-nccl-cu12==2.28.3 --force-reinstall --no-deps ; \
     elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
@@ -191,11 +193,7 @@ RUN if [ "$TARGETARCH" = "amd64" ]; then \
       pip install . ; \
     fi
 
-# Modify Triton source file to support cuda 13
-RUN if [ "${CUDA_VERSION%%.*}" = "13" ]; then \
-      TRITON_DIR=/usr/local/lib/python3.12/dist-packages/triton; \
-      grep -q 'if major >= 13:' ${TRITON_DIR}/backends/nvidia/compiler.py || bash -lc $'sed -i \'/^def ptx_get_version(cuda_version) -> int:/,/^[[:space:]]*raise RuntimeError/s/^\\([[:space:]]*\\)raise RuntimeError.*/\\1if major >= 13:\\n\\1    base_ptx = 90\\n\\1    return base_ptx + (major - 13) * 10 + minor\\n\\n\\1raise RuntimeError("Triton only support CUDA 10.0 or higher, but got CUDA version: " + cuda_version)/\' ${TRITON_DIR}/backends/nvidia/compiler.py'; \
-    fi
+# TODO: Triton needs to be updated to 3.4.0 or patched to support cuda 13/sm103
 
 # Python tools
 RUN python3 -m pip install --no-cache-dir \
