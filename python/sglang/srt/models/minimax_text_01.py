@@ -682,7 +682,7 @@ class MiniMaxText01DecoderLayer(nn.Module):
         if self.expert_num == 1:
             hidden_states = self.mlp(layernorm_output)
         else:
-            moe_hidden_states = self.block_sparse_moe(layernorm_output)
+            moe_hidden_states = self.block_sparse_moe(copy.deepcopy(layernorm_output))
             if self.shared_moe:
                 before_moe_dtype = layernorm_output.dtype
                 moe_hidden_fp32 = moe_hidden_states.to(torch.float32)
