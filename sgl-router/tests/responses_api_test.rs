@@ -385,7 +385,8 @@ fn test_responses_request_creation() {
 }
 
 #[test]
-fn test_sampling_params_conversion() {
+fn test_responses_request_sglang_extensions() {
+    // Test that SGLang-specific sampling parameters are present and serializable
     let request = ResponsesRequest {
         background: Some(false),
         include: None,
@@ -395,16 +396,16 @@ fn test_sampling_params_conversion() {
         max_tool_calls: None,
         metadata: None,
         model: Some("test-model".to_string()),
-        parallel_tool_calls: Some(true), // Use default true
+        parallel_tool_calls: Some(true),
         previous_response_id: None,
         reasoning: None,
         service_tier: Some(ServiceTier::Auto),
-        store: Some(true), // Use default true
+        store: Some(true),
         stream: Some(false),
         temperature: Some(0.8),
         tool_choice: Some(ToolChoice::Value(ToolChoiceValue::Auto)),
         tools: Some(vec![]),
-        top_logprobs: Some(0), // Use default 0
+        top_logprobs: Some(0),
         top_p: Some(0.95),
         truncation: Some(Truncation::Auto),
         user: None,
@@ -413,19 +414,26 @@ fn test_sampling_params_conversion() {
         frequency_penalty: Some(0.1),
         presence_penalty: Some(0.2),
         stop: None,
+        // SGLang-specific extensions:
         top_k: 10,
         min_p: 0.05,
         repetition_penalty: 1.1,
         conversation: None,
     };
 
-    let params = request.to_sampling_params(1000, None);
+    // Verify SGLang extensions are present
+    assert_eq!(request.top_k, 10);
+    assert_eq!(request.min_p, 0.05);
+    assert_eq!(request.repetition_penalty, 1.1);
 
-    // Check that parameters are converted correctly
-    assert!(params.contains_key("temperature"));
-    assert!(params.contains_key("top_p"));
-    assert!(params.contains_key("frequency_penalty"));
-    assert!(params.contains_key("max_new_tokens"));
+    // Verify serialization works with SGLang extensions
+    let json = serde_json::to_string(&request).expect("Serialization should work");
+    let parsed: ResponsesRequest =
+        serde_json::from_str(&json).expect("Deserialization should work");
+
+    assert_eq!(parsed.top_k, 10);
+    assert_eq!(parsed.min_p, 0.05);
+    assert_eq!(parsed.repetition_penalty, 1.1);
 }
 
 #[test]

@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use serde_json::{to_value, Map, Number, Value};
+use serde_json::{to_value, Map, Value};
 use std::collections::HashMap;
 use validator::Validate;
 
@@ -1485,15 +1485,18 @@ pub struct ResponsesRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop: Option<StringOrArray>,
 
-    /// Top-k sampling parameter
+    // SGLang-specific sampling parameters (extensions to OpenAI Responses API)
+    // These parameters are forwarded to the SGLang backend for sampling control
+    // and are not part of the official OpenAI Responses API specification.
+    /// Top-k sampling parameter (SGLang extension)
     #[serde(default = "default_top_k")]
     pub top_k: i32,
 
-    /// Min-p sampling parameter
+    /// Min-p sampling parameter (SGLang extension)
     #[serde(default)]
     pub min_p: f32,
 
-    /// Repetition penalty
+    /// Repetition penalty (SGLang extension)
     #[serde(default = "default_repetition_penalty")]
     pub repetition_penalty: f32,
 }
@@ -1550,100 +1553,7 @@ impl Default for ResponsesRequest {
     }
 }
 
-impl ResponsesRequest {
-    /// Default sampling parameters
-    const DEFAULT_TEMPERATURE: f32 = 0.7;
-    const DEFAULT_TOP_P: f32 = 1.0;
-
-    /// Convert to sampling parameters for generation
-    pub fn to_sampling_params(
-        &self,
-        default_max_tokens: u32,
-        default_params: Option<HashMap<String, Value>>,
-    ) -> HashMap<String, Value> {
-        let mut params = HashMap::new();
-
-        // Use max_output_tokens if available
-        let max_tokens = if let Some(max_output) = self.max_output_tokens {
-            std::cmp::min(max_output, default_max_tokens)
-        } else {
-            default_max_tokens
-        };
-
-        // Avoid exceeding context length by minus 1 token
-        let max_tokens = max_tokens.saturating_sub(1);
-
-        // Temperature
-        let temperature = self.temperature.unwrap_or_else(|| {
-            default_params
-                .as_ref()
-                .and_then(|p| p.get("temperature"))
-                .and_then(|v| v.as_f64())
-                .map(|v| v as f32)
-                .unwrap_or(Self::DEFAULT_TEMPERATURE)
-        });
-
-        // Top-p
-        let top_p = self.top_p.unwrap_or_else(|| {
-            default_params
-                .as_ref()
-                .and_then(|p| p.get("top_p"))
-                .and_then(|v| v.as_f64())
-                .map(|v| v as f32)
-                .unwrap_or(Self::DEFAULT_TOP_P)
-        });
-
-        params.insert(
-            "max_new_tokens".to_string(),
-            Value::Number(Number::from(max_tokens)),
-        );
-        params.insert(
-            "temperature".to_string(),
-            Value::Number(Number::from_f64(temperature as f64).unwrap()),
-        );
-        params.insert(
-            "top_p".to_string(),
-            Value::Number(Number::from_f64(top_p as f64).unwrap()),
-        );
-        if let Some(fp) = self.frequency_penalty {
-            params.insert(
-                "frequency_penalty".to_string(),
-                Value::Number(Number::from_f64(fp as f64).unwrap()),
-            );
-        }
-        if let Some(pp) = self.presence_penalty {
-            params.insert(
-                "presence_penalty".to_string(),
-                Value::Number(Number::from_f64(pp as f64).unwrap()),
-            );
-        }
-        params.insert("top_k".to_string(), Value::Number(Number::from(self.top_k)));
-        params.insert(
-            "min_p".to_string(),
-            Value::Number(Number::from_f64(self.min_p as f64).unwrap()),
-        );
-        params.insert(
-            "repetition_penalty".to_string(),
-            Value::Number(Number::from_f64(self.repetition_penalty as f64).unwrap()),
-        );
-
-        if let Some(ref stop) = self.stop {
-            match to_value(stop) {
-                Ok(value) => params.insert("stop".to_string(), value),
-                Err(_) => params.insert("stop".to_string(), Value::Null),
-            };
-        }
-
-        // Apply any additional default parameters
-        if let Some(default_params) = default_params {
-            for (key, value) in default_params {
-                params.entry(key).or_insert(value);
-            }
-        }
-
-        params
-    }
-}
+impl ResponsesRequest {}
 
 impl GenerationRequest for ResponsesRequest {
     fn is_stream(&self) -> bool {
