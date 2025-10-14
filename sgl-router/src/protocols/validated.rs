@@ -87,10 +87,9 @@ where
                 StatusCode::BAD_REQUEST,
                 Json(json!({
                     "error": {
-                        "message": format!("Validation failed: {}", validation_errors),
+                        "message": validation_errors.to_string(),
                         "type": "invalid_request_error",
-                        "code": "validation_error",
-                        "details": format!("{:?}", validation_errors)
+                        "code": 400
                     }
                 })),
             )
