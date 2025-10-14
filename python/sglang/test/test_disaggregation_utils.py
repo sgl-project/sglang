@@ -1,3 +1,4 @@
+import logging
 import os
 import time
 import warnings
@@ -14,6 +15,8 @@ from sglang.test.test_utils import (
     is_in_ci,
     popen_with_error_check,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class TestDisaggregationBase(CustomTestCase):
@@ -113,6 +116,7 @@ def get_rdma_devices_args():
     rdma_all_devices = _parse_list_env("SGLANG_CI_RDMA_ALL_DEVICES") or [
         f"mlx5_roce{i}" for i in range(8)
     ]
+    logger.info("Resolved rdma_all_devices=%s", rdma_all_devices)
 
     n_rdma = len(rdma_all_devices)
 
