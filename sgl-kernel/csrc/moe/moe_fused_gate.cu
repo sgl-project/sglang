@@ -215,6 +215,8 @@ __device__ void moe_fused_gate_impl(
       indices_ptr[idx] = static_cast<int32_t>(expert);
     }
 
+    __syncwarp();
+
     // accumulate sum for all elements
     if (thread_group_idx == 0) {
       output_sum += output_ptr[idx];
