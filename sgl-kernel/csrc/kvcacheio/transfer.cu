@@ -96,9 +96,8 @@ __device__ __forceinline__ T* get_global_offset_lf_tbl_hfrg(
     int64_t head_fragment_num,
     int64_t head_fragment_id,
     int64_t /*unused*/) {
-  return reinterpret_cast<T*>(layer_base_tbl[layer_id]);
-//    + page_id * item_size_bytes
-//         + item_size_bytes / head_fragment_num * head_fragment_id;
+  return reinterpret_cast<T*>(layer_base_tbl[layer_id]) + page_id * item_size_bytes
+        + item_size_bytes / head_fragment_num * head_fragment_id;
 }
 
 template <typename T>
@@ -160,6 +159,7 @@ __global__ void transfer_flex_tp_kernel_impl(
         char* dst_k_ptr = DstOffsetFn(
             static_cast<char*>(dst_k), dst_k_layer_tbl, layer_id, dst_layout_dim, dst_page_id, item_size_bytes, head_fragment_num, head_fragment_id, page_size);
         transfer_item_warp(lane_id, src_k_ptr, dst_k_ptr, item_size_bytes / head_fragment_num);
+
         const char* src_v_ptr = SrcOffsetFn(
             static_cast<const char*>(src_v), src_v_layer_tbl, layer_id, src_layout_dim, src_page_id, item_size_bytes, head_fragment_num, head_fragment_id, page_size);
         char* dst_v_ptr = DstOffsetFn(
@@ -400,6 +400,43 @@ void transfer_kv_per_layer_phf_lf(
       item_size,
       src_layout_dim,
       0,
+      empty,
+      empty,
+      empty,
+      empty,
+      block_quota,
+      num_warps_per_block,
+      page_size,
+      head_num);
+}
+
+void transfer_kv_per_layer_lf_phf(
+    const at::Tensor src_k,
+    at::Tensor dst_k,
+    const at::Tensor src_v,
+    at::Tensor dst_v,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t layer_id,
+    int64_t item_size,
+    int64_t dst_layout_dim,
+    int64_t page_size,
+    int64_t head_num,
+    int64_t block_quota,
+    int64_t num_warps_per_block) {
+  at::Tensor empty;
+  transfer_kv_launcher<get_global_offset_lf_hfrg<const char>, get_global_offset_phf<char>, false, true>(
+      src_k,
+      dst_k,
+      src_v,
+      dst_v,
+      src_indices,
+      dst_indices,
+      layer_id,
+      1,
+      item_size,
+      0,
+      dst_layout_dim,
       empty,
       empty,
       empty,
