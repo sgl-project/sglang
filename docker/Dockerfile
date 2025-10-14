@@ -115,11 +115,12 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5li
 # We use Tom's DeepEP fork for GB200 for now
 RUN set -eux; \
     if [ "${CUDA_VERSION%%.*}" = "13" ]; then \
-      NVSHMEM_TARBALL="nvshmem_src_cuda13-all-all-${NVSHMEM_VERSION}.tar.gz"; \
+      wget "https://github.com/NVIDIA/nvshmem/releases/download/v${NVSHMEM_VERSION}-0/nvshmem_src_cuda-all-all-${NVSHMEM_VERSION}.tar.gz"; \
+      NVSHMEM_TARBALL="nvshmem_src_cuda-all-all-${NVSHMEM_VERSION}.tar.gz"; \
     else \
+      wget "https://developer.download.nvidia.com/compute/redist/nvshmem/${NVSHMEM_VERSION}/source/nvshmem_src_cuda12-all-all-${NVSHMEM_VERSION}.tar.gz"; \
       NVSHMEM_TARBALL="nvshmem_src_cuda12-all-all-${NVSHMEM_VERSION}.tar.gz"; \
-    fi; \
-    wget "https://developer.download.nvidia.com/compute/redist/nvshmem/${NVSHMEM_VERSION}/source/${NVSHMEM_TARBALL}" && \
+    fi && \
     if [ "$GRACE_BLACKWELL" = "1" ]; then \
       git clone https://github.com/fzyzcjy/DeepEP.git && \
       cd DeepEP && \
