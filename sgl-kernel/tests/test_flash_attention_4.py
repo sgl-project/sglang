@@ -570,33 +570,43 @@ def test_flash_attn_output(
     # attention_chunk_vals = [torch.randint(1, seqlen_k * 2, (1,)).item(), 0]
     attention_chunk_vals = [0]
     for dv, attention_chunk in itertools.product(dv_vals, attention_chunk_vals):
-        q_ref = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype_ref)
+        q_ref = torch.randn(
+            batch_size, seqlen_q, nheads, d, device=device, dtype=dtype_ref
+        )
         if softcap > 0.0:
             # Ensure the values of qk are at least within softcap range.
             q_ref = q_ref * softcap / 4
         q_ref = q_ref.to(dtype).to(dtype_ref).requires_grad_()
         k_ref = (
-            torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype_ref)
+            torch.randn(
+                batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype_ref
+            )
             .to(dtype)
             .to(dtype_ref)
             .requires_grad_()
         )
         v_ref = (
-            torch.randn(batch_size, seqlen_k, nheads_kv, dv, device=device, dtype=dtype_ref)
+            torch.randn(
+                batch_size, seqlen_k, nheads_kv, dv, device=device, dtype=dtype_ref
+            )
             .to(dtype)
             .to(dtype_ref)
             .requires_grad_()
         )
         if has_qv:
             qv_ref = (
-                torch.randn(batch_size, seqlen_q, nheads, dv, device=device, dtype=dtype_ref)
+                torch.randn(
+                    batch_size, seqlen_q, nheads, dv, device=device, dtype=dtype_ref
+                )
                 .to(dtype)
                 .to(dtype_ref)
             )
         else:
             qv_ref = None
         # Put window_size after QKV randn so that window_size changes from test to test
-        window_size = (None, None) if not local else torch.randint(0, seqlen_k, (2,)).tolist()
+        window_size = (
+            (None, None) if not local else torch.randint(0, seqlen_k, (2,)).tolist()
+        )
         # window_size = (-1, -1) if not local else (16, 0)
         if has_learnable_sink:
             learnable_sink = torch.randn(nheads, dtype=torch.bfloat16, device=device)
@@ -604,7 +614,8 @@ def test_flash_attn_output(
             learnable_sink = None
         if dtype == torch.float8_e4m3fn:
             q_descale, k_descale, v_descale = [
-                torch.rand(batch_size, nheads_kv, device=device, dtype=torch.float32) * 2
+                torch.rand(batch_size, nheads_kv, device=device, dtype=torch.float32)
+                * 2
                 for _ in range(3)
             ]
         else:
@@ -659,10 +670,18 @@ def test_flash_attn_output(
         k_unpad = rearrange(k, "b s h d -> (b s) h d")
         v_unpad = rearrange(v, "b s h d -> (b s) h d")
         cu_seqlens_q = torch.arange(
-            0, (batch_size + 1) * seqlen_q, step=seqlen_q, dtype=torch.int32, device=device
+            0,
+            (batch_size + 1) * seqlen_q,
+            step=seqlen_q,
+            dtype=torch.int32,
+            device=device,
         )
         cu_seqlens_k = torch.arange(
-            0, (batch_size + 1) * seqlen_k, step=seqlen_k, dtype=torch.int32, device=device
+            0,
+            (batch_size + 1) * seqlen_k,
+            step=seqlen_k,
+            dtype=torch.int32,
+            device=device,
         )
 
         pack_gqa_vals = [False, True, None]
@@ -742,7 +761,9 @@ def test_flash_attn_output(
             # dK = torch.einsum('bhts,bthd->bshd', dP, q.float())
 
             # dq, dk, dv = torch.autograd.grad(out, (q, k, v), g)
-            dq_ref, dk_ref, dv_ref = torch.autograd.grad(out_ref, (q_ref, k_ref, v_ref), g)
+            dq_ref, dk_ref, dv_ref = torch.autograd.grad(
+                out_ref, (q_ref, k_ref, v_ref), g
+            )
             dq_pt, dk_pt, dv_pt = torch.autograd.grad(out_pt, (q_ref, k_ref, v_ref), g)
             print(f"dQ max diff: {(dq - dq_ref).abs().max().item()}")
             print(f"dK max diff: {(dk - dk_ref).abs().max().item()}")

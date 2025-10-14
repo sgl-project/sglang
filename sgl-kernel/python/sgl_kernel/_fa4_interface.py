@@ -8,7 +8,7 @@ import copy
 import gc
 import logging
 import math
-from typing import Optional, Tuple, Callable
+from typing import Callable, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -18,9 +18,9 @@ import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass.cute.runtime import from_dlpack
+from flash_attn.cute import utils
 from flash_attn.cute.flash_fwd import FlashAttentionForwardSm90
 from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
-from flash_attn.cute import utils
 
 
 def maybe_contiguous(x):
@@ -175,17 +175,33 @@ def _flash_attn_fwd(
         )
     else:
         expected_out_shape = (*q_batch_seqlen_shape, num_head, head_dim_v)
-        assert out.shape == expected_out_shape, f"out tensor shape {out.shape} does not match expected shape {expected_out_shape}"
-        assert out.dtype == out_torch_dtype, f"out tensor dtype {out.dtype} does not match expected dtype {out_torch_dtype}"
-        assert out.device == device, f"out tensor device {out.device} does not match input device {device}"
+        assert (
+            out.shape == expected_out_shape
+        ), f"out tensor shape {out.shape} does not match expected shape {expected_out_shape}"
+        assert (
+            out.dtype == out_torch_dtype
+        ), f"out tensor dtype {out.dtype} does not match expected dtype {out_torch_dtype}"
+        assert (
+            out.device == device
+        ), f"out tensor device {out.device} does not match input device {device}"
         assert out.is_cuda, "out tensor must be on CUDA device"
 
     if lse is None:
-        lse = torch.empty(lse_shape, dtype=torch.float32, device=device) if requires_grad or return_lse else None
+        lse = (
+            torch.empty(lse_shape, dtype=torch.float32, device=device)
+            if requires_grad or return_lse
+            else None
+        )
     elif lse is not None:
-        assert lse.shape == lse_shape, f"lse tensor shape {lse.shape} does not match expected shape {lse_shape}"
-        assert lse.dtype == torch.float32, f"lse tensor dtype {lse.dtype} does not match expected dtype torch.float32"
-        assert lse.device == device, f"lse tensor device {lse.device} does not match input device {device}"
+        assert (
+            lse.shape == lse_shape
+        ), f"lse tensor shape {lse.shape} does not match expected shape {lse_shape}"
+        assert (
+            lse.dtype == torch.float32
+        ), f"lse tensor dtype {lse.dtype} does not match expected dtype torch.float32"
+        assert (
+            lse.device == device
+        ), f"lse tensor device {lse.device} does not match input device {device}"
         assert lse.is_cuda, "lse tensor must be on CUDA device"
 
     dtype = torch2cute_dtype_map[q.dtype]
@@ -260,11 +276,20 @@ def _flash_attn_fwd(
         score_mod = utils.create_softcap_scoremod(softcap)
 
     if score_mod is not None:
-        is_varlen = cu_seqlens_q is not None or cu_seqlens_k is not None or seqused_q is not None or seqused_k is not None
+        is_varlen = (
+            cu_seqlens_q is not None
+            or cu_seqlens_k is not None
+            or seqused_q is not None
+            or seqused_k is not None
+        )
         if is_varlen:
-            raise NotImplementedError("score_mod with buffers is not yet supported for varlen sequences. This will be fixed in a future PR.")
+            raise NotImplementedError(
+                "score_mod with buffers is not yet supported for varlen sequences. This will be fixed in a future PR."
+            )
         if pack_gqa:
-            raise NotImplementedError("score_mod with buffers is not yet supported with pack_gqa=True. This will be fixed in a future PR.")
+            raise NotImplementedError(
+                "score_mod with buffers is not yet supported with pack_gqa=True. This will be fixed in a future PR."
+            )
 
     cute_buffers = None
     if buffers is not None:
@@ -426,14 +451,18 @@ def warmup_flash_attn(f):
         base_args, base_kwargs = _clone_args(args, kwargs)
 
         qh, kvh = _infer_heads(base_args, base_kwargs)
-        can_pack_gqa = (qh is not None and kvh is not None and qh % kvh == 0 and qh // kvh > 1)
-        has_page_table = "page_table" in base_kwargs and base_kwargs["page_table"] is not None
+        can_pack_gqa = (
+            qh is not None and kvh is not None and qh % kvh == 0 and qh // kvh > 1
+        )
+        has_page_table = (
+            "page_table" in base_kwargs and base_kwargs["page_table"] is not None
+        )
 
         # Window presets covering global, causal, and local
         window_presets = [
-            (None, None),   # global noncausal
-            (None, 0),      # causal
-            (64, 64),       # local sliding window
+            (None, None),  # global noncausal
+            (None, 0),  # causal
+            (64, 64),  # local sliding window
         ]
 
         lse_flags = [False, True]
@@ -441,13 +470,15 @@ def warmup_flash_attn(f):
         # Base combo list
         combos = []
         for ws in window_presets:
-            for rlse in lse_flags:
-                combos.append(dict(window_size=ws, return_softmax_lse=rlse))
+            for return_lse_flag in lse_flags:
+                combos.append(dict(window_size=ws, return_softmax_lse=return_lse_flag))
 
         # Optionally add a pack_gqa=True variant (FA4 may disable it internally for some varlen shapes/SMs)
         if can_pack_gqa:
             for ws in window_presets:
-                combos.append(dict(window_size=ws, return_softmax_lse=False, pack_gqa=True))
+                combos.append(
+                    dict(window_size=ws, return_softmax_lse=False, pack_gqa=True)
+                )
 
         # If page_table is present, warm one combo with it (page_table in compile key for SM100)
         if has_page_table:
@@ -475,7 +506,9 @@ def warmup_flash_attn(f):
     def wrapper(*args, **kwargs):
         nonlocal done
         if not done:
-            logger.info("Running FA4 warmup (global/causal/local, LSE on/off, optional GQA pack)...")
+            logger.info(
+                "Running FA4 warmup (global/causal/local, LSE on/off, optional GQA pack)..."
+            )
             _run_warmups(args, kwargs)
             done = True
         return f(*args, **kwargs)
