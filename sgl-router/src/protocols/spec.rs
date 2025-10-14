@@ -526,7 +526,7 @@ fn validate_chat_cross_parameters(
 
     // 7. Validate tool_choice requires tools (except for "none")
     if let Some(ref tool_choice) = req.tool_choice {
-        let has_tools = req.tools.as_ref().map_or(false, |t| !t.is_empty());
+        let has_tools = req.tools.as_ref().is_some_and(|t| !t.is_empty());
 
         // Check if tool_choice is anything other than "none"
         let is_some_choice = !matches!(tool_choice, ToolChoice::Value(ToolChoiceValue::None));
@@ -649,7 +649,7 @@ impl Normalizable for ChatCompletionRequest {
 
         // Apply tool_choice defaults
         if self.tool_choice.is_none() {
-            let has_tools = self.tools.as_ref().map_or(false, |t| !t.is_empty());
+            let has_tools = self.tools.as_ref().is_some_and(|t| !t.is_empty());
 
             self.tool_choice = if has_tools {
                 Some(ToolChoice::Value(ToolChoiceValue::Auto))
@@ -3589,10 +3589,13 @@ mod tests {
             Some(100),
             "max_tokens should be copied to max_completion_tokens"
         );
-        assert!(
-            req.max_tokens.is_none(),
-            "Deprecated field should be cleared"
-        );
+        #[allow(deprecated)]
+        {
+            assert!(
+                req.max_tokens.is_none(),
+                "Deprecated field should be cleared"
+            );
+        }
         assert!(
             req.validate().is_ok(),
             "Should be valid after normalization"
@@ -3652,10 +3655,13 @@ mod tests {
         assert!(req.tools.is_some(), "functions should be migrated to tools");
         assert_eq!(req.tools.as_ref().unwrap().len(), 1);
         assert_eq!(req.tools.as_ref().unwrap()[0].function.name, "test_func");
-        assert!(
-            req.functions.is_none(),
-            "Deprecated field should be cleared"
-        );
+        #[allow(deprecated)]
+        {
+            assert!(
+                req.functions.is_none(),
+                "Deprecated field should be cleared"
+            );
+        }
         assert!(
             req.validate().is_ok(),
             "Should be valid after normalization"
@@ -3687,10 +3693,13 @@ mod tests {
             req.tool_choice,
             Some(ToolChoice::Value(ToolChoiceValue::None))
         ));
-        assert!(
-            req.function_call.is_none(),
-            "Deprecated field should be cleared"
-        );
+        #[allow(deprecated)]
+        {
+            assert!(
+                req.function_call.is_none(),
+                "Deprecated field should be cleared"
+            );
+        }
         assert!(
             req.validate().is_ok(),
             "Should be valid after normalization"
@@ -3735,10 +3744,13 @@ mod tests {
             }
             _ => panic!("Expected ToolChoice::Function variant"),
         }
-        assert!(
-            req.function_call.is_none(),
-            "Deprecated field should be cleared"
-        );
+        #[allow(deprecated)]
+        {
+            assert!(
+                req.function_call.is_none(),
+                "Deprecated field should be cleared"
+            );
+        }
         assert!(
             req.validate().is_ok(),
             "Should be valid after normalization"
