@@ -373,7 +373,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--torchao-config` | Optimize the model with torchao. Experimental feature. Current choices are: int8dq, int8wo, int4wo-<group_size>, fp8wo, fp8dq-per_tensor, fp8dq-per_row | `` | Type: str |
 | `--enable-nan-detection` | Enable the NaN detection for debugging purposes. | `False` | bool flag (set to enable) |
 | `--enable-p2p-check` | Enable P2P check for GPU access, otherwise the p2p access is allowed by default. | `False` | bool flag (set to enable) |
-| `--triton-attention-reduce-in-fp32` | Cast the intermediate attention results to fp32 to avoid possible crashes related to fp16.This only affects Triton attention kernels. | `False` | bool flag (set to enable) |
+| `--triton-attention-reduce-in-fp32` | Cast the intermediate attention results to fp32 to avoid possible crashes related to fp16. This only affects Triton attention kernels. | `False` | bool flag (set to enable) |
 | `--triton-attention-num-kv-splits` | The number of KV splits in flash decoding Triton kernel. Larger value is better in longer context scenarios. The default value is 8. | `8` | Type: int |
 | `--triton-attention-split-tile-size` | The size of split KV tile in flash decoding Triton kernel. Used for deterministic inference. | `None` | Type: int |
 | `--num-continuous-decode-steps` | Run multiple continuous decoding steps to reduce scheduling overhead. This can potentially increase throughput but may also increase time-to-first-token latency. The default value is 1, meaning only run one decoding step at a time. | `1` | Type: int |
