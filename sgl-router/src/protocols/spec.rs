@@ -10,53 +10,6 @@ fn default_model() -> String {
     "unknown".to_string()
 }
 
-// # Protocol Specifications
-//
-// This module contains all protocol definitions for OpenAI and SGLang APIs.
-//
-// ## Table of Contents
-//
-// 1. **OPENAI SPEC - Chat Completions API**
-//    - Message Types
-//    - Response Format Types
-//    - Tool/Function Types
-//    - Streaming Delta Types
-//    - Request/Response structures
-//
-// 2. **OPENAI SPEC - Completions API**
-//    - Request/Response structures
-//    - Streaming support
-//
-// 3. **OPENAI SPEC - Responses API**
-//    - Tool Definitions
-//    - Reasoning Configuration
-//    - Input/Output Items
-//    - Service Tier & Tool Choice
-//    - Request/Response structures
-//
-// 4. **OPENAI SPEC - Common**
-//    - Shared Request Components
-//    - Tool Choice Types
-//    - Usage Tracking
-//    - Logprobs Types
-//    - Error Response Types
-//
-// 5. **SGLANG SPEC - GENERATE API**
-//    - Generate Parameters
-//    - Sampling Parameters
-//    - Request/Response structures
-//
-// 6. **SGLANG SPEC - RERANK API**
-//    - Request/Response structures
-//
-// 7. **OPENAI SPEC - Embeddings API**
-//    - Request structures
-//
-// 8. **COMMON**
-//    - GenerationRequest trait
-//    - StringOrArray & LoRAPath types
-//    - Helper functions
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "role")]
 pub enum ChatMessage {
