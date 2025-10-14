@@ -296,7 +296,7 @@ pub struct ChatCompletionRequest {
 
     /// An alternative to sampling with temperature
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[validate(range(min = 0.0, max = 1.0))]
+    #[validate(custom(function = "validate_top_p_value"))]
     pub top_p: Option<f32>,
 
     /// Verbosity level for debugging
@@ -305,6 +305,7 @@ pub struct ChatCompletionRequest {
 
     /// Top-k sampling parameter (-1 to disable)
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(custom(function = "validate_top_k_value"))]
     pub top_k: Option<i32>,
 
     /// Min-p nucleus sampling parameter
@@ -436,6 +437,26 @@ fn validate_messages(messages: &[ChatMessage]) -> Result<(), validator::Validati
     Ok(())
 }
 
+/// Validates top_p: 0.0 < top_p <= 1.0 (exclusive lower bound - can't use range validator)
+fn validate_top_p_value(top_p: f32) -> Result<(), validator::ValidationError> {
+    if !(top_p > 0.0 && top_p <= 1.0) {
+        return Err(validator::ValidationError::new(
+            "top_p must be in (0, 1] - greater than 0.0 and at most 1.0",
+        ));
+    }
+    Ok(())
+}
+
+/// Validates top_k: -1 (disabled) or >= 1 (special -1 case - can't use range validator)
+fn validate_top_k_value(top_k: i32) -> Result<(), validator::ValidationError> {
+    if top_k != -1 && top_k < 1 {
+        return Err(validator::ValidationError::new(
+            "top_k must be -1 (disabled) or at least 1",
+        ));
+    }
+    Ok(())
+}
+
 /// Schema-level validation for cross-field dependencies
 fn validate_chat_cross_parameters(
     req: &ChatCompletionRequest,
@@ -447,10 +468,15 @@ fn validate_chat_cross_parameters(
         ));
     }
 
-    // 2. Validate token limits - min <= max
-    #[allow(deprecated)]
-    let effective_max = req.max_completion_tokens.or(req.max_tokens);
-    if let (Some(min), Some(max)) = (req.min_tokens, effective_max) {
+    // 2. Validate stream_options dependency
+    if req.stream_options.is_some() && !req.stream {
+        return Err(validator::ValidationError::new(
+            "The 'stream_options' parameter is only allowed when 'stream' is enabled",
+        ));
+    }
+
+    // 3. Validate token limits - min <= max
+    if let (Some(min), Some(max)) = (req.min_tokens,  req.max_completion_tokens) {
         if min > max {
             return Err(validator::ValidationError::new(
                 "min_tokens cannot exceed max_tokens/max_completion_tokens",
@@ -458,23 +484,7 @@ fn validate_chat_cross_parameters(
         }
     }
 
-    // 3. Validate conflicting token parameters
-    #[allow(deprecated)]
-    if req.max_tokens.is_some() && req.max_completion_tokens.is_some() {
-        return Err(validator::ValidationError::new(
-            "cannot specify both max_tokens and max_completion_tokens",
-        ));
-    }
-
-    // 4. Validate conflicting function/tools parameters
-    #[allow(deprecated)]
-    if req.tools.is_some() && req.functions.is_some() {
-        return Err(validator::ValidationError::new(
-            "functions is deprecated, use tools instead - cannot specify both",
-        ));
-    }
-
-    // 5. Validate structured output conflicts
+    // 4. Validate structured output conflicts
     let has_json_format = matches!(
         req.response_format,
         Some(ResponseFormat::JsonObject | ResponseFormat::JsonSchema { .. })
@@ -492,7 +502,7 @@ fn validate_chat_cross_parameters(
         ));
     }
 
-    // 6. Validate mutually exclusive structured output constraints
+    // 5. Validate mutually exclusive structured output constraints
     let constraint_count = [
         req.regex.is_some(),
         req.ebnf.is_some(),
@@ -508,7 +518,7 @@ fn validate_chat_cross_parameters(
         ));
     }
 
-    // 7. Validate response format JSON schema name
+    // 6. Validate response format JSON schema name
     if let Some(ResponseFormat::JsonSchema { json_schema }) = &req.response_format {
         if json_schema.name.is_empty() {
             return Err(validator::ValidationError::new(
@@ -517,16 +527,7 @@ fn validate_chat_cross_parameters(
         }
     }
 
-    // 8. Validate top_k parameter (-1 to disable, or positive)
-    if let Some(top_k) = req.top_k {
-        if top_k != -1 && top_k <= 0 {
-            return Err(validator::ValidationError::new(
-                "top_k must be -1 (disabled) or positive",
-            ));
-        }
-    }
-
-    // 9. Validate tool_choice requires tools (except for "none")
+    // 7. Validate tool_choice requires tools (except for "none")
     if let Some(ref tool_choice) = req.tool_choice {
         let has_tools = req.tools.as_ref().map_or(false, |t| !t.is_empty());
 
@@ -541,16 +542,110 @@ fn validate_chat_cross_parameters(
                 "Invalid value for 'tool_choice': 'tool_choice' is only allowed when 'tools' are specified.",
             ));
         }
+
+        // Additional validation when tools are present
+        if has_tools {
+            let tools = req.tools.as_ref().unwrap();
+
+            match tool_choice {
+                ToolChoice::Function { function, .. } => {
+                    // Validate that the specified function name exists in tools
+                    let function_exists = tools.iter().any(|tool| {
+                        tool.tool_type == "function" && tool.function.name == function.name
+                    });
+
+                    if !function_exists {
+                        let mut err = validator::ValidationError::new("tool_choice_function_not_found");
+                        err.message = Some(format!(
+                            "Invalid value for 'tool_choice': function '{}' not found in 'tools'.",
+                            function.name
+                        ).into());
+                        return Err(err);
+                    }
+                }
+                ToolChoice::AllowedTools { mode, tools: allowed_tools, .. } => {
+                    // Validate mode is "auto" or "required"
+                    if mode != "auto" && mode != "required" {
+                        let mut err = validator::ValidationError::new("tool_choice_invalid_mode");
+                        err.message = Some(format!(
+                            "Invalid value for 'tool_choice.mode': must be 'auto' or 'required', got '{}'.",
+                            mode
+                        ).into());
+                        return Err(err);
+                    }
+
+                    // Validate that all referenced tool names exist in tools
+                    for tool_ref in allowed_tools {
+                        let tool_exists = tools.iter().any(|tool| {
+                            tool.tool_type == tool_ref.tool_type && tool.function.name == tool_ref.name
+                        });
+
+                        if !tool_exists {
+                            let mut err = validator::ValidationError::new("tool_choice_tool_not_found");
+                            err.message = Some(format!(
+                                "Invalid value for 'tool_choice.tools': tool '{}' not found in 'tools'.",
+                                tool_ref.name
+                            ).into());
+                            return Err(err);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     Ok(())
 }
 
 impl Normalizable for ChatCompletionRequest {
-    /// Normalize the request by applying OpenAI defaults:
-    /// - If tool_choice is None and no tools present: set to "none"
-    /// - If tool_choice is None and tools present: set to "auto"
+    /// Normalize the request by applying migrations and defaults:
+    /// 1. Migrate deprecated fields to their replacements
+    /// 2. Clear deprecated fields and log warnings
+    /// 3. Apply OpenAI defaults for tool_choice
     fn normalize(&mut self) {
+        // Migrate deprecated max_tokens → max_completion_tokens
+        #[allow(deprecated)]
+        if self.max_completion_tokens.is_none() && self.max_tokens.is_some() {
+            tracing::warn!("max_tokens is deprecated, use max_completion_tokens instead");
+            self.max_completion_tokens = self.max_tokens;
+            self.max_tokens = None; // Clear deprecated field
+        }
+
+        // Migrate deprecated functions → tools
+        #[allow(deprecated)]
+        if self.tools.is_none() && self.functions.is_some() {
+            tracing::warn!("functions is deprecated, use tools instead");
+            self.tools = self.functions.as_ref().map(|functions| {
+                functions
+                    .iter()
+                    .map(|func| Tool {
+                        tool_type: "function".to_string(),
+                        function: func.clone(),
+                    })
+                    .collect()
+            });
+            self.functions = None; // Clear deprecated field
+        }
+
+        // Migrate deprecated function_call → tool_choice
+        #[allow(deprecated)]
+        if self.tool_choice.is_none() && self.function_call.is_some() {
+            tracing::warn!("function_call is deprecated, use tool_choice instead");
+            self.tool_choice = self.function_call.as_ref().map(|fc| match fc {
+                FunctionCall::None => ToolChoice::Value(ToolChoiceValue::None),
+                FunctionCall::Auto => ToolChoice::Value(ToolChoiceValue::Auto),
+                FunctionCall::Function { name } => ToolChoice::Function {
+                    tool_type: "function".to_string(),
+                    function: FunctionChoice {
+                        name: name.clone(),
+                    },
+                },
+            });
+            self.function_call = None; // Clear deprecated field
+        }
+
+        // Apply tool_choice defaults
         if self.tool_choice.is_none() {
             let has_tools = self.tools.as_ref().map_or(false, |t| !t.is_empty());
 
@@ -2115,55 +2210,33 @@ pub enum InputIds {
     Batch(Vec<Vec<i32>>),
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
-pub struct GenerateParameters {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub best_of: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub decoder_input_details: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub details: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub do_sample: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_new_tokens: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub repetition_penalty: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub return_full_text: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub seed: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub stop: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub temperature: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub top_k: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub top_p: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub truncate: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub typical_p: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub watermark: Option<bool>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default, Validate)]
+#[validate(schema(function = "validate_sampling_params"))]
 pub struct SamplingParams {
+    /// Temperature for sampling (must be >= 0.0, no upper limit)
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = 0.0))]
     pub temperature: Option<f32>,
+    /// Maximum number of new tokens to generate (must be >= 0)
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = 0))]
     pub max_new_tokens: Option<u32>,
+    /// Top-p nucleus sampling (0.0 < top_p <= 1.0)
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(custom(function = "validate_top_p_value"))]
     pub top_p: Option<f32>,
+    /// Top-k sampling (-1 to disable, or >= 1)
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(custom(function = "validate_top_k_value"))]
     pub top_k: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = -2.0, max = 2.0))]
     pub frequency_penalty: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = -2.0, max = 2.0))]
     pub presence_penalty: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = 0.0, max = 2.0))]
     pub repetition_penalty: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop: Option<StringOrArray>,
@@ -2178,9 +2251,11 @@ pub struct SamplingParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ebnf: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = 0.0, max = 1.0))]
     pub min_p: Option<f32>,
+    /// Minimum number of new tokens (validated in schema function for cross-field check with max_new_tokens)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub min_tokens: Option<u32>,
+    pub min_new_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_token_ids: Option<Vec<u32>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2191,7 +2266,38 @@ pub struct SamplingParams {
     pub sampling_seed: Option<u64>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// Validation function for SamplingParams - cross-field validation only
+fn validate_sampling_params(params: &SamplingParams) -> Result<(), validator::ValidationError> {
+    // 1. Cross-field validation: min_new_tokens <= max_new_tokens
+    if let (Some(min), Some(max)) = (params.min_new_tokens, params.max_new_tokens) {
+        if min > max {
+            return Err(validator::ValidationError::new(
+                "min_new_tokens cannot exceed max_new_tokens",
+            ));
+        }
+    }
+
+    // 2. Validate mutually exclusive structured output constraints
+    let constraint_count = [
+        params.regex.is_some(),
+        params.ebnf.is_some(),
+        params.json_schema.is_some(),
+    ]
+        .iter()
+        .filter(|&&x| x)
+        .count();
+
+    if constraint_count > 1 {
+        return Err(validator::ValidationError::new(
+            "only one of regex, ebnf, or json_schema can be set",
+        ));
+    }
+
+    Ok(())
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Validate)]
+#[validate(schema(function = "validate_generate_request"))]
 pub struct GenerateRequest {
     /// The prompt to generate from (OpenAI style)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2204,10 +2310,6 @@ pub struct GenerateRequest {
     /// Input IDs for tokenized input
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_ids: Option<InputIds>,
-
-    /// Generation parameters
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parameters: Option<GenerateParameters>,
 
     /// Sampling parameters (sglang style)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2236,6 +2338,37 @@ pub struct GenerateRequest {
     /// Request ID for tracking
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rid: Option<String>,
+}
+
+impl Normalizable for GenerateRequest {
+    // Use default no-op implementation - no normalization needed for GenerateRequest
+}
+
+/// Validation function for GenerateRequest - ensure exactly one input type is provided
+fn validate_generate_request(req: &GenerateRequest) -> Result<(), validator::ValidationError> {
+    // Exactly one of text or input_ids must be provided
+    // Note: input_embeds not yet supported in Rust implementation
+    let has_text = req.text.is_some() || req.prompt.is_some();
+    let has_input_ids = req.input_ids.is_some();
+
+    let count = [has_text, has_input_ids]
+        .iter()
+        .filter(|&&x| x)
+        .count();
+
+    if count == 0 {
+        return Err(validator::ValidationError::new(
+            "Either text or input_ids should be provided.",
+        ));
+    }
+
+    if count > 1 {
+        return Err(validator::ValidationError::new(
+            "Either text or input_ids should be provided.",
+        ));
+    }
+
+    Ok(())
 }
 
 impl GenerationRequest for GenerateRequest {
@@ -2650,6 +2783,89 @@ pub enum LoRAPath {
 mod tests {
     use super::*;
     use serde_json::{from_str, json, to_string};
+
+    #[test]
+    fn test_chat_message_tagged_by_role_system() {
+        let json = json!({
+            "role": "system",
+            "content": "You are a helpful assistant"
+        });
+
+        let msg: ChatMessage = serde_json::from_value(json).unwrap();
+        match msg {
+            ChatMessage::System { content, .. } => {
+                assert_eq!(content, "You are a helpful assistant");
+            }
+            _ => panic!("Expected System variant"),
+        }
+    }
+
+    #[test]
+    fn test_chat_message_tagged_by_role_user() {
+        let json = json!({
+            "role": "user",
+            "content": "Hello"
+        });
+
+        let msg: ChatMessage = serde_json::from_value(json).unwrap();
+        match msg {
+            ChatMessage::User { content, .. } => {
+                match content {
+                    UserMessageContent::Text(text) => assert_eq!(text, "Hello"),
+                    _ => panic!("Expected text content"),
+                }
+            }
+            _ => panic!("Expected User variant"),
+        }
+    }
+
+    #[test]
+    fn test_chat_message_tagged_by_role_assistant() {
+        let json = json!({
+            "role": "assistant",
+            "content": "Hi there!"
+        });
+
+        let msg: ChatMessage = serde_json::from_value(json).unwrap();
+        match msg {
+            ChatMessage::Assistant { content, .. } => {
+                assert_eq!(content, Some("Hi there!".to_string()));
+            }
+            _ => panic!("Expected Assistant variant"),
+        }
+    }
+
+    #[test]
+    fn test_chat_message_tagged_by_role_tool() {
+        let json = json!({
+            "role": "tool",
+            "content": "Tool result",
+            "tool_call_id": "call_123"
+        });
+
+        let msg: ChatMessage = serde_json::from_value(json).unwrap();
+        match msg {
+            ChatMessage::Tool {
+                content,
+                tool_call_id,
+            } => {
+                assert_eq!(content, "Tool result");
+                assert_eq!(tool_call_id, "call_123");
+            }
+            _ => panic!("Expected Tool variant"),
+        }
+    }
+
+    #[test]
+    fn test_chat_message_wrong_role_rejected() {
+        let json = json!({
+            "role": "invalid_role",
+            "content": "test"
+        });
+
+        let result = serde_json::from_value::<ChatMessage>(json);
+        assert!(result.is_err(), "Should reject invalid role");
+    }
 
     #[test]
     fn test_rerank_request_serialization() {
@@ -3350,5 +3566,538 @@ mod tests {
         };
         // Only top-level string elements are extracted
         assert_eq!(req.extract_text_for_routing(), "a");
+    }
+
+    // Deprecated fields normalization tests
+
+    #[test]
+    fn test_max_tokens_normalizes_to_max_completion_tokens() {
+        use validator::Validate;
+
+        #[allow(deprecated)]
+        let mut req = ChatCompletionRequest {
+            model: "test-model".to_string(),
+            messages: vec![ChatMessage::User {
+                content: UserMessageContent::Text("hello".to_string()),
+                name: None,
+            }],
+            max_tokens: Some(100),
+            max_completion_tokens: None,
+            ..Default::default()
+        };
+
+        req.normalize();
+        assert_eq!(req.max_completion_tokens, Some(100), "max_tokens should be copied to max_completion_tokens");
+        assert!(req.max_tokens.is_none(), "Deprecated field should be cleared");
+        assert!(req.validate().is_ok(), "Should be valid after normalization");
+    }
+
+    #[test]
+    fn test_max_completion_tokens_takes_precedence() {
+        use validator::Validate;
+
+        #[allow(deprecated)]
+        let mut req = ChatCompletionRequest {
+            model: "test-model".to_string(),
+            messages: vec![ChatMessage::User {
+                content: UserMessageContent::Text("hello".to_string()),
+                name: None,
+            }],
+            max_tokens: Some(100),
+            max_completion_tokens: Some(200),
+            ..Default::default()
+        };
+
+        req.normalize();
+        assert_eq!(req.max_completion_tokens, Some(200), "max_completion_tokens should take precedence");
+        assert!(req.validate().is_ok(), "Should be valid after normalization");
+    }
+
+    #[test]
+    fn test_functions_normalizes_to_tools() {
+        use validator::Validate;
+
+        #[allow(deprecated)]
+        let mut req = ChatCompletionRequest {
+            model: "test-model".to_string(),
+            messages: vec![ChatMessage::User {
+                content: UserMessageContent::Text("hello".to_string()),
+                name: None,
+            }],
+            functions: Some(vec![Function {
+                name: "test_func".to_string(),
+                description: Some("Test function".to_string()),
+                parameters: json!({}),
+                strict: None,
+            }]),
+            tools: None,
+            ..Default::default()
+        };
+
+        req.normalize();
+        assert!(req.tools.is_some(), "functions should be migrated to tools");
+        assert_eq!(req.tools.as_ref().unwrap().len(), 1);
+        assert_eq!(req.tools.as_ref().unwrap()[0].function.name, "test_func");
+        assert!(req.functions.is_none(), "Deprecated field should be cleared");
+        assert!(req.validate().is_ok(), "Should be valid after normalization");
+    }
+
+    #[test]
+    fn test_function_call_normalizes_to_tool_choice() {
+        use validator::Validate;
+
+        #[allow(deprecated)]
+        let mut req = ChatCompletionRequest {
+            model: "test-model".to_string(),
+            messages: vec![ChatMessage::User {
+                content: UserMessageContent::Text("hello".to_string()),
+                name: None,
+            }],
+            function_call: Some(FunctionCall::None),
+            tool_choice: None,
+            ..Default::default()
+        };
+
+        req.normalize();
+        assert!(req.tool_choice.is_some(), "function_call should be migrated to tool_choice");
+        assert!(matches!(req.tool_choice, Some(ToolChoice::Value(ToolChoiceValue::None))));
+        assert!(req.function_call.is_none(), "Deprecated field should be cleared");
+        assert!(req.validate().is_ok(), "Should be valid after normalization");
+    }
+
+    #[test]
+    fn test_function_call_function_variant_normalizes() {
+        use validator::Validate;
+
+        #[allow(deprecated)]
+        let mut req = ChatCompletionRequest {
+            model: "test-model".to_string(),
+            messages: vec![ChatMessage::User {
+                content: UserMessageContent::Text("hello".to_string()),
+                name: None,
+            }],
+            function_call: Some(FunctionCall::Function { name: "my_function".to_string() }),
+            tool_choice: None,
+            tools: Some(vec![Tool {
+                tool_type: "function".to_string(),
+                function: Function {
+                    name: "my_function".to_string(),
+                    description: None,
+                    parameters: json!({}),
+                    strict: None,
+                },
+            }]),
+            ..Default::default()
+        };
+
+        req.normalize();
+        assert!(req.tool_choice.is_some(), "function_call should be migrated to tool_choice");
+        match &req.tool_choice {
+            Some(ToolChoice::Function { function, .. }) => {
+                assert_eq!(function.name, "my_function");
+            }
+            _ => panic!("Expected ToolChoice::Function variant"),
+        }
+        assert!(req.function_call.is_none(), "Deprecated field should be cleared");
+        assert!(req.validate().is_ok(), "Should be valid after normalization");
+    }
+
+    // Stream options validation tests
+
+    #[test]
+    fn test_stream_options_requires_stream_enabled() {
+        use validator::Validate;
+
+        let req = ChatCompletionRequest {
+            model: "test-model".to_string(),
+            messages: vec![ChatMessage::User {
+                content: UserMessageContent::Text("hello".to_string()),
+                name: None,
+            }],
+            stream: false,
+            stream_options: Some(StreamOptions {
+                include_usage: Some(true),
+            }),
+            ..Default::default()
+        };
+
+        let result = req.validate();
+        assert!(result.is_err(), "Should reject stream_options when stream is false");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("stream_options") && err.contains("stream") && err.contains("enabled"),
+            "Error should mention stream dependency: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_stream_options_valid_when_stream_enabled() {
+        use validator::Validate;
+
+        let req = ChatCompletionRequest {
+            model: "test-model".to_string(),
+            messages: vec![ChatMessage::User {
+                content: UserMessageContent::Text("hello".to_string()),
+                name: None,
+            }],
+            stream: true,
+            stream_options: Some(StreamOptions {
+                include_usage: Some(true),
+            }),
+            ..Default::default()
+        };
+
+        let result = req.validate();
+        assert!(result.is_ok(), "Should accept stream_options when stream is true");
+    }
+
+    #[test]
+    fn test_no_stream_options_valid_when_stream_disabled() {
+        use validator::Validate;
+
+        let req = ChatCompletionRequest {
+            model: "test-model".to_string(),
+            messages: vec![ChatMessage::User {
+                content: UserMessageContent::Text("hello".to_string()),
+                name: None,
+            }],
+            stream: false,
+            stream_options: None,
+            ..Default::default()
+        };
+
+        let result = req.validate();
+        assert!(result.is_ok(), "Should accept no stream_options when stream is false");
+    }
+
+    // Tool choice validation tests
+    #[test]
+    fn test_tool_choice_function_not_found() {
+        use validator::Validate;
+
+        let req = ChatCompletionRequest {
+            model: "test-model".to_string(),
+            messages: vec![ChatMessage::User {
+                content: UserMessageContent::Text("hello".to_string()),
+                name: None,
+            }],
+            tools: Some(vec![Tool {
+                tool_type: "function".to_string(),
+                function: Function {
+                    name: "get_weather".to_string(),
+                    description: Some("Get weather".to_string()),
+                    parameters: json!({}),
+                    strict: None,
+                },
+            }]),
+            tool_choice: Some(ToolChoice::Function {
+                function: FunctionChoice {
+                    name: "nonexistent_function".to_string(),
+                },
+                tool_type: "function".to_string(),
+            }),
+            ..Default::default()
+        };
+
+        let result = req.validate();
+        assert!(result.is_err(), "Should reject nonexistent function name");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("function 'nonexistent_function' not found"),
+            "Error should mention the missing function: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_tool_choice_function_exists_valid() {
+        use validator::Validate;
+
+        let req = ChatCompletionRequest {
+            model: "test-model".to_string(),
+            messages: vec![ChatMessage::User {
+                content: UserMessageContent::Text("hello".to_string()),
+                name: None,
+            }],
+            tools: Some(vec![Tool {
+                tool_type: "function".to_string(),
+                function: Function {
+                    name: "get_weather".to_string(),
+                    description: Some("Get weather".to_string()),
+                    parameters: json!({}),
+                    strict: None,
+                },
+            }]),
+            tool_choice: Some(ToolChoice::Function {
+                function: FunctionChoice {
+                    name: "get_weather".to_string(),
+                },
+                tool_type: "function".to_string(),
+            }),
+            ..Default::default()
+        };
+
+        let result = req.validate();
+        assert!(result.is_ok(), "Should accept existing function name");
+    }
+
+    #[test]
+    fn test_tool_choice_allowed_tools_invalid_mode() {
+        use validator::Validate;
+
+        let req = ChatCompletionRequest {
+            model: "test-model".to_string(),
+            messages: vec![ChatMessage::User {
+                content: UserMessageContent::Text("hello".to_string()),
+                name: None,
+            }],
+            tools: Some(vec![Tool {
+                tool_type: "function".to_string(),
+                function: Function {
+                    name: "get_weather".to_string(),
+                    description: Some("Get weather".to_string()),
+                    parameters: json!({}),
+                    strict: None,
+                },
+            }]),
+            tool_choice: Some(ToolChoice::AllowedTools {
+                mode: "invalid_mode".to_string(),
+                tools: vec![ToolReference {
+                    tool_type: "function".to_string(),
+                    name: "get_weather".to_string(),
+                }],
+                tool_type: "function".to_string(),
+            }),
+            ..Default::default()
+        };
+
+        let result = req.validate();
+        assert!(result.is_err(), "Should reject invalid mode");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("must be 'auto' or 'required'"),
+            "Error should mention valid modes: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_tool_choice_allowed_tools_valid_mode_auto() {
+        use validator::Validate;
+
+        let req = ChatCompletionRequest {
+            model: "test-model".to_string(),
+            messages: vec![ChatMessage::User {
+                content: UserMessageContent::Text("hello".to_string()),
+                name: None,
+            }],
+            tools: Some(vec![Tool {
+                tool_type: "function".to_string(),
+                function: Function {
+                    name: "get_weather".to_string(),
+                    description: Some("Get weather".to_string()),
+                    parameters: json!({}),
+                    strict: None,
+                },
+            }]),
+            tool_choice: Some(ToolChoice::AllowedTools {
+                mode: "auto".to_string(),
+                tools: vec![ToolReference {
+                    tool_type: "function".to_string(),
+                    name: "get_weather".to_string(),
+                }],
+                tool_type: "function".to_string(),
+            }),
+            ..Default::default()
+        };
+
+        let result = req.validate();
+        assert!(result.is_ok(), "Should accept 'auto' mode");
+    }
+
+    #[test]
+    fn test_tool_choice_allowed_tools_valid_mode_required() {
+        use validator::Validate;
+
+        let req = ChatCompletionRequest {
+            model: "test-model".to_string(),
+            messages: vec![ChatMessage::User {
+                content: UserMessageContent::Text("hello".to_string()),
+                name: None,
+            }],
+            tools: Some(vec![Tool {
+                tool_type: "function".to_string(),
+                function: Function {
+                    name: "get_weather".to_string(),
+                    description: Some("Get weather".to_string()),
+                    parameters: json!({}),
+                    strict: None,
+                },
+            }]),
+            tool_choice: Some(ToolChoice::AllowedTools {
+                mode: "required".to_string(),
+                tools: vec![ToolReference {
+                    tool_type: "function".to_string(),
+                    name: "get_weather".to_string(),
+                }],
+                tool_type: "function".to_string(),
+            }),
+            ..Default::default()
+        };
+
+        let result = req.validate();
+        assert!(result.is_ok(), "Should accept 'required' mode");
+    }
+
+    #[test]
+    fn test_tool_choice_allowed_tools_tool_not_found() {
+        use validator::Validate;
+
+        let req = ChatCompletionRequest {
+            model: "test-model".to_string(),
+            messages: vec![ChatMessage::User {
+                content: UserMessageContent::Text("hello".to_string()),
+                name: None,
+            }],
+            tools: Some(vec![Tool {
+                tool_type: "function".to_string(),
+                function: Function {
+                    name: "get_weather".to_string(),
+                    description: Some("Get weather".to_string()),
+                    parameters: json!({}),
+                    strict: None,
+                },
+            }]),
+            tool_choice: Some(ToolChoice::AllowedTools {
+                mode: "auto".to_string(),
+                tools: vec![ToolReference {
+                    tool_type: "function".to_string(),
+                    name: "nonexistent_tool".to_string(),
+                }],
+                tool_type: "function".to_string(),
+            }),
+            ..Default::default()
+        };
+
+        let result = req.validate();
+        assert!(result.is_err(), "Should reject nonexistent tool name");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("tool 'nonexistent_tool' not found"),
+            "Error should mention the missing tool: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_tool_choice_allowed_tools_multiple_tools_valid() {
+        use validator::Validate;
+
+        let req = ChatCompletionRequest {
+            model: "test-model".to_string(),
+            messages: vec![ChatMessage::User {
+                content: UserMessageContent::Text("hello".to_string()),
+                name: None,
+            }],
+            tools: Some(vec![
+                Tool {
+                    tool_type: "function".to_string(),
+                    function: Function {
+                        name: "get_weather".to_string(),
+                        description: Some("Get weather".to_string()),
+                        parameters: json!({}),
+                        strict: None,
+                    },
+                },
+                Tool {
+                    tool_type: "function".to_string(),
+                    function: Function {
+                        name: "get_time".to_string(),
+                        description: Some("Get time".to_string()),
+                        parameters: json!({}),
+                        strict: None,
+                    },
+                },
+            ]),
+            tool_choice: Some(ToolChoice::AllowedTools {
+                mode: "auto".to_string(),
+                tools: vec![
+                    ToolReference {
+                        tool_type: "function".to_string(),
+                        name: "get_weather".to_string(),
+                    },
+                    ToolReference {
+                        tool_type: "function".to_string(),
+                        name: "get_time".to_string(),
+                    },
+                ],
+                tool_type: "function".to_string(),
+            }),
+            ..Default::default()
+        };
+
+        let result = req.validate();
+        assert!(result.is_ok(), "Should accept all valid tool references");
+    }
+
+    #[test]
+    fn test_tool_choice_allowed_tools_one_invalid_among_valid() {
+        use validator::Validate;
+
+        let req = ChatCompletionRequest {
+            model: "test-model".to_string(),
+            messages: vec![ChatMessage::User {
+                content: UserMessageContent::Text("hello".to_string()),
+                name: None,
+            }],
+            tools: Some(vec![
+                Tool {
+                    tool_type: "function".to_string(),
+                    function: Function {
+                        name: "get_weather".to_string(),
+                        description: Some("Get weather".to_string()),
+                        parameters: json!({}),
+                        strict: None,
+                    },
+                },
+                Tool {
+                    tool_type: "function".to_string(),
+                    function: Function {
+                        name: "get_time".to_string(),
+                        description: Some("Get time".to_string()),
+                        parameters: json!({}),
+                        strict: None,
+                    },
+                },
+            ]),
+            tool_choice: Some(ToolChoice::AllowedTools {
+                mode: "auto".to_string(),
+                tools: vec![
+                    ToolReference {
+                        tool_type: "function".to_string(),
+                        name: "get_weather".to_string(),
+                    },
+                    ToolReference {
+                        tool_type: "function".to_string(),
+                        name: "nonexistent_tool".to_string(),
+                    },
+                ],
+                tool_type: "function".to_string(),
+            }),
+            ..Default::default()
+        };
+
+        let result = req.validate();
+        assert!(
+            result.is_err(),
+            "Should reject if any tool reference is invalid"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("tool 'nonexistent_tool' not found"),
+            "Error should mention the missing tool: {}",
+            err
+        );
     }
 }

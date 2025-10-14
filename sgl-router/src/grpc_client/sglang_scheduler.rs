@@ -301,13 +301,7 @@ impl SglangSchedulerClient {
     ) -> Result<proto::SamplingParams, String> {
         let stop_sequences = self.extract_stop_strings(request);
 
-        // Handle max tokens: prefer max_completion_tokens (new) over max_tokens (deprecated)
-        // If neither is specified, use None to let the backend decide the default
-        #[allow(deprecated)]
-        let max_new_tokens = request
-            .max_completion_tokens
-            .or(request.max_tokens)
-            .map(|v| v as i32);
+        let max_new_tokens = request.max_completion_tokens.map(|v| v as i32);
 
         // Handle skip_special_tokens: set to false if tools are present and tool_choice is not "none"
         let skip_special_tokens = if request.tools.is_some() {
@@ -322,7 +316,6 @@ impl SglangSchedulerClient {
             request.skip_special_tokens
         };
 
-        #[allow(deprecated)]
         Ok(proto::SamplingParams {
             temperature: request.temperature.unwrap_or(1.0),
             top_p: request.top_p.unwrap_or(1.0),
@@ -485,10 +478,10 @@ impl SglangSchedulerClient {
                 })?);
         }
 
-        // Handle min_tokens with conversion
-        if let Some(min_tokens) = p.min_tokens {
-            sampling.min_new_tokens = i32::try_from(min_tokens)
-                .map_err(|_| "min_tokens must fit into a 32-bit signed integer".to_string())?;
+        // Handle min_new_tokens with conversion
+        if let Some(min_new_tokens) = p.min_new_tokens {
+            sampling.min_new_tokens = i32::try_from(min_new_tokens)
+                .map_err(|_| "min_new_tokens must fit into a 32-bit signed integer".to_string())?;
         }
 
         // Handle n with conversion
