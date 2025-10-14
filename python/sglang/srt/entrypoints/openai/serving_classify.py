@@ -89,9 +89,6 @@ class OpenAIServingClassify(OpenAIServingBase):
 
         # Handle list inputs
         if isinstance(input, list):
-            if len(input) == 0:
-                return "Input cannot be empty"
-
             # Check first element to determine type
             first_item = input[0]
 
@@ -116,7 +113,7 @@ class OpenAIServingClassify(OpenAIServingBase):
         try:
             hf_config = self.tokenizer_manager.model_config.hf_config
             # Check for id2label in hf_config
-            if hasattr(hf_config, "id2label") and hf_config.label2id:
+            if hf_config.label2id:
                 return hf_config.id2label
             # Check for num_labels and create default mapping if needed
             if hasattr(hf_config, "num_labels") and hf_config.num_labels:
