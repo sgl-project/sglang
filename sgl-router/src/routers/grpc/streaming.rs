@@ -616,7 +616,7 @@ impl StreamingProcessor {
         generate_request: Arc<GenerateRequest>,
         dispatch: context::DispatchMetadata,
     ) -> Response {
-        let return_logprob = generate_request.return_logprob;
+        let return_logprob = generate_request.return_logprob.unwrap_or(false);
 
         // Create SSE channel
         let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, io::Error>>();

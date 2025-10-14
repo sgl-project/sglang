@@ -213,6 +213,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--lora-paths` | The list of LoRA adapters to load. Each adapter must be specified in one of the following formats: <PATH> | <NAME>=<PATH> | JSON with schema {"lora_name":str,"lora_path":str,"pinned":bool} | None |
 | `--max-loras-per-batch` | Maximum number of adapters for a running batch, include base-only request. | 8 |
 | `--max-loaded-loras` | If specified, it limits the maximum number of LoRA adapters loaded in CPU memory at a time. The value must be greater than or equal to `--max-loras-per-batch`. | None |
+| `--lora-eviction-policy` | LoRA adapter eviction policy when GPU memory pool is full. `lru`: Least Recently Used (better cache efficiency). `fifo`: First-In-First-Out. | lru |
 | `--lora-backend` | Choose the kernel backend for multi-LoRA serving. | triton |
 
 ## Kernel backend
