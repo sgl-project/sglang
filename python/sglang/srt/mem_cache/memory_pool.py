@@ -806,6 +806,7 @@ class HybridLinearKVPool(KVCache):
         full_attention_layer_ids: List[int],
         enable_kvcache_transpose: bool,
         device: str,
+        mamba_pool: MambaPool,
     ):
         self.size = size
         self.dtype = dtype
@@ -816,6 +817,7 @@ class HybridLinearKVPool(KVCache):
         self.start_layer = 0
         self.head_num = head_num
         self.head_dim = head_dim
+        self.mamba_pool = mamba_pool
         # TODO MHATransposedTokenToKVPool if enable_kvcache_transpose is True
         assert not enable_kvcache_transpose
         if _is_npu:
