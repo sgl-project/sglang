@@ -15,8 +15,9 @@ async fn test_glm4_complete_parsing() {
 </tool_call>
 The weather will be..."#;
 
-    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
     assert_eq!(tools.len(), 1);
+    assert_eq!(normal_text, "Let me search for that.\n");
     assert_eq!(tools[0].function.name, "get_weather");
 
     let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
@@ -39,8 +40,9 @@ async fn test_glm4_multiple_tools() {
 <arg_value>zh</arg_value>
 </tool_call>"#;
 
-    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
     assert_eq!(tools.len(), 2);
+    assert_eq!(normal_text, "");
     assert_eq!(tools[0].function.name, "search");
     assert_eq!(tools[1].function.name, "translate");
 }
@@ -62,8 +64,9 @@ async fn test_glm4_type_conversion() {
 <arg_value>string value</arg_value>
 </tool_call>"#;
 
-    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
     assert_eq!(tools.len(), 1);
+    assert_eq!(normal_text, "");
 
     let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
     assert_eq!(args["count"], 42);

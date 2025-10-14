@@ -32,8 +32,9 @@ async fn test_qwen_multiple_sequential_tools() {
 {"name": "translate", "arguments": {"text": "Hello", "to": "zh"}}
 </tool_call>"#;
 
-    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
     assert_eq!(tools.len(), 2);
+    assert_eq!(normal_text, "Let me help you with that.\n");
     assert_eq!(tools[0].function.name, "search");
     assert_eq!(tools[1].function.name, "translate");
 }
@@ -79,8 +80,9 @@ Now I'll translate something.
 </tool_call>
 Done!"#;
 
-    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
     assert_eq!(tools.len(), 2);
+    assert_eq!(normal_text, "First, let me search for information.\n");
     assert_eq!(tools[0].function.name, "search");
     assert_eq!(tools[1].function.name, "translate");
 }
@@ -171,8 +173,12 @@ Let me also calculate something for you:
 
 These tools will provide the information you need."#;
 
-    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
     assert_eq!(tools.len(), 2);
+    assert_eq!(
+        normal_text,
+        "I'll help you search for information and perform calculations.\n\n"
+    );
     assert_eq!(tools[0].function.name, "web_search");
     assert_eq!(tools[1].function.name, "calculator");
 

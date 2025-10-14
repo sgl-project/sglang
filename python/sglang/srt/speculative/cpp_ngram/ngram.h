@@ -15,7 +15,7 @@
 #include "param.h"
 #include "queue.h"
 
-namespace lookahead {
+namespace ngram {
 
 struct TrieNode {
   std::unordered_map<int32_t, TrieNode*> child;
@@ -34,7 +34,7 @@ struct TrieNode {
   std::multiset<TrieNode*, CompareByFreq> sorted_children;
 };
 
-class Lookahead {
+class Ngram {
   std::vector<TrieNode> nodes_;
   std::vector<TrieNode*> node_pool_;
   size_t free_node_count_;
@@ -61,12 +61,12 @@ class Lookahead {
   std::vector<std::tuple<int32_t, int32_t, int32_t, int32_t>> match_tmp_data_;
 
  public:
-  Lookahead(size_t capacity, const Param& param);
-  Lookahead() = default;
-  ~Lookahead();
+  Ngram(size_t capacity, const Param& param);
+  Ngram() = default;
+  ~Ngram();
 
-  static Lookahead& instance() {
-    static Lookahead instance;
+  static Ngram& instance() {
+    static Ngram instance;
     return instance;
   }
 
@@ -107,4 +107,4 @@ class Lookahead {
   void insert();
 };
 
-}  // namespace lookahead
+}  // namespace ngram

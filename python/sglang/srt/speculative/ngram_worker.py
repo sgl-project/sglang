@@ -12,8 +12,8 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.cpp_lookahead.lookahead_cache import LookaheadCache
-from sglang.srt.speculative.lookahead_utils import LookaheadVerifyInput
+from sglang.srt.speculative.cpp_ngram.ngram_cache import NgramCache
+from sglang.srt.speculative.ngram_utils import NgramVerifyInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import broadcast_pyobj
 
@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 USE_FULL_MASK = True
 
 
-class LOOKAHEADWorker:
+class NGRAMWorker:
     def __init__(
         self,
         server_args: ServerArgs,
@@ -38,9 +38,9 @@ class LOOKAHEADWorker:
         self.tp_rank = tp_rank
         self.page_size = server_args.page_size
         self.draft_token_num: int = server_args.speculative_num_draft_tokens
-        self.branch_length: int = server_args.speculative_lookahead_branch_length
+        self.branch_length: int = server_args.speculative_ngram_branch_length
         self.max_match_window_size: int = (
-            server_args.speculative_lookahead_max_match_window_size
+            server_args.speculative_ngram_max_match_window_size
         )
 
         self.max_batch_size = target_worker.max_running_requests
@@ -48,18 +48,18 @@ class LOOKAHEADWorker:
 
         self._init_preallocated_tensors()
 
-        self.lookahead_cache = LookaheadCache(
-            min_match_window_size=server_args.speculative_lookahead_min_match_window_size,
-            max_match_window_size=server_args.speculative_lookahead_max_match_window_size,
-            min_bfs_breadth=server_args.speculative_lookahead_min_bfs_breadth,
-            max_bfs_breadth=server_args.speculative_lookahead_max_bfs_breadth,
-            capacity=server_args.speculative_lookahead_capacity,
-            branch_length=server_args.speculative_lookahead_branch_length,
+        self.ngram_cache = NgramCache(
+            min_match_window_size=server_args.speculative_ngram_min_match_window_size,
+            max_match_window_size=server_args.speculative_ngram_max_match_window_size,
+            min_bfs_breadth=server_args.speculative_ngram_min_bfs_breadth,
+            max_bfs_breadth=server_args.speculative_ngram_max_bfs_breadth,
+            capacity=server_args.speculative_ngram_capacity,
+            branch_length=server_args.speculative_ngram_branch_length,
             draft_token_num=server_args.speculative_num_draft_tokens,
         )
 
     def clear_cache_pool(self):
-        self.lookahead_cache.reset()
+        self.ngram_cache.reset()
 
     def _efficient_concat_last_n(self, seq1: List[int], seq2: List[int], n: int):
         seq2_len = len(seq2)
@@ -124,14 +124,14 @@ class LOOKAHEADWorker:
     ) -> tuple[np.ndarray, np.ndarray]:
         bs = batch.batch_size()
 
-        self.lookahead_cache.synchronize()
+        self.ngram_cache.synchronize()
         batch_tokens = []
         for req in batch.reqs:
             check_token = self._efficient_concat_last_n(
                 req.origin_input_ids, req.output_ids, self.max_match_window_size
             )
             batch_tokens.append(check_token)
-        req_drafts, mask = self.lookahead_cache.batch_get(batch_tokens)
+        req_drafts, mask = self.ngram_cache.batch_get(batch_tokens)
         total_draft_token_num = len(req_drafts)
 
         # Check if speculative decoding is needed; here we always enforce it
@@ -184,9 +184,9 @@ class LOOKAHEADWorker:
                 tree_mask.append(req_mask.flatten())
             tree_mask = torch.cat(tree_mask, dim=0)
 
-        batch.spec_algorithm = SpeculativeAlgorithm.LOOKAHEAD
+        batch.spec_algorithm = SpeculativeAlgorithm.NGRAM
         batch.forward_mode = ForwardMode.TARGET_VERIFY
-        batch.spec_info = LookaheadVerifyInput(
+        batch.spec_info = NgramVerifyInput(
             draft_tokens,
             tree_mask,
             positions,
@@ -197,7 +197,7 @@ class LOOKAHEADWorker:
         )
         batch.spec_info.prepare_for_verify(batch, self.page_size)
 
-    def _update_lookahead_cache(self, batch: ScheduleBatch):
+    def _update_ngram_cache(self, batch: ScheduleBatch):
         batch_tokens = []
         for req in batch.reqs:
             # FIXME: Whether to insert 'extend' into the cache or not, after testing,
@@ -209,7 +209,7 @@ class LOOKAHEADWorker:
                 req.origin_input_ids, req.output_ids, self.branch_length
             )
             batch_tokens.append(put_ids)
-        self.lookahead_cache.batch_put(batch_tokens)
+        self.ngram_cache.batch_put(batch_tokens)
 
     def forward_batch_speculative_generation(self, batch: ScheduleBatch):
         self._prepare_for_speculative_decoding(batch)
@@ -227,7 +227,7 @@ class LOOKAHEADWorker:
             logits_output, next_token_ids, num_accepted_tokens = verify_input.verify(
                 batch, logits_output, self.page_size
             )
-            self._update_lookahead_cache(batch)
+            self._update_ngram_cache(batch)
             batch.forward_mode = ForwardMode.DECODE
 
         else:

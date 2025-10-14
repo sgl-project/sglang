@@ -175,8 +175,9 @@ impl ToolParser for MistralParser {
 
             match self.parse_json_array(json_array) {
                 Ok(tools) => Ok((normal_text_before, tools)),
-                Err(_) => {
+                Err(e) => {
                     // If JSON parsing fails, return the original text as normal text
+                    tracing::warn!("Failed to parse tool call: {}", e);
                     Ok((text.to_string(), vec![]))
                 }
             }
@@ -307,69 +308,5 @@ impl ToolParser for MistralParser {
         } else {
             false
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_parse_mistral_format() {
-        let parser = MistralParser::new();
-        let input = r#"[TOOL_CALLS] [{"name": "get_weather", "arguments": {"location": "Paris", "units": "celsius"}}]"#;
-
-        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].function.name, "get_weather");
-        assert!(tools[0].function.arguments.contains("Paris"));
-    }
-
-    #[tokio::test]
-    async fn test_parse_multiple_tools() {
-        let parser = MistralParser::new();
-        let input = r#"[TOOL_CALLS] [
-            {"name": "search", "arguments": {"query": "rust programming"}},
-            {"name": "calculate", "arguments": {"expression": "2 + 2"}}
-        ]"#;
-
-        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
-        assert_eq!(tools.len(), 2);
-        assert_eq!(tools[0].function.name, "search");
-        assert_eq!(tools[1].function.name, "calculate");
-    }
-
-    #[tokio::test]
-    async fn test_nested_brackets_in_json() {
-        let parser = MistralParser::new();
-        let input = r#"[TOOL_CALLS] [{"name": "process", "arguments": {"data": [1, 2, [3, 4]], "config": {"nested": [5, 6]}}}]"#;
-
-        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].function.name, "process");
-        // JSON serialization removes spaces, so check for [3,4] without spaces
-        assert!(tools[0].function.arguments.contains("[3,4]"));
-    }
-
-    #[tokio::test]
-    async fn test_escaped_quotes_in_strings() {
-        let parser = MistralParser::new();
-        let input = r#"[TOOL_CALLS] [{"name": "echo", "arguments": {"message": "He said \"Hello [World]\""}}]"#;
-
-        let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].function.name, "echo");
-    }
-
-    #[test]
-    fn test_detect_format() {
-        let parser = MistralParser::new();
-
-        assert!(parser.detect_format(r#"[TOOL_CALLS] [{"name": "test", "arguments": {}}]"#));
-        assert!(
-            parser.detect_format(r#"Some text [TOOL_CALLS] [{"name": "test", "arguments": {}}]"#)
-        );
-        assert!(!parser.detect_format(r#"{"name": "test", "arguments": {}}"#));
-        assert!(!parser.detect_format("plain text"));
     }
 }

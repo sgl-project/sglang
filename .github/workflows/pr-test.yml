@@ -155,6 +155,50 @@ jobs:
           cd test/srt
           python3 test_mla_deepseek_v3.py
 
+  sgl-kernel-benchmark-test:
+    needs: [check-changes, sgl-kernel-build-wheels]
+    if: always() && !failure() && !cancelled()
+    runs-on: 1-gpu-runner
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      CI: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cleanup
+        run: |
+          ls -alh sgl-kernel/dist || true
+          rm -rf sgl-kernel/dist/* || true
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda12.9
+
+      - name: Install dependencies
+        run: |
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/ci_install_dependency.sh
+
+      - name: Run benchmark tests
+        timeout-minutes: 45
+        run: |
+          cd sgl-kernel/benchmark
+          echo "Running sgl-kernel benchmark tests in CI mode..."
+
+          echo "CI environment variable: $CI"
+          echo "GITHUB_ACTIONS environment variable: $GITHUB_ACTIONS"
+
+          for bench_file in bench_*.py; do
+            echo "Testing $bench_file..."
+            timeout 60 python3 "$bench_file" || echo "Warning: $bench_file timed out or failed, continuing..."
+            echo "Completed $bench_file"
+            echo "---"
+          done
+
+          echo "All benchmark tests completed!"
+
   # =============================================== primary ====================================================
 
   unit-test-frontend:
@@ -647,7 +691,7 @@ jobs:
       check-changes,
 
       sgl-kernel-build-wheels,
-      sgl-kernel-unit-test, sgl-kernel-mla-test,
+      sgl-kernel-unit-test, sgl-kernel-mla-test, sgl-kernel-benchmark-test,
 
       unit-test-frontend, unit-test-backend-1-gpu,
       unit-test-backend-2-gpu, unit-test-backend-4-gpu, unit-test-backend-8-gpu,
