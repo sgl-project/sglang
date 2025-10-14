@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{to_value, Map, Number, Value};
 use std::collections::HashMap;
+use validator::Validate;
+
+use crate::protocols::validated::Normalizable;
 
 // Default model value when not specified
 fn default_model() -> String {
@@ -55,22 +58,22 @@ fn default_model() -> String {
 //    - Helper functions
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(untagged)]
+#[serde(tag = "role")]
 pub enum ChatMessage {
+    #[serde(rename = "system")]
     System {
-        role: String,
         content: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         name: Option<String>,
     },
+    #[serde(rename = "user")]
     User {
-        role: String, // "user"
         content: UserMessageContent,
         #[serde(skip_serializing_if = "Option::is_none")]
         name: Option<String>,
     },
+    #[serde(rename = "assistant")]
     Assistant {
-        role: String, // "assistant"
         #[serde(skip_serializing_if = "Option::is_none")]
         content: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -81,16 +84,13 @@ pub enum ChatMessage {
         #[serde(skip_serializing_if = "Option::is_none")]
         reasoning_content: Option<String>,
     },
+    #[serde(rename = "tool")]
     Tool {
-        role: String, // "tool"
         content: String,
         tool_call_id: String,
     },
-    Function {
-        role: String, // "function"
-        content: String,
-        name: String,
-    },
+    #[serde(rename = "function")]
+    Function { content: String, name: String },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -168,9 +168,11 @@ pub struct FunctionCallDelta {
     pub arguments: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default, Validate)]
+#[validate(schema(function = "validate_chat_cross_parameters"))]
 pub struct ChatCompletionRequest {
     /// A list of messages comprising the conversation so far
+    #[validate(custom(function = "validate_messages"))]
     pub messages: Vec<ChatMessage>,
 
     /// ID of the model to use
@@ -179,6 +181,7 @@ pub struct ChatCompletionRequest {
 
     /// Number between -2.0 and 2.0. Positive values penalize new tokens based on their existing frequency in the text so far
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = -2.0, max = 2.0))]
     pub frequency_penalty: Option<f32>,
 
     /// Deprecated: Replaced by tool_choice
@@ -202,10 +205,12 @@ pub struct ChatCompletionRequest {
     /// Deprecated: Replaced by max_completion_tokens
     #[serde(skip_serializing_if = "Option::is_none")]
     #[deprecated(note = "Use max_completion_tokens instead")]
+    #[validate(range(min = 1))]
     pub max_tokens: Option<u32>,
 
     /// An upper bound for the number of tokens that can be generated for a completion
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = 1))]
     pub max_completion_tokens: Option<u32>,
 
     /// Developer-defined tags and values used for filtering completions in the dashboard
@@ -218,6 +223,7 @@ pub struct ChatCompletionRequest {
 
     /// How many chat completion choices to generate for each input message
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = 1, max = 10))]
     pub n: Option<u32>,
 
     /// Whether to enable parallel function calling during tool use
@@ -226,6 +232,7 @@ pub struct ChatCompletionRequest {
 
     /// Number between -2.0 and 2.0. Positive values penalize new tokens based on whether they appear in the text so far
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = -2.0, max = 2.0))]
     pub presence_penalty: Option<f32>,
 
     /// Cache key for prompts (beta feature)
@@ -255,6 +262,7 @@ pub struct ChatCompletionRequest {
 
     /// Up to 4 sequences where the API will stop generating further tokens
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(custom(function = "validate_stop"))]
     pub stop: Option<StringOrArray>,
 
     /// If set, partial message deltas will be sent
@@ -267,6 +275,7 @@ pub struct ChatCompletionRequest {
 
     /// What sampling temperature to use, between 0 and 2
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = 0.0, max = 2.0))]
     pub temperature: Option<f32>,
 
     /// Controls which (if any) tool is called by the model
@@ -279,30 +288,42 @@ pub struct ChatCompletionRequest {
 
     /// An integer between 0 and 20 specifying the number of most likely tokens to return
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = 0, max = 20))]
     pub top_logprobs: Option<u32>,
 
     /// An alternative to sampling with temperature
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(custom(function = "validate_top_p_value"))]
     pub top_p: Option<f32>,
 
     /// Verbosity level for debugging
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verbosity: Option<i32>,
 
+    // =============================================================================
+    // Engine-Specific Sampling Parameters
+    // =============================================================================
+    // These parameters are extensions beyond the OpenAI API specification and
+    // control model generation behavior in engine-specific ways.
+    // =============================================================================
     /// Top-k sampling parameter (-1 to disable)
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(custom(function = "validate_top_k_value"))]
     pub top_k: Option<i32>,
 
     /// Min-p nucleus sampling parameter
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = 0.0, max = 1.0))]
     pub min_p: Option<f32>,
 
     /// Minimum number of tokens to generate
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = 1))]
     pub min_tokens: Option<u32>,
 
     /// Repetition penalty for reducing repetitive text
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = 0.0, max = 2.0))]
     pub repetition_penalty: Option<f32>,
 
     /// Regex constraint for output generation
@@ -360,6 +381,290 @@ pub struct ChatCompletionRequest {
     /// Random seed for sampling for deterministic outputs
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sampling_seed: Option<u64>,
+}
+
+// Validation functions for ChatCompletionRequest
+// These are automatically called by the validator derive macro
+
+/// Validates stop sequences (max 4, non-empty strings)
+fn validate_stop(stop: &StringOrArray) -> Result<(), validator::ValidationError> {
+    match stop {
+        StringOrArray::String(s) => {
+            if s.is_empty() {
+                return Err(validator::ValidationError::new(
+                    "stop sequences cannot be empty",
+                ));
+            }
+        }
+        StringOrArray::Array(arr) => {
+            if arr.len() > 4 {
+                return Err(validator::ValidationError::new(
+                    "maximum 4 stop sequences allowed",
+                ));
+            }
+            for s in arr {
+                if s.is_empty() {
+                    return Err(validator::ValidationError::new(
+                        "stop sequences cannot be empty",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validates messages array is not empty and has valid content
+fn validate_messages(messages: &[ChatMessage]) -> Result<(), validator::ValidationError> {
+    if messages.is_empty() {
+        return Err(validator::ValidationError::new("messages cannot be empty"));
+    }
+
+    for msg in messages.iter() {
+        if let ChatMessage::User { content, .. } = msg {
+            match content {
+                UserMessageContent::Text(text) if text.is_empty() => {
+                    return Err(validator::ValidationError::new(
+                        "message content cannot be empty",
+                    ));
+                }
+                UserMessageContent::Parts(parts) if parts.is_empty() => {
+                    return Err(validator::ValidationError::new(
+                        "message content parts cannot be empty",
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validates top_p: 0.0 < top_p <= 1.0 (exclusive lower bound - can't use range validator)
+fn validate_top_p_value(top_p: f32) -> Result<(), validator::ValidationError> {
+    if !(top_p > 0.0 && top_p <= 1.0) {
+        return Err(validator::ValidationError::new(
+            "top_p must be in (0, 1] - greater than 0.0 and at most 1.0",
+        ));
+    }
+    Ok(())
+}
+
+/// Validates top_k: -1 (disabled) or >= 1 (special -1 case - can't use range validator)
+fn validate_top_k_value(top_k: i32) -> Result<(), validator::ValidationError> {
+    if top_k != -1 && top_k < 1 {
+        return Err(validator::ValidationError::new(
+            "top_k must be -1 (disabled) or at least 1",
+        ));
+    }
+    Ok(())
+}
+
+/// Schema-level validation for cross-field dependencies
+fn validate_chat_cross_parameters(
+    req: &ChatCompletionRequest,
+) -> Result<(), validator::ValidationError> {
+    // 1. Validate logprobs dependency
+    if req.top_logprobs.is_some() && !req.logprobs {
+        let mut e = validator::ValidationError::new("top_logprobs_requires_logprobs");
+        e.message = Some("top_logprobs is only allowed when logprobs is enabled".into());
+        return Err(e);
+    }
+
+    // 2. Validate stream_options dependency
+    if req.stream_options.is_some() && !req.stream {
+        let mut e = validator::ValidationError::new("stream_options_requires_stream");
+        e.message =
+            Some("The 'stream_options' parameter is only allowed when 'stream' is enabled".into());
+        return Err(e);
+    }
+
+    // 3. Validate token limits - min <= max
+    if let (Some(min), Some(max)) = (req.min_tokens, req.max_completion_tokens) {
+        if min > max {
+            let mut e = validator::ValidationError::new("min_tokens_exceeds_max");
+            e.message = Some("min_tokens cannot exceed max_tokens/max_completion_tokens".into());
+            return Err(e);
+        }
+    }
+
+    // 4. Validate structured output conflicts
+    let has_json_format = matches!(
+        req.response_format,
+        Some(ResponseFormat::JsonObject | ResponseFormat::JsonSchema { .. })
+    );
+
+    if has_json_format && req.regex.is_some() {
+        let mut e = validator::ValidationError::new("regex_conflicts_with_json");
+        e.message = Some("cannot use regex constraint with JSON response format".into());
+        return Err(e);
+    }
+
+    if has_json_format && req.ebnf.is_some() {
+        let mut e = validator::ValidationError::new("ebnf_conflicts_with_json");
+        e.message = Some("cannot use EBNF constraint with JSON response format".into());
+        return Err(e);
+    }
+
+    // 5. Validate mutually exclusive structured output constraints
+    let constraint_count = [
+        req.regex.is_some(),
+        req.ebnf.is_some(),
+        matches!(req.response_format, Some(ResponseFormat::JsonSchema { .. })),
+    ]
+    .iter()
+    .filter(|&&x| x)
+    .count();
+
+    if constraint_count > 1 {
+        let mut e = validator::ValidationError::new("multiple_constraints");
+        e.message = Some("only one structured output constraint (regex, ebnf, or json_schema) can be active at a time".into());
+        return Err(e);
+    }
+
+    // 6. Validate response format JSON schema name
+    if let Some(ResponseFormat::JsonSchema { json_schema }) = &req.response_format {
+        if json_schema.name.is_empty() {
+            let mut e = validator::ValidationError::new("json_schema_name_empty");
+            e.message = Some("JSON schema name cannot be empty".into());
+            return Err(e);
+        }
+    }
+
+    // 7. Validate tool_choice requires tools (except for "none")
+    if let Some(ref tool_choice) = req.tool_choice {
+        let has_tools = req.tools.as_ref().is_some_and(|t| !t.is_empty());
+
+        // Check if tool_choice is anything other than "none"
+        let is_some_choice = !matches!(tool_choice, ToolChoice::Value(ToolChoiceValue::None));
+
+        if is_some_choice && !has_tools {
+            let mut e = validator::ValidationError::new("tool_choice_requires_tools");
+            e.message = Some("Invalid value for 'tool_choice': 'tool_choice' is only allowed when 'tools' are specified.".into());
+            return Err(e);
+        }
+
+        // Additional validation when tools are present
+        if has_tools {
+            let tools = req.tools.as_ref().unwrap();
+
+            match tool_choice {
+                ToolChoice::Function { function, .. } => {
+                    // Validate that the specified function name exists in tools
+                    let function_exists = tools.iter().any(|tool| {
+                        tool.tool_type == "function" && tool.function.name == function.name
+                    });
+
+                    if !function_exists {
+                        let mut e =
+                            validator::ValidationError::new("tool_choice_function_not_found");
+                        e.message = Some(
+                            format!(
+                            "Invalid value for 'tool_choice': function '{}' not found in 'tools'.",
+                            function.name
+                        )
+                            .into(),
+                        );
+                        return Err(e);
+                    }
+                }
+                ToolChoice::AllowedTools {
+                    mode,
+                    tools: allowed_tools,
+                    ..
+                } => {
+                    // Validate mode is "auto" or "required"
+                    if mode != "auto" && mode != "required" {
+                        let mut e = validator::ValidationError::new("tool_choice_invalid_mode");
+                        e.message = Some(format!(
+                            "Invalid value for 'tool_choice.mode': must be 'auto' or 'required', got '{}'.",
+                            mode
+                        ).into());
+                        return Err(e);
+                    }
+
+                    // Validate that all referenced tool names exist in tools
+                    for tool_ref in allowed_tools {
+                        let tool_exists = tools.iter().any(|tool| {
+                            tool.tool_type == tool_ref.tool_type
+                                && tool.function.name == tool_ref.name
+                        });
+
+                        if !tool_exists {
+                            let mut e =
+                                validator::ValidationError::new("tool_choice_tool_not_found");
+                            e.message = Some(format!(
+                                "Invalid value for 'tool_choice.tools': tool '{}' not found in 'tools'.",
+                                tool_ref.name
+                            ).into());
+                            return Err(e);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    Ok(())
+}
+
+impl Normalizable for ChatCompletionRequest {
+    /// Normalize the request by applying migrations and defaults:
+    /// 1. Migrate deprecated fields to their replacements
+    /// 2. Clear deprecated fields and log warnings
+    /// 3. Apply OpenAI defaults for tool_choice
+    fn normalize(&mut self) {
+        // Migrate deprecated max_tokens → max_completion_tokens
+        #[allow(deprecated)]
+        if self.max_completion_tokens.is_none() && self.max_tokens.is_some() {
+            tracing::warn!("max_tokens is deprecated, use max_completion_tokens instead");
+            self.max_completion_tokens = self.max_tokens;
+            self.max_tokens = None; // Clear deprecated field
+        }
+
+        // Migrate deprecated functions → tools
+        #[allow(deprecated)]
+        if self.tools.is_none() && self.functions.is_some() {
+            tracing::warn!("functions is deprecated, use tools instead");
+            self.tools = self.functions.as_ref().map(|functions| {
+                functions
+                    .iter()
+                    .map(|func| Tool {
+                        tool_type: "function".to_string(),
+                        function: func.clone(),
+                    })
+                    .collect()
+            });
+            self.functions = None; // Clear deprecated field
+        }
+
+        // Migrate deprecated function_call → tool_choice
+        #[allow(deprecated)]
+        if self.tool_choice.is_none() && self.function_call.is_some() {
+            tracing::warn!("function_call is deprecated, use tool_choice instead");
+            self.tool_choice = self.function_call.as_ref().map(|fc| match fc {
+                FunctionCall::None => ToolChoice::Value(ToolChoiceValue::None),
+                FunctionCall::Auto => ToolChoice::Value(ToolChoiceValue::Auto),
+                FunctionCall::Function { name } => ToolChoice::Function {
+                    tool_type: "function".to_string(),
+                    function: FunctionChoice { name: name.clone() },
+                },
+            });
+            self.function_call = None; // Clear deprecated field
+        }
+
+        // Apply tool_choice defaults
+        if self.tool_choice.is_none() {
+            let has_tools = self.tools.as_ref().is_some_and(|t| !t.is_empty());
+
+            self.tool_choice = if has_tools {
+                Some(ToolChoice::Value(ToolChoiceValue::Auto))
+            } else {
+                Some(ToolChoice::Value(ToolChoiceValue::None))
+            };
+        }
+    }
 }
 
 impl GenerationRequest for ChatCompletionRequest {
@@ -553,6 +858,7 @@ pub struct CompletionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seed: Option<i64>,
 
+    // -------- Engine Specific Sampling Parameters --------
     /// Top-k sampling parameter (-1 to disable)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_k: Option<i32>,
@@ -1816,6 +2122,9 @@ pub struct Function {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub parameters: Value, // JSON Schema
+    /// Whether to enable strict schema adherence (OpenAI structured outputs)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1911,55 +2220,33 @@ pub enum InputIds {
     Batch(Vec<Vec<i32>>),
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
-pub struct GenerateParameters {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub best_of: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub decoder_input_details: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub details: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub do_sample: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_new_tokens: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub repetition_penalty: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub return_full_text: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub seed: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub stop: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub temperature: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub top_k: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub top_p: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub truncate: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub typical_p: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub watermark: Option<bool>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default, Validate)]
+#[validate(schema(function = "validate_sampling_params"))]
 pub struct SamplingParams {
+    /// Temperature for sampling (must be >= 0.0, no upper limit)
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = 0.0))]
     pub temperature: Option<f32>,
+    /// Maximum number of new tokens to generate (must be >= 0)
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = 0))]
     pub max_new_tokens: Option<u32>,
+    /// Top-p nucleus sampling (0.0 < top_p <= 1.0)
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(custom(function = "validate_top_p_value"))]
     pub top_p: Option<f32>,
+    /// Top-k sampling (-1 to disable, or >= 1)
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(custom(function = "validate_top_k_value"))]
     pub top_k: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = -2.0, max = 2.0))]
     pub frequency_penalty: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = -2.0, max = 2.0))]
     pub presence_penalty: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = 0.0, max = 2.0))]
     pub repetition_penalty: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop: Option<StringOrArray>,
@@ -1974,9 +2261,11 @@ pub struct SamplingParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ebnf: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = 0.0, max = 1.0))]
     pub min_p: Option<f32>,
+    /// Minimum number of new tokens (validated in schema function for cross-field check with max_new_tokens)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub min_tokens: Option<u32>,
+    pub min_new_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_token_ids: Option<Vec<u32>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1987,7 +2276,38 @@ pub struct SamplingParams {
     pub sampling_seed: Option<u64>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// Validation function for SamplingParams - cross-field validation only
+fn validate_sampling_params(params: &SamplingParams) -> Result<(), validator::ValidationError> {
+    // 1. Cross-field validation: min_new_tokens <= max_new_tokens
+    if let (Some(min), Some(max)) = (params.min_new_tokens, params.max_new_tokens) {
+        if min > max {
+            return Err(validator::ValidationError::new(
+                "min_new_tokens cannot exceed max_new_tokens",
+            ));
+        }
+    }
+
+    // 2. Validate mutually exclusive structured output constraints
+    let constraint_count = [
+        params.regex.is_some(),
+        params.ebnf.is_some(),
+        params.json_schema.is_some(),
+    ]
+    .iter()
+    .filter(|&&x| x)
+    .count();
+
+    if constraint_count > 1 {
+        return Err(validator::ValidationError::new(
+            "only one of regex, ebnf, or json_schema can be set",
+        ));
+    }
+
+    Ok(())
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Validate)]
+#[validate(schema(function = "validate_generate_request"))]
 pub struct GenerateRequest {
     /// The prompt to generate from (OpenAI style)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2000,10 +2320,6 @@ pub struct GenerateRequest {
     /// Input IDs for tokenized input
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_ids: Option<InputIds>,
-
-    /// Generation parameters
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parameters: Option<GenerateParameters>,
 
     /// Sampling parameters (sglang style)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2032,6 +2348,34 @@ pub struct GenerateRequest {
     /// Request ID for tracking
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rid: Option<String>,
+}
+
+impl Normalizable for GenerateRequest {
+    // Use default no-op implementation - no normalization needed for GenerateRequest
+}
+
+/// Validation function for GenerateRequest - ensure exactly one input type is provided
+fn validate_generate_request(req: &GenerateRequest) -> Result<(), validator::ValidationError> {
+    // Exactly one of text or input_ids must be provided
+    // Note: input_embeds not yet supported in Rust implementation
+    let has_text = req.text.is_some() || req.prompt.is_some();
+    let has_input_ids = req.input_ids.is_some();
+
+    let count = [has_text, has_input_ids].iter().filter(|&&x| x).count();
+
+    if count == 0 {
+        return Err(validator::ValidationError::new(
+            "Either text or input_ids should be provided.",
+        ));
+    }
+
+    if count > 1 {
+        return Err(validator::ValidationError::new(
+            "Either text or input_ids should be provided.",
+        ));
+    }
+
+    Ok(())
 }
 
 impl GenerationRequest for GenerateRequest {
@@ -2168,7 +2512,7 @@ pub struct RerankRequest {
     pub user: Option<String>,
 }
 
-fn default_model_name() -> String {
+pub fn default_model_name() -> String {
     DEFAULT_MODEL_NAME.to_string()
 }
 
@@ -2440,711 +2784,4 @@ impl StringOrArray {
 pub enum LoRAPath {
     Single(Option<String>),
     Batch(Vec<Option<String>>),
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::{from_str, json, to_string};
-
-    #[test]
-    fn test_rerank_request_serialization() {
-        let request = RerankRequest {
-            query: "test query".to_string(),
-            documents: vec!["doc1".to_string(), "doc2".to_string()],
-            model: "test-model".to_string(),
-            top_k: Some(5),
-            return_documents: true,
-            rid: Some(StringOrArray::String("req-123".to_string())),
-            user: Some("user-456".to_string()),
-        };
-
-        let serialized = to_string(&request).unwrap();
-        let deserialized: RerankRequest = from_str(&serialized).unwrap();
-
-        assert_eq!(deserialized.query, request.query);
-        assert_eq!(deserialized.documents, request.documents);
-        assert_eq!(deserialized.model, request.model);
-        assert_eq!(deserialized.top_k, request.top_k);
-        assert_eq!(deserialized.return_documents, request.return_documents);
-        assert_eq!(deserialized.rid, request.rid);
-        assert_eq!(deserialized.user, request.user);
-    }
-
-    #[test]
-    fn test_rerank_request_deserialization_with_defaults() {
-        let json = r#"{
-            "query": "test query",
-            "documents": ["doc1", "doc2"]
-        }"#;
-
-        let request: RerankRequest = from_str(json).unwrap();
-
-        assert_eq!(request.query, "test query");
-        assert_eq!(request.documents, vec!["doc1", "doc2"]);
-        assert_eq!(request.model, default_model_name());
-        assert_eq!(request.top_k, None);
-        assert!(request.return_documents);
-        assert_eq!(request.rid, None);
-        assert_eq!(request.user, None);
-    }
-
-    #[test]
-    fn test_rerank_request_validation_success() {
-        let request = RerankRequest {
-            query: "valid query".to_string(),
-            documents: vec!["doc1".to_string(), "doc2".to_string()],
-            model: "test-model".to_string(),
-            top_k: Some(2),
-            return_documents: true,
-            rid: None,
-            user: None,
-        };
-
-        assert!(request.validate().is_ok());
-    }
-
-    #[test]
-    fn test_rerank_request_validation_empty_query() {
-        let request = RerankRequest {
-            query: "".to_string(),
-            documents: vec!["doc1".to_string()],
-            model: "test-model".to_string(),
-            top_k: None,
-            return_documents: true,
-            rid: None,
-            user: None,
-        };
-
-        let result = request.validate();
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), "Query cannot be empty");
-    }
-
-    #[test]
-    fn test_rerank_request_validation_whitespace_query() {
-        let request = RerankRequest {
-            query: "   ".to_string(),
-            documents: vec!["doc1".to_string()],
-            model: "test-model".to_string(),
-            top_k: None,
-            return_documents: true,
-            rid: None,
-            user: None,
-        };
-
-        let result = request.validate();
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), "Query cannot be empty");
-    }
-
-    #[test]
-    fn test_rerank_request_validation_empty_documents() {
-        let request = RerankRequest {
-            query: "test query".to_string(),
-            documents: vec![],
-            model: "test-model".to_string(),
-            top_k: None,
-            return_documents: true,
-            rid: None,
-            user: None,
-        };
-
-        let result = request.validate();
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), "Documents list cannot be empty");
-    }
-
-    #[test]
-    fn test_rerank_request_validation_top_k_zero() {
-        let request = RerankRequest {
-            query: "test query".to_string(),
-            documents: vec!["doc1".to_string(), "doc2".to_string()],
-            model: "test-model".to_string(),
-            top_k: Some(0),
-            return_documents: true,
-            rid: None,
-            user: None,
-        };
-
-        let result = request.validate();
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), "top_k must be greater than 0");
-    }
-
-    #[test]
-    fn test_rerank_request_validation_top_k_greater_than_docs() {
-        let request = RerankRequest {
-            query: "test query".to_string(),
-            documents: vec!["doc1".to_string(), "doc2".to_string()],
-            model: "test-model".to_string(),
-            top_k: Some(5),
-            return_documents: true,
-            rid: None,
-            user: None,
-        };
-
-        // This should pass but log a warning
-        assert!(request.validate().is_ok());
-    }
-
-    #[test]
-    fn test_rerank_request_effective_top_k() {
-        let request = RerankRequest {
-            query: "test query".to_string(),
-            documents: vec!["doc1".to_string(), "doc2".to_string(), "doc3".to_string()],
-            model: "test-model".to_string(),
-            top_k: Some(2),
-            return_documents: true,
-            rid: None,
-            user: None,
-        };
-
-        assert_eq!(request.effective_top_k(), 2);
-    }
-
-    #[test]
-    fn test_rerank_request_effective_top_k_none() {
-        let request = RerankRequest {
-            query: "test query".to_string(),
-            documents: vec!["doc1".to_string(), "doc2".to_string(), "doc3".to_string()],
-            model: "test-model".to_string(),
-            top_k: None,
-            return_documents: true,
-            rid: None,
-            user: None,
-        };
-
-        assert_eq!(request.effective_top_k(), 3);
-    }
-
-    #[test]
-    fn test_rerank_response_creation() {
-        let results = vec![
-            RerankResult {
-                score: 0.8,
-                document: Some("doc1".to_string()),
-                index: 0,
-                meta_info: None,
-            },
-            RerankResult {
-                score: 0.6,
-                document: Some("doc2".to_string()),
-                index: 1,
-                meta_info: None,
-            },
-        ];
-
-        let response = RerankResponse::new(
-            results.clone(),
-            "test-model".to_string(),
-            Some(StringOrArray::String("req-123".to_string())),
-        );
-
-        assert_eq!(response.results.len(), 2);
-        assert_eq!(response.model, "test-model");
-        assert_eq!(
-            response.id,
-            Some(StringOrArray::String("req-123".to_string()))
-        );
-        assert_eq!(response.object, "rerank");
-        assert!(response.created > 0);
-    }
-
-    #[test]
-    fn test_rerank_response_serialization() {
-        let results = vec![RerankResult {
-            score: 0.8,
-            document: Some("doc1".to_string()),
-            index: 0,
-            meta_info: None,
-        }];
-
-        let response = RerankResponse::new(
-            results,
-            "test-model".to_string(),
-            Some(StringOrArray::String("req-123".to_string())),
-        );
-
-        let serialized = to_string(&response).unwrap();
-        let deserialized: RerankResponse = from_str(&serialized).unwrap();
-
-        assert_eq!(deserialized.results.len(), response.results.len());
-        assert_eq!(deserialized.model, response.model);
-        assert_eq!(deserialized.id, response.id);
-        assert_eq!(deserialized.object, response.object);
-    }
-
-    #[test]
-    fn test_rerank_response_sort_by_score() {
-        let results = vec![
-            RerankResult {
-                score: 0.6,
-                document: Some("doc2".to_string()),
-                index: 1,
-                meta_info: None,
-            },
-            RerankResult {
-                score: 0.8,
-                document: Some("doc1".to_string()),
-                index: 0,
-                meta_info: None,
-            },
-            RerankResult {
-                score: 0.4,
-                document: Some("doc3".to_string()),
-                index: 2,
-                meta_info: None,
-            },
-        ];
-
-        let mut response = RerankResponse::new(
-            results,
-            "test-model".to_string(),
-            Some(StringOrArray::String("req-123".to_string())),
-        );
-
-        response.sort_by_score();
-
-        assert_eq!(response.results[0].score, 0.8);
-        assert_eq!(response.results[0].index, 0);
-        assert_eq!(response.results[1].score, 0.6);
-        assert_eq!(response.results[1].index, 1);
-        assert_eq!(response.results[2].score, 0.4);
-        assert_eq!(response.results[2].index, 2);
-    }
-
-    #[test]
-    fn test_rerank_response_apply_top_k() {
-        let results = vec![
-            RerankResult {
-                score: 0.8,
-                document: Some("doc1".to_string()),
-                index: 0,
-                meta_info: None,
-            },
-            RerankResult {
-                score: 0.6,
-                document: Some("doc2".to_string()),
-                index: 1,
-                meta_info: None,
-            },
-            RerankResult {
-                score: 0.4,
-                document: Some("doc3".to_string()),
-                index: 2,
-                meta_info: None,
-            },
-        ];
-
-        let mut response = RerankResponse::new(
-            results,
-            "test-model".to_string(),
-            Some(StringOrArray::String("req-123".to_string())),
-        );
-
-        response.apply_top_k(2);
-
-        assert_eq!(response.results.len(), 2);
-        assert_eq!(response.results[0].score, 0.8);
-        assert_eq!(response.results[1].score, 0.6);
-    }
-
-    #[test]
-    fn test_rerank_response_apply_top_k_larger_than_results() {
-        let results = vec![RerankResult {
-            score: 0.8,
-            document: Some("doc1".to_string()),
-            index: 0,
-            meta_info: None,
-        }];
-
-        let mut response = RerankResponse::new(
-            results,
-            "test-model".to_string(),
-            Some(StringOrArray::String("req-123".to_string())),
-        );
-
-        response.apply_top_k(5);
-
-        assert_eq!(response.results.len(), 1);
-    }
-
-    #[test]
-    fn test_rerank_response_drop_documents() {
-        let results = vec![RerankResult {
-            score: 0.8,
-            document: Some("doc1".to_string()),
-            index: 0,
-            meta_info: None,
-        }];
-        let mut response = RerankResponse::new(
-            results,
-            "test-model".to_string(),
-            Some(StringOrArray::String("req-123".to_string())),
-        );
-
-        response.drop_documents();
-
-        assert_eq!(response.results[0].document, None);
-    }
-
-    #[test]
-    fn test_rerank_result_serialization() {
-        let result = RerankResult {
-            score: 0.85,
-            document: Some("test document".to_string()),
-            index: 42,
-            meta_info: Some(HashMap::from([
-                ("confidence".to_string(), Value::String("high".to_string())),
-                (
-                    "processing_time".to_string(),
-                    Value::Number(Number::from(150)),
-                ),
-            ])),
-        };
-
-        let serialized = to_string(&result).unwrap();
-        let deserialized: RerankResult = from_str(&serialized).unwrap();
-
-        assert_eq!(deserialized.score, result.score);
-        assert_eq!(deserialized.document, result.document);
-        assert_eq!(deserialized.index, result.index);
-        assert_eq!(deserialized.meta_info, result.meta_info);
-    }
-
-    #[test]
-    fn test_rerank_result_serialization_without_document() {
-        let result = RerankResult {
-            score: 0.85,
-            document: None,
-            index: 42,
-            meta_info: None,
-        };
-
-        let serialized = to_string(&result).unwrap();
-        let deserialized: RerankResult = from_str(&serialized).unwrap();
-
-        assert_eq!(deserialized.score, result.score);
-        assert_eq!(deserialized.document, result.document);
-        assert_eq!(deserialized.index, result.index);
-        assert_eq!(deserialized.meta_info, result.meta_info);
-    }
-
-    #[test]
-    fn test_v1_rerank_req_input_serialization() {
-        let v1_input = V1RerankReqInput {
-            query: "test query".to_string(),
-            documents: vec!["doc1".to_string(), "doc2".to_string()],
-        };
-
-        let serialized = to_string(&v1_input).unwrap();
-        let deserialized: V1RerankReqInput = from_str(&serialized).unwrap();
-
-        assert_eq!(deserialized.query, v1_input.query);
-        assert_eq!(deserialized.documents, v1_input.documents);
-    }
-
-    #[test]
-    fn test_v1_to_rerank_request_conversion() {
-        let v1_input = V1RerankReqInput {
-            query: "test query".to_string(),
-            documents: vec!["doc1".to_string(), "doc2".to_string()],
-        };
-
-        let request: RerankRequest = v1_input.into();
-
-        assert_eq!(request.query, "test query");
-        assert_eq!(request.documents, vec!["doc1", "doc2"]);
-        assert_eq!(request.model, default_model_name());
-        assert_eq!(request.top_k, None);
-        assert!(request.return_documents);
-        assert_eq!(request.rid, None);
-        assert_eq!(request.user, None);
-    }
-
-    #[test]
-    fn test_rerank_request_generation_request_trait() {
-        let request = RerankRequest {
-            query: "test query".to_string(),
-            documents: vec!["doc1".to_string()],
-            model: "test-model".to_string(),
-            top_k: None,
-            return_documents: true,
-            rid: None,
-            user: None,
-        };
-
-        assert_eq!(request.get_model(), Some("test-model"));
-        assert!(!request.is_stream());
-        assert_eq!(request.extract_text_for_routing(), "test query");
-    }
-
-    #[test]
-    fn test_rerank_request_very_long_query() {
-        let long_query = "a".repeat(100000);
-        let request = RerankRequest {
-            query: long_query,
-            documents: vec!["doc1".to_string()],
-            model: "test-model".to_string(),
-            top_k: None,
-            return_documents: true,
-            rid: None,
-            user: None,
-        };
-
-        assert!(request.validate().is_ok());
-    }
-
-    #[test]
-    fn test_rerank_request_many_documents() {
-        let documents: Vec<String> = (0..1000).map(|i| format!("doc{}", i)).collect();
-        let request = RerankRequest {
-            query: "test query".to_string(),
-            documents,
-            model: "test-model".to_string(),
-            top_k: Some(100),
-            return_documents: true,
-            rid: None,
-            user: None,
-        };
-
-        assert!(request.validate().is_ok());
-        assert_eq!(request.effective_top_k(), 100);
-    }
-
-    #[test]
-    fn test_rerank_request_special_characters() {
-        let request = RerankRequest {
-            query: "query with émojis 🚀 and unicode: 测试".to_string(),
-            documents: vec![
-                "doc with émojis 🎉".to_string(),
-                "doc with unicode: 测试".to_string(),
-            ],
-            model: "test-model".to_string(),
-            top_k: None,
-            return_documents: true,
-            rid: Some(StringOrArray::String("req-🚀-123".to_string())),
-            user: Some("user-🎉-456".to_string()),
-        };
-
-        assert!(request.validate().is_ok());
-    }
-
-    #[test]
-    fn test_rerank_request_rid_array() {
-        let request = RerankRequest {
-            query: "test query".to_string(),
-            documents: vec!["doc1".to_string()],
-            model: "test-model".to_string(),
-            top_k: None,
-            return_documents: true,
-            rid: Some(StringOrArray::Array(vec![
-                "req1".to_string(),
-                "req2".to_string(),
-            ])),
-            user: None,
-        };
-
-        assert!(request.validate().is_ok());
-    }
-
-    #[test]
-    fn test_rerank_response_with_usage_info() {
-        let results = vec![RerankResult {
-            score: 0.8,
-            document: Some("doc1".to_string()),
-            index: 0,
-            meta_info: None,
-        }];
-
-        let mut response = RerankResponse::new(
-            results,
-            "test-model".to_string(),
-            Some(StringOrArray::String("req-123".to_string())),
-        );
-
-        response.usage = Some(UsageInfo {
-            prompt_tokens: 100,
-            completion_tokens: 50,
-            total_tokens: 150,
-            reasoning_tokens: None,
-            prompt_tokens_details: None,
-        });
-
-        let serialized = to_string(&response).unwrap();
-        let deserialized: RerankResponse = from_str(&serialized).unwrap();
-
-        assert!(deserialized.usage.is_some());
-        let usage = deserialized.usage.unwrap();
-        assert_eq!(usage.prompt_tokens, 100);
-        assert_eq!(usage.completion_tokens, 50);
-        assert_eq!(usage.total_tokens, 150);
-    }
-
-    #[test]
-    fn test_full_rerank_workflow() {
-        // Create request
-        let request = RerankRequest {
-            query: "machine learning".to_string(),
-            documents: vec![
-                "Introduction to machine learning algorithms".to_string(),
-                "Deep learning for computer vision".to_string(),
-                "Natural language processing basics".to_string(),
-                "Statistics and probability theory".to_string(),
-            ],
-            model: "rerank-model".to_string(),
-            top_k: Some(2),
-            return_documents: true,
-            rid: Some(StringOrArray::String("req-123".to_string())),
-            user: Some("user-456".to_string()),
-        };
-
-        // Validate request
-        assert!(request.validate().is_ok());
-
-        // Simulate reranking results (in real scenario, this would come from the model)
-        let results = vec![
-            RerankResult {
-                score: 0.95,
-                document: Some("Introduction to machine learning algorithms".to_string()),
-                index: 0,
-                meta_info: None,
-            },
-            RerankResult {
-                score: 0.87,
-                document: Some("Deep learning for computer vision".to_string()),
-                index: 1,
-                meta_info: None,
-            },
-            RerankResult {
-                score: 0.72,
-                document: Some("Natural language processing basics".to_string()),
-                index: 2,
-                meta_info: None,
-            },
-            RerankResult {
-                score: 0.45,
-                document: Some("Statistics and probability theory".to_string()),
-                index: 3,
-                meta_info: None,
-            },
-        ];
-
-        // Create response
-        let mut response = RerankResponse::new(results, request.model.clone(), request.rid.clone());
-
-        // Sort by score
-        response.sort_by_score();
-
-        // Apply top_k
-        response.apply_top_k(request.effective_top_k());
-
-        assert_eq!(response.results.len(), 2);
-        assert_eq!(response.results[0].score, 0.95);
-        assert_eq!(response.results[0].index, 0);
-        assert_eq!(response.results[1].score, 0.87);
-        assert_eq!(response.results[1].index, 1);
-        assert_eq!(response.model, "rerank-model");
-
-        // Serialize and deserialize
-        let serialized = to_string(&response).unwrap();
-        let deserialized: RerankResponse = from_str(&serialized).unwrap();
-        assert_eq!(deserialized.results.len(), 2);
-        assert_eq!(deserialized.model, response.model);
-    }
-
-    #[test]
-    fn test_embedding_request_serialization_string_input() {
-        let req = EmbeddingRequest {
-            model: "test-emb".to_string(),
-            input: Value::String("hello".to_string()),
-            encoding_format: Some("float".to_string()),
-            user: Some("user-1".to_string()),
-            dimensions: Some(128),
-            rid: Some("rid-123".to_string()),
-        };
-
-        let serialized = to_string(&req).unwrap();
-        let deserialized: EmbeddingRequest = from_str(&serialized).unwrap();
-
-        assert_eq!(deserialized.model, req.model);
-        assert_eq!(deserialized.input, req.input);
-        assert_eq!(deserialized.encoding_format, req.encoding_format);
-        assert_eq!(deserialized.user, req.user);
-        assert_eq!(deserialized.dimensions, req.dimensions);
-        assert_eq!(deserialized.rid, req.rid);
-    }
-
-    #[test]
-    fn test_embedding_request_serialization_array_input() {
-        let req = EmbeddingRequest {
-            model: "test-emb".to_string(),
-            input: json!(["a", "b", "c"]),
-            encoding_format: None,
-            user: None,
-            dimensions: None,
-            rid: None,
-        };
-
-        let serialized = to_string(&req).unwrap();
-        let de: EmbeddingRequest = from_str(&serialized).unwrap();
-        assert_eq!(de.model, req.model);
-        assert_eq!(de.input, req.input);
-    }
-
-    #[test]
-    fn test_embedding_generation_request_trait_string() {
-        let req = EmbeddingRequest {
-            model: "emb-model".to_string(),
-            input: Value::String("hello".to_string()),
-            encoding_format: None,
-            user: None,
-            dimensions: None,
-            rid: None,
-        };
-        assert!(!req.is_stream());
-        assert_eq!(req.get_model(), Some("emb-model"));
-        assert_eq!(req.extract_text_for_routing(), "hello");
-    }
-
-    #[test]
-    fn test_embedding_generation_request_trait_array() {
-        let req = EmbeddingRequest {
-            model: "emb-model".to_string(),
-            input: json!(["hello", "world"]),
-            encoding_format: None,
-            user: None,
-            dimensions: None,
-            rid: None,
-        };
-        assert_eq!(req.extract_text_for_routing(), "hello world");
-    }
-
-    #[test]
-    fn test_embedding_generation_request_trait_non_text() {
-        let req = EmbeddingRequest {
-            model: "emb-model".to_string(),
-            input: json!({"tokens": [1, 2, 3]}),
-            encoding_format: None,
-            user: None,
-            dimensions: None,
-            rid: None,
-        };
-        assert_eq!(req.extract_text_for_routing(), "");
-    }
-
-    #[test]
-    fn test_embedding_generation_request_trait_mixed_array_ignores_nested() {
-        let req = EmbeddingRequest {
-            model: "emb-model".to_string(),
-            input: json!(["a", ["b", "c"], 123, {"k": "v"}]),
-            encoding_format: None,
-            user: None,
-            dimensions: None,
-            rid: None,
-        };
-        // Only top-level string elements are extracted
-        assert_eq!(req.extract_text_for_routing(), "a");
-    }
 }

@@ -252,14 +252,24 @@ class SchedulerMetricsMixin:
 
         if self.spec_algorithm.is_none():
             spec_accept_length = 0
+            spec_accept_rate = 0
         else:
             spec_accept_length = (
                 self.spec_num_total_accepted_tokens / self.spec_num_total_forward_ct
             )
+            # Calculate acceptance rate: accepted tokens / total draft tokens
+            total_draft_tokens = self.spec_num_total_forward_ct * (
+                (self.server_args.speculative_num_steps or 0) + 1
+            )
+            spec_accept_rate = (
+                self.spec_num_total_accepted_tokens / total_draft_tokens
+                if total_draft_tokens > 0
+                else 0
+            )
             self.cum_spec_accept_length += self.spec_num_total_accepted_tokens
             self.cum_spec_accept_count += self.spec_num_total_forward_ct
             self.spec_num_total_accepted_tokens = self.spec_num_total_forward_ct = 0
-            msg += f"accept len: {spec_accept_length:.2f}, "
+            msg += f"accept len: {spec_accept_length:.2f}, accept rate: {spec_accept_rate:.2f}, "
         cache_hit_rate = 0.0
 
         if self.disaggregation_mode == DisaggregationMode.DECODE:
@@ -287,6 +297,9 @@ class SchedulerMetricsMixin:
             self.stats.num_queue_reqs = len(self.waiting_queue)
             self.stats.num_grammar_queue_reqs = len(self.grammar_queue)
             self.stats.cache_hit_rate = cache_hit_rate
+
+            # Speculative decoding
+            self.stats.spec_accept_rate = spec_accept_rate
             self.stats.spec_accept_length = spec_accept_length
 
             # Retract

@@ -169,8 +169,8 @@ impl SglangSchedulerClient {
         &self,
     ) -> Result<proto::HealthCheckResponse, Box<dyn std::error::Error + Send + Sync>> {
         debug!("Sending health check request");
-        // Server ignores the request body and creates its own health check internally
-        let request = Request::new(proto::HealthCheckRequest { tokenized: None });
+        // HealthCheckRequest is now empty - server generates its own health check internally
+        let request = Request::new(proto::HealthCheckRequest {});
 
         let mut client = self.client.clone();
         let response = client.health_check(request).await?;
@@ -301,13 +301,7 @@ impl SglangSchedulerClient {
     ) -> Result<proto::SamplingParams, String> {
         let stop_sequences = self.extract_stop_strings(request);
 
-        // Handle max tokens: prefer max_completion_tokens (new) over max_tokens (deprecated)
-        // If neither is specified, use None to let the backend decide the default
-        #[allow(deprecated)]
-        let max_new_tokens = request
-            .max_completion_tokens
-            .or(request.max_tokens)
-            .map(|v| v as i32);
+        let max_new_tokens = request.max_completion_tokens.map(|v| v as i32);
 
         // Handle skip_special_tokens: set to false if tools are present and tool_choice is not "none"
         let skip_special_tokens = if request.tools.is_some() {
@@ -322,7 +316,6 @@ impl SglangSchedulerClient {
             request.skip_special_tokens
         };
 
-        #[allow(deprecated)]
         Ok(proto::SamplingParams {
             temperature: request.temperature.unwrap_or(1.0),
             top_p: request.top_p.unwrap_or(1.0),
@@ -485,10 +478,10 @@ impl SglangSchedulerClient {
                 })?);
         }
 
-        // Handle min_tokens with conversion
-        if let Some(min_tokens) = p.min_tokens {
-            sampling.min_new_tokens = i32::try_from(min_tokens)
-                .map_err(|_| "min_tokens must fit into a 32-bit signed integer".to_string())?;
+        // Handle min_new_tokens with conversion
+        if let Some(min_new_tokens) = p.min_new_tokens {
+            sampling.min_new_tokens = i32::try_from(min_new_tokens)
+                .map_err(|_| "min_new_tokens must fit into a 32-bit signed integer".to_string())?;
         }
 
         // Handle n with conversion
@@ -510,13 +503,8 @@ mod tests {
 
     #[test]
     fn test_proto_types_compilation() {
-        let health_req = proto::HealthCheckRequest {
-            tokenized: Some(proto::TokenizedInput {
-                original_text: "test".to_string(),
-                input_ids: vec![1296],
-            }),
-        };
-        assert!(health_req.tokenized.is_some());
+        let _health_req = proto::HealthCheckRequest {};
+        // HealthCheckRequest is now empty - no fields to test
     }
 
     #[test]
@@ -558,13 +546,8 @@ mod tests {
 
     #[test]
     fn test_health_check_request() {
-        let health_req = proto::HealthCheckRequest {
-            tokenized: Some(proto::TokenizedInput {
-                original_text: "test".to_string(),
-                input_ids: vec![1296], // Mock token ID for "test"
-            }),
-        };
-        assert!(health_req.tokenized.is_some());
+        let _health_req = proto::HealthCheckRequest {};
+        // HealthCheckRequest is now empty - server generates its own test internally
     }
 
     #[test]

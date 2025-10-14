@@ -83,10 +83,6 @@ from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef
-from sglang.srt.managers.schedule_batch import (
-    GLOBAL_SERVER_ARGS_KEYS,
-    global_server_args_dict,
-)
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     PagedTokenToKVPoolAllocator,
@@ -125,7 +121,11 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.server_args import (
+    ServerArgs,
+    get_global_server_args,
+    set_global_server_args_for_scheduler,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     MultiprocessingSerializer,
@@ -195,7 +195,6 @@ UNBALANCED_MODEL_LOADING_TIMEOUT_S = 300
 MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO = 3
 
 logger = logging.getLogger(__name__)
-
 
 if _is_npu:
     import torch_npu
@@ -278,15 +277,12 @@ class ModelRunner:
         # Model-specific adjustment
         self.model_specific_adjustment()
 
-        # Global vars
-        global_server_args_dict.update(
-            {k: getattr(server_args, k) for k in GLOBAL_SERVER_ARGS_KEYS}
-            | {
-                # TODO it is indeed not a "server args"
-                "use_mla_backend": self.use_mla_backend,
-                "speculative_algorithm": self.spec_algorithm,
-            }
-        )
+        # Set the global server_args in the scheduler process
+        set_global_server_args_for_scheduler(server_args)
+        global_server_args = get_global_server_args()
+
+        # FIXME: hacky set `use_mla_backend`
+        global_server_args.use_mla_backend = self.use_mla_backend
 
         # Init OpenMP threads binding for CPU
         if self.device == "cpu":
@@ -419,7 +415,7 @@ class ModelRunner:
         # In layered loading, torchao may have been applied
         if not torchao_applied:
             apply_torchao_config_to_model(
-                self.model, global_server_args_dict["torchao_config"]
+                self.model, get_global_server_args().torchao_config
             )
 
         # Apply torch TP if the model supports it
@@ -638,6 +634,23 @@ class ModelRunner:
                     "FlashAttention3 decode backend is not compatible with hierarchical cache. "
                     "Setting hicache_io_backend to vanilla I/O, which may lead to suboptimal performance with small page sizes."
                 )
+
+        if self.model_config.hf_config.model_type == "qwen3_vl_moe":
+            if (
+                quantization_config := getattr(
+                    self.model_config.hf_config, "quantization_config", None
+                )
+            ) is not None:
+                text_config = self.model_config.hf_text_config
+                weight_block_size_n = quantization_config["weight_block_size"][0]
+                if (
+                    text_config.moe_intermediate_size
+                    // (self.tp_size // self.moe_ep_size)
+                ) % weight_block_size_n != 0:
+                    raise ValueError(
+                        f"For qwen3-vl-fp8 models, please make sure ({text_config.moe_intermediate_size=} // ({self.tp_size=} // {self.moe_ep_size=})) % {weight_block_size_n=} == 0. "
+                        f"You can fix this by using arguments such as `--tp-size 8 --ep-size 8`"
+                    )
 
     def init_torch_distributed(self):
         logger.info("Init torch distributed begin.")
@@ -1889,12 +1902,10 @@ class ModelRunner:
                 init_new_workspace=init_new_workspace,
             )
 
-        global_server_args_dict.update(
-            {
-                "decode_attention_backend": self.decode_attention_backend_str,
-                "prefill_attention_backend": self.prefill_attention_backend_str,
-            }
-        )
+        (
+            get_global_server_args().prefill_attention_backend,
+            get_global_server_args().decode_attention_backend,
+        ) = (self.prefill_attention_backend_str, self.decode_attention_backend_str)
         return attn_backend
 
     def _get_attention_backend_from_str(
