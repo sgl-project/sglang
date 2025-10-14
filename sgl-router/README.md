@@ -32,7 +32,7 @@ High-performance inference gateway control and data plane for SGLang deployments
 - Prefill/decode disaggregation, including bootstrap port handling and cache-aware merging.
 - gRPC routing with fully Rust tokenizer loading, reasoning parser selection, and tool parser integration for OpenAI-compatible endpoints—supporting streaming and non-streaming modes across DeepSeek, Llama, Kimi K2, Qwen, GPT-OSS, Mistral, Step-3, GLM4, and other reasoning-capable models.
 - OpenAI-compatible `/v1/chat/completions`, `/v1/responses`, `/v1/conversations`, `/v1/embeddings`, and `/v1/rerank` endpoints.
-- MCP integration for iterative tool execution by setting `SGLANG_MCP_CONFIG` to a client config file.
+- Native MCP client integration supporting all MCP transport protocols (STDIO, HTTP, SSE, and Streamable) for tool execution loops.
 - Pluggable history connectors: in-memory, disabled, or Oracle ATP (with pooling and credential support).
 - Reliability controls: retry with jitter, worker-scoped circuit breakers, token bucket limiter with optional queue, and cache flush APIs.
 - Service discovery for regular and PD workloads with independent selectors.
