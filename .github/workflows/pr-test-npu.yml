@@ -56,7 +56,7 @@ jobs:
           PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
           STREAMS_PER_DEVICE: 32
         run: |
-          source /usr/local/Ascend/8.3.RC1/bisheng_toolkit/set_env.sh
+          export PATH="/usr/local/Ascend/8.3.RC1/compiler/bishengir/bin:${PATH}"
           cd test/srt
           python3 run_suite.py --suite per-commit-1-ascend-npu
 
@@ -97,7 +97,7 @@ jobs:
           PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
           STREAMS_PER_DEVICE: 32
         run: |
-          source /usr/local/Ascend/8.3.RC1/bisheng_toolkit/set_env.sh
+          export PATH="/usr/local/Ascend/8.3.RC1/compiler/bishengir/bin:${PATH}"
           cd test/srt
           python3 run_suite.py --suite per-commit-2-ascend-npu --auto-partition-id ${{ matrix.part }} --auto-partition-size 3
 
@@ -134,7 +134,7 @@ jobs:
           PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
           STREAMS_PER_DEVICE: 32
         run: |
-          source /usr/local/Ascend/8.3.RC1/bisheng_toolkit/set_env.sh
+          export PATH="/usr/local/Ascend/8.3.RC1/compiler/bishengir/bin:${PATH}"
           cd test/srt
           python3 run_suite.py --suite per-commit-4-ascend-npu --timeout-per-file 3600
 
@@ -171,6 +171,6 @@ jobs:
           PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
           STREAMS_PER_DEVICE: 32
         run: |
-          source /usr/local/Ascend/8.3.RC1/bisheng_toolkit/set_env.sh
+          export PATH="/usr/local/Ascend/8.3.RC1/compiler/bishengir/bin:${PATH}"
           cd test/srt
           python3 run_suite.py --suite per-commit-16-ascend-a3 --timeout-per-file 5400
