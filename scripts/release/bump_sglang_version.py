@@ -10,7 +10,10 @@ def main():
     parser = argparse.ArgumentParser(
         description="Bump SGLang version across all relevant files"
     )
-    parser.add_argument("new_version", help="New version (e.g., 0.5.3 or 0.5.3rc0)")
+    parser.add_argument(
+        "new_version",
+        help="New version (e.g., 0.5.4, 0.5.3rc0, or 0.5.3.post1)",
+    )
     args = parser.parse_args()
 
     version_file = Path("python/sglang/version.py")
@@ -27,7 +30,7 @@ def main():
         Path("python/sglang/version.py"),
     ]
 
-    bump_version(args.new_version, version_file, files_to_update, "sglang")
+    bump_version(args.new_version, version_file, files_to_update)
 
 
 if __name__ == "__main__":
