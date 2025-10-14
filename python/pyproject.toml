@@ -90,7 +90,6 @@ tracing = [
   "opentelemetry-exporter-otlp-proto-grpc",
   "opentelemetry-sdk",
 ]
-all = ["sglang[test]", "sglang[decord]", "sglang[cu120]"]
 cu120 = [
   "torch==2.8.0",
   "torchaudio==2.8.0",
@@ -100,6 +99,11 @@ cu130 = [
   "torch==2.9.0",
   "torchaudio==2.9.0",
   "torchvision==0.24.0",
+]
+all = [
+  "sglang[test]", 
+  "sglang[decord]", 
+  "sglang[cu120]"
 ]
 cu130_all = [
   "sglang[test]",
