@@ -799,6 +799,12 @@ def get_dataset(args, tokenizer, model_id=None):
 
         # Limit the number of requests based on --num-prompts
         input_requests = all_requests_data[: args.num_prompts]
+    elif args.dataset_name == "leval":
+        input_requests = sample_leval_requests(
+            dataset_path="/<local way to LEval-data>/LEval-data",
+            num_requests=2000,
+            tokenizer=tokenizer,
+        )
     else:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
     return input_requests
@@ -1289,6 +1295,74 @@ def sample_random_requests(
     print(f"#Input tokens: {np.sum(input_lens)}")
     print(f"#Output tokens: {np.sum(output_lens)}")
     return input_requests
+
+
+def sample_leval_requests(
+    dataset_path: str,
+    num_requests: int,
+    tokenizer: PreTrainedTokenizerBase,
+) -> List[Tuple[str, int, int]]:
+    files = []
+    for root, dirs, filenames in os.walk(dataset_path):
+        for filename in filenames:
+            if filename.endswith(".jsonl"):
+                files.append(os.path.join(root, filename))
+
+    num_lines = sum(
+        [
+            sum(
+                [
+                    len(json.loads(line)["instructions"])
+                    for line in open(filename, "r").readlines()
+                ]
+            )
+            for filename in files
+        ]
+    )
+
+    filtered_dataset: List[Tuple[str, int, int]] = []
+    for file in files:
+        print(f"Processing {file}")
+        with open(file, "r") as f:
+            for line in f.readlines():
+                if line.strip() == "":
+                    continue
+                data = json.loads(line)
+
+                input = data["input"]
+                input_len = len(tokenizer.tokenize(input))
+                for instruction, output in zip(data["instructions"], data["outputs"]):
+                    prompt = input + instruction
+                    prompt_len = input_len + len(tokenizer.tokenize(instruction))
+                    output_len = len(tokenizer.tokenize(output))
+                    if prompt_len >= 128000:
+                        prompt = prompt[:12800]
+                        prompt_len = 12800
+                    filtered_dataset.append(
+                        DatasetRow(
+                            prompt=prompt,
+                            prompt_len=prompt_len,
+                            output_len=output_len,
+                        )
+                    )
+
+    print(f"#LEval num prompts: {len(filtered_dataset)}")
+    print(f"#Input tokens: {np.sum([data.prompt_len for data in filtered_dataset])}")
+    print(f"#Output tokens: {np.sum([data.output_len for data in filtered_dataset])}")
+    return filtered_dataset
+
+    # random.shuffle(filtered_dataset)
+    average_len = sum_len / len(filtered_dataset)
+    ratio = cnt1 / cnt2
+    ratio2 = len1 / len2
+    print(f"#LEval num prompts: {len(filtered_dataset)}")
+    print(f"#Input tokens: {np.sum([x[1] for x in filtered_dataset])}")
+    print(f"#Output tokens: {np.sum([x[2] for x in filtered_dataset])}")
+    print(f"#Average len: {average_len}")
+    print(f"#Max len of single request: {max_len}")
+    # print(f"#conversation ratio: {ratio}")
+    print(f"#1M multi-turn conversation requests ratio: {ratio2}")
+    return filtered_dataset
 
 
 def parse_image_resolution(image_resolution: str) -> Tuple[int, int]:
@@ -2327,6 +2401,7 @@ if __name__ == "__main__":
             "mmmu",
             "image",
             "mooncake",
+            "leval",
         ],
         help="Name of the dataset to benchmark on.",
     )
