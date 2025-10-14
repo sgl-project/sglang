@@ -1167,14 +1167,11 @@ class ServerArgs:
 
             # Check TP size
             if self.tp_size > 1:
-                raise ValueError(
-                    "Currently only TP size 1 is supported for deterministic inference."
+                os.environ["NCCL_ALGO"] = "allreduce:tree"
+                self.disable_custom_all_reduce = True
+                logger.warning(
+                    "NCCL_ALGO is set to 'allreduce:tree' and custom all reduce is disabled for deterministic inference when TP size > 1."
                 )
-
-            # Warnings on MoE models
-            logger.warning(
-                "Currently deterministic inference is only tested on dense models. Please be cautious when using it on MoE models."
-            )
 
     def _handle_other_validations(self):
         pass

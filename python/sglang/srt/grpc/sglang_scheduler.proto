@@ -185,20 +185,8 @@ message GenerateComplete {
   // Final output
   repeated uint32 output_ids = 1;
 
-  // Finish reason
-  enum FinishReason {
-    // The model generated a stop sequence.
-    STOP = 0;
-    // The model reached the maximum generation length.
-    LENGTH = 1;
-    // The model generated an end-of-sequence (EOS) token.
-    EOS_TOKEN = 2;
-    // The model generated a user-provided stop string.
-    STOP_STR = 3;
-    // The request was aborted by the user or system.
-    ABORT = 4;
-  }
-  FinishReason finish_reason = 2;
+  // Finish reason as OpenAI-compatible string ("stop", "length", "abort")
+  string finish_reason = 2;
 
   // Token usage counts
   int32 prompt_tokens = 3;
@@ -210,6 +198,12 @@ message GenerateComplete {
 
   // All hidden states if requested
   repeated HiddenStates all_hidden_states = 7;
+
+  // Matched stop information (for stop sequences)
+  oneof matched_stop {
+    uint32 matched_token_id = 8;
+    string matched_stop_str = 9;
+  }
 }
 
 message GenerateError {
