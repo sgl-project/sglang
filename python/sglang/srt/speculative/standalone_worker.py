@@ -7,8 +7,9 @@ import torch
 from sglang.srt.distributed import GroupCoordinator, patch_tensor_parallel_group
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.eagle_worker import EAGLEWorker, load_token_map
+from sglang.srt.speculative.eagle_worker import EAGLEWorker
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_utils import load_token_map
 from sglang.srt.utils import empty_context, get_bool_env_var, is_cuda
 
 if is_cuda():

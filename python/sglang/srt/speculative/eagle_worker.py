@@ -49,13 +49,13 @@ from sglang.srt.speculative.spec_utils import (
     assign_draft_cache_locs,
     fast_topk,
     generate_token_bitmask,
+    load_token_map,
     select_top_k_tokens,
 )
 from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
     get_bool_env_var,
-    is_blackwell,
     is_cuda,
     next_power_of_2,
 )
@@ -954,17 +954,6 @@ class EAGLEWorker(TpModelWorker):
             if torch.any(torch.isnan(logits)):
                 logger.error("Detected errors during sampling! NaN in the logits.")
                 raise ValueError("Detected errors during sampling! NaN in the logits.")
-
-
-def load_token_map(token_map_path: str) -> List[int]:
-    if not os.path.exists(token_map_path):
-        cache_dir = snapshot_download(
-            os.path.dirname(token_map_path),
-            ignore_patterns=["*.bin", "*.safetensors"],
-        )
-        token_map_path = os.path.join(cache_dir, os.path.basename(token_map_path))
-    hot_token_id = torch.load(token_map_path, weights_only=True)
-    return torch.tensor(hot_token_id, dtype=torch.int64)
 
 
 @torch.compile(dynamic=True)
