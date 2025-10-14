@@ -422,6 +422,7 @@ class ServerArgs:
     disaggregation_decode_dp: Optional[int] = None
     disaggregation_prefill_pp: Optional[int] = 1
     disaggregation_ib_device: Optional[str] = None
+    disaggregation_decode_enable_offload_kvcache: bool = False
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
     # FIXME: hack to reduce ITL when decode bs is small
     disaggregation_decode_polling_interval: int = 1
@@ -1073,6 +1074,14 @@ class ServerArgs:
             raise ValueError(
                 "The arguments enable-hierarchical-cache and disable-radix-cache are mutually exclusive "
                 "and cannot be used at the same time. Please use only one of them."
+            )
+
+        if (
+            self.disaggregation_decode_enable_offload_kvcache
+            and self.disaggregation_mode != "decode"
+        ):
+            raise ValueError(
+                "The argument disaggregation-decode-enable-offload-kvcache is only supported for decode side."
             )
 
     def _handle_metrics_labels(self):
@@ -2561,6 +2570,11 @@ class ServerArgs:
             help="The InfiniBand devices for disaggregation transfer, accepts single device (e.g., --disaggregation-ib-device mlx5_0) "
             "or multiple comma-separated devices (e.g., --disaggregation-ib-device mlx5_0,mlx5_1). "
             "Default is None, which triggers automatic device detection when mooncake backend is enabled.",
+        )
+        parser.add_argument(
+            "--disaggregation-decode-enable-offload-kvcache",
+            action="store_true",
+            help="Enable async KV cache offloading on decode server (PD mode).",
         )
         parser.add_argument(
             "--num-reserved-decode-tokens",
