@@ -306,7 +306,6 @@ pub struct ChatCompletionRequest {
     // These parameters are extensions beyond the OpenAI API specification and
     // control model generation behavior in engine-specific ways.
     // =============================================================================
-
     /// Top-k sampling parameter (-1 to disable)
     #[serde(skip_serializing_if = "Option::is_none")]
     #[validate(custom(function = "validate_top_k_value"))]
