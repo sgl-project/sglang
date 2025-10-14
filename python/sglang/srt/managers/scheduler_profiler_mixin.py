@@ -42,7 +42,7 @@ class SchedulerProfilerMixin:
         self.profile_in_progress: bool = False
         self.rpd_profiler = None
         self.profile_stage: str = "all"  # "prefill", "decode", or "all" (default)
-        self.current_profiling_stage: Optional[str] = None 
+        self.current_profiling_stage: Optional[str] = None
 
     def init_profile(
         self,
