@@ -77,10 +77,10 @@ __device__ __forceinline__ T* get_global_offset_per_head_lf(
     int64_t page_id,
     int64_t item_size_bytes,
     int64_t head_id,
-    int64_t head_size_bytes,
+    int64_t head_num,
     int64_t /*unused*/) {
   // layer first offset func per head
-  return base + layer_id * layer_dim + page_id * item_size_bytes + head_id * head_size_bytes;
+  return base + layer_id * layer_dim + page_id * item_size_bytes + item_size_bytes / head_num * head_id;
 }
 
 template <typename T>
@@ -92,9 +92,10 @@ __device__ __forceinline__ T* get_global_offset_per_head_lf_tbl(
     int64_t page_id,
     int64_t item_size_bytes,
     int64_t head_id,
-    int64_t head_size_bytes,
+    int64_t head_num,
     int64_t /*unused*/) {
-  return reinterpret_cast<T*>(layer_base_tbl[layer_id]) + page_id * item_size_bytes + head_size_bytes * head_id;
+  return reinterpret_cast<T*>(layer_base_tbl[layer_id]) + page_id * item_size_bytes +
+         item_size_bytes / head_num * head_id;
 }
 
 template <typename T>
@@ -106,11 +107,11 @@ __device__ __forceinline__ T* get_global_offset_ph(
     int64_t page_id,
     int64_t item_size_bytes,
     int64_t head_id,
-    int64_t head_size_bytes,
+    int64_t head_num,
     int64_t page_size) {
   // page head
   return base + page_id / page_size * page_size * page_dim + page_dim / head_num * head_id * page_size +
-         page_id % page_size * page_dim / head_num + layer_id * head_size_bytes;
+         page_id % page_size * page_dim / head_num + layer_id * item_size_bytes / head_num;
 }
 
 template <auto SrcOffsetFn, auto DstOffsetFn>
@@ -158,7 +159,7 @@ __global__ void transfer_page_head_kernel_impl(
             src_page_id,
             item_size_bytes,
             head_id,
-            head_size_bytes,
+            head_num,
             page_size);
         char* dst_k_ptr = DstOffsetFn(
             static_cast<char*>(dst_k),
@@ -168,7 +169,7 @@ __global__ void transfer_page_head_kernel_impl(
             dst_page_id,
             item_size_bytes,
             head_id,
-            head_size_bytes,
+            head_num,
             page_size);
         transfer_item_warp(lane_id, src_k_ptr, dst_k_ptr, head_size_bytes);
 
@@ -180,7 +181,7 @@ __global__ void transfer_page_head_kernel_impl(
             src_page_id,
             item_size_bytes,
             head_id,
-            head_size_bytes,
+            head_num,
             page_size);
         char* dst_v_ptr = DstOffsetFn(
             static_cast<char*>(dst_v),
@@ -190,7 +191,7 @@ __global__ void transfer_page_head_kernel_impl(
             dst_page_id,
             item_size_bytes,
             head_id,
-            head_size_bytes,
+            head_num,
             page_size);
         transfer_item_warp(lane_id, src_v_ptr, dst_v_ptr, head_size_bytes);
       }
