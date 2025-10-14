@@ -111,8 +111,6 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5li
     fi \
  && FLASHINFER_LOGGING_LEVEL=warning python3 -m flashinfer --download-cubin
 
-
-
 # Download NVSHMEM source files
 # We use Tom's DeepEP fork for GB200 for now
 RUN set -eux; \
@@ -155,6 +153,7 @@ RUN cd /sgl-workspace/nvshmem && \
     cmake --build build --target install -j${CMAKE_BUILD_PARALLEL_LEVEL}
 
 # Install DeepEP
+# CTK13 requires the cccl include
 RUN cd /sgl-workspace/DeepEP && \
     case "$CUDA_VERSION" in \
       12.6.1) \
@@ -167,6 +166,9 @@ RUN cd /sgl-workspace/DeepEP && \
         echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 \
         ;; \
     esac && \
+    if [ "${CUDA_VERSION%%.*}" = "13" ]; then \
+      sed -i "/^    include_dirs = \['csrc\/'\]/a\    include_dirs.append('${CUDA_HOME}/include/cccl')" setup.py; \
+    fi && \
     NVSHMEM_DIR=${NVSHMEM_DIR} TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" pip install .
 
 # Install flashmla
@@ -191,7 +193,7 @@ RUN if [ "$TARGETARCH" = "amd64" ]; then \
 
 # Modify Triton source file to support cuda 13
 RUN if [ "${CUDA_VERSION%%.*}" = "13" ]; then \
-      TRITON_DIR=/usr/local/lib/python3.12/dist-packages/triton && \
+      TRITON_DIR=/usr/local/lib/python3.12/dist-packages/triton; \
       grep -q 'if major >= 13:' ${TRITON_DIR}/backends/nvidia/compiler.py || bash -lc $'sed -i \'/^def ptx_get_version(cuda_version) -> int:/,/^[[:space:]]*raise RuntimeError/s/^\\([[:space:]]*\\)raise RuntimeError.*/\\1if major >= 13:\\n\\1    base_ptx = 90\\n\\1    return base_ptx + (major - 13) * 10 + minor\\n\\n\\1raise RuntimeError("Triton only support CUDA 10.0 or higher, but got CUDA version: " + cuda_version)/\' ${TRITON_DIR}/backends/nvidia/compiler.py'; \
     fi
 
