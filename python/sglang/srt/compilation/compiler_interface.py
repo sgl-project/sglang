@@ -12,10 +12,8 @@ import torch
 import torch._inductor.compile_fx
 import torch.fx as fx
 
-from sglang.srt.model_executor.compilation.compilation_counter import (
-    compilation_counter,
-)
-from sglang.srt.model_executor.compilation.inductor_pass import pass_context
+from sglang.srt.compilation.compilation_counter import compilation_counter
+from sglang.srt.compilation.inductor_pass import pass_context
 
 
 class CompilerInterface:
