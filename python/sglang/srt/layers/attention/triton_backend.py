@@ -63,6 +63,7 @@ class TritonAttnBackend(AttentionBackend):
             decode_attention_fwd,
         )
         from sglang.srt.layers.attention.triton_ops.extend_attention import (
+            build_unified_kv_indices,
             extend_attention_fwd,
             extend_attention_fwd_unified,
         )
@@ -74,6 +75,7 @@ class TritonAttnBackend(AttentionBackend):
         self.extend_attention_fwd_unified = torch.compiler.disable(
             extend_attention_fwd_unified
         )
+        self.build_unified_kv_indices = torch.compiler.disable(build_unified_kv_indices)
 
         # Parse args
         self.skip_prefill = skip_prefill
@@ -877,69 +879,20 @@ class TritonAttnBackend(AttentionBackend):
             prefix_kv_indices = self.forward_metadata.kv_indices
             window_start_pos = None
 
-        # Build unified kv_indices (prefix + extend)
-        # Extend tokens are already in cache (written above)
+        # Build unified kv_indices using fused Triton kernel
         extend_kv_indices = forward_batch.out_cache_loc
-
-        # Optimize: Batch all CPU-GPU synchronization upfront
-        # Transfer all needed scalar values to CPU in one operation
-        prefix_kv_indptr_cpu = prefix_kv_indptr[: bs + 1].cpu()
-        extend_start_loc_cpu = forward_batch.extend_start_loc[:bs].cpu()
-        extend_seq_lens_cpu = forward_batch.extend_seq_lens[:bs].cpu()
-
-        # Compute prefix lengths on CPU (vectorized)
-        prefix_lens = (prefix_kv_indptr_cpu[1:] - prefix_kv_indptr_cpu[:-1]).to(
-            torch.int32
+        
+        unified_kv_indptr, unified_kv_indices, prefix_lens = self.build_unified_kv_indices(
+            prefix_kv_indptr,
+            prefix_kv_indices,
+            forward_batch.extend_start_loc,
+            forward_batch.extend_seq_lens,
+            extend_kv_indices,
+            bs,
         )
-
-        # Compute unified lengths and indptr on GPU
-        unified_lens = prefix_lens + extend_seq_lens_cpu.to(torch.int32)
-        unified_kv_indptr = torch.cat(
-            [
-                torch.zeros(1, dtype=torch.int32, device=self.device),
-                torch.cumsum(unified_lens.to(self.device), dim=0),
-            ]
-        )
-
-        # Convert to numpy for fast CPU-side iteration (no additional sync)
-        prefix_kv_indptr_np = prefix_kv_indptr_cpu.numpy()
-        extend_start_loc_np = extend_start_loc_cpu.numpy()
-        extend_seq_lens_np = extend_seq_lens_cpu.numpy()
-
-        # Build unified indices list (loop uses CPU values, no sync in loop)
-        unified_kv_indices_list = []
-        for i in range(bs):
-            # All array accesses are on CPU numpy arrays - no GPU sync
-            prefix_start_i = int(prefix_kv_indptr_np[i])
-            prefix_end_i = int(prefix_kv_indptr_np[i + 1])
-            extend_start_i = int(extend_start_loc_np[i])
-            extend_len_i = int(extend_seq_lens_np[i])
-
-            # Tensor slicing doesn't cause sync when using integer indices
-            if prefix_end_i > prefix_start_i:
-                seq_prefix_indices = prefix_kv_indices[prefix_start_i:prefix_end_i]
-                if extend_len_i > 0:
-                    seq_extend_indices = extend_kv_indices[
-                        extend_start_i : extend_start_i + extend_len_i
-                    ]
-                    unified_kv_indices_list.append(
-                        torch.cat([seq_prefix_indices, seq_extend_indices])
-                    )
-                else:
-                    unified_kv_indices_list.append(seq_prefix_indices)
-            else:
-                if extend_len_i > 0:
-                    seq_extend_indices = extend_kv_indices[
-                        extend_start_i : extend_start_i + extend_len_i
-                    ]
-                    unified_kv_indices_list.append(seq_extend_indices)
-
-        unified_kv_indices = (
-            torch.cat(unified_kv_indices_list)
-            if unified_kv_indices_list
-            else torch.empty(0, dtype=prefix_kv_indices.dtype, device=self.device)
-        )
-        prefix_lens = prefix_lens.to(self.device)
+        
+        # Convert prefix_lens to int32 for the kernel
+        prefix_lens = prefix_lens.to(torch.int32)
 
         # Call unified kernel
         self.extend_attention_fwd_unified(
