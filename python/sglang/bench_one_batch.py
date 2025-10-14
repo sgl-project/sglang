@@ -86,7 +86,6 @@ from sglang.srt.utils import (
 
 
 def start_cuda_profiler(rank_print):
-    """Start CUDA Profiler API for nsys profiling."""
     try:
         torch.cuda.cudart().cudaProfilerStart()
         rank_print("CUDA Profiler started (nsys will begin capturing)")
@@ -95,7 +94,6 @@ def start_cuda_profiler(rank_print):
 
 
 def stop_cuda_profiler(rank_print):
-    """Stop CUDA Profiler API and signal nsys to dump traces."""
     try:
         torch.cuda.cudart().cudaProfilerStop()
         rank_print("CUDA Profiler stopped (nsys should dump traces)")
@@ -357,14 +355,12 @@ def _read_prompts_from_file(prompt_file, rank_print):
 
 
 def _get_torch_profiler_output_dir():
-    """Get the torch profiler output directory from environment variable or default to current directory."""
-    return os.environ.get("SGLANG_TORCH_PROFILER_DIR", ".")
+    return os.environ.get("SGLANG_TORCH_PROFILER_DIR", "/tmp")
 
 
 def _create_torch_profiler_filename(
     profile_filename_prefix, batch_size, input_len, output_len, stage
 ):
-    """Create a torch profiler filename with proper directory handling."""
     output_dir = _get_torch_profiler_output_dir()
     filename = f"{profile_filename_prefix}_batch{batch_size}_input{input_len}_output{output_len}_{stage}.trace.json.gz"
     return os.path.join(output_dir, filename)
