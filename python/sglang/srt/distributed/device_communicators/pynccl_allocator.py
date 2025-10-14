@@ -5,7 +5,7 @@ from packaging import version
 from torch.cuda.memory import CUDAPluggableAllocator
 
 from sglang.srt.distributed.parallel_state import GroupCoordinator
-from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.server_args import get_global_server_args
 
 nccl_allocator_source = """
 #include <nccl.h>
@@ -32,7 +32,7 @@ _graph_pool_id = None
 
 
 def is_symmetric_memory_enabled():
-    return global_server_args_dict["enable_symm_mem"]
+    return get_global_server_args().enable_symm_mem
 
 
 def set_graph_pool_id(graph_pool_id):

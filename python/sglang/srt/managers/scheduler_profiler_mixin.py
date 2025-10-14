@@ -9,6 +9,7 @@ import torch
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqOutput, ProfileReqType
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import is_npu
+from sglang.srt.utils.profile_merger import ProfileMerger
 
 _is_npu = is_npu()
 if _is_npu:
@@ -25,7 +26,6 @@ logger = logging.getLogger(__name__)
 
 
 class SchedulerProfilerMixin:
-
     def init_profiler(self):
         self.torch_profiler = None
         self.torch_profiler_output_dir: Optional[str] = None
@@ -41,6 +41,7 @@ class SchedulerProfilerMixin:
         self.profile_steps: Optional[int] = None
         self.profile_in_progress: bool = False
         self.rpd_profiler = None
+        self.merge_profiles = False
 
     def init_profile(
         self,
@@ -52,6 +53,7 @@ class SchedulerProfilerMixin:
         record_shapes: Optional[bool],
         profile_by_stage: bool,
         profile_id: str,
+        merge_profiles: bool = False,
     ) -> ProfileReqOutput:
         if self.profile_in_progress:
             return ProfileReqOutput(
@@ -60,6 +62,7 @@ class SchedulerProfilerMixin:
             )
 
         self.profile_by_stage = profile_by_stage
+        self.merge_profiles = merge_profiles
 
         if output_dir is None:
             output_dir = os.getenv("SGLANG_TORCH_PROFILER_DIR", "/tmp")
@@ -169,6 +172,38 @@ class SchedulerProfilerMixin:
 
         return ProfileReqOutput(success=True, message="Succeeded")
 
+    def _merge_profile_traces(self) -> str:
+        if not self.merge_profiles:
+            return ""
+
+        if self.tp_rank != 0:
+            return ""
+        if getattr(self, "dp_size", 1) > 1 and getattr(self, "dp_rank", 0) != 0:
+            return ""
+        if getattr(self, "pp_size", 1) > 1 and getattr(self, "pp_rank", 0) != 0:
+            return ""
+        if getattr(self, "moe_ep_size", 1) > 1 and getattr(self, "moe_ep_rank", 0) != 0:
+            return ""
+
+        try:
+            logger.info("Starting profile merge...")
+            merger = ProfileMerger(self.torch_profiler_output_dir, self.profile_id)
+            merged_path = merger.merge_chrome_traces()
+
+            summary = merger.get_merge_summary()
+            merge_message = (
+                f" Merged trace: {merged_path} "
+                f"(Events: {summary.get('total_events', '?')}, "
+                f"Files: {summary.get('total_files', '?')})"
+            )
+
+            logger.info(f"Profile merge completed: {merged_path}")
+        except Exception as e:
+            logger.error(f"Failed to merge profiles: {e}", exc_info=True)
+            return f" Merge failed: {e!s}"
+        else:
+            return merge_message
+
     def stop_profile(
         self, stage: Optional[ForwardMode] = None
     ) -> ProfileReqOutput | None:
@@ -186,14 +221,21 @@ class SchedulerProfilerMixin:
         if self.torch_profiler is not None:
             self.torch_profiler.stop()
             if not _is_npu:
+                # Build filename with only non-zero ranks to maintain backward compatibility
+                filename_parts = [self.profile_id, f"TP-{self.tp_rank}"]
+
+                # Only add other ranks if parallelism is enabled (size > 1)
+                if getattr(self, "dp_size", 1) > 1:
+                    filename_parts.append(f"DP-{getattr(self, 'dp_rank', 0)}")
+                if getattr(self, "pp_size", 1) > 1:
+                    filename_parts.append(f"PP-{getattr(self, 'pp_rank', 0)}")
+                if getattr(self, "moe_ep_size", 1) > 1:
+                    filename_parts.append(f"EP-{getattr(self, 'moe_ep_rank', 0)}")
+
+                filename = "-".join(filename_parts) + stage_suffix + ".trace.json.gz"
+
                 self.torch_profiler.export_chrome_trace(
-                    os.path.join(
-                        self.torch_profiler_output_dir,
-                        self.profile_id
-                        + f"-TP-{self.tp_rank}"
-                        + stage_suffix
-                        + ".trace.json.gz",
-                    )
+                    os.path.join(self.torch_profiler_output_dir, filename)
                 )
             torch.distributed.barrier(self.tp_cpu_group)
 
@@ -224,15 +266,18 @@ class SchedulerProfilerMixin:
         if "CUDA_PROFILER" in self.profiler_activities:
             torch.cuda.cudart().cudaProfilerStop()
 
+        merge_message = self._merge_profile_traces()
+
         logger.info(
-            "Profiling done. Traces are saved to: %s",
+            "Profiling done. Traces are saved to: %s%s",
             self.torch_profiler_output_dir,
+            merge_message,
         )
         self.torch_profiler = None
         self.profile_in_progress = False
         self.profiler_start_forward_ct = None
 
-        return ProfileReqOutput(success=True, message="Succeeded.")
+        return ProfileReqOutput(success=True, message=f"Succeeded.{merge_message}")
 
     def _profile_batch_predicate(self, batch):
         if self.profile_by_stage:
@@ -282,6 +327,7 @@ class SchedulerProfilerMixin:
                     recv_req.record_shapes,
                     recv_req.profile_by_stage,
                     recv_req.profile_id,
+                    recv_req.merge_profiles,
                 )
             else:
                 self.init_profile(
@@ -293,6 +339,7 @@ class SchedulerProfilerMixin:
                     recv_req.record_shapes,
                     recv_req.profile_by_stage,
                     recv_req.profile_id,
+                    recv_req.merge_profiles,
                 )
                 return self.start_profile()
         else:
