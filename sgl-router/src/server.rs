@@ -132,18 +132,29 @@ impl AppContext {
             SharedResponseStorage,
             SharedConversationStorage,
         ) = match router_config.history_backend {
-            HistoryBackend::Memory => (
-                Arc::new(MemoryResponseStorage::new()),
-                Arc::new(MemoryConversationStorage::new()),
-            ),
-            HistoryBackend::None => (
-                Arc::new(NoOpResponseStorage::new()),
-                Arc::new(NoOpConversationStorage::new()),
-            ),
+            HistoryBackend::Memory => {
+                info!("Initializing data connector: Memory");
+                (
+                    Arc::new(MemoryResponseStorage::new()),
+                    Arc::new(MemoryConversationStorage::new()),
+                )
+            }
+            HistoryBackend::None => {
+                info!("Initializing data connector: None (no persistence)");
+                (
+                    Arc::new(NoOpResponseStorage::new()),
+                    Arc::new(NoOpConversationStorage::new()),
+                )
+            }
             HistoryBackend::Oracle => {
                 let oracle_cfg = router_config.oracle.clone().ok_or_else(|| {
                     "oracle configuration is required when history_backend=oracle".to_string()
                 })?;
+
+                info!(
+                    "Initializing data connector: Oracle ATP (pool: {}-{})",
+                    oracle_cfg.pool_min, oracle_cfg.pool_max
+                );
 
                 let response_storage =
                     OracleResponseStorage::new(oracle_cfg.clone()).map_err(|err| {
@@ -155,6 +166,7 @@ impl AppContext {
                         format!("failed to initialize Oracle conversation storage: {err}")
                     })?;
 
+                info!("Data connector initialized successfully: Oracle ATP");
                 (Arc::new(response_storage), Arc::new(conversation_storage))
             }
         };
