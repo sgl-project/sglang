@@ -351,7 +351,7 @@ jobs:
           python3 run_suite.py --suite per-commit-8-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
   unit-test-backend-8-gpu-h20:
-    needs: [check-changes]
+    needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
     if: always() && !failure() && !cancelled() &&
         ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     runs-on: 8-gpu-h20
