@@ -108,6 +108,7 @@
     ```
     export SGLANG_TORCH_PROFILER_DIR=./
     export SGLANG_PROFILE_WITH_STACK=1
+    export SGLANG_PROFILE_RECORD_SHAPES=1
     <launch the server>
     <launch the client with the additional --profile argument>
     ```
