@@ -107,8 +107,8 @@ def generate_baseline(
         response.raise_for_status()
         data = response.json()
         print(f"Dataset size: {len(data)}")
-    except Exception as e:
-        raise Exception(f"Failed to download ShareGPT dataset: {e}")
+    except requests.exceptions.RequestException as e:
+        raise Exception(f"Failed to download ShareGPT dataset: {e}") from e
 
     # Filter and prepare texts
     texts = []
