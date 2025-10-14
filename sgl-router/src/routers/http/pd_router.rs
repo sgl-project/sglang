@@ -88,7 +88,7 @@ impl PDRouter {
 
                 match res.bytes().await {
                     Ok(body) => {
-                        let mut response = Response::new(axum::body::Body::from(body));
+                        let mut response = Response::new(Body::from(body));
                         *response.status_mut() = StatusCode::OK;
                         *response.headers_mut() = response_headers;
                         response
@@ -201,7 +201,7 @@ impl PDRouter {
             }
             obj.insert(
                 "bootstrap_host".to_string(),
-                Value::Array(hosts.into_iter().map(serde_json::Value::from).collect()),
+                Value::Array(hosts.into_iter().map(Value::from).collect()),
             );
             obj.insert(
                 "bootstrap_port".to_string(),
@@ -209,7 +209,7 @@ impl PDRouter {
                     ports
                         .into_iter()
                         .map(|p| match p {
-                            Some(v) => serde_json::Value::from(v),
+                            Some(v) => Value::from(v),
                             None => Value::Null,
                         })
                         .collect(),
@@ -217,23 +217,23 @@ impl PDRouter {
             );
             obj.insert(
                 "bootstrap_room".to_string(),
-                Value::Array(rooms.into_iter().map(serde_json::Value::from).collect()),
+                Value::Array(rooms.into_iter().map(Value::from).collect()),
             );
         } else {
             obj.insert(
                 "bootstrap_host".to_string(),
-                serde_json::Value::from(prefill_worker.bootstrap_host()),
+                Value::from(prefill_worker.bootstrap_host()),
             );
             obj.insert(
                 "bootstrap_port".to_string(),
                 match prefill_worker.bootstrap_port() {
-                    Some(v) => serde_json::Value::from(v),
+                    Some(v) => Value::from(v),
                     None => Value::Null,
                 },
             );
             obj.insert(
                 "bootstrap_room".to_string(),
-                serde_json::Value::from(super::pd_types::generate_room_id()),
+                Value::from(super::pd_types::generate_room_id()),
             );
         }
         Ok(original)
@@ -508,8 +508,7 @@ impl PDRouter {
 
                         match res.bytes().await {
                             Ok(decode_body) => {
-                                let mut response =
-                                    Response::new(axum::body::Body::from(decode_body));
+                                let mut response = Response::new(Body::from(decode_body));
                                 *response.status_mut() = status;
                                 *response.headers_mut() = response_headers;
                                 response
@@ -1365,7 +1364,7 @@ mod tests {
         assert_eq!(decode_ref.load(), 0);
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
+        let stream = UnboundedReceiverStream::new(rx);
 
         let _response = router.create_streaming_response(
             stream.map(Ok),

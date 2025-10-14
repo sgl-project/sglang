@@ -397,9 +397,7 @@ class GrpcRequestManager:
         # Wait for result in background
         async def wait_for_result():
             try:
-                # Wait for completion
                 await state.event.wait()
-                # Get result from queue
                 result = await state.out_queue.get()
                 future.set_result(result)
             except Exception as e:
@@ -436,19 +434,6 @@ class GrpcRequestManager:
             await state.out_queue.put({"error": "Request aborted", "abort": True})
 
         return True
-
-    async def pause_generation(self):
-        """Pause generation processing."""
-        async with self.is_pause_cond:
-            self.is_pause = True
-            logger.info("Generation paused")
-
-    async def resume_generation(self):
-        """Resume generation processing."""
-        async with self.is_pause_cond:
-            self.is_pause = False
-            self.is_pause_cond.notify_all()
-            logger.info("Generation resumed")
 
     async def handle_loop(self):
         """

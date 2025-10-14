@@ -97,9 +97,7 @@ impl ResponseProcessor {
                 &original_request.model,
             );
 
-            let mut parser = pooled_parser
-                .lock()
-                .map_err(|e| format!("Failed to acquire reasoning parser lock: {}", e))?;
+            let mut parser = pooled_parser.lock().await;
             match parser.detect_and_parse_reasoning(&processed_text) {
                 Ok(result) => {
                     if !result.reasoning_text.is_empty() {

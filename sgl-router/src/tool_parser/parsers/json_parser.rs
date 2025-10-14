@@ -174,11 +174,6 @@ impl JsonParser {
 
         Ok(tools)
     }
-
-    /// Check if text contains tool calls
-    fn has_tool_call(&self, text: &str) -> bool {
-        text.contains('[') || text.contains('{')
-    }
 }
 
 impl Default for JsonParser {
@@ -216,7 +211,7 @@ impl ToolParser for JsonParser {
         let current_text = &self.buffer.clone();
 
         // Check if current_text has tool_call
-        let has_tool_start = self.has_tool_call(current_text)
+        let has_tool_start = self.has_tool_markers(current_text)
             || (self.current_tool_id >= 0 && current_text.starts_with(self.tool_call_separator));
 
         if !has_tool_start {
@@ -263,7 +258,7 @@ impl ToolParser for JsonParser {
 
     fn has_tool_markers(&self, text: &str) -> bool {
         let trimmed = text.trim();
-        (trimmed.starts_with('[') || trimmed.starts_with('{')) && trimmed.contains(r#""name""#)
+        trimmed.starts_with('[') || trimmed.starts_with('{')
     }
 
     fn get_unstreamed_tool_args(&self) -> Option<Vec<ToolCallItem>> {

@@ -127,6 +127,10 @@ suites = {
         TestFile("test_vlm_input_format.py", 300),
         TestFile("test_vision_openai_server_a.py", 724),
         TestFile("test_vision_openai_server_b.py", 446),
+        TestFile("layers/attention/mamba/test_causal_conv1d.py", 85),
+        TestFile("layers/attention/mamba/test_mamba_ssm.py", 85),
+        TestFile("layers/attention/mamba/test_mamba_ssm_ssd.py", 220),
+        TestFile("models/test_nvidia_nemotron_nano_v2.py", 180),
         TestFile("test_modelopt_loader.py", 30),
     ],
     "per-commit-2-gpu": [
@@ -142,6 +146,7 @@ suites = {
         TestFile("hicache/test_hicache_storage_file_backend.py", 200),
         TestFile("hicache/test_hicache_storage_mooncake_backend.py", 400),
         TestFile("hicache/test_hicache_storage_3fs_backend.py", 200),
+        TestFile("layers/attention/mamba/test_mamba2_mixer.py", 110),
     ],
     "per-commit-4-gpu": [
         TestFile("test_gpt_oss_4gpu.py", 300),
