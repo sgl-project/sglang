@@ -8,6 +8,11 @@ from typing import Any, List, Optional
 import torch
 
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache
+from sglang.srt.tracing.trace import (
+    trace_event,
+    trace_slice_end,
+    trace_slice_start,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +66,17 @@ class HiCacheStorage(ABC):
         Retrieve values for multiple keys.
         Returns a list of tensors or None for each key.
         """
-        pass
+        trace_slice_start("storage_batch_get_v1", f"storage_{len(keys)}")
+        # Default implementation - subclasses should override for efficiency
+        results = []
+        for i, key in enumerate(keys):
+            success = self.get(key, host_indices[i] if i < len(host_indices) else None)
+            results.append(success is not None)
+        trace_slice_end("storage_batch_get_v1", f"storage_{len(keys)}", attrs={
+            "num_keys": len(keys),
+            "successful_gets": sum(results),
+        })
+        return results
 
     def batch_set_v1(
         self,
@@ -70,10 +85,20 @@ class HiCacheStorage(ABC):
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
         """
-        Retrieve values for multiple keys.
-        Returns a list of tensors or None for each key.
+        Store values for multiple keys.
+        Returns a list of booleans indicating success for each key.
         """
-        pass
+        trace_slice_start("storage_batch_set_v1", f"storage_{len(keys)}")
+        # Default implementation - subclasses should override for efficiency
+        results = []
+        for i, key in enumerate(keys):
+            success = self.set(key, host_indices[i] if i < len(host_indices) else None)
+            results.append(success)
+        trace_slice_end("storage_batch_set_v1", f"storage_{len(keys)}", attrs={
+            "num_keys": len(keys),
+            "successful_sets": sum(results),
+        })
+        return results
 
     @abstractmethod
     def get(

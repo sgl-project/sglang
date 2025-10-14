@@ -42,6 +42,11 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
+from sglang.srt.tracing.trace import (
+    trace_event,
+    trace_slice_end,
+    trace_slice_start,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -429,13 +434,20 @@ class HiCacheController:
         """
         Back up KV caches from device memory to host memory.
         """
+        trace_slice_start("cache_write", str(node_id))
         host_indices = self.mem_pool_host.alloc(len(device_indices))
         if host_indices is None:
+            trace_event("cache_write_alloc_failed", str(node_id))
+            trace_slice_end("cache_write", str(node_id))
             return None
         self.write_queue.append(
             CacheOperation(host_indices, device_indices, node_id, priority)
         )
         self.start_writing()
+        trace_slice_end("cache_write", str(node_id), attrs={
+            "num_tokens": len(device_indices),
+            "host_indices_size": len(host_indices) if host_indices is not None else 0,
+        })
         return host_indices
 
     def start_writing(self) -> None:
@@ -475,12 +487,19 @@ class HiCacheController:
         """
         Load KV caches from host memory to device memory.
         """
+        trace_slice_start("cache_load", str(node_id))
         device_indices = self.mem_pool_device_allocator.alloc(len(host_indices))
         if device_indices is None:
+            trace_event("cache_load_alloc_failed", str(node_id))
+            trace_slice_end("cache_load", str(node_id))
             return None
         self.load_queue.append(
             CacheOperation(host_indices, device_indices, node_id, priority)
         )
+        trace_slice_end("cache_load", str(node_id), attrs={
+            "num_tokens": len(host_indices),
+            "device_indices_size": len(device_indices) if device_indices is not None else 0,
+        })
         return device_indices
 
     def move_indices(self, op: CacheOperation):
@@ -561,10 +580,15 @@ class HiCacheController:
         """
         Prefetch KV caches from storage backend to host memory.
         """
+        trace_slice_start("cache_prefetch", request_id)
         operation = PrefetchOperation(
             request_id, host_indices, new_input_tokens, last_hash, prefix_keys
         )
         self.prefetch_queue.put(operation)
+        trace_slice_end("cache_prefetch", request_id, attrs={
+            "num_tokens": len(new_input_tokens),
+            "host_indices_size": len(host_indices),
+        })
         return operation
 
     def terminate_prefetch(self, operation):

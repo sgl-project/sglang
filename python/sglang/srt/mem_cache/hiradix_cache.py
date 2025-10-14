@@ -21,6 +21,11 @@ from sglang.srt.mem_cache.memory_pool_host import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.metrics.collector import StorageMetricsCollector
+from sglang.srt.tracing.trace import (
+    trace_event,
+    trace_slice_end,
+    trace_slice_start,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -671,9 +676,15 @@ class HiRadixCache(RadixCache):
         return True
 
     def match_prefix(self, key: RadixKey, **kwargs):
+        trace_slice_start("hicache_match_prefix", str(kwargs.get('rid', 'unknown')))
         empty_value = torch.empty((0,), dtype=torch.int64, device=self.device)
         key.token_ids = self.key_convert_fn(key.token_ids)
         if self.disable or len(key) == 0:
+            trace_slice_end("hicache_match_prefix", str(kwargs.get('rid', 'unknown')), attrs={
+                "cache_disabled": self.disable,
+                "key_length": len(key),
+                "host_hit_length": 0,
+            })
             return MatchResult(
                 device_indices=empty_value,
                 last_device_node=self.root_node,
@@ -699,6 +710,11 @@ class HiRadixCache(RadixCache):
         while not last_host_node.backuped:
             last_host_node = last_host_node.parent
 
+        trace_slice_end("hicache_match_prefix", str(kwargs.get('rid', 'unknown')), attrs={
+            "key_length": len(key),
+            "host_hit_length": host_hit_length,
+            "device_hit_length": len(value),
+        })
         return MatchResult(
             device_indices=value,
             last_device_node=last_node,
