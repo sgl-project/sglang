@@ -22,7 +22,7 @@ The radix tree data structure for managing the KV cache.
 import heapq
 import time
 from collections import defaultdict
-from functools import partial
+from functools import lru_cache, partial
 from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Tuple, Union
 
 import torch
@@ -113,6 +113,13 @@ class TreeNode:
         if self.hash_value is None or len(self.hash_value) == 0:
             return None
         return self.hash_value[-1]
+
+    @lru_cache(maxsize=1)
+    def get_prefix_hash_values(self, node: TreeNode) -> List[str]:
+        if node is None or node.hash_value is None:
+            return []
+
+        return node.get_prefix_hash_values(node.parent) + node.hash_value
 
     def __lt__(self, other: "TreeNode"):
         return self.last_access_time < other.last_access_time
@@ -326,6 +333,8 @@ class RadixCache(BasePrefixCache):
 
         token_ids = (req.origin_input_ids + req.output_ids)[:-1]
         all_token_len = len(token_ids)
+        # For EAGLE radix cache, we will convert the key to bigram key, e.g. [1,2,3,4] -> [(1,2), (2,3), (3,4)], the length will -1. ((len([(1,2), (2,3), (3,4)]) = len([1,2,3,4]) - 1))
+        # So for the corresponding kv length should also -1. Then we get the actual_kv_len, and use it to do later calculation and slicing.
         actual_kv_len = all_token_len - 1 if self.is_eagle else all_token_len
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :all_token_len
@@ -349,7 +358,8 @@ class RadixCache(BasePrefixCache):
 
         old_prefix_len = len(req.prefix_indices)
         if self.is_eagle and old_prefix_len > req.last_matched_prefix_len:
-            # prefix_indices attached partial part (for page_size > 1) and one unmatched token (for EAGLE)
+            # In EAGLE chunked prefill case, the prefix_indices included one unmatched token (kv_indices[actual_kv_len:])
+            # Here we -1 to make sure the kv of the unmatched token can be freed correctly to avoid memory leak
             old_prefix_len -= 1
 
         # Radix Cache takes one ref in memory pool
@@ -370,7 +380,8 @@ class RadixCache(BasePrefixCache):
 
         token_ids = req.fill_ids
         all_token_len = len(token_ids)
-        # The actual kv len for EAGLE is len(token_ids), since EAGLE uses bigram key
+        # For EAGLE radix cache, we will convert the key to bigram key, e.g. [1,2,3,4] -> [(1,2), (2,3), (3,4)], the length will -1. ((len([(1,2), (2,3), (3,4)]) = len([1,2,3,4]) - 1))
+        # So for the corresponding kv length should also -1. Then we get the actual_kv_len, and use it to do later calculation and slicing.
         actual_kv_len = all_token_len - 1 if self.is_eagle else all_token_len
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :all_token_len
@@ -393,7 +404,8 @@ class RadixCache(BasePrefixCache):
 
         old_prefix_len = len(req.prefix_indices)
         if self.is_eagle and old_prefix_len > req.last_matched_prefix_len:
-            # prefix_indices attached partial part (for page_size > 1) and one unmatched token (for EAGLE)
+            # In EAGLE chunked prefill case, the prefix_indices included one unmatched token (kv_indices[actual_kv_len:])
+            # Here we -1 to make sure the kv of the unmatched token can be freed correctly to avoid memory leak
             old_prefix_len -= 1
 
         # Radix Cache takes one ref in memory pool

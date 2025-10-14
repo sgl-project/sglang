@@ -93,7 +93,7 @@ impl Tree {
     Thread-safe multi tenant radix tree
 
     1. Storing data for multiple tenants (the overlap of multiple radix tree)
-    2. Node-level lock to enable concurrent acesss on nodes
+    2. Node-level lock to enable concurrent access on nodes
     3. Leaf LRU eviction based on tenant access time
     */
 

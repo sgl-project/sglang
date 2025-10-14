@@ -156,6 +156,15 @@ class LoRAManager:
         Validate if an adapter can be loaded into the current LoRA memory pool and generate error if it is incompatible.
         """
 
+        # Check if this LoRA adapter is already loaded
+        if any(
+            lora_ref.lora_name == existing_lora_ref.lora_name
+            for existing_lora_ref in self.lora_refs.values()
+        ):
+            raise ValueError(
+                f"Failed to load LoRA adapter {lora_ref.lora_name} because it is already loaded"
+            )
+
         # Check if the LoRA adapter shape is compatible with the current LoRA memory pool configuration.
         memory_pool = getattr(self, "memory_pool", None)
         incompatible = memory_pool and not memory_pool.can_support(lora_config)
@@ -418,10 +427,6 @@ class LoRAManager:
         replace_submodule(self.base_model, module_name, lora_module)
         return lora_module
 
-    def should_skip_lora_for_vision_model(self, module_name):
-        # TODO: support different vision models
-        return module_name.find("vision_model.model") != -1
-
     def init_lora_modules(self):
         # Look-up table that essentially maps (layer_index, module_name) to the corresponding LoRA module.
         self.lora_modules: List[Dict[str, BaseLayerWithLoRA]] = [
@@ -437,10 +442,6 @@ class LoRAManager:
             if getattr(
                 self.base_model, "should_apply_lora", None
             ) and not self.base_model.should_apply_lora(module_name):
-                continue
-
-            # Skip vision model
-            if self.should_skip_lora_for_vision_model(module_name):
                 continue
 
             # The module should be converted if it is included in target_names

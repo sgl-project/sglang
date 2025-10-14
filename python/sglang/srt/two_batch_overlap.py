@@ -4,7 +4,7 @@ import copy
 import dataclasses
 import logging
 from dataclasses import replace
-from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence
 
 import torch
 
@@ -22,7 +22,7 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.moe.token_dispatcher import DeepEPDispatcher
 from sglang.srt.layers.quantization import deep_gemm_wrapper
-from sglang.srt.managers.schedule_batch import ScheduleBatch, global_server_args_dict
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
@@ -30,12 +30,13 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.operations import execute_operations, execute_overlapped_operations
 from sglang.srt.operations_strategy import OperationsStrategy
-from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import BumpAllocator, empty_context, get_bool_env_var, is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import DispatchOutput
+    from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
 _is_hip = is_hip()
 
@@ -153,7 +154,7 @@ def _update_device_and_sum_field_from_cpu_field(
         cpu_value
         if isinstance(cpu_value, torch.Tensor)
         else torch.tensor(cpu_value, dtype=old_device_value.dtype)
-    ).to(device=global_server_args_dict["device"], non_blocking=True)
+    ).to(device=get_global_server_args().device, non_blocking=True)
     setattr(batch, device_field, new_device_value)
 
     if sum_field is not None:
@@ -582,7 +583,7 @@ class TboForwardBatchPreparer:
             sum_field=None,
         )
         _, child_b.extend_start_loc = compute_position(
-            global_server_args_dict["attention_backend"],
+            get_global_server_args().attention_backend,
             child_b.extend_prefix_lens,
             child_b.extend_seq_lens,
             child_b.extend_num_tokens,
@@ -667,6 +668,7 @@ class TboForwardBatchPreparer:
             "can_run_dp_cuda_graph",
             "dp_padding_mode",
             "global_forward_mode",
+            "is_prefill_only",
             "spec_algorithm",
             "capture_hidden_mode",
             "padded_static_len",
@@ -686,7 +688,7 @@ class TboForwardBatchPreparer:
 
         # TODO improve, e.g. unify w/ `init_raw`
         if (
-            global_server_args_dict["moe_dense_tp_size"] == 1
+            get_global_server_args().moe_dense_tp_size == 1
             and batch.global_dp_buffer_len is not None
         ):
             sum_len = end_token_index - start_token_index
@@ -705,6 +707,8 @@ class TboForwardBatchPreparer:
                 extend_num_tokens=extend_num_tokens,
                 attn_backend=output_attn_backend,
                 num_token_non_padded=out_num_token_non_padded,
+                # TODO: handle it when we need TBO + DeepSeek V3.2
+                num_token_non_padded_cpu=None,
                 tbo_split_seq_index=None,
                 tbo_parent_token_range=(start_token_index, end_token_index),
                 tbo_children=None,
@@ -752,7 +756,7 @@ class TboForwardBatchPreparer:
         value_a = min(tbo_split_token_index, num_token_non_padded)
         value_b = max(0, num_token_non_padded - tbo_split_token_index)
         return torch.tensor([value_a, value_b], dtype=torch.int32).to(
-            device=global_server_args_dict["device"], non_blocking=True
+            device=get_global_server_args().device, non_blocking=True
         )
 
     @classmethod
