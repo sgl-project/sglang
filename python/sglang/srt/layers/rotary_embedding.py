@@ -27,7 +27,10 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 
 if _is_cuda:
-    from sgl_kernel import apply_rope_with_cos_sin_cache_inplace
+    from sgl_kernel import FusedSetKVBufferArg, apply_rope_with_cos_sin_cache_inplace
+else:
+    FusedSetKVBufferArg = None
+
 if _use_aiter:
     from aiter.rotary_embedding import get_rope as aiter_get_rope
 
@@ -146,8 +149,13 @@ class RotaryEmbedding(CustomOp):
         query: torch.Tensor,
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
+        fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """A PyTorch-native implementation of forward()."""
+        assert (
+            fused_set_kv_buffer_arg is None
+        ), "fused_set_kv_buffer_arg is not supported for native implementation"
+
         if offsets is not None:
             positions = positions + offsets
         positions = positions.flatten()
@@ -176,12 +184,17 @@ class RotaryEmbedding(CustomOp):
         query: torch.Tensor,
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
+        fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """A PyTorch-npu implementation of forward()."""
-        import os
+        assert (
+            fused_set_kv_buffer_arg is None
+        ), "fused_set_kv_buffer_arg is not supported for npu implementation"
 
         if get_bool_env_var("SGLANG_ENABLE_TORCH_COMPILE"):
-            return self.forward_native(positions, query, key, offsets)
+            return self.forward_native(
+                positions, query, key, offsets, fused_set_kv_buffer_arg
+            )
         else:
             rotary_mode = "half"
             if self.is_neox_style:
@@ -206,7 +219,12 @@ class RotaryEmbedding(CustomOp):
         query: torch.Tensor,
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
+        fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        assert (
+            fused_set_kv_buffer_arg is None
+        ), "fused_set_kv_buffer_arg is not supported for cpu implementation"
+
         positions = torch.add(positions, offsets) if offsets is not None else positions
         if _is_cpu_amx_available:
             return torch.ops.sgl_kernel.rotary_embedding_cpu(
@@ -218,7 +236,9 @@ class RotaryEmbedding(CustomOp):
                 self.is_neox_style,
             )
         else:
-            return self.forward_native(positions, query, key, offsets)
+            return self.forward_native(
+                positions, query, key, offsets, fused_set_kv_buffer_arg
+            )
 
     def forward_cuda(
         self,
@@ -226,7 +246,7 @@ class RotaryEmbedding(CustomOp):
         query: torch.Tensor,
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
-        fused_set_kv_buffer_arg=None,  # Optional[FusedSetKVBufferArg]
+        fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if _is_cuda and (self.head_size in [64, 128, 256, 512]):
             apply_rope_with_cos_sin_cache_inplace(
@@ -988,6 +1008,17 @@ class DynamicNTKAlphaRotaryEmbedding(RotaryEmbedding):
         return cache
 
 
+def apply_interleaved_rope(x: torch.Tensor, mrope_section: list[int]) -> torch.Tensor:
+    """Apply interleaved MRoPE to 3D rotary embeddings.
+    Reorganizes frequency layout from chunked [TTT...HHH...WWW] to
+    interleaved [THTHWHTHW...TT], preserving frequency continuity.
+    """
+    x_t = x[0].clone()
+    x_t[..., 1 : mrope_section[1] * 3 : 3] = x[1, ..., 1 : mrope_section[1] * 3 : 3]
+    x_t[..., 2 : mrope_section[2] * 3 : 3] = x[2, ..., 2 : mrope_section[2] * 3 : 3]
+    return x_t
+
+
 class MRotaryEmbedding(RotaryEmbedding):
     """Rotary Embedding with Multimodal Sections."""
 
@@ -1000,12 +1031,14 @@ class MRotaryEmbedding(RotaryEmbedding):
         is_neox_style: bool,
         dtype: torch.dtype,
         mrope_section: Optional[List[int]] = None,
+        mrope_interleaved: bool = False,
     ) -> None:
         super().__init__(
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
 
         self.mrope_section = mrope_section
+        self.mrope_interleaved = mrope_interleaved
         if self.mrope_section:
             expected_sum = rotary_dim // 2
             actual_sum = sum(self.mrope_section)
@@ -1045,6 +1078,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         positions: torch.Tensor,
         query: torch.Tensor,
         key: torch.Tensor,
+        fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """PyTorch-native implementation equivalent to forward().
 
@@ -1055,6 +1089,9 @@ class MRotaryEmbedding(RotaryEmbedding):
             query: [num_tokens, num_heads * head_size]
             key: [num_tokens, num_kv_heads * head_size]
         """
+        assert (
+            fused_set_kv_buffer_arg is None
+        ), "save kv cache is not supported for MRotaryEmbedding."
         assert positions.ndim == 1 or positions.ndim == 2
 
         num_tokens = positions.shape[-1]
@@ -1062,15 +1099,18 @@ class MRotaryEmbedding(RotaryEmbedding):
         cos, sin = cos_sin.chunk(2, dim=-1)
         if positions.ndim == 2:
             assert self.mrope_section
-
-            cos = torch.cat(
-                [m[i] for i, m in enumerate(cos.split(self.mrope_section, dim=-1))],
-                dim=-1,
-            )
-            sin = torch.cat(
-                [m[i] for i, m in enumerate(sin.split(self.mrope_section, dim=-1))],
-                dim=-1,
-            )
+            if self.mrope_interleaved:
+                cos = apply_interleaved_rope(cos, self.mrope_section)
+                sin = apply_interleaved_rope(sin, self.mrope_section)
+            else:
+                cos = torch.cat(
+                    [m[i] for i, m in enumerate(cos.split(self.mrope_section, dim=-1))],
+                    dim=-1,
+                )
+                sin = torch.cat(
+                    [m[i] for i, m in enumerate(sin.split(self.mrope_section, dim=-1))],
+                    dim=-1,
+                )
 
         query_shape = query.shape
         query = query.view(num_tokens, -1, self.head_size)
@@ -1102,6 +1142,13 @@ class MRotaryEmbedding(RotaryEmbedding):
         second_per_grid_ts: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if (
+            model_type.startswith("qwen3_vl") or model_type.startswith("qwen3_vl_moe")
+        ) and video_grid_thw is not None:
+            video_grid_thw = torch.repeat_interleave(
+                video_grid_thw, video_grid_thw[:, 0], dim=0
+            )
+            video_grid_thw[:, 0] = 1
         mrope_position_deltas = []
         if input_ids is not None and (
             image_grid_thw is not None or video_grid_thw is not None
@@ -1744,6 +1791,7 @@ def get_rope(
                     is_neox_style,
                     dtype,
                     mrope_section=rope_scaling["mrope_section"],
+                    mrope_interleaved=rope_scaling.get("mrope_interleaved", False),
                 )
             else:
                 rotary_emb = RotaryEmbedding(

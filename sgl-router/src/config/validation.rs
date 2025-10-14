@@ -29,6 +29,12 @@ impl ConfigValidator {
         Self::validate_retry(&retry_cfg)?;
         Self::validate_circuit_breaker(&cb_cfg)?;
 
+        if config.history_backend == HistoryBackend::Oracle && config.oracle.is_none() {
+            return Err(ConfigError::MissingRequired {
+                field: "oracle".to_string(),
+            });
+        }
+
         Ok(())
     }
 
@@ -197,6 +203,24 @@ impl ConfigValidator {
                 value: config.request_timeout_secs.to_string(),
                 reason: "Must be > 0".to_string(),
             });
+        }
+
+        if config.queue_size > 0 && config.queue_timeout_secs == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "queue_timeout_secs".to_string(),
+                value: config.queue_timeout_secs.to_string(),
+                reason: "Must be > 0 when queue_size > 0".to_string(),
+            });
+        }
+
+        if let Some(tokens_per_second) = config.rate_limit_tokens_per_second {
+            if tokens_per_second <= 0 {
+                return Err(ConfigError::InvalidValue {
+                    field: "rate_limit_tokens_per_second".to_string(),
+                    value: tokens_per_second.to_string(),
+                    reason: "Must be > 0 when specified".to_string(),
+                });
+            }
         }
 
         if config.worker_startup_timeout_secs == 0 {
@@ -664,7 +688,6 @@ mod tests {
 
     #[test]
     fn test_validate_pd_mode_with_separate_policies() {
-        // Test PD mode with different policies for prefill and decode
         let config = RouterConfig::new(
             RoutingMode::PrefillDecode {
                 prefill_urls: vec![
@@ -695,7 +718,6 @@ mod tests {
 
     #[test]
     fn test_validate_pd_mode_power_of_two_insufficient_workers() {
-        // Test that power-of-two policy requires at least 2 workers
         let config = RouterConfig::new(
             RoutingMode::PrefillDecode {
                 prefill_urls: vec![("http://prefill1:8000".to_string(), None)], // Only 1 prefill
@@ -720,7 +742,6 @@ mod tests {
 
     #[test]
     fn test_validate_grpc_requires_tokenizer() {
-        // Test that gRPC connection mode requires tokenizer configuration
         let mut config = RouterConfig::new(
             RoutingMode::Regular {
                 worker_urls: vec!["grpc://worker:50051".to_string()],
@@ -742,7 +763,6 @@ mod tests {
 
     #[test]
     fn test_validate_grpc_with_model_path() {
-        // Test that gRPC works with model_path
         let mut config = RouterConfig::new(
             RoutingMode::Regular {
                 worker_urls: vec!["grpc://worker:50051".to_string()],
@@ -759,7 +779,6 @@ mod tests {
 
     #[test]
     fn test_validate_grpc_with_tokenizer_path() {
-        // Test that gRPC works with tokenizer_path
         let mut config = RouterConfig::new(
             RoutingMode::Regular {
                 worker_urls: vec!["grpc://worker:50051".to_string()],
