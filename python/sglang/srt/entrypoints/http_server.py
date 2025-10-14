@@ -1094,7 +1094,7 @@ async def openai_v1_embeddings(request: EmbeddingRequest, raw_request: Request):
     dependencies=[Depends(validate_json_request)],
 )
 async def openai_v1_classify(request: ClassifyRequest, raw_request: Request):
-    """vLLM-compatible classification endpoint."""
+    """OpenAI-compatible classification endpoint."""
     return await raw_request.app.state.openai_serving_classify.handle_request(
         request, raw_request
     )

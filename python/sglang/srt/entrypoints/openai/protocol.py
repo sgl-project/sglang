@@ -765,7 +765,7 @@ ClassifyInput = Union[str, List[str], List[int]]
 
 
 class ClassifyRequest(BaseModel):
-    # vLLM-compatible classification request
+    # OpenAI-compatible classification request
     model: str = DEFAULT_MODEL_NAME
     input: ClassifyInput
     user: Optional[str] = None
@@ -782,21 +782,13 @@ class ClassifyData(BaseModel):
     probs: List[float]
     num_classes: int
 
-
-class ClassifyUsage(BaseModel):
-    prompt_tokens: int
-    total_tokens: int
-    completion_tokens: int
-    prompt_tokens_details: Optional[dict] = None
-
-
 class ClassifyResponse(BaseModel):
     id: str
     object: str = "list"
     created: int
     model: str
     data: List[ClassifyData]
-    usage: ClassifyUsage
+    usage: UsageInfo
 
 
 class EmbeddingResponse(BaseModel):
