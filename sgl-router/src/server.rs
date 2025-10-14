@@ -16,6 +16,7 @@ use crate::{
             ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest,
             RerankRequest, ResponsesGetParams, ResponsesRequest, V1RerankReqInput,
         },
+        validated::ValidatedJson,
         worker_spec::{WorkerApiResponse, WorkerConfigRequest, WorkerErrorResponse},
     },
     reasoning_parser::ParserFactory as ReasoningParserFactory,
@@ -291,7 +292,7 @@ async fn generate(
 async fn v1_chat_completions(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    Json(body): Json<ChatCompletionRequest>,
+    ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
 ) -> Response {
     state.router.route_chat(Some(&headers), &body, None).await
 }
