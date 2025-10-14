@@ -340,100 +340,6 @@ class SGLangCIAnalyzer:
                 else:
                     stats["failure_patterns"]["Other"] += 1
 
-    def generate_report(self, stats: Dict):
-        """Generate CI analysis report"""
-        print("\n" + "=" * 60)
-        print("SGLang CI Analysis Report (CUDA Only)")
-        print("=" * 60)
-
-        # Overall statistics
-        total = stats["total_runs"]
-        failed = stats["failed_runs"]
-        success = stats["successful_runs"]
-        cancelled = stats["cancelled_runs"]
-        skipped = stats["skipped_runs"]
-        success_rate = (success / total * 100) if total > 0 else 0
-
-        print(f"\nOverall Statistics:")
-        print(f"  Total runs: {total}")
-        print(f"  Successful: {success}")
-        print(f"  Failed: {failed}")
-        print(f"  Cancelled: {cancelled}")
-        print(f"  Skipped: {skipped}")
-        print(f"  Success rate: {success_rate:.1f}%")
-
-        # Category failure statistics
-        if stats["category_failures"]:
-            print(f"\nCategory Failure Statistics:")
-            for category, count in sorted(
-                stats["category_failures"].items(), key=lambda x: x[1], reverse=True
-            ):
-                print(f"  {category}: {count} failures")
-
-        # Most frequently failed jobs with links
-        if stats["job_failures"]:
-            print(f"\nMost Frequently Failed Jobs (Top 50):")
-            for i, (job, count) in enumerate(
-                sorted(stats["job_failures"].items(), key=lambda x: x[1], reverse=True)[
-                    :50
-                ],
-                1,
-            ):
-                print(f"  {i:2d}. {job}: {count} times")
-
-                # Show last successful run
-                if job in stats["job_last_success"]:
-                    last_success = stats["job_last_success"][job]
-                    success_date = datetime.fromisoformat(
-                        last_success["created_at"].replace("Z", "+00:00")
-                    )
-                    pr_info = last_success["pr_info"]
-
-                    pr_text = ""
-                    if pr_info["pr_number"]:
-                        pr_text = (
-                            f" (PR #{pr_info['pr_number']} by {pr_info['author']})"
-                        )
-                    else:
-                        pr_text = f" by {pr_info['author']}"
-
-                    print(
-                        f"      Last Success: Run #{last_success['run_number']} ({success_date.strftime('%Y-%m-%d %H:%M')}){pr_text}: {last_success['url']}"
-                    )
-
-                # Show recent failure links
-                if (
-                    job in stats["job_failure_links"]
-                    and stats["job_failure_links"][job]
-                ):
-                    print("      Recent Failures:")
-                    for link_info in stats["job_failure_links"][job]:
-                        created_at = datetime.fromisoformat(
-                            link_info["created_at"].replace("Z", "+00:00")
-                        )
-
-                        # Format PR info for failures
-                        pr_info = link_info.get("pr_info", {})
-                        pr_text = ""
-                        if pr_info.get("pr_number"):
-                            pr_text = f" (PR #{pr_info['pr_number']} by {pr_info.get('author', 'Unknown')})"
-                        else:
-                            pr_text = f" by {pr_info.get('author', 'Unknown')}"
-
-                        print(
-                            f"        - Run #{link_info['run_number']} ({created_at.strftime('%Y-%m-%d %H:%M')}){pr_text}: {link_info['url']}"
-                        )
-
-        # Failure pattern analysis
-        if stats["failure_patterns"]:
-            print(f"\nFailure Pattern Analysis:")
-            for pattern, count in sorted(
-                stats["failure_patterns"].items(), key=lambda x: x[1], reverse=True
-            ):
-                print(f"  {pattern}: {count} times")
-
-        print("\n" + "=" * 60)
-
     def _calculate_timing_stats(self, durations_list: List[Dict]) -> Dict:
         """Calculate average, P90, P99 for job durations"""
         import numpy as np
@@ -546,60 +452,12 @@ class SGLangCIAnalyzer:
             print(f"Failed to generate timing graph for {job_name}: {e}")
             return None
 
-    def _print_summary_to_console(self, stats: Dict, generated_graphs: Dict):
-        """Print summary analysis to console"""
-        print("=" * 70)
-        print("CI ANALYSIS SUMMARY")
-        print("=" * 70)
-
-        # Overall stats
-        total = stats["total_runs"]
-        failed = stats["failed_runs"]
-        success = stats["successful_runs"]
-        cancelled = stats["cancelled_runs"]
-        completed_runs = success + failed
-        success_rate = (success / completed_runs * 100) if completed_runs > 0 else 0
-
-        print(f"\n📈 Overall Statistics:")
-        print(f"  Total Runs: {total}")
-        print(f"  Successful: {success} ✅")
-        print(f"  Failed: {failed} ❌")
-        print(f"  Success Rate: {success_rate:.1f}% (excludes cancelled/skipped)")
-
-        # Top failed jobs
-        if stats["job_failures"]:
-            print(f"\n🔥 Top 10 Failed Jobs (by failure rate):")
-            job_failure_rates = []
-            for job, failure_count in stats["job_failures"].items():
-                total_count = stats["job_total_runs"].get(job, failure_count)
-                failure_rate = (
-                    (failure_count / total_count * 100) if total_count > 0 else 100.0
-                )
-                job_failure_rates.append(
-                    (job, failure_count, failure_rate, total_count)
-                )
-
-            job_failure_rates.sort(key=lambda x: (x[2], x[1]), reverse=True)
-
-            for i, (job, count, failure_rate, total_count) in enumerate(
-                job_failure_rates[:10], 1
-            ):
-                has_graph = "📊" if job in generated_graphs else ""
-                print(f"  {i:2d}. {job} {has_graph}")
-                print(
-                    f"      Failures: {count}/{total_count} runs ({failure_rate:.1f}%)"
-                )
-
-                # Show timing stats if available
-                if job in stats["job_durations"] and stats["job_durations"][job]:
-                    timing_stats = self._calculate_timing_stats(
-                        stats["job_durations"][job]
-                    )
-                    print(
-                        f"      Timing: avg={timing_stats['avg']/60:.1f}min, p90={timing_stats['p90']/60:.1f}min, p99={timing_stats['p99']/60:.1f}min"
-                    )
-
-        print(f"\n📊 Generated {len(generated_graphs)} timing graphs")
+    def _print_summary_to_console(
+        self, stats: Dict, generated_graphs: Dict, summary_markdown: str
+    ):
+        """Print summary analysis to console - same content as GitHub summary"""
+        print("\n" + "=" * 70)
+        print(summary_markdown)
         print("=" * 70 + "\n")
 
     def _generate_github_summary(
@@ -623,17 +481,7 @@ class SGLangCIAnalyzer:
                 f"\nGenerated {len(generated_graphs)} timing graphs in {output_dir}/\n"
             )
 
-            # Check if running in GitHub Actions
-            github_step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
-            if not github_step_summary:
-                print(
-                    "ℹ️  Not running in GitHub Actions, skipping summary markdown generation"
-                )
-                # Still print the summary to console
-                self._print_summary_to_console(stats, generated_graphs)
-                return
-
-            print("📊 Generating GitHub Actions summary markdown...")
+            print("📊 Generating CI analysis summary markdown...")
 
             summary_lines = []
             summary_lines.append("# 📊 SGLang CI Analysis Report")
@@ -793,25 +641,38 @@ class SGLangCIAnalyzer:
                     summary_lines.append(f"| {pattern} | {count} |")
                 summary_lines.append("")
 
-            # Append summary to GitHub Actions
-            # Check if file has content already
-            file_has_content = False
-            try:
-                if os.path.exists(github_step_summary):
-                    with open(github_step_summary, "r", encoding="utf-8") as f:
-                        content = f.read().strip()
-                        file_has_content = len(content) > 0
-            except:
-                pass
+            # Generate the full markdown summary
+            summary_markdown = "\n".join(summary_lines)
 
-            with open(github_step_summary, "a", encoding="utf-8") as f:
-                # Add separator only if file already has content
-                if file_has_content:
-                    f.write("\n\n")
-                f.write("\n".join(summary_lines))
-                f.write("\n")
+            # Always print summary to console (same format as GitHub)
+            self._print_summary_to_console(stats, generated_graphs, summary_markdown)
 
-            print("✅ GitHub Actions summary generated successfully")
+            # Write to GitHub Actions summary file if available
+            github_step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
+            if github_step_summary:
+                print("📝 Writing summary to GitHub Actions...")
+                # Check if file has content already
+                file_has_content = False
+                try:
+                    if os.path.exists(github_step_summary):
+                        with open(github_step_summary, "r", encoding="utf-8") as f:
+                            content = f.read().strip()
+                            file_has_content = len(content) > 0
+                except:
+                    pass
+
+                with open(github_step_summary, "a", encoding="utf-8") as f:
+                    # Add separator only if file already has content
+                    if file_has_content:
+                        f.write("\n\n")
+                    f.write(summary_markdown)
+                    f.write("\n")
+
+                print("✅ GitHub Actions summary written successfully")
+            else:
+                print(
+                    "ℹ️  Not running in GitHub Actions, summary only printed to console"
+                )
 
         except Exception as e:
             print(f"❌ Failed to generate GitHub Actions summary: {e}")
@@ -888,9 +749,6 @@ def main():
 
         # Analyze failures
         stats = analyzer.analyze_ci_failures(runs)
-
-        # Generate report
-        analyzer.generate_report(stats)
 
         # Generate GitHub Actions summary with timing graphs
         analyzer._generate_github_summary(stats, args.graph_dir)
