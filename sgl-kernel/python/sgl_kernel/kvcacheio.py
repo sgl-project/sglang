@@ -61,7 +61,8 @@ def transfer_kv_per_layer_pf_lf(
         num_warps_per_block,
     )
 
-def transfer_kv_per_layer_phf_lf(
+
+def transfer_kv_per_layer_ph_lf(
     src_k: torch.Tensor,
     dst_k: torch.Tensor,
     src_v: torch.Tensor,
@@ -76,7 +77,7 @@ def transfer_kv_per_layer_phf_lf(
     block_quota: int = 2,
     num_warps_per_block: int = 16 if _is_hip else 32,
 ):
-    torch.ops.sgl_kernel.transfer_kv_per_layer_phf_lf(
+    torch.ops.sgl_kernel.transfer_kv_per_layer_ph_lf(
         src_k,
         dst_k,
         src_v,
@@ -91,6 +92,7 @@ def transfer_kv_per_layer_phf_lf(
         block_quota,
         num_warps_per_block,
     )
+
 
 def transfer_kv_all_layer(
     src_k_layers: torch.Tensor,
@@ -145,7 +147,8 @@ def transfer_kv_all_layer_lf_pf(
         num_warps_per_block,
     )
 
-def transfer_kv_all_layer_lf_phf(
+
+def transfer_kv_all_layer_lf_ph(
     src_k_layers: torch.Tensor,
     dst_k: torch.Tensor,
     src_v_layers: torch.Tensor,
@@ -160,7 +163,7 @@ def transfer_kv_all_layer_lf_phf(
     block_quota: int = 2,
     num_warps_per_block: int = 16 if _is_hip else 32,
 ):
-    torch.ops.sgl_kernel.transfer_kv_all_layer_lf_phf(
+    torch.ops.sgl_kernel.transfer_kv_all_layer_lf_ph(
         src_k_layers,
         dst_k,
         src_v_layers,
@@ -175,6 +178,7 @@ def transfer_kv_all_layer_lf_phf(
         block_quota,
         num_warps_per_block,
     )
+
 
 def transfer_kv_direct(
     src_layers: List[torch.Tensor],
