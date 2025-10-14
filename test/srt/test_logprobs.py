@@ -184,6 +184,9 @@ def generate_baseline(
                 print(f"Warning: Failed to process sample {i}: {e}")
                 continue
 
+        if not records:
+            raise RuntimeError("Failed to generate any baseline records. Please check the warnings above for errors.")
+
         # Save baseline files
         with open(baseline_file, "wb") as f:
             pickle.dump(records, f)
