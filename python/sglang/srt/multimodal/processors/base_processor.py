@@ -234,7 +234,14 @@ class BaseMultimodalProcessor(ABC):
             and isinstance(processor.image_processor, BaseImageProcessorFast)
             and not self.server_args.disable_fast_image_processor
         ):
-            kwargs["device"] = "cuda" if not _is_npu else "npu"
+            if not _is_npu:
+                kwargs["device"] = "cuda"
+            elif processor.__class__.__name__ not in {
+                "Qwen2_5_VLProcessor",
+                "Qwen3VLProcessor",
+            }:
+                # Note: for qwen-vl, processor has some reshape issue because of dims restriction on Ascend.
+                kwargs["device"] = "npu"
         result = processor.__call__(
             text=[input_text],
             padding=True,

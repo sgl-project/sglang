@@ -638,6 +638,7 @@ class NPU_W8A8LinearMethodImpl:
             layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
         layer.weight_scale.data = torch.flatten(layer.weight_scale.data)
         layer.weight_offset.data = torch.flatten(layer.weight_offset.data)
+        layer.weight.data = torch_npu.npu_format_cast(layer.weight.data, 29)
 
 
 class NPU_W8A8LinearMethodMTImpl:
@@ -830,6 +831,7 @@ class NPU_W8A8DynamicLinearMethodImpl:
         layer.weight_scale.data = layer.weight_scale.data.flatten()
         layer.weight_scale_fp32 = layer.weight_scale.data.to(torch.float32)
         layer.weight_offset.data = layer.weight_offset.data.flatten()
+        layer.weight.data = torch_npu.npu_format_cast(layer.weight.data, 29)
 
 
 class NPU_W8A8DynamicLinearMethod(LinearMethodBase):
