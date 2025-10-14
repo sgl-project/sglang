@@ -72,10 +72,13 @@ def proxy_k_tensor_decode_kernel(
             sum_val += block_sum
             count_val += valid_count
         
+        first_token_in_page = tl.load(req_to_token_ptr + req_pool_idx * max_seq_len + page_token_start)
+        physical_page_id = first_token_in_page // page_size
+        
         # proxy_k_tensor shape: [num_pages, 1, num_head, num_dim]
         # 0: average
         avg_val = tl.where(count_val > 0, sum_val / count_val, 0.0)
-        avg_offset = page_idx * 1 * num_head * num_dim + 0 * num_head * num_dim + head_idx * num_dim + dim_idx
+        avg_offset = physical_page_id * 1 * num_head * num_dim + 0 * num_head * num_dim + head_idx * num_dim + dim_idx
         
         tl.store(proxy_k_tensor_ptr + avg_offset, avg_val)
         
@@ -180,10 +183,13 @@ def proxy_k_tensor_extend_kernel(
             sum_val += block_sum
             count_val += valid_count
         
+        first_token_in_page = tl.load(req_to_token_ptr + req_pool_idx * max_seq_len + page_token_start)
+        physical_page_id = first_token_in_page // page_size
+        
         # proxy_k_tensor shape: [num_pages, 1, num_head, num_dim]
         # 0: average
         avg_val = tl.where(count_val > 0, sum_val / count_val, 0.0)
-        avg_offset = page_idx * 1 * num_head * num_dim + 0 * num_head * num_dim + head_idx * num_dim + dim_idx
+        avg_offset = physical_page_id * 1 * num_head * num_dim + 0 * num_head * num_dim + head_idx * num_dim + dim_idx
         
         tl.store(proxy_k_tensor_ptr + avg_offset, avg_val)
 

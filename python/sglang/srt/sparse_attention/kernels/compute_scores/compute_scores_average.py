@@ -84,14 +84,12 @@ def _compute_average_score_kernel(
     is_not_zero = page_offsets != 0
     is_page_valid = is_in_valid_pages & is_not_zero
 
-    if pid_block == 0:
-        is_sink = page_offsets < num_sink_pages
-        is_page_valid = is_page_valid & (~is_sink)
-        
-    last_valid_page_idx = max_page_index - 1
-    local_start_idx = last_valid_page_idx - num_local_pages + 1
+    position_indices = tl.argmax(is_in_valid_pages_matrix.to(tl.int32), axis=1)
+    is_sink = (position_indices < num_sink_pages) & is_in_valid_pages
+    is_page_valid = is_page_valid & (~is_sink)
     
-    is_in_local = (page_offsets >= local_start_idx) & (page_offsets <= last_valid_page_idx)
+    local_start_idx = tl.maximum(num_valid_pages - num_local_pages, 0)
+    is_in_local = (position_indices >= local_start_idx) & is_in_valid_pages
     is_page_valid = is_page_valid & (~is_in_local)
 
     out_ptrs = (Out + bid * scores_stride_b + 
@@ -136,7 +134,6 @@ def compute_average_score(q: torch.Tensor,
         NUM_KV_HEADS, 
         triton.cdiv(num_pages, meta['BLOCK_SIZE_P'])
     )
-    
     _compute_average_score_kernel[grid](
         q, k, out, kv_pages_per_seq, kv_pages_num_per_seq, kv_pages_per_seq_max,
         # Strides
@@ -156,5 +153,4 @@ def compute_average_score(q: torch.Tensor,
         PADDED_HEAD_DIM=PADDED_HEAD_DIM,
         MAX_NUM_TOKEN_PAGES=max_num_token_pages,
         PADDED_MAX_NUM_TOKEN_PAGES=padded_max_num_token_pages,
-        
     )

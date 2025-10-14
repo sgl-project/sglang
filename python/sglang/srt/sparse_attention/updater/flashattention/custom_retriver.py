@@ -215,7 +215,7 @@ class NaiveDecodeSparseRetriver:
             num_heads = self.cache_manager.config.keys[0].shape[1]
             
             # set metadata info
-            metadata.page_table = retrive_result.page_table[:forward_batch.batch_size, :, :].reshape(forward_batch.batch_size * num_heads, -1)
+            metadata.page_table = retrive_result.page_table[forward_batch.req_pool_indices, :, :].reshape(forward_batch.batch_size * num_heads, -1)
             metadata.cache_seqlens_int32 = new_seq_lens
             metadata.cu_seqlens_k = torch.nn.functional.pad(
                 torch.cumsum(new_seq_lens, dim=0, dtype=torch.int32), (1, 0)
