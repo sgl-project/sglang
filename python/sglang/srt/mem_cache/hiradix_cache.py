@@ -234,7 +234,7 @@ class HiRadixCache(RadixCache):
         # High value node should have small priority which can be process firstly
         return -1 * value
 
-    def write_backup(self, node: TreeNode, priority=None, write_back=False):
+    def write_backup(self, node: TreeNode, write_back=False, priority=None):
         host_indices = self.cache_controller.write(
             device_indices=node.value,
             priority=priority,
@@ -278,7 +278,7 @@ class HiRadixCache(RadixCache):
                 priority = None
                 if self.enable_backup_priority:
                     priority = self.calculate_node_value(node)
-                self.write_backup(node, priority)
+                self.write_backup(node, write_back=False, priority=priority)
 
     def writing_check(self, write_back=False):
         if write_back:

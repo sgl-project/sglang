@@ -784,6 +784,7 @@ class Scheduler(
                     storage_backend_extra_config=server_args.hicache_storage_backend_extra_config,
                     enable_backup_priority=server_args.enable_backup_priority,
                     is_eagle=self.spec_algorithm.is_eagle(),
+                    enable_backup_priority=server_args.hicache_enable_backup_priority,
                 )
                 self.tp_worker.register_hicache_layer_transfer_counter(
                     self.tree_cache.cache_controller.layer_done_counter
@@ -826,6 +827,7 @@ class Scheduler(
                     eviction_policy=server_args.radix_eviction_policy,
                     enable_backup_priority=server_args.enable_backup_priority,
                     is_eagle=self.spec_algorithm.is_eagle(),
+                    enable_backup_priority=server_args.hicache_enable_backup_priority,
                 )
 
         if (
