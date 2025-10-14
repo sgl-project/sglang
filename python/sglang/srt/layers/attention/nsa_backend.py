@@ -539,7 +539,9 @@ class NativeSparseAttnBackend(AttentionBackend):
                 flashmla_metadata = self.decode_cuda_graph_metadata[
                     "flashmla_metadata"
                 ].slice(slice(0, bs * self.speculative_num_draft_tokens + 1))
-
+                # As the DeepGemm is not support for q_len = 3/4 in Indexer and every token has independent topk_indices,
+                # we made the Q shape [bs * speculative_num_draft_tokens, 1, head_nums, dim].
+                # So seq_len_q is 1 for flashmla_metadata in target_verify and draft_extend mode.
                 flashmla_metadata.copy_(
                     self._compute_flashmla_metadata(
                         cache_seqlens=nsa_cache_seqlens_int32,
@@ -613,7 +615,7 @@ class NativeSparseAttnBackend(AttentionBackend):
             max_seqlen_k = int(
                 seq_lens_cpu.max().item() + self.speculative_num_draft_tokens
             )
-            # metadata.max_seq_len_k = max_seqlen_k
+
             cache_seqlens = (seq_lens + self.speculative_num_draft_tokens).to(
                 torch.int32
             )
