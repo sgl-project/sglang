@@ -197,6 +197,7 @@ class SGLangCIAnalyzer:
                         "pr-test-b200-finish",
                         "lint",
                         "Set up job",
+                        "build-test (all)",
                     ]
                     and "-amd" not in job_name.lower()
                     and "mi300" not in job_name.lower()
