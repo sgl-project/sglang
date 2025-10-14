@@ -4,8 +4,8 @@ use std::time::Instant;
 
 use sglang_router_rs::core::{BasicWorker, BasicWorkerBuilder, Worker, WorkerType};
 use sglang_router_rs::protocols::spec::{
-    ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateParameters, GenerateRequest,
-    SamplingParams, StringOrArray, UserMessageContent,
+    ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateRequest, SamplingParams,
+    StringOrArray, UserMessageContent,
 };
 use sglang_router_rs::routers::http::pd_types::{generate_room_id, RequestWithBootstrap};
 
@@ -31,7 +31,6 @@ fn default_generate_request() -> GenerateRequest {
         prompt: None,
         input_ids: None,
         stream: false,
-        parameters: None,
         sampling_params: None,
         return_logprob: false,
         // SGLang Extensions
@@ -101,14 +100,6 @@ fn default_completion_request() -> CompletionRequest {
 fn create_sample_generate_request() -> GenerateRequest {
     GenerateRequest {
         text: Some("Write a story about artificial intelligence".to_string()),
-        parameters: Some(GenerateParameters {
-            max_new_tokens: Some(100),
-            temperature: Some(0.8),
-            top_p: Some(0.9),
-            top_k: Some(50),
-            repetition_penalty: Some(1.0),
-            ..Default::default()
-        }),
         sampling_params: Some(SamplingParams {
             temperature: Some(0.8),
             top_p: Some(0.9),
@@ -128,12 +119,10 @@ fn create_sample_chat_completion_request() -> ChatCompletionRequest {
         model: "gpt-3.5-turbo".to_string(),
         messages: vec![
             ChatMessage::System {
-                role: "system".to_string(),
                 content: "You are a helpful assistant".to_string(),
                 name: None,
             },
             ChatMessage::User {
-                role: "user".to_string(),
                 content: UserMessageContent::Text(
                     "Explain quantum computing in simple terms".to_string(),
                 ),
@@ -170,7 +159,6 @@ fn create_sample_completion_request() -> CompletionRequest {
 #[allow(deprecated)]
 fn create_large_chat_completion_request() -> ChatCompletionRequest {
     let mut messages = vec![ChatMessage::System {
-        role: "system".to_string(),
         content: "You are a helpful assistant with extensive knowledge.".to_string(),
         name: None,
     }];
@@ -178,12 +166,10 @@ fn create_large_chat_completion_request() -> ChatCompletionRequest {
     // Add many user/assistant pairs to simulate a long conversation
     for i in 0..50 {
         messages.push(ChatMessage::User {
-            role: "user".to_string(),
             content: UserMessageContent::Text(format!("Question {}: What do you think about topic number {} which involves complex reasoning about multiple interconnected systems and their relationships?", i, i)),
             name: None,
         });
         messages.push(ChatMessage::Assistant {
-            role: "assistant".to_string(),
             content: Some(format!("Answer {}: This is a detailed response about topic {} that covers multiple aspects and provides comprehensive analysis of the interconnected systems you mentioned.", i, i)),
             name: None,
             tool_calls: None,
