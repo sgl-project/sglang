@@ -116,7 +116,6 @@ async fn test_llama_real_world_output() {
     assert_eq!(result.len(), 1);
     assert_eq!(result[0].function.name, "web_search");
 
-    // Test with nicely formatted JSON
     let formatted_input = r#"<|python_tag|>{
     "name": "get_current_time",
     "arguments": {
@@ -144,7 +143,6 @@ async fn test_llama_json_array_format() {
 
 #[tokio::test]
 async fn test_single_json() {
-    // Test parsing plain JSON without python_tag
     let parser = LlamaParser::new();
     let text = r#"{"name": "get_weather", "arguments": {"city": "Paris"}}"#;
 
@@ -158,7 +156,6 @@ async fn test_single_json() {
 
 #[tokio::test]
 async fn test_multiple_json_with_separator() {
-    // Test multiple JSON objects with semicolon separator
     let parser = LlamaParser::new();
     let text = r#"<|python_tag|>{"name": "get_weather", "arguments": {"city": "Paris"}};{"name": "get_tourist_attractions", "arguments": {"city": "Paris"}}"#;
 
@@ -170,7 +167,6 @@ async fn test_multiple_json_with_separator() {
 
 #[tokio::test]
 async fn test_multiple_json_with_separator_customized() {
-    // Test multiple JSON objects with python_tag repeated
     let parser = LlamaParser::new();
     let text = r#"<|python_tag|>{"name": "get_weather", "arguments": {}}<|python_tag|>{"name": "get_tourist_attractions", "arguments": {}}"#;
 
@@ -182,7 +178,6 @@ async fn test_multiple_json_with_separator_customized() {
 
 #[tokio::test]
 async fn test_json_with_trailing_text() {
-    // Test JSON with trailing text after
     let parser = LlamaParser::new();
     let text = r#"{"name": "get_weather", "arguments": {}} Some follow-up text"#;
 
@@ -193,7 +188,6 @@ async fn test_json_with_trailing_text() {
 
 #[tokio::test]
 async fn test_invalid_then_valid_json() {
-    // Test error recovery - invalid JSON followed by valid JSON
     let parser = LlamaParser::new();
     let text = r#"{"name": "get_weather", "arguments": {{"name": "get_weather", "arguments": {}}"#;
 
@@ -206,7 +200,6 @@ async fn test_invalid_then_valid_json() {
 
 #[tokio::test]
 async fn test_plain_text_only() {
-    // Test plain text with no tool calls
     let parser = LlamaParser::new();
     let text = "This is just plain explanation text.";
 
@@ -216,7 +209,6 @@ async fn test_plain_text_only() {
 
 #[tokio::test]
 async fn test_with_python_tag_prefix() {
-    // Test text before python_tag
     let parser = LlamaParser::new();
     let text = r#"Some intro. <|python_tag|>{"name": "get_weather", "arguments": {}}"#;
 
@@ -225,9 +217,7 @@ async fn test_with_python_tag_prefix() {
     assert_eq!(result[0].function.name, "get_weather");
 }
 
-// ============================================================================
 // STREAMING TESTS
-// ============================================================================
 
 #[tokio::test]
 async fn test_llama_streaming_simple() {
@@ -332,7 +322,6 @@ async fn test_llama_streaming_with_text_before() {
 
 #[tokio::test]
 async fn test_llama_streaming_multiple_tools() {
-    // Test streaming multiple tool calls with semicolon separator
     let parser = LlamaParser::new();
     let mut state = sglang_router_rs::tool_parser::ParseState::new();
 
@@ -361,7 +350,6 @@ async fn test_llama_streaming_multiple_tools() {
 
 #[tokio::test]
 async fn test_llama_streaming_multiple_tools_chunked() {
-    // Test streaming multiple tool calls arriving in chunks
     let parser = LlamaParser::new();
     let mut state = sglang_router_rs::tool_parser::ParseState::new();
 

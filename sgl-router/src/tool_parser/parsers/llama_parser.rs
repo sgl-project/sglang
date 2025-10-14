@@ -139,7 +139,6 @@ mod tests {
     async fn test_single_call_with_semicolon() {
         let parser = LlamaParser::new();
         // Note: Llama 3.2 doesn't handle multiple calls well
-        // Test that we can at least parse a single call followed by semicolon
         let input = r#"<|python_tag|>{"name": "func1", "arguments": {"x": 1}};"#;
 
         let result = parser.parse_complete(input).await.unwrap();

@@ -91,3 +91,9 @@ fi
 
 # Show current packages
 $PIP_CMD list
+
+
+if [ -n "${HF_TOKEN:-}" ]; then
+    $PIP_CMD install -U "huggingface_hub[cli]" $PIP_INSTALL_SUFFIX
+    hf auth login --token $HF_TOKEN
+fi

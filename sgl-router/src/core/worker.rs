@@ -1562,19 +1562,16 @@ mod tests {
             .worker_type(WorkerType::Regular)
             .build();
 
-        // Test health status
         assert!(dp_worker.is_healthy());
         dp_worker.set_healthy(false);
         assert!(!dp_worker.is_healthy());
 
-        // Test load tracking
         assert_eq!(dp_worker.load(), 0);
         dp_worker.increment_load();
         assert_eq!(dp_worker.load(), 1);
         dp_worker.decrement_load();
         assert_eq!(dp_worker.load(), 0);
 
-        // Test processed tracking
         assert_eq!(dp_worker.processed_requests(), 0);
         dp_worker.increment_processed();
         assert_eq!(dp_worker.processed_requests(), 1);

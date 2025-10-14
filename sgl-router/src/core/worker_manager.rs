@@ -1485,7 +1485,6 @@ mod tests {
 
     #[test]
     fn test_parse_server_info_with_fallback() {
-        // Test with "model" instead of "model_id"
         let json = serde_json::json!({
             "model": "gpt-4",
             "dp_size": 2

@@ -279,11 +279,9 @@ mod tests {
 
     #[test]
     fn test_create_tiktoken_tokenizer() {
-        // Test creating tokenizer for GPT models
         let tokenizer = create_tokenizer("gpt-4").unwrap();
         assert!(tokenizer.vocab_size() > 0);
 
-        // Test encoding and decoding
         let text = "Hello, world!";
         let encoding = tokenizer.encode(text).unwrap();
         let decoded = tokenizer.decode(encoding.token_ids(), false).unwrap();
@@ -292,7 +290,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_download_tokenizer_from_hf() {
-        // Test with a small model that should have tokenizer files
         // Skip this test if HF_TOKEN is not set and we're in CI
         if std::env::var("CI").is_ok() && std::env::var("HF_TOKEN").is_err() {
             println!("Skipping HF download test in CI without HF_TOKEN");

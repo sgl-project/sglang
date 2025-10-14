@@ -6,7 +6,6 @@ use sglang_router_rs::tool_parser::{DeepSeekParser, ParseState, StreamResult, To
 async fn test_deepseek_complete_parsing() {
     let parser = DeepSeekParser::new();
 
-    // Test single tool call
     let input = r#"Let me help you with that.
 <｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather
 ```json
@@ -18,7 +17,6 @@ The weather in Tokyo is..."#;
     assert_eq!(result.len(), 1);
     assert_eq!(result[0].function.name, "get_weather");
 
-    // Verify arguments
     let args: serde_json::Value = serde_json::from_str(&result[0].function.arguments).unwrap();
     assert_eq!(args["location"], "Tokyo");
     assert_eq!(args["units"], "celsius");

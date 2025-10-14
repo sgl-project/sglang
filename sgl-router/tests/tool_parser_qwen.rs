@@ -189,7 +189,6 @@ async fn test_buffer_drain_optimization() {
     // First chunk - incomplete tool call
     let chunk1 = "<tool_call>\n{\"name\": \"test1\", ";
     let _result = parser.parse_incremental(chunk1, &mut state).await.unwrap();
-    // Phase 2 simplified streaming might not handle partial JSON correctly
     // The important thing is buffer accumulation works
     assert!(!state.buffer.is_empty());
 
@@ -197,32 +196,23 @@ async fn test_buffer_drain_optimization() {
     let chunk2 = "\"arguments\": {}}\n</tool_call><tool_call>\n{\"name\": \"test2\", ";
     let result = parser.parse_incremental(chunk2, &mut state).await.unwrap();
 
-    match result {
-        StreamResult::ToolComplete(tool) => {
-            assert_eq!(tool.function.name, "test1");
-            // After consuming the first tool, buffer should contain only the second tool start
-            assert!(state.buffer.starts_with("<tool_call>"));
-            assert!(state.buffer.contains("test2"));
-        }
-        _ => {
-            // Phase 2 simplified streaming might return Incomplete
-            // The important thing is the buffer is managed correctly
-        }
+    if let StreamResult::ToolComplete(tool) = result {
+        assert_eq!(tool.function.name, "test1");
+        // After consuming the first tool, buffer should contain only the second tool start
+        assert!(state.buffer.starts_with("<tool_call>"));
+        assert!(state.buffer.contains("test2"));
+    } else {
+        // The important thing is the buffer is managed correctly
     }
 
     // Complete the second tool
     let chunk3 = "\"arguments\": {\"x\": 1}}\n</tool_call>";
     let result = parser.parse_incremental(chunk3, &mut state).await.unwrap();
 
-    match result {
-        StreamResult::ToolComplete(tool) => {
-            assert_eq!(tool.function.name, "test2");
-            // Buffer should be empty after consuming all tools
-            assert!(state.buffer.is_empty() || !state.buffer.contains("</tool_call>"));
-        }
-        _ => {
-            // Phase 2 simplified streaming might handle this differently
-        }
+    if let StreamResult::ToolComplete(tool) = result {
+        assert_eq!(tool.function.name, "test2");
+        // Buffer should be empty after consuming all tools
+        assert!(state.buffer.is_empty() || !state.buffer.contains("</tool_call>"));
     }
 }
 
@@ -253,7 +243,4 @@ async fn test_buffer_efficiency_with_multiple_tools() {
             // Simplified streaming might return Incomplete
         }
     }
-
-    // Verify no memory issues or panics occurred with drain()
-    // Test passes if we reach this point without panic
 }

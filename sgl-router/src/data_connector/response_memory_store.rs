@@ -266,7 +266,6 @@ mod tests {
         assert_eq!(chain.responses[1].input, "Second");
         assert_eq!(chain.responses[2].input, "Third");
 
-        // Test with max_depth
         let limited_chain = store.get_response_chain(&id3, Some(2)).await.unwrap();
         assert_eq!(limited_chain.responses.len(), 2);
         assert_eq!(limited_chain.responses[0].input, "Second");
@@ -314,7 +313,6 @@ mod tests {
         let deleted_count = store.delete_user_responses("user1").await.unwrap();
         assert_eq!(deleted_count, 2);
 
-        // Verify they're gone
         let user1_responses_after = store.list_user_responses("user1", None).await.unwrap();
         assert_eq!(user1_responses_after.len(), 0);
 

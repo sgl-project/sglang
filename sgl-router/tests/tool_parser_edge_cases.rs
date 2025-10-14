@@ -167,8 +167,6 @@ async fn test_unicode_edge_cases() {
 
 #[tokio::test]
 async fn test_nested_brackets_in_strings() {
-    // Test that parsers correctly handle brackets within string literals
-
     let mistral_parser = MistralParser::new();
     let input = r#"[TOOL_CALLS] [{"name": "echo", "arguments": {"text": "Array: [1, 2, 3]"}}]"#;
     let result = mistral_parser.parse_complete(input).await.unwrap();
@@ -186,8 +184,6 @@ async fn test_nested_brackets_in_strings() {
 
 #[tokio::test]
 async fn test_multiple_formats_in_text() {
-    // Test that parsers don't get confused by other formats in the text
-
     let json_parser = JsonParser::new();
     let input = r#"
     Here's some text with [TOOL_CALLS] that shouldn't trigger.
@@ -272,7 +268,6 @@ async fn test_partial_token_at_buffer_boundary() {
     let parser = QwenParser::new();
     let mut state = ParseState::new();
 
-    // Test case that would fail with the bug:
     // Send exactly "<tool" which is a 5-character prefix of "<tool_call>\n"
     let result = parser.parse_incremental("<tool", &mut state).await.unwrap();
     assert!(matches!(result, StreamResult::Incomplete));
@@ -303,7 +298,6 @@ async fn test_partial_token_at_buffer_boundary() {
 async fn test_exact_prefix_lengths() {
     let parser = QwenParser::new();
 
-    // Test various exact prefix lengths that would be missed by exclusive range
     let test_cases = vec![
         ("<", 1),            // 1-char prefix
         ("<t", 2),           // 2-char prefix

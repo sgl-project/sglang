@@ -84,7 +84,6 @@ fn test_sequence_operations() {
     for prompt in TEST_PROMPTS.iter() {
         let encoding = tokenizer.encode(prompt).expect("Failed to encode prompt");
 
-        // Test Sequence with append_text
         let mut sequence = Sequence::new(tokenizer.clone());
         sequence.append_text(prompt).expect("Failed to append text");
 
@@ -95,7 +94,6 @@ fn test_sequence_operations() {
         );
         assert_eq!(sequence.text().unwrap(), *prompt, "Sequence text mismatch");
 
-        // Test incremental decoding with append_token
         let mut decoder = Sequence::new(tokenizer.clone());
         let mut output = String::new();
 
@@ -178,7 +176,6 @@ fn test_stop_sequence_decoder() {
             .expect("Failed to load tokenizer"),
     );
 
-    // Test with various stop sequences
     let test_cases = vec![
         (
             "Hello world! Stop here. Continue after.",
@@ -237,7 +234,6 @@ fn test_stop_sequence_decoder() {
 
 #[test]
 fn test_factory_creation() {
-    // Test factory creation method
     let tokenizer_path = ensure_tokenizer_cached();
     let tokenizer = factory::create_tokenizer(tokenizer_path.to_str().unwrap())
         .expect("Failed to create tokenizer via factory");

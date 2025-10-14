@@ -275,49 +275,15 @@ class HiCacheController:
                 and self.storage_config.tp_rank != 0
             )
 
-            if storage_backend == "file":
-                from sglang.srt.mem_cache.hicache_storage import HiCacheFile
+            # Use storage backend factory for dynamic backend creation
+            from sglang.srt.mem_cache.storage import StorageBackendFactory
 
-                self.storage_backend = HiCacheFile(self.storage_config)
-            elif storage_backend == "nixl":
-                from sglang.srt.mem_cache.storage.nixl.hicache_nixl import HiCacheNixl
-
-                self.storage_backend = HiCacheNixl()
-            elif storage_backend == "mooncake":
-                from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
-                    MooncakeStore,
+            try:
+                self.storage_backend = StorageBackendFactory.create_backend(
+                    storage_backend, self.storage_config, self.mem_pool_host
                 )
-
-                self.storage_backend = MooncakeStore(self.storage_config)
-            elif storage_backend == "aibrix":
-                from sglang.srt.mem_cache.storage.aibrix_kvcache.aibrix_kvcache_storage import (
-                    AibrixKVCacheStorage,
-                )
-
-                self.storage_backend = AibrixKVCacheStorage(
-                    self.storage_config, self.mem_pool_host
-                )
-            elif storage_backend == "hf3fs":
-                from sglang.srt.mem_cache.storage.hf3fs.storage_hf3fs import (
-                    HiCacheHF3FS,
-                )
-
-                if self.mem_pool_host.layout == "page_first":
-                    bytes_per_page = (
-                        mem_pool_host.get_ksize_per_token() * mem_pool_host.page_size
-                    )
-                elif self.mem_pool_host.layout == "layer_first":
-                    bytes_per_page = (
-                        mem_pool_host.get_size_per_token() * mem_pool_host.page_size
-                    )
-                dtype = mem_pool_host.dtype
-                self.storage_backend = HiCacheHF3FS.from_env_config(
-                    bytes_per_page, dtype, self.storage_config
-                )
-            else:
-                raise NotImplementedError(
-                    f"Unsupported storage backend: {storage_backend}"
-                )
+            except ValueError as e:
+                raise ValueError(f"Failed to create storage backend: {e}") from e
 
             self.storage_backend.register_mem_pool_host(self.mem_pool_host)
 

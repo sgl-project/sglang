@@ -134,7 +134,7 @@ class GenerateReqInput:
     # Conversation id used for tracking requests
     conversation_id: Optional[str] = None
 
-    # Label for the request
+    # (Deprecated, please use custom_labels) Label for the request
     label: Optional[str] = None
 
     # Priority for the request
