@@ -1,10 +1,12 @@
 import time
+from urllib.parse import urlparse
 
 import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_with_error_check,
 )
@@ -13,8 +15,17 @@ from sglang.test.test_utils import (
 class TestDisaggregationBase(CustomTestCase):
     @classmethod
     def setUpClass(cls):
+        parsed_url = urlparse(DEFAULT_URL_FOR_TEST)
+        cls.base_host = parsed_url.hostname
+        base_port = str(parsed_url.port)
+        cls.lb_port = base_port
+        cls.prefill_port = f"{int(base_port) + 100}"
+        cls.decode_port = f"{int(base_port) + 200}"
+        cls.prefill_url = f"http://{cls.base_host}:{cls.prefill_port}"
+        cls.decode_url = f"http://{cls.base_host}:{cls.decode_port}"
+        cls.lb_url = f"http://{cls.base_host}:{cls.lb_port}"
+        print(f"{cls.base_host=} {cls.lb_port=} {cls.prefill_port=} {cls.decode_port=}")
         cls.process_lb, cls.process_decode, cls.process_prefill = None, None, None
-        pass
 
     @classmethod
     def launch_lb(cls):

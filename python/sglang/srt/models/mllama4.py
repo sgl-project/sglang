@@ -700,7 +700,7 @@ class Llama4ForConditionalGeneration(nn.Module):
         """Handle scale parameter remapping. Returns True if handled."""
         if "scale" in name and "expert" not in name:
             remapped_name = maybe_remap_kv_scale_name(name, params_dict)
-            return remapped_name is None
+            return remapped_name is not None and remapped_name != name
         return False
 
     def _handle_stacked_params(

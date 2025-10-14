@@ -49,7 +49,7 @@ from typing import List, Optional, Sequence, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers.activations import ACT2FN, PytorchGELUTanh
+from transformers.activations import ACT2FN, GELUTanh
 from transformers.modeling_utils import PreTrainedModel
 
 try:
@@ -614,7 +614,7 @@ class MoonVitPretrainedModel(PreTrainedModel):
                 "num_heads": config.num_attention_heads,
                 "hidden_dim": config.hidden_size,
                 "mlp_dim": config.intermediate_size,
-                "activation": PytorchGELUTanh(),
+                "activation": GELUTanh(),
                 "attn_bias": True,
                 "attn_implementation": config._attn_implementation,
             },

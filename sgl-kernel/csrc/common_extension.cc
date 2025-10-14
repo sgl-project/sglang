@@ -107,6 +107,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("concat_mla_absorb_q(Tensor a, Tensor b, Tensor! out) -> ()");
   m.impl("concat_mla_absorb_q", torch::kCUDA, &concat_mla_absorb_q);
 
+  m.def("fast_topk(Tensor score, Tensor indices, Tensor lengths) -> ()");
+  m.impl("fast_topk", torch::kCUDA, &fast_topk_interface);
+  m.def(
+      "fast_topk_transform_fused(Tensor score, Tensor lengths, Tensor dst_page_table, Tensor src_page_table, Tensor "
+      "cu_seqlens_q) -> ()");
+  m.impl("fast_topk_transform_fused", torch::kCUDA, &fast_topk_transform_interface);
+
   /*
    * From csrc/gemm
    */

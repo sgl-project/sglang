@@ -30,8 +30,7 @@ SIMULATE_ACC_LEN = envs.SGLANG_SIMULATE_ACC_LEN.get()  # turn off if < 0
 SIMULATE_ACC_METHOD = envs.SGLANG_SIMULATE_ACC_METHOD.get()
 
 TREE_TRAVERSE_TIME_THRESHOLD = 1  # TODO: set this properly
-
-TREE_SPEC_KERNEL_AVAILABLE = "tree_speculative_sampling_target_only" in globals()
+TREE_SPEC_KERNEL_AVAILABLE = is_cuda()  # This kernel is only available for CUDA now
 
 
 @triton.jit
