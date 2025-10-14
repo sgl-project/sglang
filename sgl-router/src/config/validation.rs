@@ -29,6 +29,12 @@ impl ConfigValidator {
         Self::validate_retry(&retry_cfg)?;
         Self::validate_circuit_breaker(&cb_cfg)?;
 
+        if config.history_backend == HistoryBackend::Oracle && config.oracle.is_none() {
+            return Err(ConfigError::MissingRequired {
+                field: "oracle".to_string(),
+            });
+        }
+
         Ok(())
     }
 

@@ -1,8 +1,8 @@
 use super::pd_types::api_path;
 use crate::config::types::RetryConfig;
 use crate::core::{
-    is_retryable_status, ConnectionMode, RetryExecutor, Worker, WorkerLoadGuard, WorkerRegistry,
-    WorkerType,
+    is_retryable_status, ConnectionMode, RetryExecutor, Worker, WorkerLoadGuard, WorkerManager,
+    WorkerRegistry, WorkerType,
 };
 use crate::metrics::RouterMetrics;
 use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
@@ -18,7 +18,6 @@ use axum::{
     extract::Request,
     http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
-    Json,
 };
 use futures_util::StreamExt;
 use reqwest::Client;
@@ -53,61 +52,6 @@ struct PDRequestContext<'a> {
 }
 
 impl PDRouter {
-    async fn process_workers(
-        &self,
-        worker_type_enum: WorkerType,
-        worker_type: &str,
-        endpoint: &str,
-    ) -> (Vec<String>, Vec<String>) {
-        let mut results = Vec::new();
-        let mut errors = Vec::new();
-
-        let workers = self.worker_registry.get_by_type(&worker_type_enum);
-        let urls: Vec<String> = workers.iter().map(|w| w.url().to_string()).collect();
-
-        for worker_url in urls {
-            let url = format!("{}/{}", worker_url, endpoint);
-            match self.client.post(&url).send().await {
-                Ok(res) if res.status().is_success() => {
-                    results.push(format!("{} {}: OK", worker_type, worker_url));
-                }
-                Ok(res) => {
-                    errors.push(format!(
-                        "{} {} returned status: {}",
-                        worker_type,
-                        worker_url,
-                        res.status()
-                    ));
-                }
-                Err(e) => {
-                    errors.push(format!("{} {} error: {}", worker_type, worker_url, e));
-                }
-            }
-        }
-
-        (results, errors)
-    }
-
-    fn _get_worker_url_and_key(&self, w: &Arc<dyn Worker>) -> (String, Option<String>) {
-        (w.url().to_string(), w.api_key().clone())
-    }
-
-    fn get_prefill_worker_urls_with_api_key(&self) -> Vec<(String, Option<String>)> {
-        self.worker_registry
-            .get_prefill_workers()
-            .iter()
-            .map(|w| self._get_worker_url_and_key(w))
-            .collect()
-    }
-
-    fn get_decode_worker_urls_with_api_key(&self) -> Vec<(String, Option<String>)> {
-        self.worker_registry
-            .get_decode_workers()
-            .iter()
-            .map(|w| self._get_worker_url_and_key(w))
-            .collect()
-    }
-
     async fn proxy_to_first_prefill_worker(
         &self,
         endpoint: &str,
@@ -784,7 +728,10 @@ impl PDRouter {
                     let url = url.clone();
                     let api_key = api_key.clone();
                     async move {
-                        let load = get_worker_load(&client, &url, &api_key).await.unwrap_or(0);
+                        let load =
+                            WorkerManager::get_worker_load(&url, api_key.as_deref(), &client)
+                                .await
+                                .unwrap_or(0);
                         (url, load)
                     }
                 })
@@ -1118,83 +1065,10 @@ impl PDRouter {
     }
 }
 
-// Helper functions
-
-async fn get_worker_load(
-    client: &Client,
-    worker_url: &str,
-    api_key: &Option<String>,
-) -> Option<isize> {
-    let mut req_builder = client.get(format!("{}/get_load", worker_url));
-    if let Some(key) = api_key {
-        req_builder = req_builder.bearer_auth(key);
-    }
-    match req_builder.send().await {
-        Ok(res) if res.status().is_success() => match res.bytes().await {
-            Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
-                Ok(data) => data
-                    .get("load")
-                    .and_then(|v| v.as_i64())
-                    .map(|v| v as isize),
-                Err(e) => {
-                    debug!("Failed to parse load response from {}: {}", worker_url, e);
-                    None
-                }
-            },
-            Err(e) => {
-                debug!("Failed to read load response from {}: {}", worker_url, e);
-                None
-            }
-        },
-        Ok(res) => {
-            debug!(
-                "Worker {} returned non-success status: {}",
-                worker_url,
-                res.status()
-            );
-            None
-        }
-        Err(e) => {
-            debug!("Failed to get load from {}: {}", worker_url, e);
-            None
-        }
-    }
-}
-
 #[async_trait]
 impl RouterTrait for PDRouter {
     fn as_any(&self) -> &dyn std::any::Any {
         self
-    }
-
-    async fn health(&self, _req: Request<Body>) -> Response {
-        // This is a server readiness check - checking if we have healthy workers
-        // Workers handle their own health checks in the background
-        let mut all_healthy = true;
-        let mut unhealthy_servers = Vec::new();
-
-        // Check all workers
-        for worker in self.worker_registry.get_all() {
-            if !worker.is_healthy() {
-                all_healthy = false;
-                let worker_type = match worker.worker_type() {
-                    WorkerType::Prefill { .. } => "Prefill",
-                    WorkerType::Decode => "Decode",
-                    _ => "Worker",
-                };
-                unhealthy_servers.push(format!("{}: {}", worker_type, worker.url()));
-            }
-        }
-
-        if all_healthy {
-            (StatusCode::OK, "All servers healthy").into_response()
-        } else {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("Unhealthy servers: {:?}", unhealthy_servers),
-            )
-                .into_response()
-        }
     }
 
     async fn health_generate(&self, _req: Request<Body>) -> Response {
@@ -1483,138 +1357,8 @@ impl RouterTrait for PDRouter {
         self.execute_dual_dispatch(headers, body, context).await
     }
 
-    async fn flush_cache(&self) -> Response {
-        // Process both prefill and decode workers
-        let (prefill_results, prefill_errors) = self
-            .process_workers(
-                WorkerType::Prefill {
-                    bootstrap_port: None,
-                },
-                "Prefill",
-                "flush_cache",
-            )
-            .await;
-        let (decode_results, decode_errors) = self
-            .process_workers(WorkerType::Decode, "Decode", "flush_cache")
-            .await;
-
-        // Combine results and errors
-        let mut results = prefill_results;
-        results.extend(decode_results);
-        let mut errors = prefill_errors;
-        errors.extend(decode_errors);
-
-        if errors.is_empty() {
-            (
-                StatusCode::OK,
-                format!("Cache flushed successfully: {:?}", results),
-            )
-                .into_response()
-        } else {
-            (
-                StatusCode::PARTIAL_CONTENT,
-                format!(
-                    "Partial success. Results: {:?}, Errors: {:?}",
-                    results, errors
-                ),
-            )
-                .into_response()
-        }
-    }
-
-    async fn get_worker_loads(&self) -> Response {
-        let mut loads = HashMap::new();
-        let mut errors = Vec::new();
-
-        // Process prefill workers
-        let prefill_urls_with_key = self.get_prefill_worker_urls_with_api_key();
-        for (worker_url, api_key) in prefill_urls_with_key {
-            match get_worker_load(&self.client, &worker_url, &api_key).await {
-                Some(load) => {
-                    loads.insert(format!("prefill_{}", worker_url), load);
-                }
-                None => {
-                    errors.push(format!("Failed to get load from prefill {}", worker_url));
-                }
-            }
-        }
-
-        // Process decode workers
-        let decode_urls_with_key = self.get_decode_worker_urls_with_api_key();
-        for (worker_url, api_key) in decode_urls_with_key {
-            match get_worker_load(&self.client, &worker_url, &api_key).await {
-                Some(load) => {
-                    loads.insert(format!("decode_{}", worker_url), load);
-                }
-                None => {
-                    errors.push(format!("Failed to get load from decode {}", worker_url));
-                }
-            }
-        }
-
-        let response_data = serde_json::json!({
-            "loads": loads,
-            "errors": errors
-        });
-
-        (StatusCode::OK, Json(response_data)).into_response()
-    }
-
     fn router_type(&self) -> &'static str {
         "pd"
-    }
-
-    fn readiness(&self) -> Response {
-        // PD router is ready if it has at least one healthy prefill AND one healthy decode worker
-        let prefill_workers = self.worker_registry.get_prefill_workers();
-        let decode_workers = self.worker_registry.get_decode_workers();
-
-        let healthy_prefill_count = prefill_workers.iter().filter(|w| w.is_healthy()).count();
-
-        let healthy_decode_count = decode_workers.iter().filter(|w| w.is_healthy()).count();
-
-        let total_prefill = prefill_workers.len();
-        let total_decode = decode_workers.len();
-
-        if healthy_prefill_count > 0 && healthy_decode_count > 0 {
-            Json(json!({
-                "status": "ready",
-                "prefill": {
-                    "healthy": healthy_prefill_count,
-                    "total": total_prefill
-                },
-                "decode": {
-                    "healthy": healthy_decode_count,
-                    "total": total_decode
-                }
-            }))
-            .into_response()
-        } else {
-            let mut reasons = Vec::new();
-            if healthy_prefill_count == 0 {
-                reasons.push("no healthy prefill workers");
-            }
-            if healthy_decode_count == 0 {
-                reasons.push("no healthy decode workers");
-            }
-
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({
-                    "status": "not_ready",
-                    "reason": reasons.join(", "),
-                    "prefill": {
-                        "healthy": healthy_prefill_count,
-                        "total": total_prefill
-                    },
-                    "decode": {
-                        "healthy": healthy_decode_count,
-                        "total": total_decode
-                    }
-                })),
-            )
-                .into_response()
-        }
     }
 }
 
@@ -1690,37 +1434,6 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("No prefill workers available"));
-    }
-
-    #[tokio::test]
-    async fn test_health_endpoints() {
-        let router = create_test_pd_router();
-
-        let prefill_worker = create_test_worker(
-            "http://localhost:8000".to_string(),
-            WorkerType::Prefill {
-                bootstrap_port: None,
-            },
-            true,
-        );
-        let decode_worker = create_test_worker(
-            "http://localhost:8001".to_string(),
-            WorkerType::Decode,
-            true,
-        );
-
-        router.worker_registry.register(Arc::from(prefill_worker));
-        router.worker_registry.register(Arc::from(decode_worker));
-
-        let http_req = axum::http::Request::builder()
-            .body(axum::body::Body::empty())
-            .unwrap();
-        let response = router.health(http_req).await;
-
-        assert_eq!(response.status(), 200);
-
-        let response = router.readiness();
-        assert_eq!(response.status(), 200);
     }
 
     #[tokio::test]

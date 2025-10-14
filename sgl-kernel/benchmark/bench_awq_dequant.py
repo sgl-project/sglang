@@ -108,7 +108,7 @@ def benchmark(qweight_row, qweight_col, provider):
             qweight.clone(), scales.clone(), qzeros.clone()
         )
 
-    ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=quantiles)
+    ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(fn, quantiles=quantiles)
 
     return 1000 * ms, 1000 * max_ms, 1000 * min_ms
 

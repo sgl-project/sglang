@@ -198,8 +198,6 @@ if __name__ == "__main__":
         print(f"DeepSeek-R1-0528-FP4 N={N} K={K}: ")
         benchmark.run(
             print_data=True,
-            show_plots=True,
-            save_path="bench_fp4_res",
             N=N,
             K=K,
             dtype=args.dtype,

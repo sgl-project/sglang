@@ -34,9 +34,6 @@ pub trait RouterTrait: Send + Sync + Debug {
     /// Get a reference to self as Any for downcasting
     fn as_any(&self) -> &dyn std::any::Any;
 
-    /// Route a health check request
-    async fn health(&self, req: Request<Body>) -> Response;
-
     /// Route a health generate request
     async fn health_generate(&self, req: Request<Body>) -> Response;
 
@@ -129,12 +126,6 @@ pub trait RouterTrait: Send + Sync + Debug {
         model_id: Option<&str>,
     ) -> Response;
 
-    /// Flush cache on all workers
-    async fn flush_cache(&self) -> Response;
-
-    /// Get worker loads (for monitoring)
-    async fn get_worker_loads(&self) -> Response;
-
     /// Get router type name
     fn router_type(&self) -> &'static str;
 
@@ -142,13 +133,4 @@ pub trait RouterTrait: Send + Sync + Debug {
     fn is_pd_mode(&self) -> bool {
         self.router_type() == "pd"
     }
-
-    /// Server liveness check - is the server process running
-    fn liveness(&self) -> Response {
-        // Simple liveness check - if we can respond, we're alive
-        (StatusCode::OK, "OK").into_response()
-    }
-
-    /// Server readiness check - is the server ready to handle requests
-    fn readiness(&self) -> Response;
 }

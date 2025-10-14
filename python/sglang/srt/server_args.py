@@ -2665,6 +2665,13 @@ class ServerArgs:
             help="NOTE: --enable-flashinfer-mxfp4-moe is deprecated. Please set `--moe-runner-backend` to 'flashinfer_mxfp4' instead.",
         )
 
+        # Configuration file support
+        parser.add_argument(
+            "--config",
+            type=str,
+            help="Read CLI options from a config file. Must be a YAML file with configuration options.",
+        )
+
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
         args.tp_size = args.tensor_parallel_size
@@ -2945,6 +2952,26 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
     Returns:
         The server arguments.
     """
+    # Import here to avoid circular imports
+    from sglang.srt.server_args_config_parser import ConfigArgumentMerger
+
+    # Check for config file and merge arguments if present
+    if "--config" in argv:
+        # Extract boolean actions from the parser to handle them correctly
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+
+        # Get boolean action destinations
+        boolean_actions = []
+        for action in parser._actions:
+            if hasattr(action, "dest") and hasattr(action, "action"):
+                if action.action in ["store_true", "store_false"]:
+                    boolean_actions.append(action.dest)
+
+        # Merge config file arguments with CLI arguments
+        config_merger = ConfigArgumentMerger(boolean_actions=boolean_actions)
+        argv = config_merger.merge_config_with_args(argv)
+
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
     raw_args = parser.parse_args(argv)

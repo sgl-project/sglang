@@ -20,13 +20,7 @@ use axum::{
 use bytes::Bytes;
 use futures_util::StreamExt;
 use serde_json::{json, to_value, Value};
-use std::{
-    any::Any,
-    borrow::Cow,
-    collections::HashMap,
-    io,
-    sync::atomic::{AtomicBool, Ordering},
-};
+use std::{any::Any, borrow::Cow, collections::HashMap, io, sync::atomic::AtomicBool};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{error, info, warn};
@@ -777,7 +771,7 @@ impl super::super::RouterTrait for OpenAIRouter {
         self
     }
 
-    async fn health(&self, _req: Request<Body>) -> Response {
+    async fn health_generate(&self, _req: Request<Body>) -> Response {
         // Simple upstream probe: GET {base}/v1/models without auth
         let url = format!("{}/v1/models", self.base_url);
         match self
@@ -806,11 +800,6 @@ impl super::super::RouterTrait for OpenAIRouter {
             )
                 .into_response(),
         }
-    }
-
-    async fn health_generate(&self, _req: Request<Body>) -> Response {
-        // For OpenAI, health_generate is the same as health
-        self.health(_req).await
     }
 
     async fn get_server_info(&self, _req: Request<Body>) -> Response {
@@ -1307,32 +1296,8 @@ impl super::super::RouterTrait for OpenAIRouter {
         }
     }
 
-    async fn flush_cache(&self) -> Response {
-        (
-            StatusCode::FORBIDDEN,
-            "flush_cache not supported for OpenAI router",
-        )
-            .into_response()
-    }
-
-    async fn get_worker_loads(&self) -> Response {
-        (
-            StatusCode::FORBIDDEN,
-            "get_worker_loads not supported for OpenAI router",
-        )
-            .into_response()
-    }
-
     fn router_type(&self) -> &'static str {
         "openai"
-    }
-
-    fn readiness(&self) -> Response {
-        if self.healthy.load(Ordering::Acquire) && self.circuit_breaker.can_execute() {
-            (StatusCode::OK, "Ready").into_response()
-        } else {
-            (StatusCode::SERVICE_UNAVAILABLE, "Not ready").into_response()
-        }
     }
 
     async fn route_embeddings(
