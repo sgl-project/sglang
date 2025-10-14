@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInput
 
 import logging
+
 logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
@@ -202,7 +203,7 @@ class NativeSparseAttnBackend(AttentionBackend):
         self.speculative_num_draft_tokens = (
             model_runner.server_args.speculative_num_draft_tokens
         )
-        self.speculative_step_id = speculative_step_id 
+        self.speculative_step_id = speculative_step_id
 
     def get_device_int32_arange(self, l: int) -> torch.Tensor:
         if l > len(self._arange_buf):
@@ -226,12 +227,12 @@ class NativeSparseAttnBackend(AttentionBackend):
         """Init the metadata for a forward pass."""
         batch_size = forward_batch.batch_size
         device = forward_batch.seq_lens.device
-   
+
         if forward_batch.forward_mode.is_target_verify():
             draft_token_num = self.speculative_num_draft_tokens
         else:
             draft_token_num = 0
-        
+
         cache_seqlens_int32 = (forward_batch.seq_lens + draft_token_num).to(torch.int32)
         cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
         assert forward_batch.seq_lens_cpu is not None
@@ -277,7 +278,9 @@ class NativeSparseAttnBackend(AttentionBackend):
                     )
                 ]
             )
-            page_table = torch.repeat_interleave(page_table, repeats=self.speculative_num_draft_tokens, dim=0)
+            page_table = torch.repeat_interleave(
+                page_table, repeats=self.speculative_num_draft_tokens, dim=0
+            )
         elif forward_batch.forward_mode.is_extend():
             assert (
                 forward_batch.extend_seq_lens_cpu is not None
@@ -346,7 +349,7 @@ class NativeSparseAttnBackend(AttentionBackend):
             nsa_seqlens_expanded=seqlens_expanded,
             nsa_extend_seq_lens_list=extend_seq_lens_cpu,
             real_page_table=self._transform_table_1_to_real(page_table),
-            nsa_max_seqlen_q=1
+            nsa_max_seqlen_q=1,
         )
 
         self.forward_metadata = metadata
@@ -361,7 +364,9 @@ class NativeSparseAttnBackend(AttentionBackend):
         to avoid memory allocations.
         """
         self.decode_cuda_graph_metadata: Dict = {
-            "cache_seqlens": torch.ones(max_num_tokens, dtype=torch.int32, device=self.device),
+            "cache_seqlens": torch.ones(
+                max_num_tokens, dtype=torch.int32, device=self.device
+            ),
             "cu_seqlens_q": torch.arange(
                 0, max_bs + 1, dtype=torch.int32, device=self.device
             ),
@@ -425,7 +430,7 @@ class NativeSparseAttnBackend(AttentionBackend):
 
             # real_page_table = self._transform_table_1_to_real(page_table_1)
             seqlens_expanded = cache_seqlens_int32
-            nsa_extend_seq_lens_list=[1] * num_tokens
+            nsa_extend_seq_lens_list = [1] * num_tokens
             if NSA_DECODE_IMPL == "flashmla_decode":
                 flashmla_metadata = self.decode_cuda_graph_metadata[
                     "flashmla_metadata"
@@ -439,13 +444,14 @@ class NativeSparseAttnBackend(AttentionBackend):
             else:
                 flashmla_metadata = None
         elif forward_mode.is_target_verify():
-            cache_seqlens_int32 = (
-                seq_lens + self.speculative_num_draft_tokens
-            ).to(torch.int32)
+            cache_seqlens_int32 = (seq_lens + self.speculative_num_draft_tokens).to(
+                torch.int32
+            )
             cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
             max_seqlen_q = 1
-            page_table_1 = self.decode_cuda_graph_metadata["page_table"]\
-                                                    [:bs * self.speculative_num_draft_tokens, :]
+            page_table_1 = self.decode_cuda_graph_metadata["page_table"][
+                : bs * self.speculative_num_draft_tokens, :
+            ]
             max_seqlen_k = page_table_1.shape[1]
 
             cu_seqlens_q = torch.arange(
@@ -455,7 +461,7 @@ class NativeSparseAttnBackend(AttentionBackend):
                 dtype=torch.int32,
                 device=self.device,
             )
-            
+
             extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * bs
 
             seqlens_int32_cpu = [
@@ -480,13 +486,13 @@ class NativeSparseAttnBackend(AttentionBackend):
             nsa_cache_seqlens_int32 = compute_nsa_seqlens(
                 seqlens_expanded, nsa_index_topk=self.nsa_index_topk
             )
-            nsa_extend_seq_lens_list=[1] * bs * self.speculative_num_draft_tokens
+            nsa_extend_seq_lens_list = [1] * bs * self.speculative_num_draft_tokens
 
             if NSA_DECODE_IMPL == "flashmla_decode":
                 flashmla_metadata = self.decode_cuda_graph_metadata[
                     "flashmla_metadata"
                 ].slice(slice(0, bs * self.speculative_num_draft_tokens + 1))
-                
+
                 flashmla_metadata.copy_(
                     self._compute_flashmla_metadata(
                         cache_seqlens=nsa_cache_seqlens_int32,
@@ -496,21 +502,23 @@ class NativeSparseAttnBackend(AttentionBackend):
             else:
                 flashmla_metadata = None
         elif forward_mode.is_draft_extend():
-            cache_seqlens_int32 = (
-                seq_lens + self.speculative_num_draft_tokens
-            ).to(torch.int32)
+            cache_seqlens_int32 = (seq_lens + self.speculative_num_draft_tokens).to(
+                torch.int32
+            )
             cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
-            page_table_1 = self.decode_cuda_graph_metadata["page_table"]\
-                                                    [:bs, :]
+            page_table_1 = self.decode_cuda_graph_metadata["page_table"][:bs, :]
             max_seqlen_k = page_table_1.shape[1]
 
             extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * bs
-            extend_seq_lens = torch.full((bs, ), self.speculative_num_draft_tokens, device=self.device, dtype=torch.int32)
-            
-            max_seqlen_q = max(extend_seq_lens_cpu)
-            cu_seqlens_q = compute_cu_seqlens(
-                extend_seq_lens.to(torch.int32)
+            extend_seq_lens = torch.full(
+                (bs,),
+                self.speculative_num_draft_tokens,
+                device=self.device,
+                dtype=torch.int32,
             )
+
+            max_seqlen_q = max(extend_seq_lens_cpu)
+            cu_seqlens_q = compute_cu_seqlens(extend_seq_lens.to(torch.int32))
 
             seqlens_int32_cpu = [
                 self.speculative_num_draft_tokens + kv_len
@@ -534,13 +542,13 @@ class NativeSparseAttnBackend(AttentionBackend):
             nsa_cache_seqlens_int32 = compute_nsa_seqlens(
                 seqlens_expanded, nsa_index_topk=self.nsa_index_topk
             )
-            nsa_extend_seq_lens_list=[1] * bs
+            nsa_extend_seq_lens_list = [1] * bs
 
             if NSA_DECODE_IMPL == "flashmla_decode":
                 flashmla_metadata = self.decode_cuda_graph_metadata[
                     "flashmla_metadata"
                 ].slice(slice(0, bs * self.speculative_num_draft_tokens + 1))
-                
+
                 flashmla_metadata.copy_(
                     self._compute_flashmla_metadata(
                         cache_seqlens=nsa_cache_seqlens_int32,
@@ -553,7 +561,7 @@ class NativeSparseAttnBackend(AttentionBackend):
         nsa_cu_seqlens_k = compute_cu_seqlens(nsa_cache_seqlens_int32)
         nsa_cu_seqlens_q = self.get_device_int32_arange(len(nsa_cu_seqlens_k))
         real_page_table = self._transform_table_1_to_real(page_table_1)
-            
+
         metadata = NSAMetadata(
             page_size=self.real_page_size,
             cache_seqlens_int32=cache_seqlens_int32,
@@ -567,8 +575,9 @@ class NativeSparseAttnBackend(AttentionBackend):
             nsa_cu_seqlens_q=nsa_cu_seqlens_q,
             nsa_cu_seqlens_k=nsa_cu_seqlens_k,
             nsa_seqlens_expanded=seqlens_expanded,
+            nsa_seqlens_expanded=seqlens_expanded,
             real_page_table=real_page_table,
-            nsa_extend_seq_lens_list=nsa_extend_seq_lens_list
+            nsa_extend_seq_lens_list=nsa_extend_seq_lens_list,
         )
         self.decode_cuda_graph_metadata[bs] = metadata
         self.forward_metadata = metadata
@@ -609,19 +618,27 @@ class NativeSparseAttnBackend(AttentionBackend):
             )
             page_indices = self.req_to_token[req_pool_indices, :max_len]
             metadata.page_table_1[:, :max_len].copy_(page_indices)
-            nsa_cache_seqlens = compute_nsa_seqlens(cache_seqlens, nsa_index_topk=self.nsa_index_topk)
+            nsa_cache_seqlens = compute_nsa_seqlens(
+                cache_seqlens, nsa_index_topk=self.nsa_index_topk
+            )
             metadata.nsa_cache_seqlens_int32.copy_(nsa_cache_seqlens)
             seqlens_expanded = cache_seqlens
         elif forward_mode.is_target_verify():
-            max_seqlen_k = int(seq_lens_cpu.max().item() + self.speculative_num_draft_tokens)
+            max_seqlen_k = int(
+                seq_lens_cpu.max().item() + self.speculative_num_draft_tokens
+            )
             # metadata.max_seq_len_k = max_seqlen_k
-            cache_seqlens = (seq_lens + self.speculative_num_draft_tokens).to(torch.int32)
+            cache_seqlens = (seq_lens + self.speculative_num_draft_tokens).to(
+                torch.int32
+            )
             metadata.cache_seqlens_int32.copy_(cache_seqlens)
             metadata.cu_seqlens_k[1:].copy_(
                 torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32)
             )
             page_indices = self.req_to_token[req_pool_indices, :max_seqlen_k]
-            page_indices = torch.repeat_interleave(page_indices, repeats=self.speculative_num_draft_tokens, dim=0)
+            page_indices = torch.repeat_interleave(
+                page_indices, repeats=self.speculative_num_draft_tokens, dim=0
+            )
             metadata.page_table_1[:, :max_seqlen_k].copy_(page_indices)
             extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * bs
 
@@ -645,7 +662,9 @@ class NativeSparseAttnBackend(AttentionBackend):
                 ]
             )
             metadata.nsa_seqlens_expanded.copy_(seqlens_expanded)
-            nsa_cache_seqlens = compute_nsa_seqlens(seqlens_expanded, self.nsa_index_topk)
+            nsa_cache_seqlens = compute_nsa_seqlens(
+                seqlens_expanded, self.nsa_index_topk
+            )
             metadata.nsa_cache_seqlens_int32.copy_(nsa_cache_seqlens)
         elif forward_mode.is_draft_extend():
             max_seqlen_k = int(seq_lens_cpu.max().item())
@@ -679,7 +698,9 @@ class NativeSparseAttnBackend(AttentionBackend):
                 ]
             )
             metadata.nsa_seqlens_expanded.copy_(seqlens_expanded)
-            nsa_cache_seqlens = compute_nsa_seqlens(seqlens_expanded, self.nsa_index_topk)
+            nsa_cache_seqlens = compute_nsa_seqlens(
+                seqlens_expanded, self.nsa_index_topk
+            )
             metadata.nsa_cache_seqlens_int32.copy_(nsa_cache_seqlens)
         seqlens_expanded_size = seqlens_expanded.size(0)
         assert (
@@ -687,7 +708,7 @@ class NativeSparseAttnBackend(AttentionBackend):
             and metadata.nsa_cu_seqlens_k is not None
             and self.nsa_index_topk is not None
         )
-        
+
         metadata.nsa_cu_seqlens_k[1:].copy_(
             torch.cumsum(nsa_cache_seqlens, dim=0, dtype=torch.int32)
         )
@@ -702,7 +723,9 @@ class NativeSparseAttnBackend(AttentionBackend):
             assert metadata.real_page_table is metadata.page_table_1
 
         if NSA_DECODE_IMPL == "flashmla_decode":
-            flashmla_metadata = metadata.flashmla_metadata.slice(slice(0, seqlens_expanded_size + 1))
+            flashmla_metadata = metadata.flashmla_metadata.slice(
+                slice(0, seqlens_expanded_size + 1)
+            )
             flashmla_metadata.copy_(
                 self._compute_flashmla_metadata(
                     cache_seqlens=nsa_cache_seqlens,
@@ -1163,10 +1186,8 @@ class NativeSparseAttnMultiStepBackend:
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         for i in range(self.speculative_num_steps):
-            self.attn_backends[i].init_cuda_graph_state(
-                max_bs, max_num_tokens
-            )
-    
+            self.attn_backends[i].init_cuda_graph_state(max_bs, max_num_tokens)
+
     def init_forward_metadata_capture_cuda_graph(self, forward_batch: ForwardBatch):
         for i in range(self.speculative_num_steps):
             self.attn_backends[i].init_forward_metadata_capture_cuda_graph(

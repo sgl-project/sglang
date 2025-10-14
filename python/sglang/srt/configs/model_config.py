@@ -53,9 +53,10 @@ def is_deepseek_nsa(config: PretrainedConfig) -> bool:
     return (
         config.architectures is not None
         and config.architectures[0]
-        in ["DeepseekV3ForCausalLM", 
-            "DeepseekV32ForCausalLM", 
-            "DeepseekV3ForCausalLMNextN"
+        in [
+            "DeepseekV3ForCausalLM",
+            "DeepseekV32ForCausalLM",
+            "DeepseekV3ForCausalLMNextN",
         ]
         and getattr(config, "index_topk", None) is not None
     )

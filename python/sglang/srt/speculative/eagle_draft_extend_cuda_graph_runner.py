@@ -366,7 +366,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             if bs != raw_bs:
                 self.seq_lens_cpu.fill_(self.seq_len_fill_value)
             self.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
-        
+
         if forward_batch.extend_seq_lens_cpu is not None:
             self.extend_seq_lens_cpu[:raw_bs] = forward_batch.extend_seq_lens_cpu
 
@@ -384,7 +384,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             forward_mode=ForwardMode.DRAFT_EXTEND,
             spec_info=forward_batch.spec_info,
             seq_lens_cpu=self.seq_lens_cpu,
-            extend_seq_lens_cpu=self.extend_seq_lens_cpu
+            extend_seq_lens_cpu=self.extend_seq_lens_cpu,
         )
 
         # Replay

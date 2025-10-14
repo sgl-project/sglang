@@ -17,6 +17,8 @@ if is_cuda():
     except ImportError as e:
         deep_gemm = e
 
+import logging
+
 from sglang.srt.layers.attention.nsa.utils import NSA_DUAL_STREAM, NSA_USE_REAL_INDEXER
 from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -27,7 +29,6 @@ from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import get_global_server_args
 
-import logging
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
@@ -455,9 +456,9 @@ class Indexer(CustomOp):
         ke = torch.cat(ke_list, dim=0)
 
         logits = deep_gemm.fp8_mqa_logits(
-            q_fp8[: offset],
+            q_fp8[:offset],
             kv_fp8,
-            weights[: offset],
+            weights[:offset],
             ks,
             ke,
             clean_logits=False,
@@ -465,8 +466,10 @@ class Indexer(CustomOp):
         token_nums, _, _ = q_fp8.shape
         assert logits.shape[0] == len(seq_lens_expanded)
         raw_topk_result = metadata.topk_transform(logits, self.index_topk)
-        topk_result = torch.full((token_nums, 2048), -1, device=q_fp8.device, dtype=torch.int32)
-        topk_result[ : offset] = raw_topk_result
+        topk_result = torch.full(
+            (token_nums, 2048), -1, device=q_fp8.device, dtype=torch.int32
+        )
+        topk_result[:offset] = raw_topk_result
         return topk_result
 
     def forward_indexer_bs_1(
@@ -643,8 +646,8 @@ class Indexer(CustomOp):
                 )
             elif forward_batch.forward_mode.is_target_verify():
                 topk_result = self._get_verify_topk_paged(
-                forward_batch, layer_id, q_fp8, weights, metadata
-            )
+                    forward_batch, layer_id, q_fp8, weights, metadata
+                )
             else:
                 topk_result = self._get_topk_ragged(
                     forward_batch, layer_id, q_fp8, weights, metadata
