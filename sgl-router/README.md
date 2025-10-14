@@ -7,7 +7,7 @@ High-performance model routing control and data plane for large-scale LLM deploy
 - Data plane that routes requests across HTTP, PD (prefill/decode), gRPC, and OpenAI-compatible backends with shared reliability features.
 - Industry-first gRPC pipeline with native Rust tokenization, reasoning, and tool-call execution for high-throughput OpenAI-compatible serving.
 - Multi-model inference gateway mode (`--enable-igw`) that runs several routers at once and applies per-model policies.
-- Conversation, response, and chat-history connectors with in-memory, no-op, and Oracle ATP storage backends plus optional MCP (Model Context Protocol) tooling.
+- Conversation, response, and chat-history connectors that centralize state at the router, enabling compliant sharing across models/MCP loops with in-memory, no-op, or Oracle ATP storage options.
 - Built-in reliability primitives: retries with exponential backoff, circuit breakers, token-bucket rate limiting, and queuing.
 - First-class observability with structured logging and Prometheus metrics.
 
@@ -312,7 +312,7 @@ The HTTP router exposes the full OpenAI-compatible surface area (`/generate`, `/
 ### OpenAI Router
 - Proxies OpenAI-compatible chat completions and responses APIs, preserving headers and SSE streams end-to-end.
 - Supports `/v1/responses` background jobs with cancellation, deletion, and listing input items—enabling agentic, multi-turn orchestration without persisting data at remote vendor endpoints.
-- Conversation APIs (`/v1/conversations` and `/items`) interact with the configured conversation storage backend for compliant chat-history management.
+- Conversation APIs (`/v1/conversations` and `/items`) interact with the configured conversation storage backend for compliant chat-history management. Conversation state lives at the router tier, so the same history can drive different models or MCP loops without leaking data to upstream vendors.
 - Chat history, agentic multi-turn `/v1/responses`, and the native MCP client (STDIO/HTTP/SSE/Streamable transports) are designed to satisfy enterprise data-privacy requirements by keeping sensitive state within the router.
 
 ### Request Endpoints
