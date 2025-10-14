@@ -109,9 +109,11 @@ __device__ __forceinline__ T* get_global_offset_ph(
     int64_t head_id,
     int64_t head_num,
     int64_t page_size) {
-  // page head
-  return base + page_id / page_size * page_size * page_dim + page_dim / head_num * head_id * page_size +
-         page_id % page_size * page_dim / head_num + layer_id * item_size_bytes / head_num;
+  // page head layout: [page_num, head_num, page_size, layer_num, head_dim]
+  return base + page_id / page_size * page_size * page_dim +  // page_num dimension offset
+         page_dim / head_num * head_id * page_size +          // head_num dimension offset
+         page_id % page_size * page_dim / head_num +          // page_size dimension offset
+         layer_id * item_size_bytes / head_num;               // layer_num dimension offset
 }
 
 template <auto SrcOffsetFn, auto DstOffsetFn>
@@ -150,6 +152,7 @@ __global__ void transfer_page_head_kernel_impl(
 
     // Loop over layers if necessary
     for (int64_t layer_id = start_layer_id; layer_id < start_layer_id + num_layers_to_process; ++layer_id) {
+      // For page head layout, the cache of each head in the token is discontinuous, need to loop
       for (int64_t head_id = 0; head_id < head_num; ++head_id) {
         const char* src_k_ptr = SrcOffsetFn(
             static_cast<const char*>(src_k),
