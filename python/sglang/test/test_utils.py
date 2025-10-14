@@ -1160,7 +1160,7 @@ def run_bench_offline_throughput(model, other_args):
         *[str(x) for x in other_args],
     ]
 
-    print(f"{command=}")
+    print(f"command={' '.join(command)}")
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
     try:
