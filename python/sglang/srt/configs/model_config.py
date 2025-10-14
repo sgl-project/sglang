@@ -778,6 +778,7 @@ multimodal_model_archs = [
     "VILAForConditionalGeneration",
     "Step3VLForConditionalGeneration",
     "DotsVLMForCausalLM",
+    "DotsOCRForCausalLM",
     "Sarashina2VisionForCausalLM",
 ]
 

@@ -143,6 +143,57 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
         .expect("response output missing");
     assert!(!output.is_empty(), "expected at least one output item");
 
+    // Verify mcp_list_tools item is present
+    let list_tools_item = output
+        .iter()
+        .find(|entry| {
+            entry.get("type") == Some(&serde_json::Value::String("mcp_list_tools".into()))
+        })
+        .expect("missing mcp_list_tools output item");
+
+    assert_eq!(
+        list_tools_item.get("server_label").and_then(|v| v.as_str()),
+        Some("mock"),
+        "server_label should match"
+    );
+    let tools_list = list_tools_item
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .expect("tools array missing in mcp_list_tools");
+    assert!(
+        !tools_list.is_empty(),
+        "mcp_list_tools should contain at least one tool"
+    );
+
+    // Verify mcp_call item is present
+    let mcp_call_item = output
+        .iter()
+        .find(|entry| entry.get("type") == Some(&serde_json::Value::String("mcp_call".into())))
+        .expect("missing mcp_call output item");
+
+    assert_eq!(
+        mcp_call_item.get("status").and_then(|v| v.as_str()),
+        Some("completed"),
+        "mcp_call status should be completed"
+    );
+    assert_eq!(
+        mcp_call_item.get("server_label").and_then(|v| v.as_str()),
+        Some("mock"),
+        "server_label should match"
+    );
+    assert!(
+        mcp_call_item.get("name").is_some(),
+        "mcp_call should have a tool name"
+    );
+    assert!(
+        mcp_call_item.get("arguments").is_some(),
+        "mcp_call should have arguments"
+    );
+    assert!(
+        mcp_call_item.get("output").is_some(),
+        "mcp_call should have output"
+    );
+
     let final_text = output
         .iter()
         .rev()
