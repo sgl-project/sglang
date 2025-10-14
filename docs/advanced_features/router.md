@@ -237,8 +237,6 @@ flowchart TD
     HalfOpen -- "Fail any test request" --> Open;
     HalfOpen -- "After cb-success-threshold<br/>test requests" --> Closed;
     Closed -- "Failures < cb-failure-threshold" --> Closed;
-    
-    %% --- Node Styling ---
     style Closed fill:#00C853,color:#000000
     style Open fill:#D50000,color:#000000
     style HalfOpen fill:#FFD600,color:#000000
