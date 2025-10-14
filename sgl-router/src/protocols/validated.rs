@@ -13,7 +13,15 @@ use serde::de::DeserializeOwned;
 use serde_json::json;
 use validator::Validate;
 
-/// A JSON extractor that automatically validates the request body
+/// Trait for request types that need post-deserialization normalization
+pub trait Normalizable {
+    /// Normalize the request by applying defaults and transformations
+    fn normalize(&mut self) {
+        // Default: no-op
+    }
+}
+
+/// A JSON extractor that automatically validates and normalizes the request body
 ///
 /// This extractor deserializes the request body and automatically calls `.validate()`
 /// on types that implement the `Validate` trait. If validation fails, it returns
@@ -33,14 +41,14 @@ pub struct ValidatedJson<T>(pub T);
 
 impl<S, T> FromRequest<S> for ValidatedJson<T>
 where
-    T: DeserializeOwned + Validate + Send,
+    T: DeserializeOwned + Validate + Normalizable + Send,
     S: Send + Sync,
 {
     type Rejection = Response;
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
         // First, extract and deserialize the JSON
-        let Json(data) = Json::<T>::from_request(req, state)
+        let Json(mut data) = Json::<T>::from_request(req, state)
             .await
             .map_err(|err: JsonRejection| {
                 let error_message = match err {
@@ -68,6 +76,9 @@ where
                 )
                     .into_response()
             })?;
+
+        // Normalize the request (apply defaults based on other fields)
+        data.normalize();
 
         // Then, automatically validate the data
         data.validate().map_err(|validation_errors| {
@@ -116,6 +127,10 @@ mod tests {
         value: f32,
         #[validate(length(min = 1))]
         name: String,
+    }
+
+    impl Normalizable for TestRequest {
+        // Use default no-op implementation
     }
 
     #[tokio::test]

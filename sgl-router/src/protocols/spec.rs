@@ -3,6 +3,8 @@ use serde_json::{to_value, Map, Number, Value};
 use std::collections::HashMap;
 use validator::Validate;
 
+use crate::protocols::validated::Normalizable;
+
 // Default model value when not specified
 fn default_model() -> String {
     "unknown".to_string()
@@ -524,7 +526,41 @@ fn validate_chat_cross_parameters(
         }
     }
 
+    // 9. Validate tool_choice requires tools (except for "none")
+    if let Some(ref tool_choice) = req.tool_choice {
+        let has_tools = req.tools.as_ref().map_or(false, |t| !t.is_empty());
+
+        // Check if tool_choice is anything other than "none"
+        let is_some_choice = !matches!(
+            tool_choice,
+            ToolChoice::Value(ToolChoiceValue::None)
+        );
+
+        if is_some_choice && !has_tools {
+            return Err(validator::ValidationError::new(
+                "Invalid value for 'tool_choice': 'tool_choice' is only allowed when 'tools' are specified.",
+            ));
+        }
+    }
+
     Ok(())
+}
+
+impl Normalizable for ChatCompletionRequest {
+    /// Normalize the request by applying OpenAI defaults:
+    /// - If tool_choice is None and no tools present: set to "none"
+    /// - If tool_choice is None and tools present: set to "auto"
+    fn normalize(&mut self) {
+        if self.tool_choice.is_none() {
+            let has_tools = self.tools.as_ref().map_or(false, |t| !t.is_empty());
+
+            self.tool_choice = if has_tools {
+                Some(ToolChoice::Value(ToolChoiceValue::Auto))
+            } else {
+                Some(ToolChoice::Value(ToolChoiceValue::None))
+            };
+        }
+    }
 }
 
 impl GenerationRequest for ChatCompletionRequest {
@@ -1981,6 +2017,9 @@ pub struct Function {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub parameters: Value, // JSON Schema
+    /// Whether to enable strict schema adherence (OpenAI structured outputs)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
