@@ -702,13 +702,12 @@ class ModelConfig:
         ]
         default_sampling_params: dict[str, Any] = {}
 
+        from transformers import GenerationConfig
+        base = GenerationConfig()
         for param in available_params:
             value = getattr(self.hf_generation_config, param, None)
             if value is None:
                 continue
-            from transformers import GenerationConfig
-
-            base = GenerationConfig()
             base_default = getattr(base, param, None)
             if base_default is None or value != base_default:
                 default_sampling_params[param] = value
