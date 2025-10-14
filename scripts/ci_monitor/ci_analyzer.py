@@ -593,7 +593,13 @@ class SGLangCIAnalyzer:
                                 f" (PR #{pr_info['pr_number']} by {pr_info['author']})"
                             )
                         else:
-                            pr_text = f" by {pr_info['author']}"
+                            # Show commit link when there's no PR
+                            commit_sha = pr_info.get("head_sha", "")
+                            if commit_sha:
+                                commit_url = f"https://github.com/{self.repo}/commit/{commit_sha[:7]}"
+                                pr_text = f" ([{commit_sha[:7]}]({commit_url}) by {pr_info['author']})"
+                            else:
+                                pr_text = f" by {pr_info['author']}"
 
                         summary_lines.append(
                             f"**Last Success:** Run #{last_success['run_number']} ({success_date.strftime('%Y-%m-%d %H:%M')}){pr_text}"
@@ -619,7 +625,13 @@ class SGLangCIAnalyzer:
                             if pr_info.get("pr_number"):
                                 pr_text = f" (PR #{pr_info['pr_number']} by {pr_info.get('author', 'Unknown')})"
                             else:
-                                pr_text = f" by {pr_info.get('author', 'Unknown')}"
+                                # Show commit link when there's no PR
+                                commit_sha = pr_info.get("head_sha", "")
+                                if commit_sha:
+                                    commit_url = f"https://github.com/{self.repo}/commit/{commit_sha[:7]}"
+                                    pr_text = f" ([{commit_sha[:7]}]({commit_url}) by {pr_info.get('author', 'Unknown')})"
+                                else:
+                                    pr_text = f" by {pr_info.get('author', 'Unknown')}"
 
                             summary_lines.append(
                                 f"- Run #{link_info['run_number']} ({created_at.strftime('%Y-%m-%d %H:%M')}){pr_text}: [View Run]({link_info['url']})"
