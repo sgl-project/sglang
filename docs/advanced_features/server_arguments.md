@@ -136,7 +136,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--device` | The device to use ('cuda', 'xpu', 'hpu', 'npu', 'cpu'). Defaults to auto-detection if not specified. | None |
 | `--tp-size` | The tensor parallelism size. | 1 |
 | `--pp-size` | The pipeline parallelism size. | 1 |
-| `--max-micro-batch-size` | The maximum micro batch size in pipeline parallelism. | None |
+| `--pp-max-micro-batch-size` | The maximum micro batch size in pipeline parallelism. | None |
 | `--stream-interval` | The interval (or buffer size) for streaming in terms of the token length. A smaller value makes streaming smoother, while a larger value makes the throughput higher. | 1 |
 | `--stream-output` | Whether to output as a sequence of disjoint segments. | False |
 | `--random-seed` | The random seed. | None |

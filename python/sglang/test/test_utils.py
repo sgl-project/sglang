@@ -509,6 +509,7 @@ def popen_launch_server(
     return_stdout_stderr: Optional[tuple] = None,
     device: str = "auto",
     pd_separated: bool = False,
+    num_replicas: Optional[int] = None,
 ):
     """Launch a server process with automatic device detection.
 
@@ -526,7 +527,8 @@ def popen_launch_server(
     _, host, port = base_url.split(":")
     host = host[2:]
 
-    if pd_separated:
+    use_mixed_pd_engine = not pd_separated and num_replicas is not None
+    if pd_separated or use_mixed_pd_engine:
         command = "sglang.launch_pd_server"
     else:
         command = "sglang.launch_server"
@@ -540,7 +542,7 @@ def popen_launch_server(
         *[str(x) for x in other_args],
     ]
 
-    if pd_separated:
+    if pd_separated or use_mixed_pd_engine:
         command.extend(
             [
                 "--lb-host",
@@ -556,6 +558,15 @@ def popen_launch_server(
                 host,
                 "--port",
                 port,
+            ]
+        )
+
+    if use_mixed_pd_engine:
+        command.extend(
+            [
+                "--mixed",
+                "--num-replicas",
+                str(num_replicas),
             ]
         )
 

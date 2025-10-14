@@ -82,11 +82,6 @@ impl KimiK2Parser {
         }
     }
 
-    /// Check if text contains Kimi K2 tool markers
-    fn has_tool_markers(&self, text: &str) -> bool {
-        text.contains("<|tool_calls_section_begin|>")
-    }
-
     /// Parse function ID to extract name and index
     fn parse_function_id(&self, id: &str) -> Option<(String, usize)> {
         if let Some(captures) = self.tool_call_id_regex.captures(id) {
@@ -331,8 +326,8 @@ impl ToolParser for KimiK2Parser {
         })
     }
 
-    fn detect_format(&self, text: &str) -> bool {
-        self.has_tool_markers(text) || text.contains("<|tool_call_begin|>")
+    fn has_tool_markers(&self, text: &str) -> bool {
+        text.contains("<|tool_calls_section_begin|>")
     }
 
     fn get_unstreamed_tool_args(&self) -> Option<Vec<ToolCallItem>> {

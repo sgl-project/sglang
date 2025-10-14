@@ -261,7 +261,7 @@ impl ToolParser for JsonParser {
         )
     }
 
-    fn detect_format(&self, text: &str) -> bool {
+    fn has_tool_markers(&self, text: &str) -> bool {
         let trimmed = text.trim();
         (trimmed.starts_with('[') || trimmed.starts_with('{')) && trimmed.contains(r#""name""#)
     }

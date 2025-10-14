@@ -203,7 +203,7 @@ impl ToolParser for PythonicParser {
         })
     }
 
-    fn detect_format(&self, text: &str) -> bool {
+    fn has_tool_markers(&self, text: &str) -> bool {
         let cleaned = Self::strip_special_tokens(text);
         if pythonic_block_regex().is_match(&cleaned) {
             return true;

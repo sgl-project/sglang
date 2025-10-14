@@ -20,7 +20,7 @@ import logging
 import os
 import random
 import tempfile
-from typing import List, Literal, Optional, Union
+from typing import Dict, List, Literal, Optional, Union
 
 from sglang.srt.connector import ConnectorType
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -162,6 +162,7 @@ class ServerArgs:
     load_format: str = "auto"
     model_loader_extra_config: str = "{}"
     trust_remote_code: bool = False
+    modelopt_quant: Optional[Union[str, Dict]] = None
     context_length: Optional[int] = None
     is_embedding: bool = False
     enable_multimodal: Optional[bool] = None
@@ -204,7 +205,7 @@ class ServerArgs:
     device: Optional[str] = None
     tp_size: int = 1
     pp_size: int = 1
-    max_micro_batch_size: Optional[int] = None
+    pp_max_micro_batch_size: Optional[int] = None
     stream_interval: int = 1
     stream_output: bool = False
     random_seed: Optional[int] = None
@@ -1456,6 +1457,14 @@ class ServerArgs:
             "default to 1.0, which may cause accuracy issues. ",
         )
         parser.add_argument(
+            "--modelopt-quant",
+            type=str,
+            default=ServerArgs.modelopt_quant,
+            help="The ModelOpt quantization configuration. "
+            "Supported values: 'fp8', 'int4_awq', 'w4a8_awq', 'nvfp4', 'nvfp4_awq'. "
+            "This requires the NVIDIA Model Optimizer library to be installed: pip install nvidia-modelopt",
+        )
+        parser.add_argument(
             "--kv-cache-dtype",
             type=str,
             default=ServerArgs.kv_cache_dtype,
@@ -1590,9 +1599,9 @@ class ServerArgs:
             help="The pipeline parallelism size.",
         )
         parser.add_argument(
-            "--max-micro-batch-size",
+            "--pp-max-micro-batch-size",
             type=int,
-            default=ServerArgs.max_micro_batch_size,
+            default=ServerArgs.pp_max_micro_batch_size,
             help="The maximum micro batch size in pipeline parallelism.",
         )
         parser.add_argument(

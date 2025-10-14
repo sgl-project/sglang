@@ -464,8 +464,8 @@ class Scheduler(
             _,
             _,
         ) = self.tp_worker.get_worker_info()
-        if global_server_args_dict["max_micro_batch_size"] is None:
-            global_server_args_dict["max_micro_batch_size"] = max(
+        if global_server_args_dict["pp_max_micro_batch_size"] is None:
+            global_server_args_dict["pp_max_micro_batch_size"] = max(
                 self.max_running_requests // server_args.pp_size, 1
             )
 
@@ -1802,7 +1802,7 @@ class Scheduler(
         return ret
 
     def get_num_allocatable_reqs(self, running_bs):
-        res = global_server_args_dict["max_micro_batch_size"] - running_bs
+        res = global_server_args_dict["pp_max_micro_batch_size"] - running_bs
         if self.pp_size > 1:
             res = min(res, self.req_to_token_pool.available_size())
         return res
@@ -2510,7 +2510,7 @@ class Scheduler(
         server_args_dict = recv_req.server_args
         args_allow_update = set(
             [
-                "max_micro_batch_size",
+                "pp_max_micro_batch_size",
                 "speculative_accept_threshold_single",
                 "speculative_accept_threshold_acc",
             ]
@@ -2521,7 +2521,7 @@ class Scheduler(
                 logging.warning(f"Updating {k} is not supported.")
                 if_success = False
                 break
-            elif k == "max_micro_batch_size" and (
+            elif k == "pp_max_micro_batch_size" and (
                 v > self.max_running_requests // self.pp_size or v < 1
             ):
                 logging.warning(

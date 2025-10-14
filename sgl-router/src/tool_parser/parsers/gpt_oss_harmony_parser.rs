@@ -38,7 +38,7 @@ impl ToolParser for GptOssHarmonyParser {
         Ok(StreamingParseResult::default())
     }
 
-    fn detect_format(&self, text: &str) -> bool {
+    fn has_tool_markers(&self, text: &str) -> bool {
         // Reuse the legacy heuristics for now; this will be replaced with Harmony-specific
         // start-token detection when the parser is fully implemented.
         text.contains("<|channel|>commentary")
