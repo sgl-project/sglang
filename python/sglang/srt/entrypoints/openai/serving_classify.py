@@ -175,7 +175,7 @@ class OpenAIServingClassify(OpenAIServingBase):
                     label = self.id2label[predicted_class]
 
                 except Exception as e:
-                    print(f"Error processing embedding for item {i}: {e}")
+                    logger.error(f"Error processing embedding for item {i}: {e}")
                     probs = [1.0]
                     label = "Default"
             else:
