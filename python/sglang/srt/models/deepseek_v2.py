@@ -2023,6 +2023,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             tmp_lse = torch.empty_like(accum_lse)
             merge_state_v2(output, lse, accum_output, accum_lse, tmp_output, tmp_lse)
             accum_output, accum_lse = tmp_output, tmp_lse
+            del kv, k, v, output, lse, tmp_output, tmp_lse
 
         return accum_output
 
