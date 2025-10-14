@@ -501,8 +501,12 @@ class HiCacheHF3FS(HiCacheStorage):
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)
-        self.is_zero_copy = self.mem_pool_host.layout == "page_first"
-        logger.info(f"{self.is_zero_copy=}")
+        self.is_zero_copy = self.mem_pool_host.layout in [
+            "page_first",
+            "page_first_direct",
+        ]
+
+        logger.info(f"{self.is_zero_copy=}, layout={self.mem_pool_host.layout}")
 
     def _get_mha_zero_copy_keys(self, keys: List[str]) -> List[str]:
         _keys = []
