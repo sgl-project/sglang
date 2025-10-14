@@ -1,6 +1,9 @@
 use crate::{
     config::{ConnectionMode, HistoryBackend, RouterConfig, RoutingMode},
-    core::{LoadMonitor, WorkerManager, WorkerRegistry, WorkerType},
+    core::{
+        worker_to_info, Job, JobQueue, JobQueueConfig, LoadMonitor, WorkerManager, WorkerRegistry,
+        WorkerType,
+    },
     data_connector::{
         MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
         NoOpConversationStorage, NoOpResponseStorage, OracleConversationItemStorage,
@@ -17,7 +20,7 @@ use crate::{
             RerankRequest, ResponsesGetParams, ResponsesRequest, V1RerankReqInput,
         },
         validated::ValidatedJson,
-        worker_spec::{WorkerApiResponse, WorkerConfigRequest, WorkerErrorResponse},
+        worker_spec::{WorkerConfigRequest, WorkerErrorResponse, WorkerInfo},
     },
     reasoning_parser::ParserFactory as ReasoningParserFactory,
     routers::{router_manager::RouterManager, RouterTrait},
@@ -35,6 +38,7 @@ use axum::{
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::sync::OnceLock;
 use std::{
     sync::atomic::{AtomicBool, Ordering},
     sync::Arc,
@@ -62,6 +66,7 @@ pub struct AppContext {
     pub load_monitor: Option<Arc<LoadMonitor>>,
     pub configured_reasoning_parser: Option<String>,
     pub configured_tool_parser: Option<String>,
+    pub worker_job_queue: Arc<OnceLock<Arc<JobQueue>>>,
 }
 
 impl AppContext {
@@ -178,6 +183,9 @@ impl AppContext {
         let configured_reasoning_parser = router_config.reasoning_parser.clone();
         let configured_tool_parser = router_config.tool_call_parser.clone();
 
+        // Create empty OnceLock for worker job queue (will be initialized in startup())
+        let worker_job_queue = Arc::new(OnceLock::new());
+
         Ok(Self {
             client,
             router_config,
@@ -194,6 +202,7 @@ impl AppContext {
             load_monitor,
             configured_reasoning_parser,
             configured_tool_parser,
+            worker_job_queue,
         })
     }
 }
@@ -636,52 +645,42 @@ async fn create_worker(
         );
     }
 
-    let result = WorkerManager::add_worker_from_config(&config, &state.context).await;
+    // Submit job for async processing
+    let worker_url = config.url.clone();
+    let job = Job::AddWorker {
+        config: Box::new(config),
+    };
 
-    match result {
-        Ok(message) => {
-            let response = WorkerApiResponse {
-                success: true,
-                message,
-                worker: None,
-            };
-            (StatusCode::OK, Json(response)).into_response()
+    let job_queue = state
+        .context
+        .worker_job_queue
+        .get()
+        .expect("JobQueue not initialized");
+    match job_queue.submit(job).await {
+        Ok(_) => {
+            let response = json!({
+                "status": "accepted",
+                "worker_id": worker_url,
+                "message": "Worker addition queued for background processing"
+            });
+            (StatusCode::ACCEPTED, Json(response)).into_response()
         }
         Err(error) => {
             let error_response = WorkerErrorResponse {
                 error,
-                code: "ADD_WORKER_FAILED".to_string(),
+                code: "INTERNAL_SERVER_ERROR".to_string(),
             };
-            (StatusCode::BAD_REQUEST, Json(error_response)).into_response()
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(error_response)).into_response()
         }
     }
 }
 
 async fn list_workers_rest(State(state): State<Arc<AppState>>) -> Response {
     let workers = state.context.worker_registry.get_all();
-    let response = serde_json::json!({
-        "workers": workers.iter().map(|worker| {
-            let mut worker_info = serde_json::json!({
-                "url": worker.url(),
-                "model_id": worker.model_id(),
-                "worker_type": match worker.worker_type() {
-                    WorkerType::Regular => "regular",
-                    WorkerType::Prefill { .. } => "prefill",
-                    WorkerType::Decode => "decode",
-                },
-                "is_healthy": worker.is_healthy(),
-                "load": worker.load(),
-                "connection_mode": format!("{:?}", worker.connection_mode()),
-                "priority": worker.priority(),
-                "cost": worker.cost(),
-            });
+    let worker_infos: Vec<WorkerInfo> = workers.iter().map(worker_to_info).collect();
 
-            if let WorkerType::Prefill { bootstrap_port } = worker.worker_type() {
-                worker_info["bootstrap_port"] = serde_json::json!(bootstrap_port);
-            }
-
-            worker_info
-        }).collect::<Vec<_>>(),
+    let response = json!({
+        "workers": worker_infos,
         "total": workers.len(),
         "stats": {
             "prefill_count": state.context.worker_registry.get_prefill_workers().len(),
@@ -693,41 +692,77 @@ async fn list_workers_rest(State(state): State<Arc<AppState>>) -> Response {
 }
 
 async fn get_worker(State(state): State<Arc<AppState>>, Path(url): Path<String>) -> Response {
-    let workers = WorkerManager::get_worker_urls(&state.context.worker_registry);
-    if workers.contains(&url) {
-        Json(json!({
-            "url": url,
-            "model_id": "unknown",
-            "is_healthy": true
-        }))
-        .into_response()
-    } else {
-        let error = WorkerErrorResponse {
-            error: format!("Worker {url} not found"),
-            code: "WORKER_NOT_FOUND".to_string(),
-        };
-        (StatusCode::NOT_FOUND, Json(error)).into_response()
+    let job_queue = state
+        .context
+        .worker_job_queue
+        .get()
+        .expect("JobQueue not initialized");
+
+    if let Some(worker) = state.context.worker_registry.get_by_url(&url) {
+        // Worker exists in registry, get its full info and attach job status if any
+        let mut worker_info = worker_to_info(&worker);
+        if let Some(status) = job_queue.get_status(&url) {
+            worker_info.job_status = Some(status);
+        }
+        return Json(worker_info).into_response();
     }
+
+    // Worker not in registry, check job queue for its status
+    if let Some(status) = job_queue.get_status(&url) {
+        // Create a partial WorkerInfo to report the job status
+        let worker_info = WorkerInfo {
+            id: url.clone(),
+            url: url.clone(),
+            model_id: "unknown".to_string(),
+            priority: 0,
+            cost: 1.0,
+            worker_type: "unknown".to_string(),
+            is_healthy: false,
+            load: 0,
+            connection_mode: "unknown".to_string(),
+            tokenizer_path: None,
+            reasoning_parser: None,
+            tool_parser: None,
+            chat_template: None,
+            bootstrap_port: None,
+            metadata: std::collections::HashMap::new(),
+            job_status: Some(status),
+        };
+        return Json(worker_info).into_response();
+    }
+
+    // Worker not found in registry or job queue
+    let error = WorkerErrorResponse {
+        error: format!("Worker {url} not found"),
+        code: "WORKER_NOT_FOUND".to_string(),
+    };
+    (StatusCode::NOT_FOUND, Json(error)).into_response()
 }
 
 async fn delete_worker(State(state): State<Arc<AppState>>, Path(url): Path<String>) -> Response {
-    let result = WorkerManager::remove_worker(&url, &state.context);
+    let worker_id = url.clone();
+    let job = Job::RemoveWorker { url };
 
-    match result {
-        Ok(message) => {
-            let response = WorkerApiResponse {
-                success: true,
-                message,
-                worker: None,
-            };
-            (StatusCode::OK, Json(response)).into_response()
+    let job_queue = state
+        .context
+        .worker_job_queue
+        .get()
+        .expect("JobQueue not initialized");
+    match job_queue.submit(job).await {
+        Ok(_) => {
+            let response = json!({
+                "status": "accepted",
+                "worker_id": worker_id,
+                "message": "Worker removal queued for background processing"
+            });
+            (StatusCode::ACCEPTED, Json(response)).into_response()
         }
         Err(error) => {
             let error_response = WorkerErrorResponse {
                 error,
-                code: "REMOVE_WORKER_FAILED".to_string(),
+                code: "INTERNAL_SERVER_ERROR".to_string(),
             };
-            (StatusCode::BAD_REQUEST, Json(error_response)).into_response()
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(error_response)).into_response()
         }
     }
 }
@@ -897,6 +932,13 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     )?;
 
     let app_context = Arc::new(app_context);
+
+    let weak_context = Arc::downgrade(&app_context);
+    let worker_job_queue = JobQueue::new(JobQueueConfig::default(), weak_context);
+    app_context
+        .worker_job_queue
+        .set(worker_job_queue)
+        .expect("JobQueue should only be initialized once");
 
     info!(
         "Initializing workers for routing mode: {:?}",
