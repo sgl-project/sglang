@@ -1,9 +1,16 @@
 """
 Logprobs Accuracy Test for SGLang
 
-This test module validates the accuracy of logprobs computation in SGLang by comparing
-against deterministic baselines. The test is designed to be run locally by users to
-verify logprobs accuracy before contributing code changes.
+The test is designed to be run locally by users to
+verify logprobs accuracy before contributing changes on related code.
+We really appreciate your effort and contribution to SGLang!
+
+### Contributing
+
+When submitting changes that affect logprobs computation:
+1. Run this test locally to ensure accuracy
+2. Include test results in your PR description
+
 
 ## How to Run Locally
 ### Usage
@@ -14,11 +21,14 @@ This script supports two modes: **generation** and **testing**.
 ```bash
 python test/srt/test_logprobs.py gen
 ```
+This will download ShareGPT dataset and generate a local baseline using SGLang.
 
 #### Step 2: Test Against Baseline (After Code Changes, with your commit changes)
 ```bash
 python test/srt/test_logprobs.py test
 ```
+This will test your changes against the locally generated baseline from Step 1.
+
 ### Interpreting Results
 
 The test will output:
@@ -26,27 +36,18 @@ The test will output:
 - `mean Δ`: Mean difference across all logprobs
 - Pass/fail status based on tolerance thresholds
 
-### Contributing
-
-When submitting changes that affect logprobs computation:
-1. Run this test locally to ensure accuracy
-2. If tolerances are exceeded, investigate the root cause
-3. Update baseline data if necessary (contact maintainers)
-4. Include test results in your PR description
-
 ## Note
 
 This test is NOT run in CI due to hardware variability and the need for deterministic
 baselines. It's designed for local validation by developers and contributors.
+The test mode requires a locally generated baseline from gen mode.
 """
 
 import argparse
-import io
 import json
 import os
 import pickle
 import random
-import time
 import unittest
 
 import numpy as np
@@ -55,10 +56,7 @@ import torch
 from transformers import AutoTokenizer
 
 import sglang as sgl
-from sglang.test.test_utils import (
-    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-    write_github_step_summary,
-)
+from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
 # Configuration
 DENSE_MODEL_NAME = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -70,7 +68,6 @@ SHAREGPT_URL = (
 # Hardware-specific configuration
 if torch.version.cuda is not None:
     print("Running on NVIDIA CUDA GPU")
-    DENSE_INPUT_PKL_URL = "https://huggingface.co/datasets/font-info/logprobs/resolve/main/sglang_baseline_2000_deterministic_flashinfer.pkl"
     DENSE_TOLERANCE_MAX_DIFF = 1e-5
     DENSE_TOLERANCE_MEAN_DIFF = 1e-5
 else:
@@ -79,8 +76,6 @@ else:
 
 # Common configuration
 TOP_K = 20
-MAX_RETRIES = 3
-RETRY_DELAY = 2
 NUM_SAMPLES = 1000
 LOGPROB_SAMPLE_RATIO = 0.5
 TEMPERATURE = 1.0
@@ -91,9 +86,13 @@ DEFAULT_BASELINE_PKL = "sglang_baseline_local.pkl"
 DEFAULT_META_JSON = "baseline_meta_preview.json"
 
 
-def generate_baseline(baseline_file=DEFAULT_BASELINE_PKL, meta_file=DEFAULT_META_JSON, num_samples=NUM_SAMPLES):
+def generate_baseline(
+    baseline_file=DEFAULT_BASELINE_PKL,
+    meta_file=DEFAULT_META_JSON,
+    num_samples=NUM_SAMPLES,
+):
     """Generate a local baseline for logprobs testing.
-    
+
     Args:
         baseline_file: Path to save the baseline pickle file
         meta_file: Path to save the metadata preview JSON file
@@ -101,7 +100,7 @@ def generate_baseline(baseline_file=DEFAULT_BASELINE_PKL, meta_file=DEFAULT_META
     """
     print(f"SGLang version: {sgl.__version__}")
     print("Downloading ShareGPT dataset...")
-    
+
     # Download ShareGPT dataset
     try:
         response = requests.get(SHAREGPT_URL, timeout=30)
@@ -110,7 +109,7 @@ def generate_baseline(baseline_file=DEFAULT_BASELINE_PKL, meta_file=DEFAULT_META
         print(f"Dataset size: {len(data)}")
     except Exception as e:
         raise Exception(f"Failed to download ShareGPT dataset: {e}")
-    
+
     # Filter and prepare texts
     texts = []
     for s in data:
@@ -124,15 +123,15 @@ def generate_baseline(baseline_file=DEFAULT_BASELINE_PKL, meta_file=DEFAULT_META
             except (KeyError, IndexError, TypeError) as e:
                 print(f"Warning: Skipping invalid conversation data: {e}")
                 continue
-    
+
     if not texts:
         raise ValueError("No valid texts found in the dataset")
-    
+
     print(f"Loading tokenizer for {DENSE_MODEL_NAME}...")
     tokenizer = AutoTokenizer.from_pretrained(DENSE_MODEL_NAME, use_fast=True)
-    
+
     rng = np.random.default_rng(42)
-    
+
     print(f"Launching SGLang Engine with {DENSE_MODEL_NAME}...")
     engine = sgl.Engine(
         model_path=DENSE_MODEL_NAME,
@@ -143,54 +142,61 @@ def generate_baseline(baseline_file=DEFAULT_BASELINE_PKL, meta_file=DEFAULT_META
         mem_fraction_static=0.6,
         max_running_requests=1,
     )
-    
+
     records = []
     prompt_lengths = []
-    
+
     try:
         for i, text in enumerate(texts):
             if len(records) >= num_samples:
                 break
-                
+
             try:
                 ids = tokenizer.encode(text, add_special_tokens=False)
                 if len(ids) < 5:
                     continue
-                
+
                 start_pos = int(rng.integers(0, max(1, len(ids) - 3)))
-                
+
                 outputs = engine.generate(
                     input_ids=[ids],
-                    sampling_params={"temperature": 1.0, "top_p": 1.0, "top_k": TOP_K, "max_new_tokens": 1},
+                    sampling_params={
+                        "temperature": 1.0,
+                        "top_p": 1.0,
+                        "top_k": TOP_K,
+                        "max_new_tokens": 1,
+                    },
                     return_logprob=True,
                     logprob_start_len=start_pos,
                     top_logprobs_num=TOP_K,
                 )
                 meta = outputs[0]["meta_info"]
-                
-                records.append(dict(id=i, text=text, ids=ids, start_pos=start_pos, meta=meta))
+
+                records.append(
+                    dict(id=i, text=text, ids=ids, start_pos=start_pos, meta=meta)
+                )
                 prompt_lengths.append(len(ids))
-                
+
                 if (i + 1) % 50 == 0:
                     print(f"Processed {len(records)}/{num_samples} samples")
-                    
+
             except Exception as e:
                 print(f"Warning: Failed to process sample {i}: {e}")
                 continue
-        
+
         # Save baseline files
         with open(baseline_file, "wb") as f:
             pickle.dump(records, f)
         with open(meta_file, "w", encoding="utf-8") as f:
             json.dump(records[:2], f, ensure_ascii=False, indent=2)
-        
+
         print(f"✅ Saved {len(records)} samples to {baseline_file}")
         print(f"✅ Meta preview saved to {meta_file}")
-        
+
         if prompt_lengths:
             avg_prompt_length = sum(prompt_lengths) / len(prompt_lengths)
             print(f"📊 Average prompt length: {avg_prompt_length:.2f} tokens")
-            
+
     finally:
         engine.shutdown()
         torch.cuda.empty_cache()
@@ -218,40 +224,23 @@ class TestLogprobsDense(unittest.TestCase):
         torch.cuda.empty_cache()
 
     def load_test_data(self, baseline_file=None):
-        """Load test data from local baseline file or Hugging Face dataset with retry mechanism."""
-        if baseline_file and os.path.exists(baseline_file):
-            print(f"Loading local baseline from {baseline_file}...")
-            try:
-                with open(baseline_file, "rb") as f:
-                    records = pickle.load(f)
-                print(f"Successfully loaded {len(records)} records from local baseline")
-                return records
-            except Exception as e:
-                print(f"Failed to load local baseline: {e}")
-                print("Falling back to remote baseline...")
-        
-        print(f"Loading data from {DENSE_INPUT_PKL_URL}...")
-        for attempt in range(MAX_RETRIES):
-            try:
-                response = requests.get(DENSE_INPUT_PKL_URL, timeout=30)
-                response.raise_for_status()
+        """Load test data from local baseline file. In test mode, only local baseline is supported."""
+        if not baseline_file:
+            raise ValueError("baseline_file is required in test mode")
 
-                with io.BytesIO(response.content) as f:
-                    records = pickle.load(f)
+        if not os.path.exists(baseline_file):
+            raise FileNotFoundError(
+                f"Baseline file not found: {baseline_file}. Please run 'gen' mode first to generate the baseline."
+            )
 
-                if not records:
-                    raise ValueError("Empty dataset")
-
-                print(f"Successfully loaded {len(records)} records")
-                return records
-
-            except Exception as e:
-                print(f"Attempt {attempt + 1}/{MAX_RETRIES} failed: {e}")
-                if attempt == MAX_RETRIES - 1:
-                    raise Exception(
-                        f"Failed to load data after {MAX_RETRIES} attempts: {e}"
-                    )
-                time.sleep(RETRY_DELAY)
+        print(f"Loading local baseline from {baseline_file}...")
+        try:
+            with open(baseline_file, "rb") as f:
+                records = pickle.load(f)
+            print(f"Successfully loaded {len(records)} records from local baseline")
+            return records
+        except Exception as e:
+            raise Exception(f"Failed to load local baseline: {e}")
 
     def compare_meta(self, baseline_meta, sglang_meta):
         """Compare metadata between two outputs and return max and mean differences."""
@@ -425,15 +414,17 @@ class TestLogprobsDense(unittest.TestCase):
 
 def main():
     """Main function to handle command line arguments and run either generation or testing."""
-    parser = argparse.ArgumentParser(description="SGLang Logprobs Test and Baseline Generation")
+    parser = argparse.ArgumentParser(
+        description="SGLang Logprobs Test and Baseline Generation"
+    )
     parser.add_argument(
         "mode",
         choices=["gen", "test"],
-        help="Mode to run: 'gen' to generate baseline, 'test' to run tests"
+        help="Mode to run: 'gen' to generate baseline, 'test' to run tests",
     )
-    
+
     args = parser.parse_args()
-    
+
     if args.mode == "gen":
         print("🚀 Generating baseline...")
         generate_baseline()
@@ -443,17 +434,19 @@ def main():
         print(f"\n💡 Next steps:")
         print(f"   1. Make your code changes")
         print(f"   2. Run: python {__file__} test")
-        
+
     elif args.mode == "test":
         print("🧪 Running logprobs test...")
         if not os.path.exists(DEFAULT_BASELINE_PKL):
             print(f"❌ Baseline file not found: {DEFAULT_BASELINE_PKL}")
-            print(f"💡 Generate baseline first: python {__file__} gen")
+            print(f"💡 Generate baseline first by running:")
+            print(f"   python {__file__} gen")
+            print(f"   This will download ShareGPT data and generate a local baseline.")
             return 1
-        
+
         # Set environment variable for testing
         os.environ["RETURN_ORIGINAL_LOGPROB"] = "True"
-        
+
         # Create test instance and run
         test_instance = TestLogprobsDense()
         test_instance.setUpClass()
@@ -462,7 +455,7 @@ def main():
             print("\n✅ Test completed successfully!")
         finally:
             test_instance.tearDownClass()
-    
+
     return 0
 
 
