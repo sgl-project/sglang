@@ -348,8 +348,6 @@ class RadixCache(BasePrefixCache):
         else:
             page_aligned_len = actual_kv_len
             page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
-            if self.is_eagle:
-                self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
 
         page_aligned_token_len = (
             page_aligned_len + 1 if self.is_eagle else page_aligned_len
