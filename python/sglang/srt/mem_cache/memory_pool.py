@@ -33,6 +33,7 @@ KVCache actually holds the physical kv cache.
 
 import abc
 import logging
+import os
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
@@ -457,14 +458,28 @@ class MHATokenToKVPool(KVCache):
         self.head_dim = head_dim
 
         # for disagg with nvlink
-        self.enable_custom_mem_pool = get_bool_env_var(
-            "SGLANG_MOONCAKE_CUSTOM_MEM_POOL", "false"
+        custom_mem_pool_type = os.getenv("SGLANG_MOONCAKE_CUSTOM_MEM_POOL")
+        self.enable_custom_mem_pool = (
+            custom_mem_pool_type in ["NVLINK", "BAREX"]
+            if custom_mem_pool_type is not None
+            else False
         )
         if self.enable_custom_mem_pool:
             # TODO(shangming): abstract custom allocator class for more backends
-            from mooncake.allocator import NVLinkAllocator
+            if custom_mem_pool_type == "NVLINK":
+                from mooncake.allocator import NVLinkAllocator
 
-            allocator = NVLinkAllocator.get_allocator(self.device)
+                allocator = NVLinkAllocator.get_allocator(self.device)
+            elif custom_mem_pool_type == "BAREX":
+                from mooncake.allocator import BarexAllocator
+
+                allocator = BarexAllocator.get_allocator(self.device)
+            else:
+                # This should not happen due to the enable_custom_mem_pool check above
+                raise ValueError(
+                    f"Unsupported custom mem pool type: {custom_mem_pool_type}"
+                )
+
             self.custom_mem_pool = torch.cuda.MemPool(allocator.allocator())
         else:
             self.custom_mem_pool = None
@@ -1153,14 +1168,28 @@ class MLATokenToKVPool(KVCache):
         )
 
         # for disagg with nvlink
-        self.enable_custom_mem_pool = get_bool_env_var(
-            "SGLANG_MOONCAKE_CUSTOM_MEM_POOL", "false"
+        custom_mem_pool_type = os.getenv("SGLANG_MOONCAKE_CUSTOM_MEM_POOL")
+        self.enable_custom_mem_pool = (
+            custom_mem_pool_type in ["NVLINK", "BAREX"]
+            if custom_mem_pool_type is not None
+            else False
         )
         if self.enable_custom_mem_pool:
             # TODO(shangming): abstract custom allocator class for more backends
-            from mooncake.allocator import NVLinkAllocator
+            if custom_mem_pool_type == "NVLINK":
+                from mooncake.allocator import NVLinkAllocator
 
-            allocator = NVLinkAllocator.get_allocator(self.device)
+                allocator = NVLinkAllocator.get_allocator(self.device)
+            elif custom_mem_pool_type == "BAREX":
+                from mooncake.allocator import BarexAllocator
+
+                allocator = BarexAllocator.get_allocator(self.device)
+            else:
+                # This should not happen due to the enable_custom_mem_pool check above
+                raise ValueError(
+                    f"Unsupported custom mem pool type: {custom_mem_pool_type}"
+                )
+
             self.custom_mem_pool = torch.cuda.MemPool(allocator.allocator())
         else:
             self.custom_mem_pool = None

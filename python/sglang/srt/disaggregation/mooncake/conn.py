@@ -191,8 +191,11 @@ class MooncakeKVManager(CommonKVManager):
                 "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT", 300
             )
 
-            self.enable_custom_mem_pool = get_bool_env_var(
-                "SGLANG_MOONCAKE_CUSTOM_MEM_POOL", "false"
+            custom_mem_pool_type = os.getenv("SGLANG_MOONCAKE_CUSTOM_MEM_POOL")
+            self.enable_custom_mem_pool = (
+                custom_mem_pool_type in ["NVLINK", "BAREX"]
+                if custom_mem_pool_type is not None
+                else False
             )
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.heartbeat_failures = {}
