@@ -13,7 +13,11 @@ from aibrix_kvcache import (
 )
 from aibrix_kvcache.common.absl_logging import log_every_n_seconds
 
-from sglang.srt.mem_cache.hicache_storage import HiCacheStorage, HiCacheStorageConfig
+from sglang.srt.mem_cache.hicache_storage import (
+    HiCacheStorage,
+    HiCacheStorageConfig,
+    HiCacheStorageExtraInfo,
+)
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
 logger = logging.getLogger(__name__)
@@ -140,7 +144,9 @@ class AibrixKVCacheStorage(HiCacheStorage):
     ) -> bool:
         return self.batch_set([key], [value], [target_location], [target_size])
 
-    def batch_exists(self, keys: List[str]) -> int:
+    def batch_exists(
+        self, keys: List[str], extra_info: Optional[HiCacheStorageExtraInfo] = None
+    ) -> int:
         block_hash = BlockHashes(keys, self.page_size)
         status = self.kv_cache_manager.exists(None, block_hash)
         if status.is_ok():

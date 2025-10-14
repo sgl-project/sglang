@@ -16,6 +16,7 @@
 import contextlib
 import json
 import os
+import tempfile
 import warnings
 from pathlib import Path
 from typing import Any, Dict, Optional, Type, Union
@@ -45,6 +46,7 @@ from sglang.srt.configs import (
     KimiVLConfig,
     LongcatFlashConfig,
     MultiModalityConfig,
+    NemotronHConfig,
     Qwen3NextConfig,
     Step3VLConfig,
 )
@@ -66,6 +68,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     FalconH1Config.model_type: FalconH1Config,
     DotsVLMConfig.model_type: DotsVLMConfig,
     DotsOCRConfig.model_type: DotsOCRConfig,
+    NemotronHConfig.model_type: NemotronHConfig,
 }
 
 for name, cls in _CONFIG_REGISTRY.items():
@@ -143,7 +146,7 @@ def _load_deepseek_v32_model(
     config_json["architectures"] = ["DeepseekV3ForCausalLM"]
     config_json["model_type"] = "deepseek_v3"
 
-    tmp_path = os.path.join(local_path, "_tmp_config_folder")
+    tmp_path = os.path.join(tempfile.gettempdir(), "_tmp_config_folder")
     os.makedirs(tmp_path, exist_ok=True)
 
     unique_path = os.path.join(tmp_path, f"deepseek_v32_{os.getpid()}")

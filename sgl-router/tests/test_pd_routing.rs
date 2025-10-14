@@ -164,6 +164,7 @@ mod test_pd_routing {
 
         for (mode, policy) in test_cases {
             let config = RouterConfig {
+                chat_template: None,
                 mode,
                 policy,
                 host: "127.0.0.1".to_string(),
@@ -195,6 +196,8 @@ mod test_pd_routing {
                 tokenizer_path: None,
                 history_backend: sglang_router_rs::config::HistoryBackend::Memory,
                 oracle: None,
+                reasoning_parser: None,
+                tool_call_parser: None,
             };
 
             let app_context =

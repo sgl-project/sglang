@@ -320,10 +320,8 @@ class EmbedError(_message.Message):
     def __init__(self, message: _Optional[str] = ..., code: _Optional[str] = ..., details: _Optional[str] = ...) -> None: ...
 
 class HealthCheckRequest(_message.Message):
-    __slots__ = ("tokenized",)
-    TOKENIZED_FIELD_NUMBER: _ClassVar[int]
-    tokenized: TokenizedInput
-    def __init__(self, tokenized: _Optional[_Union[TokenizedInput, _Mapping]] = ...) -> None: ...
+    __slots__ = ()
+    def __init__(self) -> None: ...
 
 class HealthCheckResponse(_message.Message):
     __slots__ = ("healthy", "message")
@@ -428,3 +426,65 @@ class SetInternalStateResponse(_message.Message):
     success: bool
     message: str
     def __init__(self, success: bool = ..., message: _Optional[str] = ...) -> None: ...
+
+class GetModelInfoRequest(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class GetModelInfoResponse(_message.Message):
+    __slots__ = ("model_path", "tokenizer_path", "is_generation", "preferred_sampling_params", "weight_version", "served_model_name", "max_context_length", "vocab_size", "supports_vision", "model_type", "eos_token_ids", "pad_token_id", "bos_token_id", "max_req_input_len")
+    MODEL_PATH_FIELD_NUMBER: _ClassVar[int]
+    TOKENIZER_PATH_FIELD_NUMBER: _ClassVar[int]
+    IS_GENERATION_FIELD_NUMBER: _ClassVar[int]
+    PREFERRED_SAMPLING_PARAMS_FIELD_NUMBER: _ClassVar[int]
+    WEIGHT_VERSION_FIELD_NUMBER: _ClassVar[int]
+    SERVED_MODEL_NAME_FIELD_NUMBER: _ClassVar[int]
+    MAX_CONTEXT_LENGTH_FIELD_NUMBER: _ClassVar[int]
+    VOCAB_SIZE_FIELD_NUMBER: _ClassVar[int]
+    SUPPORTS_VISION_FIELD_NUMBER: _ClassVar[int]
+    MODEL_TYPE_FIELD_NUMBER: _ClassVar[int]
+    EOS_TOKEN_IDS_FIELD_NUMBER: _ClassVar[int]
+    PAD_TOKEN_ID_FIELD_NUMBER: _ClassVar[int]
+    BOS_TOKEN_ID_FIELD_NUMBER: _ClassVar[int]
+    MAX_REQ_INPUT_LEN_FIELD_NUMBER: _ClassVar[int]
+    model_path: str
+    tokenizer_path: str
+    is_generation: bool
+    preferred_sampling_params: str
+    weight_version: str
+    served_model_name: str
+    max_context_length: int
+    vocab_size: int
+    supports_vision: bool
+    model_type: str
+    eos_token_ids: _containers.RepeatedScalarFieldContainer[int]
+    pad_token_id: int
+    bos_token_id: int
+    max_req_input_len: int
+    def __init__(self, model_path: _Optional[str] = ..., tokenizer_path: _Optional[str] = ..., is_generation: bool = ..., preferred_sampling_params: _Optional[str] = ..., weight_version: _Optional[str] = ..., served_model_name: _Optional[str] = ..., max_context_length: _Optional[int] = ..., vocab_size: _Optional[int] = ..., supports_vision: bool = ..., model_type: _Optional[str] = ..., eos_token_ids: _Optional[_Iterable[int]] = ..., pad_token_id: _Optional[int] = ..., bos_token_id: _Optional[int] = ..., max_req_input_len: _Optional[int] = ...) -> None: ...
+
+class GetServerInfoRequest(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class GetServerInfoResponse(_message.Message):
+    __slots__ = ("server_args", "scheduler_info", "active_requests", "is_paused", "last_receive_timestamp", "uptime_seconds", "sglang_version", "server_type", "start_time")
+    SERVER_ARGS_FIELD_NUMBER: _ClassVar[int]
+    SCHEDULER_INFO_FIELD_NUMBER: _ClassVar[int]
+    ACTIVE_REQUESTS_FIELD_NUMBER: _ClassVar[int]
+    IS_PAUSED_FIELD_NUMBER: _ClassVar[int]
+    LAST_RECEIVE_TIMESTAMP_FIELD_NUMBER: _ClassVar[int]
+    UPTIME_SECONDS_FIELD_NUMBER: _ClassVar[int]
+    SGLANG_VERSION_FIELD_NUMBER: _ClassVar[int]
+    SERVER_TYPE_FIELD_NUMBER: _ClassVar[int]
+    START_TIME_FIELD_NUMBER: _ClassVar[int]
+    server_args: _struct_pb2.Struct
+    scheduler_info: _struct_pb2.Struct
+    active_requests: int
+    is_paused: bool
+    last_receive_timestamp: float
+    uptime_seconds: float
+    sglang_version: str
+    server_type: str
+    start_time: _timestamp_pb2.Timestamp
+    def __init__(self, server_args: _Optional[_Union[_struct_pb2.Struct, _Mapping]] = ..., scheduler_info: _Optional[_Union[_struct_pb2.Struct, _Mapping]] = ..., active_requests: _Optional[int] = ..., is_paused: bool = ..., last_receive_timestamp: _Optional[float] = ..., uptime_seconds: _Optional[float] = ..., sglang_version: _Optional[str] = ..., server_type: _Optional[str] = ..., start_time: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ...) -> None: ...
