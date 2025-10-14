@@ -4,7 +4,7 @@ use crate::config::types::RetryConfig;
 use crate::core::{WorkerRegistry, WorkerType};
 use crate::metrics::RouterMetrics;
 use crate::policies::PolicyRegistry;
-use crate::reasoning_parser::ParserFactory;
+use crate::reasoning_parser::ReasoningParserFactory;
 use crate::routers::RouterTrait;
 use crate::tokenizer::traits::Tokenizer;
 use crate::tool_parser::ToolParserFactory;
@@ -24,7 +24,7 @@ pub struct GrpcPDRouter {
     worker_registry: Arc<WorkerRegistry>,
     policy_registry: Arc<PolicyRegistry>,
     tokenizer: Arc<dyn Tokenizer>,
-    reasoning_parser_factory: ParserFactory,
+    reasoning_parser_factory: ReasoningParserFactory,
     tool_parser_factory: ToolParserFactory,
 
     dp_aware: bool,

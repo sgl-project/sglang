@@ -8,7 +8,7 @@ use crate::tool_parser::{
     parsers::helpers,
     partial_json::PartialJson,
     traits::ToolParser,
-    types::{FunctionCall, StreamingParseResult, ToolCall},
+    types::{FunctionCall, StreamingParseResult, ToolCall, ToolCallItem},
 };
 
 /// JSON format parser for tool calls
@@ -136,16 +136,7 @@ impl JsonParser {
             let arguments = serde_json::to_string(args)
                 .map_err(|e| ToolParserError::ParsingFailed(e.to_string()))?;
 
-            // Generate a unique ID if not provided
-            let id = obj
-                .get("id")
-                .and_then(|v| v.as_str())
-                .map(String::from)
-                .unwrap_or_else(|| format!("call_{}", uuid::Uuid::new_v4()));
-
             Ok(Some(ToolCall {
-                id,
-                r#type: "function".to_string(),
                 function: FunctionCall {
                     name: name.to_string(),
                     arguments,
@@ -273,5 +264,9 @@ impl ToolParser for JsonParser {
     fn detect_format(&self, text: &str) -> bool {
         let trimmed = text.trim();
         (trimmed.starts_with('[') || trimmed.starts_with('{')) && trimmed.contains(r#""name""#)
+    }
+
+    fn get_unstreamed_tool_args(&self) -> Option<Vec<ToolCallItem>> {
+        helpers::get_unstreamed_args(&self.prev_tool_call_arr, &self.streamed_args_for_tool)
     }
 }

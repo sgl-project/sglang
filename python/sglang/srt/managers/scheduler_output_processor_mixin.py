@@ -9,7 +9,11 @@ import torch
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.io_struct import AbortReq, BatchEmbeddingOut, BatchTokenIDOut
+from sglang.srt.managers.io_struct import (
+    AbortReq,
+    BatchEmbeddingOutput,
+    BatchTokenIDOutput,
+)
 from sglang.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
 
 if TYPE_CHECKING:
@@ -140,7 +144,7 @@ class SchedulerOutputProcessorMixin:
                             logger.error(
                                 f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
                             )
-                            self.abort_request(AbortReq(req.rid))
+                            self.abort_request(AbortReq(rid=req.rid))
                         req.grammar.finished = req.finished()
                 else:
                     # being chunked reqs' prefill is not finished
@@ -173,8 +177,7 @@ class SchedulerOutputProcessorMixin:
             self.set_next_batch_sampling_info_done(batch)
 
         else:  # embedding or reward model
-            embeddings, bid = result.embeddings, result.bid
-            embeddings = embeddings.tolist()
+            embeddings = result.embeddings.tolist()
 
             # Check finish conditions
             for i, req in enumerate(batch.reqs):
@@ -293,7 +296,7 @@ class SchedulerOutputProcessorMixin:
                     logger.error(
                         f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
                     )
-                    self.abort_request(AbortReq(req.rid))
+                    self.abort_request(AbortReq(rid=req.rid))
                 req.grammar.finished = req.finished()
 
         self.set_next_batch_sampling_info_done(batch)
@@ -715,8 +718,7 @@ class SchedulerOutputProcessorMixin:
                 return
 
             self.send_to_detokenizer.send_pyobj(
-                BatchTokenIDOut(
-                    rids,
+                BatchTokenIDOutput(
                     finished_reasons,
                     decoded_texts,
                     decode_ids_list,
@@ -742,6 +744,7 @@ class SchedulerOutputProcessorMixin:
                     output_token_ids_logprobs_val,
                     output_token_ids_logprobs_idx,
                     output_hidden_states,
+                    rids=rids,
                     placeholder_tokens_idx=None,
                     placeholder_tokens_val=None,
                 )
@@ -762,12 +765,12 @@ class SchedulerOutputProcessorMixin:
                 prompt_tokens.append(len(req.origin_input_ids))
                 cached_tokens.append(req.cached_tokens)
         self.send_to_detokenizer.send_pyobj(
-            BatchEmbeddingOut(
-                rids,
+            BatchEmbeddingOutput(
                 finished_reasons,
                 embeddings,
                 prompt_tokens,
                 cached_tokens,
+                rids=rids,
                 placeholder_tokens_idx=None,
                 placeholder_tokens_val=None,
             )

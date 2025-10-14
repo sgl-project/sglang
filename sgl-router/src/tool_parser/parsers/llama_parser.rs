@@ -1,6 +1,5 @@
 use async_trait::async_trait;
 use serde_json::Value;
-use uuid;
 
 use crate::protocols::spec::Tool;
 
@@ -84,16 +83,7 @@ impl LlamaParser {
             let arguments = serde_json::to_string(parameters)
                 .map_err(|e| ToolParserError::ParsingFailed(e.to_string()))?;
 
-            // Generate a unique ID for Llama calls
-            let id = obj
-                .get("id")
-                .and_then(|v| v.as_str())
-                .map(String::from)
-                .unwrap_or_else(|| format!("llama_call_{}", uuid::Uuid::new_v4()));
-
             Ok(Some(ToolCall {
-                id,
-                r#type: "function".to_string(),
                 function: FunctionCall {
                     name: name.to_string(),
                     arguments,
@@ -242,5 +232,9 @@ impl ToolParser for LlamaParser {
         // Llama format if contains python_tag or starts with JSON object
         text.contains("<|python_tag|>")
             || (text.trim_start().starts_with('{') && text.contains(r#""name""#))
+    }
+
+    fn get_unstreamed_tool_args(&self) -> Option<Vec<crate::tool_parser::types::ToolCallItem>> {
+        helpers::get_unstreamed_args(&self.prev_tool_call_arr, &self.streamed_args_for_tool)
     }
 }

@@ -120,11 +120,8 @@ message GenerateRequest {
   // Data parallel routing
   int32 data_parallel_rank = 16;
 
-  // For load balancing
-  int32 dp_balance_id = 17;
-
   // Whether client wants streaming response
-  bool stream = 18;
+  bool stream = 17;
 }
 
 message TokenizedInput {
@@ -182,6 +179,9 @@ message GenerateStreamChunk {
 
   // Input logprobs (if requested) - only in first chunk
   InputLogProbs input_logprobs = 7;
+
+  // Index for ordering when n>1 (for parallel request multiplexing)
+  uint32 index = 8;
 }
 
 message GenerateComplete {
@@ -210,6 +210,9 @@ message GenerateComplete {
 
   // Input logprobs if requested (for prompt tokens)
   InputLogProbs input_logprobs = 10;
+
+  // Index for ordering when n>1 (for parallel request multiplexing)
+  uint32 index = 11;
 }
 
 message GenerateError {

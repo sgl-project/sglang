@@ -39,6 +39,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.overlap_utils import FutureMap
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.model_executor.forward_batch_info import ForwardBatchOutput
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import DynamicGradMode
 from sglang.utils import get_exception_traceback
@@ -160,13 +161,17 @@ class TpModelWorkerClient:
             self.future_map.resolve_future(model_worker_batch)
 
             # Run forward
+            forward_batch_output = self.worker.forward_batch_generation(
+                model_worker_batch,
+                model_worker_batch.launch_done,
+                #  Skip sampling for prefill-only requests
+                skip_sample=model_worker_batch.is_prefill_only,
+            )
+
             logits_output, next_token_ids, can_run_cuda_graph = (
-                self.worker.forward_batch_generation(
-                    model_worker_batch,
-                    model_worker_batch.launch_done,
-                    #  Skip sampling for prefill-only requests
-                    skip_sample=model_worker_batch.is_prefill_only,
-                )
+                forward_batch_output.logits_output,
+                forward_batch_output.next_token_ids,
+                forward_batch_output.can_run_cuda_graph,
             )
 
             # Update the future token ids map
@@ -227,7 +232,7 @@ class TpModelWorkerClient:
 
     def forward_batch_generation(
         self, model_worker_batch: ModelWorkerBatch
-    ) -> Tuple[None, torch.Tensor, bool]:
+    ) -> ForwardBatchOutput:
         # Create a new copy of sampling_info because it will be updated in-place by the scheduler for the next batch.
         sampling_info = model_worker_batch.sampling_info
         sampling_info.update_penalties()
@@ -250,7 +255,10 @@ class TpModelWorkerClient:
         future_next_token_ids = self.future_map.update_next_future(
             cur_future_map_ct, bs
         )
-        return None, future_next_token_ids, False
+        return ForwardBatchOutput(
+            next_token_ids=future_next_token_ids,
+            can_run_cuda_graph=False,
+        )
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         success, message = self.worker.update_weights_from_disk(recv_req)

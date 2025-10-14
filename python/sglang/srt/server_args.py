@@ -116,6 +116,8 @@ GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 
 DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton"]
 
+RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu"]
+
 
 # Allow external code to add more choices
 def add_load_format_choices(choices):
@@ -136,6 +138,14 @@ def add_disagg_transfer_backend_choices(choices):
 
 def add_grammar_backend_choices(choices):
     GRAMMAR_BACKEND_CHOICES.extend(choices)
+
+
+def add_deterministic_attention_backend_choices(choices):
+    DETERMINISTIC_ATTENTION_BACKEND_CHOICES.extend(choices)
+
+
+def add_radix_eviction_policy_choices(choices):
+    RADIX_EVICTION_POLICY_CHOICES.extend(choices)
 
 
 @dataclasses.dataclass
@@ -868,10 +878,9 @@ class ServerArgs:
 
         if self.attention_backend == "dual_chunk_flash_attn":
             logger.warning(
-                "Mixed chunk, radix cache, and cuda graphs are disabled because of using dual chunk flash attention backend"
+                "Mixed chunk and radix cache are disabled when using dual-chunk flash attention backend"
             )
             self.enable_mixed_chunk = False
-            self.disable_cuda_graph = True
             self.disable_radix_cache = True
 
     def _handle_page_size(self):
@@ -2243,7 +2252,7 @@ class ServerArgs:
         parser.add_argument(
             "--radix-eviction-policy",
             type=str,
-            choices=["lru", "lfu"],
+            choices=RADIX_EVICTION_POLICY_CHOICES,
             default=ServerArgs.radix_eviction_policy,
             help="The eviction policy of radix trees. 'lru' stands for Least Recently Used, 'lfu' stands for Least Frequently Used.",
         )
