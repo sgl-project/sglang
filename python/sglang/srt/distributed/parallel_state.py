@@ -240,6 +240,8 @@ class GroupCoordinator:
         use_message_queue_broadcaster: bool = False,
         group_name: Optional[str] = None,
         pynccl_use_current_stream: bool = False,
+        torch_compile: Optional[bool] = None,
+        gloo_timeout: timedelta = timedelta(seconds=120 * 60),
     ):
         # Set group info
         group_name = group_name or "anonymous"
@@ -259,7 +261,9 @@ class GroupCoordinator:
             )
             # a group with `gloo` backend, to allow direct coordination between
             # processes through the CPU.
-            cpu_group = torch.distributed.new_group(ranks, backend="gloo")
+            cpu_group = torch.distributed.new_group(
+                ranks, backend="gloo", timeout=gloo_timeout
+            )
             if self.rank in ranks:
                 self.ranks = ranks
                 self.world_size = len(ranks)
@@ -329,10 +333,17 @@ class GroupCoordinator:
         self.qr_comm: Optional[QuickAllReduce] = None
         if use_custom_allreduce and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
+            if torch_compile is not None and torch_compile:
+                # For piecewise CUDA graph, the requirement for custom allreduce is larger to
+                # avoid illegal cuda memory access.
+                ca_max_size = 256 * 1024 * 1024
+            else:
+                ca_max_size = 8 * 1024 * 1024
             try:
                 self.ca_comm = CustomAllreduce(
                     group=self.cpu_group,
                     device=self.device,
+                    max_size=ca_max_size,
                 )
             except Exception as e:
                 logger.warning(
@@ -609,8 +620,11 @@ class GroupCoordinator:
 
     def _all_reduce_in_place(self, input_: torch.Tensor) -> None:
         pynccl_comm = self.pynccl_comm
+        symm_mem_comm = self.symm_mem_comm
         if pynccl_comm is not None and not pynccl_comm.disabled:
             pynccl_comm.all_reduce(input_)
+        elif symm_mem_comm is not None and not symm_mem_comm.disabled:
+            symm_mem_comm.all_reduce(input_)
         else:
             torch.distributed.all_reduce(input_, group=self.device_group)
 
@@ -1267,6 +1281,7 @@ def init_model_parallel_group(
     use_mscclpp_allreduce: Optional[bool] = None,
     pynccl_use_current_stream: bool = True,
     use_symm_mem_allreduce: Optional[bool] = None,
+    torch_compile: Optional[bool] = None,
 ) -> GroupCoordinator:
     if use_custom_allreduce is None:
         use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
@@ -1288,6 +1303,7 @@ def init_model_parallel_group(
         use_message_queue_broadcaster=use_message_queue_broadcaster,
         group_name=group_name,
         pynccl_use_current_stream=pynccl_use_current_stream,
+        torch_compile=torch_compile,
     )
 
 
@@ -1447,6 +1463,7 @@ def initialize_model_parallel(
     pipeline_model_parallel_size: int = 1,
     backend: Optional[str] = None,
     duplicate_tp_group: bool = False,
+    torch_compile: Optional[bool] = None,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -1503,6 +1520,7 @@ def initialize_model_parallel(
         ),
         group_name="tp",
         pynccl_use_current_stream=duplicate_tp_group,
+        torch_compile=torch_compile,
     )
 
     if duplicate_tp_group:
@@ -1519,6 +1537,7 @@ def initialize_model_parallel(
             ),
             group_name="pdmux_prefill_tp",
             pynccl_use_current_stream=True,
+            torch_compile=torch_compile,
         )
         if _TP.pynccl_comm:
             _TP.pynccl_comm.disabled = False
@@ -1529,7 +1548,6 @@ def initialize_model_parallel(
 
     global _MOE_EP
     assert _MOE_EP is None, "expert model parallel group is already initialized"
-
     if moe_ep_size == tensor_model_parallel_size:
         _MOE_EP = _TP
     else:
@@ -1550,7 +1568,6 @@ def initialize_model_parallel(
 
     global _MOE_TP
     assert _MOE_TP is None, "expert model parallel group is already initialized"
-
     if moe_tp_size == tensor_model_parallel_size:
         _MOE_TP = _TP
     else:

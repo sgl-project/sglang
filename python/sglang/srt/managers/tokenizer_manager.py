@@ -25,7 +25,6 @@ import signal
 import sys
 import threading
 import time
-import uuid
 from collections import deque
 from contextlib import nullcontext
 from datetime import datetime
@@ -34,6 +33,7 @@ from http import HTTPStatus
 from typing import Any, Awaitable, Dict, List, Optional, Tuple, Union
 
 import fastapi
+import orjson
 import torch
 import uvloop
 import zmq
@@ -157,7 +157,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         self.log_requests = server_args.log_requests
         self.log_requests_level = server_args.log_requests_level
         self.preferred_sampling_params = (
-            json.loads(server_args.preferred_sampling_params)
+            orjson.loads(server_args.preferred_sampling_params)
             if server_args.preferred_sampling_params
             else None
         )
@@ -359,7 +359,8 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 (
                     FreezeGCReq,
                     lambda x: None,
-                ),  # For handling case when scheduler skips detokenizer and forwards back to the tokenizer manager, we ignore it.
+                ),
+                # For handling case when scheduler skips detokenizer and forwards back to the tokenizer manager, we ignore it.
                 (HealthCheckOutput, lambda x: None),
             ]
         )
@@ -586,9 +587,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             )
 
         if self.mm_processor and obj.contains_mm_input():
-            if not isinstance(obj.image_data, list):
+            if not isinstance(obj.image_data, list) and obj.image_data:
                 obj.image_data = [obj.image_data]
-            if not isinstance(obj.audio_data, list):
+            if not isinstance(obj.audio_data, list) and obj.audio_data:
                 obj.audio_data = [obj.audio_data]
             mm_inputs: Dict = await self.mm_processor.process_mm_data_async(
                 image_data=obj.image_data,
@@ -1422,7 +1423,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                             meta_info["spec_accept_rate"] = 0.0
                             meta_info["spec_accept_length"] = 0
                     else:
-                        meta_info["spec_acceptance_rate"] = 0.0
+                        meta_info["spec_accept_rate"] = 0.0
                         meta_info["spec_accept_length"] = 0
                 state.finished_time = time.time()
                 meta_info["e2e_latency"] = state.finished_time - state.created_time
