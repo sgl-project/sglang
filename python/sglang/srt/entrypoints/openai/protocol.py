@@ -782,6 +782,7 @@ class ClassifyData(BaseModel):
     probs: List[float]
     num_classes: int
 
+
 class ClassifyResponse(BaseModel):
     id: str
     object: str = "list"
