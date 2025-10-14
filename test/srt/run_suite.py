@@ -115,6 +115,8 @@ suites = {
         TestFile("test_srt_engine.py", 261),
         TestFile("test_standalone_speculative_decoding.py", 250),
         TestFile("test_start_profile.py", 60),
+        TestFile("test_profile_merger.py", 60),
+        TestFile("test_profile_merger_http_api.py", 15),
         TestFile("test_swa_unittest.py", 1),
         TestFile("test_torch_compile.py", 76),
         TestFile("test_torch_compile_moe.py", 172),
