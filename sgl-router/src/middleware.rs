@@ -2,7 +2,7 @@ use axum::{
     body::Body, extract::Request, extract::State, http::header, http::HeaderValue,
     http::StatusCode, middleware::Next, response::IntoResponse, response::Response,
 };
-use rand::{Rng, RngCore};
+use rand::Rng;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -61,27 +61,16 @@ pub async fn auth_middleware(
     Ok(next.run(request).await)
 }
 
-/// Generate responses API ID with format "resp_" + 50 hex characters
-pub fn generate_responses_api_id() -> String {
-    let mut rng = rand::rng();
-    let mut bytes = [0u8; 25];
-    rng.fill_bytes(&mut bytes);
-    let hex_string: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
-    format!("resp_{}", hex_string)
-}
-
 /// Generate OpenAI-compatible request ID based on endpoint
 fn generate_request_id(path: &str) -> String {
-    if path.contains("/v1/responses") {
-        return generate_responses_api_id();
-    }
-
     let prefix = if path.contains("/chat/completions") {
         "chatcmpl-"
     } else if path.contains("/completions") {
         "cmpl-"
     } else if path.contains("/generate") {
         "gnt-"
+    } else if path.contains("/responses") {
+        "resp-"
     } else {
         "req-"
     };
