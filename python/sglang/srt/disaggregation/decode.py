@@ -60,7 +60,6 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.tracing.trace import (
     trace_event_batch,
-    trace_slice,
     trace_slice_batch,
     trace_slice_end,
 )
@@ -787,7 +786,9 @@ class DecodeTransferQueue:
                     )
                     self.tree_cache.cache_finished_req(decode_req.req)
                     trace_slice_end(
-                        RequestStage.DECODE_QUICK_FINISH, decode_req.req.rid, thread_finish_flag=True
+                        RequestStage.DECODE_QUICK_FINISH,
+                        decode_req.req.rid,
+                        thread_finish_flag=True,
                     )
                 else:
                     transferred_reqs.append(decode_req.req)

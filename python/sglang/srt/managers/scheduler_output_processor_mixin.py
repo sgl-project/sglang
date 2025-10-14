@@ -14,7 +14,6 @@ from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
     BatchTokenIDOutput,
 )
-from sglang.srt.utils.common import ceil_div
 from sglang.srt.managers.schedule_batch import (
     BaseFinishReason,
     Req,
@@ -22,6 +21,7 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
 )
 from sglang.srt.tracing.trace import trace_slice
+from sglang.srt.utils.common import ceil_div
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import (
