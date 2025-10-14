@@ -851,6 +851,7 @@ pub struct CompletionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seed: Option<i64>,
 
+    // -------- Engine Specific Sampling Parameters --------
     /// Top-k sampling parameter (-1 to disable)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_k: Option<i32>,
