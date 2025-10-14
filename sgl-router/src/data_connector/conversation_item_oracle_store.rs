@@ -286,8 +286,7 @@ impl Manager for ConversationItemOracleConnectionManager {
 
     fn create(
         &self,
-    ) -> impl std::future::Future<Output = std::result::Result<Connection, oracle::Error>> + Send
-    {
+    ) -> impl std::future::Future<Output = Result<Connection, oracle::Error>> + Send {
         let params = self.params.clone();
         async move {
             let mut conn = Connection::connect(

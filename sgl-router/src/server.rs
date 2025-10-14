@@ -18,11 +18,11 @@ use crate::{
         },
         worker_spec::{WorkerApiResponse, WorkerConfigRequest, WorkerErrorResponse},
     },
-    reasoning_parser::ReasoningParserFactory,
+    reasoning_parser::ParserFactory as ReasoningParserFactory,
     routers::{router_manager::RouterManager, RouterTrait},
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
     tokenizer::{factory as tokenizer_factory, traits::Tokenizer},
-    tool_parser::ToolParserFactory,
+    tool_parser::ParserFactory as ToolParserFactory,
 };
 use axum::{
     extract::{Path, Query, Request, State},
@@ -88,8 +88,8 @@ impl AppContext {
                     tokenizer_factory::create_tokenizer(&tokenizer_path)
                         .map_err(|e| format!("Failed to create tokenizer: {e}"))?,
                 );
-                let reasoning_parser_factory = Some(ReasoningParserFactory::new());
-                let tool_parser_factory = Some(ToolParserFactory::new());
+                let reasoning_parser_factory = Some(crate::reasoning_parser::ParserFactory::new());
+                let tool_parser_factory = Some(crate::tool_parser::ParserFactory::new());
 
                 (tokenizer, reasoning_parser_factory, tool_parser_factory)
             } else {

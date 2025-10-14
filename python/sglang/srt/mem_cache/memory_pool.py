@@ -1177,7 +1177,9 @@ class MLATokenToKVPool(KVCache):
             dtype=torch.uint64,
             device=self.device,
         )
-        self._finalize_allocation_log(size)
+        if not use_nsa:
+            # NSA will allocate indexer KV cache later and then log the total size
+            self._finalize_allocation_log(size)
 
     def get_kv_size_bytes(self):
         assert hasattr(self, "kv_buffer")
@@ -1298,6 +1300,9 @@ class MLATokenToKVPool(KVCache):
 
 
 class NSATokenToKVPool(MLATokenToKVPool):
+    quant_block_size = 128
+    index_k_with_scale_buffer_dtype = torch.uint8
+
     def __init__(
         self,
         size: int,
@@ -1331,8 +1336,6 @@ class NSATokenToKVPool(MLATokenToKVPool):
         # num head == 1 and head dim == 128 for index_k in NSA
         assert index_head_dim == 128
 
-        self.quant_block_size = 128
-
         assert self.page_size == 64
         self.index_k_with_scale_buffer = [
             torch.zeros(
@@ -1347,11 +1350,12 @@ class NSATokenToKVPool(MLATokenToKVPool):
                     self.page_size
                     * (index_head_dim + index_head_dim // self.quant_block_size * 4),
                 ),
-                dtype=torch.uint8,
+                dtype=self.index_k_with_scale_buffer_dtype,
                 device=device,
             )
             for _ in range(layer_num)
         ]
+        self._finalize_allocation_log(size)
 
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
         if self.layer_transfer_counter is not None:
@@ -1392,6 +1396,12 @@ class NSATokenToKVPool(MLATokenToKVPool):
         index_buf_accessor.SetKAndS.execute(
             pool=self, buf=buf, loc=loc, index_k=index_k, index_k_scale=index_k_scale
         )
+
+    def get_kv_size_bytes(self):
+        kv_size_bytes = super().get_kv_size_bytes()
+        for index_k_cache in self.index_k_with_scale_buffer:
+            kv_size_bytes += get_tensor_size_bytes(index_k_cache)
+        return kv_size_bytes
 
 
 class AscendMLAPagedTokenToKVPool(MLATokenToKVPool):
