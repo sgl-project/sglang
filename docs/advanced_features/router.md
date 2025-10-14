@@ -239,13 +239,10 @@ flowchart TD
     Closed -- "Failures < cb-failure-threshold" --> Closed;
     
     %% --- Node Styling ---
-    classDef closed fill:#dff0d8,stroke:#3c763d,stroke-width:2px;
-    classDef open fill:#f2dede,stroke:#a94442,stroke-width:2px;
-    classDef halfopen fill:#fcf8e3,stroke:#8a6d3b,stroke-width:2px;
-    
-    class Closed closed;
-    class Open open;
-    class HalfOpen halfopen;
+    style Closed fill:#00C853,color:#000000
+    style Open fill:#D50000,color:#000000
+    style HalfOpen fill:#FFD600,color:#000000
+    linkStyle 1 stroke:transparent,fill:none
 ```
 
 **Behavior**:
