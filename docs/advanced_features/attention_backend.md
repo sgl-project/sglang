@@ -18,7 +18,7 @@ The support matrix is split into two parts: MHA (standard attention) and MLA (mu
 | **FlashInfer**                  | ✅                          | ✅               | ✅              | ✅              | ✅                 | ❌             |
 | **FA3 (FlashAttention 3)**      | ✅                          | ✅               | ✅              | ✅              | ✅                 | ✅             |
 | **FA4 (FlashAttention 4)**      | ❌                          | ❌               | ❌              | ❌              | ❌                 | ❌             |
-| **Triton**                      | ❌                          | ❌               | ✅              | ✅              | ✅                 | ❌             |
+| **Triton**                      | ❌                          | ❌               | ✅              | ✅              | ✅                 | ✅             |
 | **Torch Native (SDPA)**         | ❌                          | ❌               | ❌              | ❌              | ❌                 | ❌             |
 | **FlexAttention (PyTorch)**     | ❌                          | ❌               | ❌              | ❌              | ❌                 | ❌             |
 | **Dual Chunk FlashAttention**   | ✅                          | ❌               | ❌              | ❌              | ❌                 | ❌             |
