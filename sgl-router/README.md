@@ -1,9 +1,9 @@
 # SGLang Model Gateway
 
-High-performance inference gateway control and data plane for SGLang deployments. The gateway orchestrates fleets of workers, balances traffic across HTTP and gRPC backends, and exposes OpenAI-compatible APIs with pluggable history storage and tool integrations.
+High-performance model routing control and data plane for large-scale LLM deployments. The gateway orchestrates fleets of workers, balances traffic across HTTP and gRPC backends, and exposes OpenAI-compatible APIs with pluggable history storage and tool integrations—while remaining deeply optimized for the SGLang serving runtime.
 
 ## Overview
-- Unified control plane for registering, monitoring, and orchestrating prefill, decode, and regular workers.
+- Unified control plane for registering, monitoring, and orchestrating prefill, decode, and regular workers across heterogeneous model fleets.
 - Data plane that routes requests across HTTP, PD (prefill/decode), gRPC, and OpenAI-compatible backends with shared reliability features.
 - Industry-first gRPC pipeline with native Rust tokenization, reasoning, and tool-call execution for high-throughput OpenAI-compatible serving.
 - Multi-model inference gateway mode (`--enable-igw`) that runs several routers at once and applies per-model policies.
