@@ -16,6 +16,7 @@
 import contextlib
 import json
 import os
+import tempfile
 import warnings
 from pathlib import Path
 from typing import Any, Dict, Optional, Type, Union
@@ -145,7 +146,7 @@ def _load_deepseek_v32_model(
     config_json["architectures"] = ["DeepseekV3ForCausalLM"]
     config_json["model_type"] = "deepseek_v3"
 
-    tmp_path = os.path.join(local_path, "_tmp_config_folder")
+    tmp_path = os.path.join(tempfile.gettempdir(), "_tmp_config_folder")
     os.makedirs(tmp_path, exist_ok=True)
 
     unique_path = os.path.join(tmp_path, f"deepseek_v32_{os.getpid()}")

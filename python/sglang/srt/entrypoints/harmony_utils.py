@@ -7,6 +7,7 @@ import json
 from collections.abc import Iterable
 from typing import Literal, Optional, Union
 
+import orjson
 from openai.types.responses import (
     ResponseOutputItem,
     ResponseOutputMessage,
@@ -228,7 +229,7 @@ def parse_output_message(message: Message):
         if len(message.content) != 1:
             raise ValueError("Invalid number of contents in browser message")
         content = message.content[0]
-        browser_call = json.loads(content.text)
+        browser_call = orjson.loads(content.text)
         # TODO: translate to url properly!
         if recipient == "browser.search":
             action = ActionSearch(

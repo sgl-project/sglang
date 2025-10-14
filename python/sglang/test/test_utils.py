@@ -139,11 +139,11 @@ def _use_cached_default_models(model_repo: str):
 
 if is_in_ci():
     DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
-        5000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 100
+        10000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 1000
     )
 else:
     DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
-        7000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 100
+        20000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 1000
     )
 DEFAULT_URL_FOR_TEST = f"http://127.0.0.1:{DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 1000}"
 
@@ -400,8 +400,6 @@ def _get_call_generate(args: argparse.Namespace):
         return partial(call_generate_vllm, url=f"{args.host}:{args.port}/generate")
     elif args.backend == "srt-raw":
         return partial(call_generate_srt_raw, url=f"{args.host}:{args.port}/generate")
-    elif args.backend == "gserver":
-        return partial(call_generate_gserver, url=f"{args.host}:{args.port}")
     elif args.backend == "outlines":
         return partial(call_generate_outlines, url=f"{args.host}:{args.port}/generate")
     elif args.backend == "guidance":
@@ -507,7 +505,7 @@ def popen_launch_server(
     base_url: str,
     timeout: float,
     api_key: Optional[str] = None,
-    other_args: list[str] = [],
+    other_args: Optional[list[str]] = None,
     env: Optional[dict] = None,
     return_stdout_stderr: Optional[tuple] = None,
     device: str = "auto",
@@ -520,10 +518,11 @@ def popen_launch_server(
         device: Device type ("auto", "cuda", "rocm" or "cpu").
                 If "auto", will detect available platforms automatically.
     """
+    other_args = other_args or []
+
     # Auto-detect device if needed
     if device == "auto":
         device = auto_config_device()
-        print(f"Auto-configed device: {device}", flush=True)
         other_args = list(other_args)
         other_args += ["--device", str(device)]
 
