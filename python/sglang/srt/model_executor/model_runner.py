@@ -387,8 +387,8 @@ class ModelRunner:
             if architectures and not any("Llama4" in arch for arch in architectures):
                 self.is_hybrid = self.model_config.is_hybrid = True
 
-        if config := self.mamba2_config:
-            class_name = config.__class__.__name__
+        if self.mamba2_config is not None or self.minimax_config is not None:
+            class_name = self.mambaish_config.__class__.__name__
             logger.warning(f"{class_name} model detected, disable radix cache")
             self.server_args.disable_radix_cache = True
 
@@ -1356,10 +1356,7 @@ class ModelRunner:
             if self.minimax_config is None
             else config.minimax_cache_per_req
         )
-        if (
-            server_args.disable_radix_cache
-            or mamba_cache_per_req == 0
-        ):
+        if server_args.disable_radix_cache or mamba_cache_per_req == 0:
             # with disable radix cache, sets the max_mamba_cache_size based on the max_running_requests
             if server_args.max_mamba_cache_size is None:
                 if server_args.max_running_requests is not None:
@@ -1679,7 +1676,7 @@ class ModelRunner:
                     self.req_to_token_pool = HybridReqToTokenPool(
                         size=max_num_reqs,
                         mamba_size=self.server_args.max_mamba_cache_size,
-                    max_context_len=self.model_config.context_len
+                        max_context_len=self.model_config.context_len
                         + extra_max_context_len,
                         device=self.device,
                         enable_memory_saver=self.server_args.enable_memory_saver,
