@@ -100,7 +100,6 @@ ATTENTION_BACKEND_CHOICES = [
     "trtllm_mla",
     "trtllm_mha",
     "dual_chunk_flash_attn",
-    "hybrid_linear_attn",
     # AMD specific
     "aiter",
     "wave",
@@ -168,6 +167,7 @@ class ServerArgs:
     quantization: Optional[str] = None
     quantization_param_path: Optional[str] = None
     kv_cache_dtype: str = "auto"
+    enable_fp32_lm_head: bool = False
 
     # Memory and scheduling
     mem_fraction_static: Optional[float] = None
@@ -524,57 +524,134 @@ class ServerArgs:
 
     def _handle_gpu_memory_settings(self, gpu_mem):
         """
-        Configure GPU memory-dependent settings including mem_fraction_static,
-        chunked_prefill_size, cuda_graph_max_bs, and cuda_graph_bs.
+        Configure GPU memory-dependent settings including
+        chunked_prefill_size, cuda_graph_max_bs, and mem_fraction_static.
+
+        Here are our heuristics:
+        - Set chunked_prefill_size and cuda_graph_max_bs based on the GPU memory capacity.
+          This is because GPUs with more memory are generally more powerful, we need to use a larger
+          chunked_prefill_size and a larger cuda_graph_max_bs to fully utilize the GPU.
+        - Then set mem_fraction_static based on chunked_prefill_size and cuda_graph_max_bs.
+
+          GPU memory capacity = model weights + KV cache pool + activations + cuda graph buffers
+
+          The argument mem_fraction_static is defined as (model weights + KV cache pool) / GPU memory capacity,
+          or equivalently, mem_fraction_static = (GPU memory capacity - activations - cuda graph buffers) / GPU memory capacity.
+
+          In order to compute mem_fraction_static, we need to estimate the size of activations and cuda graph buffers.
+          The activation memory is proportional to the chunked_prefill_size.
+          The cuda graph memory is proportional to the cuda_graph_max_bs.
+          We use reserved_mem = chunked_prefill_size * 1.5 + cuda_graph_max_bs * 2 to estimate the size of activations and cuda graph buffers in GB.
+          and set mem_fraction_static = (GPU memory capacity - reserved_mem) / GPU memory capacity.
+
+          The coefficient 1.5 is a heuristic value, in the future, we can do better estimation by looking at the model types, hidden sizes or even do a dummy run.
         """
-        # Set mem fraction static
-        if self.mem_fraction_static is None:
-            if gpu_mem is not None:
-                # GPU memory capacity = model weights + KV cache pool + activations + cuda graph buffers
-                # mem_fraction_static = (model weights + KV cache pool) / GPU memory capacity.
-
-                # We want mem_fraction_static to be as large as possible but still has enough room
-                # for activations and cuda graph buffers. We use the following heuristic to
-                # compute the needed size for activations and cuda graph buffers:
-                # - The size of the activation depends on the chunked_prefill_size and model size.
-                # - The size of cuda graph buffers depends on the cuda graph capture range and model size.
-                # For GPUs with more memory, we use a larger chunked_prefill_size and
-                # capture more cuda graphs, so they need to reserve more memory.
-                parallel_size = self.tp_size * self.pp_size
-
-                if gpu_mem < 20 * 1024:
-                    # T4, 4080. (chunked_prefill_size 2k, cuda_graph_max_bs 8)
-                    reserved_mem = (2.8 + parallel_size / 10) * 1024
-                elif gpu_mem < 50 * 1024:
-                    # A10, L40, 4090, 5090. (chunked_prefill_size 2k, cuda_graph_max_bs 16 if tp < 4 else 80)
-                    reserved_mem = (2.8 + parallel_size / 10) * 1024
-                elif gpu_mem < 90 * 1024:
-                    # H100, A100. (chunked_prefill_size 8k, cuda_graph_max_bs 256 if tp < 4 else 512)
-                    reserved_mem = (12 + parallel_size / 2) * 1024
-                elif gpu_mem < 100 * 1024:
-                    # H20. (chunked_prefill_size 8k, cuda_graph_max_bs 512)
-                    reserved_mem = (15 + parallel_size / 2) * 1024
-                elif gpu_mem < 160 * 1024:
-                    # H200. (chunked_prefill_size 8k, cuda_graph_max_bs 512)
-                    reserved_mem = (15 + parallel_size / 2) * 1024
-                else:
-                    # B200, MI300. (chunked_prefill_size 16k, cuda_graph_max_bs 512)
-                    reserved_mem = 32 * 1024
-
-                # draft model and larger cuda graph buffers
-                if self.speculative_algorithm is not None:
-                    if self.speculative_algorithm == "STANDALONE":
-                        # Standalone speculative decoding needs more memory than other speculative
-                        # decoding algorithms since the draft model is typically larger.
-                        reserved_mem += 6 * 1024
-                    elif self.speculative_algorithm != "NGRAM":
-                        reserved_mem += 2 * 1024
-                if self.enable_dp_attention:
-                    reserved_mem += 4 * 1024
-
-                self.mem_fraction_static = round((gpu_mem - reserved_mem) / gpu_mem, 3)
+        if gpu_mem is not None:
+            if gpu_mem < 20 * 1024:
+                # T4, 4080
+                # (chunked_prefill_size 2k, cuda_graph_max_bs 8)
+                if self.chunked_prefill_size is None:
+                    self.chunked_prefill_size = 2048
+                if self.cuda_graph_max_bs is None:
+                    self.cuda_graph_max_bs = 8
+            elif gpu_mem < 35 * 1024:
+                # A10, 4090, 5090
+                # (chunked_prefill_size 2k, cuda_graph_max_bs 16 if tp < 4 else 80)
+                if self.chunked_prefill_size is None:
+                    self.chunked_prefill_size = 2048
+                if self.cuda_graph_max_bs is None:
+                    # Based on detailed statistics, when serving TP1/TP2 models on lower-end GPUs with HBM < 35GB, you can either disable cuda graph or set `cuda_graph_max_bs` to a very small value to reduce the memory overhead of creating cuda graphs, with almost no impact on performance.
+                    # However, when serving models with TP4 or TP8, we need to enable cuda graph to maintain high performance. In this case, we can set `cuda_graph_max_bs` to 80 (half of the default value 160) to reduce the memory overhead of creating cuda graphs. Looking at the logs
+                    # from TP4 serving of qwen2-72b, a value of 80 is sufficient and can reduce the memory overhead of creating cuda graphs on lower-end GPUs compared to the original 160, avoiding OOM issues.
+                    if self.tp_size < 4:
+                        self.cuda_graph_max_bs = 16
+                    else:
+                        self.cuda_graph_max_bs = 80
+            elif gpu_mem < 60 * 1024:
+                # A100 (40GB), L40,
+                # (chunked_prefill_size 4k, cuda_graph_max_bs 32 if tp < 4 else 160)
+                if self.chunked_prefill_size is None:
+                    self.chunked_prefill_size = 4096
+                if self.cuda_graph_max_bs is None:
+                    if self.tp_size < 4:
+                        self.cuda_graph_max_bs = 32
+                    else:
+                        self.cuda_graph_max_bs = 160
+            elif gpu_mem < 90 * 1024:
+                # H100, A100
+                # (chunked_prefill_size 8k, cuda_graph_max_bs 256 if tp < 4 else 512)
+                if self.chunked_prefill_size is None:
+                    self.chunked_prefill_size = 8192
+                if self.cuda_graph_max_bs is None:
+                    if self.tp_size < 4:
+                        self.cuda_graph_max_bs = 256
+                    else:
+                        self.cuda_graph_max_bs = 512
+            elif gpu_mem < 160 * 1024:
+                # H20, H200
+                # (chunked_prefill_size 8k, cuda_graph_max_bs 256 if tp < 4 else 512)
+                if self.chunked_prefill_size is None:
+                    self.chunked_prefill_size = 8192
+                if self.cuda_graph_max_bs is None:
+                    if self.tp_size < 4:
+                        self.cuda_graph_max_bs = 256
+                    else:
+                        self.cuda_graph_max_bs = 512
             else:
-                self.mem_fraction_static = 0.88
+                # B200, MI300
+                # (chunked_prefill_size 16k, cuda_graph_max_bs 512)
+                if self.chunked_prefill_size is None:
+                    self.chunked_prefill_size = 16384
+                if self.cuda_graph_max_bs is None:
+                    self.cuda_graph_max_bs = 512
+        else:
+            # Fallback defaults when gpu_mem is None
+            if self.chunked_prefill_size is None:
+                self.chunked_prefill_size = 4096
+            if self.cuda_graph_max_bs is None:
+                self.cuda_graph_max_bs = 160
+
+        # Set cuda graph batch sizes
+        if self.cuda_graph_bs is None:
+            self.cuda_graph_bs = self._generate_cuda_graph_batch_sizes()
+        else:
+            self.cuda_graph_max_bs = max(self.cuda_graph_bs)
+
+        if self.mem_fraction_static is None:
+            # Constant meta data (e.g., from attention backend)
+            reserved_mem = 512
+            # For activation during large prefill
+            if self.chunked_prefill_size > 0:
+                reserved_mem += max(self.chunked_prefill_size, 2048) * 1.5
+            else:
+                reserved_mem += max(self.max_prefill_tokens, 2048) * 1.5
+            # For cuda graphs
+            reserved_mem += self.cuda_graph_max_bs * 2
+            # Some adjustments for large parallel size
+            reserved_mem += self.tp_size * self.pp_size / 8 * 1024
+
+            if self.enable_dp_attention:
+                # DP attention needs more padding for some operations
+                reserved_mem += self.cuda_graph_max_bs * self.dp_size * 3
+
+                # DP attention uses much more memory for large cuda graph max bs,
+                # likely due to some inefficiencies in torch allocator or our implementation.
+                # So we need to reserve more memory.
+                if self.cuda_graph_max_bs > 300:
+                    reserved_mem += self.cuda_graph_max_bs * self.dp_size * 1.5
+
+            if gpu_mem > 60 * 1024:
+                reserved_mem = max(reserved_mem, 10 * 1024)
+
+            if self.speculative_algorithm is not None:
+                if self.speculative_algorithm == "STANDALONE":
+                    # standalonedraft model and cuda graphs
+                    reserved_mem += 6 * 1024
+                elif self.speculative_algorithm != "NGRAM":
+                    # eagle draft models and cuda graphs
+                    reserved_mem += 2 * 1024
+
+            self.mem_fraction_static = round((gpu_mem - reserved_mem) / gpu_mem, 3)
 
             # Lazy init to avoid circular import
             # Multimodal models need more memory for the image processor
@@ -583,49 +660,6 @@ class ServerArgs:
             model_config = ModelConfig.from_server_args(self)
             if model_config.is_multimodal:
                 self.adjust_mem_fraction_for_vlm(model_config)
-
-        # Set chunked prefill size, which depends on the gpu memory capacity
-        if self.chunked_prefill_size is None:
-            if gpu_mem is not None:
-                if gpu_mem < 50 * 1024:  # T4, 4080, A10, L40, 4090, 5090
-                    self.chunked_prefill_size = 2048
-                elif gpu_mem < 160 * 1024:  # H100, H200, A100, H20
-                    self.chunked_prefill_size = 8192
-                else:  # B200, MI300
-                    self.chunked_prefill_size = 16384
-            else:
-                self.chunked_prefill_size = 4096
-
-        # Set cuda graph max batch size and cuda graph batch sizes
-        if self.cuda_graph_max_bs is None:
-            if gpu_mem is not None:
-                if gpu_mem < 20 * 1024:
-                    # T4, 4080
-                    self.cuda_graph_max_bs = 8
-                elif gpu_mem < 50 * 1024:
-                    # A10, L40, 4090, 5090
-                    # Based on detailed statistics, when serving TP1/TP2 models on lower-end GPUs with HBM<25G, you can either disable cuda graph or set `cuda_graph_max_bs` to a very small value to reduce the memory overhead of creating cuda graphs, with almost no impact on performance.
-                    # However, when serving models with TP4 or TP8, we need to enable cuda graph to maintain high performance. In this case, we can set `cuda_graph_max_bs` to 80 (half of the default value 160) to reduce the memory overhead of creating cuda graphs. Looking at the logs
-                    # from TP4 serving of qwen2-72b, a value of 80 is sufficient and can reduce the memory overhead of creating cuda graphs on lower-end GPUs compared to the original 160, avoiding OOM issues.
-                    if self.tp_size < 4:
-                        self.cuda_graph_max_bs = 16
-                    else:
-                        self.cuda_graph_max_bs = 80
-                elif gpu_mem < 90 * 1024:
-                    # H100, A100
-                    if self.tp_size < 4:
-                        self.cuda_graph_max_bs = 256
-                    else:
-                        self.cuda_graph_max_bs = 512
-                else:
-                    # H20, H200, B200, MI300
-                    self.cuda_graph_max_bs = 512
-            else:
-                # Default fallback
-                self.cuda_graph_max_bs = 160
-
-        if self.cuda_graph_bs is None:
-            self.cuda_graph_bs = self._generate_cuda_graph_batch_sizes()
 
     def _generate_cuda_graph_batch_sizes(self):
         """
@@ -768,7 +802,7 @@ class ServerArgs:
                 self.speculative_algorithm is None
             ), "Speculative decoding is currently not supported with Flex Attention backend"
 
-        if is_npu() and self.attention_backend in ["ascend", "hybrid_linear_attn"]:
+        if is_npu() and self.attention_backend in ["ascend"]:
             logger.warning(
                 "At this moment Ascend attention backend only supports a page_size of 128, change page_size to 128."
             )
@@ -1359,6 +1393,11 @@ class ServerArgs:
             default=ServerArgs.kv_cache_dtype,
             choices=["auto", "fp8_e5m2", "fp8_e4m3"],
             help='Data type for kv cache storage. "auto" will use model data type. "fp8_e5m2" and "fp8_e4m3" is supported for CUDA 11.8+.',
+        )
+        parser.add_argument(
+            "--enable-fp32-lm-head",
+            action="store_true",
+            help="If set, the LM head outputs (logits) are in FP32.",
         )
 
         # Memory and scheduling

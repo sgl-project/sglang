@@ -64,6 +64,7 @@ class OpenAIServingChat(OpenAIServingBase):
         super().__init__(tokenizer_manager)
         self.template_manager = template_manager
         self.tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
+        self.reasoning_parser = self.tokenizer_manager.server_args.reasoning_parser
 
     def _request_id_prefix(self) -> str:
         return "chatcmpl-"
@@ -563,10 +564,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 stream_buffers[index] = stream_buffer + delta
 
                 # Handle reasoning content
-                if (
-                    self.tokenizer_manager.server_args.reasoning_parser
-                    and request.separate_reasoning
-                ):
+                if self.reasoning_parser and request.separate_reasoning:
                     reasoning_text, delta = self._process_reasoning_stream(
                         index, delta, reasoning_parser_dict, content, request
                     )
@@ -756,7 +754,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
             # Handle reasoning content
             reasoning_text = None
-            reasoning_parser = self.tokenizer_manager.server_args.reasoning_parser
+            reasoning_parser = self.reasoning_parser
             if reasoning_parser and request.separate_reasoning:
                 is_force_reasoning = (
                     self.template_manager.force_reasoning
@@ -1010,7 +1008,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 or self._get_enable_thinking_from_request(request)
             )
             reasoning_parser_dict[index] = ReasoningParser(
-                self.tokenizer_manager.server_args.reasoning_parser,
+                self.reasoning_parser,
                 request.stream_reasoning,
                 is_force_reasoning,
             )
@@ -1050,11 +1048,11 @@ class OpenAIServingChat(OpenAIServingBase):
         """
         if hasattr(request, "chat_template_kwargs") and request.chat_template_kwargs:
             # For Qwen3 models, `enable_thinking` is supported.
-            if request.chat_template_kwargs.get("enable_thinking") is not None:
-                return request.chat_template_kwargs.get("enable_thinking")
+            if self.reasoning_parser in ["qwen3", "glm45"]:
+                return request.chat_template_kwargs.get("enable_thinking", False)
             # For DeepSeek-V3.1 models, `thinking` is supported.
-            elif request.chat_template_kwargs.get("thinking") is not None:
-                return request.chat_template_kwargs.get("thinking")
+            elif self.reasoning_parser in ["deepseek-v3"]:
+                return request.chat_template_kwargs.get("thinking", False)
             else:
                 return False
         return False

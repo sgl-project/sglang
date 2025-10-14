@@ -220,6 +220,7 @@ class LogitsProcessor(nn.Module):
         self.config = config
         self.logit_scale = logit_scale
         self.use_attn_tp_group = global_server_args_dict["enable_dp_lm_head"]
+        self.use_fp32_lm_head = global_server_args_dict["enable_fp32_lm_head"]
         if self.use_attn_tp_group:
             self.attn_tp_size = get_attention_tp_size()
             self.do_tensor_parallel_all_gather = (
@@ -461,7 +462,11 @@ class LogitsProcessor(nn.Module):
             dp_gather_replicate(hidden_states, local_hidden_states, logits_metadata)
 
         if hasattr(lm_head, "weight"):
-            if use_intel_amx_backend(lm_head):
+            if self.use_fp32_lm_head:
+                logits = torch.matmul(
+                    hidden_states.to(torch.float32), lm_head.weight.to(torch.float32).T
+                )
+            elif use_intel_amx_backend(lm_head):
                 logits = torch.ops.sgl_kernel.weight_packed_linear(
                     hidden_states.to(lm_head.weight.dtype),
                     lm_head.weight,
@@ -475,7 +480,15 @@ class LogitsProcessor(nn.Module):
         else:
             # GGUF models
             # TODO: use weight_packed_linear for GGUF models
-            logits = lm_head.quant_method.apply(lm_head, hidden_states, embedding_bias)
+            if self.use_fp32_lm_head:
+                with torch.cuda.amp.autocast(enabled=False):
+                    logits = lm_head.quant_method.apply(
+                        lm_head, hidden_states.to(torch.float32), embedding_bias
+                    )
+            else:
+                logits = lm_head.quant_method.apply(
+                    lm_head, hidden_states, embedding_bias
+                )
 
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)

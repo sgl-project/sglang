@@ -63,10 +63,15 @@ class TestNightlyGsm8KEval(unittest.TestCase):
             for model in model_group:
                 model_count += 1
                 with self.subTest(model=model):
+                    other_args = ["--tp", "2"] if is_tp2 else []
+
+                    if model == "meta-llama/Llama-3.1-70B-Instruct":
+                        other_args.extend(["--mem-fraction-static", "0.9"])
+
                     process = popen_launch_server(
                         model=model,
+                        other_args=other_args,
                         base_url=self.base_url,
-                        other_args=["--tp", "2"] if is_tp2 else [],
                         timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
                     )
 

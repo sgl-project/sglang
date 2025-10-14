@@ -130,32 +130,7 @@ impl ToolParser for PythonicParser {
             return true;
         }
 
-        let trimmed = cleaned.trim();
-        let Some(open_idx) = trimmed.find('[') else {
-            return false;
-        };
-
-        let after_bracket = trimmed[open_idx + 1..].trim_start();
-        let mut chars = after_bracket.char_indices();
-        let Some((_, first_char)) = chars.next() else {
-            return false;
-        };
-
-        if !(first_char.is_ascii_alphabetic() || first_char == '_') {
-            return false;
-        }
-
-        let mut ident_len = first_char.len_utf8();
-        for (idx, ch) in chars {
-            if ch.is_alphanumeric() || ch == '_' {
-                ident_len = idx + ch.len_utf8();
-            } else {
-                break;
-            }
-        }
-
-        let remaining = after_bracket[ident_len..].trim_start();
-        remaining.starts_with('(')
+        false
     }
 }
 

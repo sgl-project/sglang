@@ -3,7 +3,7 @@
 //! Tests for the JSON parser which handles OpenAI, Claude, and generic JSON formats
 
 use serde_json::json;
-use sglang_router_rs::tool_parser::{JsonParser, TokenConfig, ToolParser};
+use sglang_router_rs::tool_parser::{JsonParser, ToolParser};
 
 #[tokio::test]
 async fn test_simple_json_tool_call() {
@@ -158,34 +158,4 @@ async fn test_json_format_detection() {
     assert!(parser.detect_format(r#"{"name": "test", "arguments": {}}"#));
     assert!(parser.detect_format(r#"[{"name": "test"}]"#));
     assert!(!parser.detect_format("plain text"));
-    assert!(!parser.detect_format(r#"{"key": "value"}"#)); // No name field
-}
-
-#[tokio::test]
-async fn test_parse_with_wrapper_tokens() {
-    let parser = JsonParser::with_config(TokenConfig {
-        start_tokens: vec!["<tool>".to_string()],
-        end_tokens: vec!["</tool>".to_string()],
-        separator: ", ".to_string(),
-    });
-
-    let input = r#"<tool>{"name": "test", "arguments": {}}</tool>"#;
-    let (normal_text, tool_calls) = parser.parse_complete(input).await.unwrap();
-    assert_eq!(tool_calls.len(), 1);
-    assert_eq!(tool_calls[0].function.name, "test");
-    assert_eq!(normal_text, ""); // Wrapper tokens with no extra text
-}
-
-#[tokio::test]
-async fn test_parse_with_start_token_invalid_json() {
-    let parser = JsonParser::with_config(TokenConfig {
-        start_tokens: vec!["<|python_tag|>".to_string()],
-        end_tokens: vec!["".to_string()],
-        separator: ";".to_string(),
-    });
-
-    let input = r#"Hello world <|python_tag|>this is not valid json at all"#;
-    let (normal_text, tool_calls) = parser.parse_complete(input).await.unwrap();
-    assert_eq!(tool_calls.len(), 0);
-    assert_eq!(normal_text, input); // Should return entire original text when JSON parsing fails
 }
