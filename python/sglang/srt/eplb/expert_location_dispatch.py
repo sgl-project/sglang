@@ -51,7 +51,7 @@ class ExpertLocationDispatchInfo:
             node_rank = get_global_server_args().node_rank
             device = get_global_server_args().device
             num_physical_experts = expert_location_metadata.num_physical_experts
-            dispatch_node = get_global_server_args().fake_node
+            dispatch_node = get_global_server_args().ep_dispatch_fake_num_node
             dummy_topk_ids_shape = DUMMY_MAX_TOPK_SHAPE
             balanced_tensor = generate_balanced_expert_selection(
                 dummy_topk_ids_shape,
