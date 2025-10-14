@@ -551,31 +551,23 @@ impl WorkerManager {
     }
 
     /// Add a worker from a configuration request
+    ///
+    /// Registers worker immediately with healthy=false, returns worker for async validation
     pub async fn add_worker_from_config(
         config: &WorkerConfigRequest,
         context: &AppContext,
-    ) -> Result<String, String> {
+    ) -> Result<Arc<dyn Worker>, String> {
+        // Check if worker already exists
+        if context.worker_registry.get_by_url(&config.url).is_some() {
+            return Err(format!("Worker {} already exists", config.url));
+        }
         let mut labels = config.labels.clone();
 
-        let model_id = if let Some(ref model_id) = config.model_id {
-            model_id.clone()
-        } else {
-            match Self::get_server_info(&config.url, config.api_key.as_deref()).await {
-                Ok(info) => info
-                    .model_id
-                    .or_else(|| {
-                        info.model_path
-                            .as_ref()
-                            .and_then(|path| path.split('/').next_back().map(|s| s.to_string()))
-                    })
-                    .unwrap_or_else(|| "unknown".to_string()),
-                Err(e) => {
-                    warn!("Failed to query server info from {}: {}", config.url, e);
-                    "unknown".to_string()
-                }
-            }
-        };
-
+        // Use provided model_id or default to "unknown"
+        let model_id = config
+            .model_id
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
         labels.insert("model_id".to_string(), model_id.clone());
         if let Some(priority) = config.priority {
             labels.insert("priority".to_string(), priority.to_string());
@@ -614,18 +606,54 @@ impl WorkerManager {
             ConnectionMode::Http
         };
 
-        let policy_hint = labels.get("policy").cloned();
+        let circuit_breaker_config = Self::convert_circuit_breaker_config(
+            &context.router_config.effective_circuit_breaker_config(),
+        );
+        let health_config = Self::convert_health_config(&context.router_config.health_check);
 
-        Self::add_worker_internal(
-            &config.url,
+        // Create and register worker (starts with healthy=false)
+        let worker = Self::create_basic_worker(
+            config.url.clone(),
             worker_type,
             connection_mode,
             config.api_key.clone(),
-            Some(labels),
-            policy_hint.as_deref(),
-            context,
-        )
-        .await
+            Some(labels.clone()),
+            circuit_breaker_config,
+            health_config,
+        );
+
+        worker.set_healthy(false);
+        context.worker_registry.register(worker.clone());
+
+        let policy_hint = labels.get("policy").map(|s| s.as_str());
+        context
+            .policy_registry
+            .on_worker_added(&model_id, policy_hint);
+
+        info!("Registered worker {} (initializing)", config.url);
+
+        // Return worker for async validation
+        Ok(worker)
+    }
+
+    /// Validate and activate a worker (for async validation after registration)
+    pub async fn validate_and_activate_worker(
+        worker: &Arc<dyn Worker>,
+        context: &AppContext,
+    ) -> Result<String, String> {
+        let url = worker.url();
+
+        // Perform health validation
+        WorkerFactory::validate_health(url, context.router_config.worker_startup_timeout_secs)
+            .await
+            .map_err(|e| format!("Health check failed for {}: {}", url, e))?;
+
+        // Mark as healthy
+        worker.set_healthy(true);
+
+        info!("Worker {} validated and activated", url);
+
+        Ok(format!("Worker {} is now healthy", url))
     }
 
     /// Add a worker from URL (legacy endpoint)
