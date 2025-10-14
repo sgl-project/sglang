@@ -2,6 +2,7 @@
 
 use super::ProcessedMessages;
 use crate::core::Worker;
+use crate::grpc_client::sglang_scheduler::AbortOnDropStream;
 use crate::grpc_client::{proto, SglangSchedulerClient};
 use crate::protocols::spec::{
     ChatCompletionRequest, ChatLogProbs, ChatLogProbsContent, ChatMessage, FunctionCallResponse,
@@ -20,7 +21,6 @@ use futures::StreamExt;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tonic::codec::Streaming;
 use tracing::{error, warn};
 use uuid::Uuid;
 
@@ -158,51 +158,54 @@ pub fn generate_tool_constraints(
     tools: &[Tool],
     tool_choice: &Option<ToolChoice>,
     _model: &str,
-) -> Option<(String, String)> {
-    let choice = tool_choice.as_ref()?;
+) -> Result<Option<(String, String)>, String> {
+    let Some(choice) = tool_choice.as_ref() else {
+        return Ok(None);
+    };
 
     match choice {
         // Specific function: Return parameters schema directly
         // tools should already be filtered to contain only the specific function
         ToolChoice::Function { .. } => {
             if tools.is_empty() {
-                return None;
+                return Ok(None);
             }
             let tool = &tools[0];
 
             // Return the tool's parameters schema directly (not wrapped in array)
-            let params_schema = serde_json::to_string(&tool.function.parameters).ok()?;
-            Some(("json_schema".to_string(), params_schema))
+            let params_schema = serde_json::to_string(&tool.function.parameters)
+                .map_err(|e| format!("Failed to serialize tool parameters: {}", e))?;
+            Ok(Some(("json_schema".to_string(), params_schema)))
         }
 
         // Required: Array of tool calls with minItems: 1
         ToolChoice::Value(ToolChoiceValue::Required) => {
             let schema = build_required_array_schema(tools)?;
-            Some(("json_schema".to_string(), schema))
+            Ok(Some(("json_schema".to_string(), schema)))
         }
 
         // AllowedTools with required mode: tools are already filtered
         ToolChoice::AllowedTools { mode, .. } => {
             if mode == "required" {
                 if tools.is_empty() {
-                    return None;
+                    return Ok(None);
                 }
                 let schema = build_required_array_schema(tools)?;
-                Some(("json_schema".to_string(), schema))
+                Ok(Some(("json_schema".to_string(), schema)))
             } else {
                 // "auto" mode - no constraint needed
-                None
+                Ok(None)
             }
         }
 
         // "auto" or "none" - no constraint
-        _ => None,
+        _ => Ok(None),
     }
 }
 
 /// Build JSON schema for required tool calls (array with minItems: 1)
 /// Includes $defs consolidation from all tools (matching Python's behavior)
-pub fn build_required_array_schema(tools: &[Tool]) -> Option<String> {
+pub fn build_required_array_schema(tools: &[Tool]) -> Result<String, String> {
     // Build anyOf schemas for each tool
     let mut any_of_schemas = Vec::new();
     for tool in tools {
@@ -228,11 +231,12 @@ pub fn build_required_array_schema(tools: &[Tool]) -> Option<String> {
                     if let Some(existing) = all_defs.get(def_name) {
                         // Check for conflicts
                         if existing != def_schema {
-                            error!(
-                                "Tool definition '{}' has multiple schemas, which is not supported",
+                            let error_msg = format!(
+                                "Tool definition '{}' has multiple conflicting schemas, which is not supported",
                                 def_name
                             );
-                            return None;
+                            error!("{}", error_msg);
+                            return Err(error_msg);
                         }
                     } else {
                         all_defs.insert(def_name.clone(), def_schema.clone());
@@ -260,7 +264,8 @@ pub fn build_required_array_schema(tools: &[Tool]) -> Option<String> {
         }
     }
 
-    serde_json::to_string(&array_schema).ok()
+    serde_json::to_string(&array_schema)
+        .map_err(|e| format!("Failed to serialize tool schema: {}", e))
 }
 
 /// Filter tools based on tool_choice (shared by both routers)
@@ -590,7 +595,7 @@ pub fn parse_json_schema_response(
 /// * `Ok(Vec<GenerateComplete>)` - All complete responses collected from the stream
 /// * `Err(Response)` - Error response if the stream fails or returns an error
 pub async fn collect_stream_responses(
-    mut stream: Streaming<proto::GenerateResponse>,
+    stream: &mut AbortOnDropStream,
     worker_name: &str,
 ) -> Result<Vec<proto::GenerateComplete>, Response> {
     use proto::generate_response::Response::*;
@@ -606,6 +611,7 @@ pub async fn collect_stream_responses(
                     }
                     Some(Error(err)) => {
                         error!("{} error: {}", worker_name, err.message);
+                        // Don't mark as completed - let Drop send abort for error cases
                         return Err(internal_error_message(format!(
                             "{} generation failed: {}",
                             worker_name, err.message
@@ -621,6 +627,7 @@ pub async fn collect_stream_responses(
             }
             Err(e) => {
                 error!("{} stream error: {:?}", worker_name, e);
+                // Don't mark as completed - let Drop send abort for error cases
                 return Err(internal_error_message(format!(
                     "{} stream failed: {}",
                     worker_name, e
@@ -673,17 +680,44 @@ pub fn generate_tool_call_id(
     }
 }
 
+/// Check if a reasoning parser is available for the given model
+pub fn check_reasoning_parser_availability(
+    reasoning_parser_factory: &crate::reasoning_parser::ParserFactory,
+    configured_parser: Option<&String>,
+    model: &str,
+) -> bool {
+    if let Some(parser_name) = configured_parser {
+        reasoning_parser_factory.registry().has_parser(parser_name)
+    } else {
+        reasoning_parser_factory
+            .registry()
+            .has_parser_for_model(model)
+    }
+}
+
+/// Check if a tool parser is available for the given model
+pub fn check_tool_parser_availability(
+    tool_parser_factory: &crate::tool_parser::ParserFactory,
+    configured_parser: Option<&String>,
+    model: &str,
+) -> bool {
+    if let Some(parser_name) = configured_parser {
+        tool_parser_factory.registry().has_parser(parser_name)
+    } else {
+        tool_parser_factory.registry().has_parser_for_model(model)
+    }
+}
+
 /// Get the appropriate reasoning parser for a model
 ///
 /// If a parser name is explicitly configured, use that parser.
 /// Otherwise, auto-detect based on the model name.
+/// Get a pooled reasoning parser (for non-streaming where state doesn't matter)
 pub fn get_reasoning_parser(
-    reasoning_parser_factory: &crate::reasoning_parser::ReasoningParserFactory,
+    reasoning_parser_factory: &crate::reasoning_parser::ParserFactory,
     configured_parser: Option<&String>,
     model: &str,
 ) -> crate::reasoning_parser::PooledParser {
-    use tracing::warn;
-
     if let Some(parser_name) = configured_parser {
         // Use configured parser if specified
         reasoning_parser_factory
@@ -702,17 +736,40 @@ pub fn get_reasoning_parser(
     }
 }
 
+/// Create a fresh reasoning parser instance (for streaming where state isolation is needed)
+pub fn create_reasoning_parser(
+    reasoning_parser_factory: &crate::reasoning_parser::ParserFactory,
+    configured_parser: Option<&String>,
+    model: &str,
+) -> Option<Box<dyn crate::reasoning_parser::ReasoningParser>> {
+    if let Some(parser_name) = configured_parser {
+        // Use configured parser if specified
+        reasoning_parser_factory
+            .registry()
+            .create_parser(parser_name)
+            .or_else(|| {
+                warn!(
+                    "Configured reasoning parser '{}' not found, falling back to model-based selection",
+                    parser_name
+                );
+                reasoning_parser_factory.registry().create_for_model(model)
+            })
+    } else {
+        // Auto-detect based on model
+        reasoning_parser_factory.registry().create_for_model(model)
+    }
+}
+
 /// Get the appropriate tool parser for a model
 ///
 /// If a parser name is explicitly configured, use that parser.
 /// Otherwise, auto-detect based on the model name.
+/// Get a pooled tool parser (for non-streaming where state doesn't matter)
 pub fn get_tool_parser(
-    tool_parser_factory: &crate::tool_parser::ToolParserFactory,
+    tool_parser_factory: &crate::tool_parser::ParserFactory,
     configured_parser: Option<&String>,
     model: &str,
-) -> crate::tool_parser::PooledToolParser {
-    use tracing::warn;
-
+) -> crate::tool_parser::PooledParser {
     if let Some(parser_name) = configured_parser {
         // Use configured parser if specified
         tool_parser_factory
@@ -728,6 +785,30 @@ pub fn get_tool_parser(
     } else {
         // Auto-detect based on model
         tool_parser_factory.get_pooled(model)
+    }
+}
+
+/// Create a fresh tool parser instance (for streaming where state isolation is needed)
+pub fn create_tool_parser(
+    tool_parser_factory: &crate::tool_parser::ParserFactory,
+    configured_parser: Option<&String>,
+    model: &str,
+) -> Option<Box<dyn crate::tool_parser::ToolParser>> {
+    if let Some(parser_name) = configured_parser {
+        // Use configured parser if specified
+        tool_parser_factory
+            .registry()
+            .create_parser(parser_name)
+            .or_else(|| {
+                warn!(
+                    "Configured tool parser '{}' not found, falling back to model-based selection",
+                    parser_name
+                );
+                tool_parser_factory.registry().create_for_model(model)
+            })
+    } else {
+        // Auto-detect based on model
+        tool_parser_factory.registry().create_for_model(model)
     }
 }
 

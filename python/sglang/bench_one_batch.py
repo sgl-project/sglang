@@ -51,6 +51,7 @@ import logging
 import multiprocessing
 import os
 import time
+from types import SimpleNamespace
 from typing import Tuple
 
 import numpy as np
@@ -71,7 +72,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     configure_logger,
     get_bool_env_var,
-    is_cuda,
+    is_cuda_alike,
     is_xpu,
     kill_process_tree,
     require_mlp_sync,
@@ -84,8 +85,8 @@ from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 profile_activities = [torch.profiler.ProfilerActivity.CPU] + [
     profiler_activity
     for available, profiler_activity in [
-        (torch.cuda.is_available(), torch.profiler.ProfilerActivity.CUDA),
-        (torch.xpu.is_available(), torch.profiler.ProfilerActivity.XPU),
+        (is_cuda_alike(), torch.profiler.ProfilerActivity.CUDA),
+        (is_xpu(), torch.profiler.ProfilerActivity.XPU),
     ]
     if available
 ]
@@ -268,11 +269,18 @@ def prepare_synthetic_inputs_for_latency_test(
 
 @torch.no_grad
 def extend(reqs, model_runner):
+    # Create dummy tree_cache for benchmarks (no prefix caching, just allocation)
+    dummy_tree_cache = SimpleNamespace(
+        page_size=1,
+        device=model_runner.device,
+        token_to_kv_pool_allocator=model_runner.token_to_kv_pool_allocator,
+    )
+
     batch = ScheduleBatch.init_new(
         reqs=reqs,
         req_to_token_pool=model_runner.req_to_token_pool,
         token_to_kv_pool_allocator=model_runner.token_to_kv_pool_allocator,
-        tree_cache=None,
+        tree_cache=dummy_tree_cache,
         model_config=model_runner.model_config,
         enable_overlap=False,
         spec_algorithm=SpeculativeAlgorithm.NONE,
@@ -515,7 +523,9 @@ def latency_test(
 
     # Set CPU affinity
     if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
-        set_gpu_proc_affinity(server_args.tp_size, server_args.nnodes, tp_rank)
+        set_gpu_proc_affinity(
+            server_args.pp_size, server_args.tp_size, server_args.nnodes, tp_rank
+        )
 
     # Configure the logger
     configure_logger(server_args, prefix=f" TP{tp_rank}")

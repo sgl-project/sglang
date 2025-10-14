@@ -18,11 +18,11 @@ use crate::{
         },
         worker_spec::{WorkerApiResponse, WorkerConfigRequest, WorkerErrorResponse},
     },
-    reasoning_parser::ReasoningParserFactory,
+    reasoning_parser::ParserFactory as ReasoningParserFactory,
     routers::{router_manager::RouterManager, RouterTrait},
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
     tokenizer::{factory as tokenizer_factory, traits::Tokenizer},
-    tool_parser::ToolParserFactory,
+    tool_parser::ParserFactory as ToolParserFactory,
 };
 use axum::{
     extract::{Path, Query, Request, State},
@@ -48,7 +48,7 @@ use tracing::{error, info, warn, Level};
 pub struct AppContext {
     pub client: Client,
     pub router_config: RouterConfig,
-    pub rate_limiter: Arc<TokenBucket>,
+    pub rate_limiter: Option<Arc<TokenBucket>>,
     pub tokenizer: Option<Arc<dyn Tokenizer>>,
     pub reasoning_parser_factory: Option<ReasoningParserFactory>,
     pub tool_parser_factory: Option<ToolParserFactory>,
@@ -67,34 +67,55 @@ impl AppContext {
     pub fn new(
         router_config: RouterConfig,
         client: Client,
-        max_concurrent_requests: usize,
-        rate_limit_tokens_per_second: Option<usize>,
+        max_concurrent_requests: i32,
+        rate_limit_tokens_per_second: Option<i32>,
     ) -> Result<Self, String> {
-        let rate_limit_tokens = rate_limit_tokens_per_second.unwrap_or(max_concurrent_requests);
-        let rate_limiter = Arc::new(TokenBucket::new(max_concurrent_requests, rate_limit_tokens));
+        let rate_limiter = match max_concurrent_requests {
+            n if n <= 0 => None,
+            n => {
+                let rate_limit_tokens =
+                    rate_limit_tokens_per_second.filter(|&t| t > 0).unwrap_or(n);
+                Some(Arc::new(TokenBucket::new(
+                    n as usize,
+                    rate_limit_tokens as usize,
+                )))
+            }
+        };
 
-        let (tokenizer, reasoning_parser_factory, tool_parser_factory) =
-            if router_config.connection_mode == ConnectionMode::Grpc {
-                let tokenizer_path = router_config
-                    .tokenizer_path
-                    .clone()
-                    .or_else(|| router_config.model_path.clone())
-                    .ok_or_else(|| {
-                        "gRPC mode requires either --tokenizer-path or --model-path to be specified"
-                            .to_string()
-                    })?;
+        let (tokenizer, reasoning_parser_factory, tool_parser_factory) = if router_config
+            .connection_mode
+            == ConnectionMode::Grpc
+        {
+            let tokenizer_path = router_config
+                .tokenizer_path
+                .clone()
+                .or_else(|| router_config.model_path.clone())
+                .ok_or_else(|| {
+                    "gRPC mode requires either --tokenizer-path or --model-path to be specified"
+                        .to_string()
+                })?;
 
-                let tokenizer = Some(
-                    tokenizer_factory::create_tokenizer(&tokenizer_path)
-                        .map_err(|e| format!("Failed to create tokenizer: {e}"))?,
+            let tokenizer = Some(
+                    tokenizer_factory::create_tokenizer_with_chat_template_blocking(
+                        &tokenizer_path,
+                        router_config.chat_template.as_deref(),
+                    )
+                    .map_err(|e| {
+                        format!(
+                            "Failed to create tokenizer from '{}': {}. \
+                            Ensure the path is valid and points to a tokenizer file (tokenizer.json) \
+                            or a HuggingFace model ID. For directories, ensure they contain tokenizer files.",
+                            tokenizer_path, e
+                        )
+                    })?,
                 );
-                let reasoning_parser_factory = Some(ReasoningParserFactory::new());
-                let tool_parser_factory = Some(ToolParserFactory::new());
+            let reasoning_parser_factory = Some(crate::reasoning_parser::ParserFactory::new());
+            let tool_parser_factory = Some(crate::tool_parser::ParserFactory::new());
 
-                (tokenizer, reasoning_parser_factory, tool_parser_factory)
-            } else {
-                (None, None, None)
-            };
+            (tokenizer, reasoning_parser_factory, tool_parser_factory)
+        } else {
+            (None, None, None)
+        };
 
         let worker_registry = Arc::new(WorkerRegistry::new());
         let policy_registry = Arc::new(PolicyRegistry::new(router_config.policy.clone()));
@@ -440,6 +461,47 @@ async fn v1_conversations_list_items(
         .await
 }
 
+#[derive(Deserialize, Default)]
+struct GetItemQuery {
+    /// Additional fields to include in response (not yet implemented)
+    include: Option<Vec<String>>,
+}
+
+async fn v1_conversations_create_items(
+    State(state): State<Arc<AppState>>,
+    Path(conversation_id): Path<String>,
+    headers: http::HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    state
+        .router
+        .create_conversation_items(Some(&headers), &conversation_id, &body)
+        .await
+}
+
+async fn v1_conversations_get_item(
+    State(state): State<Arc<AppState>>,
+    Path((conversation_id, item_id)): Path<(String, String)>,
+    Query(query): Query<GetItemQuery>,
+    headers: http::HeaderMap,
+) -> Response {
+    state
+        .router
+        .get_conversation_item(Some(&headers), &conversation_id, &item_id, query.include)
+        .await
+}
+
+async fn v1_conversations_delete_item(
+    State(state): State<Arc<AppState>>,
+    Path((conversation_id, item_id)): Path<(String, String)>,
+    headers: http::HeaderMap,
+) -> Response {
+    state
+        .router
+        .delete_conversation_item(Some(&headers), &conversation_id, &item_id)
+        .await
+}
+
 #[derive(Deserialize)]
 struct AddWorkerQuery {
     url: String,
@@ -716,7 +778,11 @@ pub fn build_app(
         )
         .route(
             "/v1/conversations/{conversation_id}/items",
-            get(v1_conversations_list_items),
+            get(v1_conversations_list_items).post(v1_conversations_create_items),
+        )
+        .route(
+            "/v1/conversations/{conversation_id}/items/{item_id}",
+            get(v1_conversations_get_item).delete(v1_conversations_delete_item),
         )
         .route_layer(axum::middleware::from_fn_with_state(
             app_state.clone(),
@@ -871,12 +937,24 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         Duration::from_secs(config.router_config.queue_timeout_secs),
     );
 
-    if let Some(processor) = processor {
-        spawn(processor.run());
-        info!(
-            "Started request queue with size: {}, timeout: {}s",
-            config.router_config.queue_size, config.router_config.queue_timeout_secs
-        );
+    if app_context.rate_limiter.is_none() {
+        info!("Rate limiting is disabled (max_concurrent_requests = -1)");
+    }
+
+    match processor {
+        Some(proc) => {
+            spawn(proc.run());
+            info!(
+                "Started request queue (size: {}, timeout: {}s)",
+                config.router_config.queue_size, config.router_config.queue_timeout_secs
+            );
+        }
+        None => {
+            info!(
+                "Rate limiting enabled (max_concurrent_requests = {}, queue disabled)",
+                config.router_config.max_concurrent_requests
+            );
+        }
     }
 
     let app_state = Arc::new(AppState {
