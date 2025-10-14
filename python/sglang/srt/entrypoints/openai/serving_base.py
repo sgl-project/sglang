@@ -6,6 +6,7 @@ import uuid
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
+import orjson
 from fastapi import HTTPException, Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
@@ -225,7 +226,7 @@ class OpenAIServingBase(ABC):
         )
         try:
             raw_labels = (
-                json.loads(raw_request.headers.get(header))
+                orjson.loads(raw_request.headers.get(header))
                 if raw_request and raw_request.headers.get(header)
                 else None
             )

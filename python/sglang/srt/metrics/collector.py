@@ -118,6 +118,7 @@ class SchedulerStats:
     num_running_reqs: int = 0
     num_used_tokens: int = 0
     token_usage: float = 0.0
+    pending_prealloc_token_usage: float = 0.0
     swa_token_usage: float = 0.0
     gen_throughput: float = 0.0
     num_queue_reqs: int = 0
@@ -127,6 +128,7 @@ class SchedulerStats:
 
     # Speculative decoding
     spec_accept_length: float = 0.0
+    spec_accept_rate: float = 0.0
 
     # Retract
     num_retracted_reqs: int = 0
@@ -176,6 +178,12 @@ class SchedulerMetricsCollector:
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
+        self.pending_prealloc_token_usage = Gauge(
+            name="sglang:pending_prealloc_token_usage",
+            documentation="The token usage for pending preallocated tokens (not preallocated yet).",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
         self.swa_token_usage = Gauge(
             name="sglang:swa_token_usage",
             documentation="The token usage for SWA layers.",
@@ -217,6 +225,12 @@ class SchedulerMetricsCollector:
         self.spec_accept_length = Gauge(
             name="sglang:spec_accept_length",
             documentation="The average acceptance length of speculative decoding.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.spec_accept_rate = Gauge(
+            name="sglang:spec_accept_rate",
+            documentation="The average acceptance rate of speculative decoding (`accepted tokens / total draft tokens` in batch).",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -509,6 +523,9 @@ class SchedulerMetricsCollector:
         self._log_gauge(self.num_running_reqs, stats.num_running_reqs)
         self._log_gauge(self.num_used_tokens, stats.num_used_tokens)
         self._log_gauge(self.token_usage, stats.token_usage)
+        self._log_gauge(
+            self.pending_prealloc_token_usage, stats.pending_prealloc_token_usage
+        )
         self._log_gauge(self.swa_token_usage, stats.swa_token_usage)
         self._log_gauge(self.gen_throughput, stats.gen_throughput)
         self._log_gauge(self.num_queue_reqs, stats.num_queue_reqs)
@@ -520,6 +537,7 @@ class SchedulerMetricsCollector:
 
         # Speculative decoding
         self._log_gauge(self.spec_accept_length, stats.spec_accept_length)
+        self._log_gauge(self.spec_accept_rate, stats.spec_accept_rate)
 
         # PD disaggregation
         self._log_gauge(

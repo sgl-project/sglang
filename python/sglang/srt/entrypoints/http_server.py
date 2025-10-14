@@ -569,7 +569,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
 async def generate_from_file_request(file: UploadFile, request: Request):
     """Handle a generate request, this is purely to work with input_embeds."""
     content = await file.read()
-    input_embeds = json.loads(content.decode("utf-8"))
+    input_embeds = orjson.loads(content.decode("utf-8"))
 
     obj = GenerateReqInput(
         input_embeds=input_embeds,
@@ -664,6 +664,7 @@ async def start_profile_async(obj: Optional[ProfileReqInput] = None):
         with_stack=obj.with_stack,
         record_shapes=obj.record_shapes,
         profile_by_stage=obj.profile_by_stage,
+        merge_profiles=obj.merge_profiles,
     )
     return Response(
         content="Start profiling.\n",
