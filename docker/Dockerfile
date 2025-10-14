@@ -93,9 +93,10 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5li
  && FLASHINFER_LOGGING_LEVEL=warning python3 -m flashinfer --download-cubin
 
 
-# Download source files
+# Download NVSHMEM source files
+# We use Tom's DeepEP fork for GB200 for now
 RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.3.9/source/nvshmem_src_cuda12-all-all-3.3.9.tar.gz && \
-    if [ "$BUILD_TYPE" = "blackwell_aarch" ] && [ "$(uname -m)" = "aarch64" ]; then \
+    if [ "$BUILD_TYPE" = "blackwell_aarch64" ]; then \
       git clone https://github.com/fzyzcjy/DeepEP.git \
       && cd DeepEP && git checkout 1b14ad661c7640137fcfe93cccb2694ede1220b0 && sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && cd .. ; \
     else \
@@ -108,7 +109,7 @@ RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.3.9/sour
 
 # Build and install NVSHMEM
 RUN cd /sgl-workspace/nvshmem && \
-    if [ "$BUILD_TYPE" = "blackwell" ] || [ "$BUILD_TYPE" = "blackwell_aarch" ]; then CUDA_ARCH="90;100;120"; else CUDA_ARCH="90"; fi && \
+    export CUDA_ARCH="90;100;120" && \
     NVSHMEM_SHMEM_SUPPORT=0 \
     NVSHMEM_UCX_SUPPORT=0 \
     NVSHMEM_USE_NCCL=0 \
