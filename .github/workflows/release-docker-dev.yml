@@ -6,7 +6,7 @@ on:
     - cron: '0 0 * * *'
 
 jobs:
-  build-dev:
+  build-dev-x86:
     if: ${{ github.repository == 'sgl-project/sglang' }}
     runs-on: ubuntu-22.04
     strategy:
@@ -15,6 +15,46 @@ jobs:
           - version: 12.9.1
             type: all
             tag: dev
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          docker-images: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and Push Dev Image (x86)
+        run: |
+          docker buildx build --platform linux/amd64 --push -f docker/Dockerfile --build-arg CUDA_VERSION=${{ matrix.variant.version }} --build-arg BUILD_TYPE=${{ matrix.variant.type }} --build-arg CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) -t lmsysorg/sglang:${{ matrix.variant.tag }} --no-cache .
+
+  build-blackwell-x86:
+    if: ${{ github.repository == 'sgl-project/sglang' }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        variant:
+          - version: 12.8.1
+            type: blackwell
+            tag: blackwell
+          - version: 12.9.1
+            type: blackwell
+            tag: blackwell-cu129
 
     steps:
       - name: Checkout repository
@@ -31,13 +71,79 @@ jobs:
           large-packages: true
           swap-storage: false
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Login to Docker Hub
         uses: docker/login-action@v2
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and Push Dev Image
+      - name: Build and Push Blackwell Image (x86)
         run: |
-          docker buildx build --output type=image,compression=zstd . -f docker/Dockerfile --build-arg CUDA_VERSION=${{ matrix.variant.version }} --build-arg BUILD_TYPE=${{ matrix.variant.type }} --build-arg CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) -t lmsysorg/sglang:${{ matrix.variant.tag }} --no-cache
-          docker push lmsysorg/sglang:${{ matrix.variant.tag }}
+          if [ "${{ matrix.variant.version }}" = "12.9.1" ]; then
+            docker buildx build --platform linux/amd64 --push -f docker/Dockerfile --build-arg CUDA_VERSION=${{ matrix.variant.version }} --build-arg BUILD_TYPE=${{ matrix.variant.type }} --build-arg CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) -t lmsysorg/sglang:${{ matrix.variant.tag }}-x86 --no-cache .
+          else
+            docker buildx build --platform linux/amd64 --push -f docker/Dockerfile --build-arg CUDA_VERSION=${{ matrix.variant.version }} --build-arg BUILD_TYPE=${{ matrix.variant.type }} --build-arg CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) -t lmsysorg/sglang:${{ matrix.variant.tag }} --no-cache .
+          fi
+
+  build-blackwell-arm:
+    if: ${{ github.repository == 'sgl-project/sglang' }}
+    runs-on: ubuntu-22.04-arm
+    strategy:
+      matrix:
+        variant:
+          - version: 12.9.1
+            type: blackwell_aarch
+            tag: blackwell-cu129
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          docker-images: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and Push Blackwell Image (ARM)
+        run: |
+          docker buildx build --platform linux/arm64 --push -f docker/Dockerfile --build-arg CUDA_VERSION=${{ matrix.variant.version }} --build-arg BUILD_TYPE=${{ matrix.variant.type }} --build-arg CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) -t lmsysorg/sglang:${{ matrix.variant.tag }}-arm64 --no-cache .
+
+
+  create-manifests:
+    runs-on: ubuntu-22.04
+    needs: [build-blackwell-x86, build-blackwell-arm]
+    if: ${{ github.repository == 'sgl-project/sglang' }}
+    strategy:
+      matrix:
+        variant:
+          - tag: blackwell-cu129
+            x86_tag: blackwell-cu129-x86
+            arm64_tag: blackwell-cu129-arm64
+    steps:
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - run: |
+          docker buildx imagetools create \
+            -t lmsysorg/sglang:${{ matrix.variant.tag }} \
+            lmsysorg/sglang:${{ matrix.variant.x86_tag }} \
+            lmsysorg/sglang:${{ matrix.variant.arm64_tag }}

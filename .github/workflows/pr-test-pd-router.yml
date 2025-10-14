@@ -219,7 +219,7 @@ jobs:
             --decode http://127.0.0.7:30007 \
             --decode http://127.0.0.8:30008 \
             --host 127.0.0.9 \
-            --log-level warning \
+            --log-level warn \
             --port 8000 &
           ROUTER_PID=$!
 
