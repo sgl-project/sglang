@@ -207,7 +207,6 @@ python3 -m sglang_router.launch_router \
 - OpenAI backend mode acts as a proxy to a single remote endpoint; load balancing is not applied.
 - Provide exactly one `--worker-urls` entry per router instance.
 - The Rust binary supports the same flags (`./target/release/sglang-router --backend openai ...`).
-- Optional `SGLANG_MCP_CONFIG=/path/to/mcp.json` enables Model Context Protocol tool loops for OpenAI-compatible tool calls.
 
 ### Python Launcher (Router + Workers)
 Launch router and SGLang worker processes together; `launch_server` spins up workers (HTTP or gRPC) and the router in one shot.
