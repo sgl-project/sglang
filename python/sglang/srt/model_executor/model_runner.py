@@ -1297,6 +1297,7 @@ class ModelRunner:
         return self.model_config.hf_config.architectures[0] in [
             "Qwen3NextForCausalLM",
             "Qwen3NextForCausalLMMTP",
+            "FalconH1ForCausalLM",
         ]
 
     def set_num_token_hybrid(self):

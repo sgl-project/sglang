@@ -3251,17 +3251,24 @@ def get_extend_input_len_swa_limit(
 
 
 def get_num_new_pages(
-    prefix_lens: torch.Tensor,
     seq_lens: torch.Tensor,
     page_size: int,
+    prefix_lens: Optional[torch.Tensor] = None,
     decode: bool = False,
 ) -> torch.Tensor:
     """
-    Get the number of new pages for the given prefix and sequence lengths. We use cpu tensors to avoid blocking kernel launch.
+    Get the number of new pages for the given prefix and sequence lengths.
+    We use cpu tensors to avoid blocking kernel launch.
     """
     cpu_device = torch.device("cpu")
-    assert prefix_lens.device == cpu_device
     assert seq_lens.device == cpu_device
+
+    if prefix_lens is None or decode:
+        # NOTE: Special case for handling decode, which prefix lens is `seq_lens - 1`.
+        assert decode
+        return (seq_lens % page_size == 1).int().sum().item()
+
+    assert prefix_lens.device == cpu_device
     num_pages_after = (seq_lens + page_size - 1) // page_size
     num_pages_before = (prefix_lens + page_size - 1) // page_size
     num_new_pages = num_pages_after - num_pages_before

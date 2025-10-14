@@ -1,6 +1,9 @@
 //! DeepSeek V3 Parser Integration Tests
 
-use sglang_router_rs::tool_parser::{DeepSeekParser, ParseState, StreamResult, ToolParser};
+use sglang_router_rs::tool_parser::{DeepSeekParser, ToolParser};
+
+mod common;
+use common::create_test_tools;
 
 #[tokio::test]
 async fn test_deepseek_complete_parsing() {
@@ -46,8 +49,9 @@ async fn test_deepseek_multiple_tools() {
 
 #[tokio::test]
 async fn test_deepseek_streaming() {
-    let parser = DeepSeekParser::new();
-    let mut state = ParseState::new();
+    let tools = create_test_tools();
+
+    let mut parser = DeepSeekParser::new();
 
     // Simulate streaming chunks
     let chunks = vec![
@@ -61,25 +65,19 @@ async fn test_deepseek_streaming() {
     ];
 
     let mut found_name = false;
-    let mut found_complete = false;
 
     for chunk in chunks {
-        let result = parser.parse_incremental(chunk, &mut state).await.unwrap();
+        let result = parser.parse_incremental(chunk, &tools).await.unwrap();
 
-        match result {
-            StreamResult::ToolName { name, .. } => {
+        for call in result.calls {
+            if let Some(name) = call.name {
                 assert_eq!(name, "get_weather");
                 found_name = true;
             }
-            StreamResult::ToolComplete(tool) => {
-                assert_eq!(tool.function.name, "get_weather");
-                found_complete = true;
-            }
-            _ => {}
         }
     }
 
-    assert!(found_name || found_complete);
+    assert!(found_name, "Should have found tool name during streaming");
 }
 
 #[tokio::test]

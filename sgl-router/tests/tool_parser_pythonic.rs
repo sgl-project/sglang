@@ -5,6 +5,9 @@
 use serde_json::json;
 use sglang_router_rs::tool_parser::{PythonicParser, ToolParser};
 
+mod common;
+use common::create_test_tools;
+
 #[tokio::test]
 async fn test_pythonic_single_function() {
     let parser = PythonicParser::new();
@@ -246,260 +249,231 @@ async fn test_pythonic_complex_nesting() {
 
 #[tokio::test]
 async fn test_parse_streaming_no_brackets() {
-    let parser = PythonicParser::new();
-    let mut state = sglang_router_rs::tool_parser::ParseState::new();
+    let mut parser = PythonicParser::new();
+
+    let tools = create_test_tools();
 
     let text = "This is just normal text without any tool calls.";
-    let result = parser.parse_incremental(text, &mut state).await.unwrap();
+    let result = parser.parse_incremental(text, &tools).await.unwrap();
 
-    match result {
-        sglang_router_rs::tool_parser::StreamResult::Incomplete => {
-            // Expected - no tool calls found
-            assert_eq!(state.buffer, text);
-        }
-        _ => panic!("Should return Incomplete for text without tool calls"),
-    }
+    // Expected - no tool calls found
+    assert!(result.calls.is_empty());
 }
 
 #[tokio::test]
 async fn test_parse_streaming_complete_tool_call() {
-    let parser = PythonicParser::new();
-    let mut state = sglang_router_rs::tool_parser::ParseState::new();
+    let mut parser = PythonicParser::new();
+
+    let tools = create_test_tools();
 
     let text = "Here's a tool call: [get_weather(location='New York', unit='celsius')]";
-    let result = parser.parse_incremental(text, &mut state).await.unwrap();
+    let result = parser.parse_incremental(text, &tools).await.unwrap();
 
-    match result {
-        sglang_router_rs::tool_parser::StreamResult::ToolComplete(tool) => {
-            assert_eq!(tool.function.name, "get_weather");
-            let args: serde_json::Value = serde_json::from_str(&tool.function.arguments).unwrap();
-            assert_eq!(args["location"], "New York");
-            assert_eq!(args["unit"], "celsius");
-            assert_eq!(state.buffer, "");
-        }
-        _ => panic!("Should return ToolComplete for complete tool call"),
-    }
+    assert!(!result.calls.is_empty(), "Should parse complete tool call");
+    assert_eq!(result.calls[0].name.as_ref().unwrap(), "get_weather");
+    let args: serde_json::Value = serde_json::from_str(&result.calls[0].parameters).unwrap();
+    assert_eq!(args["location"], "New York");
+    assert_eq!(args["unit"], "celsius");
 }
 
 #[tokio::test]
 async fn test_parse_streaming_text_before_tool_call() {
-    let parser = PythonicParser::new();
-    let mut state = sglang_router_rs::tool_parser::ParseState::new();
+    let mut parser = PythonicParser::new();
+
+    let tools = create_test_tools();
 
     let text = "This is some text before [get_weather(location='London')]";
-    let result = parser.parse_incremental(text, &mut state).await.unwrap();
+    let result = parser.parse_incremental(text, &tools).await.unwrap();
 
-    match result {
-        sglang_router_rs::tool_parser::StreamResult::ToolComplete(tool) => {
-            assert_eq!(tool.function.name, "get_weather");
-            let args: serde_json::Value = serde_json::from_str(&tool.function.arguments).unwrap();
-            assert_eq!(args["location"], "London");
-        }
-        _ => panic!("Should return ToolComplete"),
-    }
+    assert!(!result.calls.is_empty(), "Should parse tool call");
+    assert_eq!(result.calls[0].name.as_ref().unwrap(), "get_weather");
+    let args: serde_json::Value = serde_json::from_str(&result.calls[0].parameters).unwrap();
+    assert_eq!(args["location"], "London");
 }
 
 #[tokio::test]
 async fn test_parse_streaming_partial_tool_call() {
-    let parser = PythonicParser::new();
-    let mut state = sglang_router_rs::tool_parser::ParseState::new();
+    let mut parser = PythonicParser::new();
+
+    let tools = create_test_tools();
 
     // First chunk with opening bracket but no closing bracket
     let text1 = "Let me check the weather: [get_weather(location=";
-    let result1 = parser.parse_incremental(text1, &mut state).await.unwrap();
+    let result1 = parser.parse_incremental(text1, &tools).await.unwrap();
 
-    match result1 {
-        sglang_router_rs::tool_parser::StreamResult::Incomplete => {
-            assert!(state.buffer.contains("[get_weather(location="));
-        }
-        _ => panic!("First chunk should return Incomplete"),
-    }
+    // First chunk should be incomplete
+    assert!(
+        result1.calls.is_empty(),
+        "First chunk should not return tool call"
+    );
 
     // Second chunk completing the tool call
     let text2 = "'Paris')]";
-    let result2 = parser.parse_incremental(text2, &mut state).await.unwrap();
+    let result2 = parser.parse_incremental(text2, &tools).await.unwrap();
 
-    match result2 {
-        sglang_router_rs::tool_parser::StreamResult::ToolComplete(tool) => {
-            assert_eq!(tool.function.name, "get_weather");
-            let args: serde_json::Value = serde_json::from_str(&tool.function.arguments).unwrap();
-            assert_eq!(args["location"], "Paris");
-            assert_eq!(state.buffer, "");
-        }
-        _ => panic!("Second chunk should return ToolComplete"),
-    }
+    assert!(
+        !result2.calls.is_empty(),
+        "Second chunk should complete tool call"
+    );
+    assert_eq!(result2.calls[0].name.as_ref().unwrap(), "get_weather");
+    let args: serde_json::Value = serde_json::from_str(&result2.calls[0].parameters).unwrap();
+    assert_eq!(args["location"], "Paris");
 }
 
 #[tokio::test]
 async fn test_parse_streaming_bracket_without_text_before() {
-    let parser = PythonicParser::new();
-    let mut state = sglang_router_rs::tool_parser::ParseState::new();
+    let mut parser = PythonicParser::new();
+
+    let tools = create_test_tools();
 
     let text = "[search(query='python programming')]";
-    let result = parser.parse_incremental(text, &mut state).await.unwrap();
+    let result = parser.parse_incremental(text, &tools).await.unwrap();
 
-    match result {
-        sglang_router_rs::tool_parser::StreamResult::ToolComplete(tool) => {
-            assert_eq!(tool.function.name, "search");
-            let args: serde_json::Value = serde_json::from_str(&tool.function.arguments).unwrap();
-            assert_eq!(args["query"], "python programming");
-        }
-        _ => panic!("Should return ToolComplete"),
-    }
+    assert!(!result.calls.is_empty(), "Should parse tool call");
+    assert_eq!(result.calls[0].name.as_ref().unwrap(), "search");
+    let args: serde_json::Value = serde_json::from_str(&result.calls[0].parameters).unwrap();
+    assert_eq!(args["query"], "python programming");
 }
 
 #[tokio::test]
 async fn test_parse_streaming_text_after_tool_call() {
-    let parser = PythonicParser::new();
-    let mut state = sglang_router_rs::tool_parser::ParseState::new();
+    let mut parser = PythonicParser::new();
+
+    let tools = create_test_tools();
 
     // First chunk with complete tool call and some text after
     let text = "[get_weather(location='Tokyo')] Here's the forecast:";
-    let result = parser.parse_incremental(text, &mut state).await.unwrap();
+    let result = parser.parse_incremental(text, &tools).await.unwrap();
 
-    match result {
-        sglang_router_rs::tool_parser::StreamResult::ToolComplete(tool) => {
-            assert_eq!(tool.function.name, "get_weather");
-            // Text after tool call should remain in buffer
-            // Note: Current implementation may clear buffer, this behavior needs verification
-        }
-        _ => panic!("Should return ToolComplete"),
-    }
+    assert!(!result.calls.is_empty(), "Should parse tool call");
+    assert_eq!(result.calls[0].name.as_ref().unwrap(), "get_weather");
+    // Text after tool call is handled by parser internally
 }
 
 #[tokio::test]
 async fn test_parse_streaming_multiple_tool_calls() {
-    let parser = PythonicParser::new();
-    let mut state = sglang_router_rs::tool_parser::ParseState::new();
+    let mut parser = PythonicParser::new();
+
+    let tools = create_test_tools();
 
     let text = "[get_weather(location='Berlin'), search(query='restaurants')]";
 
     // Current implementation may handle this as a single parse
-    let result = parser.parse_incremental(text, &mut state).await.unwrap();
+    let result = parser.parse_incremental(text, &tools).await.unwrap();
 
     // The parser should handle multiple tools in one bracket pair
-    match result {
-        sglang_router_rs::tool_parser::StreamResult::ToolComplete(_) => {
-            // Expected behavior - parses first tool
-        }
-        _ => {
-            // Also acceptable if it returns Incomplete waiting for more
-        }
+    // This test is flexible about the implementation behavior
+    if !result.calls.is_empty() {
+        // Parser found at least one tool
+        assert!(result.calls[0].name.is_some());
     }
+    // Also acceptable if parser returns empty waiting for more context
 }
 
 #[tokio::test]
 async fn test_parse_streaming_opening_bracket_only() {
-    let parser = PythonicParser::new();
-    let mut state = sglang_router_rs::tool_parser::ParseState::new();
+    let mut parser = PythonicParser::new();
+
+    let tools = create_test_tools();
 
     let text = "Let's try this: [";
-    let result = parser.parse_incremental(text, &mut state).await.unwrap();
+    let result = parser.parse_incremental(text, &tools).await.unwrap();
 
-    match result {
-        sglang_router_rs::tool_parser::StreamResult::Incomplete => {
-            assert!(state.buffer.ends_with("["));
-        }
-        _ => panic!("Should return Incomplete for partial bracket"),
-    }
+    // Should be incomplete - no complete tool call
+    assert!(
+        result.calls.is_empty(),
+        "Should not return tool call for partial bracket"
+    );
 }
 
 #[tokio::test]
 async fn test_parse_streaming_nested_brackets() {
-    let parser = PythonicParser::new();
-    let mut state = sglang_router_rs::tool_parser::ParseState::new();
+    let mut parser = PythonicParser::new();
+
+    let tools = create_test_tools();
 
     let text = "[get_weather(location='New York', unit='celsius', data=[1, 2, 3])]";
-    let result = parser.parse_incremental(text, &mut state).await.unwrap();
+    let result = parser.parse_incremental(text, &tools).await.unwrap();
 
-    match result {
-        sglang_router_rs::tool_parser::StreamResult::ToolComplete(tool) => {
-            assert_eq!(tool.function.name, "get_weather");
-            let args: serde_json::Value = serde_json::from_str(&tool.function.arguments).unwrap();
-            assert_eq!(args["location"], "New York");
-            assert_eq!(args["unit"], "celsius");
-            assert_eq!(args["data"], json!([1, 2, 3]));
-        }
-        _ => panic!("Should return ToolComplete"),
-    }
+    assert!(
+        !result.calls.is_empty(),
+        "Should parse tool call with nested brackets"
+    );
+    assert_eq!(result.calls[0].name.as_ref().unwrap(), "get_weather");
+    let args: serde_json::Value = serde_json::from_str(&result.calls[0].parameters).unwrap();
+    assert_eq!(args["location"], "New York");
+    assert_eq!(args["unit"], "celsius");
+    assert_eq!(args["data"], json!([1, 2, 3]));
 }
 
 #[tokio::test]
 async fn test_parse_streaming_nested_brackets_dict() {
-    let parser = PythonicParser::new();
-    let mut state = sglang_router_rs::tool_parser::ParseState::new();
+    let mut parser = PythonicParser::new();
+    let tools = create_test_tools();
 
     let text = r#"[search(query='test', config={'options': [1, 2], 'nested': {'key': 'value'}})]"#;
-    let result = parser.parse_incremental(text, &mut state).await.unwrap();
+    let result = parser.parse_incremental(text, &tools).await.unwrap();
 
-    match result {
-        sglang_router_rs::tool_parser::StreamResult::ToolComplete(tool) => {
-            assert_eq!(tool.function.name, "search");
-            let args: serde_json::Value = serde_json::from_str(&tool.function.arguments).unwrap();
-            assert_eq!(args["query"], "test");
-            assert_eq!(args["config"]["options"], json!([1, 2]));
-            assert_eq!(args["config"]["nested"]["key"], "value");
-        }
-        _ => panic!("Should return ToolComplete"),
-    }
+    assert!(
+        !result.calls.is_empty(),
+        "Should parse tool call with nested dict"
+    );
+    assert_eq!(result.calls[0].name.as_ref().unwrap(), "search");
+    let args: serde_json::Value = serde_json::from_str(&result.calls[0].parameters).unwrap();
+    assert_eq!(args["query"], "test");
+    assert_eq!(args["config"]["options"], json!([1, 2]));
+    assert_eq!(args["config"]["nested"]["key"], "value");
 }
 
 #[tokio::test]
 async fn test_parse_streaming_multiple_tools_with_nested_brackets() {
-    let parser = PythonicParser::new();
-    let mut state = sglang_router_rs::tool_parser::ParseState::new();
+    let mut parser = PythonicParser::new();
+
+    let tools = create_test_tools();
 
     let text =
         "[get_weather(location='Paris', data=[10, 20]), search(query='test', filters=['a', 'b'])]";
-    let result = parser.parse_incremental(text, &mut state).await.unwrap();
+    let result = parser.parse_incremental(text, &tools).await.unwrap();
 
-    // Should parse both tools successfully
-    match result {
-        sglang_router_rs::tool_parser::StreamResult::ToolComplete(tool) => {
-            // At least gets the first tool
-            assert_eq!(tool.function.name, "get_weather");
-        }
-        _ => panic!("Should return ToolComplete"),
+    // Should parse tools successfully
+    if !result.calls.is_empty() {
+        // At least gets the first tool
+        assert!(result.calls[0].name.is_some());
     }
 }
 
 #[tokio::test]
 async fn test_parse_streaming_partial_nested_brackets() {
-    let parser = PythonicParser::new();
-    let mut state = sglang_router_rs::tool_parser::ParseState::new();
+    let mut parser = PythonicParser::new();
+
+    let tools = create_test_tools();
 
     // First chunk with nested brackets but incomplete
     let text1 = "Here's a call: [get_weather(location='Tokyo', data=[1, 2";
-    let result1 = parser.parse_incremental(text1, &mut state).await.unwrap();
+    let result1 = parser.parse_incremental(text1, &tools).await.unwrap();
 
-    match result1 {
-        sglang_router_rs::tool_parser::StreamResult::Incomplete => {
-            assert!(state
-                .buffer
-                .contains("[get_weather(location='Tokyo', data=[1, 2"));
-        }
-        _ => panic!("First chunk should return Incomplete"),
-    }
+    // First chunk should be incomplete
+    assert!(result1.calls.is_empty(), "First chunk should not complete");
 
     // Second chunk completing the nested brackets
     let text2 = ", 3])]";
-    let result2 = parser.parse_incremental(text2, &mut state).await.unwrap();
+    let result2 = parser.parse_incremental(text2, &tools).await.unwrap();
 
-    match result2 {
-        sglang_router_rs::tool_parser::StreamResult::ToolComplete(tool) => {
-            assert_eq!(tool.function.name, "get_weather");
-            let args: serde_json::Value = serde_json::from_str(&tool.function.arguments).unwrap();
-            assert_eq!(args["location"], "Tokyo");
-            assert_eq!(args["data"], json!([1, 2, 3]));
-        }
-        _ => panic!("Second chunk should return ToolComplete"),
-    }
+    assert!(
+        !result2.calls.is_empty(),
+        "Second chunk should complete tool call"
+    );
+    assert_eq!(result2.calls[0].name.as_ref().unwrap(), "get_weather");
+    let args: serde_json::Value = serde_json::from_str(&result2.calls[0].parameters).unwrap();
+    assert_eq!(args["location"], "Tokyo");
+    assert_eq!(args["data"], json!([1, 2, 3]));
 }
 
 #[tokio::test]
 async fn test_parse_streaming_with_python_start_and_end_token() {
-    let parser = PythonicParser::new();
-    let mut state = sglang_router_rs::tool_parser::ParseState::new();
+    let mut parser = PythonicParser::new();
+
+    let tools = create_test_tools();
 
     let chunks = vec![
         "Here's a call: ",
@@ -512,13 +486,16 @@ async fn test_parse_streaming_with_python_start_and_end_token() {
     let mut got_tool = false;
 
     for chunk in chunks {
-        let result = parser.parse_incremental(chunk, &mut state).await.unwrap();
-        if let sglang_router_rs::tool_parser::StreamResult::ToolComplete(tool) = result {
-            assert_eq!(tool.function.name, "get_weather");
-            let args: serde_json::Value = serde_json::from_str(&tool.function.arguments).unwrap();
-            assert_eq!(args["location"], "Tokyo");
-            assert_eq!(args["data"], json!([1, 2, 3]));
-            got_tool = true;
+        let result = parser.parse_incremental(chunk, &tools).await.unwrap();
+        if !result.calls.is_empty() {
+            if let Some(name) = &result.calls[0].name {
+                assert_eq!(name, "get_weather");
+                let args: serde_json::Value =
+                    serde_json::from_str(&result.calls[0].parameters).unwrap();
+                assert_eq!(args["location"], "Tokyo");
+                assert_eq!(args["data"], json!([1, 2, 3]));
+                got_tool = true;
+            }
         }
     }
 

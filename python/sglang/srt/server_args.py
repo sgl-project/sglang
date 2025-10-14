@@ -679,7 +679,7 @@ class ServerArgs:
                 [1, 2, 4, 8, 12]
                 + list(range(16, 257, 8))
                 + list(range(272, 512, 16))
-                + list(range(512, self.cuda_graph_max_bs + 1))
+                + list(range(512, self.cuda_graph_max_bs + 1, 32))
             )
         else:
             # Spec decoding case: list(range(1, 9, 1)) + list(range(10, 33, 2)) + list(range(40, 64, 4)) + list(range(72, 257, 8))
