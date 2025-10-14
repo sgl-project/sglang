@@ -174,9 +174,43 @@ void copy_to_gpu_no_ce(const at::Tensor& input, at::Tensor& output);
 void concat_mla_k(torch::Tensor k, torch::Tensor k_nope, torch::Tensor k_rope);
 void concat_mla_absorb_q(at::Tensor a, at::Tensor b, at::Tensor out);
 
+void fast_topk_interface(at::Tensor score, at::Tensor indices, at::Tensor lengths);
+void fast_topk_transform_interface(
+    at::Tensor score,
+    at::Tensor lengths,
+    at::Tensor dst_page_table,
+    at::Tensor src_page_table,
+    at::Tensor cu_seqlens_q);
+
 #ifdef USE_ROCM
 void gelu_quick(at::Tensor& out, const at::Tensor& input);
 #endif
+
+/*
+ * From gguf quantization
+ */
+torch::Tensor
+ggml_dequantize(torch::Tensor W, int64_t type, int64_t m, int64_t n, std::optional<at::ScalarType> const& dtype);
+
+torch::Tensor ggml_mul_mat_vec_a8(torch::Tensor W, torch::Tensor X, int64_t type, int64_t row);
+
+torch::Tensor ggml_mul_mat_a8(torch::Tensor W, torch::Tensor X, int64_t type, int64_t row);
+
+torch::Tensor ggml_moe_a8(
+    torch::Tensor X,
+    torch::Tensor W,
+    torch::Tensor sorted_token_ids,
+    torch::Tensor expert_ids,
+    torch::Tensor num_tokens_post_padded,
+    int64_t type,
+    int64_t row,
+    int64_t top_k,
+    int64_t tokens);
+
+torch::Tensor ggml_moe_a8_vec(
+    torch::Tensor X, torch::Tensor W, torch::Tensor topk_ids, int64_t top_k, int64_t type, int64_t row, int64_t tokens);
+
+int64_t ggml_moe_get_block_size(int64_t type);
 
 /*
  * From csrc/gemm
@@ -211,7 +245,7 @@ torch::Tensor fp8_blockwise_scaled_mm(
     const torch::Dtype& out_dtype);
 void scaled_fp4_quant(
     torch::Tensor& output, torch::Tensor const& input, torch::Tensor& output_scale, torch::Tensor const& input_scale);
-void sgl_per_token_group_quant_fp8(
+void sgl_per_token_group_quant_8bit(
     at::Tensor input,
     at::Tensor output_q,
     at::Tensor output_s,
@@ -220,14 +254,17 @@ void sgl_per_token_group_quant_fp8(
     double fp8_min,
     double fp8_max,
     bool scale_ue8m0);
-void sgl_per_token_group_quant_int8(
+void sgl_per_token_group_quant_8bit_v2(
     at::Tensor input,
     at::Tensor output_q,
     at::Tensor output_s,
     int64_t group_size,
     double eps,
-    double int8_min,
-    double int8_max);
+    double min_8bit,
+    double max_8bit,
+    bool scale_ue8m0,
+    bool fuse_silu_and_mul,
+    const std::optional<torch::Tensor>& masked_m);
 void sgl_per_tensor_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s, bool is_static);
 void sgl_per_token_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s);
 void bmm_fp8(
@@ -294,6 +331,8 @@ void topk_softmax(
     torch::Tensor& topk_weights, torch::Tensor& topk_indices, torch::Tensor& gating_output, bool renormalize);
 
 void moe_sum_reduce(at::Tensor& input, at::Tensor& output, double routed_scaling_factor);
+
+void moe_sum(torch::Tensor& input, torch::Tensor& output);
 
 std::vector<at::Tensor> moe_fused_gate(
     at::Tensor& input,
@@ -782,3 +821,18 @@ void causal_conv1d_fwd(
     const std::optional<at::Tensor>& has_initial_state,
     bool silu_activation,
     int64_t pad_slot_id);
+
+/*
+ * From csrc/expert_specialization
+ */
+void es_fp8_blockwise_scaled_grouped_mm(
+    torch::Tensor& output,
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    const torch::Tensor& scales_a,
+    const torch::Tensor& scales_b,
+    const torch::Tensor& stride_a,
+    const torch::Tensor& stride_b,
+    const torch::Tensor& stride_d,
+    const torch::Tensor& problem_sizes,
+    const torch::Tensor& expert_offsets);
