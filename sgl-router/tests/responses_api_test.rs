@@ -44,6 +44,7 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
 
     // Build router config (HTTP OpenAI mode)
     let router_cfg = RouterConfig {
+        chat_template: None,
         mode: RoutingMode::OpenAI {
             worker_urls: vec![worker_url],
         },
@@ -245,6 +246,7 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
 async fn test_conversations_crud_basic() {
     // Router in OpenAI mode (no actual upstream calls in these tests)
     let router_cfg = RouterConfig {
+        chat_template: None,
         mode: RoutingMode::OpenAI {
             worker_urls: vec!["http://localhost".to_string()],
         },
@@ -576,6 +578,7 @@ async fn test_multi_turn_loop_with_mcp() {
 
     // Build router config
     let router_cfg = RouterConfig {
+        chat_template: None,
         mode: RoutingMode::OpenAI {
             worker_urls: vec![worker_url],
         },
@@ -753,6 +756,7 @@ async fn test_max_tool_calls_limit() {
     let worker_url = worker.start().await.expect("start worker");
 
     let router_cfg = RouterConfig {
+        chat_template: None,
         mode: RoutingMode::OpenAI {
             worker_urls: vec![worker_url],
         },
@@ -896,6 +900,7 @@ async fn setup_streaming_mcp_test() -> (
     let worker_url = worker.start().await.expect("start worker");
 
     let router_cfg = RouterConfig {
+        chat_template: None,
         mode: RoutingMode::OpenAI {
             worker_urls: vec![worker_url],
         },
@@ -1338,6 +1343,7 @@ async fn test_streaming_multi_turn_with_mcp() {
 async fn test_conversation_items_create_and_get() {
     // Test creating items and getting a specific item
     let router_cfg = RouterConfig {
+        chat_template: None,
         mode: RoutingMode::OpenAI {
             worker_urls: vec!["http://localhost".to_string()],
         },
@@ -1440,6 +1446,7 @@ async fn test_conversation_items_create_and_get() {
 async fn test_conversation_items_delete() {
     // Test deleting an item from a conversation
     let router_cfg = RouterConfig {
+        chat_template: None,
         mode: RoutingMode::OpenAI {
             worker_urls: vec!["http://localhost".to_string()],
         },
@@ -1548,6 +1555,7 @@ async fn test_conversation_items_delete() {
 async fn test_conversation_items_max_limit() {
     // Test that creating > 20 items returns error
     let router_cfg = RouterConfig {
+        chat_template: None,
         mode: RoutingMode::OpenAI {
             worker_urls: vec!["http://localhost".to_string()],
         },
@@ -1626,6 +1634,7 @@ async fn test_conversation_items_max_limit() {
 async fn test_conversation_items_unsupported_type() {
     // Test that unsupported item types return error
     let router_cfg = RouterConfig {
+        chat_template: None,
         mode: RoutingMode::OpenAI {
             worker_urls: vec!["http://localhost".to_string()],
         },
@@ -1703,6 +1712,7 @@ async fn test_conversation_items_unsupported_type() {
 async fn test_conversation_items_multi_conversation_sharing() {
     // Test that items can be shared across conversations via soft delete
     let router_cfg = RouterConfig {
+        chat_template: None,
         mode: RoutingMode::OpenAI {
             worker_urls: vec!["http://localhost".to_string()],
         },

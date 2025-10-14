@@ -1,8 +1,7 @@
-import os
-import time
 import unittest
 from types import SimpleNamespace
 
+from sglang.srt.environ import envs
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_disaggregation_utils import TestDisaggregationBase
 from sglang.test.test_utils import (
@@ -19,8 +18,7 @@ class TestDisaggregationMooncakePrefillLargerTP(TestDisaggregationBase):
     def setUpClass(cls):
         super().setUpClass()
         # Temporarily disable JIT DeepGEMM
-        cls.original_jit_deepgemm = os.environ.get("SGL_ENABLE_JIT_DEEPGEMM")
-        os.environ["SGL_ENABLE_JIT_DEEPGEMM"] = "false"
+        envs.SGLANG_ENABLE_JIT_DEEPGEMM.set(False)
 
         cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST_MLA)
 
@@ -91,8 +89,7 @@ class TestDisaggregationMooncakeDecodeLargerTP(TestDisaggregationBase):
     def setUpClass(cls):
         super().setUpClass()
         # Temporarily disable JIT DeepGEMM
-        cls.original_jit_deepgemm = os.environ.get("SGL_ENABLE_JIT_DEEPGEMM")
-        os.environ["SGL_ENABLE_JIT_DEEPGEMM"] = "false"
+        envs.SGLANG_ENABLE_JIT_DEEPGEMM.set(False)
 
         cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST_MLA)
 
@@ -163,8 +160,7 @@ class TestDisaggregationMooncakeMHAPrefillLargerTP(TestDisaggregationBase):
     def setUpClass(cls):
         super().setUpClass()
         # Temporarily disable JIT DeepGEMM
-        cls.original_jit_deepgemm = os.environ.get("SGL_ENABLE_JIT_DEEPGEMM")
-        os.environ["SGL_ENABLE_JIT_DEEPGEMM"] = "false"
+        envs.SGLANG_ENABLE_JIT_DEEPGEMM.set(False)
 
         cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST)
 
@@ -235,8 +231,7 @@ class TestDisaggregationMooncakeMHADecodeLargerTP(TestDisaggregationBase):
     def setUpClass(cls):
         super().setUpClass()
         # Temporarily disable JIT DeepGEMM
-        cls.original_jit_deepgemm = os.environ.get("SGL_ENABLE_JIT_DEEPGEMM")
-        os.environ["SGL_ENABLE_JIT_DEEPGEMM"] = "false"
+        envs.SGLANG_ENABLE_JIT_DEEPGEMM.set(False)
 
         cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST)
 
