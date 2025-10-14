@@ -158,7 +158,7 @@ RUN cd /sgl-workspace/DeepEP && \
       12.6.1) \
         CHOSEN_TORCH_CUDA_ARCH_LIST='9.0' \
         ;; \
-      12.8.1|12.9.1|13.0.2) \
+      12.8.1|12.9.1|13.0.1) \
         CHOSEN_TORCH_CUDA_ARCH_LIST='9.0;10.0;10.3' \
         ;; \
       *) \
