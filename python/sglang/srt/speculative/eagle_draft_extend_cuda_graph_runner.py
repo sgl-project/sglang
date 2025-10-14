@@ -71,7 +71,7 @@ class EAGLEDraftExtendCudaGraphRunner:
         self.seq_lens_cpu = torch.full(
             (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
         )
-        self.extend_seq_lens_cpu = [self.num_tokens_per_bs] * self.max_num_token
+        self.extend_seq_lens_cpu = [self.num_tokens_per_bs] * self.max_bs
 
         if self.enable_torch_compile:
             set_torch_compile_config()

@@ -307,7 +307,10 @@ class Indexer(CustomOp):
         )
 
         blocksize = page_size
-        seqlens_32 = metadata.get_seqlens_int32()
+        if forward_batch.forward_mode.is_target_verify():
+            seqlens_32 = metadata.get_seqlens_expanded()
+        else:
+            seqlens_32 = metadata.get_seqlens_int32()
         # NOTE(dark): 132 is SM count on H200/B200, not magic number
         schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
             seqlens_32, blocksize, self.sm_count
@@ -324,65 +327,6 @@ class Indexer(CustomOp):
         )
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
-
-        logits = deep_gemm.fp8_paged_mqa_logits(
-            q_fp8,
-            kv_cache_fp8,
-            weights,
-            seqlens_32,
-            block_tables,
-            schedule_metadata,
-            max_seq_len,
-            clean_logits=False,
-        )
-
-        # NOTE(dark): logits should be cleaned in topk_transform
-        topk_result = metadata.topk_transform(logits, self.index_topk)
-        return topk_result
-
-    def _get_verify_topk_paged(
-        self,
-        forward_batch: ForwardBatch,
-        layer_id: int,
-        q_fp8: torch.Tensor,
-        weights: torch.Tensor,
-        metadata: BaseIndexerMetadata,
-    ) -> torch.Tensor:
-        if TYPE_CHECKING:
-            assert isinstance(forward_batch.token_to_kv_pool, NSATokenToKVPool)
-
-        page_size = forward_batch.token_to_kv_pool.page_size
-        # NOTE(dark): blocksize = 64 is hardcoded in deep_gemm_v32
-        assert page_size == 64, "only support page size 64"
-
-        # NOTE(dark): this support extend/decode/decode+graph
-        block_tables = metadata.get_page_table_64()
-
-        max_seq_len = block_tables.shape[1] * page_size
-        kv_cache_fp8 = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
-            layer_id=layer_id
-        )
-
-        blocksize = page_size
-        seqlens_32 = metadata.get_seqlens_expanded()
-        # NOTE(dark): 132 is SM count on H200/B200, not magic number
-        schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-            seqlens_32, blocksize, self.sm_count
-        )
-
-        assert len(weights.shape) == 3
-        weights = weights.squeeze(2)
-
-        assert len(q_fp8.shape) == 3
-        q_fp8 = q_fp8.unsqueeze(1)  # the next_n dim is 1 now
-
-        assert len(kv_cache_fp8.shape) == 2
-        block_kv = 64
-        num_heads_kv = 1
-        head_dim_with_sf = 132
-        kv_cache_fp8 = kv_cache_fp8.view(
-            kv_cache_fp8.shape[0], block_kv, num_heads_kv, head_dim_with_sf
-        )
 
         logits = deep_gemm.fp8_paged_mqa_logits(
             q_fp8,
@@ -642,12 +586,11 @@ class Indexer(CustomOp):
                     (x.shape[0], self.index_topk), -1, dtype=torch.int, device="cuda"
                 )
 
-            if forward_batch.forward_mode.is_decode_or_idle():
+            if (
+                forward_batch.forward_mode.is_decode_or_idle()
+                or forward_batch.forward_mode.is_target_verify()
+            ):
                 topk_result = self._get_topk_paged(
-                    forward_batch, layer_id, q_fp8, weights, metadata
-                )
-            elif forward_batch.forward_mode.is_target_verify():
-                topk_result = self._get_verify_topk_paged(
                     forward_batch, layer_id, q_fp8, weights, metadata
                 )
             else:
