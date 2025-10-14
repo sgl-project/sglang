@@ -310,10 +310,10 @@ The HTTP router exposes the full OpenAI-compatible surface area (`/generate`, `/
 - Explore the code paths in `src/reasoning_parser`, `src/tool_parser`, and `src/tokenizer` for the end-to-end Rust implementations that power gRPC mode.
 
 ### OpenAI Router
-- Proxies OpenAI-compatible payloads, preserving headers and SSE streams.
-- Supports `/v1/responses` background jobs with cancellation, deletion, and listing input items.
-- Conversation APIs (`/v1/conversations` and `/items`) interact with the configured conversation storage backend.
-- Optional MCP loop performs iterative tool execution, automatically transforming tool definitions and handling streaming patches.
+- Proxies OpenAI-compatible chat completions and responses APIs, preserving headers and SSE streams end-to-end.
+- Supports `/v1/responses` background jobs with cancellation, deletion, and listing input items—enabling agentic, multi-turn orchestration without persisting data at remote vendor endpoints.
+- Conversation APIs (`/v1/conversations` and `/items`) interact with the configured conversation storage backend for compliant chat-history management.
+- Chat history, agentic multi-turn `/v1/responses`, and the native MCP client (STDIO/HTTP/SSE/Streamable transports) are designed to satisfy enterprise data-privacy requirements by keeping sensitive state within the router.
 
 ### Request Endpoints
 | Endpoint                                                                         | Notes                                                      |
