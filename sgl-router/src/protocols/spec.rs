@@ -474,7 +474,8 @@ fn validate_chat_cross_parameters(
     // 2. Validate stream_options dependency
     if req.stream_options.is_some() && !req.stream {
         let mut e = validator::ValidationError::new("stream_options_requires_stream");
-        e.message = Some("The 'stream_options' parameter is only allowed when 'stream' is enabled".into());
+        e.message =
+            Some("The 'stream_options' parameter is only allowed when 'stream' is enabled".into());
         return Err(e);
     }
 
@@ -555,11 +556,15 @@ fn validate_chat_cross_parameters(
                     });
 
                     if !function_exists {
-                        let mut e = validator::ValidationError::new("tool_choice_function_not_found");
-                        e.message = Some(format!(
+                        let mut e =
+                            validator::ValidationError::new("tool_choice_function_not_found");
+                        e.message = Some(
+                            format!(
                             "Invalid value for 'tool_choice': function '{}' not found in 'tools'.",
                             function.name
-                        ).into());
+                        )
+                            .into(),
+                        );
                         return Err(e);
                     }
                 }
@@ -586,7 +591,8 @@ fn validate_chat_cross_parameters(
                         });
 
                         if !tool_exists {
-                            let mut e = validator::ValidationError::new("tool_choice_tool_not_found");
+                            let mut e =
+                                validator::ValidationError::new("tool_choice_tool_not_found");
                             e.message = Some(format!(
                                 "Invalid value for 'tool_choice.tools': tool '{}' not found in 'tools'.",
                                 tool_ref.name
