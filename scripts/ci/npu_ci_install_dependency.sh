@@ -61,6 +61,8 @@ wget -O "${BISHENG_NAME}" "${BISHENG_URL}" && chmod a+x "${BISHENG_NAME}" && "./
 ### Install sgl-kernel-npu
 SGL_KERNEL_NPU_TAG="20250926"
 git clone --depth 1 https://github.com/sgl-project/sgl-kernel-npu.git --branch ${SGL_KERNEL_NPU_TAG}
+# pin wheel to 0.45.1 ref: https://github.com/pypa/wheel/issues/662
+pip install wheel==0.45.1
 (cd sgl-kernel-npu && bash ./build.sh && pip install output/deep_ep*.whl output/sgl_kernel_npu*.whl && cd "$(pip show deep-ep | grep -E '^Location:' | awk '{print $2}')" && ln -s deep_ep/deep_ep_cpp*.so)
 
 
