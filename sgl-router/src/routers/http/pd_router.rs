@@ -52,7 +52,6 @@ struct PDRequestContext<'a> {
     return_logprob: bool,
     request_text: Option<String>,
     model_id: Option<&'a str>,
-    parallel_batch: bool, // Flag to enable parallel batch processing
 }
 
 impl PDRouter {
@@ -378,7 +377,7 @@ impl PDRouter {
         batch_size: Option<usize>,
     ) -> Result<Value, String> {
         let bootstrap_port = match prefill_worker.worker_type() {
-            WorkerType::Prefill { bootstrap_port } => bootstrap_port,
+            crate::core::WorkerType::Prefill { bootstrap_port } => bootstrap_port,
             _ => None,
         };
         let hostname = super::pd_types::get_hostname(prefill_worker.url());
@@ -441,44 +440,6 @@ impl PDRouter {
         headers: Option<&HeaderMap>,
         original_request: &T,
         context: PDRequestContext<'_>,
-    ) -> Response {
-        // Check if we should use parallel batch processing
-        let batch_size = context.batch_size.unwrap_or(0);
-
-        // Only check workers if parallel batch is requested with multiple items
-        if context.parallel_batch && batch_size > 1 {
-            let prefill_workers = self.worker_registry.get_by_type(&WorkerType::Prefill {
-                bootstrap_port: None,
-            });
-            let available_prefill = prefill_workers.iter().filter(|w| w.is_available()).count();
-
-            if available_prefill >= 2 {
-                info!(
-                    "Parallel batch processing: {} items across {} available workers",
-                    batch_size, available_prefill
-                );
-                return self
-                    .execute_parallel_batch(headers, original_request, context)
-                    .await;
-            } else {
-                info!(
-                    "Parallel batch requested but insufficient workers ({}), using single worker",
-                    available_prefill
-                );
-            }
-        }
-
-        // Regular single-worker execution
-        self.execute_dual_dispatch_internal_wrapper(headers, original_request, context)
-            .await
-    }
-
-    // Wrapper for the original execute_dual_dispatch logic
-    async fn execute_dual_dispatch_internal_wrapper<'a, T: Serialize + Clone>(
-        &self,
-        headers: Option<&HeaderMap>,
-        original_request: &T,
-        context: PDRequestContext<'a>,
     ) -> Response {
         let start_time = Instant::now();
 
@@ -551,389 +512,6 @@ impl PDRouter {
             || RouterMetrics::record_retries_exhausted(route),
         )
         .await
-    }
-
-    // Execute batch request in parallel across multiple prefill workers
-    async fn execute_parallel_batch<'a, T: Serialize + Clone>(
-        &self,
-        headers: Option<&HeaderMap>,
-        original_request: &T,
-        context: PDRequestContext<'a>,
-    ) -> Response {
-        let batch_size = context.batch_size.unwrap_or(0);
-
-        // Serialize request to extract items
-        let request_value = match serde_json::to_value(original_request) {
-            Ok(v) => v,
-            Err(e) => {
-                error!("Failed to serialize request: {}", e);
-                return Self::handle_serialization_error(e);
-            }
-        };
-
-        // Extract batch items
-        let batch_items = match Self::extract_batch_items(&request_value) {
-            Ok(items) => items,
-            Err(e) => {
-                warn!(
-                    "Cannot extract batch items: {}, falling back to single request",
-                    e
-                );
-                return self
-                    .execute_dual_dispatch_internal_wrapper(headers, original_request, context)
-                    .await;
-            }
-        };
-
-        // Get available prefill workers count
-        let prefill_workers = self.worker_registry.get_by_type(&WorkerType::Prefill {
-            bootstrap_port: None,
-        });
-        let available_workers = prefill_workers.iter().filter(|w| w.is_available()).count();
-
-        // Calculate distribution
-        let workers_to_use = available_workers.min(batch_size).max(1);
-        let base_items_per_worker = batch_size / workers_to_use;
-        let extra_items = batch_size % workers_to_use;
-
-        info!(
-            "Distributing {} items across {} workers",
-            batch_size, workers_to_use
-        );
-
-        // Create sub-batch futures
-        let mut futures = Vec::new();
-        let mut current_idx = 0;
-
-        for worker_idx in 0..workers_to_use {
-            // Calculate items for this worker (distribute extra items to first workers)
-            let items_for_worker = if worker_idx < extra_items {
-                base_items_per_worker + 1
-            } else {
-                base_items_per_worker
-            };
-
-            if items_for_worker == 0 {
-                break;
-            }
-
-            let end_idx = (current_idx + items_for_worker).min(batch_items.len());
-            let sub_batch: Vec<Value> = batch_items[current_idx..end_idx].to_vec();
-            current_idx = end_idx;
-
-            // Create sub-batch request
-            let sub_batch_request =
-                match Self::create_sub_batch_request(&request_value, sub_batch.clone()) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        error!("Failed to create sub-batch request: {}", e);
-                        continue;
-                    }
-                };
-
-            // Clone necessary data for the future
-            let headers_clone = headers.cloned();
-            let mut context_clone = context.clone();
-            context_clone.batch_size = Some(sub_batch.len());
-            context_clone.parallel_batch = false; // Prevent recursion
-
-            // Create future for this sub-batch
-            let fut = async move {
-                debug!("Worker {} processing {} items", worker_idx, sub_batch.len());
-                let response = self
-                    .execute_dual_dispatch_internal_wrapper(
-                        headers_clone.as_ref(),
-                        &sub_batch_request,
-                        context_clone,
-                    )
-                    .await;
-                (worker_idx, response)
-            };
-
-            futures.push(fut);
-        }
-
-        // Execute all sub-batches concurrently
-        let results = futures::future::join_all(futures).await;
-
-        // Aggregate responses
-        Self::aggregate_batch_responses(results).await
-    }
-
-    // Extract batch items from request
-    // Note: ChatCompletionRequest uses 'n' parameter for multiple responses, not array batching.
-    // Only GenerateRequest (text/prompt) and CompletionRequest (prompt) support array batching.
-    fn extract_batch_items(request: &Value) -> Result<Vec<Value>, String> {
-        if let Some(prompts) = request.get("prompt").and_then(|p| p.as_array()) {
-            return Ok(prompts.clone());
-        }
-
-        if let Some(texts) = request.get("text").and_then(|t| t.as_array()) {
-            return Ok(texts.clone());
-        }
-
-        Err("No batch array found in request".to_string())
-    }
-
-    // Create sub-batch request
-    fn create_sub_batch_request(
-        base_request: &Value,
-        sub_batch: Vec<Value>,
-    ) -> Result<Value, String> {
-        let mut request = base_request.clone();
-
-        if let Some(obj) = request.as_object_mut() {
-            if obj.contains_key("prompt") {
-                obj.insert("prompt".to_string(), Value::Array(sub_batch));
-            } else if obj.contains_key("text") {
-                obj.insert("text".to_string(), Value::Array(sub_batch));
-            }
-
-            // Remove parallel_batch flag
-            obj.remove("parallel_batch");
-
-            Ok(request)
-        } else {
-            Err("Request is not an object".to_string())
-        }
-    }
-
-    // Aggregate batch responses
-    async fn aggregate_batch_responses(results: Vec<(usize, Response)>) -> Response {
-        // First, check if all responses succeeded
-        let mut all_success = true;
-        let mut error_details = Vec::new();
-        let mut is_streaming = false;
-
-        // Check response types and collect errors
-        for (worker_idx, response) in &results {
-            if !response.status().is_success() {
-                all_success = false;
-                error_details.push(format!(
-                    "Worker {} failed with status {}",
-                    worker_idx,
-                    response.status()
-                ));
-            }
-
-            // Check if any response is streaming (SSE)
-            if let Some(content_type) = response.headers().get(CONTENT_TYPE) {
-                if content_type == HeaderValue::from_static("text/event-stream") {
-                    is_streaming = true;
-                }
-            }
-        }
-
-        if !all_success {
-            // Return error response
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({
-                    "error": "Some sub-batches failed",
-                    "details": error_details
-                })),
-            )
-                .into_response();
-        }
-
-        if is_streaming {
-            debug!(
-                "Aggregating streaming responses from {} workers",
-                results.len()
-            );
-            Self::aggregate_streaming_responses(results)
-        } else {
-            debug!(
-                "Aggregating non-streaming responses from {} workers",
-                results.len()
-            );
-            Self::aggregate_json_responses(results).await
-        }
-    }
-
-    // Aggregate multiple streaming SSE responses into a single stream
-    fn aggregate_streaming_responses(mut results: Vec<(usize, Response)>) -> Response {
-        // Create a channel for the merged stream
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<bytes::Bytes, String>>();
-
-        // Track how many streams are active
-        let active_streams = Arc::new(std::sync::atomic::AtomicUsize::new(results.len()));
-
-        // Spawn tasks to merge all streams
-        for (worker_idx, response) in results.drain(..) {
-            let tx = tx.clone();
-            let active_streams = active_streams.clone();
-
-            tokio::spawn(async move {
-                // Extract the body stream from the response
-                let body = response.into_body();
-                let mut stream = body.into_data_stream();
-
-                let mut batch_idx = 0;
-                while let Some(chunk_result) = stream.next().await {
-                    match chunk_result {
-                        Ok(chunk) => {
-                            // Parse SSE events and add worker/batch context
-                            let chunk_bytes = chunk.to_vec();
-                            let chunk_str = String::from_utf8_lossy(&chunk_bytes);
-
-                            // Process each SSE event in the chunk
-                            for line in chunk_str.lines() {
-                                if let Some(data_content) = line.strip_prefix("data: ") {
-                                    // Parse the JSON data
-                                    if let Ok(mut data) =
-                                        serde_json::from_str::<Value>(data_content)
-                                    {
-                                        // Add metadata about which worker and item this is from
-                                        if let Some(obj) = data.as_object_mut() {
-                                            obj.insert(
-                                                "_worker_idx".to_string(),
-                                                json!(worker_idx),
-                                            );
-                                            obj.insert(
-                                                "_batch_item_idx".to_string(),
-                                                json!(batch_idx),
-                                            );
-                                        }
-
-                                        // Re-serialize and send
-                                        let modified_line = format!(
-                                            "data: {}\n\n",
-                                            serde_json::to_string(&data).unwrap_or_default()
-                                        );
-                                        if tx.send(Ok(bytes::Bytes::from(modified_line))).is_err() {
-                                            break;
-                                        }
-
-                                        batch_idx += 1;
-                                    } else if data_content == "[DONE]" {
-                                        // Don't forward individual DONE markers
-                                        continue;
-                                    } else {
-                                        // Forward other data as-is
-                                        let line_with_newline = format!("{}\n\n", line);
-                                        if tx
-                                            .send(Ok(bytes::Bytes::from(line_with_newline)))
-                                            .is_err()
-                                        {
-                                            break;
-                                        }
-                                    }
-                                } else if !line.is_empty() {
-                                    // Forward other SSE fields (id:, event:, retry:)
-                                    let line_with_newline = format!("{}\n", line);
-                                    if tx.send(Ok(bytes::Bytes::from(line_with_newline))).is_err() {
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            warn!("Error reading stream from worker {}: {}", worker_idx, e);
-                            break;
-                        }
-                    }
-                }
-
-                // Decrement active streams counter
-                let remaining =
-                    active_streams.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) - 1;
-                debug!(
-                    "Worker {} stream completed, {} streams remaining",
-                    worker_idx, remaining
-                );
-
-                // If this was the last stream, send DONE marker
-                if remaining == 0 {
-                    let _ = tx.send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
-                }
-            });
-        }
-
-        // Drop the original sender so the stream ends when all tasks complete
-        drop(tx);
-
-        // Create response with merged stream
-        let stream = UnboundedReceiverStream::new(rx);
-        let body = Body::from_stream(stream);
-
-        let mut response = Response::new(body);
-        *response.status_mut() = StatusCode::OK;
-        response
-            .headers_mut()
-            .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
-        response.headers_mut().insert(
-            axum::http::header::CACHE_CONTROL,
-            HeaderValue::from_static("no-cache"),
-        );
-
-        response
-    }
-
-    // Aggregate multiple JSON responses into a single batch response
-    async fn aggregate_json_responses(results: Vec<(usize, Response)>) -> Response {
-        let mut all_responses = Vec::new();
-        let worker_count = results.len();
-
-        // Collect all response bodies
-        for (worker_idx, response) in results {
-            let body = response.into_body();
-            let bytes = match axum::body::to_bytes(body, usize::MAX).await {
-                Ok(b) => b,
-                Err(e) => {
-                    warn!(
-                        "Failed to read response body from worker {}: {}",
-                        worker_idx, e
-                    );
-                    continue;
-                }
-            };
-
-            match serde_json::from_slice::<Value>(&bytes) {
-                Ok(mut json_value) => {
-                    // Handle different response formats
-                    if let Some(obj) = json_value.as_object_mut() {
-                        // Add metadata about which worker processed this
-                        obj.insert("_worker_idx".to_string(), json!(worker_idx));
-
-                        // If it's an array response (batch), extract items
-                        if let Some(items) = obj.get("text").and_then(|t| t.as_array()) {
-                            for item in items {
-                                all_responses.push(item.clone());
-                            }
-                        } else if let Some(items) = obj.get("choices").and_then(|c| c.as_array()) {
-                            for item in items {
-                                all_responses.push(item.clone());
-                            }
-                        } else {
-                            // Single response, add as-is
-                            all_responses.push(json_value);
-                        }
-                    } else if let Some(array) = json_value.as_array() {
-                        // Direct array response
-                        for item in array {
-                            all_responses.push(item.clone());
-                        }
-                    } else {
-                        all_responses.push(json_value);
-                    }
-                }
-                Err(e) => {
-                    warn!("Failed to parse JSON from worker {}: {}", worker_idx, e);
-                }
-            }
-        }
-
-        // Return aggregated response
-        (
-            StatusCode::OK,
-            Json(json!({
-                "text": all_responses,
-                "_parallel_batch": true,
-                "_worker_count": worker_count
-            })),
-        )
-            .into_response()
     }
 
     async fn handle_decode_error_response(
@@ -1922,7 +1500,6 @@ impl RouterTrait for PDRouter {
             return_logprob,
             request_text,
             model_id,
-            parallel_batch: body.parallel_batch.unwrap_or(false),
         };
 
         self.execute_dual_dispatch(headers, body, context).await
@@ -1960,7 +1537,6 @@ impl RouterTrait for PDRouter {
             return_logprob,
             request_text,
             model_id,
-            parallel_batch: body.parallel_batch.unwrap_or(false),
         };
 
         self.execute_dual_dispatch(headers, body, context).await
@@ -1994,7 +1570,6 @@ impl RouterTrait for PDRouter {
             return_logprob,
             request_text,
             model_id,
-            parallel_batch: body.parallel_batch.unwrap_or(false),
         };
 
         self.execute_dual_dispatch(headers, body, context).await
@@ -2062,7 +1637,6 @@ impl RouterTrait for PDRouter {
             return_logprob: false,
             request_text: req_text,
             model_id,
-            parallel_batch: false,
         };
 
         self.execute_dual_dispatch(headers, body, context).await

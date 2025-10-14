@@ -44,56 +44,19 @@ fn default_generate_request() -> GenerateRequest {
         session_params: None,
         return_hidden_states: false,
         rid: None,
-        parallel_batch: None,
     }
 }
 
 /// Create a default ChatCompletionRequest for benchmarks with minimal fields set
+#[allow(deprecated)]
 fn default_chat_completion_request() -> ChatCompletionRequest {
     ChatCompletionRequest {
-        model: String::new(),
+        // Required fields in OpenAI order
         messages: vec![],
-        max_tokens: None,
-        max_completion_tokens: None,
-        temperature: None,
-        top_p: None,
-        n: None,
-        stream: false,
-        stream_options: None,
-        stop: None,
-        presence_penalty: None,
-        frequency_penalty: None,
-        logit_bias: None,
-        logprobs: false,
-        top_logprobs: None,
-        user: None,
-        response_format: None,
-        seed: None,
-        tools: None,
-        tool_choice: None,
-        parallel_tool_calls: None,
-        function_call: None,
-        functions: None,
-        // SGLang Extensions
-        top_k: None,
-        min_p: None,
-        min_tokens: None,
-        repetition_penalty: None,
-        regex: None,
-        ebnf: None,
-        stop_token_ids: None,
-        no_stop_trim: false,
-        ignore_eos: false,
-        continue_final_message: false,
-        skip_special_tokens: true,
-        // SGLang Extensions
-        lora_path: None,
-        session_params: None,
-        separate_reasoning: true,
-        stream_reasoning: true,
-        chat_template_kwargs: None,
-        return_hidden_states: false,
-        parallel_batch: None,
+        model: String::new(),
+
+        // Use default for all other fields
+        ..Default::default()
     }
 }
 
@@ -134,7 +97,7 @@ fn default_completion_request() -> CompletionRequest {
         lora_path: None,
         session_params: None,
         return_hidden_states: false,
-        parallel_batch: None,
+        sampling_seed: None,
         other: serde_json::Map::new(),
     }
 }
@@ -164,6 +127,7 @@ fn create_sample_generate_request() -> GenerateRequest {
     }
 }
 
+#[allow(deprecated)]
 fn create_sample_chat_completion_request() -> ChatCompletionRequest {
     ChatCompletionRequest {
         model: "gpt-3.5-turbo".to_string(),
@@ -208,6 +172,7 @@ fn create_sample_completion_request() -> CompletionRequest {
     }
 }
 
+#[allow(deprecated)]
 fn create_large_chat_completion_request() -> ChatCompletionRequest {
     let mut messages = vec![ChatMessage::System {
         role: "system".to_string(),
@@ -243,7 +208,6 @@ fn create_large_chat_completion_request() -> ChatCompletionRequest {
         presence_penalty: Some(0.1),
         frequency_penalty: Some(0.1),
         top_logprobs: Some(5),
-        user: Some("benchmark_user".to_string()),
         seed: Some(42),
         parallel_tool_calls: Some(true),
         ..default_chat_completion_request()

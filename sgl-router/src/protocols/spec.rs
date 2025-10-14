@@ -368,10 +368,9 @@ pub struct ChatCompletionRequest {
     #[serde(default)]
     pub return_hidden_states: bool,
 
-    /// Enable parallel batch processing (SGLang extension)
-    /// When true and batch detected, distribute items across multiple workers
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parallel_batch: Option<bool>,
+    /// Random seed for sampling for deterministic outputs
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sampling_seed: Option<u64>,
 }
 
 impl GenerationRequest for ChatCompletionRequest {
@@ -613,10 +612,9 @@ pub struct CompletionRequest {
     #[serde(default)]
     pub return_hidden_states: bool,
 
-    /// Enable parallel batch processing (SGLang extension)
-    /// When true and batch detected, distribute items across multiple workers
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parallel_batch: Option<bool>,
+    /// Sampling seed for deterministic outputs
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sampling_seed: Option<u64>,
 
     /// Additional fields including bootstrap info for PD routing
     #[serde(flatten)]
@@ -1759,6 +1757,8 @@ pub struct SamplingParams {
     pub stop_token_ids: Option<Vec<i32>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub no_stop_trim: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sampling_seed: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1807,11 +1807,6 @@ pub struct GenerateRequest {
     /// Request ID for tracking
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rid: Option<String>,
-
-    /// Enable parallel batch processing (SGLang extension)
-    /// When true and batch detected, distribute items across multiple workers
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parallel_batch: Option<bool>,
 }
 
 impl GenerationRequest for GenerateRequest {
