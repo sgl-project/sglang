@@ -127,6 +127,7 @@ class SchedulerStats:
 
     # Speculative decoding
     spec_accept_length: float = 0.0
+    spec_accept_rate: float = 0.0
 
     # Retract
     num_retracted_reqs: int = 0
@@ -217,6 +218,12 @@ class SchedulerMetricsCollector:
         self.spec_accept_length = Gauge(
             name="sglang:spec_accept_length",
             documentation="The average acceptance length of speculative decoding.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.spec_accept_rate = Gauge(
+            name="sglang:spec_accept_rate",
+            documentation="The average acceptance rate of speculative decoding (`accepted tokens / total draft tokens` in batch).",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -520,6 +527,7 @@ class SchedulerMetricsCollector:
 
         # Speculative decoding
         self._log_gauge(self.spec_accept_length, stats.spec_accept_length)
+        self._log_gauge(self.spec_accept_rate, stats.spec_accept_rate)
 
         # PD disaggregation
         self._log_gauge(
@@ -809,13 +817,13 @@ class TokenizerMetricsCollector:
     def check_time_to_first_token_straggler(self, value: float) -> bool:
         his = self.histogram_time_to_first_token.labels(**self.labels)
         total_observations = sum(bucket._value for bucket in his._buckets)
-        if total_observations < 100:
+        if total_observations < 1000:
             return False
-        p99_threshold = total_observations * 0.99
+        p999_threshold = total_observations * 0.999
         cumulative_count = 0
         for i, bucket in enumerate(his._buckets):
             cumulative_count += bucket._value
-            if cumulative_count > p99_threshold:
+            if cumulative_count > p999_threshold:
                 return value >= his._upper_bounds[i]
         return False
 

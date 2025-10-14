@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from sglang.srt.utils import DEFAULT_DETERMINISTIC_INFERENCE_BACKEND_SIZE
+
 """
 Copyright 2023-2024 SGLang Team
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,7 +24,7 @@ The radix tree data structure for managing the KV cache.
 import heapq
 import time
 from collections import defaultdict
-from functools import partial
+from functools import lru_cache, partial
 from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Tuple, Union
 
 import torch
@@ -114,6 +116,13 @@ class TreeNode:
             return None
         return self.hash_value[-1]
 
+    @lru_cache(maxsize=1)
+    def get_prefix_hash_values(self, node: TreeNode) -> List[str]:
+        if node is None or node.hash_value is None:
+            return []
+
+        return node.get_prefix_hash_values(node.parent) + node.hash_value
+
     def __lt__(self, other: "TreeNode"):
         return self.last_access_time < other.last_access_time
 
@@ -178,6 +187,7 @@ class RadixCache(BasePrefixCache):
         disable: bool = False,
         enable_kv_cache_events: bool = False,
         eviction_policy: str = "lru",
+        enable_deterministic_inference: bool = False,
         is_eagle: bool = False,
     ):
         self.req_to_token_pool = req_to_token_pool
@@ -186,6 +196,8 @@ class RadixCache(BasePrefixCache):
         self.disable = disable
         self.enable_kv_cache_events = enable_kv_cache_events
         self.kv_event_queue = []
+        self.enable_deterministic_inference = enable_deterministic_inference
+        self.split_size = DEFAULT_DETERMINISTIC_INFERENCE_BACKEND_SIZE
         self.is_eagle = is_eagle
 
         if self.token_to_kv_pool_allocator:
@@ -227,7 +239,9 @@ class RadixCache(BasePrefixCache):
         self.protected_size_ = 0
         self._record_all_cleared_event()
 
-    def match_prefix(self, key: RadixKey, **kwargs) -> MatchResult:
+    def match_prefix(
+        self, key: RadixKey, is_cache_unfinished: bool = False, **kwargs
+    ) -> MatchResult:
         """Find the longest cached prefix of ``key`` in the radix tree.
 
         The logical namespace for prefix matching is determined by both the
@@ -267,7 +281,7 @@ class RadixCache(BasePrefixCache):
         """
         key.token_ids = self.key_convert_fn(key.token_ids)
 
-        if self.disable or len(key) == 0:
+        def empty_match_result():
             return MatchResult(
                 device_indices=torch.empty(
                     (0,),
@@ -278,11 +292,19 @@ class RadixCache(BasePrefixCache):
                 last_host_node=self.root_node,
             )
 
+        if self.disable or len(key) == 0:
+            return empty_match_result()
+
         if self.page_size != 1:
             page_aligned_len = len(key) // self.page_size * self.page_size
             key = key[:page_aligned_len]
 
-        value, last_node = self._match_prefix_helper(self.root_node, key)
+        if len(key) == 0:
+            return empty_match_result()
+
+        value, last_node = self._match_prefix_helper(
+            self.root_node, key, is_cache_unfinished=is_cache_unfinished
+        )
         if value:
             value = torch.cat(value)
         else:
@@ -320,6 +342,8 @@ class RadixCache(BasePrefixCache):
 
         token_ids = (req.origin_input_ids + req.output_ids)[:-1]
         all_token_len = len(token_ids)
+        # For EAGLE radix cache, we will convert the key to bigram key, e.g. [1,2,3,4] -> [(1,2), (2,3), (3,4)], the length will -1. ((len([(1,2), (2,3), (3,4)]) = len([1,2,3,4]) - 1))
+        # So for the corresponding kv length should also -1. Then we get the actual_kv_len, and use it to do later calculation and slicing.
         actual_kv_len = all_token_len - 1 if self.is_eagle else all_token_len
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :all_token_len
@@ -343,7 +367,8 @@ class RadixCache(BasePrefixCache):
 
         old_prefix_len = len(req.prefix_indices)
         if self.is_eagle and old_prefix_len > req.last_matched_prefix_len:
-            # prefix_indices attached partial part (for page_size > 1) and one unmatched token (for EAGLE)
+            # In EAGLE chunked prefill case, the prefix_indices included one unmatched token (kv_indices[actual_kv_len:])
+            # Here we -1 to make sure the kv of the unmatched token can be freed correctly to avoid memory leak
             old_prefix_len -= 1
 
         # Radix Cache takes one ref in memory pool
@@ -364,7 +389,8 @@ class RadixCache(BasePrefixCache):
 
         token_ids = req.fill_ids
         all_token_len = len(token_ids)
-        # The actual kv len for EAGLE is len(token_ids), since EAGLE uses bigram key
+        # For EAGLE radix cache, we will convert the key to bigram key, e.g. [1,2,3,4] -> [(1,2), (2,3), (3,4)], the length will -1. ((len([(1,2), (2,3), (3,4)]) = len([1,2,3,4]) - 1))
+        # So for the corresponding kv length should also -1. Then we get the actual_kv_len, and use it to do later calculation and slicing.
         actual_kv_len = all_token_len - 1 if self.is_eagle else all_token_len
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :all_token_len
@@ -387,7 +413,8 @@ class RadixCache(BasePrefixCache):
 
         old_prefix_len = len(req.prefix_indices)
         if self.is_eagle and old_prefix_len > req.last_matched_prefix_len:
-            # prefix_indices attached partial part (for page_size > 1) and one unmatched token (for EAGLE)
+            # In EAGLE chunked prefill case, the prefix_indices included one unmatched token (kv_indices[actual_kv_len:])
+            # Here we -1 to make sure the kv of the unmatched token can be freed correctly to avoid memory leak
             old_prefix_len -= 1
 
         # Radix Cache takes one ref in memory pool
@@ -400,7 +427,8 @@ class RadixCache(BasePrefixCache):
 
         # The prefix indices could be updated, reuse it
         new_indices, new_last_node, _, _ = self.match_prefix(
-            RadixKey(token_ids=page_aligned_token_ids, extra_key=req.extra_key)
+            RadixKey(token_ids=page_aligned_token_ids, extra_key=req.extra_key),
+            is_cache_unfinished=True,
         )
         self.req_to_token_pool.write(
             (req.req_pool_idx, slice(old_prefix_len, len(new_indices))),
@@ -475,9 +503,9 @@ class RadixCache(BasePrefixCache):
         delta = 0
         while node != self.root_node:
             if node.lock_ref == 0:
-                self.evictable_size_ -= len(node.value)
-                self.protected_size_ += len(node.value)
-                delta -= len(node.value)
+                self.evictable_size_ -= len(node.key)
+                self.protected_size_ += len(node.key)
+                delta -= len(node.key)
             node.lock_ref += 1
             node = node.parent
         return delta
@@ -489,9 +517,9 @@ class RadixCache(BasePrefixCache):
         delta = 0
         while node != self.root_node:
             if node.lock_ref == 1:
-                self.evictable_size_ += len(node.value)
-                self.protected_size_ -= len(node.value)
-                delta += len(node.value)
+                self.evictable_size_ += len(node.key)
+                self.protected_size_ -= len(node.key)
+                delta += len(node.key)
             node.lock_ref -= 1
             node = node.parent
         return delta
@@ -516,16 +544,58 @@ class RadixCache(BasePrefixCache):
 
     ##### Internal Helper Functions #####
 
-    def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
+    def _match_prefix_helper(
+        self, node: TreeNode, key: RadixKey, is_cache_unfinished: bool
+    ):
         node.last_access_time = time.monotonic()
 
         child_key = self.get_child_key_fn(key)
 
         value = []
+        align_split_size = (
+            not is_cache_unfinished and self.enable_deterministic_inference
+        )
+        match_history = [node] if align_split_size else None
+
+        if align_split_size and len(key) < self.split_size:
+            # fast path: directly return the root node if the split point is 0
+            return value, node
+
+        # use the access history to first find a split point at split_size and then return the value and node at that point.
+        def reconstruct_at_split_point(match_history, value_len):
+            # reverse the search process to find the last node right above the split_size, split here
+            split_point = value_len // self.split_size * self.split_size
+            # rebuild value form history
+            value = []
+            current_value_len = 0
+            node = match_history[0]  # this is the root node
+            for idx, node in enumerate(match_history):
+                match_len = len(node.value)
+                if current_value_len + match_len > split_point:
+                    # split the node at the desired split point
+                    node = self._split_node(
+                        node.key, node, split_point - current_value_len
+                    )
+                    value.append(node.value)
+                    return value, node
+                elif current_value_len + match_len == split_point:
+                    if idx != 0:
+                        value.append(node.value)
+                    return value, node
+                current_value_len += match_len
+                if idx != 0:
+                    # the root node always has empty value, skip
+                    value.append(node.value)
+            # return the root node as the corresponding node doesn't exist yet
+            # and the previously computed node is not at the split boundary
+            return [], match_history[0]
+
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
             child.last_access_time = time.monotonic()
             prefix_len = self.key_match_fn(child.key, key)
+            if align_split_size:
+                match_history.append(child)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
                 value.append(new_node.value)
@@ -538,6 +608,13 @@ class RadixCache(BasePrefixCache):
 
                 if len(key):
                     child_key = self.get_child_key_fn(key)
+
+        if align_split_size:
+            value_len = sum(map(len, value))
+            value, node = reconstruct_at_split_point(match_history, value_len)
+            assert (
+                sum(map(len, value)) % self.split_size == 0
+            ), "The value length is not aligned with the split size"
 
         return value, node
 
@@ -589,7 +666,7 @@ class RadixCache(BasePrefixCache):
             new_node.key = key
             new_node.value = value
             node.children[child_key] = new_node
-            self.evictable_size_ += len(value)
+            self.evictable_size_ += len(key)
             self._record_store_event(new_node)
         return total_prefix_length
 

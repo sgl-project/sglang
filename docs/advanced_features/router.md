@@ -11,6 +11,7 @@ The SGLang Router is a high-performance request distribution system that routes 
 - **Kubernetes Integration**: Native service discovery and pod management
 - **Prefill-Decode Disaggregation**: Support for disaggregated serving load balancing
 - **Prometheus Metrics**: Built-in observability and monitoring
+- **Rate Limiter**: Token-bucket rate limiter to shield workers from overload
 
 ## Installation
 
@@ -224,10 +225,58 @@ python -m sglang_router.launch_router \
     --cb-window-duration-secs 60
 ```
 
+```mermaid
+flowchart TD
+    Closed(["Closed"])
+    Open(["Open"])
+    HalfOpen(["HalfOpen"])
+
+    Closed -- "Consecutive Failures >=<br/>cb-failure-threshold" --> Open;
+    Closed --> HalfOpen;
+    linkStyle 1 stroke:transparent;
+    Open -- "After cb-timeout-duration-secs" --> HalfOpen;
+    HalfOpen -- "Fail any test request" --> Open;
+    HalfOpen -- "After cb-success-threshold<br/>test requests" --> Closed;
+    Closed -- "Failures < cb-failure-threshold" --> Closed;
+    style Closed fill:#00C853,color:#000000
+    style Open fill:#D50000,color:#000000
+    style HalfOpen fill:#FFD600,color:#000000
+    linkStyle 1 stroke:transparent,fill:none
+```
+
 **Behavior**:
 - Worker is marked unhealthy after `cb-failure-threshold` consecutive failures
 - Returns to service after `cb-success-threshold` successful health checks
 - Circuit breaker can be disabled with `--disable-circuit-breaker`
+
+### Rate Limiter
+
+Use the token-bucket rate limiter to cap requests before they overwhelm downstream workers.
+
+- Enable rate limiting by setting `--max-concurrent-requests` to a positive integer. A bucket with that many tokens (concurrent leases) is created; `-1` keeps it disabled.
+- Optionally override the refill rate with `--rate-limit-tokens-per-second`. If omitted, the refill rate matches `max-concurrent-requests`.
+- Overflow traffic can wait in a FIFO queue controlled by:
+  - `--queue-size`: pending-request buffer (0 disables queuing; defaults to 100).
+  - `--queue-timeout-secs`: maximum wait time for queued requests before returning `429` (defaults to 60 seconds).
+
+Example:
+
+```bash
+python -m sglang_router.launch_router \
+    --worker-urls http://worker1:8000 http://worker2:8001 \
+    --max-concurrent-requests 256 \
+    --rate-limit-tokens-per-second 512 \
+    --queue-size 128 \
+    --queue-timeout-secs 30
+```
+
+**Behavior**:
+
+This configuration allows up to 256 concurrent requests, refills 512 tokens (requests) per second, and keeps up to 128 overflow requests queued for 30 seconds before timing out.
+
+**Responses**:
+- Returns **429** when the router cannot enqueue the request (queue disabled or full).
+- Returns **408** when a queued request waits longer than `--queue-timeout-secs` or no token becomes available before the timeout.
 
 ## Routing Policies
 
@@ -421,13 +470,31 @@ python -m sglang_router.launch_router \
     --request-id-headers x-request-id x-trace-id
 ```
 
+## Observability
+
+When Prometheus is enabled, the router provides several key metrics for observability.
+
+| Metric Name                            | Type      | Description                                                                                          |
+|:---------------------------------------|:----------|:-----------------------------------------------------------------------------------------------------|
+| `sgl_router_requests_total`            | Counter   | Total number of requests received by the router's API endpoint. Useful for tracking overall traffic. |
+| `sgl_router_processed_requests_total`  | Counter   | Total requests processed, labeled by `worker`. Critical for spotting load imbalances.                |
+| `sgl_router_active_workers`            | Gauge     | The current number of healthy workers in the routing pool. Essential for alerting.                   |
+| `sgl_router_running_requests`          | Gauge     | The number of currently in-flight requests, labeled by `worker`. For monitoring real-time load.      |
+| `sgl_router_cache_hits_total`          | Counter   | Total requests routed to a worker with a matching prefix cache.                                      |
+| `sgl_router_cache_misses_total`        | Counter   | Total requests that could not be routed based on cache locality.                                     |
+| `sgl_router_generate_duration_seconds` | Histogram | Tracks end-to-end request latency. Use this to monitor performance (e.g., p95/p99).                  |
+
 ## Troubleshooting
 
 ### Common Issues
 
 1. **Workers not connecting**: Ensure workers are fully initialized before starting the router. Use `--worker-startup-timeout-secs` to increase wait time.
 
-2. **High latency**: Check if cache-aware routing is causing imbalance. Try adjusting `--balance-abs-threshold` and `--balance-rel-threshold`.
+2. **High latency**:
+   - **A common cause**: Load Imbalanced.
+   - Check the `sgl_router_processed_requests_total` metric grouped by `worker`.
+   - Cache-aware routing might be prioritizing cache hits too aggressively.
+   - Try adjusting `--balance-abs-threshold` and `--balance-rel-threshold`.
 
 3. **Memory growth**: Reduce `--max-tree-size` or decrease `--eviction-interval-secs` for more aggressive cache cleanup.
 

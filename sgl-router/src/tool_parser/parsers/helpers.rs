@@ -2,7 +2,7 @@ use crate::protocols::spec::Tool;
 use serde_json::Value;
 use std::collections::HashMap;
 
-use crate::tool_parser::errors::{ToolParserError, ToolParserResult};
+use crate::tool_parser::errors::{ParserError, ParserResult};
 use crate::tool_parser::types::{StreamingParseResult, ToolCallItem};
 
 /// Get a mapping of tool names to their indices
@@ -12,6 +12,58 @@ pub fn get_tool_indices(tools: &[Tool]) -> HashMap<String, usize> {
         .enumerate()
         .map(|(i, tool)| (tool.function.name.clone(), i))
         .collect()
+}
+
+/// Find the common prefix of two strings
+/// Used for incremental argument streaming when partial JSON returns different intermediate states
+pub fn find_common_prefix(s1: &str, s2: &str) -> String {
+    s1.chars()
+        .zip(s2.chars())
+        .take_while(|(c1, c2)| c1 == c2)
+        .map(|(c1, _)| c1)
+        .collect()
+}
+
+/// Get unstreamed tool call arguments
+/// Returns tool call items for arguments that have been parsed but not yet streamed
+/// This ensures tool calls are properly completed even if the model generates final arguments in the last chunk
+pub fn get_unstreamed_args(
+    prev_tool_call_arr: &[Value],
+    streamed_args_for_tool: &[String],
+) -> Option<Vec<ToolCallItem>> {
+    // Check if we have tool calls being tracked
+    if prev_tool_call_arr.is_empty() || streamed_args_for_tool.is_empty() {
+        return None;
+    }
+
+    // Get the last tool call that was being processed
+    let tool_index = prev_tool_call_arr.len() - 1;
+    if tool_index >= streamed_args_for_tool.len() {
+        return None;
+    }
+
+    // Get expected vs actual arguments
+    let expected_args = prev_tool_call_arr[tool_index].get("arguments")?;
+    let expected_str = serde_json::to_string(expected_args).ok()?;
+    let actual_str = &streamed_args_for_tool[tool_index];
+
+    // Check if there are remaining arguments to send
+    let remaining = if expected_str.starts_with(actual_str) {
+        &expected_str[actual_str.len()..]
+    } else {
+        return None;
+    };
+
+    if remaining.is_empty() {
+        return None;
+    }
+
+    // Return the remaining arguments as a ToolCallItem
+    Some(vec![ToolCallItem {
+        tool_index,
+        name: None, // No name for argument deltas
+        parameters: remaining.to_string(),
+    }])
 }
 
 /// Check if a buffer ends with a partial occurrence of a token
@@ -54,7 +106,7 @@ pub fn reset_parser_state(
 ) {
     buffer.clear();
     prev_tool_call_arr.clear();
-    *current_tool_id = 0;
+    *current_tool_id = -1;
     *current_tool_name_sent = false;
     streamed_args_for_tool.clear();
 }
@@ -127,7 +179,7 @@ pub fn normalize_arguments_field(mut obj: Value) -> Value {
 ///
 /// # Returns
 /// - `Ok(StreamingParseResult)` with any tool call items to stream
-/// - `Err(ToolParserError)` if JSON parsing or serialization fails
+/// - `Err(ParserError)` if JSON parsing or serialization fails
 #[allow(clippy::too_many_arguments)]
 pub fn handle_json_tool_streaming(
     current_text: &str,
@@ -139,7 +191,7 @@ pub fn handle_json_tool_streaming(
     current_tool_name_sent: &mut bool,
     streamed_args_for_tool: &mut Vec<String>,
     prev_tool_call_arr: &mut Vec<Value>,
-) -> ToolParserResult<StreamingParseResult> {
+) -> ParserResult<StreamingParseResult> {
     // Check if we have content to parse
     if start_idx >= current_text.len() {
         return Ok(StreamingParseResult::default());
@@ -148,8 +200,12 @@ pub fn handle_json_tool_streaming(
     // Extract JSON string from current position
     let json_str = &current_text[start_idx..];
 
+    // When current_tool_name_sent is false, don't allow partial strings to avoid
+    // parsing incomplete tool names as empty strings
+    let allow_partial_strings = *current_tool_name_sent;
+
     // Parse partial JSON
-    let (obj, end_idx) = match partial_json.parse_value(json_str) {
+    let (obj, end_idx) = match partial_json.parse_value(json_str, allow_partial_strings) {
         Ok(result) => result,
         Err(_) => {
             return Ok(StreamingParseResult::default());
@@ -210,49 +266,68 @@ pub fn handle_json_tool_streaming(
             .map(|s| s.len())
             .unwrap_or(0);
         let cur_args_json = serde_json::to_string(cur_arguments)
-            .map_err(|e| ToolParserError::ParsingFailed(e.to_string()))?;
+            .map_err(|e| ParserError::ParsingFailed(e.to_string()))?;
 
-        // Compute diff: everything after what we've already sent
-        let diff = cur_args_json[sent..].to_string();
+        // Get prev_arguments (matches Python's structure)
+        let prev_arguments = if tool_id < prev_tool_call_arr.len() {
+            prev_tool_call_arr[tool_id].get("arguments")
+        } else {
+            None
+        };
 
-        // Send diff if there's new content
-        if !diff.is_empty() {
-            // Only accumulate if not complete
-            if !is_complete && tool_id < streamed_args_for_tool.len() {
-                streamed_args_for_tool[tool_id].push_str(&diff);
-            }
+        // Calculate diff: everything after we've already sent
+        let mut argument_diff = None;
 
-            result.calls.push(ToolCallItem {
-                tool_index: tool_id,
-                name: None,
-                parameters: diff,
-            });
-        }
-
-        // If JSON is complete, advance to next tool
         if is_complete {
-            // Remove processed portion, keep unprocessed content
-            *buffer = current_text[start_idx + end_idx..].to_string();
+            // Python: argument_diff = cur_args_json[sent:]
+            // Rust needs bounds check (Python returns "" automatically)
+            argument_diff = if sent < cur_args_json.len() {
+                Some(cur_args_json[sent..].to_string())
+            } else {
+                Some(String::new())
+            };
+        } else if let Some(prev_args) = prev_arguments {
+            let prev_args_json = serde_json::to_string(prev_args)
+                .map_err(|e| ParserError::ParsingFailed(e.to_string()))?;
 
-            // Clear completed tool data
-            if tool_id < prev_tool_call_arr.len() {
-                prev_tool_call_arr[tool_id] = Value::Null;
+            if cur_args_json != prev_args_json {
+                let prefix = find_common_prefix(&prev_args_json, &cur_args_json);
+                argument_diff = if sent < prefix.len() {
+                    Some(prefix[sent..].to_string())
+                } else {
+                    Some(String::new())
+                };
             }
-            *current_tool_name_sent = false;
-            if tool_id < streamed_args_for_tool.len() {
-                streamed_args_for_tool[tool_id].clear();
-            }
-            *current_tool_id += 1;
         }
-    }
 
-    // Update prev_tool_call_arr with current state
-    if *current_tool_id >= 0 {
-        ensure_capacity(*current_tool_id, prev_tool_call_arr, streamed_args_for_tool);
-        let tool_id = *current_tool_id as usize;
+        // Send diff if present
+        if let Some(diff) = argument_diff {
+            if !diff.is_empty() {
+                if tool_id < streamed_args_for_tool.len() {
+                    streamed_args_for_tool[tool_id].push_str(&diff);
+                }
+                result.calls.push(ToolCallItem {
+                    tool_index: tool_id,
+                    name: None,
+                    parameters: diff,
+                });
+            }
+        }
 
-        if tool_id < prev_tool_call_arr.len() {
-            prev_tool_call_arr[tool_id] = current_tool_call;
+        // Update prev_tool_call_arr with current state
+        if *current_tool_id >= 0 {
+            ensure_capacity(*current_tool_id, prev_tool_call_arr, streamed_args_for_tool);
+
+            if tool_id < prev_tool_call_arr.len() {
+                prev_tool_call_arr[tool_id] = current_tool_call;
+            }
+        }
+
+        // If complete, advance to next tool
+        if is_complete {
+            *buffer = current_text[start_idx + end_idx..].to_string();
+            *current_tool_name_sent = false;
+            *current_tool_id += 1;
         }
     }
 
@@ -329,7 +404,7 @@ mod tests {
 
         assert_eq!(buffer, "");
         assert_eq!(prev_tools.len(), 0);
-        assert_eq!(current_tool_id, 0);
+        assert_eq!(current_tool_id, -1);
         assert!(!current_tool_name_sent);
         assert_eq!(streamed_args.len(), 0);
     }

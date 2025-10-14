@@ -136,7 +136,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--device` | The device to use ('cuda', 'xpu', 'hpu', 'npu', 'cpu'). Defaults to auto-detection if not specified. | None |
 | `--tp-size` | The tensor parallelism size. | 1 |
 | `--pp-size` | The pipeline parallelism size. | 1 |
-| `--max-micro-batch-size` | The maximum micro batch size in pipeline parallelism. | None |
+| `--pp-max-micro-batch-size` | The maximum micro batch size in pipeline parallelism. | None |
 | `--stream-interval` | The interval (or buffer size) for streaming in terms of the token length. A smaller value makes streaming smoother, while a larger value makes the throughput higher. | 1 |
 | `--stream-output` | Whether to output as a sequence of disjoint segments. | False |
 | `--random-seed` | The random seed. | None |
@@ -213,6 +213,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--lora-paths` | The list of LoRA adapters to load. Each adapter must be specified in one of the following formats: <PATH> | <NAME>=<PATH> | JSON with schema {"lora_name":str,"lora_path":str,"pinned":bool} | None |
 | `--max-loras-per-batch` | Maximum number of adapters for a running batch, include base-only request. | 8 |
 | `--max-loaded-loras` | If specified, it limits the maximum number of LoRA adapters loaded in CPU memory at a time. The value must be greater than or equal to `--max-loras-per-batch`. | None |
+| `--lora-eviction-policy` | LoRA adapter eviction policy when GPU memory pool is full. `lru`: Least Recently Used (better cache efficiency). `fifo`: First-In-First-Out. | lru |
 | `--lora-backend` | Choose the kernel backend for multi-LoRA serving. | triton |
 
 ## Kernel backend
@@ -246,7 +247,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 |-----------|-------------|----------|
 | `--ep-size` | The expert parallelism size. | 1 |
 | `--moe-a2a-backend` | Select the backend for all-to-all communication for expert parallelism. | none |
-| `--moe-runner-backend` | Select the runner backend for MoE. | 'triton' |
+| `--moe-runner-backend` | Select the runner backend for MoE. | auto |
 | `--deepep-mode` | Select the mode when enable DeepEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch. | auto |
 | `--ep-num-redundant-experts` | Allocate this number of redundant experts in expert parallel. | 0 |
 | `--ep-dispatch-algorithm` | The algorithm to choose ranks for redundant experts in EPLB. | None |
@@ -305,6 +306,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--num-continuous-decode-steps` | Run multiple continuous decoding steps to reduce scheduling overhead. This can potentially increase throughput but may also increase time-to-first-token latency. The default value is 1, meaning only run one decoding step at a time. | 1 |
 | `--delete-ckpt-after-loading` | Delete the model checkpoint after loading the model. | False |
 | `--enable-memory-saver` | Allow saving memory using release_memory_occupation and resume_memory_occupation. | False |
+| `--enable-weights-cpu-backup` | Save model weights to CPU memory during release_weights_occupation and resume_weights_occupation | False |
 | `--allow-auto-truncate` | Allow automatically truncating requests that exceed the maximum input length instead of returning an error. | False |
 | `--enable-custom-logit-processor` | Enable users to pass custom logit processors to the server (disabled by default for security). | False |
 | `--flashinfer-mla-disable-ragged` | Disable ragged processing in Flashinfer MLA. | False |
@@ -320,7 +322,6 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--debug-tensor-dump-output-folder` | The output folder for debug tensor dumps. | None |
 | `--debug-tensor-dump-input-file` | The input file for debug tensor dumps. | None |
 | `--debug-tensor-dump-inject` | Enable injection of debug tensor dumps. | False |
-| `--debug-tensor-dump-prefill-only` | Enable prefill-only mode for debug tensor dumps. | False |
 
 ## PD disaggregation
 

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import time
 from typing import TYPE_CHECKING, List
 
@@ -30,8 +29,7 @@ SIMULATE_ACC_LEN = envs.SGLANG_SIMULATE_ACC_LEN.get()  # turn off if < 0
 SIMULATE_ACC_METHOD = envs.SGLANG_SIMULATE_ACC_METHOD.get()
 
 TREE_TRAVERSE_TIME_THRESHOLD = 1  # TODO: set this properly
-
-TREE_SPEC_KERNEL_AVAILABLE = "tree_speculative_sampling_target_only" in globals()
+TREE_SPEC_KERNEL_AVAILABLE = is_cuda()  # This kernel is only available for CUDA now
 
 
 @triton.jit
@@ -437,7 +435,7 @@ def select_top_k_tokens(
     return input_ids, hidden_states, scores, tree_info
 
 
-def _generate_simulated_accept_index(
+def generate_simulated_accept_index(
     accept_index,
     predict,
     accept_length,

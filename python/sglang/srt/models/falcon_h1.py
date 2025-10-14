@@ -8,6 +8,10 @@ from torch import nn
 from sglang.srt.configs.falcon_h1 import FalconH1Config
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+    HybridLinearAttnBackend,
+    Mamba2AttnBackend,
+)
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
@@ -29,9 +33,9 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, is_cuda, make_layers
 
 logger = logging.getLogger(__name__)
@@ -184,18 +188,12 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
         )
 
         self.mamba = MambaMixer2(
+            cache_params=config.mamba2_cache_params,
             hidden_size=config.hidden_size,
-            ssm_state_size=config.mamba_d_state,
-            conv_kernel_size=config.mamba_d_conv,
-            intermediate_size=self.d_ssm,
             use_conv_bias=config.mamba_conv_bias,
             use_bias=config.mamba_proj_bias,
             n_groups=config.mamba_n_groups,
-            num_heads=config.mamba_n_heads,
-            layer_id=layer_id,
-            head_dim=config.mamba_d_head,
             rms_norm_eps=config.rms_norm_eps,
-            chunk_size=config.mamba_chunk_size,
             activation=config.hidden_act,
             use_rms_norm=config.mamba_rms_norm,
             prefix=f"{prefix}.mixer",
@@ -339,12 +337,16 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
             )
             attention_hidden_states = attention_hidden_states * self.attn_out_multiplier
 
+            attn_backend = forward_batch.attn_backend
+            assert isinstance(attn_backend, HybridLinearAttnBackend)
+            assert isinstance(attn_backend.linear_attn_backend, Mamba2AttnBackend)
             # Mamba block
             mamba_hidden_states = torch.empty_like(hidden_states)
-            self.mamba(
+            attn_backend.linear_attn_backend.forward(
+                self.mamba,
                 hidden_states * self.ssm_in_multiplier,
                 mamba_hidden_states,
-                forward_batch=forward_batch,
+                layer_id=self.layer_id,
                 mup_vector=self.mup_vector,
             )
             mamba_hidden_states = mamba_hidden_states * self.ssm_out_multiplier
@@ -481,7 +483,7 @@ class FalconH1ForCausalLM(nn.Module):
                 quant_config=quant_config,
                 org_num_embeddings=config.vocab_size,
                 prefix=add_prefix("lm_head", prefix),
-                use_attn_tp_group=global_server_args_dict["enable_dp_lm_head"],
+                use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
             )
         self.lm_head = self.lm_head.float()
         self.lm_head_multiplier = config.lm_head_multiplier
