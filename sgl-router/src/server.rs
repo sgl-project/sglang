@@ -12,10 +12,10 @@ use crate::{
     middleware::{self, AuthConfig, QueuedRequest, TokenBucket},
     policies::PolicyRegistry,
     protocols::{
-        ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest,
-        RerankRequest, ResponsesGetParams, ResponsesRequest, V1RerankReqInput,
         validated::ValidatedJson,
         worker_spec::{WorkerApiResponse, WorkerConfigRequest, WorkerErrorResponse},
+        ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest,
+        ResponsesGetParams, ResponsesRequest, V1RerankReqInput,
     },
     reasoning_parser::ParserFactory as ReasoningParserFactory,
     routers::{router_manager::RouterManager, RouterTrait},
