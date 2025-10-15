@@ -192,9 +192,6 @@ class EAGLEWorker(TpModelWorker):
 
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners
-
-        self.draft_extend_attn_backend = None
-
         draft_backend_factory = DraftBackendFactory(
             self.server_args,
             self.draft_model_runner,
