@@ -133,7 +133,16 @@ GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 
 DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton"]
 
-NSA_CHOICES = ["flashmla_sparse", "flashmla_kv", "fa3", "tilelang", "aiter"]
+DEFAULT_LORA_EVICTION_POLICY = "lru"
+
+NSA_CHOICES = [
+    "flashmla_sparse",
+    "flashmla_kv",
+    "flashmla_auto",
+    "fa3",
+    "tilelang",
+    "aiter",
+]
 
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu"]
 
@@ -1025,7 +1034,8 @@ class ServerArgs:
                     logger.warning("Setting KV cache dtype to fp8.")
 
                 if self.kv_cache_dtype == "fp8_e4m3":
-                    self.nsa_prefill_backend = "flashmla_kv"
+                    # flashmla_auto dispatches to flashmla_sparse/flashmla_kv based on hardware and heuristics
+                    self.nsa_prefill_backend = "flashmla_auto"
                     self.nsa_decode_backend = "flashmla_kv"
                     logger.warning(
                         "Setting NSA backend to flashmla_kv for FP8 KV Cache."
