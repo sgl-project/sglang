@@ -67,7 +67,11 @@ class OpenAIServingBase(ABC):
 
             self._label_and_observe_one_received_request(
                 raw_request,
-                adapted_request,
+                (
+                    adapted_request
+                    if isinstance(adapted_request, GenerateReqInput)
+                    else None
+                ),
                 http_status="200",
             )
 

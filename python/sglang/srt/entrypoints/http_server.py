@@ -603,11 +603,11 @@ async def encode_request(obj: EmbeddingReqInput, request: Request):
             obj, request
         ).__anext__()
 
-        _observe_request_metric(request, "200", obj.custom_labels)
+        _observe_request_metric(request, "200")
 
         return ret
     except ValueError as e:
-        _observe_request_metric(request, "400", obj.custom_labels)
+        _observe_request_metric(request, "400")
 
         return _create_error_response(e)
 
@@ -620,11 +620,11 @@ async def classify_request(obj: EmbeddingReqInput, request: Request):
             obj, request
         ).__anext__()
 
-        _observe_request_metric(request, "200", obj.custom_labels)
+        _observe_request_metric(request, "200")
 
         return ret
     except ValueError as e:
-        _observe_request_metric(request, "400", obj.custom_labels)
+        _observe_request_metric(request, "400")
 
         return _create_error_response(e)
 
@@ -1300,7 +1300,9 @@ def _observe_request_metric(
     http_status: str,
     custom_labels: Optional[Dict[str, str]] = None,
 ) -> None:
-    """Observe a received request metric with proper labels."""
+    """Observe a received request metric with proper labels.
+
+    `custom_labels` should be from the request's `GenerateReqInput.custom_labels`."""
     if not _global_state.tokenizer_manager.enable_metrics:
         return
 
