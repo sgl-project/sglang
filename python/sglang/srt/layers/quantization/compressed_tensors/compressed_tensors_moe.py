@@ -39,6 +39,7 @@ from sglang.srt.layers.quantization.utils import (
 )
 from sglang.srt.utils import (
     get_bool_env_var,
+    get_compiler_backend,
     is_cpu,
     is_cuda,
     is_hip,
@@ -72,6 +73,18 @@ except ImportError:
     VLLM_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
+
+
+def _mask_topk_ids_cpu_experts(topk_ids: torch.Tensor, num_gpu_experts: int):
+    """Mask topk_ids >= num_gpu_experts by setting them to -1."""
+    topk_ids[topk_ids >= num_gpu_experts] = -1
+
+
+@torch.compile(dynamic=True, backend=get_compiler_backend())
+def mask_cpu_expert_ids(topk_ids: torch.Tensor, num_gpu_experts: int):
+    """mask CPU expert IDs."""
+    _mask_topk_ids_cpu_experts(topk_ids, num_gpu_experts)
+    return topk_ids
 
 
 class GPTQMarlinState(Enum):
@@ -990,6 +1003,9 @@ class CompressedTensorsWNA16AMXEPMoEMethod(CompressedTensorsMoEMethod):
         if self.tp_rank == 0:
             self.AMX_method.submit(layer, dispatch_output)
 
+        # Mask CPU expert IDs (>= num_gpu_experts) as -1 so they won't be computed on GPU
+        topk_ids = mask_cpu_expert_ids(topk_ids, self.num_gpu_experts)
+
         # Execute GPU (Marlin) experts
         output = fused_marlin_moe(
             x,
@@ -1007,7 +1023,6 @@ class CompressedTensorsWNA16AMXEPMoEMethod(CompressedTensorsMoEMethod):
             num_bits=self.marlin_method.num_bits,
             is_k_full=self.marlin_method.is_k_full,
             global_num_experts=self.global_num_experts,
-            num_gpu_experts=self.num_gpu_experts,
         )
         return StandardCombineInput(hidden_states=output)
 
@@ -1039,6 +1054,10 @@ class CompressedTensorsWNA16AMXEPMoEMethod(CompressedTensorsMoEMethod):
             self.AMX_method.submit(layer, dispatch_output)
 
         # Step 2: Execute GPU (Marlin) experts in parallel with CPU
+
+        # Mask CPU expert IDs (>= num_gpu_experts) as -1 so they won't be computed on GPU
+        topk_ids = mask_cpu_expert_ids(topk_ids, self.num_gpu_experts)
+
         # While GPU computes, CPU is also computing
         output = fused_marlin_moe(
             x,
@@ -1056,7 +1075,6 @@ class CompressedTensorsWNA16AMXEPMoEMethod(CompressedTensorsMoEMethod):
             num_bits=self.marlin_method.num_bits,
             is_k_full=self.marlin_method.is_k_full,
             global_num_experts=self.global_num_experts,
-            num_gpu_experts=self.num_gpu_experts,
         )
 
         # Step 3: Sync AMX results and combine with GPU results

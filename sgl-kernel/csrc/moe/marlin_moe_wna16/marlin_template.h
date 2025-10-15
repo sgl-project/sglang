@@ -73,7 +73,6 @@ __global__ void Marlin(
     int top_k,                                               // num of experts per token
     bool mul_topk_weights,                                   // mul topk weights or not
     bool is_ep,                                              // expert parallelism
-    const int num_gpu_experts,                               // number of experts on this GPU
     int num_groups,                                          // number of scale groups per output channel
     int prob_m,                                              // batch dimension m
     int prob_n,                                              // output dimension n
@@ -440,7 +439,6 @@ __global__ void Marlin(
     int top_k,                                               // num of experts per token
     bool mul_topk_weights,                                   // mul topk weights or not
     bool is_ep,                                              // expert parallelism
-    const int num_gpu_experts,                               // number of experts on this GPU
     int num_groups,                                          // number of scale groups per output channel
     int prob_m,                                              // batch dimension m
     int prob_n,                                              // output dimension n
@@ -483,14 +481,6 @@ __global__ void Marlin(
   int num_tokens_past_padded = num_tokens_past_padded_ptr[0];
   int parallel = num_tokens_past_padded / moe_block_size;
   int num_valid_blocks = parallel;
-
-  for (int i = 0; i < parallel; i++) {
-    if (expert_ids_ptr[i] >= num_gpu_experts) {
-      num_valid_blocks = i;
-      break;
-    }
-  }
-
   if (is_ep) {
     for (int i = 0; i < parallel; i++) {
       if (expert_ids_ptr[i] == -1) num_valid_blocks--;
