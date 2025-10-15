@@ -839,6 +839,12 @@ async def update_weights_from_ipc(obj: UpdateWeightsFromIPCReqInput, request: Re
     success, message = await _global_state.tokenizer_manager.update_weights_from_ipc(
         obj, request
     )
+
+    # Update weight version if provided and weights update was successful
+    if success and obj.weight_version is not None:
+        _update_weight_version_if_provided(obj.weight_version)
+        message += f" Weight version updated to {obj.weight_version}."
+
     content = {"success": success, "message": message}
     if success:
         return ORJSONResponse(content)

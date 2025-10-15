@@ -1079,6 +1079,8 @@ class UpdateWeightsFromIPCReqInput(BaseReq):
     zmq_handles: Dict[str, str]
     # Whether to flush cache after weight update
     flush_cache: bool = True
+    # Optional: Update weight version along with weights
+    weight_version: Optional[str] = None
 
 
 @dataclass
