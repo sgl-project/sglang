@@ -59,6 +59,8 @@ class TestForwardSplitPrefill(CustomTestCase):
             tp_size=cls.tp_size,
             pp_rank=0,
             pp_size=1,
+            moe_ep_rank=0,
+            moe_ep_size=1,
             nccl_port=cls.port_args.nccl_port,
             server_args=cls.server_args,
         )
@@ -111,7 +113,6 @@ class TestForwardSplitPrefill(CustomTestCase):
             model_config=self.model_config,
             enable_overlap=False,
             spec_algorithm=SpeculativeAlgorithm.NONE,
-            enable_custom_logit_processor=False,
         )
         if is_split_prefill:
             batch.prepare_for_split_prefill()
