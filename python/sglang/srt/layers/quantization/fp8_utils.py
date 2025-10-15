@@ -2,11 +2,10 @@ from typing import Callable, List, Optional, Tuple
 
 import torch
 
-from sglang.srt import offloader
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
-from sglang.srt.utils import is_sm100_supported
+from sglang.srt.utils import is_sm100_supported, offloader
 
 try:
     from vllm import _custom_ops as ops
@@ -29,7 +28,6 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 )
 from sglang.srt.utils import (
     align,
-    ceil_div,
     get_bool_env_var,
     get_cuda_version,
     get_device_capability,

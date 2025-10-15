@@ -1,11 +1,11 @@
 use thiserror::Error;
 
 /// Result type for tool parser operations
-pub type ToolParserResult<T> = Result<T, ToolParserError>;
+pub type ParserResult<T> = Result<T, ParserError>;
 
 /// Errors that can occur during tool parsing
 #[derive(Debug, Error)]
-pub enum ToolParserError {
+pub enum ParserError {
     #[error("Parsing failed: {0}")]
     ParsingFailed(String),
 
