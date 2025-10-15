@@ -30,6 +30,7 @@ from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqOutput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
+    ExpertDistributionReqType,
     FlushCacheReqInput,
     FlushCacheReqOutput,
     GetInternalStateReq,
@@ -44,7 +45,7 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqOutput,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
-    LoRAUpdateResult,
+    LoRAUpdateOutput,
     MultiTokenizerWrapper,
     OpenSessionReqInput,
     ProfileReq,
@@ -276,7 +277,7 @@ class TokenizerCommunicatorMixin:
                     self.expert_distribution_communicator.handle_recv,
                 ),
                 (
-                    LoRAUpdateResult,
+                    LoRAUpdateOutput,
                     self.update_lora_adapter_communicator.handle_recv,
                 ),
                 (
@@ -305,6 +306,7 @@ class TokenizerCommunicatorMixin:
         with_stack: Optional[bool] = None,
         record_shapes: Optional[bool] = None,
         profile_by_stage: bool = False,
+        merge_profiles: bool = False,
     ):
         self.auto_create_handle_loop()
         env_with_stack: bool = get_bool_env_var("SGLANG_PROFILE_WITH_STACK", "true")
@@ -319,6 +321,7 @@ class TokenizerCommunicatorMixin:
             record_shapes=record_shapes,
             profile_by_stage=profile_by_stage,
             profile_id=str(time.time()),
+            merge_profiles=merge_profiles,
         )
         return await self._execute_profile(req)
 
@@ -335,15 +338,18 @@ class TokenizerCommunicatorMixin:
 
     async def start_expert_distribution_record(self: TokenizerManager):
         self.auto_create_handle_loop()
-        await self.expert_distribution_communicator(ExpertDistributionReq.START_RECORD)
+        req = ExpertDistributionReq(action=ExpertDistributionReqType.START_RECORD)
+        await self.expert_distribution_communicator(req)
 
     async def stop_expert_distribution_record(self: TokenizerManager):
         self.auto_create_handle_loop()
-        await self.expert_distribution_communicator(ExpertDistributionReq.STOP_RECORD)
+        req = ExpertDistributionReq(action=ExpertDistributionReqType.STOP_RECORD)
+        await self.expert_distribution_communicator(req)
 
     async def dump_expert_distribution_record(self: TokenizerManager):
         self.auto_create_handle_loop()
-        await self.expert_distribution_communicator(ExpertDistributionReq.DUMP_RECORD)
+        req = ExpertDistributionReq(action=ExpertDistributionReqType.DUMP_RECORD)
+        await self.expert_distribution_communicator(req)
 
     async def init_weights_update_group(
         self: TokenizerManager,

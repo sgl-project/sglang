@@ -1,11 +1,14 @@
 ARG CUDA_VERSION=12.9.1
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04 AS base
+ARG TARGETARCH
 
 ARG BUILD_TYPE=all
 ARG BRANCH_TYPE=remote
 ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
+ARG FLASHMLA_COMMIT=1408756a88e52a25196b759eaf8db89d2b51b5a1
+ARG FAST_HADAMARD_TRANSFORM_COMMIT=7fd811c2b47f63b0b08d2582619f939e14dad77c
 ARG CMAKE_BUILD_PARALLEL_LEVEL=2
-ARG SGL_KERNEL_VERSION=0.3.12
+ARG SGL_KERNEL_VERSION=0.3.15
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
     GDRCOPY_HOME=/usr/src/gdrdrv-2.4.4/ \
@@ -109,7 +112,7 @@ RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.3.9/sour
 
 # Build and install NVSHMEM
 RUN cd /sgl-workspace/nvshmem && \
-    export CUDA_ARCH="90;100;120" && \
+    if [ "$BUILD_TYPE" = "blackwell" ] || [ "$BUILD_TYPE" = "blackwell_aarch" ]; then CUDA_ARCH="90;100;120"; else CUDA_ARCH="90"; fi && \
     NVSHMEM_SHMEM_SUPPORT=0 \
     NVSHMEM_UCX_SUPPORT=0 \
     NVSHMEM_USE_NCCL=0 \
@@ -136,6 +139,25 @@ RUN cd /sgl-workspace/DeepEP && \
     esac && \
     NVSHMEM_DIR=${NVSHMEM_DIR} TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" pip install .
 
+# Install flashmla
+RUN if [ "$TARGETARCH" = "amd64" ]; then \
+      git clone https://github.com/deepseek-ai/FlashMLA.git flash-mla && \
+      cd flash-mla && \
+      git checkout ${FLASHMLA_COMMIT} && \
+      git submodule update --init --recursive && \
+      if [ "$CUDA_VERSION" = "12.6.1" ]; then \
+        export FLASH_MLA_DISABLE_SM100=1; \
+      fi && \
+      pip install -v . ; \
+    fi
+
+# Install fast-hadamard-transform
+RUN if [ "$TARGETARCH" = "amd64" ]; then \
+      git clone https://github.com/Dao-AILab/fast-hadamard-transform && \
+      cd fast-hadamard-transform && \
+      git checkout ${FAST_HADAMARD_TRANSFORM_COMMIT} && \
+      pip install . ; \
+    fi
 
 # Python tools
 RUN python3 -m pip install --no-cache-dir \

@@ -332,29 +332,20 @@ class SchedulerDisaggregationPrefillMixin:
             if require_mlp_sync(self.server_args):
                 batch = self.prepare_mlp_sync_batch(batch)
             self.cur_batch = batch
-            if batch:
-                result = self.run_batch(batch)
-                self.result_queue.append((batch.copy(), result))
 
-                if self.last_batch is None:
-                    # Create a dummy first batch to start the pipeline for overlap schedule.
-                    # It is now used for triggering the sampling_info_done event.
-                    tmp_batch = ScheduleBatch(
-                        reqs=None,
-                        forward_mode=ForwardMode.DUMMY_FIRST,
-                        next_batch_sampling_info=self.tp_worker.cur_sampling_info,
-                    )
-                    self.set_next_batch_sampling_info_done(tmp_batch)
+            batch_result = None
+            if batch:
+                batch_result = self.run_batch(batch)
+                self.result_queue.append((batch.copy(), batch_result))
 
             if self.last_batch:
                 tmp_batch, tmp_result = self.result_queue.popleft()
-                tmp_batch.next_batch_sampling_info = (
-                    self.tp_worker.cur_sampling_info if batch else None
-                )
                 self.process_batch_result_disagg_prefill(tmp_batch, tmp_result)
 
             if len(self.disagg_prefill_inflight_queue) > 0:
                 self.process_disagg_prefill_inflight_queue()
+
+            self.launch_batch_sample_if_needed(batch_result)
 
             if batch is None and len(self.disagg_prefill_inflight_queue) == 0:
                 self.self_check_during_idle()
@@ -368,7 +359,6 @@ class SchedulerDisaggregationPrefillMixin:
         self: Scheduler,
         batch: ScheduleBatch,
         result: GenerationBatchResult,
-        launch_done: Optional[threading.Event] = None,
     ) -> None:
         """
         Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
@@ -379,31 +369,30 @@ class SchedulerDisaggregationPrefillMixin:
             next_token_ids,
             extend_input_len_per_req,
             extend_logprob_start_len_per_req,
+            copy_done,
         ) = (
             result.logits_output,
             result.next_token_ids,
             result.extend_input_len_per_req,
             result.extend_logprob_start_len_per_req,
+            result.copy_done,
         )
+
+        if copy_done is not None:
+            copy_done.synchronize()
 
         logprob_pt = 0
         # Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
-        if self.enable_overlap:
-            # wait
-            logits_output, next_token_ids, _ = self.tp_worker.resolve_last_batch_result(
-                launch_done
-            )
-        else:
-            next_token_ids = result.next_token_ids.tolist()
-            if batch.return_logprob:
-                if logits_output.next_token_logprobs is not None:
-                    logits_output.next_token_logprobs = (
-                        logits_output.next_token_logprobs.tolist()
-                    )
-                if logits_output.input_token_logprobs is not None:
-                    logits_output.input_token_logprobs = tuple(
-                        logits_output.input_token_logprobs.tolist()
-                    )
+        next_token_ids = result.next_token_ids.tolist()
+        if batch.return_logprob:
+            if logits_output.next_token_logprobs is not None:
+                logits_output.next_token_logprobs = (
+                    logits_output.next_token_logprobs.tolist()
+                )
+            if logits_output.input_token_logprobs is not None:
+                logits_output.input_token_logprobs = tuple(
+                    logits_output.input_token_logprobs.tolist()
+                )
 
         hidden_state_offset = 0
         for i, (req, next_token_id) in enumerate(
@@ -491,8 +480,6 @@ class SchedulerDisaggregationPrefillMixin:
                 if self.enable_overlap:
                     self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
 
-        # We need to remove the sync in the following function for overlap schedule.
-        self.set_next_batch_sampling_info_done(batch)
         self.maybe_send_health_check_signal()
 
     def process_disagg_prefill_inflight_queue(
@@ -689,7 +676,6 @@ class SchedulerDisaggregationPrefillMixin:
         self.running_mbs = [
             ScheduleBatch(reqs=[], batch_is_full=False) for _ in range(self.pp_size)
         ]
-        bids = [None] * self.pp_size
         pp_outputs: Optional[PPProxyTensors] = None
 
         # Either success or failed
@@ -761,10 +747,7 @@ class SchedulerDisaggregationPrefillMixin:
                 # send the outputs to the next step
                 if self.pp_group.is_last_rank:
                     if self.cur_batch:
-                        next_token_ids, bids[mb_id] = (
-                            result.next_token_ids,
-                            result.bid,
-                        )
+                        next_token_ids = result.next_token_ids
                         pp_outputs = PPProxyTensors(
                             {
                                 "next_token_ids": next_token_ids,
@@ -801,7 +784,6 @@ class SchedulerDisaggregationPrefillMixin:
                         next_token_ids=next_pp_outputs["next_token_ids"],
                         extend_input_len_per_req=None,
                         extend_logprob_start_len_per_req=None,
-                        bid=bids[next_mb_id],
                         can_run_cuda_graph=result.can_run_cuda_graph,
                     )
                     self.process_batch_result_disagg_prefill(
@@ -818,8 +800,6 @@ class SchedulerDisaggregationPrefillMixin:
 
                 # carry the outputs to the next stage
                 if not self.pp_group.is_last_rank:
-                    if self.cur_batch:
-                        bids[mb_id] = result.bid
                     if pp_outputs:
                         # send the outputs from the last round to let the next stage worker run post processing
                         self.pp_group.send_tensor_dict(
@@ -838,8 +818,10 @@ class SchedulerDisaggregationPrefillMixin:
 
                     # send out proxy tensors to the next stage
                     if self.cur_batch:
+                        # FIXME(lsyin): remove this assert
+                        assert result.pp_hidden_states_proxy_tensors.tensors is not None
                         self.pp_group.send_tensor_dict(
-                            result.pp_hidden_states_proxy_tensors,
+                            result.pp_hidden_states_proxy_tensors.tensors,
                             all_gather_group=self.attn_tp_group,
                         )
 

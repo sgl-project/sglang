@@ -11,6 +11,7 @@ use crate::core::{
     BasicWorkerBuilder, CircuitBreakerConfig, ConnectionMode, DPAwareWorkerBuilder, HealthConfig,
     Worker, WorkerFactory, WorkerRegistry, WorkerType,
 };
+use crate::grpc_client::SglangSchedulerClient;
 use crate::policies::PolicyRegistry;
 use crate::protocols::worker_spec::{
     FlushCacheResult, WorkerConfigRequest, WorkerLoadInfo, WorkerLoadsResult,
@@ -21,6 +22,7 @@ use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{watch, Mutex};
@@ -53,6 +55,21 @@ pub struct ServerInfo {
 pub struct DpInfo {
     pub dp_size: usize,
     pub model_id: String,
+}
+
+/// Worker discovery results gathered from backend endpoints
+struct WorkerDiscovery {
+    labels: HashMap<String, String>,
+    grpc_client: Option<SglangSchedulerClient>,
+}
+
+impl WorkerDiscovery {
+    fn new() -> Self {
+        Self {
+            labels: HashMap::new(),
+            grpc_client: None,
+        }
+    }
 }
 
 /// Unified worker management
@@ -318,7 +335,8 @@ impl WorkerManager {
                     None,
                     circuit_breaker_config.clone(),
                     health_config.clone(),
-                );
+                )
+                .await;
                 Self::register_worker(worker, registry, &mut registered_workers, policy_registry);
             }
         }
@@ -363,7 +381,8 @@ impl WorkerManager {
                 None,
                 circuit_breaker_config.clone(),
                 health_config.clone(),
-            );
+            )
+            .await;
             Self::register_worker(worker, registry, &mut registered_workers, policy_registry);
         }
 
@@ -408,7 +427,8 @@ impl WorkerManager {
                 None,
                 circuit_breaker_config.clone(),
                 health_config.clone(),
-            );
+            )
+            .await;
             Self::register_worker(worker, registry, &mut registered_workers, policy_registry);
         }
 
@@ -448,7 +468,8 @@ impl WorkerManager {
                 None,
                 circuit_breaker_config.clone(),
                 health_config.clone(),
-            );
+            )
+            .await;
             Self::register_worker(worker, registry, &mut registered_workers, policy_registry);
             info!(
                 "Registered gRPC worker at {} (will connect on first use)",
@@ -497,7 +518,8 @@ impl WorkerManager {
                 None,
                 circuit_breaker_config.clone(),
                 health_config.clone(),
-            );
+            )
+            .await;
             Self::register_worker(
                 worker,
                 registry,
@@ -522,7 +544,8 @@ impl WorkerManager {
                 None,
                 circuit_breaker_config.clone(),
                 health_config.clone(),
-            );
+            )
+            .await;
             Self::register_worker(
                 worker,
                 registry,
@@ -551,32 +574,21 @@ impl WorkerManager {
     }
 
     /// Add a worker from a configuration request
+    ///
+    /// Registers worker immediately with healthy=false, returns worker for async validation
     pub async fn add_worker_from_config(
         config: &WorkerConfigRequest,
         context: &AppContext,
-    ) -> Result<String, String> {
+    ) -> Result<Arc<dyn Worker>, String> {
+        // Check if worker already exists
+        if context.worker_registry.get_by_url(&config.url).is_some() {
+            return Err(format!("Worker {} already exists", config.url));
+        }
         let mut labels = config.labels.clone();
 
-        let model_id = if let Some(ref model_id) = config.model_id {
-            model_id.clone()
-        } else {
-            match Self::get_server_info(&config.url, config.api_key.as_deref()).await {
-                Ok(info) => info
-                    .model_id
-                    .or_else(|| {
-                        info.model_path
-                            .as_ref()
-                            .and_then(|path| path.split('/').next_back().map(|s| s.to_string()))
-                    })
-                    .unwrap_or_else(|| "unknown".to_string()),
-                Err(e) => {
-                    warn!("Failed to query server info from {}: {}", config.url, e);
-                    "unknown".to_string()
-                }
-            }
-        };
-
-        labels.insert("model_id".to_string(), model_id.clone());
+        if let Some(model_id) = &config.model_id {
+            labels.insert("model_id".to_string(), model_id.clone());
+        }
         if let Some(priority) = config.priority {
             labels.insert("priority".to_string(), priority.to_string());
         }
@@ -614,18 +626,56 @@ impl WorkerManager {
             ConnectionMode::Http
         };
 
-        let policy_hint = labels.get("policy").cloned();
+        let circuit_breaker_config = Self::convert_circuit_breaker_config(
+            &context.router_config.effective_circuit_breaker_config(),
+        );
+        let health_config = Self::convert_health_config(&context.router_config.health_check);
 
-        Self::add_worker_internal(
-            &config.url,
+        // Create and register worker (starts with healthy=false)
+        let worker = Self::create_basic_worker(
+            config.url.clone(),
             worker_type,
             connection_mode,
             config.api_key.clone(),
-            Some(labels),
-            policy_hint.as_deref(),
-            context,
+            Some(labels.clone()),
+            circuit_breaker_config,
+            health_config,
         )
-        .await
+        .await;
+
+        worker.set_healthy(false);
+        context.worker_registry.register(worker.clone());
+
+        let policy_hint = labels.get("policy").map(|s| s.as_str());
+        let model_id = worker.model_id().to_string();
+        context
+            .policy_registry
+            .on_worker_added(&model_id, policy_hint);
+
+        info!("Registered worker {} (initializing)", config.url);
+
+        // Return worker for async validation
+        Ok(worker)
+    }
+
+    /// Validate and activate a worker (for async validation after registration)
+    pub async fn validate_and_activate_worker(
+        worker: &Arc<dyn Worker>,
+        context: &AppContext,
+    ) -> Result<String, String> {
+        let url = worker.url();
+
+        // Perform health validation
+        WorkerFactory::validate_health(url, context.router_config.worker_startup_timeout_secs)
+            .await
+            .map_err(|e| format!("Health check failed for {}: {}", url, e))?;
+
+        // Mark as healthy
+        worker.set_healthy(true);
+
+        info!("Worker {} validated and activated", url);
+
+        Ok(format!("Worker {} is now healthy", url))
     }
 
     /// Add a worker from URL (legacy endpoint)
@@ -765,7 +815,8 @@ impl WorkerManager {
                 labels,
                 circuit_breaker_config,
                 health_config,
-            );
+            )
+            .await;
 
             let model_id = worker.model_id().to_string();
             context.worker_registry.register(worker.clone());
@@ -865,7 +916,7 @@ impl WorkerManager {
     }
 
     /// Create a basic worker
-    fn create_basic_worker(
+    async fn create_basic_worker(
         url: String,
         worker_type: WorkerType,
         connection_mode: ConnectionMode,
@@ -874,6 +925,16 @@ impl WorkerManager {
         circuit_breaker_config: CircuitBreakerConfig,
         health_config: HealthConfig,
     ) -> Arc<dyn Worker> {
+        let discovery =
+            Self::discover_worker_metadata(&url, &connection_mode, api_key.as_deref()).await;
+
+        let mut final_labels = discovery.labels;
+        if let Some(custom_labels) = labels {
+            for (key, value) in custom_labels {
+                final_labels.insert(key, value);
+            }
+        }
+
         let mut builder = BasicWorkerBuilder::new(url)
             .worker_type(worker_type)
             .connection_mode(connection_mode)
@@ -884,8 +945,12 @@ impl WorkerManager {
             builder = builder.api_key(key);
         }
 
-        if let Some(worker_labels) = labels {
-            builder = builder.labels(worker_labels);
+        if !final_labels.is_empty() {
+            builder = builder.labels(final_labels);
+        }
+
+        if let Some(client) = discovery.grpc_client {
+            builder = builder.grpc_client(client);
         }
 
         let worker = builder.build();
@@ -953,114 +1018,406 @@ impl WorkerManager {
             return Ok(());
         }
 
+        // Mark all workers as unhealthy initially
         info!(
-            "Marking {} workers as unhealthy before initial health checks",
+            "Marking {} workers as unhealthy before health checks",
             workers.len()
         );
         for worker in &workers {
             worker.set_healthy(false);
         }
 
-        info!(
-            "Performing initial health checks for {} workers",
-            workers.len()
-        );
-        let health_check_futures: Vec<_> = workers
-            .iter()
-            .map(|worker| {
-                let w = worker.clone();
-                let url = worker.url().to_string();
-                async move {
-                    match w.check_health_async().await {
-                        Ok(_) => {
-                            w.set_healthy(true);
-                            debug!(
-                                "Worker {} passed initial health check and marked healthy",
-                                url
-                            );
-                            Ok(url)
-                        }
-                        Err(e) => {
-                            warn!("Worker {} failed initial health check: {}", url, e);
-                            Err(url)
-                        }
-                    }
-                }
-            })
-            .collect();
-
-        let health_results = future::join_all(health_check_futures).await;
-        let failed_checks: Vec<_> = health_results.into_iter().filter_map(|r| r.err()).collect();
-
-        if !failed_checks.is_empty() {
-            info!(
-                "Initial health check: {} workers failed: {:?}",
-                failed_checks.len(),
-                failed_checks
-            );
-        }
-
         loop {
+            // 1. Filter unhealthy workers
             let workers = registry.get_all();
-            let healthy_workers: Vec<_> = workers
-                .iter()
-                .filter(|w| w.is_healthy())
-                .map(|w| w.url().to_string())
-                .collect();
             let unhealthy_workers: Vec<_> = workers
                 .iter()
                 .filter(|w| !w.is_healthy())
-                .map(|w| w.url().to_string())
+                .cloned()
                 .collect();
 
+            // 2. If all workers are healthy, return immediately
             if unhealthy_workers.is_empty() {
+                let healthy_urls: Vec<_> = workers.iter().map(|w| w.url().to_string()).collect();
                 info!(
                     "All {} workers are healthy: {:?}",
                     workers.len(),
-                    healthy_workers
+                    healthy_urls
                 );
                 return Ok(());
             }
 
+            // Check timeout
             if start_time.elapsed() > timeout {
+                let healthy_workers: Vec<_> = workers
+                    .iter()
+                    .filter(|w| w.is_healthy())
+                    .map(|w| w.url().to_string())
+                    .collect();
+                let unhealthy_urls: Vec<_> = unhealthy_workers
+                    .iter()
+                    .map(|w| w.url().to_string())
+                    .collect();
+
                 error!(
                     "Workers failed to become healthy after {}s. Unhealthy: {:?}, Healthy: {:?}",
-                    timeout_secs, unhealthy_workers, healthy_workers
+                    timeout_secs, unhealthy_urls, healthy_workers
                 );
                 return Err(format!(
                     "Workers failed to become healthy after {}s. Unhealthy: {:?}",
-                    timeout_secs, unhealthy_workers
+                    timeout_secs, unhealthy_urls
                 ));
             }
+
+            let unhealthy_urls: Vec<_> = unhealthy_workers
+                .iter()
+                .map(|w| w.url().to_string())
+                .collect();
 
             info!(
                 "Waiting for {} workers to become healthy. Unhealthy: {:?}",
                 unhealthy_workers.len(),
-                unhealthy_workers
+                unhealthy_urls
             );
 
-            let unhealthy_workers_to_check = workers
+            // 3. Check health of all unhealthy workers in parallel
+            let health_check_futures: Vec<_> = unhealthy_workers
                 .iter()
-                .filter(|w| !w.is_healthy())
-                .cloned()
-                .collect::<Vec<_>>();
-
-            for worker in unhealthy_workers_to_check {
-                let url = worker.url().to_string();
-                match worker.check_health_async().await {
-                    Ok(_) => {
-                        if !worker.is_healthy() {
-                            worker.set_healthy(true);
-                            debug!("Worker {} now healthy after health check", url);
+                .map(|worker| {
+                    let w = worker.clone();
+                    let url = worker.url().to_string();
+                    async move {
+                        match w.check_health_async().await {
+                            Ok(_) => {
+                                w.set_healthy(true);
+                                debug!("Worker {} now healthy", url);
+                            }
+                            Err(e) => {
+                                debug!("Worker {} health check failed: {}", url, e);
+                            }
                         }
                     }
-                    Err(e) => {
-                        debug!("Worker {} health check failed: {}", url, e);
-                    }
-                }
+                })
+                .collect();
+
+            future::join_all(health_check_futures).await;
+
+            // 4. Check if all workers are now healthy after health checks
+            let still_unhealthy: Vec<_> = workers.iter().filter(|w| !w.is_healthy()).collect();
+
+            // 5. If all workers are now healthy, return immediately without sleeping
+            if still_unhealthy.is_empty() {
+                let healthy_urls: Vec<_> = workers.iter().map(|w| w.url().to_string()).collect();
+                info!(
+                    "All {} workers are healthy: {:?}",
+                    workers.len(),
+                    healthy_urls
+                );
+                return Ok(());
             }
 
+            // 6. Otherwise, sleep before next iteration
             tokio::time::sleep(check_interval).await;
+        }
+    }
+
+    /// Gather worker metadata directly from the backend before registration.
+    async fn discover_worker_metadata(
+        url: &str,
+        connection_mode: &ConnectionMode,
+        api_key: Option<&str>,
+    ) -> WorkerDiscovery {
+        match connection_mode {
+            ConnectionMode::Http => Self::discover_http_metadata(url, api_key).await,
+            ConnectionMode::Grpc { .. } => Self::discover_grpc_metadata(url).await,
+        }
+    }
+
+    async fn discover_http_metadata(url: &str, api_key: Option<&str>) -> WorkerDiscovery {
+        let mut discovery = WorkerDiscovery::new();
+
+        match Self::get_model_info(url, api_key).await {
+            Ok(model_info) => {
+                if let Some(model_path) = model_info.get("model_path").and_then(|v| v.as_str()) {
+                    if !model_path.is_empty() {
+                        discovery
+                            .labels
+                            .insert("model_path".to_string(), model_path.to_string());
+                    }
+                }
+                if let Some(tokenizer_path) =
+                    model_info.get("tokenizer_path").and_then(|v| v.as_str())
+                {
+                    if !tokenizer_path.is_empty() {
+                        discovery
+                            .labels
+                            .insert("tokenizer_path".to_string(), tokenizer_path.to_string());
+                    }
+                }
+                if let Some(served_model_name) =
+                    model_info.get("served_model_name").and_then(|v| v.as_str())
+                {
+                    if !served_model_name.is_empty() {
+                        discovery.labels.insert(
+                            "served_model_name".to_string(),
+                            served_model_name.to_string(),
+                        );
+                    }
+                }
+                if let Some(weight_version) =
+                    model_info.get("weight_version").and_then(|v| v.as_str())
+                {
+                    if !weight_version.is_empty() {
+                        discovery
+                            .labels
+                            .insert("weight_version".to_string(), weight_version.to_string());
+                    }
+                }
+                if let Some(model_type) = model_info.get("model_type").and_then(|v| v.as_str()) {
+                    if !model_type.is_empty() {
+                        discovery
+                            .labels
+                            .insert("model_type".to_string(), model_type.to_string());
+                    }
+                }
+                if let Some(is_generation) =
+                    model_info.get("is_generation").and_then(|v| v.as_bool())
+                {
+                    discovery
+                        .labels
+                        .insert("is_generation".to_string(), is_generation.to_string());
+                }
+                if let Some(preferred_sampling_params) = model_info
+                    .get("preferred_sampling_params")
+                    .and_then(|v| v.as_str())
+                {
+                    if !preferred_sampling_params.is_empty() {
+                        discovery.labels.insert(
+                            "preferred_sampling_params".to_string(),
+                            preferred_sampling_params.to_string(),
+                        );
+                    }
+                }
+                if let Some(max_context_length) = model_info
+                    .get("max_context_length")
+                    .and_then(|v| v.as_i64())
+                {
+                    discovery.labels.insert(
+                        "max_context_length".to_string(),
+                        max_context_length.to_string(),
+                    );
+                }
+                if let Some(max_req_input_len) =
+                    model_info.get("max_req_input_len").and_then(|v| v.as_i64())
+                {
+                    discovery.labels.insert(
+                        "max_req_input_len".to_string(),
+                        max_req_input_len.to_string(),
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "Worker discovery: failed to fetch HTTP model info from {}: {}",
+                    url, e
+                );
+            }
+        }
+
+        match Self::get_server_info(url, api_key).await {
+            Ok(server_info) => {
+                if let Some(model_id) = server_info.model_id {
+                    if !model_id.is_empty() {
+                        let normalized = Self::normalize_model_identifier(&model_id);
+                        discovery.labels.insert("model_id".to_string(), normalized);
+                    }
+                }
+                if let Some(model_path) = server_info.model_path {
+                    if !model_path.is_empty() {
+                        discovery
+                            .labels
+                            .insert("model_path".to_string(), model_path);
+                    }
+                }
+                if let Some(version) = server_info.version {
+                    if !version.is_empty() {
+                        discovery
+                            .labels
+                            .insert("server_version".to_string(), version);
+                    }
+                }
+                if let Some(max_total_tokens) = server_info.max_total_tokens {
+                    discovery
+                        .labels
+                        .insert("max_total_tokens".to_string(), max_total_tokens.to_string());
+                }
+                if let Some(max_prefill_tokens) = server_info.max_prefill_tokens {
+                    discovery.labels.insert(
+                        "max_prefill_tokens".to_string(),
+                        max_prefill_tokens.to_string(),
+                    );
+                }
+                if let Some(max_running_requests) = server_info.max_running_requests {
+                    discovery.labels.insert(
+                        "max_running_requests".to_string(),
+                        max_running_requests.to_string(),
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "Worker discovery: failed to fetch HTTP server info from {}: {}",
+                    url, e
+                );
+            }
+        }
+
+        Self::finalize_model_id(&mut discovery.labels);
+
+        discovery
+    }
+
+    async fn discover_grpc_metadata(url: &str) -> WorkerDiscovery {
+        let mut discovery = WorkerDiscovery::new();
+
+        let client = match SglangSchedulerClient::connect(url).await {
+            Ok(client) => client,
+            Err(e) => {
+                warn!(
+                    "Worker discovery: failed to connect to gRPC worker {}: {}",
+                    url, e
+                );
+                return discovery;
+            }
+        };
+
+        match client.get_model_info().await {
+            Ok(model_info) => {
+                if !model_info.model_path.is_empty() {
+                    discovery
+                        .labels
+                        .insert("model_path".to_string(), model_info.model_path.clone());
+                }
+                if !model_info.tokenizer_path.is_empty() {
+                    discovery.labels.insert(
+                        "tokenizer_path".to_string(),
+                        model_info.tokenizer_path.clone(),
+                    );
+                }
+                if !model_info.served_model_name.is_empty() {
+                    discovery.labels.insert(
+                        "served_model_name".to_string(),
+                        model_info.served_model_name.clone(),
+                    );
+                    let normalized =
+                        Self::normalize_model_identifier(&model_info.served_model_name);
+                    discovery.labels.insert("model_id".to_string(), normalized);
+                }
+                if !model_info.weight_version.is_empty() {
+                    discovery.labels.insert(
+                        "weight_version".to_string(),
+                        model_info.weight_version.clone(),
+                    );
+                }
+                if !model_info.model_type.is_empty() {
+                    discovery
+                        .labels
+                        .insert("model_type".to_string(), model_info.model_type.clone());
+                }
+                if !model_info.preferred_sampling_params.is_empty() {
+                    discovery.labels.insert(
+                        "preferred_sampling_params".to_string(),
+                        model_info.preferred_sampling_params.clone(),
+                    );
+                }
+                discovery.labels.insert(
+                    "is_generation".to_string(),
+                    model_info.is_generation.to_string(),
+                );
+                if model_info.max_context_length > 0 {
+                    discovery.labels.insert(
+                        "max_context_length".to_string(),
+                        model_info.max_context_length.to_string(),
+                    );
+                }
+                if model_info.max_req_input_len > 0 {
+                    discovery.labels.insert(
+                        "max_req_input_len".to_string(),
+                        model_info.max_req_input_len.to_string(),
+                    );
+                }
+                if model_info.vocab_size > 0 {
+                    discovery
+                        .labels
+                        .insert("vocab_size".to_string(), model_info.vocab_size.to_string());
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "Worker discovery: failed to fetch gRPC model info from {}: {}",
+                    url, e
+                );
+            }
+        }
+
+        if !discovery.labels.contains_key("model_id") {
+            Self::finalize_model_id(&mut discovery.labels);
+        }
+
+        discovery.grpc_client = Some(client);
+        discovery
+    }
+
+    fn normalize_model_identifier(value: &str) -> String {
+        let trimmed = value.trim();
+        if trimmed.contains('/') || trimmed.contains('\\') {
+            Self::derive_model_id_from_path(trimmed)
+        } else {
+            trimmed.to_string()
+        }
+    }
+
+    fn finalize_model_id(labels: &mut HashMap<String, String>) {
+        let has_model_id = labels
+            .get("model_id")
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false);
+        if has_model_id {
+            return;
+        }
+
+        if let Some(served_name) = labels.get("served_model_name").cloned() {
+            if !served_name.trim().is_empty() {
+                let normalized = Self::normalize_model_identifier(&served_name);
+                labels.insert("model_id".to_string(), normalized);
+                return;
+            }
+        }
+
+        if let Some(model_path) = labels.get("model_path").cloned() {
+            if !model_path.trim().is_empty() {
+                let derived = Self::derive_model_id_from_path(&model_path);
+                if !derived.is_empty() {
+                    labels.insert("model_id".to_string(), derived);
+                }
+            }
+        }
+    }
+
+    fn derive_model_id_from_path(path: &str) -> String {
+        let trimmed = path.trim_end_matches(['/', '\\']);
+        if trimmed.is_empty() {
+            return path.to_string();
+        }
+
+        let candidate = Path::new(trimmed)
+            .file_name()
+            .and_then(|p| p.to_str())
+            .map(|s| s.to_string());
+
+        match candidate {
+            Some(name) if !name.is_empty() => name,
+            _ => trimmed.to_string(),
         }
     }
 
@@ -1188,7 +1545,7 @@ impl WorkerManager {
             });
         }
 
-        let results = futures::future::join_all(tasks).await;
+        let results = future::join_all(tasks).await;
 
         let mut successful = Vec::new();
         let mut failed = Vec::new();
@@ -1252,11 +1609,22 @@ impl WorkerManager {
             Ok(response) if response.status().is_success() => {
                 match response.json::<Value>().await {
                     Ok(json) => {
-                        if let Some(load) = json.get("load").and_then(|v| v.as_i64()) {
-                            debug!("Worker {} load: {}", url, load);
-                            Some(load as isize)
+                        // The /get_load endpoint returns an array of load info objects (one per DP rank)
+                        // Each object has: {dp_rank, num_reqs, num_waiting_reqs, num_tokens}
+                        if let Some(array) = json.as_array() {
+                            let total_tokens: i64 = array
+                                .iter()
+                                .filter_map(|entry| {
+                                    entry.get("num_tokens").and_then(|v| v.as_i64())
+                                })
+                                .sum();
+                            debug!("Worker {} load (total tokens): {}", url, total_tokens);
+                            Some(total_tokens as isize)
                         } else {
-                            warn!("Invalid load response from {}: {:?}", url, json);
+                            warn!(
+                                "Invalid load response from {}: expected array, got {:?}",
+                                url, json
+                            );
                             None
                         }
                     }
@@ -1318,7 +1686,7 @@ impl WorkerManager {
             });
         }
 
-        let loads = futures::future::join_all(tasks).await;
+        let loads = future::join_all(tasks).await;
 
         let successful = loads.iter().filter(|l| l.load >= 0).count();
         let failed = loads.iter().filter(|l| l.load < 0).count();
@@ -1468,6 +1836,7 @@ impl Drop for LoadMonitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn test_parse_server_info() {
@@ -1501,5 +1870,50 @@ mod tests {
         let info = WorkerManager::parse_server_info(json).unwrap();
         assert_eq!(info.model_id, None);
         assert_eq!(info.dp_size, None);
+    }
+
+    #[test]
+    fn test_derive_model_id_from_path() {
+        let path = "/raid/models/meta-llama/Llama-3.1-8B-Instruct";
+        let derived = WorkerManager::derive_model_id_from_path(path);
+        assert_eq!(derived, "Llama-3.1-8B-Instruct");
+    }
+
+    #[test]
+    fn test_derive_model_id_trailing_slash() {
+        let path = "/models/foo/bar/";
+        let derived = WorkerManager::derive_model_id_from_path(path);
+        assert_eq!(derived, "bar");
+    }
+
+    #[test]
+    fn test_finalize_model_id_prefers_existing() {
+        let mut labels = HashMap::new();
+        labels.insert("model_id".to_string(), "manual-id".to_string());
+        labels.insert("served_model_name".to_string(), "auto-id".to_string());
+        WorkerManager::finalize_model_id(&mut labels);
+        assert_eq!(labels.get("model_id").unwrap(), "manual-id");
+    }
+
+    #[test]
+    fn test_finalize_model_id_prefers_served_name() {
+        let mut labels = HashMap::new();
+        labels.insert("served_model_name".to_string(), "served-name".to_string());
+        WorkerManager::finalize_model_id(&mut labels);
+        assert_eq!(labels.get("model_id").unwrap(), "served-name");
+    }
+
+    #[test]
+    fn test_finalize_model_id_falls_back_to_path() {
+        let mut labels = HashMap::new();
+        labels.insert("model_path".to_string(), "/models/alpha".to_string());
+        WorkerManager::finalize_model_id(&mut labels);
+        assert_eq!(labels.get("model_id").unwrap(), "alpha");
+    }
+
+    #[test]
+    fn test_normalize_model_identifier_from_path() {
+        let normalized = WorkerManager::normalize_model_identifier("/raid/models/foo/bar-model");
+        assert_eq!(normalized, "bar-model");
     }
 }

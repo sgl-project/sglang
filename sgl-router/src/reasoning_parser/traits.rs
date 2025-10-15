@@ -69,6 +69,11 @@ pub trait ReasoningParser: Send + Sync {
 
     /// Get the model type this parser is designed for.
     fn model_type(&self) -> &str;
+
+    /// Check if the parser is currently in reasoning mode.
+    ///
+    /// Returns true if the parser is currently parsing reasoning content.
+    fn is_in_reasoning(&self) -> bool;
 }
 
 /// Error types for reasoning parsing operations.
