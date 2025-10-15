@@ -63,6 +63,9 @@ class EagleDraftWorker(BaseDraftWorker):
 
         # Args for easy access
         self.device = server_args.device
+        self.topk = server_args.speculative_eagle_topk
+        self.speculative_num_steps = server_args.speculative_num_steps
+        self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
@@ -149,7 +152,7 @@ class EagleDraftWorker(BaseDraftWorker):
 
         draft_backend_factory = DraftBackendFactory(
             self.server_args,
-            self.draft_model_runner,
+            self.draft_runner,
             self.topk,
             self.speculative_num_steps,
         )
@@ -162,7 +165,7 @@ class EagleDraftWorker(BaseDraftWorker):
             draft_backend_factory.create_draft_extend_backend()
         )
 
-        self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
+        self.draft_runner.draft_attn_backend = self.draft_attn_backend
 
     def init_cuda_graphs(self):
         """Capture cuda graphs."""
