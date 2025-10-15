@@ -384,8 +384,12 @@ class ModelRunner:
             else None
         )
         self.expert_location_updater = ExpertLocationUpdater()
-        
-        ElasticEPStateManager.init(self.server_args) if self.server_args.elastic_ep_backend else None
+
+        (
+            ElasticEPStateManager.init(self.server_args)
+            if self.server_args.elastic_ep_backend
+            else None
+        )
         # Load the model
         self.sampler = Sampler()
         self.load_model()

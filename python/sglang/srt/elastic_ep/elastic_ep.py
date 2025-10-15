@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import threading
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
@@ -56,7 +56,9 @@ class ElasticEPStateManager:
             raise NotImplementedError("Only CUDA and CPU support elastic ep now.")
 
     @classmethod
-    def _build_state(cls, *, ep_size: Optional[int], device: Optional[torch.device]) -> ElasticEPState:
+    def _build_state(
+        cls, *, ep_size: Optional[int], device: Optional[torch.device]
+    ) -> ElasticEPState:
         ep = ep_size if ep_size is not None else torch.distributed.get_world_size()
         dev = device if device is not None else cls._select_device()
 

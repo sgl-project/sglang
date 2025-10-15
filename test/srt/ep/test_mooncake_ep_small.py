@@ -14,6 +14,7 @@ from sglang.test.test_utils import (
 
 ib_devices = get_rdma_devices_args()
 
+
 class _BaseTestMooncakeEp(CustomTestCase):
     @classmethod
     def setUpClass(cls):
