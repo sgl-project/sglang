@@ -8,7 +8,7 @@ ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
 ARG FLASHMLA_COMMIT=1408756a88e52a25196b759eaf8db89d2b51b5a1
 ARG FAST_HADAMARD_TRANSFORM_COMMIT=7fd811c2b47f63b0b08d2582619f939e14dad77c
 ARG CMAKE_BUILD_PARALLEL_LEVEL=2
-ARG SGL_KERNEL_VERSION=0.3.12
+ARG SGL_KERNEL_VERSION=0.3.15
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
     GDRCOPY_HOME=/usr/src/gdrdrv-2.4.4/ \
@@ -157,11 +157,6 @@ RUN if [ "$TARGETARCH" = "amd64" ]; then \
       cd fast-hadamard-transform && \
       git checkout ${FAST_HADAMARD_TRANSFORM_COMMIT} && \
       pip install . ; \
-    fi
-
-# Install tilelang
-RUN if [ "$TARGETARCH" = "amd64" ]; then \
-      pip install tilelang==0.1.6.post1 ; \
     fi
 
 # Python tools
