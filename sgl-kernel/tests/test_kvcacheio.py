@@ -32,7 +32,7 @@ def ref_copy_with_indices_pf_direct(
             ][layer_id].to(dst_pool.device)
 
 
-def ref_copy_with_indices_ph_first(
+def ref_copy_with_indices_page_head(
     src_pool,
     dst_pool,
     src_indices,
@@ -605,7 +605,7 @@ def test_transfer_kv_page_head(
         torch.cuda.synchronize()
 
         for i in range(num_layers):
-            ref_copy_with_indices_ph_first(
+            ref_copy_with_indices_page_head(
                 src_k_pool,
                 dst_k_pool_ref,
                 src_indices_device,
@@ -615,7 +615,7 @@ def test_transfer_kv_page_head(
                 head_num,
                 lf_to_ph=True,
             )
-            ref_copy_with_indices_ph_first(
+            ref_copy_with_indices_page_head(
                 src_v_pool,
                 dst_v_pool_ref,
                 src_indices_device,
@@ -660,7 +660,7 @@ def test_transfer_kv_page_head(
             head_num,
         )
 
-        ref_copy_with_indices_ph_first(
+        ref_copy_with_indices_page_head(
             src_k_pool,
             dst_k_pool_ref,
             src_indices_host,
@@ -670,7 +670,7 @@ def test_transfer_kv_page_head(
             head_num,
             lf_to_ph=False,
         )
-        ref_copy_with_indices_ph_first(
+        ref_copy_with_indices_page_head(
             src_v_pool,
             dst_v_pool_ref,
             src_indices_host,
