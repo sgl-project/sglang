@@ -34,7 +34,7 @@ class TestDisaggregationHybridAttentionMamba(TestDisaggregationBase):
             "--disaggregation-mode",
             "prefill",
             "--tp",
-            "2",
+            "4",
         ]
         prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
@@ -51,9 +51,9 @@ class TestDisaggregationHybridAttentionMamba(TestDisaggregationBase):
             "--disaggregation-mode",
             "decode",
             "--tp",
-            "2",
+            "4",
             "--base-gpu-id",
-            "2",
+            "4",
         ]
         decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
