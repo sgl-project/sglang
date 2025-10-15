@@ -268,6 +268,7 @@ class ModelRunner:
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.attention_chunk_size = model_config.attention_chunk_size
         self.forward_pass_id = 0
+        self.init_new_workspace = False
 
         # Apply the rank zero filter to logger
         if not any(isinstance(f, RankZeroFilter) for f in logger.filters):
