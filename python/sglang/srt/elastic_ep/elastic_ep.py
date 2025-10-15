@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import threading
 from typing import Optional
 
 import torch
@@ -27,42 +28,41 @@ class ElasticEPState:
             self.last_active_ranks = self.active_ranks.clone()
 
 
-_elastic_ep_state: Optional[ElasticEPState] = None
+class ElasticEPStateManager:
+    _instance: Optional[ElasticEPState] = None
+    _lock = threading.Lock()
 
+    @classmethod
+    def instance(cls) -> ElasticEPState:
+        return cls._instance
 
-def get_elastic_ep_state():
-    return _elastic_ep_state
+    @classmethod
+    def init(cls, server_args: ServerArgs):
+        with cls._lock:
+            if cls._instance is not None:
+                return cls._instance
 
+            if server_args.elastic_ep_backend is not None:
+                cls._instance = cls._build_state(ep_size=None, device=None)
+            return cls._instance
 
-def init_elastic_ep_state(server_args: ServerArgs):
-    global _elastic_ep_state
-    assert _elastic_ep_state is None
-    if server_args.elastic_ep_backend is not None:
-        return _build_state(ep_size=None, device=None)
+    @staticmethod
+    def _select_device() -> torch.device:
+        if is_cuda():
+            return torch.device("cuda")
+        elif is_cpu():
+            return torch.device("cpu")
+        else:
+            raise NotImplementedError("Only CUDA and CPU support elastic ep now.")
 
+    @classmethod
+    def _build_state(cls, *, ep_size: Optional[int], device: Optional[torch.device]) -> ElasticEPState:
+        ep = ep_size if ep_size is not None else torch.distributed.get_world_size()
+        dev = device if device is not None else cls._select_device()
 
-def _select_device() -> torch.device:
-    # cuda or cpu for now
-    if is_cuda():
-        return torch.device("cuda")
-    elif is_cpu():
-        return torch.device("cpu")
-    else:
-        raise NotImplementedError("Only CUDA and CPU support elastic ep now.")
-
-
-def _build_state(
-    *,
-    ep_size: Optional[int],
-    device: Optional[torch.device],
-) -> ElasticEPState:
-    ep = ep_size if ep_size is not None else torch.distributed.get_world_size()
-    dev = device if device is not None else _select_device()
-
-    active = torch.ones(ep, dtype=torch.int32, device=dev)
-    state = ElasticEPState(
-        active_ranks=active,
-        last_active_ranks=active.clone(),
-        active_ranks_cpu=active.detach().cpu().clone(),
-    )
-    return state
+        active = torch.ones(ep, dtype=torch.int32, device=dev)
+        return ElasticEPState(
+            active_ranks=active,
+            last_active_ranks=active.clone(),
+            active_ranks_cpu=active.detach().cpu().clone(),
+        )
