@@ -96,7 +96,6 @@ class DraftBackendFactory:
                 FlashInferMultiStepDraftBackend,
             )
 
-            self.has_prefill_wrapper_verify = True
             return FlashInferMultiStepDraftBackend(
                 self.draft_model_runner, self.topk, self.speculative_num_steps
             )
@@ -105,7 +104,6 @@ class DraftBackendFactory:
                 FlashInferMLAMultiStepDraftBackend,
             )
 
-            self.has_prefill_wrapper_verify = True
             return FlashInferMLAMultiStepDraftBackend(
                 self.draft_model_runner, self.topk, self.speculative_num_steps
             )
@@ -149,7 +147,6 @@ class DraftBackendFactory:
             TRTLLMHAAttnMultiStepDraftBackend,
         )
 
-        self.has_prefill_wrapper_verify = True
         return TRTLLMHAAttnMultiStepDraftBackend(
             self.draft_model_runner, self.topk, self.speculative_num_steps
         )
@@ -164,7 +161,6 @@ class DraftBackendFactory:
             TRTLLMMLAMultiStepDraftBackend,
         )
 
-        self.has_prefill_wrapper_verify = True
         return TRTLLMMLAMultiStepDraftBackend(
             self.draft_model_runner, self.topk, self.speculative_num_steps
         )
