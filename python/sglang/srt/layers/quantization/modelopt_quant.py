@@ -49,20 +49,15 @@ if TYPE_CHECKING:
     )
     from sglang.srt.single_batch_overlap import DownGemmOverlapArgs
 
-fp4_gemm = None
 if is_cuda():
     from sgl_kernel import cutlass_scaled_fp4_mm as fp4_gemm
     from sgl_kernel import scaled_fp4_quant
-
-    enable_flashinfer_fp4_gemm = False
+else:
+    fp4_gemm = None
 
 try:
     from flashinfer import reorder_rows_for_gated_act_gemm, shuffle_matrix_sf_a
 
-    if not is_cuda():
-        from flashinfer import mm_fp4 as fp4_gemm
-
-        enable_flashinfer_fp4_gemm = True
 except ImportError:
     reorder_rows_for_gated_act_gemm = None
     shuffle_matrix_a = None
@@ -850,9 +845,6 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
 
         w = layer.weight
         w_scale_interleaved = layer.weight_scale_interleaved
-        if enable_flashinfer_fp4_gemm:
-            w = layer.weight.T
-            w_scale_interleaved = layer.weight_scale_interleaved.T
         out = fp4_gemm(
             x_fp4,
             w,
