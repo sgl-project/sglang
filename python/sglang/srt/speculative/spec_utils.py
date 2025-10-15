@@ -21,13 +21,17 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.utils import is_cuda, is_hip
 
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
+    from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+    from sglang.srt.speculative.eagle_info import EagleVerifyInput
+
+
 if is_cuda():
     from sgl_kernel import fast_topk
 elif is_hip():
     from sgl_kernel import fast_topk
 
-if TYPE_CHECKING:
-    from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
 logger = logging.getLogger(__name__)
 
@@ -637,3 +641,25 @@ def detect_nan(logits_output: LogitsProcessorOutput):
     if torch.any(torch.isnan(logits)):
         logger.error("Detected errors during sampling! NaN in the logits.")
         raise ValueError("Detected errors during sampling! NaN in the logits.")
+
+
+def free_spec_dec_tokens_page_size_1(
+    req_to_token_pool: ReqToTokenPool,
+    token_to_kv_pool_allocator: TokenToKVPoolAllocator,
+    req: Req,
+    allocate_len: int,
+    new_seq_len: int,
+):
+    from sglang.srt.speculative.eagle_info import EagleDraftInput
+
+    # free extra allocated tokens
+    if new_seq_len is None:
+        # True only for overlap eagle and the current batch is decode. This seq will be part of the decode, so the final iteration's allocation is not used (i.e. this case).
+        start_len = allocate_len - EagleDraftInput.ALLOC_LEN_PER_DECODE
+    else:
+        # True for 1) non-overlap; 2) overlap eagle and the current batch is prefill. This seq will not run extra iteration, so start_lens is passed in.
+        start_len = new_seq_len
+    indices_to_free = req_to_token_pool.req_to_token[req.req_pool_idx][
+        start_len:allocate_len
+    ]
+    token_to_kv_pool_allocator.free(indices_to_free)

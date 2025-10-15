@@ -266,7 +266,7 @@ class SchedulerOutputProcessorMixin:
             if self.enable_overlap and req.finished():
                 if self.page_size == 1:
                     if batch.spec_algorithm.is_eagle():
-                        from sglang.srt.speculative.eagle_worker_v2 import (
+                        from sglang.srt.speculative.spec_utils import (
                             free_spec_dec_tokens_page_size_1,
                         )
 
@@ -309,7 +309,7 @@ class SchedulerOutputProcessorMixin:
                     # FIXME(lsyin): fix the messy logic here
                     # 1) when not overlap (v2 impl), we free the extra tokens in the req
                     # 2) when overlap and current batch is extend, we free the extra tokens in the req of the previous batch
-                    from sglang.srt.speculative.eagle_worker_v2 import (
+                    from sglang.srt.speculative.spec_utils import (
                         free_spec_dec_tokens_page_size_1,
                     )
 

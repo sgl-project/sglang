@@ -5,12 +5,9 @@ from typing import List, Optional
 import torch
 from torch.cuda import Stream as CudaStream
 
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.schedule_batch import ModelWorkerBatch, Req
+from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseDraftWorker, BaseSpecWorker
@@ -697,25 +694,3 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
             tgt_cache_loc, accepted_out_cache_loc
         )
-
-
-def free_spec_dec_tokens_page_size_1(
-    req_to_token_pool: ReqToTokenPool,
-    token_to_kv_pool_allocator: TokenToKVPoolAllocator,
-    req: Req,
-    allocate_len: int,
-    new_seq_len: int,
-):
-    # FIXME(lsyin): move this function elsewhere
-
-    # free extra allocated tokens
-    if new_seq_len is None:
-        # True only for overlap eagle and the current batch is decode. This seq will be part of the decode, so the final iteration's allocation is not used (i.e. this case).
-        start_len = allocate_len - EagleDraftInput.ALLOC_LEN_PER_DECODE
-    else:
-        # True for 1) non-overlap; 2) overlap eagle and the current batch is prefill. This seq will not run extra iteration, so start_lens is passed in.
-        start_len = new_seq_len
-    indices_to_free = req_to_token_pool.req_to_token[req.req_pool_idx][
-        start_len:allocate_len
-    ]
-    token_to_kv_pool_allocator.free(indices_to_free)
