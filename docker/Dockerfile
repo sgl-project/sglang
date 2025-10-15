@@ -1,11 +1,14 @@
 ARG CUDA_VERSION=12.9.1
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04 AS base
+ARG TARGETARCH
 
 ARG BUILD_TYPE=all
 ARG BRANCH_TYPE=remote
 ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
+ARG FLASHMLA_COMMIT=1408756a88e52a25196b759eaf8db89d2b51b5a1
+ARG FAST_HADAMARD_TRANSFORM_COMMIT=7fd811c2b47f63b0b08d2582619f939e14dad77c
 ARG CMAKE_BUILD_PARALLEL_LEVEL=2
-ARG SGL_KERNEL_VERSION=0.3.12
+ARG SGL_KERNEL_VERSION=0.3.15
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
     GDRCOPY_HOME=/usr/src/gdrdrv-2.4.4/ \
@@ -90,12 +93,13 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5li
    fi \
  && python3 -m pip install --no-cache-dir -e "python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
  && python3 -m pip install --no-cache-dir nvidia-nccl-cu12==2.27.6 --force-reinstall --no-deps \
- && python3 -m flashinfer --download-cubin
+ && FLASHINFER_LOGGING_LEVEL=warning python3 -m flashinfer --download-cubin
 
 
-# Download source files
+# Download NVSHMEM source files
+# We use Tom's DeepEP fork for GB200 for now
 RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.3.9/source/nvshmem_src_cuda12-all-all-3.3.9.tar.gz && \
-    if [ "$BUILD_TYPE" = "blackwell" ] && [ "$(uname -m)" = "aarch64" ]; then \
+    if [ "$BUILD_TYPE" = "blackwell_aarch64" ]; then \
       git clone https://github.com/fzyzcjy/DeepEP.git \
       && cd DeepEP && git checkout 1b14ad661c7640137fcfe93cccb2694ede1220b0 && sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && cd .. ; \
     else \
@@ -135,6 +139,25 @@ RUN cd /sgl-workspace/DeepEP && \
     esac && \
     NVSHMEM_DIR=${NVSHMEM_DIR} TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" pip install .
 
+# Install flashmla
+RUN if [ "$TARGETARCH" = "amd64" ]; then \
+      git clone https://github.com/deepseek-ai/FlashMLA.git flash-mla && \
+      cd flash-mla && \
+      git checkout ${FLASHMLA_COMMIT} && \
+      git submodule update --init --recursive && \
+      if [ "$CUDA_VERSION" = "12.6.1" ]; then \
+        export FLASH_MLA_DISABLE_SM100=1; \
+      fi && \
+      pip install -v . ; \
+    fi
+
+# Install fast-hadamard-transform
+RUN if [ "$TARGETARCH" = "amd64" ]; then \
+      git clone https://github.com/Dao-AILab/fast-hadamard-transform && \
+      cd fast-hadamard-transform && \
+      git checkout ${FAST_HADAMARD_TRANSFORM_COMMIT} && \
+      pip install . ; \
+    fi
 
 # Python tools
 RUN python3 -m pip install --no-cache-dir \

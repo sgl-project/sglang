@@ -93,19 +93,16 @@ fn test_mixed_model_ids() {
     policy.add_worker(&worker3);
     policy.add_worker(&worker4);
 
-    // Test selection with default workers only
     let default_workers: Vec<Arc<dyn Worker>> =
         vec![Arc::new(worker1.clone()), Arc::new(worker3.clone())];
     let selected = policy.select_worker(&default_workers, Some("test request"));
     assert!(selected.is_some(), "Should select from default workers");
 
-    // Test selection with specific model workers only
     let llama_workers: Vec<Arc<dyn Worker>> =
         vec![Arc::new(worker2.clone()), Arc::new(worker4.clone())];
     let selected = policy.select_worker(&llama_workers, Some("test request"));
     assert!(selected.is_some(), "Should select from llama-3 workers");
 
-    // Test selection with mixed workers
     let all_workers: Vec<Arc<dyn Worker>> = vec![
         Arc::new(worker1.clone()),
         Arc::new(worker2.clone()),
@@ -144,7 +141,6 @@ fn test_remove_worker_by_url_backward_compat() {
     // Should remove from all trees since we don't know the model
     policy.remove_worker_by_url("http://worker1:8080");
 
-    // Verify removal worked
     let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(worker2.clone())];
     let selected = policy.select_worker(&workers, Some("test"));
     assert_eq!(selected, Some(0), "Should only have worker2 left");
