@@ -928,7 +928,7 @@ class ModelRunner:
         new_expert_location_metadata: ExpertLocationMetadata,
         update_layer_ids: List[int],
     ):
-        if get_elastic_ep_state().using_elastic_ep:
+        if get_elastic_ep_state() is not None:
             # TODO: refactor the weights update when elastic ep
             old_expert_location_metadata = get_global_expert_location_metadata()
             assert old_expert_location_metadata is not None
@@ -2154,7 +2154,6 @@ class ModelRunner:
             self.forward_pass_id,
             forward_batch,
         ):
-
             output = self._forward_raw(
                 forward_batch,
                 skip_attn_backend_init,
