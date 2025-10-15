@@ -4,10 +4,8 @@ import logging
 
 from torch import fx as fx
 
-from sglang.srt.model_executor.compilation.fix_functionalization import (
-    FixFunctionalizationPass,
-)
-from sglang.srt.model_executor.compilation.inductor_pass import (
+from sglang.srt.compilation.fix_functionalization import FixFunctionalizationPass
+from sglang.srt.compilation.inductor_pass import (
     CustomGraphPass,
     InductorPass,
     SGLangInductorPass,

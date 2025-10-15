@@ -3,6 +3,7 @@ use crate::core::CircuitState;
 use crate::core::{BasicWorkerBuilder, DPAwareWorkerBuilder};
 use crate::grpc_client::SglangSchedulerClient;
 use crate::metrics::RouterMetrics;
+use crate::protocols::worker_spec::WorkerInfo;
 use async_trait::async_trait;
 use futures;
 use serde_json;
@@ -972,6 +973,39 @@ pub fn start_health_checker(
     });
 
     HealthChecker { handle, shutdown }
+}
+
+/// Helper to convert Worker trait object to WorkerInfo struct
+pub fn worker_to_info(worker: &Arc<dyn Worker>) -> WorkerInfo {
+    let worker_type_str = match worker.worker_type() {
+        WorkerType::Regular => "regular",
+        WorkerType::Prefill { .. } => "prefill",
+        WorkerType::Decode => "decode",
+    };
+
+    let bootstrap_port = match worker.worker_type() {
+        WorkerType::Prefill { bootstrap_port } => bootstrap_port,
+        _ => None,
+    };
+
+    WorkerInfo {
+        id: worker.url().to_string(),
+        url: worker.url().to_string(),
+        model_id: worker.model_id().to_string(),
+        priority: worker.priority(),
+        cost: worker.cost(),
+        worker_type: worker_type_str.to_string(),
+        is_healthy: worker.is_healthy(),
+        load: worker.load(),
+        connection_mode: format!("{:?}", worker.connection_mode()),
+        tokenizer_path: worker.tokenizer_path().map(String::from),
+        reasoning_parser: worker.reasoning_parser().map(String::from),
+        tool_parser: worker.tool_parser().map(String::from),
+        chat_template: worker.chat_template().map(String::from),
+        bootstrap_port,
+        metadata: worker.metadata().labels.clone(),
+        job_status: None,
+    }
 }
 
 #[cfg(test)]
