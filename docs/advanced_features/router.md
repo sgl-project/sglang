@@ -313,28 +313,26 @@ Use CLI flags to select parsers:
 
 ## API Surface
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/generate` | SGLang generate API. |
-| `POST` | `/v1/chat/completions` | OpenAI-compatible chat (streaming/tool calls). |
-| `POST` | `/v1/completions` | OpenAI-compatible text completions. |
-| `POST` | `/v1/responses` | Create background responses (agentic loops). |
-| `GET` | `/v1/responses/{id}` | Retrieve stored responses. |
-| `POST` | `/v1/responses/{id}/cancel` | Cancel running responses. |
-| `DELETE` | `/v1/responses/{id}` | Delete stored response. |
-| `GET` | `/v1/responses/{id}/input` | List captured input items. |
-| `POST` | `/v1/embeddings` | Forward embedding requests. |
-| `POST` | `/v1/rerank` | Ranking endpoint (`/rerank` synonym). |
-| `POST` | `/v1/conversations` | Create conversation metadata. |
-| `GET`/`POST`/`DELETE` | `/v1/conversations/{id}` | Get/update/delete conversation. |
-| `GET`/`POST` | `/v1/conversations/{id}/items` | List or append conversation items. |
-| `GET`/`DELETE` | `/v1/conversations/{id}/items/{item_id}` | Inspect/delete conversation item. |
-| `GET` | `/workers` | List registered workers with health/load. |
-| `POST` | `/workers` | Queue worker registration. |
-| `DELETE` | `/workers/{url}` | Queue worker removal. |
-| `POST` | `/flush_cache` | Flush worker caches (HTTP workers). |
-| `GET` | `/get_loads` | Retrieve worker load snapshot. |
-| `GET` | `/liveness` / `/readiness` / `/health` | Health probes. |
+| Method                | Path                                     | Description                                    |
+|-----------------------|------------------------------------------|------------------------------------------------|
+| `POST`                | `/generate`                              | SGLang generate API.                           |
+| `POST`                | `/v1/chat/completions`                   | OpenAI-compatible chat (streaming/tool calls). |
+| `POST`                | `/v1/completions`                        | OpenAI-compatible text completions.            |
+| `POST`                | `/v1/responses`                          | Create background responses (agentic loops).   |
+| `GET`                 | `/v1/responses/{id}`                     | Retrieve stored responses.                     |
+| `GET`                 | `/v1/responses/{id}/input`               | List captured input items.                     |
+| `POST`                | `/v1/embeddings`                         | Forward embedding requests.                    |
+| `POST`                | `/v1/rerank`                             | Ranking endpoint (`/rerank` synonym).          |
+| `POST`                | `/v1/conversations`                      | Create conversation metadata.                  |
+| `GET`/`POST`/`DELETE` | `/v1/conversations/{id}`                 | Get/update/delete conversation.                |
+| `GET`/`POST`          | `/v1/conversations/{id}/items`           | List or append conversation items.             |
+| `GET`/`DELETE`        | `/v1/conversations/{id}/items/{item_id}` | Inspect/delete conversation item.              |
+| `GET`                 | `/workers`                               | List registered workers with health/load.      |
+| `POST`                | `/workers`                               | Queue worker registration.                     |
+| `DELETE`              | `/workers/{url}`                         | Queue worker removal.                          |
+| `POST`                | `/flush_cache`                           | Flush worker caches (HTTP workers).            |
+| `GET`                 | `/get_loads`                             | Retrieve worker load snapshot.                 |
+| `GET`                 | `/liveness` / `/readiness` / `/health`   | Health probes.                                 |
 
 ---
 
@@ -380,26 +378,26 @@ Use CLI flags to select parsers:
 
 ### Prefill/Decode
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `--pd-disaggregation` | flag | False | Enable PD mode. |
-| `--prefill` | list | [] | Prefill URLs + optional bootstrap ports. |
-| `--decode` | list | [] | Decode URLs. |
-| `--prefill-policy` | str | None | Override policy for prefill nodes. |
-| `--decode-policy` | str | None | Override policy for decode nodes. |
-| `--worker-startup-timeout-secs` | int | 600 | Worker init timeout. |
-| `--worker-startup-check-interval` | int | 30 | Polling interval. |
+| Parameter                         | Type | Default | Description                              |
+|-----------------------------------|------|---------|------------------------------------------|
+| `--pd-disaggregation`             | flag | False   | Enable PD mode.                          |
+| `--prefill`                       | list | []      | Prefill URLs + optional bootstrap ports. |
+| `--decode`                        | list | []      | Decode URLs.                             |
+| `--prefill-policy`                | str  | None    | Override policy for prefill nodes.       |
+| `--decode-policy`                 | str  | None    | Override policy for decode nodes.        |
+| `--worker-startup-timeout-secs`   | int  | 600     | Worker init timeout.                     |
+| `--worker-startup-check-interval` | int  | 30      | Polling interval.                        |
 
 ### Kubernetes Discovery
 
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `--service-discovery` | flag | Enable discovery. |
-| `--selector key=value ...` | list | Label selectors (regular mode). |
-| `--prefill-selector` / `--decode-selector` | list | Label selectors for PD mode. |
-| `--service-discovery-namespace` | str | Namespace to watch. |
-| `--service-discovery-port` | int | Worker port (default 80). |
-| `--bootstrap-port-annotation` | str | Prefill bootstrap annotation (default `sglang.ai/bootstrap-port`). |
+| Parameter                                  | Type | Description                                                        |
+|--------------------------------------------|------|--------------------------------------------------------------------|
+| `--service-discovery`                      | flag | Enable discovery.                                                  |
+| `--selector key=value ...`                 | list | Label selectors (regular mode).                                    |
+| `--prefill-selector` / `--decode-selector` | list | Label selectors for PD mode.                                       |
+| `--service-discovery-namespace`            | str  | Namespace to watch.                                                |
+| `--service-discovery-port`                 | int  | Worker port (default 80).                                          |
+| `--bootstrap-port-annotation`              | str  | Prefill bootstrap annotation (default `sglang.ai/bootstrap-port`). |
 
 ---
 
