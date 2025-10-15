@@ -1197,11 +1197,13 @@ class AbortReq(BaseReq):
         if self.rid is None:
             self.rid = ""
 
+
 class Ranks:
     status: List[int]
-    
+
     def __init__(self, status: List[int]):
         self.status = status
+
 
 @dataclass
 class GetInternalStateReq(BaseReq):

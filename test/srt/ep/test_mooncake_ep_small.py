@@ -1,8 +1,7 @@
 import os
+import time
 import unittest
 from types import SimpleNamespace
-import time
-
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
@@ -151,7 +150,7 @@ ib_devices,                "--moe-a2a-backend",
         kill_process_tree(cls.process.pid)
 
     def test_gsm8k(self):
-        #os.system("pkill -f sglang::scheduler_DP0_TP0_EP0")
+        # os.system("pkill -f sglang::scheduler_DP0_TP0_EP0")
         os.system("pkill -f sglang::scheduler_DP1_TP2_EP2")
         args = SimpleNamespace(
             num_shots=5,

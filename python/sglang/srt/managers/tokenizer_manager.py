@@ -1707,7 +1707,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             }
         state.out_list.append(out)
         state.event.set()
-    
+
     def update_ranks(self, ranks: Ranks):
         self.send_to_scheduler.send_pyobj(ranks)
 
