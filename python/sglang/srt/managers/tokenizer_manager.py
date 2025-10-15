@@ -1705,12 +1705,10 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         state.finished = True
 
         abort_message = recv_obj.abort_reason or "Abort in waiting queue"
-        finish_reason = (
-            {
-                "type": "abort",
-                "message": abort_message,
-            },
-        )
+        finish_reason = {
+            "type": "abort",
+            "message": abort_message,
+        }
         if recv_obj.finished_reason:
             finish_reason = recv_obj.finished_reason
         meta_info = {"id": origin_rid, "finish_reason": finish_reason}
