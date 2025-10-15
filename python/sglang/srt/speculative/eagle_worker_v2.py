@@ -418,6 +418,60 @@ class EagleDraftWorker(BaseDraftWorker):
         next_draft_input.hidden_states = logits_output.hidden_states
         return next_draft_input
 
+    def draft_extend_after_verify(
+        self, batch: ModelWorkerBatch, batch_result: GenerationBatchResult
+    ):
+        # Batch 2: Draft extend
+        draft_input = EagleDraftInput(
+            hidden_states=batch_result.logits_output.hidden_states,
+        )
+        select_index = (
+            torch.arange(len(batch.seq_lens), device=self.device)
+            * self.speculative_num_draft_tokens
+            + batch_result.accept_lens
+            - 1
+        )
+
+        # Prepare for draft extend in a separate stream
+        with self.plan_stream_ctx:
+            forward_batch = draft_input.prepare_for_extend_to_fill_draft_kvcache(
+                batch,
+                batch_result.next_token_ids,
+                self.speculative_num_draft_tokens,
+                self.draft_runner,
+            )
+
+        if self.plan_stream:
+            torch.cuda.current_stream().wait_stream(self.plan_stream)
+
+        # Run draft extend batch in the main compute stream
+        draft_logits_output = self.draft_runner.model.forward(
+            forward_batch.input_ids, forward_batch.positions, forward_batch
+        )
+
+        # Reorganize the spec info for the next batch
+        draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
+            select_index
+        ]
+        draft_logits_output.hidden_states = draft_logits_output.hidden_states[
+            select_index
+        ]
+        probs = torch.softmax(draft_logits_output.next_token_logits, dim=-1)
+        ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
+        ret_hidden_states = draft_logits_output.hidden_states
+
+        # Construct the return values
+        next_draft_input = batch_result.next_draft_input
+        (
+            next_draft_input.topk_p,
+            next_draft_input.topk_index,
+            next_draft_input.hidden_states,
+        ) = (
+            ret_topk_p,
+            ret_topk_index,
+            ret_hidden_states,
+        )
+
 
 class EAGLEWorkerV2(BaseSpecWorker):
     def __init__(
@@ -482,6 +536,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
             assert verify_input.is_verify_input()
             model_worker_batch.spec_info = verify_input
             batch_output = self.verify(model_worker_batch, draft_input.allocate_lens)
+            self.draft_worker.draft_extend_after_verify(
+                model_worker_batch, batch_output
+            )
             return batch_output
         else:
             # Target prefill
@@ -508,6 +565,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
         verify_input: EagleVerifyInput = batch.spec_info
         seq_lens_backup = batch.seq_lens
         bs = len(batch.seq_lens)
+
+        # Since seq_lens_backup's tensor is allocated in another stream, we
+        # need record_stream() to prevent pytorch gc and reuse the gpu memory
+        # while forward_stream is still running.
+        seq_lens_backup.record_stream(torch.cuda.current_stream())
 
         # Batch 1: Target verify
         # Prepare for target verify in a separate stream
@@ -575,55 +637,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
             self.speculative_num_draft_tokens,
         )
 
-        # Batch 2: Draft extend
-        draft_input = EagleDraftInput(
-            hidden_states=logits_output.hidden_states,
-        )
-        select_index = (
-            torch.arange(len(batch.seq_lens), device=self.device)
-            * self.speculative_num_draft_tokens
-            + accept_length
-            - 1
-        )
-
-        # Prepare for draft extend in a separate stream
-        with self.plan_stream_ctx:
-            forward_batch = draft_input.prepare_for_extend_to_fill_draft_kvcache(
-                batch,
-                predict,
-                self.speculative_num_draft_tokens,
-                self.draft_worker.draft_runner,
-            )
-
-        if self.plan_stream:
-            torch.cuda.current_stream().wait_stream(self.plan_stream)
-
-        # Run draft extend batch in the main compute stream
-        draft_logits_output = self.draft_worker.draft_runner.model.forward(
-            forward_batch.input_ids, forward_batch.positions, forward_batch
-        )
-
-        # Reorganize the spec info for the next batch
-        draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
-            select_index
-        ]
-        draft_logits_output.hidden_states = draft_logits_output.hidden_states[
-            select_index
-        ]
-        probs = torch.softmax(draft_logits_output.next_token_logits, dim=-1)
-        ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
-        ret_hidden_states = draft_logits_output.hidden_states
-
-        # Since seq_lens_backup's tensor is allocated in another stream, we
-        # need record_stream() to prevent pytorch gc and reuse the gpu memory
-        # while forward_stream is still running.
-        seq_lens_backup.record_stream(torch.cuda.current_stream())
-
-        # Construct the return values
+        # Construct the next draft input
         next_draft_input = EagleDraftInput(
-            topk_p=ret_topk_p,
-            topk_index=ret_topk_index,
-            hidden_states=ret_hidden_states,
             verified_id=verified_id,
             new_seq_lens=new_seq_lens,
             allocate_lens=pre_draft_allocate_lens,
