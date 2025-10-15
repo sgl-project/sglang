@@ -226,7 +226,7 @@ class TpModelWorker(BaseTpWorker):
             is_draft_model=is_draft_worker,
         )
 
-        self.model_runner = ModelRunner(
+        self._model_runner = ModelRunner(
             model_config=self.model_config,
             mem_fraction_static=server_args.mem_fraction_static,
             gpu_id=gpu_id,
@@ -304,6 +304,10 @@ class TpModelWorker(BaseTpWorker):
 
         self.enable_overlap = not server_args.disable_overlap_schedule
         self.hicache_layer_transfer_counter = None
+
+    @property
+    def model_runner(self) -> ModelRunner:
+        return self._model_runner
 
     def register_hicache_layer_transfer_counter(self, counter: LayerDoneCounter):
         self.hicache_layer_transfer_counter = counter
