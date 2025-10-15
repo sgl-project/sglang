@@ -2,8 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
-use super::chat::GenerationRequest;
-use super::common::{default_model, default_true, StringOrArray, UsageInfo};
+use super::common::{default_model, default_true, GenerationRequest, StringOrArray, UsageInfo};
 
 fn default_rerank_object() -> String {
     "rerank".to_string()

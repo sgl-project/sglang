@@ -6,8 +6,9 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 // Import shared types from common module
-use super::chat::GenerationRequest;
-use super::common::{ChatLogProbs, PromptTokenUsageInfo, StringOrArray, ToolChoice, UsageInfo};
+use super::common::{
+    ChatLogProbs, GenerationRequest, PromptTokenUsageInfo, StringOrArray, ToolChoice, UsageInfo,
+};
 
 // ============================================================================
 // Response Tools (MCP and others)

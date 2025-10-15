@@ -546,18 +546,6 @@ impl Normalizable for ChatCompletionRequest {
 // GenerationRequest Trait Implementation
 // ============================================================================
 
-/// Trait for unified access to generation request properties
-pub trait GenerationRequest: Send + Sync {
-    /// Check if the request is for streaming
-    fn is_stream(&self) -> bool;
-
-    /// Get the model name if specified
-    fn get_model(&self) -> Option<&str>;
-
-    /// Extract text content for routing decisions
-    fn extract_text_for_routing(&self) -> String;
-}
-
 impl GenerationRequest for ChatCompletionRequest {
     fn is_stream(&self) -> bool {
         self.stream

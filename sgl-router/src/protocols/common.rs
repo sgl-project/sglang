@@ -17,6 +17,24 @@ pub fn default_true() -> bool {
 }
 
 // ============================================================================
+// GenerationRequest Trait
+// ============================================================================
+
+/// Trait for unified access to generation request properties
+/// Implemented by ChatCompletionRequest, CompletionRequest, GenerateRequest,
+/// EmbeddingRequest, RerankRequest, and ResponsesRequest
+pub trait GenerationRequest: Send + Sync {
+    /// Check if the request is for streaming
+    fn is_stream(&self) -> bool;
+
+    /// Get the model name if specified
+    fn get_model(&self) -> Option<&str>;
+
+    /// Extract text content for routing decisions
+    fn extract_text_for_routing(&self) -> String;
+}
+
+// ============================================================================
 // String/Array Utilities
 // ============================================================================
 
