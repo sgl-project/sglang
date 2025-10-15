@@ -1323,11 +1323,15 @@ def parse_image_resolution(image_resolution: str) -> Tuple[int, int]:
 
 def create_mm_data_row(text_prompt, images: list, images_base64, output_len, processor):
     try:
-        content_items = [
-            {"type": "image", "image": {"url": image_base64}}
-            for image_base64 in images_base64
-        ]
-        content_items.append({"type": "text", "text": text_prompt})
+        if "phi-4-multimodal" in processor.name_or_path.lower():
+            # <|endoftext10|> is the image token used in the phi-4-multimodal model.
+            content_items = text_prompt.replace("image 1", "<|endoftext10|>")
+        else:
+            content_items = [
+                {"type": "image", "image": {"url": image_base64}}
+                for image_base64 in images_base64
+            ]
+            content_items.append({"type": "text", "text": text_prompt})
         prompt_str = processor.apply_chat_template(
             [{"role": "user", "content": content_items}],
             add_generation_prompt=True,
