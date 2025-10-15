@@ -185,7 +185,9 @@ def generate_baseline(
                 continue
 
         if not records:
-            raise RuntimeError("Failed to generate any baseline records. Please check the warnings above for errors.")
+            raise RuntimeError(
+                "Failed to generate any baseline records. Please check the warnings above for errors."
+            )
 
         # Save baseline files
         with open(baseline_file, "wb") as f:
