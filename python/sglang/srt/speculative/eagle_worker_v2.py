@@ -410,7 +410,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.enable_nan_detection = server_args.enable_nan_detection
         self.gpu_id = gpu_id
         self.device = server_args.device
-        self.target_worker = target_worker
+        self._target_worker = target_worker
         self.page_size = server_args.page_size
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
@@ -435,7 +435,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         else:
             self.hot_token_id = None
 
-        self.draft_worker = EagleDraftWorker(
+        self._draft_worker = EagleDraftWorker(
             server_args, gpu_id, tp_rank, dp_rank, moe_ep_rank, nccl_port, target_worker
         )
 
@@ -445,6 +445,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
         )
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
+
+    @property
+    def target_worker(self):
+        return self._target_worker
+
+    @property
+    def draft_worker(self):
+        return self._draft_worker
 
     def forward_batch_generation(self, model_worker_batch: ModelWorkerBatch):
         if model_worker_batch.forward_mode.is_decode():
