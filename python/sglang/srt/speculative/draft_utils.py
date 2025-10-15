@@ -43,35 +43,16 @@ class DraftBackendFactory:
                 def __init__(self):
                     self.attn_backends = []
 
-                def init_forward_metadata(*args, **kwargs):
+                def init_forward_metadata(self, *args, **kwargs):
                     pass
 
-                def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+                def init_cuda_graph_state(self, *args, **kwargs):
                     pass
 
-                def init_forward_metadata_replay_cuda_graph(
-                    self,
-                    bs: int,
-                    req_pool_indices: torch.Tensor,
-                    seq_lens: torch.Tensor,
-                    seq_lens_sum: int,
-                    encoder_lens: Optional[torch.Tensor],
-                    forward_mode: ForwardMode,
-                    spec_info: Optional[SpecInput],
-                    seq_lens_cpu: Optional[torch.Tensor],
-                ):
+                def init_forward_metadata_replay_cuda_graph(self, *args, **kwargs):
                     pass
 
-                def init_forward_metadata_capture_cuda_graph(
-                    self,
-                    bs: int,
-                    num_tokens: int,
-                    req_pool_indices: torch.Tensor,
-                    seq_lens: torch.Tensor,
-                    encoder_lens: Optional[torch.Tensor],
-                    forward_mode: ForwardMode,
-                    spec_info: Optional[SpecInput],
-                ):
+                def init_forward_metadata_capture_cuda_graph(self, *args, **kwargs):
                     pass
 
             return DummyAttnBackend()
