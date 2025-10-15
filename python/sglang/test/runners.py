@@ -535,6 +535,7 @@ class SRTRunner:
         enable_lora: Optional[bool] = None,
         max_loaded_loras: Optional[int] = None,
         json_model_override_args: Optional[dict[str, Any]] = None,
+        lora_eviction_policy: str = "lru",
     ):
         self.model_type = model_type
         self.is_generation = model_type == "generation"
@@ -586,6 +587,7 @@ class SRTRunner:
                 if json_model_override_args
                 else "{}"
             ),
+            lora_eviction_policy=lora_eviction_policy,
             **spec_kwargs,
         )
 

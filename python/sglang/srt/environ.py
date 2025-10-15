@@ -128,6 +128,18 @@ class Envs:
     SGLANG_SIMULATE_ACC_METHOD = EnvStr("multinomial")
     SGLANG_TORCH_PROFILER_DIR = EnvStr("/tmp")
 
+    # Scheduler: new token ratio hyperparameters
+    SGLANG_INIT_NEW_TOKEN_RATIO = EnvFloat(0.7)
+    SGLANG_MIN_NEW_TOKEN_RATIO_FACTOR = EnvFloat(0.14)
+    SGLANG_NEW_TOKEN_RATIO_DECAY_STEPS = EnvInt(600)
+    SGLANG_RETRACT_DECODE_STEPS = EnvInt(20)
+
+    # Scheduler: others:
+    SGLANG_EMPTY_CACHE_INTERVAL = EnvFloat(-1)  # in seconds. Set if you observe high memory accumulation over a long serving period.
+    # Test: pd-disaggregation
+    SGLANG_TEST_PD_DISAGG_BACKEND = EnvStr("mooncake")
+    SGLANG_TEST_PD_DISAGG_DEVICES = EnvStr(None)
+
     # Model Parallel
     SGLANG_USE_MESSAGE_QUEUE_BROADCASTER = EnvBool(True)
 
@@ -155,6 +167,7 @@ class Envs:
     # Flashinfer
     SGLANG_IS_FLASHINFER_AVAILABLE = EnvBool(True)
     SGLANG_ENABLE_FLASHINFER_GEMM = EnvBool(False)
+    SGLANG_FLASHINFER_WORKSPACE_SIZE = EnvInt(384 * 1024 * 1024)
 
     # Triton
     SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS = EnvBool(False)
@@ -167,6 +180,7 @@ class Envs:
     SGLANG_EXPERT_LOCATION_UPDATER_CANARY = EnvBool(False)
     SGLANG_EXPERT_LOCATION_UPDATER_LOG_METRICS = EnvBool(False)
     SGLANG_LOG_EXPERT_LOCATION_METADATA = EnvBool(False)
+    SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR = EnvStr("/tmp")
 
     # TBO
     SGLANG_TBO_DEBUG = EnvBool(False)
