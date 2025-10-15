@@ -46,7 +46,7 @@ FlashMLA FP8 KV cache is currently not working. See upstream issue [#8856](https
 
 ```{note}
 - FlashAttention 4 is prefill-only for now.
-- NSA is specifically designed for [DeepSeek V3.2 NSA](https://lmsys.org/blog/2025-09-29-deepseek-V32/).
+- NSA is specifically designed for [DeepSeek V3.2 DSA](https://lmsys.org/blog/2025-09-29-deepseek-V32/).
 ```
 
 ```{tip}
