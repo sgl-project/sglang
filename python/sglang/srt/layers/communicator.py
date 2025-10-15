@@ -106,6 +106,7 @@ def use_attn_input_tp_scattered(forward_batch: ForwardBatch):
         and not forward_batch.forward_mode.is_target_verify()
         and not forward_batch.forward_mode.is_draft_extend()
         and forward_batch.input_ids is not None
+        and not forward_batch.can_run_tbo
     )
 
 
