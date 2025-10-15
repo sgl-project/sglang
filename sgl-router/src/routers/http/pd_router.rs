@@ -151,14 +151,9 @@ impl PDRouter {
 
     fn get_generate_batch_size(req: &GenerateRequest) -> Option<usize> {
         // GenerateRequest doesn't support batch via arrays, only via input_ids
-        if let Some(ref input_ids) = req.input_ids {
-            match input_ids {
-                crate::protocols::common::InputIds::Batch(batches) => {
-                    if !batches.is_empty() {
-                        return Some(batches.len());
-                    }
-                }
-                _ => {}
+        if let Some(crate::protocols::common::InputIds::Batch(batches)) = &req.input_ids {
+            if !batches.is_empty() {
+                return Some(batches.len());
             }
         }
         None
