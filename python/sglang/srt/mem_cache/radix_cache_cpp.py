@@ -157,7 +157,9 @@ class RadixCacheCpp(BasePrefixCache):
         all_token_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
         token_ids = (req.origin_input_ids + req.output_ids)[:all_token_len]
         overall_len = len(token_ids)  # prefill + decode
-        kv_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx, :overall_len]
+        kv_indices = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, :overall_len
+        ].to(dtype=torch.int64, copy=True)
 
         # NOTE: our C++ implementation don't need `token_ids` and `kv_indices` to be page-aligned
         # it will automatically align them, but length of them should be equal
@@ -194,7 +196,9 @@ class RadixCacheCpp(BasePrefixCache):
         assert req.req_pool_idx is not None
         token_ids = req.fill_ids
         prefill_len = len(token_ids)  # prefill only (maybe chunked)
-        kv_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx, :prefill_len]
+        kv_indices = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, :prefill_len
+        ].to(dtype=torch.int64, copy=True)
 
         # NOTE: our C++ implementation don't need `token_ids` and `kv_indices` to be page-aligned
         # it will automatically align them, but length of them should be equal
