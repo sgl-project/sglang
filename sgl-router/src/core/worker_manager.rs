@@ -551,31 +551,23 @@ impl WorkerManager {
     }
 
     /// Add a worker from a configuration request
+    ///
+    /// Registers worker immediately with healthy=false, returns worker for async validation
     pub async fn add_worker_from_config(
         config: &WorkerConfigRequest,
         context: &AppContext,
-    ) -> Result<String, String> {
+    ) -> Result<Arc<dyn Worker>, String> {
+        // Check if worker already exists
+        if context.worker_registry.get_by_url(&config.url).is_some() {
+            return Err(format!("Worker {} already exists", config.url));
+        }
         let mut labels = config.labels.clone();
 
-        let model_id = if let Some(ref model_id) = config.model_id {
-            model_id.clone()
-        } else {
-            match Self::get_server_info(&config.url, config.api_key.as_deref()).await {
-                Ok(info) => info
-                    .model_id
-                    .or_else(|| {
-                        info.model_path
-                            .as_ref()
-                            .and_then(|path| path.split('/').next_back().map(|s| s.to_string()))
-                    })
-                    .unwrap_or_else(|| "unknown".to_string()),
-                Err(e) => {
-                    warn!("Failed to query server info from {}: {}", config.url, e);
-                    "unknown".to_string()
-                }
-            }
-        };
-
+        // Use provided model_id or default to "unknown"
+        let model_id = config
+            .model_id
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
         labels.insert("model_id".to_string(), model_id.clone());
         if let Some(priority) = config.priority {
             labels.insert("priority".to_string(), priority.to_string());
@@ -614,18 +606,54 @@ impl WorkerManager {
             ConnectionMode::Http
         };
 
-        let policy_hint = labels.get("policy").cloned();
+        let circuit_breaker_config = Self::convert_circuit_breaker_config(
+            &context.router_config.effective_circuit_breaker_config(),
+        );
+        let health_config = Self::convert_health_config(&context.router_config.health_check);
 
-        Self::add_worker_internal(
-            &config.url,
+        // Create and register worker (starts with healthy=false)
+        let worker = Self::create_basic_worker(
+            config.url.clone(),
             worker_type,
             connection_mode,
             config.api_key.clone(),
-            Some(labels),
-            policy_hint.as_deref(),
-            context,
-        )
-        .await
+            Some(labels.clone()),
+            circuit_breaker_config,
+            health_config,
+        );
+
+        worker.set_healthy(false);
+        context.worker_registry.register(worker.clone());
+
+        let policy_hint = labels.get("policy").map(|s| s.as_str());
+        context
+            .policy_registry
+            .on_worker_added(&model_id, policy_hint);
+
+        info!("Registered worker {} (initializing)", config.url);
+
+        // Return worker for async validation
+        Ok(worker)
+    }
+
+    /// Validate and activate a worker (for async validation after registration)
+    pub async fn validate_and_activate_worker(
+        worker: &Arc<dyn Worker>,
+        context: &AppContext,
+    ) -> Result<String, String> {
+        let url = worker.url();
+
+        // Perform health validation
+        WorkerFactory::validate_health(url, context.router_config.worker_startup_timeout_secs)
+            .await
+            .map_err(|e| format!("Health check failed for {}: {}", url, e))?;
+
+        // Mark as healthy
+        worker.set_healthy(true);
+
+        info!("Worker {} validated and activated", url);
+
+        Ok(format!("Worker {} is now healthy", url))
     }
 
     /// Add a worker from URL (legacy endpoint)
@@ -953,113 +981,105 @@ impl WorkerManager {
             return Ok(());
         }
 
+        // Mark all workers as unhealthy initially
         info!(
-            "Marking {} workers as unhealthy before initial health checks",
+            "Marking {} workers as unhealthy before health checks",
             workers.len()
         );
         for worker in &workers {
             worker.set_healthy(false);
         }
 
-        info!(
-            "Performing initial health checks for {} workers",
-            workers.len()
-        );
-        let health_check_futures: Vec<_> = workers
-            .iter()
-            .map(|worker| {
-                let w = worker.clone();
-                let url = worker.url().to_string();
-                async move {
-                    match w.check_health_async().await {
-                        Ok(_) => {
-                            w.set_healthy(true);
-                            debug!(
-                                "Worker {} passed initial health check and marked healthy",
-                                url
-                            );
-                            Ok(url)
-                        }
-                        Err(e) => {
-                            warn!("Worker {} failed initial health check: {}", url, e);
-                            Err(url)
-                        }
-                    }
-                }
-            })
-            .collect();
-
-        let health_results = future::join_all(health_check_futures).await;
-        let failed_checks: Vec<_> = health_results.into_iter().filter_map(|r| r.err()).collect();
-
-        if !failed_checks.is_empty() {
-            info!(
-                "Initial health check: {} workers failed: {:?}",
-                failed_checks.len(),
-                failed_checks
-            );
-        }
-
         loop {
+            // 1. Filter unhealthy workers
             let workers = registry.get_all();
-            let healthy_workers: Vec<_> = workers
-                .iter()
-                .filter(|w| w.is_healthy())
-                .map(|w| w.url().to_string())
-                .collect();
             let unhealthy_workers: Vec<_> = workers
                 .iter()
                 .filter(|w| !w.is_healthy())
-                .map(|w| w.url().to_string())
+                .cloned()
                 .collect();
 
+            // 2. If all workers are healthy, return immediately
             if unhealthy_workers.is_empty() {
+                let healthy_urls: Vec<_> = workers.iter().map(|w| w.url().to_string()).collect();
                 info!(
                     "All {} workers are healthy: {:?}",
                     workers.len(),
-                    healthy_workers
+                    healthy_urls
                 );
                 return Ok(());
             }
 
+            // Check timeout
             if start_time.elapsed() > timeout {
+                let healthy_workers: Vec<_> = workers
+                    .iter()
+                    .filter(|w| w.is_healthy())
+                    .map(|w| w.url().to_string())
+                    .collect();
+                let unhealthy_urls: Vec<_> = unhealthy_workers
+                    .iter()
+                    .map(|w| w.url().to_string())
+                    .collect();
+
                 error!(
                     "Workers failed to become healthy after {}s. Unhealthy: {:?}, Healthy: {:?}",
-                    timeout_secs, unhealthy_workers, healthy_workers
+                    timeout_secs, unhealthy_urls, healthy_workers
                 );
                 return Err(format!(
                     "Workers failed to become healthy after {}s. Unhealthy: {:?}",
-                    timeout_secs, unhealthy_workers
+                    timeout_secs, unhealthy_urls
                 ));
             }
+
+            let unhealthy_urls: Vec<_> = unhealthy_workers
+                .iter()
+                .map(|w| w.url().to_string())
+                .collect();
 
             info!(
                 "Waiting for {} workers to become healthy. Unhealthy: {:?}",
                 unhealthy_workers.len(),
-                unhealthy_workers
+                unhealthy_urls
             );
 
-            let unhealthy_workers_to_check = workers
+            // 3. Check health of all unhealthy workers in parallel
+            let health_check_futures: Vec<_> = unhealthy_workers
                 .iter()
-                .filter(|w| !w.is_healthy())
-                .cloned()
-                .collect::<Vec<_>>();
-
-            for worker in unhealthy_workers_to_check {
-                let url = worker.url().to_string();
-                match worker.check_health_async().await {
-                    Ok(_) => {
-                        if !worker.is_healthy() {
-                            worker.set_healthy(true);
-                            debug!("Worker {} now healthy after health check", url);
+                .map(|worker| {
+                    let w = worker.clone();
+                    let url = worker.url().to_string();
+                    async move {
+                        match w.check_health_async().await {
+                            Ok(_) => {
+                                w.set_healthy(true);
+                                debug!("Worker {} now healthy", url);
+                            }
+                            Err(e) => {
+                                debug!("Worker {} health check failed: {}", url, e);
+                            }
                         }
                     }
-                    Err(e) => {
-                        debug!("Worker {} health check failed: {}", url, e);
-                    }
-                }
+                })
+                .collect();
+
+            future::join_all(health_check_futures).await;
+
+            // 4. Check if all workers are now healthy after health checks
+            let still_unhealthy: Vec<_> = workers.iter().filter(|w| !w.is_healthy()).collect();
+
+            // 5. If all workers are now healthy, return immediately without sleeping
+            if still_unhealthy.is_empty() {
+                let healthy_urls: Vec<_> = workers.iter().map(|w| w.url().to_string()).collect();
+                info!(
+                    "All {} workers are healthy: {:?}",
+                    workers.len(),
+                    healthy_urls
+                );
+                return Ok(());
             }
 
+            // 6. Otherwise, sleep before next iteration
             tokio::time::sleep(check_interval).await;
         }
     }
@@ -1188,7 +1208,7 @@ impl WorkerManager {
             });
         }
 
-        let results = futures::future::join_all(tasks).await;
+        let results = future::join_all(tasks).await;
 
         let mut successful = Vec::new();
         let mut failed = Vec::new();
@@ -1329,7 +1349,7 @@ impl WorkerManager {
             });
         }
 
-        let loads = futures::future::join_all(tasks).await;
+        let loads = future::join_all(tasks).await;
 
         let successful = loads.iter().filter(|l| l.load >= 0).count();
         let failed = loads.iter().filter(|l| l.load < 0).count();

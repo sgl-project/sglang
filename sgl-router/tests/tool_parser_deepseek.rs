@@ -108,13 +108,13 @@ fn test_deepseek_format_detection() {
     let parser = DeepSeekParser::new();
 
     // Should detect DeepSeek format
-    assert!(parser.detect_format("<｜tool▁calls▁begin｜>"));
-    assert!(parser.detect_format("text with <｜tool▁calls▁begin｜> marker"));
+    assert!(parser.has_tool_markers("<｜tool▁calls▁begin｜>"));
+    assert!(parser.has_tool_markers("text with <｜tool▁calls▁begin｜> marker"));
 
     // Should not detect other formats
-    assert!(!parser.detect_format("[TOOL_CALLS]"));
-    assert!(!parser.detect_format("<tool_call>"));
-    assert!(!parser.detect_format("plain text"));
+    assert!(!parser.has_tool_markers("[TOOL_CALLS]"));
+    assert!(!parser.has_tool_markers("<tool_call>"));
+    assert!(!parser.has_tool_markers("plain text"));
 }
 
 #[tokio::test]

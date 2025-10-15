@@ -30,7 +30,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux.rocm.gpu.gfx942.1]
+        runner: [linux-mi300-gpu-1]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -59,7 +59,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux.rocm.gpu.gfx942.2]
+        runner: [linux-mi300-gpu-2]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -86,7 +86,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux.rocm.gpu.gfx942.2]
+        runner: [linux-mi300-gpu-1]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -113,7 +113,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux.rocm.gpu.gfx942.1]
+        runner: [linux-mi300-gpu-1]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -156,7 +156,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux.rocm.gpu.gfx942.1]
+        runner: [linux-mi300-gpu-1]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -193,7 +193,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux.rocm.gpu.gfx942.2]
+        runner: [linux-mi300-gpu-2]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -240,7 +240,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux.rocm.gpu.gfx942.1]
+        runner: [linux-mi300-gpu-1]
         part: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
     runs-on: ${{matrix.runner}}
     steps:
@@ -268,7 +268,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux.rocm.gpu.gfx942.2]
+        runner: [linux-mi300-gpu-2]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -295,7 +295,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux.rocm.gpu.gfx942.8]
+        runner: [linux-mi300-gpu-8]
+        part: [0, 1]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -315,14 +316,14 @@ jobs:
       - name: Run test
         timeout-minutes: 60
         run: |
-          bash scripts/ci/amd_ci_exec.sh python3 run_suite.py --suite per-commit-8-gpu-amd --timeout-per-file 3600
+          bash scripts/ci/amd_ci_exec.sh python3 run_suite.py --suite per-commit-8-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 3600
 
   unit-test-sgl-kernel-amd:
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux.rocm.gpu.gfx942.1]
+        runner: [linux-mi300-gpu-1]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code

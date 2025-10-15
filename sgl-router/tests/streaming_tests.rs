@@ -19,6 +19,7 @@ struct TestContext {
 impl TestContext {
     async fn new(worker_configs: Vec<MockWorkerConfig>) -> Self {
         let mut config = RouterConfig {
+            chat_template: None,
             mode: RoutingMode::Regular {
                 worker_urls: vec![],
             },
