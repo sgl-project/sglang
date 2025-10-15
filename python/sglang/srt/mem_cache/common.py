@@ -293,9 +293,15 @@ def alloc_req_slots(
     req_to_token_pool: ReqToTokenPool,
     num_reqs: int,
     reqs: list[Req] | None,
+    tree_cache: BasePrefixCache | None,
 ) -> list[int]:
     """Allocate request slots from the pool."""
     if isinstance(req_to_token_pool, HybridReqToTokenPool):
+        mamba_available_size = req_to_token_pool.mamba_pool.available_size()
+        if mamba_available_size < num_reqs:
+            if tree_cache is not None and isinstance(tree_cache, MambaRadixCache):
+                mamba_num = max(0, num_reqs - mamba_available_size)
+                tree_cache.evict_mamba(mamba_num)
         req_pool_indices = req_to_token_pool.alloc(num_reqs, reqs)
     else:
         req_pool_indices = req_to_token_pool.alloc(num_reqs)
@@ -331,15 +337,6 @@ def alloc_for_extend(
     bs = len(batch.reqs)
     prefix_tensors = [r.prefix_indices for r in batch.reqs]
 
-    if isinstance(batch.req_to_token_pool, HybridReqToTokenPool):
-        mamba_available_size = batch.req_to_token_pool.mamba_pool.available_size()
-        if mamba_available_size < bs:
-            if batch.tree_cache is not None and isinstance(
-                batch.tree_cache, MambaRadixCache
-            ):
-                mamba_num = max(0, bs - mamba_available_size)
-                batch.tree_cache.evict_mamba(mamba_num)
-
     # Create tensors for allocation
     prefix_lens_cpu = torch.tensor(batch.prefix_lens, dtype=torch.int64)
     extend_lens_cpu = torch.tensor(batch.extend_lens, dtype=torch.int64)
@@ -347,7 +344,9 @@ def alloc_for_extend(
     extend_lens_device = extend_lens_cpu.to(batch.device, non_blocking=True)
 
     # Allocate req slots
-    req_pool_indices = alloc_req_slots(batch.req_to_token_pool, bs, batch.reqs)
+    req_pool_indices = alloc_req_slots(
+        batch.req_to_token_pool, bs, batch.reqs, batch.tree_cache
+    )
     req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
     req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
 
