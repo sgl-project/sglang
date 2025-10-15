@@ -65,7 +65,7 @@ class _BaseTestMooncakeEp(CustomTestCase):
         kill_process_tree(cls.process.pid)
 
     def test_gsm8k(self):
-        os.system("pkill -f sglang::scheduler_DP0_TP0_EP0")
+        os.system("pkill -f sglang::scheduler_DP1_TP1_EP1")
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,
