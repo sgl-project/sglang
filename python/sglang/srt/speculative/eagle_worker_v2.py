@@ -226,7 +226,7 @@ class EagleDraftWorker(BaseDraftWorker):
             self.req_to_token_pool,
             model_worker_batch,
             self.cuda_graph_runner,
-            self.draft_model_runner,
+            self.draft_runner,
             self.topk,
             self.speculative_num_steps,
         )
@@ -332,7 +332,7 @@ class EagleDraftWorker(BaseDraftWorker):
             spec_info.hidden_states = hidden_states
 
             # Run forward
-            logits_output = self.draft_model_runner.model.forward(
+            logits_output = self.draft_runner.model.forward(
                 forward_batch.input_ids, forward_batch.positions, forward_batch
             )
             self._detect_nan_if_needed(logits_output)
@@ -397,8 +397,8 @@ class EagleDraftWorker(BaseDraftWorker):
         batch.spec_info = next_draft_input
 
         # Run forward
-        forward_batch = ForwardBatch.init_new(batch, self.draft_model_runner)
-        logits_output, _ = self.draft_model_runner.forward(forward_batch)
+        forward_batch = ForwardBatch.init_new(batch, self.draft_runner)
+        logits_output, _ = self.draft_runner.forward(forward_batch)
 
         # Update spec_info for the next draft step
         probs = torch.softmax(logits_output.next_token_logits, dim=-1)
@@ -574,14 +574,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 batch,
                 predict,
                 self.speculative_num_draft_tokens,
-                self.draft_model_runner,
+                self.draft_worker.draft_runner,
             )
 
         if self.plan_stream:
             torch.cuda.current_stream().wait_stream(self.plan_stream)
 
         # Run draft extend batch in the main compute stream
-        draft_logits_output = self.draft_model_runner.model.forward(
+        draft_logits_output = self.draft_worker.draft_runner.model.forward(
             forward_batch.input_ids, forward_batch.positions, forward_batch
         )
 
