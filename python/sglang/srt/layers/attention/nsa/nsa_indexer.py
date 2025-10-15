@@ -367,7 +367,7 @@ class Indexer(CustomOp):
 
         return topk_result
 
-    def forward_indexer_bs_1(
+    def forward_indexer(
         self,
         q_fp8: torch.Tensor,
         weights: torch.Tensor,
@@ -448,20 +448,9 @@ class Indexer(CustomOp):
             q_len_start = q_len_end
 
         topk_indices = torch.cat(topk_indices_list, dim=0)
-
         return topk_indices
 
-    def forward_indexer(
-        self,
-        q_fp8: torch.Tensor,
-        weights: torch.Tensor,
-        forward_batch: ForwardBatch,
-        topk: int,
-        layer_id: int,
-    ) -> Optional[torch.Tensor]:
-        return self.forward_indexer_bs_1(q_fp8, weights, forward_batch, topk, layer_id)
-
-    def _forward(
+    def forward_cuda(
         self,
         x: torch.Tensor,
         q_lora: torch.Tensor,
@@ -548,18 +537,7 @@ class Indexer(CustomOp):
                 topk=self.index_topk,
                 layer_id=layer_id,
             )
-
         return topk_result
-
-    def forward_cuda(
-        self,
-        x: torch.Tensor,
-        q_lora: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        layer_id: int,
-    ) -> Optional[torch.Tensor]:
-        return self._forward(x, q_lora, positions, forward_batch, layer_id)
 
     def forward_npu(
         self,
