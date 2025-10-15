@@ -3,7 +3,7 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.elastic_ep.elastic_ep import get_elastic_ep_state
+from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 from sglang.srt.eplb.eplb_algorithms import deepseek, deepseek_vec, elasticity_aware
 
 
@@ -55,7 +55,7 @@ def rebalance_experts(
             num_nodes=num_nodes,
             num_gpus=num_physical_experts // num_local_physical_experts,
             enable_hierarchical=True,
-            active_ranks=get_elastic_ep_state().active_ranks,
+            active_ranks=ElasticEPStateManager.instance().active_ranks,
         )
 
     raise NotImplementedError
