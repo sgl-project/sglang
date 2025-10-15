@@ -325,23 +325,6 @@ pub struct OutputTokensDetails {
 }
 
 impl UsageInfo {
-    /// TODO: remove this in tests if the test is not useful
-    /// Create usage info with cached token details
-    pub fn new_with_cached(
-        prompt_tokens: u32,
-        completion_tokens: u32,
-        reasoning_tokens: Option<u32>,
-        cached_tokens: u32,
-    ) -> Self {
-        Self {
-            prompt_tokens,
-            completion_tokens,
-            total_tokens: prompt_tokens + completion_tokens,
-            reasoning_tokens,
-            prompt_tokens_details: Some(PromptTokenUsageInfo { cached_tokens }),
-        }
-    }
-
     /// Convert to OpenAI Responses API format
     pub fn to_response_usage(&self) -> ResponseUsage {
         ResponseUsage {

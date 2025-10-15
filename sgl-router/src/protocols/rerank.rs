@@ -138,7 +138,7 @@ pub struct RerankResponse {
 }
 
 impl RerankResponse {
-    /// TODO: remove or move if the code is only used for uts
+    /// Create a new RerankResponse with the given results and model
     pub fn new(
         results: Vec<RerankResult>,
         model: String,

@@ -447,7 +447,16 @@ fn test_responses_response_creation() {
 
 #[test]
 fn test_usage_conversion() {
-    let usage_info = UsageInfo::new_with_cached(15, 25, Some(8), 3);
+    // Construct UsageInfo directly with cached token details
+    let usage_info = UsageInfo {
+        prompt_tokens: 15,
+        completion_tokens: 25,
+        total_tokens: 40,
+        reasoning_tokens: Some(8),
+        prompt_tokens_details: Some(sglang_router_rs::protocols::PromptTokenUsageInfo {
+            cached_tokens: 3,
+        }),
+    };
     let response_usage = usage_info.to_response_usage();
 
     assert_eq!(response_usage.input_tokens, 15);
