@@ -41,6 +41,9 @@ class DraftBackendFactory:
                 def init_forward_metadata(*args, **kwargs):
                     pass
 
+                def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+                    pass
+
             return DummyAttnBackend()
 
         backend_map = {
