@@ -623,14 +623,7 @@ class DeepseekV2MoE(nn.Module):
 
         self.top_k = config.num_experts_per_tok
 
-<<<<<<< HEAD
         if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
-=======
-        if get_moe_a2a_backend().is_none():
-            self._enable_a2a_moe = False
-        else:
-            self._enable_a2a_moe = True
->>>>>>> fa7d9d26a (Fix for more readable code)
             # TODO: we will support tp < ep in the future
             self.ep_size = get_moe_expert_parallel_world_size()
             self.num_experts = (
