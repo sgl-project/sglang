@@ -114,8 +114,8 @@ class EagleDraftWorker(BaseDraftWorker):
             self.speculative_num_steps * self.topk, self.speculative_num_draft_tokens
         )
 
-        self.plan_stream: CudaStream = torch.get_device_module(self.device).Stream()
         # TODO(lsyin): potential bugs with a separate plan stream
+        self.plan_stream: CudaStream = torch.get_device_module(self.device).Stream()
         self.plan_stream_ctx = torch.cuda.stream(self.plan_stream)
 
     def init_token_map(self):
@@ -184,6 +184,7 @@ class EagleDraftWorker(BaseDraftWorker):
         )
 
         self.draft_runner.draft_attn_backend = self.draft_attn_backend
+        self.tree_mask_mode = TreeMaskMode.FULL_MASK
 
     def init_cuda_graphs(self):
         """Capture cuda graphs."""
@@ -435,6 +436,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
         )
         self.padded_static_len = -1
 
+        self.req_to_token_pool, self.token_to_kv_pool_allocator = (
+            target_worker.get_memory_pool()
+        )
+
         # Override the context length of the draft model to be the same as the target model.
         server_args.context_length = target_worker.model_runner.model_config.context_len
 
@@ -447,7 +452,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
             (), dtype=torch.int64, device=self.device
         )
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
-        self.tree_mask_mode = TreeMaskMode.FULL_MASK
+
+        # TODO(lsyin): potential bugs with a separate plan stream
+        self.plan_stream: CudaStream = torch.get_device_module(self.device).Stream()
+        self.plan_stream_ctx = torch.cuda.stream(self.plan_stream)
 
     @property
     def target_worker(self):
