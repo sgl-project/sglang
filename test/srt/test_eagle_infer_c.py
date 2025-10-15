@@ -1,6 +1,6 @@
 import time
-from types import SimpleNamespace
 import unittest
+from types import SimpleNamespace
 
 import requests
 
@@ -14,6 +14,7 @@ from sglang.test.test_utils import (
     CustomTestCase,
     popen_launch_server,
 )
+
 
 class TestEAGLE3Server(CustomTestCase):
     @classmethod
@@ -84,6 +85,7 @@ class TestEAGLE3Server(CustomTestCase):
         # Wait a little bit so that the memory check happens.
         time.sleep(4)
 
+
 class TestEAGLE3Server2(TestEAGLE3Server):
     @classmethod
     def setUpClass(cls):
@@ -120,6 +122,7 @@ class TestEAGLE3Server2(TestEAGLE3Server):
                 "float16",
             ],
         )
+
 
 class TestEAGLE3Server3(TestEAGLE3Server):
     @classmethod
@@ -159,6 +162,7 @@ class TestEAGLE3Server3(TestEAGLE3Server):
                 "float16",
             ],
         )
+
 
 if __name__ == "__main__":
     unittest.main()
