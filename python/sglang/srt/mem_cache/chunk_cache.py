@@ -49,7 +49,7 @@ class ChunkCache(BasePrefixCache):
             last_host_node=None,
         )
 
-    def cache_finished_req(self, req: Req, insert: bool = True):
+    def cache_finished_req(self, req: Req, is_insert: bool = True):
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx,
             # For decode server: if req.output_ids is empty, we want to free all req.origin_input_ids

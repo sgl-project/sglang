@@ -30,6 +30,113 @@ pub enum PolicyType {
     PowerOfTwo,
 }
 
+#[pyclass(eq)]
+#[derive(Clone, PartialEq, Debug)]
+pub enum BackendType {
+    Sglang,
+    Openai,
+}
+
+#[pyclass(eq)]
+#[derive(Clone, PartialEq, Debug)]
+pub enum HistoryBackendType {
+    Memory,
+    None,
+    Oracle,
+}
+
+#[pyclass]
+#[derive(Clone, PartialEq)]
+pub struct PyOracleConfig {
+    #[pyo3(get, set)]
+    pub wallet_path: Option<String>,
+    #[pyo3(get, set)]
+    pub connect_descriptor: Option<String>,
+    #[pyo3(get, set)]
+    pub username: Option<String>,
+    #[pyo3(get, set)]
+    pub password: Option<String>,
+    #[pyo3(get, set)]
+    pub pool_min: usize,
+    #[pyo3(get, set)]
+    pub pool_max: usize,
+    #[pyo3(get, set)]
+    pub pool_timeout_secs: u64,
+}
+
+impl std::fmt::Debug for PyOracleConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PyOracleConfig")
+            .field("wallet_path", &self.wallet_path)
+            .field("connect_descriptor", &"<redacted>")
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .field("pool_min", &self.pool_min)
+            .field("pool_max", &self.pool_max)
+            .field("pool_timeout_secs", &self.pool_timeout_secs)
+            .finish()
+    }
+}
+
+#[pymethods]
+impl PyOracleConfig {
+    #[new]
+    #[pyo3(signature = (
+        password = None,
+        username = None,
+        connect_descriptor = None,
+        wallet_path = None,
+        pool_min = 1,
+        pool_max = 16,
+        pool_timeout_secs = 30,
+    ))]
+    fn new(
+        password: Option<String>,
+        username: Option<String>,
+        connect_descriptor: Option<String>,
+        wallet_path: Option<String>,
+        pool_min: usize,
+        pool_max: usize,
+        pool_timeout_secs: u64,
+    ) -> PyResult<Self> {
+        if pool_min == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "pool_min must be at least 1",
+            ));
+        }
+        if pool_max < pool_min {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "pool_max must be >= pool_min",
+            ));
+        }
+
+        Ok(PyOracleConfig {
+            wallet_path,
+            connect_descriptor,
+            username,
+            password,
+            pool_min,
+            pool_max,
+            pool_timeout_secs,
+        })
+    }
+}
+
+impl PyOracleConfig {
+    fn to_config_oracle(&self) -> config::OracleConfig {
+        // Simple conversion - validation happens later in validate_oracle()
+        config::OracleConfig {
+            wallet_path: self.wallet_path.clone(),
+            connect_descriptor: self.connect_descriptor.clone().unwrap_or_default(),
+            username: self.username.clone().unwrap_or_default(),
+            password: self.password.clone().unwrap_or_default(),
+            pool_min: self.pool_min,
+            pool_max: self.pool_max,
+            pool_timeout_secs: self.pool_timeout_secs,
+        }
+    }
+}
+
 #[pyclass]
 #[derive(Debug, Clone, PartialEq)]
 struct Router {
@@ -90,8 +197,12 @@ struct Router {
     connection_mode: config::ConnectionMode,
     model_path: Option<String>,
     tokenizer_path: Option<String>,
+    chat_template: Option<String>,
     reasoning_parser: Option<String>,
     tool_call_parser: Option<String>,
+    backend: BackendType,
+    history_backend: HistoryBackendType,
+    oracle_config: Option<PyOracleConfig>,
 }
 
 impl Router {
@@ -131,6 +242,10 @@ impl Router {
             RoutingMode::Regular {
                 worker_urls: vec![],
             }
+        } else if matches!(self.backend, BackendType::Openai) {
+            RoutingMode::OpenAI {
+                worker_urls: self.worker_urls.clone(),
+            }
         } else if self.pd_disaggregation {
             RoutingMode::PrefillDecode {
                 prefill_urls: self.prefill_urls.clone().unwrap_or_default(),
@@ -167,6 +282,20 @@ impl Router {
                 host: host.clone(),
             }),
             _ => None,
+        };
+
+        let history_backend = match self.history_backend {
+            HistoryBackendType::Memory => config::HistoryBackend::Memory,
+            HistoryBackendType::None => config::HistoryBackend::None,
+            HistoryBackendType::Oracle => config::HistoryBackend::Oracle,
+        };
+
+        let oracle = if matches!(self.history_backend, HistoryBackendType::Oracle) {
+            self.oracle_config
+                .as_ref()
+                .map(|cfg| cfg.to_config_oracle())
+        } else {
+            None
         };
 
         Ok(config::RouterConfig {
@@ -216,8 +345,9 @@ impl Router {
             enable_igw: self.enable_igw,
             model_path: self.model_path.clone(),
             tokenizer_path: self.tokenizer_path.clone(),
-            history_backend: config::HistoryBackend::Memory,
-            oracle: None,
+            chat_template: self.chat_template.clone(),
+            history_backend,
+            oracle,
             reasoning_parser: self.reasoning_parser.clone(),
             tool_call_parser: self.tool_call_parser.clone(),
         })
@@ -284,8 +414,12 @@ impl Router {
         rate_limit_tokens_per_second = None,
         model_path = None,
         tokenizer_path = None,
+        chat_template = None,
         reasoning_parser = None,
         tool_call_parser = None,
+        backend = BackendType::Sglang,
+        history_backend = HistoryBackendType::Memory,
+        oracle_config = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -345,8 +479,12 @@ impl Router {
         rate_limit_tokens_per_second: Option<i32>,
         model_path: Option<String>,
         tokenizer_path: Option<String>,
+        chat_template: Option<String>,
         reasoning_parser: Option<String>,
         tool_call_parser: Option<String>,
+        backend: BackendType,
+        history_backend: HistoryBackendType,
+        oracle_config: Option<PyOracleConfig>,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -420,8 +558,12 @@ impl Router {
             connection_mode,
             model_path,
             tokenizer_path,
+            chat_template,
             reasoning_parser,
             tool_call_parser,
+            backend,
+            history_backend,
+            oracle_config,
         })
     }
 
@@ -486,6 +628,9 @@ impl Router {
 #[pymodule]
 fn sglang_router_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PolicyType>()?;
+    m.add_class::<BackendType>()?;
+    m.add_class::<HistoryBackendType>()?;
+    m.add_class::<PyOracleConfig>()?;
     m.add_class::<Router>()?;
     Ok(())
 }

@@ -28,8 +28,8 @@ from sglang.srt.layers.attention.flashinfer_backend import (
     create_flashinfer_kv_indices_triton,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import (
     is_flashinfer_available,
@@ -193,9 +193,9 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.skip_prefill = skip_prefill
         self.enable_chunk_kv = (
             not skip_prefill
-            and global_server_args_dict["disaggregation_mode"] != "decode"
-            and not global_server_args_dict["disable_chunked_prefix_cache"]
-            and not global_server_args_dict["flashinfer_mla_disable_ragged"]
+            and get_global_server_args().disaggregation_mode != "decode"
+            and not get_global_server_args().disable_chunked_prefix_cache
+            and not get_global_server_args().flashinfer_mla_disable_ragged
         )
         self.page_size = model_runner.page_size
 
@@ -306,7 +306,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             prefix_lens = forward_batch.extend_prefix_lens
             extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
             use_ragged = (
-                not global_server_args_dict["flashinfer_mla_disable_ragged"]
+                not get_global_server_args().flashinfer_mla_disable_ragged
                 and extend_no_prefix
             )
 
@@ -916,7 +916,7 @@ class FlashInferMLAMultiStepDraftBackend:
         )
 
         self.attn_backends = []
-        for i in range(self.speculative_num_steps):
+        for i in range(self.speculative_num_steps - 1):
             self.attn_backends.append(
                 FlashInferMLAAttnBackend(
                     model_runner,
@@ -998,7 +998,7 @@ class FlashInferMLAMultiStepDraftBackend:
             device="cuda",
         )
 
-        for i in range(self.speculative_num_steps):
+        for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_cuda_graph_state(
                 max_bs, max_num_tokens, kv_indices_buf=self.cuda_graph_kv_indices[i]
             )
