@@ -49,12 +49,6 @@ FlashMLA FP8 KV cache is currently not working. See upstream issue [#8856](https
 - NSA is specifically designed for [DeepSeek V3.2 NSA](https://lmsys.org/blog/2025-09-29-deepseek-V32/).
 ```
 
-```{important}
-FlashInfer vs FlashInfer MLA:
-- FlashInfer MHA supports native `page_size > 1` and speculative decoding with `topk > 1`.
-- FlashInfer MLA currently supports `page_size = 1` only and speculative decoding with `topk = 1`.
-```
-
 ```{tip}
 Speculative decoding topk: `topk` is the number of draft tokens sampled per step from the draft model. `topk = 1` follows classic EAGLE; `topk > 1` explores multiple branches and requires backend support in both draft and verification paths.
 ```
