@@ -95,8 +95,10 @@ class EagleDraftWorker(BaseDraftWorker):
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             )
 
+        # Alias for better readability
         self.draft_runner = self.draft_worker.model_runner
 
+        self.init_token_map()
         self.init_lm_head()
 
         # Init attention backend and cuda graphs
@@ -115,6 +117,22 @@ class EagleDraftWorker(BaseDraftWorker):
         self.plan_stream: CudaStream = torch.get_device_module(self.device).Stream()
         # TODO(lsyin): potential bugs with a separate plan stream
         self.plan_stream_ctx = torch.cuda.stream(self.plan_stream)
+
+    def init_token_map(self):
+        # Load hot token ids
+        if self.speculative_algorithm.is_eagle3():
+            if self.server_args.speculative_token_map is not None:
+                logger.warning(
+                    "Speculative token map specified, but EAGLE3 models already have this. Ignoring the specified token map."
+                )
+            self.hot_token_id = None
+        elif self.server_args.speculative_token_map is not None:
+            self.hot_token_id = load_token_map(self.server_args.speculative_token_map)
+            self.server_args.json_model_override_args = (
+                f'{{"hot_vocab_size": {len(self.hot_token_id)}}}'
+            )
+        else:
+            self.hot_token_id = None
 
     def init_lm_head(self):
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
@@ -420,21 +438,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # Override the context length of the draft model to be the same as the target model.
         server_args.context_length = target_worker.model_runner.model_config.context_len
 
-        # Load hot token ids
-        if self.speculative_algorithm.is_eagle3():
-            if server_args.speculative_token_map is not None:
-                logger.warning(
-                    "Speculative token map specified, but EAGLE3 models already have this. Ignoring the specified token map."
-                )
-            self.hot_token_id = None
-        elif server_args.speculative_token_map is not None:
-            self.hot_token_id = load_token_map(server_args.speculative_token_map)
-            server_args.json_model_override_args = (
-                f'{{"hot_vocab_size": {len(self.hot_token_id)}}}'
-            )
-        else:
-            self.hot_token_id = None
-
         self._draft_worker = EagleDraftWorker(
             server_args, gpu_id, tp_rank, dp_rank, moe_ep_rank, nccl_port, target_worker
         )
@@ -518,7 +521,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Run target verify batch in the main compute stream
         forward_batch_output = self.target_worker.forward_batch_generation(
-            forward_batch=None,
+            model_worker_batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
             skip_attn_backend_init=True,
