@@ -9,6 +9,12 @@ pub mod test_app;
 
 use serde_json::json;
 use sglang_router_rs::config::RouterConfig;
+use sglang_router_rs::core::{LoadMonitor, WorkerRegistry};
+use sglang_router_rs::data_connector::{
+    MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
+};
+use sglang_router_rs::middleware::TokenBucket;
+use sglang_router_rs::policies::PolicyRegistry;
 use sglang_router_rs::protocols::spec::{Function, Tool};
 use sglang_router_rs::server::AppContext;
 use std::fs;
@@ -17,15 +23,58 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 /// Helper function to create AppContext for tests
 pub fn create_test_context(config: RouterConfig) -> Arc<AppContext> {
-    Arc::new(
-        AppContext::new(
-            config.clone(),
-            reqwest::Client::new(),
-            config.max_concurrent_requests,
-            config.rate_limit_tokens_per_second,
-        )
-        .expect("Failed to create AppContext in test"),
-    )
+    let client = reqwest::Client::new();
+
+    // Initialize rate limiter
+    let rate_limiter = match config.max_concurrent_requests {
+        n if n <= 0 => None,
+        n => {
+            let rate_limit_tokens = config
+                .rate_limit_tokens_per_second
+                .filter(|&t| t > 0)
+                .unwrap_or(n);
+            Some(Arc::new(TokenBucket::new(
+                n as usize,
+                rate_limit_tokens as usize,
+            )))
+        }
+    };
+
+    // Initialize registries
+    let worker_registry = Arc::new(WorkerRegistry::new());
+    let policy_registry = Arc::new(PolicyRegistry::new(config.policy.clone()));
+
+    // Initialize storage backends (Memory for tests)
+    let response_storage = Arc::new(MemoryResponseStorage::new());
+    let conversation_storage = Arc::new(MemoryConversationStorage::new());
+    let conversation_item_storage = Arc::new(MemoryConversationItemStorage::new());
+
+    // Initialize load monitor
+    let load_monitor = Some(Arc::new(LoadMonitor::new(
+        worker_registry.clone(),
+        policy_registry.clone(),
+        client.clone(),
+        config.worker_startup_check_interval_secs,
+    )));
+
+    // Create empty OnceLock for worker job queue
+    let worker_job_queue = Arc::new(OnceLock::new());
+
+    Arc::new(AppContext::new(
+        config,
+        client,
+        rate_limiter,
+        None, // tokenizer
+        None, // reasoning_parser_factory
+        None, // tool_parser_factory
+        worker_registry,
+        policy_registry,
+        response_storage,
+        conversation_storage,
+        conversation_item_storage,
+        load_monitor,
+        worker_job_queue,
+    ))
 }
 
 // Tokenizer download configuration

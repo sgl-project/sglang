@@ -15,8 +15,6 @@ use sglang_router_rs::config::{
     RouterConfig, RoutingMode,
 };
 use sglang_router_rs::routers::RouterFactory;
-use sglang_router_rs::server::AppContext;
-use std::sync::Arc;
 
 #[tokio::test]
 async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
@@ -83,10 +81,8 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
     };
 
     // Create router and context
-    let ctx = AppContext::new(router_cfg, reqwest::Client::new(), 64, None).expect("ctx");
-    let router = RouterFactory::create_router(&Arc::new(ctx))
-        .await
-        .expect("router");
+    let ctx = common::create_test_context(router_cfg);
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Build a simple ResponsesRequest that will trigger the tool call
     let req = ResponsesRequest {
@@ -284,10 +280,8 @@ async fn test_conversations_crud_basic() {
         tool_call_parser: None,
     };
 
-    let ctx = AppContext::new(router_cfg, reqwest::Client::new(), 8, None).expect("ctx");
-    let router = RouterFactory::create_router(&Arc::new(ctx))
-        .await
-        .expect("router");
+    let ctx = common::create_test_context(router_cfg);
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create
     let create_body = serde_json::json!({ "metadata": { "project": "alpha" } });
@@ -616,10 +610,8 @@ async fn test_multi_turn_loop_with_mcp() {
         tool_call_parser: None,
     };
 
-    let ctx = AppContext::new(router_cfg, reqwest::Client::new(), 64, None).expect("ctx");
-    let router = RouterFactory::create_router(&Arc::new(ctx))
-        .await
-        .expect("router");
+    let ctx = common::create_test_context(router_cfg);
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Build request with MCP tools
     let req = ResponsesRequest {
@@ -794,10 +786,8 @@ async fn test_max_tool_calls_limit() {
         tool_call_parser: None,
     };
 
-    let ctx = AppContext::new(router_cfg, reqwest::Client::new(), 64, None).expect("ctx");
-    let router = RouterFactory::create_router(&Arc::new(ctx))
-        .await
-        .expect("router");
+    let ctx = common::create_test_context(router_cfg);
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     let req = ResponsesRequest {
         background: Some(false),
@@ -938,10 +928,8 @@ async fn setup_streaming_mcp_test() -> (
         tool_call_parser: None,
     };
 
-    let ctx = AppContext::new(router_cfg, reqwest::Client::new(), 64, None).expect("ctx");
-    let router = RouterFactory::create_router(&Arc::new(ctx))
-        .await
-        .expect("router");
+    let ctx = common::create_test_context(router_cfg);
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     (mcp, worker, router, dir)
 }
@@ -1381,10 +1369,8 @@ async fn test_conversation_items_create_and_get() {
         tool_call_parser: None,
     };
 
-    let ctx = AppContext::new(router_cfg, reqwest::Client::new(), 8, None).expect("ctx");
-    let router = RouterFactory::create_router(&Arc::new(ctx))
-        .await
-        .expect("router");
+    let ctx = common::create_test_context(router_cfg);
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create conversation
     let create_conv = serde_json::json!({});
@@ -1484,10 +1470,8 @@ async fn test_conversation_items_delete() {
         tool_call_parser: None,
     };
 
-    let ctx = AppContext::new(router_cfg, reqwest::Client::new(), 8, None).expect("ctx");
-    let router = RouterFactory::create_router(&Arc::new(ctx))
-        .await
-        .expect("router");
+    let ctx = common::create_test_context(router_cfg);
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create conversation
     let create_conv = serde_json::json!({});
@@ -1593,10 +1577,8 @@ async fn test_conversation_items_max_limit() {
         tool_call_parser: None,
     };
 
-    let ctx = AppContext::new(router_cfg, reqwest::Client::new(), 8, None).expect("ctx");
-    let router = RouterFactory::create_router(&Arc::new(ctx))
-        .await
-        .expect("router");
+    let ctx = common::create_test_context(router_cfg);
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create conversation
     let create_conv = serde_json::json!({});
@@ -1672,10 +1654,8 @@ async fn test_conversation_items_unsupported_type() {
         tool_call_parser: None,
     };
 
-    let ctx = AppContext::new(router_cfg, reqwest::Client::new(), 8, None).expect("ctx");
-    let router = RouterFactory::create_router(&Arc::new(ctx))
-        .await
-        .expect("router");
+    let ctx = common::create_test_context(router_cfg);
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create conversation
     let create_conv = serde_json::json!({});
@@ -1750,10 +1730,8 @@ async fn test_conversation_items_multi_conversation_sharing() {
         tool_call_parser: None,
     };
 
-    let ctx = AppContext::new(router_cfg, reqwest::Client::new(), 8, None).expect("ctx");
-    let router = RouterFactory::create_router(&Arc::new(ctx))
-        .await
-        .expect("router");
+    let ctx = common::create_test_context(router_cfg);
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create two conversations
     let conv_a_resp = router
