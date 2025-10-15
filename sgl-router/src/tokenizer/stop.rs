@@ -144,20 +144,40 @@ impl StopSequenceDecoder {
             }
         }
 
-        // Check for partial matches using simple prefix matching
+        // Check for partial matches: is the end of jail_buffer the start of any stop_seq?
+        // This handles stop sequences split across tokens
+        let mut longest_partial = 0;
         for stop_seq in self.config.stop_sequences.iter().chain(&self.config.visible_stop_sequences) {
-            if stop_seq.starts_with(&self.jail_buffer) {
-                // Partial match - hold and wait for more tokens
-                return Ok(SequenceDecoderOutput::Held);
+            // Check suffixes of jail_buffer that match prefixes of stop_seq
+            // We check up to stop_seq.len() - 1 to avoid rechecking exact matches
+            let max_len = self.jail_buffer.len().min(stop_seq.len() - 1);
+            for len in 1..=max_len {
+                let suffix = &self.jail_buffer[self.jail_buffer.len() - len..];
+                if stop_seq.starts_with(suffix) {
+                    longest_partial = longest_partial.max(len);
+                }
             }
         }
 
-        // No matches - flush the jail buffer
-        let output = std::mem::take(&mut self.jail_buffer);
-        if output.is_empty() {
-            Ok(SequenceDecoderOutput::Held)
+        if longest_partial > 0 {
+            // Hold the partial match, flush the rest
+            let split_pos = self.jail_buffer.len() - longest_partial;
+            let to_output = self.jail_buffer[..split_pos].to_string();
+            self.jail_buffer = self.jail_buffer[split_pos..].to_string();
+
+            if to_output.is_empty() {
+                Ok(SequenceDecoderOutput::Held)
+            } else {
+                Ok(SequenceDecoderOutput::Text(to_output))
+            }
         } else {
-            Ok(SequenceDecoderOutput::Text(output))
+            // No partial matches - flush everything
+            let output = std::mem::take(&mut self.jail_buffer);
+            if output.is_empty() {
+                Ok(SequenceDecoderOutput::Held)
+            } else {
+                Ok(SequenceDecoderOutput::Text(output))
+            }
         }
     }
 
