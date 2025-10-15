@@ -46,18 +46,17 @@ FlashMLA FP8 KV cache is currently not working. See upstream issue [#8856](https
 
 ```{note}
 - FlashAttention 4 is prefill-only for now.
-- FlexAttention and Torch Native do not currently support MLA.
-- NSA is specifically designed for DeepSeek V3.2.
+- NSA is specifically designed for [DeepSeek V3.2 NSA](https://lmsys.org/blog/2025-09-29-deepseek-V32/).
 ```
 
 ```{important}
 FlashInfer vs FlashInfer MLA:
-- FlashInfer MHA supports native page_size > 1 and speculative decoding with topk > 1.
-- FlashInfer MLA currently supports page_size = 1 only and speculative decoding with topk = 1.
+- FlashInfer MHA supports native `page_size > 1` and speculative decoding with `topk > 1`.
+- FlashInfer MLA currently supports `page_size = 1` only and speculative decoding with `topk = 1`.
 ```
 
 ```{tip}
-Speculative decoding topk: "topk" is the number of draft tokens sampled per step from the draft model. topk = 1 follows classic EAGLE; topk > 1 explores multiple branches and requires backend support in both draft and verification paths.
+Speculative decoding topk: `topk` is the number of draft tokens sampled per step from the draft model. `topk = 1` follows classic EAGLE; `topk > 1` explores multiple branches and requires backend support in both draft and verification paths.
 ```
 
 Note: Many backends that do not natively operate on pages can emulate `page_size > 1` at the wrapper layer by expanding page tables to per-token indices. The "Page Size > 1 (native)" column indicates true in-kernel paging. Some backends require fixed native page sizes and cannot be reduced/emulated differently: TRTLLM MHA (16/32/64), TRTLLM MLA (32/64), FlashMLA (64), Cutlass MLA (128), Ascend (128).
