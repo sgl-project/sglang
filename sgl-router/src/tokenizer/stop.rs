@@ -147,7 +147,12 @@ impl StopSequenceDecoder {
         // Check for partial matches: is the end of jail_buffer the start of any stop_seq?
         // This handles stop sequences split across tokens
         let mut longest_partial = 0;
-        for stop_seq in self.config.stop_sequences.iter().chain(&self.config.visible_stop_sequences) {
+        for stop_seq in self
+            .config
+            .stop_sequences
+            .iter()
+            .chain(&self.config.visible_stop_sequences)
+        {
             // Check suffixes of jail_buffer that match prefixes of stop_seq
             // We check up to stop_seq.len() - 1 to avoid rechecking exact matches
             let max_len = self.jail_buffer.len().min(stop_seq.len() - 1);

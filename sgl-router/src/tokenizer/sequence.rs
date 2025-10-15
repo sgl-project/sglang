@@ -118,7 +118,9 @@ impl Sequence {
 
         // If this is the first token or we're at the beginning, decode everything
         if self.prefix_offset == 0 && old_read_offset == 0 {
-            let text = self.tokenizer.decode(&self.token_ids, self.skip_special_tokens)?;
+            let text = self
+                .tokenizer
+                .decode(&self.token_ids, self.skip_special_tokens)?;
             if text.ends_with("�") {
                 // Incomplete UTF-8 sequence, wait for more tokens
                 return Ok(String::new());
@@ -128,14 +130,16 @@ impl Sequence {
         }
 
         // Decode the text up to the previous position
-        let prefix_text = self
-            .tokenizer
-            .decode(&self.token_ids[self.prefix_offset..old_read_offset], self.skip_special_tokens)?;
+        let prefix_text = self.tokenizer.decode(
+            &self.token_ids[self.prefix_offset..old_read_offset],
+            self.skip_special_tokens,
+        )?;
 
         // Decode the text including the new token
-        let new_text = self
-            .tokenizer
-            .decode(&self.token_ids[self.prefix_offset..], self.skip_special_tokens)?;
+        let new_text = self.tokenizer.decode(
+            &self.token_ids[self.prefix_offset..],
+            self.skip_special_tokens,
+        )?;
 
         // Handle multi-byte character boundaries
         let mut prefix_text_len = prefix_text.len();
@@ -170,7 +174,8 @@ impl Sequence {
 
     /// Decode the entire sequence to text
     pub fn text(&self) -> Result<String> {
-        self.tokenizer.decode(&self.token_ids, self.skip_special_tokens)
+        self.tokenizer
+            .decode(&self.token_ids, self.skip_special_tokens)
     }
 
     /// Get the prefix offset
