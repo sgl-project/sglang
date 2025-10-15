@@ -40,6 +40,7 @@ from sglang.srt.speculative.eagle_utils import (
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     assign_draft_cache_locs,
+    detect_nan,
     draft_tp_context,
     fast_topk,
     generate_token_bitmask,
@@ -598,7 +599,8 @@ class EAGLEWorker(TpModelWorker):
             logits_output, _ = self.draft_model_runner.forward(
                 forward_batch, skip_attn_backend_init=True
             )
-            self._detect_nan_if_needed(logits_output)
+            if self.server_args.enable_nan_detection:
+                detect_nan(logits_output)
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             if self.hot_token_id is not None:
@@ -666,7 +668,9 @@ class EAGLEWorker(TpModelWorker):
                 # and will be applied to produce wrong results
                 batch.sampling_info.vocab_mask = None
 
-        self._detect_nan_if_needed(logits_output)
+        if self.enable_nan_detection:
+            detect_nan(logits_output)
+
         spec_info.hidden_states = logits_output.hidden_states
         res: EagleVerifyOutput = spec_info.verify(
             batch,
@@ -819,7 +823,8 @@ class EAGLEWorker(TpModelWorker):
         )
         forward_batch.return_logprob = False
         logits_output, _ = self.draft_model_runner.forward(forward_batch)
-        self._detect_nan_if_needed(logits_output)
+        if self.enable_nan_detection:
+            detect_nan(logits_output)
         assert isinstance(forward_batch.spec_info, EagleDraftInput)
         assert forward_batch.spec_info is batch.spec_info
         self.capture_for_decode(logits_output, forward_batch.spec_info)
@@ -914,7 +919,8 @@ class EAGLEWorker(TpModelWorker):
             )
             self.capture_for_decode(logits_output, forward_batch.spec_info)
 
-        self._detect_nan_if_needed(logits_output)
+        if self.enable_nan_detection:
+            detect_nan(logits_output)
 
         # Restore backup.
         # This is because `seq_lens` can be modified in `prepare_extend_after_decode`
@@ -933,13 +939,6 @@ class EAGLEWorker(TpModelWorker):
         probs = torch.softmax(logits_output.next_token_logits, dim=-1)
         draft_input.topk_p, draft_input.topk_index = fast_topk(probs, self.topk, dim=-1)
         draft_input.hidden_states = logits_output.hidden_states
-
-    def _detect_nan_if_needed(self, logits_output: LogitsProcessorOutput):
-        if self.enable_nan_detection:
-            logits = logits_output.next_token_logits
-            if torch.any(torch.isnan(logits)):
-                logger.error("Detected errors during sampling! NaN in the logits.")
-                raise ValueError("Detected errors during sampling! NaN in the logits.")
 
 
 @torch.compile(dynamic=True)

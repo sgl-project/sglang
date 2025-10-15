@@ -30,7 +30,11 @@ from sglang.srt.speculative.eagle_info_v2 import (
 )
 from sglang.srt.speculative.eagle_utils import TreeMaskMode, build_tree_kernel_efficient
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.spec_utils import draft_tp_context, load_token_map
+from sglang.srt.speculative.spec_utils import (
+    detect_nan,
+    draft_tp_context,
+    load_token_map,
+)
 from sglang.srt.utils.common import (
     empty_context,
     fast_topk,
@@ -336,7 +340,8 @@ class EagleDraftWorker(BaseDraftWorker):
             logits_output = self.draft_runner.model.forward(
                 forward_batch.input_ids, forward_batch.positions, forward_batch
             )
-            self._detect_nan_if_needed(logits_output)
+            if self.server_args.enable_nan_detection:
+                detect_nan(logits_output)
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             if self.hot_token_id is not None:
@@ -537,7 +542,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
         logits_output = forward_batch_output.logits_output
 
         # Sample
-        self._detect_nan_if_needed(logits_output)
+        if self.enable_nan_detection:
+            detect_nan(logits_output)
         (
             predict,
             accept_length,
@@ -672,13 +678,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
             tgt_cache_loc, accepted_out_cache_loc
         )
-
-    def _detect_nan_if_needed(self, logits_output: LogitsProcessorOutput):
-        if self.enable_nan_detection:
-            logits = logits_output.next_token_logits
-            if torch.any(torch.isnan(logits)):
-                logger.error("Detected errors during sampling! NaN in the logits.")
-                raise ValueError("Detected errors during sampling! NaN in the logits.")
 
 
 def free_spec_dec_tokens_page_size_1(

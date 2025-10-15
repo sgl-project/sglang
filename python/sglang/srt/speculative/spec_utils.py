@@ -17,6 +17,7 @@ from sglang.srt.distributed.parallel_state import (
     patch_tensor_parallel_group,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.utils import is_cuda, is_hip
 
@@ -629,3 +630,10 @@ def draft_tp_context(tp_group: GroupCoordinator):
     # We disable mscclpp now because it doesn't support 2 comm groups.
     with patch_tensor_parallel_group(tp_group):
         yield
+
+
+def detect_nan(logits_output: LogitsProcessorOutput):
+    logits = logits_output.next_token_logits
+    if torch.any(torch.isnan(logits)):
+        logger.error("Detected errors during sampling! NaN in the logits.")
+        raise ValueError("Detected errors during sampling! NaN in the logits.")
