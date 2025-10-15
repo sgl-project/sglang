@@ -225,15 +225,18 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             output_strs.append(incremental_output)
 
         return BatchStrOutput(
-            rids=recv_obj.rids,
+            spec_verify_ct=recv_obj.spec_verify_ct,
+            spec_accepted_tokens=recv_obj.spec_accepted_tokens,
+            queue_time=recv_obj.queue_time,
+            inference_start_time=recv_obj.inference_start_time,
+            prefill_delay=recv_obj.prefill_delay,
+            prefill_latency=recv_obj.prefill_latency,
             finished_reasons=recv_obj.finished_reasons,
             output_strs=output_strs,
             output_ids=recv_obj.decode_ids,
             prompt_tokens=recv_obj.prompt_tokens,
             completion_tokens=recv_obj.completion_tokens,
             cached_tokens=recv_obj.cached_tokens,
-            spec_verify_ct=recv_obj.spec_verify_ct,
-            spec_accepted_tokens=recv_obj.spec_accepted_tokens,
             input_token_logprobs_val=recv_obj.input_token_logprobs_val,
             input_token_logprobs_idx=recv_obj.input_token_logprobs_idx,
             output_token_logprobs_val=recv_obj.output_token_logprobs_val,
@@ -250,11 +253,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             output_hidden_states=recv_obj.output_hidden_states,
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
-            queue_time=recv_obj.queue_time,
-            inference_start_time=recv_obj.inference_start_time,
-            prefill_delay=recv_obj.prefill_delay,
-            prefill_latency=recv_obj.prefill_latency,
             token_steps=recv_obj.token_steps,
+            rids=recv_obj.rids,
         )
 
     def handle_multimodal_decode_req(self, recv_obj: BatchMultimodalDecodeReq):

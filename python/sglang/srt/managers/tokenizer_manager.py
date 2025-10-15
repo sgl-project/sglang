@@ -1437,42 +1437,8 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 state.finished_time_perf = time.perf_counter()
                 meta_info["e2e_latency"] = state.finished_time - state.created_time
 
-                # Timing metrics
-                if state.created_time > 0:
-                    meta_info["request_received_ts"] = state.created_time
-                if state.request_scheduled_ts > 0:
-                    meta_info["request_scheduled_ts"] = state.request_scheduled_ts
-                # For embeddings, there's no separate prefill phase, so omit prefill_finished_ts.
-                if not isinstance(recv_obj, BatchEmbeddingOutput):
-                    if state.first_token_time > 0:
-                        meta_info["prefill_finished_ts"] = state.first_token_time
-                if state.response_sent_ts > 0:
-                    meta_info["response_sent_ts"] = state.response_sent_ts
-                if state.finished_time > 0:
-                    meta_info["decode_finished_ts"] = state.finished_time
-
-                if (
-                    hasattr(recv_obj, "inference_start_time")
-                    and recv_obj.inference_start_time
-                    and recv_obj.inference_start_time[i] is not None
-                    and state.finished_time_perf > 0.0
-                ):
-                    inference_time = (
-                        state.finished_time_perf - recv_obj.inference_start_time[i]
-                    )
-                    meta_info["inference_time"] = inference_time
-
-                # Decode throughput, time per token
-                if (
-                    state.first_token_time_perf > 0.0
-                    and state.finished_time_perf > 0.0
-                    and not isinstance(recv_obj, BatchEmbeddingOutput)
-                    and recv_obj.completion_tokens[i] > 0
-                ):
-                    decode_time = state.finished_time_perf - state.first_token_time_perf
-                    completion_tokens = recv_obj.completion_tokens[i]
-                    meta_info["decode_throughput"] = completion_tokens / decode_time
-                    meta_info["time_per_token"] = decode_time / completion_tokens
+                # Calculate timing metrics
+                self._calculate_timing_metrics(meta_info, state, recv_obj, i)
 
                 trace_req_finish(rid, ts=int(state.finished_time * 1e9))
 
@@ -1654,6 +1620,57 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 meta_info["spec_accept_length"] = (
                     recv_obj.completion_tokens[i] / recv_obj.spec_verify_ct[i]
                 )
+
+    def _calculate_timing_metrics(
+        self,
+        meta_info: Dict[str, Any],
+        state: ReqState,
+        recv_obj: Union[
+            BatchStrOutput,
+            BatchEmbeddingOutput,
+            BatchMultimodalOutput,
+            BatchTokenIDOutput,
+        ],
+        i: int,
+    ) -> None:
+        """Calculate request-level timing metrics, such as inference time, decode throughput, and time per token."""
+        # Request timing timestamps.
+        if state.created_time > 0:
+            meta_info["request_received_ts"] = state.created_time
+        if state.request_scheduled_ts > 0:
+            meta_info["request_scheduled_ts"] = state.request_scheduled_ts
+        # For embeddings, there's no separate prefill phase, so omit `prefill_finished_ts`.
+        if (
+            not isinstance(recv_obj, BatchEmbeddingOutput)
+            and state.first_token_time > 0
+        ):
+            meta_info["prefill_finished_ts"] = state.first_token_time
+        if state.response_sent_ts > 0:
+            meta_info["response_sent_ts"] = state.response_sent_ts
+        if state.finished_time > 0:
+            meta_info["decode_finished_ts"] = state.finished_time
+
+        # Inference time calculation.
+        if (
+            hasattr(recv_obj, "inference_start_time")
+            and recv_obj.inference_start_time
+            and recv_obj.inference_start_time[i] is not None
+            and state.finished_time_perf > 0.0
+        ):
+            inference_time = state.finished_time_perf - recv_obj.inference_start_time[i]
+            meta_info["inference_time"] = inference_time
+
+        # Decode throughput, time per token calculation. Only calculated if TTFT is available.
+        if (
+            state.first_token_time_perf > 0.0
+            and state.finished_time_perf > 0.0
+            and not isinstance(recv_obj, BatchEmbeddingOutput)
+            and recv_obj.completion_tokens[i] > 0
+        ):
+            decode_time = state.finished_time_perf - state.first_token_time_perf
+            completion_tokens = recv_obj.completion_tokens[i]
+            meta_info["decode_throughput"] = completion_tokens / decode_time
+            meta_info["time_per_token"] = decode_time / completion_tokens
 
     def collect_metrics(self, state: ReqState, recv_obj: BatchStrOutput, i: int):
         completion_tokens = (

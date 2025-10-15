@@ -59,6 +59,44 @@ class BaseBatchReq(ABC):
         return self.rids
 
 
+@dataclass
+class RequestTimingMetricsMixin:
+    """
+    Mixin class containing common request-level timing metrics.
+
+    This class consolidates the timing metrics that are shared across all batch output types
+    to avoid code duplication and ensure consistency.
+    """
+
+    # Queue duration: time spent waiting in queue before request is scheduled.
+    queue_time: List[Optional[float]]
+
+    # Inference start time: timestamp when inference computation begins (start of prefill).
+    inference_start_time: List[Optional[float]]
+
+    # Prefill delay: time spent waiting before prefill starts
+    prefill_delay: List[Optional[float]]
+
+    # Prefill latency: time spent during prefill computation
+    prefill_latency: List[Optional[float]]
+
+
+@dataclass
+class SpeculativeDecodingMetricsMixin:
+    """
+    Mixin class containing speculative decoding metrics.
+
+    This class consolidates speculative decoding metrics that are shared across
+    batch output types that support speculative decoding to avoid code duplication.
+    """
+
+    # Verify count: number of verification forward passes
+    spec_verify_ct: List[int]
+
+    # Accepted tokens: Number of accepted tokens during speculative decoding
+    spec_accepted_tokens: List[int]
+
+
 # Parameters for a session
 @dataclass
 class SessionParams:
@@ -811,7 +849,9 @@ class BatchTokenizedEmbeddingReqInput(BaseBatchReq):
 
 
 @dataclass
-class BatchTokenIDOutput(BaseBatchReq):
+class BatchTokenIDOutput(
+    BaseBatchReq, RequestTimingMetricsMixin, SpeculativeDecodingMetricsMixin
+):
     # The finish reason
     finished_reasons: List[BaseFinishReason]
     # For incremental decoding
@@ -829,8 +869,6 @@ class BatchTokenIDOutput(BaseBatchReq):
     prompt_tokens: List[int]
     completion_tokens: List[int]
     cached_tokens: List[int]
-    spec_verify_ct: List[int]
-    spec_accepted_tokens: List[int]
 
     # Logprobs
     input_token_logprobs_val: List[float]
@@ -856,22 +894,12 @@ class BatchTokenIDOutput(BaseBatchReq):
     placeholder_tokens_idx: List[Optional[List[int]]]
     placeholder_tokens_val: List[Optional[List[int]]]
 
-    # Queue duration
-    queue_time: List[Optional[float]]
-
-    # Inference start time
-    inference_start_time: List[Optional[float]]
-
-    # Prefill timing metrics
-    prefill_delay: List[Optional[float]]
-    prefill_latency: List[Optional[float]]
-
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
 
 
 @dataclass
-class BatchMultimodalDecodeReq(BaseBatchReq):
+class BatchMultimodalDecodeReq(BaseBatchReq, RequestTimingMetricsMixin):
     decoded_ids: List[int]
     input_token_logprobs_val: List[float]
     input_token_logprobs_idx: List[int]
@@ -896,22 +924,14 @@ class BatchMultimodalDecodeReq(BaseBatchReq):
     placeholder_tokens_idx: List[Optional[List[int]]]
     placeholder_tokens_val: List[Optional[List[int]]]
 
-    # Queue duration
-    queue_time: List[Optional[float]]
-
-    # Inference start time
-    inference_start_time: List[Optional[float]]
-
-    # Prefill timing metrics
-    prefill_delay: List[Optional[float]]
-    prefill_latency: List[Optional[float]]
-
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
 
 
 @dataclass
-class BatchStrOutput(BaseBatchReq):
+class BatchStrOutput(
+    BaseBatchReq, RequestTimingMetricsMixin, SpeculativeDecodingMetricsMixin
+):
     # The finish reason
     finished_reasons: List[dict]
     # The output decoded strings
@@ -923,8 +943,6 @@ class BatchStrOutput(BaseBatchReq):
     prompt_tokens: List[int]
     completion_tokens: List[int]
     cached_tokens: List[int]
-    spec_verify_ct: List[int]
-    spec_accepted_tokens: List[int]
 
     # Logprobs
     input_token_logprobs_val: List[float]
@@ -950,22 +968,12 @@ class BatchStrOutput(BaseBatchReq):
     placeholder_tokens_idx: List[Optional[List[int]]]
     placeholder_tokens_val: List[Optional[List[int]]]
 
-    # Queue duration
-    queue_time: List[Optional[float]]
-
-    # Inference start time
-    inference_start_time: List[Optional[float]]
-
-    # Prefill timing metrics
-    prefill_delay: List[Optional[float]]
-    prefill_latency: List[Optional[float]]
-
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
 
 
 @dataclass
-class BatchMultimodalOutput(BaseBatchReq):
+class BatchMultimodalOutput(BaseBatchReq, RequestTimingMetricsMixin):
     # The finish reason
     finished_reasons: List[dict]
     decoded_ids: List[List[int]]
@@ -986,21 +994,11 @@ class BatchMultimodalOutput(BaseBatchReq):
     placeholder_tokens_idx: List[Optional[List[int]]]
     placeholder_tokens_val: List[Optional[List[int]]]
 
-    # Queue duration
-    queue_time: List[Optional[float]]
-
-    # Inference start time
-    inference_start_time: List[Optional[float]]
-
-    # Prefill timing metrics
-    prefill_delay: List[Optional[float]]
-    prefill_latency: List[Optional[float]]
-
     return_bytes: List[bool]
 
 
 @dataclass
-class BatchEmbeddingOutput(BaseBatchReq):
+class BatchEmbeddingOutput(BaseBatchReq, RequestTimingMetricsMixin):
     # The finish reason
     finished_reasons: List[BaseFinishReason]
     # The output embedding
@@ -1011,16 +1009,6 @@ class BatchEmbeddingOutput(BaseBatchReq):
     # Placeholder token info
     placeholder_tokens_idx: List[Optional[List[int]]]
     placeholder_tokens_val: List[Optional[List[int]]]
-
-    # Queue duration
-    queue_time: List[Optional[float]]
-
-    # Inference start time
-    inference_start_time: List[Optional[float]]
-
-    # Prefill timing metrics
-    prefill_delay: List[Optional[float]]
-    prefill_latency: List[Optional[float]]
 
 
 @dataclass
