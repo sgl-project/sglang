@@ -149,7 +149,7 @@ from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
-from sglang.srt.multiplex.multiplexing import SchedulerMultiplexMixin
+from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.multiplex.pdmux_context import (
     get_sm_counts,
     get_stream_groups,
@@ -2326,7 +2326,7 @@ class Scheduler(
             if self.enable_trace:
                 trace_slice_batch("decode loop", batch.reqs)
 
-        elif batch.forward_mode.is_extend() or batch.forward_mode.is_split_prefill():
+        elif batch.forward_mode.is_extend():
             self.process_batch_result_prefill(batch, result)
             if self.enable_trace:
                 trace_slice_batch("prefill", batch.reqs)
