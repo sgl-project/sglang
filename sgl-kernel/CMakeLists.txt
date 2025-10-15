@@ -118,7 +118,7 @@ FetchContent_Populate(repo-mscclpp)
 FetchContent_Declare(
     repo-fast-hadamard-transform
     GIT_REPOSITORY https://github.com/sgl-project/fast-hadamard-transform.git
-    GIT_TAG sgl
+    GIT_TAG 48f3c13764dc2ec662ade842a4696a90a137f1bc
     GIT_SHALLOW OFF
 )
 FetchContent_Populate(repo-fast-hadamard-transform)
