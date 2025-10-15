@@ -1904,10 +1904,15 @@ async def benchmark(
                 accept_length = server_info_json.get(
                     "avg_spec_accept_length", None
                 )
-            else:
+            elif (
+                "internal_states" in server_info_json
+                and server_info_json["internal_states"]
+            ):
                 accept_length = server_info_json["internal_states"][0].get(
                     "avg_spec_accept_length", None
                 )
+            else:
+                accept_length = None
         else:
             accept_length = None
     else:
