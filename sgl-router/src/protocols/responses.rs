@@ -779,10 +779,8 @@ impl ResponsesResponse {
     }
 
     /// Create a response from a request
-    #[allow(clippy::too_many_arguments)]
     pub fn from_request(
         request: &ResponsesRequest,
-        _sampling_params: &HashMap<String, Value>,
         model_name: String,
         created_time: i64,
         output: Vec<ResponseOutputItem>,
