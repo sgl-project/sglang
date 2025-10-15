@@ -74,17 +74,16 @@ class NaiveDecodeSparseRetriver:
         self.cache_manager._retrive_cache_indices =  self._retrive_cache_indices
         self.cache_manager._call_after_update_query = self._call_after_update_query
         
-    def update_extend(self, forward_batch: "ForwardBatch"):
-        for layer_id in range(self.cache_manager.config.num_layers):
-            proxy_k_tensor_extend(
-                key_cache=self.cache_manager.config.keys[layer_id],
-                seq_lens=forward_batch.seq_lens,
-                prefix_lens=forward_batch.extend_prefix_lens,
-                req_pool_indices=forward_batch.req_pool_indices,
-                req_to_token=forward_batch.req_to_token_pool.req_to_token,
-                page_size=self.cache_manager.config.page_size,
-                proxy_k_tensor=self.cache_manager.retrived_query[layer_id].proxy_k_tensor,
-            )
+    def update_extend(self, forward_batch: "ForwardBatch", layer_id: int):  
+        proxy_k_tensor_extend(
+            key_cache=self.cache_manager.config.keys[layer_id],
+            seq_lens=forward_batch.seq_lens,
+            prefix_lens=forward_batch.extend_prefix_lens,
+            req_pool_indices=forward_batch.req_pool_indices,
+            req_to_token=forward_batch.req_to_token_pool.req_to_token,
+            page_size=self.cache_manager.config.page_size,
+            proxy_k_tensor=self.cache_manager.retrived_query[layer_id].proxy_k_tensor,
+        )
 
     def build_stream(self, forward_batch: "ForwardBatch", metadata: "FlashAttentionMetadata") -> "FlashAttentionMetadata":
         if not self.cache_manager.config.async_retrive:
@@ -173,9 +172,6 @@ class NaiveDecodeSparseRetriver:
         num_heads = retrived_cache_indices.shape[1]
         stream_len = self.stream_indices_page.shape[1]
         stream_indices_expanded = self.stream_indices_page.unsqueeze(1).expand(bs, num_heads, stream_len)
-        # cuda graph for sync retrive
-        # retrived_cache_indices[:bs, :, self.top_k:(self.stream_len+self.top_k)].copy_(stream_indices_expanded)
-        # return retrived_cache_indices.reshape(bs * num_heads, -1)
         combined_page_indices = torch.cat([retrived_cache_indices[:bs], stream_indices_expanded], dim=2).reshape(bs * num_heads, self.cache_manager.config.top_k + stream_len)
         return combined_page_indices
         
@@ -198,7 +194,7 @@ class NaiveDecodeSparseRetriver:
         
     
     def retrive_decode(self, query: torch.Tensor, forward_batch: "ForwardBatch", metadata: "FlashAttentionMetadata", layer: "RadixAttention"):
-        self.cache_manager.update_query(query, forward_batch.req_pool_indices, forward_batch.seq_lens, metadata.cu_seqlens_k, metadata.max_seq_len_k, layer.layer_id)
+        self.cache_manager.update_query(query, forward_batch.req_pool_indices, forward_batch.seq_lens, layer.layer_id)
         
         device = forward_batch.seq_lens.device
         positions_in_page = ((forward_batch.seq_lens - 1) % self.cache_manager.config.page_size).to(torch.int32)

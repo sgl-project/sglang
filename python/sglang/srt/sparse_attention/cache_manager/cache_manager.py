@@ -21,6 +21,8 @@ class ManagerConfig:
     device: torch.device
     async_retrive: bool
     num_layers: int
+    num_q_heads: int
+    q_dtype: torch.dtype
     top_k: int
     stream_budget: Tuple[int, int]
     
@@ -30,13 +32,14 @@ class ManagerConfig:
     
 class RetriveQuery:
     def __init__(self, config: ManagerConfig):
-        self.query = None
-        self.req_pool_indices = None
-        self.seq_lens = None
-        self.cu_seq_len_k = None
-        self.updated = False
-        self.max_seq_len_k = None
-
+        self.query = torch.empty(config.max_bs, config.num_q_heads*config.keys[0].shape[2], device=config.device, dtype=config.q_dtype)
+        self.req_pool_indices = torch.full(
+            size=(config.max_bs,),
+            fill_value=-1,
+            dtype=torch.int32,
+            device=config.device,
+        )
+        self.seq_lens = torch.empty(config.max_bs, device=config.device, dtype=torch.int32)
         # for quest
         # self.proxy_k_tensor = torch.zeros(
         #         size=(config.keys[0].shape[0]//config.page_size, 2, config.keys[0].shape[1], config.keys[0].shape[2]),
@@ -57,7 +60,6 @@ class RetriveQuery:
             dtype=torch.int32,
         )
 
-        # TODO: Scores and selected_page_indices may be init once instead of every layer?
         self.score = torch.zeros(
             config.max_bs, # bs
             config.keys[0].shape[1],  # head_num
@@ -71,6 +73,7 @@ class RetriveQuery:
             dtype=torch.int32, 
             device=config.device
         )
+        self.updated = False
         
 class RetriveResult:
     def __init__(self, config: ManagerConfig):
@@ -94,7 +97,7 @@ class RetriveResult:
         )
         self.req_pool_indices = torch.full(
             size=(config.max_bs,),
-            fill_value=0,
+            fill_value=-1,
             dtype=torch.int32,
             device=config.device,
         )
@@ -113,17 +116,15 @@ class RetriveResult:
         self.updated = False
         
     def copy_from(self, 
-                  bs: int, 
                   req_pool_indices: torch.Tensor, 
                   seq_lens: torch.Tensor, 
                   retrived_cache_indices_page: torch.Tensor
                 ):
-        self.req_pool_indices = req_pool_indices[:bs]
-        self.seq_lens = seq_lens[:bs]
-        # self.retrived_cache_indices_page[:bs,:retrived_cache_indices_page.shape[1]].copy_(retrived_cache_indices_page)
-        self.retrived_cache_indices_page = retrived_cache_indices_page
+        self.req_pool_indices.copy_(req_pool_indices)
+        self.seq_lens.copy_(seq_lens)
+        self.retrived_cache_indices_page.copy_(retrived_cache_indices_page)
         self.updated = True
-        
+
 class CacheManager:
     def __init__(self, config: ManagerConfig):
         self.config = config
@@ -138,13 +139,14 @@ class CacheManager:
         self.accumlation_step = self.config.page_size
         
     def update_query(self, query: torch.Tensor, req_pool_indices: torch.Tensor, seq_lens: torch.Tensor, 
-                     cu_seq_len_k: torch.Tensor, max_seq_len_k: int, layer_id: int):
-        self.retrived_query[layer_id].query = query
-        self.retrived_query[layer_id].req_pool_indices = req_pool_indices
-        self.retrived_query[layer_id].seq_lens = seq_lens
-        self.retrived_query[layer_id].cu_seq_len_k = cu_seq_len_k
+                    layer_id: int):
+
+        bs = req_pool_indices.shape[0]
+        self.retrived_query[layer_id].query[:bs] = query[:bs]
+        self.retrived_query[layer_id].req_pool_indices[:bs] = req_pool_indices
+        self.retrived_query[layer_id].seq_lens[:bs] = seq_lens
         self.retrived_query[layer_id].updated = True
-        self.retrived_query[layer_id].max_seq_len_k = max_seq_len_k
+        self.retrived_query[layer_id].bs = bs
         
         self._call_after_update_query(
             key_cache=self.config.keys[layer_id],
@@ -156,6 +158,11 @@ class CacheManager:
             accumlation_step=self.accumlation_step,
             proxy_k_tensor=self.retrived_query[layer_id].proxy_k_tensor,
         )
+        
+    def call_after_init_cuda_graph(self):
+        for layer_id in range(self.config.num_layers):
+            self.retrived_query[layer_id].req_pool_indices.fill_(-1)
+            self.retrived_result[layer_id].req_pool_indices.fill_(-1)
 
     def get_result(self, layer_id: int):
         return self.retrived_result[layer_id]
@@ -183,10 +190,9 @@ class CacheManager:
                             selected_page_indices=query.selected_page_indices,
                         )
                         self.retrived_result[layer_id].copy_from(
-                            bs=query.seq_lens.shape[0], 
                             req_pool_indices=query.req_pool_indices, 
                             seq_lens=query.seq_lens, 
                             retrived_cache_indices_page=query.selected_page_indices,
                         )
-                        self.retrived_query[layer_id].updated = False
-                    time.sleep(0.001)
+                        #self.retrived_query[layer_id].updated = False
+                    time.sleep(0.02)

@@ -187,7 +187,7 @@ def combine_indices(
     _, num_kv_heads, cache_len = retrived_cache_indices.shape
     _, _, max_pages = page_table.shape
     max_bs, max_seq_len = req_to_token.shape
-    new_seq_lens = torch.zeros(cur_bs, dtype=torch.int32, device=seq_lens.device)
+    new_seq_lens = torch.empty(cur_bs, dtype=torch.int32, device=seq_lens.device)
     
     grid = (cur_bs * num_kv_heads,)
     

@@ -49,8 +49,8 @@ class LServerUpdaterFlashAttentionBackend(SparseCacheUpdaterFlashAttentionBacken
     def update_extend(self, forward_batch: "ForwardBatch", metadata: "FlashAttentionMetadata"):
         self.dense_retriver.retrive_extend(forward_batch, metadata)
     
-    def update_extend_proxy_k_tensor(self, forward_batch: "ForwardBatch"):
-        self.naive_decode_sparse_retriver.update_extend(forward_batch)
+    def update_extend_proxy_k_tensor(self, forward_batch: "ForwardBatch", layer_id: int):
+        self.naive_decode_sparse_retriver.update_extend(forward_batch, layer_id)
     
     def call_begin_forward_attn_decode(self, query: torch.Tensor, forward_batch: "ForwardBatch", metadata: "FlashAttentionMetadata", layer: "RadixAttention"):
         self.naive_decode_sparse_retriver.retrive_decode(query, forward_batch, metadata, layer)

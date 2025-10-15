@@ -341,10 +341,12 @@ class FlashAttentionBackend(AttentionBackend):
                 keys=model_runner.token_to_kv_pool.k_buffer,
                 values=model_runner.token_to_kv_pool.v_buffer,
                 num_layers=model_runner.token_to_kv_pool.layer_num,
+                num_q_heads=model_runner.model_config.num_attention_heads,
+                q_dtype=model_runner.dtype,
                 use_cuda_graph=not model_runner.server_args.disable_cuda_graph,
                 max_bs=32,
                 page_size=self.page_size,
-                top_k=26,
+                top_k=10,
                 retrive_budget_per_seq=1024,
                 device=model_runner.device,
                 async_retrive=True,
@@ -687,7 +689,7 @@ class FlashAttentionBackend(AttentionBackend):
                         k_rope,
                     )
         if self.sparse_attn:
-            self.sparse_cache_updater.update_extend_proxy_k_tensor(forward_batch)
+            self.sparse_cache_updater.update_extend_proxy_k_tensor(forward_batch, layer.layer_id)
 
         # Use precomputed metadata across all layers
         metadata = self.forward_metadata
