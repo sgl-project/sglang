@@ -19,6 +19,7 @@ import requests
 
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
 from sglang.srt.entrypoints.http_server import launch_server
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.server_args import ServerArgs
@@ -28,9 +29,9 @@ from sglang.srt.warmup import warmup
 multiprocessing.set_start_method("spawn", force=True)
 
 # Reduce warning
-os.environ["SGL_IN_DEEPGEMM_PRECOMPILE_STAGE"] = "1"
+envs.SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE.set(True)
 # Force enable deep gemm
-os.environ["SGL_ENABLE_JIT_DEEPGEMM"] = "1"
+envs.SGLANG_ENABLE_JIT_DEEPGEMM.set(True)
 # Force enable mha chunked kv for DeepSeek V3 to avoid missing kv_b_proj DeepGEMM case
 os.environ["SGL_CHUNKED_PREFIX_CACHE_THRESHOLD"] = "0"
 

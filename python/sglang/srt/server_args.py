@@ -122,6 +122,8 @@ GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 
 DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton"]
 
+DEFAULT_LORA_EVICTION_POLICY = "lru"
+
 NSA_CHOICES = ["flashmla_prefill", "flashmla_decode", "fa3", "tilelang", "aiter"]
 
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu"]
@@ -194,6 +196,7 @@ class ServerArgs:
     # HTTP server
     host: str = "127.0.0.1"
     port: int = 30000
+    grpc_mode: bool = False
     skip_server_warmup: bool = False
     warmups: Optional[str] = None
     nccl_port: Optional[int] = None
@@ -303,6 +306,7 @@ class ServerArgs:
     ] = None
     max_loaded_loras: Optional[int] = None
     max_loras_per_batch: int = 8
+    lora_eviction_policy: str = DEFAULT_LORA_EVICTION_POLICY
     lora_backend: str = "triton"
     max_lora_chunk_size: Optional[int] = 16
 
@@ -321,6 +325,7 @@ class ServerArgs:
     speculative_algorithm: Optional[str] = None
     speculative_draft_model_path: Optional[str] = None
     speculative_draft_model_revision: Optional[str] = None
+    speculative_draft_load_format: Optional[str] = None
     speculative_num_steps: Optional[int] = None
     speculative_eagle_topk: Optional[int] = None
     speculative_num_draft_tokens: Optional[int] = None
@@ -804,7 +809,7 @@ class ServerArgs:
 
         hf_config = self.get_hf_config()
         model_arch = hf_config.architectures[0]
-        if model_arch in ["DeepseekV3ForCausalLM"]:
+        if model_arch in ["DeepseekV3ForCausalLM"] and not is_deepseek_nsa(hf_config):
             if is_cuda() and is_sm100_supported():
                 if (
                     self.attention_backend is None
@@ -1377,13 +1382,6 @@ class ServerArgs:
                     f"Currently only {DETERMINISTIC_ATTENTION_BACKEND_CHOICES} attention backends are supported for deterministic inference."
                 )
 
-            # Currently, only FA3 supports radix cache. Support for other backends is in progress
-            if self.attention_backend != "fa3":
-                self.disable_radix_cache = True
-                logger.warning(
-                    f"Currently radix cache is not compatible with {self.attention_backend} attention backend for deterministic inference. It will be supported in the future."
-                )
-
             # Check TP size
             if self.tp_size > 1:
                 os.environ["NCCL_ALGO"] = "allreduce:tree"
@@ -1515,6 +1513,11 @@ class ServerArgs:
             type=int,
             default=ServerArgs.port,
             help="The port of the HTTP server.",
+        )
+        parser.add_argument(
+            "--grpc-mode",
+            action="store_true",
+            help="If set, use gRPC server instead of HTTP server.",
         )
         parser.add_argument(
             "--skip-server-warmup",
@@ -2122,6 +2125,13 @@ class ServerArgs:
             help="If specified, it limits the maximum number of LoRA adapters loaded in CPU memory at a time. The value must be greater than or equal to `--max-loras-per-batch`.",
         )
         parser.add_argument(
+            "--lora-eviction-policy",
+            type=str,
+            default=DEFAULT_LORA_EVICTION_POLICY,
+            choices=["lru", "fifo"],
+            help="LoRA adapter eviction policy when memory pool is full. 'lru': Least Recently Used (default, better cache efficiency). 'fifo': First-In-First-Out.",
+        )
+        parser.add_argument(
             "--lora-backend",
             type=str,
             choices=LORA_BACKEND_CHOICES,
@@ -2213,6 +2223,15 @@ class ServerArgs:
             help="The specific draft model version to use. It can be a branch "
             "name, a tag name, or a commit id. If unspecified, will use "
             "the default version.",
+        )
+        parser.add_argument(
+            "--speculative-draft-load-format",
+            type=str,
+            default=ServerArgs.speculative_draft_load_format,
+            choices=LOAD_FORMAT_CHOICES,
+            help="The format of the draft model weights to load. "
+            "If not specified, will use the same format as --load-format. "
+            "Use 'dummy' to initialize draft model weights with random values for profiling.",
         )
         parser.add_argument(
             "--speculative-num-steps",

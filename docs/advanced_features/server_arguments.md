@@ -220,14 +220,15 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 ## LoRA
 | Argument | Description | Defaults | Options |
 | --- | --- | --- | --- |
-| `--enable-lora` | Enable LoRA support for the model. This argument is automatically set to True if `--lora-paths` is provided for backward compatibility. | `None` | bool flag (set to enable) |
-| `--max-lora-rank` | The maximum rank of LoRA adapters. If not specified, it will be automatically inferred from the adapters provided in --lora-paths. | `None` | Type: int |
-| `--lora-target-modules` | The union set of all target modules where LoRA should be applied. If not specified, it will be automatically inferred from the adapters provided in --lora-paths. If 'all' is specified, all supported modules will be targeted. | `None` | `q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`, `down_proj`, `qkv_proj`, `gate_up_proj`, `all` |
-| `--lora-paths` | The list of LoRA adapters to load. Each adapter must be specified in one of the following formats: <PATH> \| <NAME>=<PATH> \| JSON with schema {"lora_name":str,"lora_path":str,"pinned":bool} | `None` | List[str] |
-| `--max-loras-per-batch` | Maximum number of adapters for a running batch, include base-only request. | `8` | Type: int |
-| `--max-loaded-loras` | If specified, it limits the maximum number of LoRA adapters loaded in CPU memory at a time. The value must be greater than or equal to `--max-loras-per-batch`. | `None` | Type: int |
+| `--enable-lora` | Enable LoRA support for the model. This argument is automatically set to `True` if `--lora-paths` is provided for backward compatibility. | `False` | Bool flag (set to enable) |
+| `--max-lora-rank` | The maximum LoRA rank that should be supported. If not specified, it will be automatically inferred from the adapters provided in `--lora-paths`. This argument is needed when you expect to dynamically load adapters of larger LoRA rank after server startup. | `None` | Type: int |
+| `--lora-target-modules` | The union set of all target modules where LoRA should be applied (e.g., `q_proj`, `k_proj`, `gate_proj`). If not specified, it will be automatically inferred from the adapters provided in `--lora-paths`. You can also set it to `all` to enable LoRA for all supported modules; note this may introduce minor performance overhead. | `None` | `q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`, `down_proj`, `qkv_proj`, `gate_up_proj`, `all` |
+| `--lora-paths` | The list of LoRA adapters to load. Each adapter must be specified in one of the following formats: `<PATH>` \| `<NAME>=<PATH>` \| JSON with schema `{"lora_name": str, "lora_path": str, "pinned": bool}`. | `None` | Type: List[str] / JSON objects |
+| `--max-loras-per-batch` | Maximum number of adapters for a running batch, including base-only requests. | `8` | Type: int |
+| `--max-loaded-loras` | If specified, limits the maximum number of LoRA adapters loaded in CPU memory at a time. Must be ≥ `--max-loras-per-batch`. | `None` | Type: int |
+| `--lora-eviction-policy` | LoRA adapter eviction policy when the GPU memory pool is full. | `lru` | `lru`, `fifo` |
 | `--lora-backend` | Choose the kernel backend for multi-LoRA serving. | `triton` | `triton`, `csgmv` |
-| `--max-lora-chunk-size` | Maximum chunk size for the ChunkedSGMV LoRA backend. Only used when --lora-backend is 'csgmv'. Choosing a larger value might improve performance. | `16` | `16`, `32`, `64`, `128` |
+| `--max-lora-chunk-size` | Maximum chunk size for the ChunkedSGMV LoRA backend. Only used when `--lora-backend` is `csgmv`. Larger values may improve performance. | `16` | `16`, `32`, `64`, `128` |
 
 ## Kernel backend
 | Argument | Description | Defaults | Options |

@@ -174,6 +174,15 @@ MLA_ATTENTION_BACKENDS = [
     "nsa",
 ]
 
+CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS = [
+    "flashinfer",
+    "fa3",
+    "fa4",
+    "flashmla",
+    "cutlass_mla",
+    "trtllm_mla",
+]
+
 
 def add_mla_attention_backend(backend_name):
     if backend_name not in MLA_ATTENTION_BACKENDS:
@@ -604,7 +613,11 @@ class ModelRunner:
                     f"{self.model_config.hf_config.model_type}"
                 )
 
-        if not self.use_mla_backend:
+        if (
+            not self.use_mla_backend
+            or server_args.attention_backend
+            not in CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS
+        ):
             server_args.disable_chunked_prefix_cache = True
 
         if not server_args.disable_chunked_prefix_cache:
@@ -648,7 +661,8 @@ class ModelRunner:
                     // (self.tp_size // self.moe_ep_size)
                 ) % weight_block_size_n != 0:
                     raise ValueError(
-                        f"For qwen3-vl-fp8 models, please make sure ({text_config.moe_intermediate_size=} // ({self.tp_size=} // {self.moe_ep_size=})) % {weight_block_size_n=} == 0"
+                        f"For qwen3-vl-fp8 models, please make sure ({text_config.moe_intermediate_size=} // ({self.tp_size=} // {self.moe_ep_size=})) % {weight_block_size_n=} == 0. "
+                        f"You can fix this by using arguments such as `--tp-size 8 --ep-size 8`"
                     )
 
     def init_torch_distributed(self):
