@@ -21,6 +21,7 @@ The support matrix is split into two parts: MHA (standard attention) and MLA (mu
 | **Triton**                      | ❌                          | ❌               | ✅              | ✅              | ✅                 | ✅             |
 | **Torch Native (SDPA)**         | ❌                          | ❌               | ❌              | ❌              | ❌                 | ❌             |
 | **FlexAttention (PyTorch)**     | ❌                          | ❌               | ❌              | ❌              | ❌                 | ❌             |
+| **TRTLLM MHA**                  | 16, 32 or 64                | ❌               | ✅              | ❌              | ❌                 | ❌             |
 | **Dual Chunk FlashAttention**   | ✅                          | ❌               | ❌              | ❌              | ❌                 | ❌             |
 | **AITER (ROCm)**                | ✅                          | ❌               | ✅              | ✅              | ❌                 | ❌             |
 | **Wave (ROCm)**                 | ✅                          | ❌               | ❌              | ❌              | ❌                 | ❌             |
@@ -30,14 +31,14 @@ The support matrix is split into two parts: MHA (standard attention) and MLA (mu
 
 | **Backend**                | **Native Page Sizes**     | **FP8 KV Cache** | **Chunked Prefix Cache** | **Spec topk=1** | **Spec topk>1** |
 |----------------------------|---------------------------|------------------|--------------------------|-----------------|-----------------|
-| **FlashInfer MLA**         | 1                         | ✅               | ✅                       | ✅              | ❌              |
+| **FlashInfer MLA**         | 1                         | ❌               | ✅                       | ✅              | ❌              |
 | **FlashMLA**               | 64                        | ❌               | ✅                       | ✅              | ❌              |
 | **Cutlass MLA**            | 128                       | ✅               | ✅                       | ✅              | ❌              |
 | **TRTLLM MLA (Blackwell)** | 32 or 64                  | ✅               | ✅                       | ✅              | ❌              |
-| **FA3 (FlashAttention 3)** | n/a                       | ✅               | ✅                       | ✅              | ⚠️ (page_size=1 only) |
-| **Triton**                 | n/a                       | ❌               | ✅                       | ✅              | ⚠️ (page_size=1 only) |
+| **FA3 (FlashAttention 3)** | n/a                       | ❌               | ✅                       | ✅              | ⚠️ (page_size=1 only) |
+| **Triton**                 | n/a                       | ❌               | ❌                       | ✅              | ⚠️ (page_size=1 only) |
 | **FA4**                    | n/a                       | ❌               | ❌                       | ❌              | ❌              |
-| **Ascend MLA (NPU)**       | 128                       | ❌               | ✅                       | ❌              | ❌              |
+| **Ascend MLA (NPU)**       | 128                       | ❌               | ❌                       | ❌              | ❌              |
 
 ```{warning}
 FlashMLA FP8 KV cache is currently not working. See upstream issue [#8856](https://github.com/sgl-project/sglang/pull/8856). Use non-FP8 KV or another backend when FP8 KV cache is required.
