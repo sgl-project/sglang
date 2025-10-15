@@ -614,9 +614,11 @@ class AiterAttnBackend(AttentionBackend):
             kv_indptr = self.forward_metadata.kv_indptr
             kv_indices = self.forward_metadata.kv_indices
             qo_indptr = self.forward_metadata.qo_indptr
-            #K_Buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(torch.bfloat16)
-            #V_Buffer = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id).to(torch.bfloat16)
-            K_Buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            if self.kv_cache_dtype == fp8_dtype:
+                K_Buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(torch.bfloat16)
+            else:
+                K_Buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+
             V_Buffer = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
             kv_lora_rank = V_Buffer.shape[-1]
             qk_rope_head_dim = K_Buffer.shape[-1] - kv_lora_rank
@@ -657,9 +659,6 @@ class AiterAttnBackend(AttentionBackend):
                     k_prefix, v_prefix = torch.split(
                         kvprefix, [qk_nope_head_dim, layer.v_head_dim], dim=-1
                     )
-
-                    #if self.kv_cache_dtype == fp8_dtype:
-                    #    k_pe = k_pe.to(torch.bfloat16)
 
                     k_prefix = torch.cat(
                         [
