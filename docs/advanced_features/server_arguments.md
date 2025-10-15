@@ -130,7 +130,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--schedule-low-priority-values-first` | If specified with --enable-priority-scheduling, the scheduler will schedule requests with lower priority integer values first. | `False` | bool flag (set to enable) |
 | `--priority-scheduling-preemption-threshold` | Minimum difference in priorities for an incoming request to have to preempt running request(s). | `10` | Type: int |
 | `--schedule-conservativeness` | How conservative the schedule policy is. A larger value means more conservative scheduling. Use a larger value if you see requests being retracted frequently. | `1.0` | Type: float |
-| `--page-size` | The number of tokens in a page. | `None` | Type: int |
+| `--page-size` | The number of tokens in a page. | `1` | Type: int |
 | `--hybrid-kvcache-ratio` | Mix ratio in [0,1] between uniform and hybrid kv buffers (0.0 = pure uniform: swa_size / full_size = 1)(1.0 = pure hybrid: swa_size / full_size = local_attention_size / context_length) | `None` | Optional[float] |
 | `--swa-full-tokens-ratio` | The ratio of SWA layer KV tokens / full layer KV tokens, regardless of the number of swa:full layers. It should be between 0 and 1. E.g. 0.5 means if each swa layer has 50 tokens, then each full layer has 100 tokens. | `0.8` | Type: float |
 | `--disable-hybrid-swa-memory` | Disable the hybrid SWA memory. | `False` | bool flag (set to enable) |
@@ -145,7 +145,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--stream-interval` | The interval (or buffer size) for streaming in terms of the token length. A smaller value makes streaming smoother, while a larger value makes the throughput higher | `1` | Type: int |
 | `--stream-output` | Whether to output as a sequence of disjoint segments. | `False` | bool flag (set to enable) |
 | `--random-seed` | The random seed. | `None` | Type: int |
-| `--constrained-json-whitespace-pattern` | (outlines and llguidance backends only) Regex pattern for syntactic whitespaces allowed in JSON constrained output. For example, to allow the model generate consecutive whitespaces, set the pattern to [ ]* | `None` | Type: str |
+| `--constrained-json-whitespace-pattern` | (outlines and llguidance backends only) Regex pattern for syntactic whitespaces allowed in JSON constrained output. For example, to allow the model to generate consecutive whitespaces, set the pattern to [\n\t ]* | `None` | Type: str |
 | `--constrained-json-disable-any-whitespace` | (xgrammar and llguidance backends only) Enforce compact representation in JSON constrained output. | `False` | bool flag (set to enable) |
 | `--watchdog-timeout` | Set watchdog timeout in seconds. If a forward batch takes longer than this, the server will crash to prevent hanging. | `300` | Type: float |
 | `--dist-timeout` | Set timeout for torch.distributed initialization. | `None` | Type: int |
@@ -172,8 +172,8 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--bucket-inter-token-latency` | The buckets of inter-token latency, specified as a list of floats. | `None` | List[float] |
 | `--bucket-e2e-request-latency` | The buckets of end-to-end request latency, specified as a list of floats. | `None` | List[float] |
 | `--collect-tokens-histogram` | Collect prompt/generation tokens histogram. | `False` | bool flag (set to enable) |
-| `--prompt-tokens-buckets` | The buckets rule of prompt tokens. bucket_rule | `None` | List[str] |
-| `--generation-tokens-buckets` | The buckets rule for generation tokens histogram. bucket_rule | `None` | List[str] |
+| `--prompt-tokens-buckets` | The buckets rule of prompt tokens. Supports 3 rule types: 'default' uses predefined buckets; 'tse <middle> <base> <count>' generates two sides exponential distributed buckets (e.g., 'tse 1000 2 8' generates buckets [984.0, 992.0, 996.0, 998.0, 1000.0, 1002.0, 1004.0, 1008.0, 1016.0]).); 'custom <value1> <value2> ...' uses custom bucket values (e.g., 'custom 10 50 100 500'). | `None` | List[str] |
+| `--generation-tokens-buckets` | The buckets rule for generation tokens histogram. Supports 3 rule types: 'default' uses predefined buckets; 'tse <middle> <base> <count>' generates two sides exponential distributed buckets (e.g., 'tse 1000 2 8' generates buckets [984.0, 992.0, 996.0, 998.0, 1000.0, 1002.0, 1004.0, 1008.0, 1016.0]).); 'custom <value1> <value2> ...' uses custom bucket values (e.g., 'custom 10 50 100 500'). | `None` | List[str] |
 | `--gc-warning-threshold-secs` | The threshold for long GC warning. If a GC takes longer than this, a warning will be logged. Set to 0 to disable. | `0.0` | Type: float |
 | `--decode-log-interval` | The log interval of decode batch. | `40` | Type: int |
 | `--enable-request-time-stats-logging` | Enable per request time stats logging | `False` | bool flag (set to enable) |
@@ -191,8 +191,8 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--completion-template` | The buliltin completion template name or the path of the completion template file. This is only used for OpenAI-compatible API server. only for code completion currently. | `None` | Type: str |
 | `--file-storage-path` | The path of the file storage in backend. | `sglang_storage` | Type: str |
 | `--enable-cache-report` | Return number of cached tokens in usage.prompt_tokens_details for each openai request. | `False` | bool flag (set to enable) |
-| `--reasoning-parser` | Specify the parser for reasoning models, supported parsers are: ['R', 'e', 'a', 's', 'o', 'n', 'i', 'n', 'g', 'P', 'a', 'r', 's', 'e', 'r', '.', 'D', 'e', 't', 'e', 'c', 't', 'o', 'r', 'M', 'a', 'p', '.', 'k', 'e', 'y', 's', '(', ')']. | `None` | `R`, `e`, `a`, `s`, `o`, `n`, `i`, `n`, `g`, `P`, `a`, `r`, `s`, `e`, `r`, `.`, `D`, `e`, `t`, `e`, `c`, `t`, `o`, `r`, `M`, `a`, `p`, `.`, `k`, `e`, `y`, `s`, `(`, `)` |
-| `--tool-call-parser` | Specify the parser for handling tool-call interactions. Options include: tool_call_parser_choices. | `None` | Type: str |
+| `--reasoning-parser` | Specify the parser for reasoning models. Supported parsers: [deepseek-r1, deepseek-v3, glm45, gpt-oss, kimi, qwen3, qwen3-thinking, step3]. | `None` | `deepseek-r1`, `deepseek-v3`, `glm45`, `gpt-oss`, `kimi`, `qwen3`, `qwen3-thinking`, `step3` |
+| `--tool-call-parser` | Specify the parser for handling tool-call interactions. Supported parsers: [deepseekv3, deepseekv31, glm, glm45, gpt-oss, kimi_k2, llama3, mistral, pythonic, qwen, qwen25, qwen3_coder, step3]. | `None` | `deepseekv3`, `deepseekv31`, `glm`, `glm45`, `gpt-oss`, `kimi_k2`, `llama3`, `mistral`, `pythonic`, `qwen`, `qwen25`, `qwen3_coder`, `step3` |
 | `--sampling-defaults` | Where to get default sampling parameters. 'openai' uses SGLang/OpenAI defaults (temperature=1.0, top_p=1.0, etc.). 'model' uses the model's generation_config.json to get the recommended sampling parameters if available. Default is 'model'. | `model` | `openai`, `model` |
 | `--tool-server` | Either 'demo' or a comma-separated list of tool server urls to use for the model. If not specified, no tool server will be used. | `None` | Type: str |
 
@@ -200,7 +200,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | Argument | Description | Defaults | Options |
 | --- | --- | --- | --- |
 | `--data-parallel-size`<br>`--dp-size` | The data parallelism size. | `1` | Type: int |
-| `--load-balance-method` | The load balancing strategy for data parallelism. | `round_robin` | `round_robin`, `shortest_queue`, `minimum_tokens` |
+| `--load-balance-method` | The load balancing strategy for data parallelism. The Minimum Token algorithm can only be used when DP attention is applied. This algorithm performs load balancing based on the real-time token load of the DP workers. | `round_robin` | `round_robin`, `shortest_queue`, `minimum_tokens` |
 | `--load-watch-interval` | The interval of load watching in seconds. | `0.1` | Type: float |
 | `--prefill-round-robin-balance` | Prefill is round robin balanced. This is used to promise decode server can get the correct dp rank. | `False` | bool flag (set to enable) |
 
@@ -223,7 +223,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--enable-lora` | Enable LoRA support for the model. This argument is automatically set to True if `--lora-paths` is provided for backward compatibility. | `None` | bool flag (set to enable) |
 | `--max-lora-rank` | The maximum rank of LoRA adapters. If not specified, it will be automatically inferred from the adapters provided in --lora-paths. | `None` | Type: int |
 | `--lora-target-modules` | The union set of all target modules where LoRA should be applied. If not specified, it will be automatically inferred from the adapters provided in --lora-paths. If 'all' is specified, all supported modules will be targeted. | `None` | `q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`, `down_proj`, `qkv_proj`, `gate_up_proj`, `all` |
-| `--lora-paths` | The list of LoRA adapters to load. Each adapter must be specified in one of the following formats: <PATH> \| <NAME>=<PATH> \| JSON with schema {"lora_name":str,"lora_path":str,"pinned":bool} | `None` | Custom action: LoRAPathAction |
+| `--lora-paths` | The list of LoRA adapters to load. Each adapter must be specified in one of the following formats: <PATH> \| <NAME>=<PATH> \| JSON with schema {"lora_name":str,"lora_path":str,"pinned":bool} | `None` | List[str] |
 | `--max-loras-per-batch` | Maximum number of adapters for a running batch, include base-only request. | `8` | Type: int |
 | `--max-loaded-loras` | If specified, it limits the maximum number of LoRA adapters loaded in CPU memory at a time. The value must be greater than or equal to `--max-loras-per-batch`. | `None` | Type: int |
 | `--lora-backend` | Choose the kernel backend for multi-LoRA serving. | `triton` | `triton`, `csgmv` |
@@ -238,8 +238,8 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--sampling-backend` | Choose the kernels for sampling layers. | `None` | `flashinfer`, `pytorch` |
 | `--grammar-backend` | Choose the backend for grammar-guided decoding. | `None` | `xgrammar`, `outlines`, `llguidance`, `none` |
 | `--mm-attention-backend` | Set multimodal attention backend. | `None` | `sdpa`, `fa3`, `triton_attn`, `ascend_attn` |
-| `--nsa-prefill` | Description not provided in server_args.py | `flashmla_prefill` | `flashmla_prefill`, `flashmla_decode`, `fa3`, `tilelang`, `aiter` |
-| `--nsa-decode` | Description not provided in server_args.py | `fa3` | `flashmla_prefill`, `flashmla_decode`, `fa3`, `tilelang`, `aiter` |
+| `--nsa-prefill` | Choose the NSA backend for the prefill stage (overrides `--attention-backend` when running DeepSeek NSA-style attention). | `flashmla_prefill` | `flashmla_prefill`, `flashmla_decode`, `fa3`, `tilelang`, `aiter` |
+| `--nsa-decode` | Choose the NSA backend for the decode stage when running DeepSeek NSA-style attention. Overrides `--attention-backend` for decoding. | `fa3` | `flashmla_prefill`, `flashmla_decode`, `fa3`, `tilelang`, `aiter` |
 
 ## Speculative decoding
 | Argument | Description | Defaults | Options |
@@ -329,7 +329,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--ds-heavy-channel-num` | The number of heavy channels in double sparsity attention | `32` | Type: int |
 | `--ds-heavy-token-num` | The number of heavy tokens in double sparsity attention | `256` | Type: int |
 | `--ds-heavy-channel-type` | The type of heavy channels in double sparsity attention | `qk` | Type: str |
-| `--ds-sparse-decode-threshold` | The type of heavy channels in double sparsity attention | `4096` | Type: int |
+| `--ds-sparse-decode-threshold` | The minimum decode sequence length required before the double-sparsity backend switches from the dense fallback to the sparse decode kernel. | `4096` | Type: int |
 
 ## Offloading
 | Argument | Description | Defaults | Options |
@@ -439,13 +439,13 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 ## Deprecated arguments
 | Argument | Description | Defaults | Options |
 | --- | --- | --- | --- |
-| `--enable-ep-moe` | NOTE: --enable-ep-moe is deprecated. Please set `--ep-size` to the same value as `--tp-size` instead. | `None` | Custom action: DeprecatedAction |
-| `--enable-deepep-moe` | NOTE: --enable-deepep-moe is deprecated. Please set `--moe-a2a-backend` to 'deepep' instead. | `None` | Custom action: DeprecatedAction |
-| `--enable-flashinfer-cutlass-moe` | NOTE: --enable-flashinfer-cutlass-moe is deprecated. Please set `--moe-runner-backend` to 'flashinfer_cutlass' instead. | `None` | Custom action: DeprecatedAction |
-| `--enable-flashinfer-cutedsl-moe` | NOTE: --enable-flashinfer-cutedsl-moe is deprecated. Please set `--moe-runner-backend` to 'flashinfer_cutedsl' instead. | `None` | Custom action: DeprecatedAction |
-| `--enable-flashinfer-trtllm-moe` | NOTE: --enable-flashinfer-trtllm-moe is deprecated. Please set `--moe-runner-backend` to 'flashinfer_trtllm' instead. | `None` | Custom action: DeprecatedAction |
-| `--enable-triton-kernel-moe` | NOTE: --enable-triton-kernel-moe is deprecated. Please set `--moe-runner-backend` to 'triton_kernel' instead. | `None` | Custom action: DeprecatedAction |
-| `--enable-flashinfer-mxfp4-moe` | NOTE: --enable-flashinfer-mxfp4-moe is deprecated. Please set `--moe-runner-backend` to 'flashinfer_mxfp4' instead. | `None` | Custom action: DeprecatedAction |
+| `--enable-ep-moe` | NOTE: --enable-ep-moe is deprecated. Please set `--ep-size` to the same value as `--tp-size` instead. | `None` | N/A |
+| `--enable-deepep-moe` | NOTE: --enable-deepep-moe is deprecated. Please set `--moe-a2a-backend` to 'deepep' instead. | `None` | N/A |
+| `--enable-flashinfer-cutlass-moe` | NOTE: --enable-flashinfer-cutlass-moe is deprecated. Please set `--moe-runner-backend` to 'flashinfer_cutlass' instead. | `None` | N/A |
+| `--enable-flashinfer-cutedsl-moe` | NOTE: --enable-flashinfer-cutedsl-moe is deprecated. Please set `--moe-runner-backend` to 'flashinfer_cutedsl' instead. | `None` | N/A |
+| `--enable-flashinfer-trtllm-moe` | NOTE: --enable-flashinfer-trtllm-moe is deprecated. Please set `--moe-runner-backend` to 'flashinfer_trtllm' instead. | `None` | N/A |
+| `--enable-triton-kernel-moe` | NOTE: --enable-triton-kernel-moe is deprecated. Please set `--moe-runner-backend` to 'triton_kernel' instead. | `None` | N/A |
+| `--enable-flashinfer-mxfp4-moe` | NOTE: --enable-flashinfer-mxfp4-moe is deprecated. Please set `--moe-runner-backend` to 'flashinfer_mxfp4' instead. | `None` | N/A |
 
 ## Configuration file support
 | Argument | Description | Defaults | Options |

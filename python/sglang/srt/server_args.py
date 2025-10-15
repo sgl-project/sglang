@@ -2558,7 +2558,7 @@ class ServerArgs:
             "--ds-sparse-decode-threshold",
             type=int,
             default=ServerArgs.ds_sparse_decode_threshold,
-            help="The type of heavy channels in double sparsity attention",
+            help="The minimum decode sequence length required before the double-sparsity backend switches from the dense fallback to the sparse decode kernel.",
         )
 
         # Offloading
