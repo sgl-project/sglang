@@ -134,6 +134,8 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | Arguments | Description | Defaults |
 |-----------|-------------|----------|
 | `--device` | The device to use ('cuda', 'xpu', 'hpu', 'npu', 'cpu'). Defaults to auto-detection if not specified. | None |
+| `--elastic-ep-backend` | Select the collective communication backend for elastic EP. Currently supports 'mooncake'. | None |
+| `--mooncake-ib-device` | The InfiniBand devices for Mooncake Backend, accepts multiple comma-separated devices. Default is None, which triggers automatic device detection when Mooncake Backend is enabled. | None |
 | `--tp-size` | The tensor parallelism size. | 1 |
 | `--pp-size` | The pipeline parallelism size. | 1 |
 | `--pp-max-micro-batch-size` | The maximum micro batch size in pipeline parallelism. | None |
@@ -246,7 +248,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | Arguments | Description | Defaults |
 |-----------|-------------|----------|
 | `--ep-size` | The expert parallelism size. | 1 |
-| `--moe-a2a-backend` | Select the backend for all-to-all communication for expert parallelism. | none |
+| `--moe-a2a-backend` | Select the backend for all-to-all communication for expert parallelism, could be `deepep` or `mooncake`. | none |
 | `--moe-runner-backend` | Select the runner backend for MoE. | auto |
 | `--deepep-mode` | Select the mode when enable DeepEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch. | auto |
 | `--ep-num-redundant-experts` | Allocate this number of redundant experts in expert parallel. | 0 |
