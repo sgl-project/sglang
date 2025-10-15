@@ -8,8 +8,8 @@ from typing import Optional, Union
 import torch
 from torch._higher_order_ops.auto_functionalize import auto_functionalized
 
-from sglang.srt.model_executor.compilation.fx_utils import is_func
-from sglang.srt.model_executor.compilation.inductor_pass import SGLangInductorPass
+from sglang.srt.compilation.fx_utils import is_func
+from sglang.srt.compilation.inductor_pass import SGLangInductorPass
 
 logger = logging.getLogger(__name__)
 

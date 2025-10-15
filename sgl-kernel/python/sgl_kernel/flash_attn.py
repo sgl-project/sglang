@@ -6,7 +6,9 @@ import torch
 try:
     from sgl_kernel import flash_ops
 except:
-    raise ImportError("Can not import sgl_kernel. Please check your installation.")
+    raise ImportError(
+        "Can not import FA3 in sgl_kernel. Please check your installation."
+    )
 
 try:
     from ._fa4_interface import flash_attn_varlen_func as flash_attn_varlen_func_v4
@@ -43,7 +45,7 @@ def flash_attn_with_kvcache(
     qv=None,
     rotary_cos=None,
     rotary_sin=None,
-    cache_seqlens: Optional[Union[int, torch.Tensor]] = None,
+    cache_seqlens: Optional[Union[(int, torch.Tensor)]] = None,
     cache_batch_idx: Optional[torch.Tensor] = None,
     cache_leftpad: Optional[torch.Tensor] = None,
     page_table: Optional[torch.Tensor] = None,
@@ -57,7 +59,6 @@ def flash_attn_with_kvcache(
     softmax_scale=None,
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
-    attention_chunk: Optional[int] = None,
     softcap=0.0,  # 0.0 means deactivated
     rotary_interleaved=True,
     scheduler_metadata=None,
@@ -136,7 +137,6 @@ def flash_attn_with_kvcache(
             Default to 1 / sqrt(headdim).
         causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
         window_size: (left, right). If not (-1, -1), implements sliding window local attention.
-        attention_chunk: Optional[int]. If not None, splits the query into chunks of this size to save memory.
         softcap: float. Anything > 0 activates softcapping attention.
         rotary_interleaved: bool. Only applicable if rotary_cos and rotary_sin are passed in.
             If True, rotary embedding will combine dimensions 0 & 1, 2 & 3, etc. If False,
@@ -216,7 +216,6 @@ def flash_attn_with_kvcache(
     ]
     rotary_cos, rotary_sin = [maybe_contiguous(x) for x in (rotary_cos, rotary_sin)]
     rotary_seqlens = maybe_contiguous(rotary_seqlens)
-    attention_chunk = 0 if attention_chunk is None else int(attention_chunk)
 
     out, softmax_lse, *rest = torch.ops.sgl_kernel.fwd.default(
         q,
@@ -246,7 +245,6 @@ def flash_attn_with_kvcache(
         causal,
         window_size[0],
         window_size[1],
-        attention_chunk,
         softcap,
         rotary_interleaved,
         scheduler_metadata,
@@ -276,7 +274,6 @@ def flash_attn_varlen_func(
     k_descale=None,
     v_descale=None,
     window_size=(-1, -1),
-    attention_chunk: Optional[int] = None,
     softcap=0.0,
     num_splits=1,
     pack_gqa=None,
@@ -326,7 +323,6 @@ def flash_attn_varlen_func(
         softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (
             -0.5
         )
-    attention_chunk = 0 if attention_chunk is None else int(attention_chunk)
 
     out, softmax_lse, *rest = torch.ops.sgl_kernel.fwd.default(
         q,
@@ -356,7 +352,6 @@ def flash_attn_varlen_func(
         causal,
         window_size[0],
         window_size[1],
-        attention_chunk,
         softcap,
         is_rotary_interleaved=False,
         scheduler_metadata=None,
