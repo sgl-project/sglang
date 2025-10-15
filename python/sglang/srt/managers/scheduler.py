@@ -1888,7 +1888,7 @@ class Scheduler(
                     self.chunked_req.req_pool_idx, free_mamba_cache=False
                 )
             elif (
-                self.tp_worker.worker.model_runner.server_args.attention_backend
+                self.tp_worker.model_runner.server_args.attention_backend
                 == "hybrid_lightning_attn"
             ):
                 self.req_to_token_pool.free(
