@@ -1556,7 +1556,7 @@ def get_hpu_memory_capacity():
 
 def get_npu_memory_capacity():
     try:
-        import torch_npu
+        import torch_npu  # noqa: F401
 
         return torch.npu.mem_get_info()[1] // 1024 // 1024  # unit: MB
     except ImportError as e:
@@ -1743,7 +1743,7 @@ def get_device(device_id: Optional[int] = None) -> str:
 
     if is_habana_available():
         try:
-            import habana_frameworks.torch.hpu
+            import habana_frameworks.torch.hpu  # noqa: F401
 
             if torch.hpu.is_available():
                 if device_id == None:
@@ -1773,7 +1773,7 @@ def get_device_count() -> int:
 
     if is_habana_available():
         try:
-            import habana_frameworks.torch.hpu
+            import habana_frameworks.torch.hpu  # noqa: F401
 
             if torch.hpu.is_available():
                 return torch.hpu.device_count()

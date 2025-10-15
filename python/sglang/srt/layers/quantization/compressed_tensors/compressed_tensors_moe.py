@@ -42,7 +42,7 @@ if _use_aiter:
     from sglang.srt.layers.moe.rocm_moe_utils import rocm_fused_experts_tkw1
 
 try:
-    import vllm
+    import vllm  # noqa: F401
 
     VLLM_AVAILABLE = True
 except ImportError:
