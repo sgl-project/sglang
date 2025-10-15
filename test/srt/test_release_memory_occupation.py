@@ -25,9 +25,10 @@ configurations (tp=1, tp=2) to ensure proper memory management in distributed se
 data parallel size, we test it in verl.
 """
 
+import os
 import time
 import unittest
-import os
+
 import torch
 from transformers import AutoModelForCausalLM
 
