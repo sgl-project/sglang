@@ -511,11 +511,11 @@ class CudaGraphRunner:
     def _capture_graph(self, graph, pool, stream, run_once_fn):
         memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=self.model_runner.server_args.enable_memory_saver
+            and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
         )
         graph_fn = (
             partial(memory_saver_adapter.cuda_graph, tag=GPU_MEMORY_TYPE_CUDA_GRAPH)
             if memory_saver_adapter.enabled
-            and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
             else torch.cuda.graph
         )
         with graph_fn(cuda_graph=graph, pool=pool, stream=stream):
