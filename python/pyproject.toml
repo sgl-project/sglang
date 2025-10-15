@@ -75,7 +75,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-decord = ["decord"]
+decord = ["decord2"]
 modelopt = ["nvidia-modelopt"]
 test = [
   "accelerate",
