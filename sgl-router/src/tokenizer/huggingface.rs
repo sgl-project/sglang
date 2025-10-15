@@ -44,8 +44,8 @@ impl HuggingFaceTokenizer {
         // Extract special tokens
         let special_tokens = Self::extract_special_tokens(&tokenizer);
 
-        // Build vocab mappings
-        let vocab = tokenizer.get_vocab(false);
+        // Build vocab mappings (include special tokens to get added_tokens like <|im_start|>)
+        let vocab = tokenizer.get_vocab(true); // true = include special tokens and added_tokens
         let reverse_vocab: HashMap<TokenIdType, String> = vocab
             .iter()
             .map(|(token, &id)| (id, token.clone()))
@@ -80,7 +80,7 @@ impl HuggingFaceTokenizer {
     /// Create from an existing HuggingFace tokenizer
     pub fn from_tokenizer(tokenizer: HfTokenizer) -> Self {
         let special_tokens = Self::extract_special_tokens(&tokenizer);
-        let vocab = tokenizer.get_vocab(false);
+        let vocab = tokenizer.get_vocab(true); // true = include special tokens and added_tokens
         let reverse_vocab: HashMap<TokenIdType, String> = vocab
             .iter()
             .map(|(token, &id)| (id, token.clone()))
@@ -98,8 +98,7 @@ impl HuggingFaceTokenizer {
 
     /// Extract special tokens from the tokenizer
     fn extract_special_tokens(tokenizer: &HfTokenizer) -> SpecialTokens {
-        // Try to get special tokens from the tokenizer
-        // This is a simplified version - actual implementation would need to handle various formats
+        // Get vocab with special tokens included (added_tokens like <|im_start|>)
         let vocab = tokenizer.get_vocab(true);
 
         let find_token = |patterns: &[&str]| -> Option<String> {
@@ -111,6 +110,19 @@ impl HuggingFaceTokenizer {
             None
         };
 
+        // Extract additional special tokens (ChatML tokens like <|im_start|>, <|im_end|>, etc.)
+        // These are typically in added_tokens with special: true
+        let mut additional_special_tokens = Vec::new();
+        for (token, _id) in vocab.iter() {
+            // Look for tokens that match common special token patterns
+            if token.starts_with("<|") && token.ends_with("|>") {
+                additional_special_tokens.push(token.clone());
+            } else if token.starts_with("<|") && token.ends_with(">") {
+                // Alternative patterns like <|endoftext|>
+                additional_special_tokens.push(token.clone());
+            }
+        }
+
         SpecialTokens {
             bos_token: find_token(&["<s>", "<|startoftext|>", "<BOS>", "[CLS]"]),
             eos_token: find_token(&["</s>", "<|endoftext|>", "<EOS>", "[SEP]"]),
@@ -119,7 +131,7 @@ impl HuggingFaceTokenizer {
             pad_token: find_token(&["<pad>", "<PAD>", "[PAD]"]),
             cls_token: find_token(&["[CLS]", "<cls>", "<CLS>"]),
             mask_token: find_token(&["[MASK]", "<mask>", "<MASK>"]),
-            additional_special_tokens: vec![],
+            additional_special_tokens,
         }
     }
 

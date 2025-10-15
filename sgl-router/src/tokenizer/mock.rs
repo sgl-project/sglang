@@ -62,11 +62,9 @@ impl MockTokenizer {
 
 impl Encoder for MockTokenizer {
     fn encode(&self, input: &str) -> Result<Encoding> {
-        // Simple word-based tokenization for testing
-        let tokens: Vec<u32> = input
-            .split_whitespace()
-            .filter_map(|word| self.vocab.get(word).copied())
-            .collect();
+        // Simple character-based tokenization for testing
+        // Returns one token per character to ensure non-empty encodings
+        let tokens: Vec<u32> = input.bytes().map(|b| b as u32).collect();
 
         Ok(Encoding::Sp(tokens))
     }
