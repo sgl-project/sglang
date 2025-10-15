@@ -13,6 +13,10 @@ from sglang.srt.distributed.parallel_state import set_pdmux_status
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.multiplex.pdmux_context import (
     get_current_stream_idx,
+    get_sm_counts,
+    get_stream_groups,
+    initialize_stream_groups,
+    load_pdmux_config,
     set_current_stream_idx,
 )
 
@@ -20,6 +24,17 @@ logger = logging.getLogger(__name__)
 
 
 class SchedulerMultiplexMixin:
+
+    def init_pdmux():
+        # for pd_multiplexing, Init stream_groups, exclude normal stream for prefill only and decode only
+        self.pdmux_config = load_pdmux_config(self.server_args.pdmux_config_path)
+        initialize_stream_groups(self.gpu_id, self.pdmux_config)
+        self.stream_groups = get_stream_groups()
+        self.sm_counts = get_sm_counts()
+        self.real_sm_group_num = len(self.stream_groups)
+        logger.info(
+            f"PD-Multiplexing enabled with {self.real_sm_group_num} stream groups, sm_counts (prefill_sm, decode_sm): {self.sm_counts}"
+        )
 
     # TODO(jason-fxz): This is a temporary demo
     def adjust_stream_groups(self) -> tuple[int, tuple[ExternalStream, ExternalStream]]:

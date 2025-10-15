@@ -150,12 +150,6 @@ from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
-from sglang.srt.multiplex.pdmux_context import (
-    get_sm_counts,
-    get_stream_groups,
-    initialize_stream_groups,
-    load_pdmux_config,
-)
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
 from sglang.srt.speculative.eagle_info import EagleDraftInput
@@ -399,16 +393,9 @@ class Scheduler(
                 context, zmq.PUSH, port_args.metrics_ipc_name, False
             )
 
+        # Init pdmux context
         if self.enable_pdmux:
-            # for pd_multiplexing, Init stream_groups, exclude normal stream for prefill only and decode only
-            self.pdmux_config = load_pdmux_config(server_args.pdmux_config_path)
-            initialize_stream_groups(gpu_id, self.pdmux_config)
-            self.stream_groups = get_stream_groups()
-            self.sm_counts = get_sm_counts()
-            self.real_sm_group_num = len(self.stream_groups)
-            logger.info(
-                f"PD-Multiplexing enabled with {self.real_sm_group_num} stream groups, sm_counts (prefill_sm, decode_sm): {self.sm_counts}"
-            )
+            self.init_pdmux()
 
         # Init tokenizer
         self.init_tokenizer()
