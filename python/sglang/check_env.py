@@ -93,6 +93,7 @@ def get_cuda_info():
         if cuda_info["NPU available"]:
             cuda_info.update(_get_npu_info())
             cuda_info.update(_get_cuda_version_info())
+            PACKAGE_LIST.insert(0, "torch_npu")
 
         return cuda_info
 
@@ -233,14 +234,23 @@ def _get_nvcc_info():
     elif is_npu():
         CANN_HOME = _get_npu_cann_home()
 
+        cann_info = {}
+        cann_version_file = os.path.join(CANN_HOME, "version.cfg")
+        if os.path.exists(cann_version_file):
+            with open(cann_version_file, "r", encoding="utf-8") as f:
+                f.readline()  # discard first line comment in version.cfg
+                cann_info["CANN"] = f.readline().split("[")[1].split("]")[0]
+        else:
+            cann_info["CANN"] = "Not Available"
         try:
             bisheng = os.path.join(CANN_HOME, "aarch64-linux/ccec_compiler/bin/bisheng")
             bisheng_output = (
                 subprocess.check_output([bisheng, "--version"]).decode("utf-8").strip()
             )
-            return {"BiSheng": bisheng_output.split("\n")[0].strip()}
+            cann_info["BiSheng"] = bisheng_output.split("\n")[0].strip()
         except subprocess.SubprocessError:
-            return {"BiSheng": "Not Available"}
+            cann_info["BiSheng"] = "Not Available"
+        return cann_info
     else:
         return {"NVCC": "Not Available"}
 
