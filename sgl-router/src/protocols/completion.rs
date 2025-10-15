@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 
-use super::chat::{default_true, GenerationRequest};
+use super::chat::GenerationRequest;
 use super::common::*;
 
 // ============================================================================

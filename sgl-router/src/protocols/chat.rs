@@ -8,22 +8,6 @@ use super::sampling_params::{validate_top_k_value, validate_top_p_value};
 use crate::protocols::validated::Normalizable;
 
 // ============================================================================
-// Default value helpers
-// ============================================================================
-
-/// Default model value when not specified
-/// TODO: move to common.rs
-fn default_model() -> String {
-    "unknown".to_string()
-}
-
-/// Helper function for serde default value
-/// TODO: move to common.rs
-pub fn default_true() -> bool {
-    true
-}
-
-// ============================================================================
 // Chat Messages
 // ============================================================================
 

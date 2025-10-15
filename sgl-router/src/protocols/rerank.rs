@@ -3,18 +3,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 use super::chat::GenerationRequest;
-use super::common::{StringOrArray, UsageInfo};
-
-// Constants
-pub const DEFAULT_MODEL_NAME: &str = "default";
-
-pub fn default_model_name() -> String {
-    DEFAULT_MODEL_NAME.to_string()
-}
-
-fn default_return_documents() -> bool {
-    true
-}
+use super::common::{default_model, default_true, StringOrArray, UsageInfo};
 
 fn default_rerank_object() -> String {
     "rerank".to_string()
@@ -40,14 +29,14 @@ pub struct RerankRequest {
     pub documents: Vec<String>,
 
     /// Model to use for reranking
-    #[serde(default = "default_model_name")]
+    #[serde(default = "default_model")]
     pub model: String,
 
     /// Maximum number of documents to return (optional)
     pub top_k: Option<usize>,
 
     /// Whether to return documents in addition to scores
-    #[serde(default = "default_return_documents")]
+    #[serde(default = "default_true")]
     pub return_documents: bool,
 
     // SGLang specific extensions
@@ -202,7 +191,7 @@ impl From<V1RerankReqInput> for RerankRequest {
         RerankRequest {
             query: v1.query,
             documents: v1.documents,
-            model: default_model_name(),
+            model: default_model(),
             top_k: None,
             return_documents: true,
             rid: None,

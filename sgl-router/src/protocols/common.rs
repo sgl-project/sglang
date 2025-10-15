@@ -3,6 +3,20 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 // ============================================================================
+// Default value helpers
+// ============================================================================
+
+/// Default model value when not specified
+pub(crate) fn default_model() -> String {
+    "unknown".to_string()
+}
+
+/// Helper function for serde default value (returns true)
+pub fn default_true() -> bool {
+    true
+}
+
+// ============================================================================
 // String/Array Utilities
 // ============================================================================
 

@@ -3,8 +3,8 @@ use serde_json::Value;
 use std::collections::HashMap;
 use validator::Validate;
 
-use super::chat::{default_true, GenerationRequest};
-use super::common::InputIds;
+use super::chat::GenerationRequest;
+use super::common::{default_true, InputIds};
 use super::sampling_params::SamplingParams;
 use crate::protocols::validated::Normalizable;
 
