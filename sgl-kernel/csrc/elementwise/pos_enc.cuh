@@ -16,9 +16,17 @@
 #ifndef SGL_POS_ENC_CUH_
 #define SGL_POS_ENC_CUH_
 
+#ifdef USE_ROCM
+#include "flashinfer_helper.cuh"
+#else
 #include <flashinfer/pos_enc.cuh>  // upstream
+#endif
 
+#ifdef USE_ROCM
+namespace sgl_hip {
+#else
 namespace flashinfer {
+#endif
 
 namespace kv_buffer_saver {
 
@@ -323,6 +331,11 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheEnhancedKernel(
     __VA_ARGS__                                                   \
   }
 
+// std::max is not a constexpr function in rocm compiler
+constexpr int std_max(int a, int b) {
+  return a > b ? a : b;
+}
+
 template <typename DType, typename IdType>
 cudaError_t BatchQKApplyRotaryPosIdsCosSinCacheEnhanced(
     DType* q,
@@ -372,7 +385,7 @@ cudaError_t BatchQKApplyRotaryPosIdsCosSinCacheEnhanced(
     config.stream = stream;                                           \
     cudaLaunchAttribute attrs[1] = {};                                \
     attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization; \
-    attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl; \
+    EnablePDL(attrs[0].val, enable_pdl);                              \
     config.numAttrs = 1;                                              \
     config.attrs = attrs;                                             \
                                                                       \
@@ -413,7 +426,7 @@ cudaError_t BatchQKApplyRotaryPosIdsCosSinCacheEnhanced(
     DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
       DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
         // operate on 16 Bytes at a time
-        constexpr uint32_t vec_size = std::max(16 / sizeof(DType), HEAD_DIM / 32);
+        constexpr uint32_t vec_size = std_max(16 / sizeof(DType), HEAD_DIM / 32);
         // how many threads needed per head_dim
         constexpr uint32_t bdx = HEAD_DIM / vec_size;
         // how many threads needed per block

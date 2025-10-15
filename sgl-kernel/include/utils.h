@@ -20,10 +20,6 @@ limitations under the License.
 #include <torch/all.h>
 
 #ifdef USE_ROCM
-#include <hip/hip_runtime.h>
-#endif
-
-#ifdef USE_ROCM
 // Adapted from flashinfer-rocm [PR#491](https://github.com/flashinfer-ai/flashinfer/pull/491)
 #define _DISPATCH_CASE_F16(c_type, ...) \
   case at::ScalarType::Half: {          \
@@ -79,19 +75,6 @@ limitations under the License.
 #else
 #define _DISPATCH_CASE_FP8_E5M2(c_type, ...)
 #endif  // FLASHINFER_ENABLE_FP8_E5M2
-
-#define DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(pytorch_dtype, c_type, ...)                 \
-  [&]() -> bool {                                                                        \
-    switch (pytorch_dtype) {                                                             \
-      _DISPATCH_CASE_F16(c_type, __VA_ARGS__)                                            \
-      _DISPATCH_CASE_BF16(c_type, __VA_ARGS__)                                           \
-      default:                                                                           \
-        std::ostringstream oss;                                                          \
-        oss << __PRETTY_FUNCTION__ << " failed to dispatch data type " << pytorch_dtype; \
-        TORCH_CHECK(false, oss.str());                                                   \
-        return false;                                                                    \
-    }                                                                                    \
-  }()
 
 #define DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(pytorch_dtype, c_type, ...)                      \
   [&]() -> bool {                                                                            \
@@ -216,6 +199,20 @@ inline bool is_float8_tensor(const at::Tensor& tensor) {
 }
 #endif  // USE_ROCM
 
+// USE_ROCM or USE_CUDA
+#define DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(pytorch_dtype, c_type, ...)                 \
+  [&]() -> bool {                                                                        \
+    switch (pytorch_dtype) {                                                             \
+      _DISPATCH_CASE_F16(c_type, __VA_ARGS__)                                            \
+      _DISPATCH_CASE_BF16(c_type, __VA_ARGS__)                                           \
+      default:                                                                           \
+        std::ostringstream oss;                                                          \
+        oss << __PRETTY_FUNCTION__ << " failed to dispatch data type " << pytorch_dtype; \
+        TORCH_CHECK(false, oss.str());                                                   \
+        return false;                                                                    \
+    }                                                                                    \
+  }()
+
 struct cuda_error : public std::runtime_error {
   /**
    * @brief Constructs a `cuda_error` object with the given `message`.
@@ -329,13 +326,6 @@ inline bool getEnvEnablePDL() {
 
 #define DISPATCH_INTEGRAL_TYPES(TYPE, NAME, ...) \
   AT_DISPATCH_SWITCH(TYPE, NAME, DISPATCH_CASE_INTEGRAL_TYPES(__VA_ARGS__))
-
-#define DISPATCH_CASE_FLOAT_TYPES(...)                 \
-  AT_DISPATCH_CASE(at::ScalarType::Float, __VA_ARGS__) \
-  AT_DISPATCH_CASE(at::ScalarType::Half, __VA_ARGS__)  \
-  AT_DISPATCH_CASE(at::ScalarType::BFloat16, __VA_ARGS__)
-
-#define DISPATCH_FLOAT_TYPES(TYPE, NAME, ...) AT_DISPATCH_SWITCH(TYPE, NAME, DISPATCH_CASE_FLOAT_TYPES(__VA_ARGS__))
 
 #define CEILDIV(x, y) (((x) + (y) - 1) / (y))
 
@@ -458,12 +448,3 @@ inline uint32_t next_pow2(uint32_t x) noexcept {
   if (x <= 1) return 1;
   return 1u << (32 - __builtin_clz(x - 1));
 }
-
-/*
- * LDG Support
- */
-#ifndef USE_ROCM
-#define SGLANG_LDG(arg) __ldg(arg)
-#else
-#define SGLANG_LDG(arg) *(arg)
-#endif

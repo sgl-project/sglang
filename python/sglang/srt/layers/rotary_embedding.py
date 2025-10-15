@@ -26,7 +26,7 @@ _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 
-if _is_cuda:
+if _is_cuda or _is_hip:
     from sgl_kernel import FusedSetKVBufferArg, apply_rope_with_cos_sin_cache_inplace
 else:
     FusedSetKVBufferArg = None
@@ -105,7 +105,7 @@ class RotaryEmbedding(CustomOp):
 
         cache = self._compute_cos_sin_cache()
         # NOTE(ByronHsu): cache needs to be in FP32 for numerical stability
-        if not _is_cuda:
+        if not (_is_cuda or _is_hip):
             cache = cache.to(dtype)
 
         if (
@@ -248,7 +248,7 @@ class RotaryEmbedding(CustomOp):
         offsets: Optional[torch.Tensor] = None,
         fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if _is_cuda and (self.head_size in [64, 128, 256, 512]):
+        if (_is_cuda or _is_hip) and (self.head_size in [64, 128, 256, 512]):
             apply_rope_with_cos_sin_cache_inplace(
                 positions=positions,
                 query=query,

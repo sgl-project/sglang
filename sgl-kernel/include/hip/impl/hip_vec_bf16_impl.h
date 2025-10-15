@@ -4,6 +4,7 @@
 
 #include <hip/hip_bf16.h>
 #include <hip/hip_common.h>
+#include <hip/hip_math_def.h>
 
 // Adapted from flashinfer-rocm [PR#491](https://github.com/flashinfer-ai/flashinfer/pull/491)
 
@@ -19,6 +20,14 @@ __BF16_HOST_DEVICE_STATIC__ __hip_bfloat162 make_bfloat162(const __hip_bfloat16 
 
 namespace sgl_hip {
 
+template <typename T, int vec_size>
+SGL_HIP_INLINE void cast_from_impl_bf16(vec_t<nv_bfloat16, vec_size>& data, const vec_t<T, vec_size>& src) {
+  nv_bfloat16* f_data = reinterpret_cast<nv_bfloat16*>(data);
+#pragma unroll
+  for (size_t i = 0; i < vec_size; ++i) {
+    f_data[i] = castToBFloat16(src[i]);
+  }
+}
 // nv_bfloat16 x 1
 template <>
 struct vec_t<nv_bfloat16, 1> {
@@ -36,7 +45,7 @@ struct vec_t<nv_bfloat16, 1> {
   SGL_HIP_INLINE void store(nv_bfloat16* ptr) const;
   template <typename T>
   SGL_HIP_INLINE void cast_from(const vec_t<T, 1>& src) {
-    cast_from_impl(*this, src);
+    cast_from_impl_bf16(*this, src);
   }
   template <typename T>
   SGL_HIP_INLINE void cast_load(const T* ptr) {
@@ -74,7 +83,7 @@ struct vec_t<nv_bfloat16, 2> {
   SGL_HIP_INLINE void store(nv_bfloat16* ptr) const;
   template <typename T>
   SGL_HIP_INLINE void cast_from(const vec_t<T, 2>& src) {
-    cast_from_impl(*this, src);
+    cast_from_impl_bf16(*this, src);
   }
   template <typename T>
   SGL_HIP_INLINE void cast_load(const T* ptr) {
@@ -111,7 +120,7 @@ struct vec_t<nv_bfloat16, 4> {
   SGL_HIP_INLINE void store(nv_bfloat16* ptr) const;
   template <typename T>
   SGL_HIP_INLINE void cast_from(const vec_t<T, 4>& src) {
-    cast_from_impl(*this, src);
+    cast_from_impl_bf16(*this, src);
   }
   template <typename T>
   SGL_HIP_INLINE void cast_load(const T* ptr) {
@@ -160,7 +169,11 @@ struct vec_t<nv_bfloat16, vec_size> {
   }
   template <typename T>
   SGL_HIP_INLINE void cast_from(const vec_t<T, vec_size>& src) {
-    cast_from_impl(*this, src);
+    nv_bfloat16* f_data = reinterpret_cast<nv_bfloat16*>(data);
+#pragma unroll
+    for (size_t i = 0; i < vec_size; ++i) {
+      f_data[i] = castToBFloat16(src[i]);
+    }
   }
   template <typename T>
   SGL_HIP_INLINE void cast_load(const T* ptr) {

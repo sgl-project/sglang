@@ -4,6 +4,7 @@
 
 #include <hip/hip_common.h>
 #include <hip/hip_fp16.h>
+#include <hip/hip_math_def.h>
 
 // Adapted from flashinfer-rocm [PR#491](https://github.com/flashinfer-ai/flashinfer/pull/491)
 
@@ -12,6 +13,14 @@ using half2 = __half2;
 
 namespace sgl_hip {
 
+    template<typename T, int vec_size>
+SGL_HIP_INLINE void cast_from_impl_float16(vec_t<half, vec_size>& data, const vec_t<T, vec_size>& src) {
+    half* f_data = reinterpret_cast<half*>(data);
+    #pragma unroll
+    for (size_t i = 0; i < vec_size; ++i) {
+      f_data[i] = castToHalf(src[i]);
+    }
+}
 // half x 1
 template <>
 struct vec_t<half, 1> {
@@ -156,7 +165,11 @@ struct vec_t<half, vec_size> {
   }
   template <typename T>
   SGL_HIP_INLINE void cast_from(const vec_t<T, vec_size>& src) {
-    cast_from_impl(*this, src);
+    half* f_data = reinterpret_cast<half*>(data);
+    #pragma unroll
+    for (size_t i = 0; i < vec_size; ++i) {
+      f_data[i] = castToHalf(src[i]);
+    }
   }
   template <typename T>
   SGL_HIP_INLINE void cast_load(const T* ptr) {
