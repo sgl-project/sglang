@@ -1,6 +1,9 @@
 import logging
 
+import torch
+
 from sglang.srt.server_args import ServerArgs, get_global_server_args
+from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils.common import is_blackwell
 
 logger = logging.getLogger(__name__)
@@ -36,12 +39,37 @@ class DraftBackendFactory:
 
             class DummyAttnBackend:
                 def __init__(self):
-                    pass
+                    self.attn_backends = []
 
                 def init_forward_metadata(*args, **kwargs):
                     pass
 
                 def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+                    pass
+
+                def init_forward_metadata_replay_cuda_graph(
+                    self,
+                    bs: int,
+                    req_pool_indices: torch.Tensor,
+                    seq_lens: torch.Tensor,
+                    seq_lens_sum: int,
+                    encoder_lens: Optional[torch.Tensor],
+                    forward_mode: ForwardMode,
+                    spec_info: Optional[SpecInput],
+                    seq_lens_cpu: Optional[torch.Tensor],
+                ):
+                    pass
+
+                def init_forward_metadata_capture_cuda_graph(
+                    self,
+                    bs: int,
+                    num_tokens: int,
+                    req_pool_indices: torch.Tensor,
+                    seq_lens: torch.Tensor,
+                    encoder_lens: Optional[torch.Tensor],
+                    forward_mode: "ForwardMode",
+                    spec_info: Optional[SpecInput],
+                ):
                     pass
 
             return DummyAttnBackend()
