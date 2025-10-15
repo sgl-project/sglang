@@ -836,3 +836,11 @@ void es_fp8_blockwise_scaled_grouped_mm(
     const torch::Tensor& stride_d,
     const torch::Tensor& problem_sizes,
     const torch::Tensor& expert_offsets);
+/*
+ * From fast-hadamard-transform
+ */
+torch::Tensor fast_hadamard_transform(torch::Tensor& x, double scale);
+torch::Tensor fast_hadamard_transform_12N(torch::Tensor& x, double scale);
+torch::Tensor fast_hadamard_transform_20N(torch::Tensor& x, double scale);
+torch::Tensor fast_hadamard_transform_28N(torch::Tensor& x, double scale);
+torch::Tensor fast_hadamard_transform_40N(torch::Tensor& x, double scale);
