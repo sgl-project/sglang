@@ -458,4 +458,4 @@ python -m sglang_router.launch_router \
 
 ---
 
-SGLang Router continues to evolve alongside the SGLang runtime. Keep CLI flags, integrations, and documentation aligned when adopting new features or contributing improvements.
+SGLang Model Gateway continues to evolve alongside the SGLang runtime. Keep CLI flags, integrations, and documentation aligned when adopting new features or contributing improvements.
