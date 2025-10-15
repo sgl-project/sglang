@@ -46,7 +46,7 @@ class OpenAIServingBase(ABC):
             if error_msg:
                 # Increment received requests metric for validation failures
                 self._label_and_observe_one_received_request(
-                    raw_request, http_status="400", custom_labels=request.custom_labels
+                    raw_request, http_status="400"
                 )
                 return self.create_error_response(error_msg)
 
@@ -69,7 +69,6 @@ class OpenAIServingBase(ABC):
                 raw_request,
                 adapted_request,
                 http_status="200",
-                custom_labels=adapted_request.custom_labels,
             )
 
             return response
@@ -80,7 +79,6 @@ class OpenAIServingBase(ABC):
             self._label_and_observe_one_received_request(
                 raw_request,
                 http_status=str(e.status_code),
-                custom_labels=request.custom_labels,
             )
             return error_response
         except ValueError as e:
@@ -89,9 +87,7 @@ class OpenAIServingBase(ABC):
                 err_type="BadRequest",
                 status_code=400,
             )
-            self._label_and_observe_one_received_request(
-                raw_request, http_status="400", custom_labels=request.custom_labels
-            )
+            self._label_and_observe_one_received_request(raw_request, http_status="400")
             return error_response
         except Exception as e:
             logger.exception(f"Error in request: {e}")
@@ -100,9 +96,7 @@ class OpenAIServingBase(ABC):
                 err_type="InternalServerError",
                 status_code=500,
             )
-            self._label_and_observe_one_received_request(
-                raw_request, http_status="500", custom_labels=request.custom_labels
-            )
+            self._label_and_observe_one_received_request(raw_request, http_status="500")
             return error_response
 
     @abstractmethod
@@ -247,18 +241,25 @@ class OpenAIServingBase(ABC):
         raw_request: Request,
         adapted_request: Optional[GenerateReqInput] = None,
         http_status: Optional[str] = None,
-        custom_labels: Optional[Dict[str, str]] = None,
     ) -> None:
         """Observe a received request metric with proper labels."""
         if not self.tokenizer_manager.enable_metrics:
             return
 
-        # Build metric labels for this request.
+        # Build additional metric labels for this request.
         metric_labels = build_metric_labels(
             self.tokenizer_manager.server_args,
             raw_request.url.path,
             http_status,
         )
+
+        custom_labels = {}
+        if adapted_request and adapted_request.custom_labels is not None:
+            custom_labels = adapted_request.custom_labels
+
+            # Also need to update the adapted request's custom labels with newly
+            # merged labels, for metrics observed at the end of the request.
+            adapted_request.custom_labels.update(metric_labels)
 
         # Merge all labels together before sending to the metrics collector.
         # We first take the default configured labels in the collector, then
@@ -266,12 +267,7 @@ class OpenAIServingBase(ABC):
         labels = {
             **self.tokenizer_manager.metrics_collector.labels,
             **metric_labels,
-            **(custom_labels or {}),
+            **custom_labels,
         }
-
-        # Also need to update the adapted request's custom labels with newly
-        # merged labels, for metrics observed at the end of the request.
-        if adapted_request and adapted_request.custom_labels is not None:
-            adapted_request.custom_labels.update(metric_labels)
 
         self.tokenizer_manager.metrics_collector.observe_one_received_request(labels)
