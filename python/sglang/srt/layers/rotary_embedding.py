@@ -295,7 +295,7 @@ class RotaryEmbedding(CustomOp):
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Now make a wrapper, and XPU will implement this kernel later.
+        # TODO: make a wrapper, and XPU will implement this kernel later.
         return self.forward_native(positions, query, key, offsets)
 
 
