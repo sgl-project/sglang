@@ -148,7 +148,6 @@ mod tests {
     async fn test_mock_server_with_rmcp_client() {
         let mut server = MockMCPServer::start().await.unwrap();
 
-        // Test that we can connect with rmcp client
         use rmcp::transport::StreamableHttpClientTransport;
         use rmcp::ServiceExt;
 
@@ -158,7 +157,6 @@ mod tests {
         assert!(client.is_ok(), "Should be able to connect to mock server");
 
         if let Ok(client) = client {
-            // Test listing tools
             let tools = client.peer().list_all_tools().await;
             assert!(tools.is_ok(), "Should be able to list tools");
 

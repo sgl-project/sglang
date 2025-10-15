@@ -38,7 +38,7 @@ class TestLlama4LoRA(CustomTestCase):
                         "--tp-size",
                         str(model.tp_size),
                         "--context-length",
-                        "1048576",
+                        "262144",
                         "--attention-backend",
                         "fa3",
                     ],

@@ -7,7 +7,7 @@ from pathlib import Path
 from tqdm import tqdm
 
 import sglang as sgl
-from sglang.srt.hf_transformers_utils import get_tokenizer
+from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.test_utils import (
     add_common_sglang_args_and_parse,
     select_sglang_backend,
