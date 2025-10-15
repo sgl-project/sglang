@@ -2,7 +2,7 @@
 #![allow(dead_code)]
 
 use axum::{
-    extract::{Json, State},
+    extract::{Json, Path, State},
     http::StatusCode,
     response::sse::{Event, KeepAlive},
     response::{IntoResponse, Response, Sse},
@@ -11,8 +11,9 @@ use axum::{
 };
 use futures_util::stream::{self, StreamExt};
 use serde_json::json;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -81,6 +82,13 @@ impl MockWorker {
             .route("/generate", post(generate_handler))
             .route("/v1/chat/completions", post(chat_completions_handler))
             .route("/v1/completions", post(completions_handler))
+            .route("/v1/rerank", post(rerank_handler))
+            .route("/v1/responses", post(responses_handler))
+            .route("/v1/responses/{response_id}", get(responses_get_handler))
+            .route(
+                "/v1/responses/{response_id}/cancel",
+                post(responses_cancel_handler),
+            )
             .route("/flush_cache", post(flush_cache_handler))
             .route("/v1/models", get(v1_models_handler))
             .with_state(config);
@@ -548,6 +556,511 @@ async fn completions_handler(
     }
 }
 
+async fn responses_handler(
+    State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    Json(payload): Json<serde_json::Value>,
+) -> Response {
+    let config = config.read().await;
+
+    if should_fail(&config).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": {
+                    "message": "Random failure for testing",
+                    "type": "internal_error",
+                    "code": "internal_error"
+                }
+            })),
+        )
+            .into_response();
+    }
+
+    if config.response_delay_ms > 0 {
+        tokio::time::sleep(tokio::time::Duration::from_millis(config.response_delay_ms)).await;
+    }
+
+    let is_stream = payload
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    // Background storage simulation
+    let is_background = payload
+        .get("background")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let req_id = payload
+        .get("request_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    if is_background {
+        if let Some(id) = &req_id {
+            store_response_for_port(config.port, id);
+        }
+    }
+
+    if is_stream {
+        let request_id = format!("resp-{}", Uuid::new_v4());
+
+        // Check if this is an MCP tool call scenario
+        let has_tools = payload
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter().any(|tool| {
+                    tool.get("type")
+                        .and_then(|t| t.as_str())
+                        .map(|t| t == "function")
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+        let has_function_output = payload
+            .get("input")
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items.iter().any(|item| {
+                    item.get("type")
+                        .and_then(|t| t.as_str())
+                        .map(|t| t == "function_call_output")
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+
+        if has_tools && !has_function_output {
+            // First turn: emit streaming tool call events
+            let call_id = format!(
+                "call_{}",
+                Uuid::new_v4().to_string().split('-').next().unwrap()
+            );
+            let rid = request_id.clone();
+
+            let events = vec![
+                // response.created
+                Ok::<_, Infallible>(
+                    Event::default().event("response.created").data(
+                        json!({
+                            "type": "response.created",
+                            "response": {
+                                "id": rid.clone(),
+                                "object": "response",
+                                "created_at": timestamp,
+                                "model": "mock-model",
+                                "status": "in_progress"
+                            }
+                        })
+                        .to_string(),
+                    ),
+                ),
+                // response.in_progress
+                Ok(Event::default().event("response.in_progress").data(
+                    json!({
+                        "type": "response.in_progress",
+                        "response": {
+                            "id": rid.clone(),
+                            "object": "response",
+                            "created_at": timestamp,
+                            "model": "mock-model",
+                            "status": "in_progress"
+                        }
+                    })
+                    .to_string(),
+                )),
+                // response.output_item.added with function_tool_call
+                Ok(Event::default().event("response.output_item.added").data(
+                    json!({
+                        "type": "response.output_item.added",
+                        "output_index": 0,
+                        "item": {
+                            "id": call_id.clone(),
+                            "type": "function_tool_call",
+                            "name": "brave_web_search",
+                            "arguments": "",
+                            "status": "in_progress"
+                        }
+                    })
+                    .to_string(),
+                )),
+                // response.function_call_arguments.delta events
+                Ok(Event::default()
+                    .event("response.function_call_arguments.delta")
+                    .data(
+                        json!({
+                            "type": "response.function_call_arguments.delta",
+                            "output_index": 0,
+                            "item_id": call_id.clone(),
+                            "delta": "{\"query\""
+                        })
+                        .to_string(),
+                    )),
+                Ok(Event::default()
+                    .event("response.function_call_arguments.delta")
+                    .data(
+                        json!({
+                            "type": "response.function_call_arguments.delta",
+                            "output_index": 0,
+                            "item_id": call_id.clone(),
+                            "delta": ":\"SGLang"
+                        })
+                        .to_string(),
+                    )),
+                Ok(Event::default()
+                    .event("response.function_call_arguments.delta")
+                    .data(
+                        json!({
+                            "type": "response.function_call_arguments.delta",
+                            "output_index": 0,
+                            "item_id": call_id.clone(),
+                            "delta": " router MCP"
+                        })
+                        .to_string(),
+                    )),
+                Ok(Event::default()
+                    .event("response.function_call_arguments.delta")
+                    .data(
+                        json!({
+                            "type": "response.function_call_arguments.delta",
+                            "output_index": 0,
+                            "item_id": call_id.clone(),
+                            "delta": " integration\"}"
+                        })
+                        .to_string(),
+                    )),
+                // response.function_call_arguments.done
+                Ok(Event::default()
+                    .event("response.function_call_arguments.done")
+                    .data(
+                        json!({
+                            "type": "response.function_call_arguments.done",
+                            "output_index": 0,
+                            "item_id": call_id.clone()
+                        })
+                        .to_string(),
+                    )),
+                // response.output_item.done
+                Ok(Event::default().event("response.output_item.done").data(
+                    json!({
+                        "type": "response.output_item.done",
+                        "output_index": 0,
+                        "item": {
+                            "id": call_id.clone(),
+                            "type": "function_tool_call",
+                            "name": "brave_web_search",
+                            "arguments": "{\"query\":\"SGLang router MCP integration\"}",
+                            "status": "completed"
+                        }
+                    })
+                    .to_string(),
+                )),
+                // response.completed
+                Ok(Event::default().event("response.completed").data(
+                    json!({
+                        "type": "response.completed",
+                        "response": {
+                            "id": rid,
+                            "object": "response",
+                            "created_at": timestamp,
+                            "model": "mock-model",
+                            "status": "completed"
+                        }
+                    })
+                    .to_string(),
+                )),
+                // [DONE]
+                Ok(Event::default().data("[DONE]")),
+            ];
+
+            let stream = stream::iter(events);
+            Sse::new(stream)
+                .keep_alive(KeepAlive::default())
+                .into_response()
+        } else if has_tools && has_function_output {
+            // Second turn: emit streaming text response
+            let rid = request_id.clone();
+            let msg_id = format!(
+                "msg_{}",
+                Uuid::new_v4().to_string().split('-').next().unwrap()
+            );
+
+            let events = vec![
+                // response.created
+                Ok::<_, Infallible>(
+                    Event::default().event("response.created").data(
+                        json!({
+                            "type": "response.created",
+                            "response": {
+                                "id": rid.clone(),
+                                "object": "response",
+                                "created_at": timestamp,
+                                "model": "mock-model",
+                                "status": "in_progress"
+                            }
+                        })
+                        .to_string(),
+                    ),
+                ),
+                // response.in_progress
+                Ok(Event::default().event("response.in_progress").data(
+                    json!({
+                        "type": "response.in_progress",
+                        "response": {
+                            "id": rid.clone(),
+                            "object": "response",
+                            "created_at": timestamp,
+                            "model": "mock-model",
+                            "status": "in_progress"
+                        }
+                    })
+                    .to_string(),
+                )),
+                // response.output_item.added with message
+                Ok(Event::default().event("response.output_item.added").data(
+                    json!({
+                        "type": "response.output_item.added",
+                        "output_index": 0,
+                        "item": {
+                            "id": msg_id.clone(),
+                            "type": "message",
+                            "role": "assistant",
+                            "content": []
+                        }
+                    })
+                    .to_string(),
+                )),
+                // response.content_part.added
+                Ok(Event::default().event("response.content_part.added").data(
+                    json!({
+                        "type": "response.content_part.added",
+                        "output_index": 0,
+                        "item_id": msg_id.clone(),
+                        "part": {
+                            "type": "output_text",
+                            "text": ""
+                        }
+                    })
+                    .to_string(),
+                )),
+                // response.output_text.delta events
+                Ok(Event::default().event("response.output_text.delta").data(
+                    json!({
+                        "type": "response.output_text.delta",
+                        "output_index": 0,
+                        "content_index": 0,
+                        "delta": "Tool result"
+                    })
+                    .to_string(),
+                )),
+                Ok(Event::default().event("response.output_text.delta").data(
+                    json!({
+                        "type": "response.output_text.delta",
+                        "output_index": 0,
+                        "content_index": 0,
+                        "delta": " consumed;"
+                    })
+                    .to_string(),
+                )),
+                Ok(Event::default().event("response.output_text.delta").data(
+                    json!({
+                        "type": "response.output_text.delta",
+                        "output_index": 0,
+                        "content_index": 0,
+                        "delta": " here is the final answer."
+                    })
+                    .to_string(),
+                )),
+                // response.output_text.done
+                Ok(Event::default().event("response.output_text.done").data(
+                    json!({
+                        "type": "response.output_text.done",
+                        "output_index": 0,
+                        "content_index": 0,
+                        "text": "Tool result consumed; here is the final answer."
+                    })
+                    .to_string(),
+                )),
+                // response.output_item.done
+                Ok(Event::default().event("response.output_item.done").data(
+                    json!({
+                        "type": "response.output_item.done",
+                        "output_index": 0,
+                        "item": {
+                            "id": msg_id,
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{
+                                "type": "output_text",
+                                "text": "Tool result consumed; here is the final answer."
+                            }]
+                        }
+                    })
+                    .to_string(),
+                )),
+                // response.completed
+                Ok(Event::default().event("response.completed").data(
+                    json!({
+                        "type": "response.completed",
+                        "response": {
+                            "id": rid,
+                            "object": "response",
+                            "created_at": timestamp,
+                            "model": "mock-model",
+                            "status": "completed",
+                            "usage": {
+                                "input_tokens": 12,
+                                "output_tokens": 7,
+                                "total_tokens": 19
+                            }
+                        }
+                    })
+                    .to_string(),
+                )),
+                // [DONE]
+                Ok(Event::default().data("[DONE]")),
+            ];
+
+            let stream = stream::iter(events);
+            Sse::new(stream)
+                .keep_alive(KeepAlive::default())
+                .into_response()
+        } else {
+            // Default streaming response
+            let stream = stream::once(async move {
+                let chunk = json!({
+                    "id": request_id,
+                    "object": "response",
+                    "created_at": timestamp,
+                    "model": "mock-model",
+                    "status": "in_progress",
+                    "output": [{
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{
+                            "type": "output_text",
+                            "text": "This is a mock responses streamed output."
+                        }]
+                    }]
+                });
+                Ok::<_, Infallible>(Event::default().data(chunk.to_string()))
+            })
+            .chain(stream::once(async { Ok(Event::default().data("[DONE]")) }));
+
+            Sse::new(stream)
+                .keep_alive(KeepAlive::default())
+                .into_response()
+        }
+    } else if is_background {
+        let rid = req_id.unwrap_or_else(|| format!("resp-{}", Uuid::new_v4()));
+        Json(json!({
+            "id": rid,
+            "object": "response",
+            "created_at": timestamp,
+            "model": "mock-model",
+            "output": [],
+            "status": "queued",
+            "usage": null
+        }))
+        .into_response()
+    } else {
+        // If tools are provided and this is the first call (no previous_response_id),
+        // emit a single function_tool_call to trigger the router's MCP flow.
+        let has_tools = payload
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter().any(|tool| {
+                    tool.get("type")
+                        .and_then(|t| t.as_str())
+                        .map(|t| t == "function")
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+        let has_function_output = payload
+            .get("input")
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items.iter().any(|item| {
+                    item.get("type")
+                        .and_then(|t| t.as_str())
+                        .map(|t| t == "function_call_output")
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+
+        if has_tools && !has_function_output {
+            let rid = format!("resp-{}", Uuid::new_v4());
+            Json(json!({
+                "id": rid,
+                "object": "response",
+                "created_at": timestamp,
+                "model": "mock-model",
+                "output": [{
+                    "type": "function_tool_call",
+                    "id": "call_1",
+                    "name": "brave_web_search",
+                    "arguments": "{\"query\":\"SGLang router MCP integration\"}",
+                    "status": "in_progress"
+                }],
+                "status": "in_progress",
+                "usage": null
+            }))
+            .into_response()
+        } else if has_tools && has_function_output {
+            Json(json!({
+                "id": format!("resp-{}", Uuid::new_v4()),
+                "object": "response",
+                "created_at": timestamp,
+                "model": "mock-model",
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "Tool result consumed; here is the final answer."
+                    }]
+                }],
+                "status": "completed",
+                "usage": {
+                    "input_tokens": 12,
+                    "output_tokens": 7,
+                    "total_tokens": 19
+                }
+            }))
+            .into_response()
+        } else {
+            Json(json!({
+                "id": format!("resp-{}", Uuid::new_v4()),
+                "object": "response",
+                "created_at": timestamp,
+                "model": "mock-model",
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "This is a mock responses output."
+                    }]
+                }],
+                "status": "completed",
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 5,
+                    "total_tokens": 15
+                }
+            }))
+            .into_response()
+        }
+    }
+}
+
 async fn flush_cache_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>) -> Response {
     let config = config.read().await;
 
@@ -599,6 +1112,145 @@ async fn v1_models_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>) 
         }]
     }))
     .into_response()
+}
+
+async fn responses_get_handler(
+    State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    Path(response_id): Path<String>,
+) -> Response {
+    let config = config.read().await;
+    if should_fail(&config).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "Random failure for testing" })),
+        )
+            .into_response();
+    }
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    // Only return 200 if this worker "stores" the response id
+    if response_exists_for_port(config.port, &response_id) {
+        Json(json!({
+            "id": response_id,
+            "object": "response",
+            "created_at": timestamp,
+            "model": "mock-model",
+            "output": [],
+            "status": "completed",
+            "usage": {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0
+            }
+        }))
+        .into_response()
+    } else {
+        StatusCode::NOT_FOUND.into_response()
+    }
+}
+
+async fn responses_cancel_handler(
+    State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    Path(response_id): Path<String>,
+) -> Response {
+    let config = config.read().await;
+    if should_fail(&config).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "Random failure for testing" })),
+        )
+            .into_response();
+    }
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    if response_exists_for_port(config.port, &response_id) {
+        Json(json!({
+            "id": response_id,
+            "object": "response",
+            "created_at": timestamp,
+            "model": "mock-model",
+            "output": [],
+            "status": "cancelled",
+            "usage": null
+        }))
+        .into_response()
+    } else {
+        StatusCode::NOT_FOUND.into_response()
+    }
+}
+
+// --- Simple in-memory response store per worker port (for tests) ---
+static RESP_STORE: OnceLock<Mutex<HashMap<u16, HashSet<String>>>> = OnceLock::new();
+
+fn get_store() -> &'static Mutex<HashMap<u16, HashSet<String>>> {
+    RESP_STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn store_response_for_port(port: u16, response_id: &str) {
+    let mut map = get_store().lock().unwrap();
+    map.entry(port).or_default().insert(response_id.to_string());
+}
+
+fn response_exists_for_port(port: u16, response_id: &str) -> bool {
+    let map = get_store().lock().unwrap();
+    map.get(&port)
+        .map(|set| set.contains(response_id))
+        .unwrap_or(false)
+}
+
+// Minimal rerank handler returning mock results; router shapes final response
+async fn rerank_handler(
+    State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    Json(payload): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let config = config.read().await;
+
+    // Simulate response delay
+    if config.response_delay_ms > 0 {
+        tokio::time::sleep(tokio::time::Duration::from_millis(config.response_delay_ms)).await;
+    }
+
+    // Simulate failure rate
+    if rand::random::<f32>() < config.fail_rate {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "Simulated failure").into_response();
+    }
+
+    // Extract documents from the request to create mock results
+    let empty_vec = vec![];
+    let documents = payload
+        .get("documents")
+        .and_then(|d| d.as_array())
+        .unwrap_or(&empty_vec);
+
+    // Create mock rerank results with scores based on document index
+    let mut mock_results = Vec::new();
+    for (i, doc) in documents.iter().enumerate() {
+        let score = 0.95 - (i as f32 * 0.1); // Decreasing scores
+        let result = serde_json::json!({
+            "score": score,
+            "document": doc.as_str().unwrap_or(""),
+            "index": i,
+            "meta_info": {
+                "confidence": if score > 0.9 { "high" } else { "medium" }
+            }
+        });
+        mock_results.push(result);
+    }
+
+    // Sort by score (highest first) to simulate proper ranking
+    mock_results.sort_by(|a, b| {
+        b["score"]
+            .as_f64()
+            .unwrap()
+            .partial_cmp(&a["score"].as_f64().unwrap())
+            .unwrap()
+    });
+
+    (StatusCode::OK, Json(mock_results)).into_response()
 }
 
 impl Default for MockWorkerConfig {

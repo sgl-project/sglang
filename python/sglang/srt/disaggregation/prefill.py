@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from collections import deque
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional, Type
@@ -42,7 +43,12 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce,
     prepare_abort,
 )
-from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import (
+    FINISH_LENGTH,
+    Req,
+    RequestStage,
+    ScheduleBatch,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.utils import (
     DynamicGradMode,
@@ -170,6 +176,7 @@ class PrefillBootstrapQueue:
             pp_rank=self.pp_rank,
         )
         self._process_req(req)
+        req.add_latency(RequestStage.PREFILL_PREPARE)
         self.queue.append(req)
 
     def extend(self, reqs: List[Req], num_kv_heads: int) -> None:
@@ -256,8 +263,11 @@ class PrefillBootstrapQueue:
 
             num_pages = kv_to_page_num(num_kv_indices, self.token_to_kv_pool.page_size)
             req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
+
             bootstrapped_reqs.append(req)
             indices_to_remove.add(i)
+            req.time_stats.wait_queue_entry_time = time.perf_counter()
+            req.add_latency(RequestStage.PREFILL_BOOTSTRAP)
 
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
@@ -322,29 +332,20 @@ class SchedulerDisaggregationPrefillMixin:
             if require_mlp_sync(self.server_args):
                 batch = self.prepare_mlp_sync_batch(batch)
             self.cur_batch = batch
-            if batch:
-                result = self.run_batch(batch)
-                self.result_queue.append((batch.copy(), result))
 
-                if self.last_batch is None:
-                    # Create a dummy first batch to start the pipeline for overlap schedule.
-                    # It is now used for triggering the sampling_info_done event.
-                    tmp_batch = ScheduleBatch(
-                        reqs=None,
-                        forward_mode=ForwardMode.DUMMY_FIRST,
-                        next_batch_sampling_info=self.tp_worker.cur_sampling_info,
-                    )
-                    self.set_next_batch_sampling_info_done(tmp_batch)
+            batch_result = None
+            if batch:
+                batch_result = self.run_batch(batch)
+                self.result_queue.append((batch.copy(), batch_result))
 
             if self.last_batch:
                 tmp_batch, tmp_result = self.result_queue.popleft()
-                tmp_batch.next_batch_sampling_info = (
-                    self.tp_worker.cur_sampling_info if batch else None
-                )
                 self.process_batch_result_disagg_prefill(tmp_batch, tmp_result)
 
             if len(self.disagg_prefill_inflight_queue) > 0:
                 self.process_disagg_prefill_inflight_queue()
+
+            self.launch_batch_sample_if_needed(batch_result)
 
             if batch is None and len(self.disagg_prefill_inflight_queue) == 0:
                 self.self_check_during_idle()
@@ -358,7 +359,6 @@ class SchedulerDisaggregationPrefillMixin:
         self: Scheduler,
         batch: ScheduleBatch,
         result: GenerationBatchResult,
-        launch_done: Optional[threading.Event] = None,
     ) -> None:
         """
         Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
@@ -369,41 +369,40 @@ class SchedulerDisaggregationPrefillMixin:
             next_token_ids,
             extend_input_len_per_req,
             extend_logprob_start_len_per_req,
+            copy_done,
         ) = (
             result.logits_output,
             result.next_token_ids,
             result.extend_input_len_per_req,
             result.extend_logprob_start_len_per_req,
+            result.copy_done,
         )
+
+        if copy_done is not None:
+            copy_done.synchronize()
 
         logprob_pt = 0
         # Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
-        if self.enable_overlap:
-            # wait
-            logits_output, next_token_ids, _ = self.tp_worker.resolve_last_batch_result(
-                launch_done
-            )
-        else:
-            next_token_ids = result.next_token_ids.tolist()
-            if batch.return_logprob:
-                if logits_output.next_token_logprobs is not None:
-                    logits_output.next_token_logprobs = (
-                        logits_output.next_token_logprobs.tolist()
-                    )
-                if logits_output.input_token_logprobs is not None:
-                    logits_output.input_token_logprobs = tuple(
-                        logits_output.input_token_logprobs.tolist()
-                    )
+        next_token_ids = result.next_token_ids.tolist()
+        if batch.return_logprob:
+            if logits_output.next_token_logprobs is not None:
+                logits_output.next_token_logprobs = (
+                    logits_output.next_token_logprobs.tolist()
+                )
+            if logits_output.input_token_logprobs is not None:
+                logits_output.input_token_logprobs = tuple(
+                    logits_output.input_token_logprobs.tolist()
+                )
 
         hidden_state_offset = 0
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
-            req: Req
             if req.is_chunked <= 0:
                 # There is no output_ids for prefill
                 req.output_ids.append(next_token_id)
                 self.tree_cache.cache_unfinished_req(req)  # update the tree and lock
+                req.add_latency(RequestStage.PREFILL_FORWARD)
                 self.disagg_prefill_inflight_queue.append(req)
                 if (
                     logits_output is not None
@@ -412,9 +411,16 @@ class SchedulerDisaggregationPrefillMixin:
                     last_hidden_index = (
                         hidden_state_offset + extend_input_len_per_req[i] - 1
                     )
-                    req.hidden_states_tensor = (
-                        logits_output.hidden_states[last_hidden_index].cpu().clone()
-                    )
+                    req.output_topk_p = batch.spec_info.topk_p[i]
+                    req.output_topk_index = batch.spec_info.topk_index[i]
+                    if self.spec_algorithm.is_eagle3():
+                        req.hidden_states_tensor = (
+                            batch.spec_info.hidden_states[i].cpu().clone()
+                        )
+                    else:
+                        req.hidden_states_tensor = (
+                            logits_output.hidden_states[last_hidden_index].cpu().clone()
+                        )
                     hidden_state_offset += extend_input_len_per_req[i]
                 else:
                     req.hidden_states_tensor = None
@@ -434,6 +440,7 @@ class SchedulerDisaggregationPrefillMixin:
                     )
                     logprob_pt += num_input_logprobs
                 self.send_kv_chunk(req, last_chunk=True)
+                req.time_stats.prefill_transfer_queue_entry_time = time.perf_counter()
 
                 if req.grammar is not None:
                     # FIXME: this try-except block is for handling unexpected xgrammar issue.
@@ -473,8 +480,6 @@ class SchedulerDisaggregationPrefillMixin:
                 if self.enable_overlap:
                     self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
 
-        # We need to remove the sync in the following function for overlap schedule.
-        self.set_next_batch_sampling_info_done(batch)
         self.maybe_send_health_check_signal()
 
     def process_disagg_prefill_inflight_queue(
@@ -531,6 +536,9 @@ class SchedulerDisaggregationPrefillMixin:
             else:
                 assert False, f"Unexpected polling state {poll=}"
 
+        for req in done_reqs:
+            req.time_stats.completion_time = time.perf_counter()
+
         # Stream requests which have finished transfer
         self.stream_output(
             done_reqs,
@@ -539,6 +547,7 @@ class SchedulerDisaggregationPrefillMixin:
         )
         for req in done_reqs:
             req: Req
+            req.add_latency(RequestStage.PREFILL_TRANSFER_KV_CACHE)
             self.req_to_metadata_buffer_idx_allocator.free(req.metadata_buffer_index)
             req.metadata_buffer_index = -1
 
@@ -667,7 +676,6 @@ class SchedulerDisaggregationPrefillMixin:
         self.running_mbs = [
             ScheduleBatch(reqs=[], batch_is_full=False) for _ in range(self.pp_size)
         ]
-        bids = [None] * self.pp_size
         pp_outputs: Optional[PPProxyTensors] = None
 
         # Either success or failed
@@ -739,10 +747,7 @@ class SchedulerDisaggregationPrefillMixin:
                 # send the outputs to the next step
                 if self.pp_group.is_last_rank:
                     if self.cur_batch:
-                        next_token_ids, bids[mb_id] = (
-                            result.next_token_ids,
-                            result.bid,
-                        )
+                        next_token_ids = result.next_token_ids
                         pp_outputs = PPProxyTensors(
                             {
                                 "next_token_ids": next_token_ids,
@@ -779,7 +784,6 @@ class SchedulerDisaggregationPrefillMixin:
                         next_token_ids=next_pp_outputs["next_token_ids"],
                         extend_input_len_per_req=None,
                         extend_logprob_start_len_per_req=None,
-                        bid=bids[next_mb_id],
                         can_run_cuda_graph=result.can_run_cuda_graph,
                     )
                     self.process_batch_result_disagg_prefill(
@@ -796,8 +800,6 @@ class SchedulerDisaggregationPrefillMixin:
 
                 # carry the outputs to the next stage
                 if not self.pp_group.is_last_rank:
-                    if self.cur_batch:
-                        bids[mb_id] = result.bid
                     if pp_outputs:
                         # send the outputs from the last round to let the next stage worker run post processing
                         self.pp_group.send_tensor_dict(
@@ -816,8 +818,10 @@ class SchedulerDisaggregationPrefillMixin:
 
                     # send out proxy tensors to the next stage
                     if self.cur_batch:
+                        # FIXME(lsyin): remove this assert
+                        assert result.pp_hidden_states_proxy_tensors.tensors is not None
                         self.pp_group.send_tensor_dict(
-                            result.pp_hidden_states_proxy_tensors,
+                            result.pp_hidden_states_proxy_tensors.tensors,
                             all_gather_group=self.attn_tp_group,
                         )
 

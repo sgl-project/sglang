@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 import triton
@@ -12,12 +12,18 @@ from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_trito
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.utils import get_bool_env_var, get_device_core_count, next_power_of_2
+from sglang.srt.speculative.spec_utils import generate_draft_decode_kv_indices
+from sglang.srt.utils import (
+    get_bool_env_var,
+    get_device_core_count,
+    get_int_env_var,
+    next_power_of_2,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
-    from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
+    from sglang.srt.speculative.spec_info import SpecInput
 
 
 def logit_capping_mod(logit_capping_method, logit_cap):
@@ -80,7 +86,13 @@ class TritonAttnBackend(AttentionBackend):
         self.num_kv_head = model_runner.model_config.get_num_kv_heads(
             get_attention_tp_size()
         )
-        self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[-1]
+        if model_runner.hybrid_gdn_config is not None:
+            # For hybrid linear models, layer_id = 0 may not be full attention
+            self.v_head_dim = model_runner.token_to_kv_pool.get_v_head_dim()
+        else:
+            self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[
+                -1
+            ]
         self.max_context_len = model_runner.model_config.context_len
         self.device = model_runner.device
         self.device_core_count = get_device_core_count(model_runner.gpu_id)
@@ -88,6 +100,29 @@ class TritonAttnBackend(AttentionBackend):
             "SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS", "false"
         )
         self.max_kv_splits = model_runner.server_args.triton_attention_num_kv_splits
+
+        # Decide whether enable deterministic inference with batch-invariant operations
+        self.enable_deterministic = (
+            model_runner.server_args.enable_deterministic_inference
+        )
+
+        # Configure deterministic inference settings
+        if self.enable_deterministic:
+            # Use fixed split tile size for batch invariance
+            self.split_tile_size = get_int_env_var(
+                "SGLANG_TRITON_DECODE_SPLIT_TILE_SIZE", 256
+            )
+            # Set static_kv_splits to False to use deterministic logic instead
+            self.static_kv_splits = False
+        else:
+            self.split_tile_size = (
+                model_runner.server_args.triton_attention_split_tile_size
+            )
+
+        if self.split_tile_size is not None:
+            self.max_kv_splits = (
+                self.max_context_len + self.split_tile_size - 1
+            ) // self.split_tile_size
 
         # Check arguments
         assert not (
@@ -128,6 +163,8 @@ class TritonAttnBackend(AttentionBackend):
         # Initialize forward metadata
         self.forward_metadata: ForwardMetadata = None
 
+        self.cuda_graph_custom_mask = None
+
     def get_num_kv_splits(
         self,
         num_kv_splits: torch.Tensor,
@@ -143,8 +180,24 @@ class TritonAttnBackend(AttentionBackend):
             num_group * num_seq == num_token
         ), f"num_seq({num_seq}), num_token({num_token}), something goes wrong!"
 
-        if self.static_kv_splits or self.device_core_count <= 0:
+        # Legacy dynamic splitting logic (non-deterministic)
+        if (
+            self.static_kv_splits or self.device_core_count <= 0
+        ) and not self.enable_deterministic:
             num_kv_splits.fill_(self.max_kv_splits)
+            return
+
+        # deterministic
+        if self.split_tile_size is not None and self.enable_deterministic:
+            # expand seq_lens to match num_token
+            if num_group > 1:
+                expanded_seq_lens = seq_lens.repeat_interleave(num_group)
+            else:
+                expanded_seq_lens = seq_lens
+
+            num_kv_splits[:] = (
+                expanded_seq_lens + self.split_tile_size - 1
+            ) // self.split_tile_size
             return
 
         if num_seq < 256:
@@ -371,6 +424,7 @@ class TritonAttnBackend(AttentionBackend):
         max_bs: int,
         max_num_tokens: int,
         kv_indices_buf: Optional[torch.Tensor] = None,
+        cuda_graph_num_kv_splits_buf: Optional[torch.Tensor] = None,
     ):
         self.cuda_graph_attn_logits = torch.zeros(
             (max_num_tokens, self.num_head, self.max_kv_splits, self.v_head_dim),
@@ -382,9 +436,17 @@ class TritonAttnBackend(AttentionBackend):
             dtype=torch.float32,
             device=self.device,
         )
-        self.cuda_graph_num_kv_splits = torch.full(
-            (max_num_tokens,), self.max_kv_splits, dtype=torch.int32, device=self.device
-        )
+
+        if cuda_graph_num_kv_splits_buf is None:
+            self.cuda_graph_num_kv_splits = torch.full(
+                (max_num_tokens,),
+                self.max_kv_splits,
+                dtype=torch.int32,
+                device=self.device,
+            )
+        else:
+            self.cuda_graph_num_kv_splits = cuda_graph_num_kv_splits_buf
+
         if kv_indices_buf is None:
             self.cuda_graph_kv_indices = torch.zeros(
                 (max_num_tokens * self.max_context_len),
@@ -432,7 +494,7 @@ class TritonAttnBackend(AttentionBackend):
         seq_lens: torch.Tensor,
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        spec_info: Optional[SpecInput],
     ):
         assert encoder_lens is None, "Not supported"
         window_kv_indptr = self.window_kv_indptr
@@ -588,7 +650,7 @@ class TritonAttnBackend(AttentionBackend):
         seq_lens_sum: int,
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
         # NOTE: encoder_lens expected to be zeros or None
@@ -631,9 +693,7 @@ class TritonAttnBackend(AttentionBackend):
                     )
 
             else:
-                kv_indptr[: spec_info.kv_indptr.shape[0]] = spec_info.kv_indptr
-                kv_indices[: spec_info.kv_indices.shape[0]] = spec_info.kv_indices
-                num_token = spec_info.kv_indptr.shape[0] - 1
+                assert False, "Multi-step cuda graph init is not done here."
             self.get_num_kv_splits(num_kv_splits[:num_token], seq_lens[:bs])
 
         elif forward_mode.is_target_verify():
@@ -705,6 +765,19 @@ class TritonAttnBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
 
+    def get_verify_buffers_to_fill_after_draft(self):
+        """
+        Return buffers for verify attention kernels that needs to be filled after draft.
+
+        Typically, these are tree mask and position buffers.
+        """
+        return [self.cuda_graph_custom_mask, None]
+
+    def update_verify_buffers_to_fill_after_draft(
+        self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
+    ):
+        pass
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -729,7 +802,7 @@ class TritonAttnBackend(AttentionBackend):
         logits_soft_cap = logit_capping_mod(layer.logit_capping_method, layer.logit_cap)
 
         causal = True
-        if layer.attn_type == AttentionType.ENCODER_ONLY:
+        if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
             causal = False
 
         if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
@@ -833,11 +906,8 @@ class TritonMultiStepDraftBackend:
         topk: int,
         speculative_num_steps: int,
     ):
-        from sglang.srt.speculative.eagle_utils import generate_draft_decode_kv_indices
-
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
-        self.generate_draft_decode_kv_indices = generate_draft_decode_kv_indices
         max_bs = model_runner.req_to_token_pool.size * self.topk
         self.kv_indptr = torch.zeros(
             (
@@ -847,8 +917,8 @@ class TritonMultiStepDraftBackend:
             dtype=torch.int32,
             device=model_runner.device,
         )
-        self.attn_backends = []
-        for i in range(self.speculative_num_steps):
+        self.attn_backends: List[TritonAttnBackend] = []
+        for i in range(self.speculative_num_steps - 1):
             self.attn_backends.append(
                 TritonAttnBackend(
                     model_runner,
@@ -866,13 +936,19 @@ class TritonMultiStepDraftBackend:
         self.page_size = model_runner.server_args.page_size
 
     def common_template(
-        self, forward_batch: ForwardBatch, kv_indices_buffer: torch.Tensor, call_fn: int
+        self,
+        forward_batch: ForwardBatch,
+        kv_indices_buffer: Optional[torch.Tensor],
+        call_fn: int,
     ):
+        if kv_indices_buffer is None:
+            kv_indices_buffer = self.cuda_graph_kv_indices
+
         num_seqs = forward_batch.batch_size
         bs = self.topk * num_seqs
         seq_lens_sum = forward_batch.seq_lens_sum
 
-        self.generate_draft_decode_kv_indices[
+        generate_draft_decode_kv_indices[
             (self.speculative_num_steps, num_seqs, self.topk)
         ](
             forward_batch.req_pool_indices,
@@ -890,7 +966,10 @@ class TritonMultiStepDraftBackend:
             self.page_size,
         )
 
-        for i in range(self.speculative_num_steps):
+        if call_fn is None:
+            return
+
+        for i in range(self.speculative_num_steps - 1):
             forward_batch.spec_info.kv_indptr = self.kv_indptr[i, : bs + 1]
             forward_batch.spec_info.kv_indices = kv_indices_buffer[i][
                 : seq_lens_sum * self.topk + bs * (i + 1)
@@ -924,9 +1003,19 @@ class TritonMultiStepDraftBackend:
             dtype=torch.int64,
             device=self.device,
         )
-        for i in range(self.speculative_num_steps):
+        self.cuda_graph_num_kv_splits = torch.full(
+            (max_num_tokens,),
+            self.attn_backends[0].max_kv_splits,
+            dtype=torch.int32,
+            device=self.device,
+        )
+
+        for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_cuda_graph_state(
-                max_bs, max_num_tokens, kv_indices_buf=self.cuda_graph_kv_indices[i]
+                max_bs,
+                max_num_tokens,
+                kv_indices_buf=self.cuda_graph_kv_indices[i],
+                cuda_graph_num_kv_splits_buf=self.cuda_graph_num_kv_splits,
             )
 
     def init_forward_metadata_capture_cuda_graph(self, forward_batch: ForwardBatch):
@@ -941,24 +1030,24 @@ class TritonMultiStepDraftBackend:
                 spec_info=forward_batch.spec_info,
             )
 
-        self.common_template(forward_batch, self.cuda_graph_kv_indices, call_fn)
+        self.common_template(forward_batch, None, call_fn)
 
     def init_forward_metadata_replay_cuda_graph(
         self, forward_batch: ForwardBatch, bs: int
     ):
-        def call_fn(i, forward_batch):
-            self.attn_backends[i].init_forward_metadata_replay_cuda_graph(
-                bs,
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                seq_lens_sum=-1,
-                encoder_lens=None,
-                forward_mode=ForwardMode.DECODE,
-                spec_info=forward_batch.spec_info,
-                seq_lens_cpu=None,
-            )
+        self.common_template(forward_batch, None, None)
 
-        self.common_template(forward_batch, self.cuda_graph_kv_indices, call_fn)
+        # NOTE: Multi-step's attention backends use the slice of
+        # - kv_indptr buffer (cuda graph and non-cuda graph)
+        # - kv_indices buffer (cuda graph only)
+        # So we don't need to assign the KV indices inside the attention backend.
+
+        # Compute num_kv_splits only once
+        num_token = forward_batch.batch_size * self.topk
+        self.attn_backends[-1].get_num_kv_splits(
+            self.attn_backends[-1].cuda_graph_num_kv_splits[:num_token],
+            forward_batch.seq_lens[:bs],
+        )
 
 
 @triton.jit

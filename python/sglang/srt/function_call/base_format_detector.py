@@ -3,6 +3,7 @@ import logging
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List
 
+import orjson
 from partial_json_parser.core.exceptions import MalformedJSON
 from partial_json_parser.core.options import Allow
 
@@ -96,7 +97,7 @@ class BaseFormatDetector(ABC):
         Parses the text in one go. Returns success=True if the format matches, otherwise False.
         Note that leftover_text here represents "content that this parser will not consume further".
         """
-        action = json.loads(text)
+        action = orjson.loads(text)
         return StreamingParseResult(calls=self.parse_base_json(action, tools))
 
     def _ends_with_partial_token(self, buffer: str, bot_token: str) -> int:
@@ -162,12 +163,9 @@ class BaseFormatDetector(ABC):
 
         try:
             try:
-                if current_text.startswith(self.bot_token):
-                    start_idx = len(self.bot_token)
-                elif self.current_tool_id > 0 and current_text.startswith(
-                    self.tool_call_separator + self.bot_token
-                ):
-                    start_idx = len(self.tool_call_separator + self.bot_token)
+                tool_call_pos = current_text.find(self.bot_token)
+                if tool_call_pos != -1:
+                    start_idx = tool_call_pos + len(self.bot_token)
                 elif self.current_tool_id > 0 and current_text.startswith(
                     self.tool_call_separator
                 ):

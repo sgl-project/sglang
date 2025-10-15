@@ -170,9 +170,47 @@ void downcast_fp8(
     int64_t offset,
     int64_t cuda_stream);
 
+void copy_to_gpu_no_ce(const at::Tensor& input, at::Tensor& output);
+void concat_mla_k(torch::Tensor k, torch::Tensor k_nope, torch::Tensor k_rope);
+void concat_mla_absorb_q(at::Tensor a, at::Tensor b, at::Tensor out);
+
+void fast_topk_interface(at::Tensor score, at::Tensor indices, at::Tensor lengths);
+void fast_topk_transform_interface(
+    at::Tensor score,
+    at::Tensor lengths,
+    at::Tensor dst_page_table,
+    at::Tensor src_page_table,
+    at::Tensor cu_seqlens_q);
+
 #ifdef USE_ROCM
 void gelu_quick(at::Tensor& out, const at::Tensor& input);
 #endif
+
+/*
+ * From gguf quantization
+ */
+torch::Tensor
+ggml_dequantize(torch::Tensor W, int64_t type, int64_t m, int64_t n, std::optional<at::ScalarType> const& dtype);
+
+torch::Tensor ggml_mul_mat_vec_a8(torch::Tensor W, torch::Tensor X, int64_t type, int64_t row);
+
+torch::Tensor ggml_mul_mat_a8(torch::Tensor W, torch::Tensor X, int64_t type, int64_t row);
+
+torch::Tensor ggml_moe_a8(
+    torch::Tensor X,
+    torch::Tensor W,
+    torch::Tensor sorted_token_ids,
+    torch::Tensor expert_ids,
+    torch::Tensor num_tokens_post_padded,
+    int64_t type,
+    int64_t row,
+    int64_t top_k,
+    int64_t tokens);
+
+torch::Tensor ggml_moe_a8_vec(
+    torch::Tensor X, torch::Tensor W, torch::Tensor topk_ids, int64_t top_k, int64_t type, int64_t row, int64_t tokens);
+
+int64_t ggml_moe_get_block_size(int64_t type);
 
 /*
  * From csrc/gemm
@@ -208,6 +246,15 @@ torch::Tensor fp8_blockwise_scaled_mm(
 void scaled_fp4_quant(
     torch::Tensor& output, torch::Tensor const& input, torch::Tensor& output_scale, torch::Tensor const& input_scale);
 void sgl_per_token_group_quant_8bit(
+    at::Tensor input,
+    at::Tensor output_q,
+    at::Tensor output_s,
+    int64_t group_size,
+    double eps,
+    double fp8_min,
+    double fp8_max,
+    bool scale_ue8m0);
+void sgl_per_token_group_quant_8bit_v2(
     at::Tensor input,
     at::Tensor output_q,
     at::Tensor output_s,
@@ -282,6 +329,10 @@ void moe_align_block_size(
 
 void topk_softmax(
     torch::Tensor& topk_weights, torch::Tensor& topk_indices, torch::Tensor& gating_output, bool renormalize);
+
+void moe_sum_reduce(at::Tensor& input, at::Tensor& output, double routed_scaling_factor);
+
+void moe_sum(torch::Tensor& input, torch::Tensor& output);
 
 std::vector<at::Tensor> moe_fused_gate(
     at::Tensor& input,
@@ -447,6 +498,16 @@ void verify_tree_greedy(
     at::Tensor target_predict,
     int64_t cuda_stream = 0);
 
+void reconstruct_indices_from_tree_mask(
+    at::Tensor tree_mask,
+    at::Tensor verified_seq_len,
+    at::Tensor positions,             // mutable
+    at::Tensor retrive_index,         // mutable
+    at::Tensor retrive_next_token,    // mutable
+    at::Tensor retrive_next_sibling,  // mutable
+    int64_t batch_size,
+    int64_t draft_token_num);
+
 void build_tree_kernel_efficient(
     at::Tensor parent_list,
     at::Tensor selected_index,
@@ -567,6 +628,21 @@ void transfer_kv_direct(
     std::vector<at::Tensor> dst_layers,
     const at::Tensor src_indices,
     const at::Tensor dst_indices,
+    int64_t page_size);
+
+void transfer_kv_per_layer_direct_pf_lf(
+    const std::vector<at::Tensor>& src_ptrs,
+    std::vector<at::Tensor> dst_ptrs,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t layer_id,
+    int64_t page_size);
+
+void transfer_kv_all_layer_direct_lf_pf(
+    const std::vector<at::Tensor>& src_ptrs,
+    std::vector<at::Tensor> dst_ptrs,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
     int64_t page_size);
 
 /*
@@ -722,4 +798,41 @@ std::vector<int64_t> create_greenctx_stream_by_value(int64_t smA, int64_t smB, i
  */
 void store_kv_cache(at::Tensor k_cache, at::Tensor v_cache, at::Tensor out_loc, at::Tensor k, at::Tensor v);
 
-void copy_to_gpu_no_ce(const at::Tensor& input, at::Tensor& output);
+/*
+ * From csrc/mamba
+ */
+void causal_conv1d_update(
+    const at::Tensor& x,
+    const at::Tensor& conv_state,
+    const at::Tensor& weight,
+    const std::optional<at::Tensor>& bias_,
+    bool silu_activation,
+    const std::optional<at::Tensor>& cache_seqlens_,
+    const std::optional<at::Tensor>& conv_state_indices_,
+    int64_t pad_slot_id);
+
+void causal_conv1d_fwd(
+    const at::Tensor& x,
+    const at::Tensor& weight,
+    const std::optional<at::Tensor>& bias_,
+    const std::optional<at::Tensor>& conv_states,
+    const std::optional<at::Tensor>& query_start_loc,
+    const std::optional<at::Tensor>& cache_indices,
+    const std::optional<at::Tensor>& has_initial_state,
+    bool silu_activation,
+    int64_t pad_slot_id);
+
+/*
+ * From csrc/expert_specialization
+ */
+void es_fp8_blockwise_scaled_grouped_mm(
+    torch::Tensor& output,
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    const torch::Tensor& scales_a,
+    const torch::Tensor& scales_b,
+    const torch::Tensor& stride_a,
+    const torch::Tensor& stride_b,
+    const torch::Tensor& stride_d,
+    const torch::Tensor& problem_sizes,
+    const torch::Tensor& expert_offsets);

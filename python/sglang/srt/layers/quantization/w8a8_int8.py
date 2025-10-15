@@ -343,9 +343,8 @@ class W8A8Int8LinearMethod(LinearMethodBase):
                 _is_cpu_amx_available
             ), "W8A8Int8LinearMethod on CPU requires that CPU has AMX support"
             _amx_process_weight_after_loading(layer, ["weight"])
-            return
-
-        layer.weight = Parameter(layer.weight.t(), requires_grad=False)
+        else:
+            layer.weight = Parameter(layer.weight.t(), requires_grad=False)
         layer.weight_scale = Parameter(layer.weight_scale.data, requires_grad=False)
 
     def create_weights(
@@ -394,12 +393,22 @@ class W8A8Int8LinearMethod(LinearMethodBase):
                 x.dtype,
                 True,  # is_vnni
             )
-
         x_q, x_scale = per_token_quant_int8(x)
 
-        return int8_scaled_mm(
-            x_q, layer.weight, x_scale, layer.weight_scale, out_dtype=x.dtype, bias=bias
+        x_q_2d = x_q.view(-1, x_q.shape[-1])
+        x_scale_2d = x_scale.view(-1, x_scale.shape[-1])
+        output_shape = [*x_q.shape[:-1], layer.weight.shape[1]]
+
+        output = int8_scaled_mm(
+            x_q_2d,
+            layer.weight,
+            x_scale_2d,
+            layer.weight_scale,
+            out_dtype=x.dtype,
+            bias=bias,
         )
+
+        return output.view(output_shape)
 
 
 class W8A8Int8MoEMethod(FusedMoEMethodBase):
@@ -486,10 +495,9 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
                 _is_cpu_amx_available
             ), "W8A8Int8MoEMethod on CPU requires that CPU has AMX support"
             _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
-            return
-
-        layer.w13_weight = Parameter(layer.w13_weight, requires_grad=False)
-        layer.w2_weight = Parameter(layer.w2_weight, requires_grad=False)
+        else:
+            layer.w13_weight = Parameter(layer.w13_weight, requires_grad=False)
+            layer.w2_weight = Parameter(layer.w2_weight, requires_grad=False)
         layer.w13_weight_scale = Parameter(
             layer.w13_weight_scale.data, requires_grad=False
         )
@@ -640,6 +648,7 @@ class NPU_W8A8LinearMethodImpl:
             layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
         layer.weight_scale.data = torch.flatten(layer.weight_scale.data)
         layer.weight_offset.data = torch.flatten(layer.weight_offset.data)
+        layer.weight.data = torch_npu.npu_format_cast(layer.weight.data, 29)
 
 
 class NPU_W8A8LinearMethodMTImpl:
@@ -832,6 +841,7 @@ class NPU_W8A8DynamicLinearMethodImpl:
         layer.weight_scale.data = layer.weight_scale.data.flatten()
         layer.weight_scale_fp32 = layer.weight_scale.data.to(torch.float32)
         layer.weight_offset.data = layer.weight_offset.data.flatten()
+        layer.weight.data = torch_npu.npu_format_cast(layer.weight.data, 29)
 
 
 class NPU_W8A8DynamicLinearMethod(LinearMethodBase):

@@ -12,6 +12,8 @@ from torchvision.transforms import InterpolationMode
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 from sglang.srt.models.qwen2_vl import Qwen2VLForConditionalGeneration
+from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
+from sglang.srt.models.qwen3_vl_moe import Qwen3VLMoeForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
@@ -67,10 +69,15 @@ def smart_resize(
     return h_bar, w_bar
 
 
-def resize_image(image, size_factor: int = IMAGE_FACTOR) -> Image.Image:
+def resize_image(
+    image,
+    min_pixels: int = MIN_PIXELS,
+    max_pixels: int = MAX_PIXELS,
+    size_factor: int = IMAGE_FACTOR,
+) -> Image.Image:
     width, height = image.size
-    min_pixels = MIN_PIXELS
-    max_pixels = MAX_PIXELS
+    min_pixels = min_pixels
+    max_pixels = max_pixels
     resized_height, resized_width = smart_resize(
         height,
         width,
@@ -97,8 +104,13 @@ def floor_by_factor(number: int, factor: int) -> int:
     return math.floor(number / factor) * factor
 
 
-async def resize_image_async(image):
-    return resize_image(image)
+async def resize_image_async(
+    image,
+    min_pixels: int = MIN_PIXELS,
+    max_pixels: int = MAX_PIXELS,
+    size_factor: int = IMAGE_FACTOR,
+):
+    return resize_image(image, min_pixels, max_pixels, size_factor)
 
 
 def smart_nframes(
@@ -199,7 +211,12 @@ async def preprocess_video(
 
 # Compatible with Qwen2VL and Qwen2_5VL
 class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
-    models = [Qwen2VLForConditionalGeneration, Qwen2_5_VLForConditionalGeneration]
+    models = [
+        Qwen2VLForConditionalGeneration,
+        Qwen2_5_VLForConditionalGeneration,
+        Qwen3VLForConditionalGeneration,
+        Qwen3VLMoeForConditionalGeneration,
+    ]
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)

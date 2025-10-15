@@ -40,7 +40,6 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VisionRotaryEmbedding,
 )
 
-from sglang.srt.hf_transformers_utils import get_processor
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -61,6 +60,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.utils import add_prefix
+from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
 
@@ -265,7 +265,7 @@ class Qwen2_5_VisionTransformer(nn.Module):
         self.fullatt_block_indexes = vision_config.fullatt_block_indexes
         self.window_size = vision_config.window_size
         self.patch_size = vision_config.patch_size
-        mlp_hidden_size: int = vision_config.intermediate_size
+        mlp_hidden_size: int = ((vision_config.intermediate_size + 7) // 8) * 8
         self.patch_embed = Qwen2_5_VisionPatchEmbed(
             patch_size=patch_size,
             temporal_patch_size=temporal_patch_size,
@@ -436,7 +436,7 @@ class Qwen2_5_VisionTransformer(nn.Module):
                 .to(device=x.device, dtype=torch.int32),
             ]
         )
-        cu_seqlens = F.pad(cu_seqlens, (1, 0), "constant", 0)
+        cu_seqlens = torch.cat([cu_seqlens.new_zeros(1), cu_seqlens])
 
         # transformers
         x = x.unsqueeze(1)
@@ -518,6 +518,9 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
 
+        # For EAGLE3 support
+        self.capture_aux_hidden_states = False
+
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
@@ -588,9 +591,13 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             positions=positions,
         )
 
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
+
         if not get_embedding:
             return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch
+                input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
             )
         else:
             return self.pooler(hidden_states, forward_batch)
@@ -643,6 +650,22 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
 
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+
+    def get_embed_and_head(self):
+        return self.model.embed_tokens.weight, self.lm_head.weight
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        self.capture_aux_hidden_states = True
+        self.model.capture_aux_hidden_states = True
+        if layer_ids is None:
+            num_layers = self.config.num_hidden_layers
+            self.model.layers_to_capture = [
+                2,
+                num_layers // 2,
+                num_layers - 3,
+            ]  # Specific layers for EAGLE3 support
+        else:
+            self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
 
 EntryClass = [Qwen2_5_VLForConditionalGeneration]

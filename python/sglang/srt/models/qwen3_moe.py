@@ -51,15 +51,19 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.rotary_embedding import MRotaryEmbedding, get_rope
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP as Qwen3MoeMLP
 from sglang.srt.models.qwen2_moe import Qwen2MoeModel
+from sglang.srt.models.utils import (
+    create_fused_set_kv_buffer_arg,
+    enable_fused_set_kv_buffer,
+)
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     add_prefix,
     is_cuda,
@@ -98,9 +102,9 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             use_grouped_topk=False,
         )
 
-        self.experts = get_moe_impl_class()(
+        self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.num_experts
-            + global_server_args_dict["ep_num_redundant_experts"],
+            + get_global_server_args().ep_num_redundant_experts,
             top_k=config.num_experts_per_tok,
             layer_id=layer_id,
             hidden_size=config.hidden_size,
@@ -121,7 +125,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             # TODO: we will support tp < ep in the future
             self.ep_size = get_moe_expert_parallel_world_size()
             self.num_experts = (
-                config.num_experts + global_server_args_dict["ep_num_redundant_experts"]
+                config.num_experts + get_global_server_args().ep_num_redundant_experts
             )
             self.top_k = config.num_experts_per_tok
 
@@ -354,6 +358,10 @@ class Qwen3MoeAttention(nn.Module):
             rope_scaling=rope_scaling,
             dual_chunk_attention_config=dual_chunk_attention_config,
         )
+        self.compatible_with_fused_kv_buffer = (
+            False if isinstance(self.rotary_emb, MRotaryEmbedding) else True
+        )
+
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
@@ -412,7 +420,21 @@ class Qwen3MoeAttention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self._apply_qk_norm(q, k)
-        q, k = self.rotary_emb(positions, q, k)
+        q, k = self.rotary_emb(
+            positions,
+            q,
+            k,
+            fused_set_kv_buffer_arg=(
+                create_fused_set_kv_buffer_arg(
+                    value=v,
+                    layer=self.attn,
+                    forward_batch=forward_batch,
+                )
+                if enable_fused_set_kv_buffer(forward_batch)
+                and self.compatible_with_fused_kv_buffer
+                else None
+            ),
+        )
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
 
@@ -420,7 +442,13 @@ class Qwen3MoeAttention(nn.Module):
         hidden_states, forward_batch, inner_state = intermediate_state
         if inner_state is None:
             return hidden_states
-        attn_output = self.attn(*inner_state)
+        attn_output = self.attn(
+            *inner_state,
+            save_kv_cache=not (
+                enable_fused_set_kv_buffer(forward_batch)
+                and self.compatible_with_fused_kv_buffer
+            ),
+        )
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -665,7 +693,7 @@ class Qwen3MoeForCausalLM(nn.Module):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=global_server_args_dict["enable_dp_lm_head"],
+            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
         self.capture_aux_hidden_states = False
