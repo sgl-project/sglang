@@ -276,7 +276,7 @@ class EagleVerifyInputV2Mixin:
                 accept_length=accept_length,  # mutable
                 simulate_acc_len=SIMULATE_ACC_LEN,
                 bs=bs,
-                spec_steps=self.draft_token_num,
+                spec_steps=self.spec_steps,
             )
 
         # Include the bonus token
