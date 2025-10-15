@@ -38,24 +38,7 @@ class DraftBackendFactory:
 
     def create_decode_backend(self):
         if self.speculative_num_steps == 1:
-
-            class DummyAttnBackend:
-                def __init__(self):
-                    self.attn_backends = []
-
-                def init_forward_metadata(self, *args, **kwargs):
-                    pass
-
-                def init_cuda_graph_state(self, *args, **kwargs):
-                    pass
-
-                def init_forward_metadata_replay_cuda_graph(self, *args, **kwargs):
-                    pass
-
-                def init_forward_metadata_capture_cuda_graph(self, *args, **kwargs):
-                    pass
-
-            return DummyAttnBackend()
+            return None
 
         backend_map = {
             "flashinfer": self._create_flashinfer_decode_backend,

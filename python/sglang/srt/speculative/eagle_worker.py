@@ -505,8 +505,11 @@ class EAGLEWorker(TpModelWorker):
             )
         else:
             forward_batch.can_run_dp_cuda_graph = False
-            if not forward_batch.forward_mode.is_idle():
-                # Initialize attention backend
+            if (
+                not forward_batch.forward_mode.is_idle()
+                and self.speculative_num_steps > 1
+            ):
+                # Skip attention backend init for idle mode or 1-step draft
                 self.draft_attn_backend.init_forward_metadata(forward_batch)
             # Run forward steps
             parent_list, top_scores_index, draft_tokens = self.draft_forward(
