@@ -59,12 +59,19 @@ class ElasticEPStateManager:
     def _build_state(
         cls, *, ep_size: Optional[int], device: Optional[torch.device]
     ) -> ElasticEPState:
-        ep = ep_size if ep_size is not None else torch.distributed.get_world_size()
-        dev = device if device is not None else cls._select_device()
 
-        active = torch.ones(ep, dtype=torch.int32, device=dev)
+        active = cls.healthy_rank_state(cls, ep_size=ep_size, device=device)
         return ElasticEPState(
             active_ranks=active,
             last_active_ranks=active.clone(),
             active_ranks_cpu=active.detach().cpu().clone(),
         )
+
+    @classmethod
+    def healthy_rank_state(
+        cls, *, ep_size: Optional[int], device: Optional[torch.device]
+    ) -> torch.Tensor:
+        size = ep_size if ep_size is not None else torch.distributed.get_world_size()
+        dev = device if device is not None else cls._select_device()
+
+        return torch.ones(size, dtype=torch.int32, device=dev)
