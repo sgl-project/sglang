@@ -1358,7 +1358,7 @@ pub struct ResponsesRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<HashMap<String, Value>>,
 
-    /// Model to use (optional to match vLLM)
+    /// Model to use
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
 
@@ -2783,7 +2783,7 @@ impl GenerationRequest for EmbeddingRequest {
     }
 }
 
-/// Classification request compatible with vLLM API
+/// Classification request compatible with openAI API
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ClassifyRequest {
     /// ID of the model to use
@@ -2825,7 +2825,7 @@ impl GenerationRequest for ClassifyRequest {
     }
 }
 
-/// Classification response compatible with vLLM API
+/// Classification response compatible with OpenAI API
 #[derive(Debug, Clone, Serialize)]
 pub struct ClassifyResponse {
     pub id: String,
