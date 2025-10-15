@@ -1061,6 +1061,27 @@ class UpdateWeightsFromTensorReqOutput(BaseReq):
 
 
 @dataclass
+class UpdateWeightsFromCkptEngineReqInput(BaseReq):
+    # The model path with the new weights
+    model_path: str
+    # The format to load the weights
+    load_format: Optional[str] = None
+    # Whether to abort all requests before updating weights
+    abort_all_requests: bool = False
+    # Optional: Update weight version along with weights
+    weight_version: Optional[str] = None
+    # Whether to flush the cache after updating weights
+    flush_cache: bool = True
+
+
+@dataclass
+class UpdateWeightsFromCkptEngineReqOutput(BaseReq):
+    success: bool
+    message: str
+    # Number of paused requests during weight sync.
+    num_paused_requests: Optional[int] = 0
+
+
 class InitWeightsSendGroupForRemoteInstanceReqInput(BaseReq):
     # The master address
     master_address: str

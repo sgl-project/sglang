@@ -69,6 +69,7 @@ LOAD_FORMAT_CHOICES = [
     "layered",
     "remote",
     "remote_instance",
+    "ckpt_engine",
 ]
 
 QUANTIZATION_CHOICES = [
@@ -486,6 +487,8 @@ class ServerArgs:
     remote_instance_weight_loader_seed_instance_ip: Optional[str] = None
     remote_instance_weight_loader_seed_instance_service_port: Optional[int] = None
     remote_instance_weight_loader_send_weights_group_ports: Optional[List[int]] = None
+
+    ckpt_engine_port: int = 33001
 
     # For PD-Multiplexing
     enable_pdmux: bool = False
@@ -3020,6 +3023,12 @@ class ServerArgs:
             type=json_list_type,
             default=ServerArgs.remote_instance_weight_loader_send_weights_group_ports,
             help="The communication group ports for loading weights from remote instance.",
+        )
+        parser.add_argument(
+            "--ckpt-engine-port",
+            type=int,
+            default=ServerArgs.ckpt_engine_port,
+            help="The base port for checkpoint engine communication. Default is 33001.",
         )
 
         # For PD-Multiplexing

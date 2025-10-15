@@ -14,6 +14,7 @@ import os
 import socket
 import threading
 import time
+import uuid
 from abc import ABC, abstractmethod
 from contextlib import contextmanager, suppress
 from typing import (
@@ -1571,6 +1572,66 @@ class RemoteInstanceModelLoader(BaseModelLoader):
         torch.cuda.empty_cache()
 
 
+class CkptEngineModelLoader(BaseModelLoader):
+    """Model loader for checkpoint engine format."""
+
+    def __init__(self, load_config: LoadConfig):
+        super().__init__(load_config)
+        if load_config.model_loader_extra_config:
+            raise ValueError(
+                f"Model loader extra config is not supported for "
+                f"load format {load_config.load_format}"
+            )
+
+    def download_model(self, model_config: ModelConfig) -> None:
+        raise NotImplementedError
+
+    def load_model(
+        self,
+        *,
+        model_config: ModelConfig,
+        device_config: DeviceConfig,
+    ) -> nn.Module:
+        """Load model using checkpoint engine format."""
+        logger.info("Loading weights from checkpoint engine format ...")
+        model_weights = f"ckptengine://"
+
+        with set_default_torch_dtype(model_config.dtype):
+            with torch.device(device_config.device):
+                model = _initialize_model(model_config, self.load_config)
+
+            with create_remote_connector(
+                model_weights,
+                device_config.device,
+                ckpt_engine_port=self.load_config.ckpt_engine_port,
+            ) as client:
+                connector_type = get_connector_type(client)
+                if connector_type == ConnectorType.CKPTENGINE:
+                    self.load_model_from_ckpt_engine(
+                        model, client, model_config, device_config
+                    )
+                else:
+                    raise ValueError(
+                        f"Unsupported connector type {connector_type} for "
+                        f"remote tensor model loading."
+                    )
+
+        return model.eval()
+
+    def load_model_from_ckpt_engine(
+        self, model, client, model_config: ModelConfig, device_config: DeviceConfig
+    ) -> nn.Module:
+        for _, module in model.named_modules():
+            quant_method = getattr(module, "quant_method", None)
+            if quant_method is not None:
+                quant_method.process_weights_after_loading(module)
+
+        def post_hook():
+            post_load_weights(model, model_config)
+
+        client.update_weights_from_ipc(model, device_config.gpu_id, post_hook)
+
+
 class RemoteModelLoader(BaseModelLoader):
     """Model loader that can load Tensors from remote database."""
 
@@ -1950,5 +2011,8 @@ def get_model_loader(
 
     if load_config.load_format == LoadFormat.REMOTE_INSTANCE:
         return RemoteInstanceModelLoader(load_config)
+
+    if load_config.load_format == LoadFormat.CKPT_ENGINE:
+        return CkptEngineModelLoader(load_config)
 
     return DefaultModelLoader(load_config)
