@@ -22,6 +22,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
 
 # Adapted from
@@ -36,14 +37,13 @@ from transformers import LlamaConfig
 
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
+from sglang.srt.layers.linear import QKVParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaDecoderLayer, LlamaForCausalLM, LlamaMLP
@@ -254,7 +254,7 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
                 config.hidden_size,
                 quant_config=quant_config,
                 prefix=add_prefix("lm_head", prefix),
-                use_attn_tp_group=global_server_args_dict["enable_dp_lm_head"],
+                use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
             )
 
         self.logits_processor = LogitsProcessor(config)
