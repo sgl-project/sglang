@@ -1,11 +1,6 @@
 import logging
-from typing import Optional
 
-import torch
-
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import ServerArgs, get_global_server_args
-from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils.common import is_blackwell
 
 logger = logging.getLogger(__name__)
