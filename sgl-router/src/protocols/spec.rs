@@ -2783,6 +2783,78 @@ impl GenerationRequest for EmbeddingRequest {
     }
 }
 
+/// Classification request compatible with vLLM API
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ClassifyRequest {
+    /// ID of the model to use
+    pub model: String,
+
+    /// Input can be a string or array of strings to classify
+    pub input: Value,
+
+    /// Optional user identifier
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+
+    /// SGLang extension: request id for tracking
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rid: Option<String>,
+}
+
+impl GenerationRequest for ClassifyRequest {
+    fn is_stream(&self) -> bool {
+        // Classification is non-streaming
+        false
+    }
+
+    fn get_model(&self) -> Option<&str> {
+        Some(&self.model)
+    }
+
+    fn extract_text_for_routing(&self) -> String {
+        // Best effort: extract text content for routing decisions
+        match &self.input {
+            Value::String(s) => s.clone(),
+            Value::Array(arr) => arr
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>()
+                .join(" "),
+            _ => String::new(),
+        }
+    }
+}
+
+/// Classification response compatible with vLLM API
+#[derive(Debug, Clone, Serialize)]
+pub struct ClassifyResponse {
+    pub id: String,
+    pub object: String, // "list"
+    pub created: u64,
+    pub model: String,
+    pub data: Vec<ClassifyData>,
+    pub usage: ClassifyUsage,
+}
+
+/// Classification data item
+#[derive(Debug, Clone, Serialize)]
+pub struct ClassifyData {
+    pub index: u32,
+    pub label: String,
+    pub probs: Vec<f32>,
+    pub num_classes: u32,
+}
+
+/// Usage information for classification
+#[derive(Debug, Clone, Serialize)]
+pub struct ClassifyUsage {
+    pub prompt_tokens: u32,
+    pub total_tokens: u32,
+    pub completion_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens_details: Option<Value>,
+}
+
 /// Helper function for serde default value
 pub fn default_true() -> bool {
     true

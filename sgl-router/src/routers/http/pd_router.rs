@@ -1182,6 +1182,19 @@ impl RouterTrait for PDRouter {
             .into_response()
     }
 
+    async fn route_classify(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _body: &crate::protocols::spec::ClassifyRequest,
+        _model_id: Option<&str>,
+    ) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Classify endpoint not implemented for PD router",
+        )
+            .into_response()
+    }
+
     async fn route_embeddings(
         &self,
         _headers: Option<&HeaderMap>,

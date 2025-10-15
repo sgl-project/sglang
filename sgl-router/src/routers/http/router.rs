@@ -5,8 +5,9 @@ use crate::core::{
 use crate::metrics::RouterMetrics;
 use crate::policies::PolicyRegistry;
 use crate::protocols::spec::{
-    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, GenerationRequest,
-    RerankRequest, RerankResponse, RerankResult, ResponsesGetParams, ResponsesRequest,
+    ChatCompletionRequest, ClassifyRequest, CompletionRequest, EmbeddingRequest, GenerateRequest,
+    GenerationRequest, RerankRequest, RerankResponse, RerankResult, ResponsesGetParams,
+    ResponsesRequest,
 };
 use crate::routers::header_utils;
 use crate::routers::RouterTrait;
@@ -737,6 +738,30 @@ impl RouterTrait for Router {
         } else {
             let error_type = format!("http_{}", res.status().as_u16());
             RouterMetrics::record_embeddings_error(&error_type);
+        }
+
+        res
+    }
+
+    async fn route_classify(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ClassifyRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        // Record classification-specific metrics in addition to general request metrics
+        let start = Instant::now();
+        let res = self
+            .route_typed_request(headers, body, "/v1/classify", model_id)
+            .await;
+
+        // Classification specific metrics
+        if res.status().is_success() {
+            RouterMetrics::record_classify_request();
+            RouterMetrics::record_classify_duration(start.elapsed());
+        } else {
+            let error_type = format!("http_{}", res.status().as_u16());
+            RouterMetrics::record_classify_error(&error_type);
         }
 
         res

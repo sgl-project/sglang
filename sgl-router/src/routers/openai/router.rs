@@ -7,8 +7,8 @@ use crate::data_connector::{
     SharedConversationItemStorage, SharedConversationStorage, SharedResponseStorage,
 };
 use crate::protocols::spec::{
-    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest,
-    ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponsesGetParams,
+    ChatCompletionRequest, ClassifyRequest, CompletionRequest, EmbeddingRequest, GenerateRequest,
+    RerankRequest, ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponsesGetParams,
     ResponsesRequest,
 };
 use crate::routers::header_utils::apply_request_headers;
@@ -816,7 +816,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                 .into_response(),
             Err(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("Failed to get response: {}", e)})),
+                Json(json!({ "error": format!("Failed to get response: {}", e) })),
             )
                 .into_response(),
         }
@@ -868,6 +868,15 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         _model_id: Option<&str>,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED, "Rerank not supported").into_response()
+    }
+
+    async fn route_classify(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _body: &ClassifyRequest,
+        _model_id: Option<&str>,
+    ) -> Response {
+        (StatusCode::NOT_IMPLEMENTED, "Classify not supported").into_response()
     }
 
     async fn create_conversation(&self, _headers: Option<&HeaderMap>, body: &Value) -> Response {

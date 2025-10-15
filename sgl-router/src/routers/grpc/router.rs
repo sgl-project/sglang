@@ -15,8 +15,8 @@ use crate::config::types::RetryConfig;
 use crate::core::WorkerRegistry;
 use crate::policies::PolicyRegistry;
 use crate::protocols::spec::{
-    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest,
-    ResponsesGetParams, ResponsesRequest,
+    ChatCompletionRequest, ClassifyRequest, CompletionRequest, EmbeddingRequest, GenerateRequest,
+    RerankRequest, ResponsesGetParams, ResponsesRequest,
 };
 use crate::reasoning_parser::ParserFactory as ReasoningParserFactory;
 use crate::routers::RouterTrait;
@@ -229,6 +229,15 @@ impl RouterTrait for GrpcRouter {
     }
 
     async fn cancel_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
+        (StatusCode::NOT_IMPLEMENTED).into_response()
+    }
+
+    async fn route_classify(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _body: &ClassifyRequest,
+        _model_id: Option<&str>,
+    ) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
     }
 

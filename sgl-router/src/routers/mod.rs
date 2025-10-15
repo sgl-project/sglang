@@ -10,8 +10,8 @@ use axum::{
 use std::fmt::Debug;
 
 use crate::protocols::spec::{
-    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest,
-    ResponsesGetParams, ResponsesRequest,
+    ChatCompletionRequest, ClassifyRequest, CompletionRequest, EmbeddingRequest, GenerateRequest,
+    RerankRequest, ResponsesGetParams, ResponsesRequest,
 };
 use serde_json::Value;
 
@@ -118,6 +118,14 @@ pub trait RouterTrait: Send + Sync + Debug {
         &self,
         headers: Option<&HeaderMap>,
         body: &EmbeddingRequest,
+        model_id: Option<&str>,
+    ) -> Response;
+
+    /// Route classification requests (OpenAI-compatible /v1/classify)
+    async fn route_classify(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ClassifyRequest,
         model_id: Option<&str>,
     ) -> Response;
 
