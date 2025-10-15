@@ -40,6 +40,8 @@ from sglang.srt.layers.dp_attention import (
     set_dp_buffer_len,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
+from sglang.srt.layers.moe.utils import get_deepep_mode, get_moe_a2a_backend
 from sglang.srt.layers.torchao_utils import save_gemlite_cache
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -237,6 +239,8 @@ class CudaGraphRunner:
         self.tp_size = model_runner.server_args.tp_size
         self.dp_size = model_runner.server_args.dp_size
         self.pp_size = model_runner.server_args.pp_size
+        # Record DeepEP mode used during capture to ensure replay consistency
+        self._captured_deepep_mode = None
 
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
@@ -655,6 +659,16 @@ class CudaGraphRunner:
             )
             return logits_output_or_pp_proxy_tensors
 
+        # Resolve and pin DeepEP mode to avoid AUTO flipping between capture and replay
+        if get_moe_a2a_backend().is_deepep():
+            # Base runner handles decode/verify; not extend-in-batch
+            resolved = get_deepep_mode().resolve(is_extend_in_batch=False)
+            if resolved.is_low_latency():
+                DeepEPBuffer.set_dispatch_mode_as_low_latency()
+            else:
+                DeepEPBuffer.set_dispatch_mode_as_normal()
+            self._captured_deepep_mode = resolved
+
         for _ in range(2):
             self.device_module.synchronize()
             self.model_runner.tp_group.barrier()
@@ -798,6 +812,13 @@ class CudaGraphRunner:
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+        # Re-apply captured DeepEP mode before replay to keep CUDA Graph stable under AUTO
+        if get_moe_a2a_backend().is_deepep() and self._captured_deepep_mode is not None:
+            if self._captured_deepep_mode.is_low_latency():
+                DeepEPBuffer.set_dispatch_mode_as_low_latency()
+            else:
+                DeepEPBuffer.set_dispatch_mode_as_normal()
+
         if not skip_attn_backend_init:
             self.replay_prepare(forward_batch, pp_proxy_tensors)
         else:

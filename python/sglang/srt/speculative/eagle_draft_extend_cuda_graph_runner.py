@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING, Callable
 import torch
 
 from sglang.srt.layers.dp_attention import DpPaddingMode, set_dp_buffer_len
+from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
+from sglang.srt.layers.moe.utils import get_deepep_mode, get_moe_a2a_backend
 from sglang.srt.model_executor.cuda_graph_runner import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
     CudaGraphRunner,
@@ -56,6 +58,8 @@ class EAGLEDraftExtendCudaGraphRunner:
         )
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
         self.padded_static_len = -1
+        # Record resolved DeepEP mode used during capture to ensure replay consistency
+        self._captured_deepep_mode = None
 
         # Attention backend
         self.num_tokens_per_bs = self.speculative_num_steps + 1
@@ -238,6 +242,15 @@ class EAGLEDraftExtendCudaGraphRunner:
         )
         spec_info.positions = None
 
+        # Resolve and pin DeepEP mode during capture to avoid AUTO flipping between runs
+        if get_moe_a2a_backend().is_deepep():
+            resolved = get_deepep_mode().resolve(is_extend_in_batch=True)
+            if resolved.is_low_latency():
+                DeepEPBuffer.set_dispatch_mode_as_low_latency()
+            else:
+                DeepEPBuffer.set_dispatch_mode_as_normal()
+            self._captured_deepep_mode = resolved
+
         # Forward batch
         forward_batch = ForwardBatch(
             forward_mode=ForwardMode.DRAFT_EXTEND,
@@ -313,6 +326,13 @@ class EAGLEDraftExtendCudaGraphRunner:
 
     def replay(self, forward_batch: ForwardBatch):
         assert forward_batch.out_cache_loc is not None
+        # Re-pin DeepEP mode to captured one to avoid AUTO switching between runs
+        if get_moe_a2a_backend().is_deepep() and self._captured_deepep_mode is not None:
+            if self._captured_deepep_mode.is_low_latency():
+                DeepEPBuffer.set_dispatch_mode_as_low_latency()
+            else:
+                DeepEPBuffer.set_dispatch_mode_as_normal()
+
         # batch_size and num_seqs can be different in case there are finished examples
         # in the batch, which will not be counted as num_seqs
         raw_bs = forward_batch.batch_size
