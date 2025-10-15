@@ -57,6 +57,9 @@ class Operation:
     data: Optional[Any]
     # If the operation is expected to fail, this is the error message to expect
     expected_error: Optional[str] = None
+    # Because the logic for implicitly evicting LoRA adapters can be complicated, we explicitly
+    # pass in LoRA adapters that should be implicitly evicted here
+    expected_implicit_evictions: Optional[set[str]] = None
 
 
 @dataclass
@@ -594,8 +597,10 @@ MAX_LOADED_LORAS_TESTS = [
             Operation(
                 type=OperationType.LOAD,
                 data="pbevan11/llama-3.1-8b-ocr-correction",
+                expected_implicit_evictions={
+                    "philschmid/code-llama-3-1-8b-text-to-sql-lora"
+                },
             ),
-            # "philschmid/code-llama-3-1-8b-text-to-sql-lora" should have been implicitly evicted
             Operation(
                 type=OperationType.UNLOAD,
                 data="philschmid/code-llama-3-1-8b-text-to-sql-lora",
@@ -610,8 +615,8 @@ MAX_LOADED_LORAS_TESTS = [
                         "philschmid/code-llama-3-1-8b-text-to-sql-lora",
                     ]
                 ),
+                expected_implicit_evictions={"pbevan11/llama-3.1-8b-ocr-correction"},
             ),
-            # "pbevan11/llama-3.1-8b-ocr-correction" should have been implicitly evicted
             Operation(
                 type=OperationType.UNLOAD,
                 data="pbevan11/llama-3.1-8b-ocr-correction",
@@ -643,6 +648,30 @@ MAX_LOADED_LORAS_TESTS = [
                         "pbevan11/llama-3.1-8b-ocr-correction",
                     ]
                 ),
+                expected_implicit_evictions={
+                    "philschmid/code-llama-3-1-8b-text-to-sql-lora"
+                },
+            ),
+            Operation(
+                type=OperationType.UNLOAD,
+                data="Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
+            ),
+            Operation(
+                type=OperationType.LOAD,
+                data="algoprog/fact-generation-llama-3.1-8b-instruct-lora",
+            ),
+            Operation(
+                type=OperationType.FORWARD,
+                data=create_batch_data(
+                    [
+                        "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
+                        "philschmid/code-llama-3-1-8b-text-to-sql-lora",
+                    ]
+                ),
+                expected_implicit_evictions={
+                    "pbevan11/llama-3.1-8b-ocr-correction",
+                    "algoprog/fact-generation-llama-3.1-8b-instruct-lora",
+                },
             ),
         ],
     ),
@@ -671,8 +700,10 @@ MAX_LOADED_LORAS_TESTS = [
             Operation(
                 type=OperationType.LOAD,
                 data="pbevan11/llama-3.1-8b-ocr-correction",
+                expected_implicit_evictions={
+                    "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16"
+                },
             ),
-            # "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16" should have been implicitly evicted
             Operation(
                 type=OperationType.UNLOAD,
                 data="Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
@@ -687,8 +718,8 @@ MAX_LOADED_LORAS_TESTS = [
                         "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
                     ]
                 ),
+                expected_implicit_evictions={"pbevan11/llama-3.1-8b-ocr-correction"},
             ),
-            # "pbevan11/llama-3.1-8b-ocr-correction" should have been implicitly evicted
             Operation(
                 type=OperationType.UNLOAD,
                 data="pbevan11/llama-3.1-8b-ocr-correction",
@@ -921,13 +952,14 @@ class LoRAUpdateTestSessionBase:
         lora_name: str,
         lora_path: Optional[str] = None,
         expected_error: Optional[str] = None,
+        expected_implicit_evictions: Optional[set[str]] = None,
     ):
         """
         Load a LoRA adapter by name and path.
         """
         raise NotImplementedError("Subclasses must implement load_lora_adapter")
 
-    def unload_lora_adapter(self, lora_name: str):
+    def unload_lora_adapter(self, lora_name: str, expected_error: Optional[str] = None):
         """
         Unload a LoRA adapter by name.
         """
@@ -939,6 +971,7 @@ class LoRAUpdateTestSessionBase:
         lora_paths: List[str],
         max_new_tokens: int = 32,
         expected_error: Optional[str] = None,
+        expected_implicit_evictions: Optional[set[str]] = None,
     ):
         """
         Perform a batch forward pass with the current set of loaded LoRA adapters.
@@ -985,6 +1018,7 @@ class LoRAUpdateEngineTestSession(LoRAUpdateTestSessionBase):
         lora_path: Optional[str] = None,
         expected_error: Optional[str] = None,
         pinned: bool = False,
+        expected_implicit_evictions: Optional[set[str]] = None,
     ):
         """
         Load a LoRA adapter by name and path.
@@ -1009,6 +1043,9 @@ class LoRAUpdateEngineTestSession(LoRAUpdateTestSessionBase):
             print(f"Received error as expected: {response.error_message}")
         else:
             self.expected_adapters.add(lora_name)
+            if expected_implicit_evictions is not None:
+                self.expected_adapters -= expected_implicit_evictions
+
             self.testcase.assertTrue(
                 response.success,
                 f"Failed to load LoRA adapter {lora_name}: {response.error_message}",
@@ -1021,27 +1058,38 @@ class LoRAUpdateEngineTestSession(LoRAUpdateTestSessionBase):
                 f"Expected loaded adapters to be {self.expected_adapters}, but got {loaded_adapters}",
             )
 
-    def unload_lora_adapter(self, lora_name: str):
+    def unload_lora_adapter(self, lora_name: str, expected_error: Optional[str] = None):
         """
         Unload a LoRA adapter by name.
         """
-        self.expected_adapters.remove(lora_name)
-
         response = self.handle.unload_lora_adapter(
             lora_name=lora_name,
         )
-        self.testcase.assertTrue(
-            response.success,
-            f"Failed to unload LoRA adapter {lora_name}: {response.error_message}",
-        )
-        loaded_adapters = set(response.loaded_adapters)
+        if expected_error:
+            self.testcase.assertFalse(
+                response.success, f"Expected failure for {lora_name}, but got success."
+            )
+            self.testcase.assertIn(
+                expected_error,
+                response.error_message,
+                f"Expected error message to contain '{expected_error}', but got '{response.error_message}'",
+            )
+            print(f"Received error as expected: {response.error_message}")
+        else:
+            self.expected_adapters.remove(lora_name)
 
-        print(f"loaded_adapters: {loaded_adapters}")
-        self.testcase.assertEqual(
-            loaded_adapters,
-            self.expected_adapters,
-            f"Expected loaded adapters to be {self.expected_adapters}, but got {loaded_adapters}",
-        )
+            self.testcase.assertTrue(
+                response.success,
+                f"Failed to unload LoRA adapter {lora_name}: {response.error_message}",
+            )
+            loaded_adapters = set(response.loaded_adapters)
+
+            print(f"loaded_adapters: {loaded_adapters}")
+            self.testcase.assertEqual(
+                loaded_adapters,
+                self.expected_adapters,
+                f"Expected loaded adapters to be {self.expected_adapters}, but got {loaded_adapters}",
+            )
 
     def forward(
         self,
@@ -1049,6 +1097,7 @@ class LoRAUpdateEngineTestSession(LoRAUpdateTestSessionBase):
         lora_paths: List[str],
         max_new_tokens: int = 32,
         expected_error: Optional[str] = None,
+        expected_implicit_evictions: Optional[set[str]] = None,
     ):
         """
         Perform a batch forward pass with the current set of loaded LoRA adapters.
@@ -1083,6 +1132,9 @@ class LoRAUpdateEngineTestSession(LoRAUpdateTestSessionBase):
         self.expected_adapters.update(
             [lora_path for lora_path in lora_paths if lora_path is not None]
         )
+
+        if expected_implicit_evictions is not None:
+            self.expected_adapters -= expected_implicit_evictions
 
         return output
 
@@ -1146,6 +1198,7 @@ class LoRAUpdateServerTestSession(LoRAUpdateTestSessionBase):
         lora_path: Optional[str] = None,
         expected_error: Optional[str] = None,
         pinned: bool = False,
+        expected_implicit_evictions: Optional[set[str]] = None,
     ):
         """
         Load a LoRA adapter by name and path.
@@ -1171,6 +1224,9 @@ class LoRAUpdateServerTestSession(LoRAUpdateTestSessionBase):
             print(f"Received error as expected: {response.text}")
         else:
             self.expected_adapters.add(lora_name)
+            if expected_implicit_evictions is not None:
+                self.expected_adapters -= expected_implicit_evictions
+
             self.testcase.assertTrue(
                 response.ok, f"Failed to load LoRA adapter {lora_name}: {response.text}"
             )
@@ -1182,27 +1238,42 @@ class LoRAUpdateServerTestSession(LoRAUpdateTestSessionBase):
                 f"Expected loaded adapters to be {self.expected_adapters}, but got {loaded_adapters}",
             )
 
-    def unload_lora_adapter(self, lora_name: str):
+    def unload_lora_adapter(self, lora_name: str, expected_error: Optional[str] = None):
         """
         Unload a LoRA adapter by name.
         """
-        self.expected_adapters.remove(lora_name)
-
         response = requests.post(
             DEFAULT_URL_FOR_TEST + "/unload_lora_adapter",
             json={"lora_name": lora_name},
         )
-        self.testcase.assertTrue(
-            response.ok, f"Failed to unload LoRA adapter {lora_name}: {response.text}"
-        )
-        loaded_adapters = set(response.json()["loaded_adapters"])
+        response_payload = response.json()
+        success = response_payload["success"]
+        error_message = response_payload["error_message"]
 
-        print(f"loaded_adapters: {loaded_adapters}")
-        self.testcase.assertEqual(
-            loaded_adapters,
-            self.expected_adapters,
-            f"Expected loaded adapters to be {self.expected_adapters}, but got {loaded_adapters}",
-        )
+        if expected_error:
+            self.testcase.assertFalse(
+                success, f"Expected failure for {lora_name}, but got success."
+            )
+            self.testcase.assertIn(
+                expected_error,
+                error_message,
+                f"Expected error message to contain '{expected_error}', but got '{error_message}'",
+            )
+            print(f"Received error as expected: {error_message}")
+        else:
+            self.expected_adapters.remove(lora_name)
+
+            self.testcase.assertTrue(
+                success, f"Failed to unload LoRA adapter {lora_name}: {error_message}"
+            )
+
+            loaded_adapters = set(response_payload["loaded_adapters"])
+            print(f"loaded_adapters: {loaded_adapters}")
+            self.testcase.assertEqual(
+                loaded_adapters,
+                self.expected_adapters,
+                f"Expected loaded adapters to be {self.expected_adapters}, but got {loaded_adapters}",
+            )
 
     def forward(
         self,
@@ -1210,6 +1281,7 @@ class LoRAUpdateServerTestSession(LoRAUpdateTestSessionBase):
         lora_paths: List[str],
         max_new_tokens: int = 32,
         expected_error: Optional[str] = None,
+        expected_implicit_evictions: Optional[set[str]] = None,
     ):
         """
         Perform a batch forward pass with the current set of loaded LoRA adapters.
@@ -1255,6 +1327,9 @@ class LoRAUpdateServerTestSession(LoRAUpdateTestSessionBase):
             self.expected_adapters.update(
                 [lora_path for lora_path in lora_paths if lora_path is not None]
             )
+
+            if expected_implicit_evictions is not None:
+                self.expected_adapters -= expected_implicit_evictions
 
             return output
 
@@ -1317,6 +1392,7 @@ class TestLoRADynamicUpdate(CustomTestCase):
                 op_type = op.type
                 data = op.data
                 expected_error = op.expected_error
+                expected_implicit_evictions = op.expected_implicit_evictions
                 print("-" * 100)
                 print(
                     f"Running operation: {op_type} --- data: {data} --- mode: {mode} ---"
@@ -1333,11 +1409,13 @@ class TestLoRADynamicUpdate(CustomTestCase):
 
                     result = session.load_lora_adapter(
                         expected_error=expected_error,
+                        expected_implicit_evictions=expected_implicit_evictions,
                         **adapter_info,
                     )
                 elif op_type == OperationType.UNLOAD:
                     result = session.unload_lora_adapter(
                         lora_name=data,
+                        expected_error=expected_error,
                     )
                 elif op_type == OperationType.FORWARD:
                     prompts, adapters = zip(*data)
@@ -1346,6 +1424,7 @@ class TestLoRADynamicUpdate(CustomTestCase):
                         lora_paths=list(adapters),
                         max_new_tokens=max_new_tokens,
                         expected_error=expected_error,
+                        expected_implicit_evictions=expected_implicit_evictions,
                     )
                     if not expected_error:
                         forward_outputs.append(result)

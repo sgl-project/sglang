@@ -484,30 +484,6 @@ class TokenizerCommunicatorMixin:
             )
 
             async with self.lora_update_lock:
-                if self.server_args.max_loaded_loras is not None:
-                    while (
-                        self.lora_registry.num_registered_loras
-                        >= self.server_args.max_loaded_loras
-                    ):
-                        lru_lora_name = await self.lora_registry.lru_lora_name(
-                            exclude_pinned=True
-                        )
-                        if lru_lora_name is None:
-                            raise ValueError(
-                                "Didn't find any LoRA adapters when trying to evict LRU LoRA adapter. "
-                                f"lora registry is: {self.lora_registry._registry}"
-                            )
-
-                        logger.warning(
-                            f"Unloading least recently used LoRA adapter '{lru_lora_name}' "
-                            f"(current number of adapters: {self.lora_registry.num_registered_loras}, "
-                            f"max allowed: {self.server_args.max_loaded_loras})"
-                        )
-
-                        await self._unload_lora_adapter_locked(
-                            UnloadLoRAAdapterReqInput(lora_name=lru_lora_name)
-                        )
-
                 # Generate new uniquely identifiable LoRARef object.
                 new_adapter = LoRARef(
                     lora_name=obj.lora_name,
@@ -523,6 +499,31 @@ class TokenizerCommunicatorMixin:
                 if result.success:
                     await self.lora_registry.register(new_adapter)
                     self.lora_ref_cache[obj.lora_name] = new_adapter
+
+                if self.server_args.max_loaded_loras is not None:
+                    while (
+                        self.lora_registry.num_registered_loras
+                        > self.server_args.max_loaded_loras
+                    ):
+                        lru_lora_name = await self.lora_registry.lru_lora_name(
+                            exclude_pinned=True
+                        )
+                        if lru_lora_name is None:
+                            raise ValueError(
+                                "Didn't find any LoRA adapters when trying to evict LRU LoRA adapter. "
+                                f"LoRA registry is: {self.lora_registry._registry}"
+                            )
+
+                        logger.warning(
+                            f"Unloading least recently used LoRA adapter '{lru_lora_name}' "
+                            f"(current number of adapters: {self.lora_registry.num_registered_loras}, "
+                            f"max allowed: {self.server_args.max_loaded_loras})"
+                        )
+
+                        await self._unload_lora_adapter_locked(
+                            UnloadLoRAAdapterReqInput(lora_name=lru_lora_name)
+                        )
+                        del result.loaded_adapters[lru_lora_name]
 
                 return result
         except ValueError as e:
