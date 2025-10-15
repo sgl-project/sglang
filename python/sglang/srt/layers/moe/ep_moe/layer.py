@@ -29,6 +29,7 @@ from sglang.srt.layers.quantization.modelopt_quant import (
     CUTEDSL_MOE_NVFP4_DISPATCH,
     ModelOptNvFp4FusedMoEMethod,
 )
+from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.single_batch_overlap import DownGemmOverlapArgs
 from sglang.srt.utils import ceil_div, dispose_tensor, get_bool_env_var, is_hip, is_npu
@@ -95,10 +96,16 @@ class DeepEPMoE(FusedMoE):
         if isinstance(quant_config, Fp8Config):
             self.use_block_quant = getattr(self.quant_method, "block_quant", False)
             self.use_fp8_w8a8 = True
+            self.use_w4afp8 = False
             self.fp8_dtype = torch.float8_e4m3fn
-        else:
-            self.use_fp8_w8a8 = False
+        elif isinstance(quant_config, W4AFp8Config):
             self.use_block_quant = False
+            self.use_fp8_w8a8 = False
+            self.use_w4afp8 = True
+        else:
+            self.use_block_quant = False
+            self.use_fp8_w8a8 = False
+            self.use_w4afp8 = False
 
         self.deepep_mode = get_deepep_mode()
 
@@ -142,7 +149,7 @@ class DeepEPMoE(FusedMoE):
                 self.w13_weight,
                 (
                     self.w13_weight_scale_inv
-                    if self.use_block_quant
+                    if self.use_block_quant or self.use_w4afp8
                     else self.w13_weight_scale
                 ),
             )
@@ -150,7 +157,7 @@ class DeepEPMoE(FusedMoE):
                 self.w2_weight,
                 (
                     self.w2_weight_scale_inv
-                    if self.use_block_quant
+                    if self.use_block_quant or self.use_w4afp8
                     else self.w2_weight_scale
                 ),
             )
@@ -217,6 +224,8 @@ class DeepEPMoE(FusedMoE):
                 return self.forward_flashinfer_cutedsl(
                     dispatch_output, down_gemm_overlap_args=down_gemm_overlap_args
                 )
+            if self.use_w4afp8:
+                return self.forward_w4afp8_masked(dispatch_output)
             assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8
             return self.forward_deepgemm_masked(dispatch_output)
         else:
@@ -437,6 +446,19 @@ class DeepEPMoE(FusedMoE):
             down_gemm_overlap_args=down_gemm_overlap_args,
         )
         return output
+
+    def forward_w4afp8_masked(
+        self,
+        dispatch_output: DeepEPLLOutput,
+    ):
+        assert self.moe_runner_config.activation == "silu"
+        assert isinstance(self.quant_method, W4AFp8MoEMethod)
+        return self.quant_method.apply_deepep_ll(
+            layer=self,
+            x=dispatch_output.hidden_states_fp8,
+            topk_ids=dispatch_output.topk_idx,
+            masked_m=dispatch_output.masked_m,
+        )
 
     def forward_deepgemm_masked(
         self,
