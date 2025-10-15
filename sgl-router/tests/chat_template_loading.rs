@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use sglang_router_rs::protocols::spec;
+    use sglang_router_rs::protocols;
     use sglang_router_rs::tokenizer::chat_template::ChatTemplateParams;
     use sglang_router_rs::tokenizer::huggingface::HuggingFaceTokenizer;
     use std::fs;

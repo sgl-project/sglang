@@ -7,7 +7,7 @@ use std::time::Duration;
 use tonic::{transport::Channel, Request, Streaming};
 use tracing::{debug, warn};
 
-use crate::protocols::spec::{
+use crate::protocols::{
     ChatCompletionRequest, GenerateRequest, ResponseFormat,
     SamplingParams as GenerateSamplingParams, StringOrArray,
 };
@@ -306,8 +306,8 @@ impl SglangSchedulerClient {
         // Handle skip_special_tokens: set to false if tools are present and tool_choice is not "none"
         let skip_special_tokens = if request.tools.is_some() {
             match &request.tool_choice {
-                Some(crate::protocols::spec::ToolChoice::Value(
-                    crate::protocols::spec::ToolChoiceValue::None,
+                Some(crate::protocols::ToolChoice::Value(
+                    crate::protocols::ToolChoiceValue::None,
                 )) => request.skip_special_tokens,
                 Some(_) => false, // tool_choice is not "none"
                 None => false, // TODO: this assumes tool_choice defaults to "auto" when tools present

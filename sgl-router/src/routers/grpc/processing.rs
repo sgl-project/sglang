@@ -9,7 +9,7 @@ use serde_json::Value;
 use tracing::error;
 
 use crate::grpc_client::proto;
-use crate::protocols::spec::{
+use crate::protocols::{
     ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse,
     FunctionCallResponse, GenerateMetaInfo, GenerateRequest, GenerateResponse, ToolCall,
     ToolChoice, ToolChoiceValue, Usage,

@@ -1,5 +1,5 @@
 use serde_json::{from_str, to_string, Number, Value};
-use sglang_router_rs::protocols::spec::{
+use sglang_router_rs::protocols::{
     GenerationRequest, RerankRequest, RerankResponse, RerankResult, StringOrArray, UsageInfo,
     V1RerankReqInput,
 };

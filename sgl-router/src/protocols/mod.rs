@@ -12,10 +12,6 @@ pub mod sampling_params;
 pub mod validated;
 pub mod worker_spec;
 
-// Keep spec.rs for now to avoid breaking changes during migration
-// TODO: This can be removed once all imports are updated
-pub mod spec;
-
 // Re-export all public types for backward compatibility
 pub use chat::*;
 pub use common::*;

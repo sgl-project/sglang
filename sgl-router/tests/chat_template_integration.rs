@@ -1,4 +1,4 @@
-use sglang_router_rs::protocols::spec;
+use sglang_router_rs::protocols;
 use sglang_router_rs::tokenizer::chat_template::{
     detect_chat_template_content_format, ChatTemplateContentFormat, ChatTemplateParams,
     ChatTemplateProcessor,

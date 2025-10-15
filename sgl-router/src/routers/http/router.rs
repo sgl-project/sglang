@@ -4,7 +4,7 @@ use crate::core::{
 };
 use crate::metrics::RouterMetrics;
 use crate::policies::PolicyRegistry;
-use crate::protocols::spec::{
+use crate::protocols::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, GenerationRequest,
     RerankRequest, RerankResponse, RerankResult, ResponsesGetParams, ResponsesRequest,
 };

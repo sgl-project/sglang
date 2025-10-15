@@ -19,7 +19,7 @@ use tracing::{debug, error, warn};
 use super::context;
 use super::utils;
 use crate::grpc_client::proto;
-use crate::protocols::spec::*;
+use crate::protocols::*;
 use crate::reasoning_parser::ReasoningParser;
 use crate::tokenizer::stop::{SequenceDecoderOutput, StopSequenceDecoder};
 use crate::tokenizer::traits::Tokenizer;

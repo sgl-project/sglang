@@ -1,5 +1,5 @@
 use serde_json::json;
-use sglang_router_rs::protocols::spec::{
+use sglang_router_rs::protocols::{
     ChatCompletionRequest, ChatMessage, Function, FunctionCall, FunctionChoice, StreamOptions,
     Tool, ToolChoice, ToolChoiceValue, ToolReference, UserMessageContent,
 };

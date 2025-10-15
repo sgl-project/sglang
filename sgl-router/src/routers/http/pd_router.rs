@@ -5,7 +5,7 @@ use crate::core::{
 };
 use crate::metrics::RouterMetrics;
 use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
-use crate::protocols::spec::{
+use crate::protocols::{
     ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateRequest, RerankRequest,
     ResponsesGetParams, ResponsesRequest, StringOrArray, UserMessageContent,
 };
@@ -1191,7 +1191,7 @@ impl RouterTrait for PDRouter {
     async fn route_embeddings(
         &self,
         _headers: Option<&HeaderMap>,
-        _body: &crate::protocols::spec::EmbeddingRequest,
+        _body: &crate::protocols::EmbeddingRequest,
         _model_id: Option<&str>,
     ) -> Response {
         (

@@ -3,7 +3,7 @@
 use crate::config::types::RetryConfig;
 use crate::core::{ConnectionMode, WorkerRegistry, WorkerType};
 use crate::policies::PolicyRegistry;
-use crate::protocols::spec::{
+use crate::protocols::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest,
     ResponsesGetParams, ResponsesRequest,
 };

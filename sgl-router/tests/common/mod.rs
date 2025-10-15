@@ -9,7 +9,7 @@ pub mod test_app;
 
 use serde_json::json;
 use sglang_router_rs::config::RouterConfig;
-use sglang_router_rs::protocols::spec::{Function, Tool};
+use sglang_router_rs::protocols::{Function, Tool};
 use sglang_router_rs::server::AppContext;
 use std::fs;
 use std::path::PathBuf;

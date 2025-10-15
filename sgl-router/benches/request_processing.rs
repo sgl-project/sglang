@@ -3,7 +3,7 @@ use serde_json::{from_str, to_string, to_value, to_vec};
 use std::time::Instant;
 
 use sglang_router_rs::core::{BasicWorker, BasicWorkerBuilder, Worker, WorkerType};
-use sglang_router_rs::protocols::spec::{
+use sglang_router_rs::protocols::{
     ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateRequest, SamplingParams,
     StringOrArray, UserMessageContent,
 };

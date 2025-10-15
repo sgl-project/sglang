@@ -4,7 +4,7 @@ use super::ProcessedMessages;
 use crate::core::Worker;
 use crate::grpc_client::sglang_scheduler::AbortOnDropStream;
 use crate::grpc_client::{proto, SglangSchedulerClient};
-use crate::protocols::spec::{
+use crate::protocols::{
     ChatCompletionRequest, ChatLogProbs, ChatLogProbsContent, ChatMessage, FunctionCallResponse,
     GenerateFinishReason, StringOrArray, Tool, ToolCall, ToolChoice, ToolChoiceValue, TopLogProb,
 };
@@ -952,7 +952,7 @@ pub fn parse_finish_reason(reason_str: &str, completion_tokens: i32) -> Generate
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocols::spec::{ChatMessage, ContentPart, ImageUrl, UserMessageContent};
+    use crate::protocols::{ChatMessage, ContentPart, ImageUrl, UserMessageContent};
     use crate::tokenizer::chat_template::ChatTemplateContentFormat;
     use serde_json::json;
 

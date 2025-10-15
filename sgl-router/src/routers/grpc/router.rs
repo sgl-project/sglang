@@ -14,7 +14,7 @@ use tracing::debug;
 use crate::config::types::RetryConfig;
 use crate::core::WorkerRegistry;
 use crate::policies::PolicyRegistry;
-use crate::protocols::spec::{
+use crate::protocols::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest,
     ResponsesGetParams, ResponsesRequest,
 };

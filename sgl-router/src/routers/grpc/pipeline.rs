@@ -14,7 +14,7 @@ use super::utils;
 use crate::core::{ConnectionMode, Worker, WorkerRegistry, WorkerType};
 use crate::grpc_client::proto;
 use crate::policies::PolicyRegistry;
-use crate::protocols::spec::{ChatCompletionRequest, GenerateRequest, InputIds};
+use crate::protocols::{ChatCompletionRequest, GenerateRequest, InputIds};
 use crate::reasoning_parser::ParserFactory as ReasoningParserFactory;
 use crate::tokenizer::traits::Tokenizer;
 use crate::tool_parser::ParserFactory as ToolParserFactory;

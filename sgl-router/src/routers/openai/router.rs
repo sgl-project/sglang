@@ -6,7 +6,7 @@ use crate::data_connector::{
     conversation_items::ListParams, conversation_items::SortOrder, ConversationId, ResponseId,
     SharedConversationItemStorage, SharedConversationStorage, SharedResponseStorage,
 };
-use crate::protocols::spec::{
+use crate::protocols::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest,
     ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponsesGetParams,
     ResponsesRequest,

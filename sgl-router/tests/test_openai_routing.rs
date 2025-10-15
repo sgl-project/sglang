@@ -18,7 +18,7 @@ use sglang_router_rs::{
         MemoryConversationStorage, MemoryResponseStorage, ResponseId, ResponseStorage,
         StoredResponse,
     },
-    protocols::spec::{
+    protocols::{
         ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateRequest, ResponseInput,
         ResponsesGetParams, ResponsesRequest, UserMessageContent,
     },
@@ -52,7 +52,7 @@ fn create_minimal_chat_request() -> ChatCompletionRequest {
 fn create_minimal_completion_request() -> CompletionRequest {
     CompletionRequest {
         model: "gpt-3.5-turbo".to_string(),
-        prompt: sglang_router_rs::protocols::spec::StringOrArray::String("Hello".to_string()),
+        prompt: sglang_router_rs::protocols::StringOrArray::String("Hello".to_string()),
         suffix: None,
         max_tokens: Some(100),
         temperature: None,

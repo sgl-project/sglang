@@ -6,7 +6,7 @@
 
 use crate::config::{ConnectionMode, RoutingMode};
 use crate::core::{WorkerRegistry, WorkerType};
-use crate::protocols::spec::{
+use crate::protocols::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest,
     ResponsesGetParams, ResponsesRequest,
 };

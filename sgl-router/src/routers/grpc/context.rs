@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use crate::core::Worker;
 use crate::grpc_client::{proto, SglangSchedulerClient};
-use crate::protocols::spec::{
+use crate::protocols::{
     ChatCompletionRequest, ChatCompletionResponse, GenerateRequest, GenerateResponse,
 };
 use crate::reasoning_parser::ParserFactory as ReasoningParserFactory;

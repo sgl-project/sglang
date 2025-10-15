@@ -12,10 +12,8 @@ use crate::{
     middleware::{self, AuthConfig, QueuedRequest, TokenBucket},
     policies::PolicyRegistry,
     protocols::{
-        spec::{
-            ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest,
-            RerankRequest, ResponsesGetParams, ResponsesRequest, V1RerankReqInput,
-        },
+        ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest,
+        RerankRequest, ResponsesGetParams, ResponsesRequest, V1RerankReqInput,
         validated::ValidatedJson,
         worker_spec::{WorkerApiResponse, WorkerConfigRequest, WorkerErrorResponse},
     },

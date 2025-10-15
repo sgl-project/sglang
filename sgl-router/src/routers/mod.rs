@@ -9,7 +9,7 @@ use axum::{
 };
 use std::fmt::Debug;
 
-use crate::protocols::spec::{
+use crate::protocols::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest,
     ResponsesGetParams, ResponsesRequest,
 };
