@@ -13,7 +13,6 @@ from sglang.test.test_utils import (
 )
 
 ib_devices = get_rdma_devices_args()
-DEFAULT_MODEL_NAME_FOR_TEST_MLA = "/data/models/sglang-ci-dsv3-test"
 
 
 class _BaseTestMooncakeEp(CustomTestCase):
