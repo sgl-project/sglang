@@ -199,16 +199,17 @@ class EagleDraftWorker(BaseDraftWorker):
             return
 
         # Capture draft
-        tic = time.perf_counter()
-        before_mem = get_available_gpu_memory(self.device, self.gpu_id)
-        logger.info(
-            f"Capture draft cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
-        )
-        self.cuda_graph_runner = EAGLEDraftCudaGraphRunner(self)
-        after_mem = get_available_gpu_memory(self.device, self.gpu_id)
-        logger.info(
-            f"Capture draft cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
-        )
+        if self.speculative_num_steps > 1:
+            tic = time.perf_counter()
+            before_mem = get_available_gpu_memory(self.device, self.gpu_id)
+            logger.info(
+                f"Capture draft cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
+            )
+            self.cuda_graph_runner = EAGLEDraftCudaGraphRunner(self)
+            after_mem = get_available_gpu_memory(self.device, self.gpu_id)
+            logger.info(
+                f"Capture draft cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
+            )
 
         # Capture extend
         if self.draft_extend_attn_backend:
