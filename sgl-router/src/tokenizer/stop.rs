@@ -114,24 +114,16 @@ impl StopSequenceDecoder {
             return Ok(SequenceDecoderOutput::StoppedWithText(output));
         }
 
-        // Use Sequence for incremental decoding - this replaces 40+ lines of duplicate logic!
+        // Use Sequence for incremental decoding
         let new_text = self.sequence.append_token(token_id)?;
 
-        // If no new text was produced (incomplete UTF-8 or special token), hold
-        if new_text.is_empty() {
-            return Ok(SequenceDecoderOutput::Held);
-        }
+        self.jail_buffer.push_str(&new_text);
 
-        // Combine jail buffer with new text for checking
-        let check_text = format!("{}{}", self.jail_buffer, new_text);
-
-        // Check for complete stop sequences
+        // Check for hidden stop sequences
         for stop_seq in &self.config.stop_sequences {
-            if let Some(pos) = check_text.find(stop_seq) {
+            if let Some(pos) = self.jail_buffer.find(stop_seq) {
                 self.stopped = true;
-
-                // Output text before the stop sequence
-                let output = check_text[..pos].to_string();
+                let output = self.jail_buffer[..pos].to_string();
                 self.jail_buffer.clear();
                 return Ok(if output.is_empty() {
                     SequenceDecoderOutput::Stopped
@@ -143,50 +135,29 @@ impl StopSequenceDecoder {
 
         // Check for visible stop sequences
         for stop_seq in &self.config.visible_stop_sequences {
-            if let Some(pos) = check_text.find(stop_seq) {
+            if let Some(pos) = self.jail_buffer.find(stop_seq) {
                 self.stopped = true;
-
-                // Include the stop sequence in output
                 let end_pos = pos + stop_seq.len();
-                let output = check_text[..end_pos].to_string();
+                let output = self.jail_buffer[..end_pos].to_string();
                 self.jail_buffer.clear();
                 return Ok(SequenceDecoderOutput::StoppedWithText(output));
             }
         }
 
-        // Check for partial matches at the end of check_text
-        let mut partial_match_len = 0;
-        for stop_seq in self
-            .config
-            .stop_sequences
-            .iter()
-            .chain(&self.config.visible_stop_sequences)
-        {
-            // Check all possible suffixes that could be a prefix of stop_seq
-            for i in 1..=check_text.len().min(stop_seq.len() - 1) {
-                let suffix = &check_text[check_text.len() - i..];
-                if stop_seq.starts_with(suffix) {
-                    partial_match_len = partial_match_len.max(i);
-                }
+        // Check for partial matches using simple prefix matching
+        for stop_seq in self.config.stop_sequences.iter().chain(&self.config.visible_stop_sequences) {
+            if stop_seq.starts_with(&self.jail_buffer) {
+                // Partial match - hold and wait for more tokens
+                return Ok(SequenceDecoderOutput::Held);
             }
         }
 
-        if partial_match_len > 0 {
-            // Split: output safe text, jail the potential match
-            let safe_end = check_text.len() - partial_match_len;
-            let safe_text = &check_text[..safe_end];
-            self.jail_buffer = check_text[safe_end..].to_string();
-
-            if safe_text.is_empty() {
-                Ok(SequenceDecoderOutput::Held)
-            } else {
-                Ok(SequenceDecoderOutput::Text(safe_text.to_string()))
-            }
+        // No matches - flush the jail buffer
+        let output = std::mem::take(&mut self.jail_buffer);
+        if output.is_empty() {
+            Ok(SequenceDecoderOutput::Held)
         } else {
-            // No partial matches - output everything
-            self.jail_buffer.clear();
-
-            Ok(SequenceDecoderOutput::Text(check_text))
+            Ok(SequenceDecoderOutput::Text(output))
         }
     }
 
