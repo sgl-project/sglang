@@ -1375,16 +1375,16 @@ impl WorkerManager {
             return;
         }
 
-        if let Some(served_name) = labels.get("served_model_name").cloned() {
+        if let Some(served_name) = labels.get("served_model_name") {
             if !served_name.trim().is_empty() {
-                labels.insert("model_id".to_string(), served_name);
+                labels.insert("model_id".to_string(), served_name.clone());
                 return;
             }
         }
 
-        if let Some(model_path) = labels.get("model_path").cloned() {
+        if let Some(model_path) = labels.get("model_path") {
             if !model_path.trim().is_empty() {
-                labels.insert("model_id".to_string(), model_path);
+                labels.insert("model_id".to_string(), model_path.clone());
             }
         }
     }
