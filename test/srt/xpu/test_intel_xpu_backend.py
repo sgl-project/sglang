@@ -1,6 +1,6 @@
 """
 Usage:
-python3 -m unittest test_intel_xpu_backend.TestIntelAMXAttnBackend.test_latency_qwen_model
+python3 -m unittest test_intel_xpu_backend.TestIntelXPUBackend.test_latency_qwen_model
 """
 
 import os
@@ -8,7 +8,6 @@ import unittest
 from functools import wraps
 
 from sglang.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_TEST_AWQ_INT4,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
     CustomTestCase,
     is_in_ci,
