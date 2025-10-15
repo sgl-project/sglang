@@ -3,6 +3,7 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import ServerArgs, get_global_server_args
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils.common import is_blackwell
@@ -68,7 +69,7 @@ class DraftBackendFactory:
                     req_pool_indices: torch.Tensor,
                     seq_lens: torch.Tensor,
                     encoder_lens: Optional[torch.Tensor],
-                    forward_mode: "ForwardMode",
+                    forward_mode: ForwardMode,
                     spec_info: Optional[SpecInput],
                 ):
                     pass
