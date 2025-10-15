@@ -1,17 +1,10 @@
 import logging
-import os
 import time
-from contextlib import contextmanager
 from typing import List, Optional, Tuple
 
 import torch
-from huggingface_hub import snapshot_download
 
-from sglang.srt.distributed import (
-    GroupCoordinator,
-    get_tp_group,
-    patch_tensor_parallel_group,
-)
+from sglang.srt.distributed import get_tp_group
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import get_token_ids_logprobs, get_top_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
