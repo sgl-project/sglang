@@ -832,7 +832,7 @@ class HybridLinearKVPool(KVCache):
         enable_kvcache_transpose: bool,
         device: str,
         layer_num: int,
-        enable_memory_saver: bool,
+        enable_memory_saver: bool = False,
         TokenToKVPoolClass: Optional[KVCache] = None,
         kwargs_for_token_to_kv_pool: Optional[Dict] = None,
         LinearTokenToKVPoolClass: Optional[KVCache] = None,

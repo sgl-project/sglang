@@ -666,10 +666,6 @@ class BailingMoELinearModel(nn.Module):
         assert (
             self.num_layers % self.layer_group_size == 0
         ), f"num_layers={self.num_layers} must be divided by layer_group_size={self.layer_group_size}"
-        self.layer_group_num = self.num_layers // self.layer_group_size
-        assert (
-            self.layer_group_num % self.pp_group.world_size == 0
-        ), f"layer_group_num={self.layer_group_num} must be divided by pp_size={self.pp_group.world_size}"
 
         if self.pp_group.is_first_rank:
             self.word_embeddings = VocabParallelEmbedding(
