@@ -42,6 +42,7 @@ class TestMamba(unittest.TestCase):
             full_attention_layer_ids=full_attention_layer_ids,
             enable_kvcache_transpose=False,
             device=device,
+            layer_num=num_layers,
         )
         assert pool._transfer_full_attention_id(global_interval - 1) == 0
         assert pool._transfer_full_attention_id(2 * global_interval - 1) == 1
@@ -173,6 +174,7 @@ class TestMamba(unittest.TestCase):
             full_attention_layer_ids=full_attention_layer_ids,
             enable_kvcache_transpose=False,
             device=device,
+            layer_num=num_layers,
         )
 
         # setup token to kv pool allocator
