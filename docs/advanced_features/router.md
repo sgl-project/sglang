@@ -1,6 +1,6 @@
 # SGLang Model Gateway (formerly SGLang Router)
 
-SGLang Router is a high-performance model-routing gateway for large-scale LLM deployments. It centralizes worker lifecycle management, balances traffic across heterogeneous protocols (HTTP, gRPC, OpenAI-compatible), and provides enterprise-ready control over history storage, MCP tooling, and privacy-sensitive workflows. The router is deeply optimized for the SGLang serving runtime, but can route to any OpenAI-compatible backend.
+SGLang Model Gateway is a high-performance model-routing gateway for large-scale LLM deployments. It centralizes worker lifecycle management, balances traffic across heterogeneous protocols (HTTP, gRPC, OpenAI-compatible), and provides enterprise-ready control over history storage, MCP tooling, and privacy-sensitive workflows. The router is deeply optimized for the SGLang serving runtime, but can route to any OpenAI-compatible backend.
 
 ---
 
@@ -53,7 +53,7 @@ SGLang Router is a high-performance model-routing gateway for large-scale LLM de
 ### Data Plane
 - **HTTP routers** (regular & PD) implement `/generate`, `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/embeddings`, `/v1/rerank`, and associated admin endpoints.
 - **gRPC router** streams tokenized requests directly to SRT gRPC workers, running fully in Rust—tokenizer, reasoning parser, and tool parser all reside in-process. Supports both single-stage and PD routing.
-- **OpenAI router** proxies OpenAI-compatible endpoints to external vendors (OpenAI, xAI, Gemini, GPT-OSS, etc.) while keeping chat history and multi-turn orchestration local.
+- **OpenAI router** proxies OpenAI-compatible endpoints to external vendors (OpenAI, xAI, etc.) while keeping chat history and multi-turn orchestration local.
 
 ### Storage & Privacy
 - Conversation and response history is stored at the router tier (memory, none, or Oracle ATP). The same history can power multiple models or MCP loops without sending data to upstream vendors.
@@ -146,7 +146,7 @@ python -m sglang_router.launch_router \
 ```
 
 ### OpenAI Backend Proxy
-Proxy OpenAI-compatible endpoints (OpenAI, xAI, Gemini, etc.) while keeping history and MCP sessions local.
+Proxy OpenAI-compatible endpoints (OpenAI, xAI, etc.) while keeping history and MCP sessions local.
 
 ```bash
 python -m sglang_router.launch_router \
