@@ -20,6 +20,8 @@ suites = {
         TestFile("hicache/test_hicache_mla.py", 127),
         TestFile("hicache/test_hicache_storage.py", 127),
         TestFile("lora/test_lora.py", 200),
+        TestFile("lora/test_lora_eviction.py", 200),
+        TestFile("lora/test_lora_eviction_policy.py", 200),
         TestFile("lora/test_lora_backend.py", 99),
         TestFile("lora/test_lora_eviction.py", 200),
         TestFile("lora/test_lora_qwen3.py", 97),
@@ -115,6 +117,8 @@ suites = {
         TestFile("test_srt_engine.py", 261),
         TestFile("test_standalone_speculative_decoding.py", 250),
         TestFile("test_start_profile.py", 60),
+        TestFile("test_profile_merger.py", 60),
+        TestFile("test_profile_merger_http_api.py", 15),
         TestFile("test_swa_unittest.py", 1),
         TestFile("test_torch_compile.py", 76),
         TestFile("test_torch_compile_moe.py", 172),
@@ -169,6 +173,9 @@ suites = {
     ],
     "per-commit-8-gpu-deepep": [
         TestFile("ep/test_deepep_large.py", 338),
+    ],
+    "per-commit-8-gpu-deepseek-v32": [
+        TestFile("test_deepseek_v32_basic.py", 275),
     ],
     "per-commit-8-gpu-h20": [
         TestFile("quant/test_w4a8_deepseek_v3.py", 371),
