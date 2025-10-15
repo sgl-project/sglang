@@ -49,20 +49,21 @@ if TYPE_CHECKING:
     )
     from sglang.srt.single_batch_overlap import DownGemmOverlapArgs
 
+fp4_gemm = None
 if is_cuda():
+    from sgl_kernel import cutlass_scaled_fp4_mm as fp4_gemm
     from sgl_kernel import scaled_fp4_quant
 
+    enable_flashinfer_fp4_gemm = False
+
 try:
-    from flashinfer import mm_fp4 as fp4_gemm
     from flashinfer import reorder_rows_for_gated_act_gemm, shuffle_matrix_sf_a
 
-    enable_flashinfer_fp4_gemm = True
+    if not is_cuda():
+        from flashinfer import mm_fp4 as fp4_gemm
+
+        enable_flashinfer_fp4_gemm = True
 except ImportError:
-    if is_cuda():
-        from sgl_kernel import cutlass_scaled_fp4_mm as fp4_gemm
-    else:
-        fp4_gemm = None
-    enable_flashinfer_fp4_gemm = False
     reorder_rows_for_gated_act_gemm = None
     shuffle_matrix_a = None
     shuffle_matrix_sf_a = None
