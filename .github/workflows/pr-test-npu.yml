@@ -38,7 +38,8 @@ jobs:
           CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
           sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
           pip config set global.index-url http://${CACHING_URL}/pypi/simple
-          pip config set global.trusted-host ${CACHING_URL}
+          pip config set global.extra-index-url "https://pypi.tuna.tsinghua.edu.cn/simple https://mirrors.aliyun.com/pypi/simple/"
+          pip config set global.trusted-host "${CACHING_URL} pypi.tuna.tsinghua.edu.cn mirrors.aliyun.com"
 
           bash scripts/ci/npu_ci_install_dependency.sh 910b
           # copy required file from our daily cache
@@ -79,7 +80,8 @@ jobs:
           CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
           sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
           pip config set global.index-url http://${CACHING_URL}/pypi/simple
-          pip config set global.trusted-host ${CACHING_URL}
+          pip config set global.extra-index-url "https://pypi.tuna.tsinghua.edu.cn/simple https://mirrors.aliyun.com/pypi/simple/"
+          pip config set global.trusted-host "${CACHING_URL} pypi.tuna.tsinghua.edu.cn mirrors.aliyun.com"
 
           bash scripts/ci/npu_ci_install_dependency.sh 910b
           # copy required file from our daily cache
@@ -88,7 +90,7 @@ jobs:
           curl -o /tmp/test.jsonl -L https://gh-proxy.test.osinfra.cn/https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl
 
       - name: Run test
-        timeout-minutes: 90
+        timeout-minutes: 60
         env:
           SGLANG_USE_MODELSCOPE: true
           SGLANG_IS_IN_CI: true
@@ -116,7 +118,8 @@ jobs:
           CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
           sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
           pip config set global.index-url http://${CACHING_URL}/pypi/simple
-          pip config set global.trusted-host ${CACHING_URL}
+          pip config set global.extra-index-url "https://pypi.tuna.tsinghua.edu.cn/simple https://mirrors.aliyun.com/pypi/simple/"
+          pip config set global.trusted-host "${CACHING_URL} pypi.tuna.tsinghua.edu.cn mirrors.aliyun.com"
 
           bash scripts/ci/npu_ci_install_dependency.sh 910b
           # copy required file from our daily cache
@@ -125,7 +128,7 @@ jobs:
           curl -o /tmp/test.jsonl -L https://gh-proxy.test.osinfra.cn/https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl
 
       - name: Run test
-        timeout-minutes: 120
+        timeout-minutes: 60
         env:
           SGLANG_USE_MODELSCOPE: true
           SGLANG_IS_IN_CI: true
@@ -153,7 +156,8 @@ jobs:
           CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
           sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
           pip config set global.index-url http://${CACHING_URL}/pypi/simple
-          pip config set global.trusted-host ${CACHING_URL}
+          pip config set global.extra-index-url "https://pypi.tuna.tsinghua.edu.cn/simple https://mirrors.aliyun.com/pypi/simple/"
+          pip config set global.trusted-host "${CACHING_URL} pypi.tuna.tsinghua.edu.cn mirrors.aliyun.com"
 
           bash scripts/ci/npu_ci_install_dependency.sh a3
           # copy required file from our daily cache
@@ -162,7 +166,7 @@ jobs:
           curl -o /tmp/test.jsonl -L https://gh-proxy.test.osinfra.cn/https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl
 
       - name: Run test
-        timeout-minutes: 90
+        timeout-minutes: 60
         env:
           SGLANG_USE_MODELSCOPE: true
           SGLANG_IS_IN_CI: true
@@ -173,4 +177,4 @@ jobs:
         run: |
           export PATH="/usr/local/Ascend/8.3.RC1/compiler/bishengir/bin:${PATH}"
           cd test/srt
-          python3 run_suite.py --suite per-commit-16-ascend-a3 --timeout-per-file 5400
+          python3 run_suite.py --suite per-commit-16-ascend-a3 --timeout-per-file 3600
