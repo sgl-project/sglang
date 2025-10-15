@@ -15,12 +15,11 @@
 """Inference-only Qwen3-VL model compatible with HuggingFace weights."""
 import logging
 from functools import lru_cache, partial
-from typing import Callable, Iterable, List, Literal, Optional, Tuple, TypedDict, Union
+from typing import Callable, Iterable, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from einops import rearrange
 from transformers.activations import ACT2FN
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
@@ -41,7 +40,6 @@ from sglang.srt.managers.mm_utils import (
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.qwen2_vl import Qwen2VLVideoInputs
 from sglang.srt.models.qwen3 import Qwen3Model
 from sglang.srt.utils import add_prefix
 from sglang.srt.utils.hf_transformers_utils import get_processor

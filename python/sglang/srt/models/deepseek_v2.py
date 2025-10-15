@@ -182,7 +182,7 @@ elif _is_hip:
     from sglang.srt.layers.quantization.awq_triton import (
         awq_dequantize_triton as awq_dequantize,
     )
-elif _is_npu:
+elif _is_npu:  # noqa: F401
     import custom_ops
     import sgl_kernel_npu
     import torch_npu

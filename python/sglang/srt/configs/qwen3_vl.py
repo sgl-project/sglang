@@ -1,5 +1,3 @@
-from typing import Optional, Union
-
 from transformers import PretrainedConfig
 from transformers.modeling_rope_utils import rope_config_validation
 

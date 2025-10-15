@@ -1,5 +1,4 @@
 import itertools
-import os
 import unittest
 
 import torch

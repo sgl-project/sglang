@@ -14,24 +14,15 @@
 # ==============================================================================
 """Inference-only Qwen3-VL model compatible with HuggingFace weights."""
 import logging
-from functools import lru_cache, partial
-from typing import Callable, Iterable, List, Literal, Optional, Tuple, TypedDict, Union
+from functools import lru_cache
+from typing import Iterable, List, Optional, Tuple, Union
 
-import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from einops import rearrange
-from transformers import BatchFeature
-from transformers.activations import ACT2FN
-from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
-    Qwen2_5_VisionRotaryEmbedding,
-)
 
-from sglang.srt.configs.qwen3_vl import Qwen3VLMoeConfig, Qwen3VLMoeVisionConfig
+from sglang.srt.configs.qwen3_vl import Qwen3VLMoeConfig
 from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
-    get_pp_group,
     get_tensor_model_parallel_rank,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor

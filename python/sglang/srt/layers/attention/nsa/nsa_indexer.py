@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
 import torch.nn.functional as F
@@ -609,7 +609,6 @@ class Indexer(CustomOp):
         forward_batch: ForwardBatch,
         layer_id: int,
     ) -> torch.Tensor:
-        import custom_ops
         import torch_npu
 
         from sglang.srt.layers.dp_attention import (

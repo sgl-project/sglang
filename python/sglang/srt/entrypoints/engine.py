@@ -31,7 +31,6 @@ from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union
 
 import zmq
 import zmq.asyncio
-from PIL.Image import Image
 
 from sglang.srt.tracing.trace import process_tracing_init, trace_set_thread_info
 

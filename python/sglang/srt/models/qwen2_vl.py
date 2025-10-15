@@ -28,7 +28,6 @@ from typing import Iterable, List, Optional, Tuple, Type, TypedDict
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from einops import rearrange
 from transformers import Qwen2VLConfig
 from transformers.models.qwen2_vl.configuration_qwen2_vl import Qwen2VLVisionConfig
