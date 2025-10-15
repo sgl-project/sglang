@@ -192,3 +192,23 @@ pub struct CompletionChoice {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub matched_stop: Option<Value>, // Can be string or integer
 }
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CompletionStreamResponse {
+    pub id: String,
+    pub object: String, // "text_completion"
+    pub created: u64,
+    pub choices: Vec<CompletionStreamChoice>,
+    pub model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_fingerprint: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CompletionStreamChoice {
+    pub text: String,
+    pub index: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<LogProbs>,
+    pub finish_reason: Option<String>,
+}
