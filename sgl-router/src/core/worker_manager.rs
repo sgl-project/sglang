@@ -1228,9 +1228,8 @@ impl WorkerManager {
             Ok(server_info) => {
                 if let Some(model_id) = server_info.model_id {
                     if !model_id.is_empty() {
-                        discovery
-                            .labels
-                            .insert("model_id".to_string(), model_id.to_string());
+                        let normalized = Self::normalize_model_identifier(&model_id);
+                        discovery.labels.insert("model_id".to_string(), normalized);
                     }
                 }
                 if let Some(model_path) = server_info.model_path {
@@ -1310,9 +1309,9 @@ impl WorkerManager {
                         "served_model_name".to_string(),
                         model_info.served_model_name.clone(),
                     );
-                    discovery
-                        .labels
-                        .insert("model_id".to_string(), model_info.served_model_name.clone());
+                    let normalized =
+                        Self::normalize_model_identifier(&model_info.served_model_name);
+                    discovery.labels.insert("model_id".to_string(), normalized);
                 }
                 if !model_info.weight_version.is_empty() {
                     discovery.labels.insert(
@@ -1369,6 +1368,15 @@ impl WorkerManager {
         discovery
     }
 
+    fn normalize_model_identifier(value: &str) -> String {
+        let trimmed = value.trim();
+        if trimmed.contains('/') || trimmed.contains('\\') {
+            Self::derive_model_id_from_path(trimmed)
+        } else {
+            trimmed.to_string()
+        }
+    }
+
     fn finalize_model_id(labels: &mut HashMap<String, String>) {
         let has_model_id = labels
             .get("model_id")
@@ -1380,7 +1388,8 @@ impl WorkerManager {
 
         if let Some(served_name) = labels.get("served_model_name").cloned() {
             if !served_name.trim().is_empty() {
-                labels.insert("model_id".to_string(), served_name);
+                let normalized = Self::normalize_model_identifier(&served_name);
+                labels.insert("model_id".to_string(), normalized);
                 return;
             }
         }
@@ -1900,5 +1909,11 @@ mod tests {
         labels.insert("model_path".to_string(), "/models/alpha".to_string());
         WorkerManager::finalize_model_id(&mut labels);
         assert_eq!(labels.get("model_id").unwrap(), "alpha");
+    }
+
+    #[test]
+    fn test_normalize_model_identifier_from_path() {
+        let normalized = WorkerManager::normalize_model_identifier("/raid/models/foo/bar-model");
+        assert_eq!(normalized, "bar-model");
     }
 }
