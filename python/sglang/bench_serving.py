@@ -1901,9 +1901,7 @@ async def benchmark(
             if "decode" in server_info_json:
                 server_info_json = server_info_json["decode"][0]
             if pd_separated:
-                accept_length = server_info_json.get(
-                    "avg_spec_accept_length", None
-                )
+                accept_length = server_info_json.get("avg_spec_accept_length", None)
             elif (
                 "internal_states" in server_info_json
                 and server_info_json["internal_states"]
