@@ -117,6 +117,7 @@ class Envs:
     SGLANG_TEST_RETRACT = EnvBool(False)
     SGLANG_SET_CPU_AFFINITY = EnvBool(False)
     SGLANG_PROFILE_WITH_STACK = EnvBool(True)
+    SGLANG_PROFILE_RECORD_SHAPES = EnvBool(True)
     SGLANG_RECORD_STEP_TIME = EnvBool(False)
     SGLANG_GC_LOG = EnvBool(False)
     SGLANG_FORCE_SHUTDOWN = EnvBool(False)
