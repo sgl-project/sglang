@@ -60,7 +60,7 @@ dependencies = [
     "transformers==4.57.1",
     "uvicorn",
     "uvloop",
-    "xgrammar==0.1.24",
+    "xgrammar==0.1.25",
 ]
 
 [project.optional-dependencies]
