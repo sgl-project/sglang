@@ -16,7 +16,7 @@ use crate::{
     policies::PolicyRegistry,
     protocols::{
         validated::ValidatedJson,
-        worker_spec::{WorkerApiResponse, WorkerConfigRequest, WorkerErrorResponse},
+        worker_spec::{WorkerConfigRequest, WorkerErrorResponse, WorkerInfo},
         ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest,
         ResponsesGetParams, ResponsesRequest, V1RerankReqInput,
     },
