@@ -16,7 +16,7 @@ from sglang.srt.layers.attention.triton_ops.extend_attention import (
 from sglang.srt.layers.attention.triton_ops.prefill_attention import (
     context_attention_fwd,
 )
-from sglang.srt.utils import get_device
+from sglang.srt.utils import get_device, is_cuda, is_cuda_alike, is_xpu
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -100,12 +100,13 @@ class TestTritonAttention(CustomTestCase):
         """Set all random seeds for reproducibility."""
         random.seed(seed)
         torch.manual_seed(seed)
-        if torch.cuda.is_available():
+        if is_cuda_alike():
             torch.cuda.manual_seed(seed)
             torch.cuda.manual_seed_all(seed)
-            torch.backends.cudnn.deterministic = True
-            torch.backends.cudnn.benchmark = False
-        if torch.xpu.is_available():
+            if is_cuda():
+                torch.backends.cudnn.deterministic = True
+                torch.backends.cudnn.benchmark = False
+        if is_xpu():
             torch.xpu.manual_seed(seed)
             torch.xpu.manual_seed_all(seed)
 
