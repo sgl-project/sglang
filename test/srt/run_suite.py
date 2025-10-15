@@ -69,6 +69,7 @@ suites = {
         TestFile("test_chunked_prefill.py", 313),
         TestFile("test_create_kvindices.py", 2),
         TestFile("test_deterministic.py", 300),
+        TestFile("test_build_eagle_tree.py", 8),
         TestFile("test_eagle_infer_a.py", 370),
         TestFile("test_eagle_infer_b.py", 700),
         TestFile("test_eagle_infer_beta.py", 300),
@@ -170,6 +171,7 @@ suites = {
     ],
     "per-commit-4-gpu-deepep": [
         TestFile("ep/test_deepep_small.py", 531),
+        TestFile("ep/test_mooncake_ep_small.py", 450),
     ],
     "per-commit-8-gpu-deepep": [
         TestFile("ep/test_deepep_large.py", 338),
