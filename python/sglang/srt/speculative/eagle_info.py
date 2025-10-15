@@ -667,7 +667,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         batch.extend_lens = [x + 1 for x in batch.spec_info.accept_length_cpu]
         batch.extend_num_tokens = sum(batch.extend_lens)
         batch.seq_lens = batch.spec_info.seq_lens_for_draft_extend
-        batch.seq_lens_cpu = batch.spec_info.seq_lens_for_draft_extend_cpu
+        # batch.seq_lens_cpu = batch.spec_info.seq_lens_for_draft_extend_cpu
         batch.req_pool_indices = batch.spec_info.req_pool_indices_for_draft_extend
         batch.return_logprob = False
         batch.return_hidden_states = False

@@ -21,6 +21,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.eagle_info import (
     EagleDraftInput,
@@ -35,6 +36,12 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     assign_req_to_token_pool,
     create_draft_kv_indices,
+    align_evict_mask_to_page_size,
+)
+from sglang.srt.mem_cache.common import (
+    alloc_paged_token_slots_extend,
+    alloc_token_slots,
+    get_last_loc,
 )
 from sglang.srt.utils import (
     empty_context,
@@ -222,9 +229,9 @@ class SimpleEagleWorker(TpModelWorker):
     def draft_model_runner(self):
         return self.model_runner
 
-    def forward_batch_speculative_generation(
+    def forward_batch_generation(
         self, batch: ScheduleBatch
-    ) -> Tuple[LogitsProcessorOutput, List[int], int, int]:
+    ) -> GenerationBatchResult:
         """Run speculative decoding forward.
         NOTE: Many states of batch is modified as you go through. It is not guaranteed that
         the final output batch have the same state as the input.
@@ -235,22 +242,46 @@ class SimpleEagleWorker(TpModelWorker):
             the batch id (used for overlap schedule), and number of accepted tokens.
         """
         if batch.forward_mode.is_decode():
-            return self.draft(batch)
+            # return self.draft(batch)
+            (
+	            logits_output,
+	            output_ids,
+	            # _,  # The 'bid' (batch_id) is no longer part of the new return structure.
+	            num_accepted_tokens,
+	            can_run_cuda_graph,
+	        ) = self.draft(batch)
+            return GenerationBatchResult(
+	            logits_output=logits_output,
+	            next_token_ids=output_ids,
+	            num_accepted_tokens=num_accepted_tokens,
+	            can_run_cuda_graph=can_run_cuda_graph,
+	        )
         elif batch.forward_mode.is_idle():
             model_worker_batch = batch.get_model_worker_batch()
-            logits_output, next_token_ids, _ = (
-                self.target_worker.forward_batch_generation(model_worker_batch)
-            )
+            # logits_output, next_token_ids, _ = (
+            #     self.target_worker.forward_batch_generation(model_worker_batch)
+            # )
 
-            return logits_output, next_token_ids, model_worker_batch.bid, 0, False
+            # return logits_output, next_token_ids, model_worker_batch.bid, 0, False
+            generation_result = self.target_worker.forward_batch_generation(model_worker_batch)
+            # generation_result.num_accepted_tokens = 0
+            # generation_result.can_run_cuda_graph = False
+            return generation_result
+            
         else:
-            logits_output, next_token_ids, bid = self.forward_target_extend(batch)
+            logits_output, next_token_ids, seq_lens_cpu = self.forward_target_extend(batch)
             with self.draft_tp_context(self.draft_model_runner.tp_group):
                 self.forward_draft_extend(
-                    batch, logits_output.hidden_states, next_token_ids
+                    batch, logits_output.hidden_states, next_token_ids,seq_lens_cpu
                 )
             # logger.info()
-            return logits_output, next_token_ids, bid, 0, False
+            # return logits_output, next_token_ids, bid, 0, False
+            return GenerationBatchResult(
+                logits_output=logits_output,
+                next_token_ids=next_token_ids,
+                num_accepted_tokens=0,
+                can_run_cuda_graph=False,
+            )
 
     def forward_target_extend(
         self, batch: ScheduleBatch
@@ -267,10 +298,20 @@ class SimpleEagleWorker(TpModelWorker):
         # We need the full hidden states to prefill the KV cache of the draft model.
         model_worker_batch = batch.get_model_worker_batch()
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
-        logits_output, next_token_ids, _ = self.target_worker.forward_batch_generation(
-            model_worker_batch
-        )
-        return logits_output, next_token_ids, model_worker_batch.bid
+        # logits_output, next_token_ids, _ = self.target_worker.forward_batch_generation(
+        #     model_worker_batch
+        # )
+        # return logits_output, next_token_ids,model_worker_batch.seq_lens_cpu
+        # 接收 GenerationBatchResult 对象
+        generation_result = self.target_worker.forward_batch_generation(
+	        model_worker_batch
+	    )
+	    
+	    # 从对象中获取属性
+        logits_output = generation_result.logits_output
+        next_token_ids = generation_result.next_token_ids
+	    
+        return logits_output, next_token_ids, model_worker_batch.seq_lens_cpu
 
     def forward_draft_extend_after_decode(
         self, forward_batch: ForwardBatch, accept_index
@@ -282,6 +323,8 @@ class SimpleEagleWorker(TpModelWorker):
         )
         forward_batch.forward_mode = ForwardMode.SIMPLE_DRAFT_EXTEND
         forward_batch.seq_lens_sum = sum(forward_batch.seq_lens)
+        # forward_batch.seq_lens_cpu = forward_batch.spec_info.seq_lens_for_draft_extend_cpu
+        forward_batch.seq_lens_cpu = forward_batch.seq_lens.cpu()
         forward_batch.spec_info.capture_hidden_mode = CaptureHiddenMode.FULL
         forward_batch.return_logprob = False
         forward_batch.req_to_token_pool = self.draft_model_runner.req_to_token_pool
@@ -304,20 +347,30 @@ class SimpleEagleWorker(TpModelWorker):
         draft_input_spec_info = batch.spec_info
         num_draft_tokens = 2
         if self.page_size == 1:
-            batch.out_cache_loc = batch.alloc_token_slots(
+            batch.out_cache_loc = alloc_token_slots(
+                batch.tree_cache,
                 num_seqs * 2,
                 backup_state=False,
             )
             end_offset = batch.seq_lens + 2
         else:  # support page_size > 1
-            seq_lens, end_offset, last_loc = get_last_loc_large_page_size_top_k_1(
+            prefix_lens = batch.seq_lens
+            prefix_lens_cpu = batch.seq_lens_cpu
+            end_offset = prefix_lens + 2
+            end_offset_cpu = prefix_lens_cpu + 2
+            last_loc = get_last_loc(
                 batch.req_to_token_pool.req_to_token,
                 batch.req_pool_indices,
-                batch.seq_lens,
-                2,
+                prefix_lens,
             )
-            batch.out_cache_loc = batch.alloc_paged_token_slots_extend(
-                seq_lens, end_offset, last_loc, num_seqs * 2
+            batch.out_cache_loc = alloc_paged_token_slots_extend(
+                batch.tree_cache,
+                prefix_lens,
+                prefix_lens_cpu,
+                end_offset,
+                end_offset_cpu,
+                last_loc,
+                num_seqs * 2,
             )
 
         assign_req_to_token_pool[(num_seqs,)](
@@ -429,6 +482,7 @@ class SimpleEagleWorker(TpModelWorker):
                 forward_batch.req_pool_indices
             )
             forward_batch.spec_info = draft_input
+            # forward_batch.seq_lens_cpu = forward_batch.seq_lens.cpu()
             draft_logits_output = self.forward_draft_extend_after_decode(
                 forward_batch, accept_index
             )
@@ -507,6 +561,7 @@ class SimpleEagleWorker(TpModelWorker):
         else:
             # if self.topk == 1:
             # Only evict full empty page. Do not evict partial empty page
+            
             align_evict_mask_to_page_size_simple_eagle[num_seqs,](
                 batch.out_cache_loc,
                 evict_mask,
@@ -515,6 +570,23 @@ class SimpleEagleWorker(TpModelWorker):
                 next_power_of_2(num_draft_tokens),
             )
             self.token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
+            # evicted_locs = batch.out_cache_loc[evict_mask]
+            # if evicted_locs.numel() > 0:
+            #     evicted_pages = evicted_locs // self.page_size
+            #     sorted_pages, sort_indices = torch.sort(evicted_pages)
+            #     boundary_mask = torch.cat([
+	        #             sorted_pages[:-1] != sorted_pages[1:], 
+	        #             torch.tensor([True], device=self.device)
+	        #         ])
+                
+            #     first_indices_in_sorted_array = torch.cat([
+	        #             torch.tensor([0], device=self.device),
+	        #             torch.where(boundary_mask)[0][:-1] + 1
+	        #         ])
+            #     original_indices = sort_indices[first_indices_in_sorted_array]
+            #     representative_slots_to_free = evicted_locs[original_indices]
+
+            #     self.token_to_kv_pool_allocator.free(representative_slots_to_free)
 
         cumsum = torch.cumsum(batch.spec_info.accept_length + 1, dim=0)
         output_idx = cumsum - 1
@@ -541,7 +613,7 @@ class SimpleEagleWorker(TpModelWorker):
         return (
             logits_output,
             output_ids,
-            model_worker_batch.bid,
+            # model_worker_batch.bid,
             sum(accept_length_cpu),
             can_cuda_graph,
         )
@@ -611,6 +683,7 @@ class SimpleEagleWorker(TpModelWorker):
         batch: ScheduleBatch,
         hidden_states: torch.Tensor,
         next_token_ids: List[int],
+        seq_lens_cpu: Optional[torch.Tensor],
     ):
         """Run draft model extend. This API modifies the states of the batch.
         Args:
@@ -621,10 +694,14 @@ class SimpleEagleWorker(TpModelWorker):
         batch.spec_info = EagleDraftInput(
             hidden_states=hidden_states,
             verified_id=next_token_ids,
+            num_tokens_per_batch=1,
+            num_tokens_for_logprob_per_batch=1,
         )
         batch.spec_info.prepare_for_extend(batch)
         batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
-        model_worker_batch = batch.get_model_worker_batch()
+        model_worker_batch = batch.get_model_worker_batch(
+            seq_lens_cpu_cache=seq_lens_cpu
+        )
         forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.draft_model_runner
         )
@@ -634,6 +711,22 @@ class SimpleEagleWorker(TpModelWorker):
         assert isinstance(forward_batch.spec_info, EagleDraftInput)
         assert forward_batch.spec_info is batch.spec_info
         self.capture_for_decode(logits_output, forward_batch.spec_info)
+        # fix unexpected answer
+        # has_finished, unfinished_req_index = False, []
+        # for i, req in enumerate(batch.reqs):
+        #     if req.finished():
+        #         has_finished = True
+        #     else:
+        #         unfinished_req_index.append(i)
+        # if has_finished:
+        #     unfinished_index_device = torch.tensor(
+        #         unfinished_req_index,
+        #         dtype=torch.int64,
+        #         device=batch.spec_info.topk_p.device,
+        #     )
+        #     batch.spec_info.filter_batch(
+        #         unfinished_index_device, has_been_filtered=False
+        #     )
 
     def capture_for_decode(
         self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput

@@ -120,9 +120,11 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             )
         elif forward_batch.forward_mode.is_simple_draft():
             seq_lens = forward_batch.seq_lens + 1
-            max_seqlen_pad = triton.cdiv(
-                (forward_batch.seq_lens_cpu + 1).max().item(), PAGE_SIZE
-            )
+            if forward_batch.seq_lens_cpu is not None:
+                seq_lens_cpu = forward_batch.seq_lens_cpu + 1
+            else:
+                seq_lens_cpu = forward_batch.seq_lens.cpu() + 1
+            max_seqlen_pad = triton.cdiv(seq_lens_cpu.max().item(), PAGE_SIZE)
 
             block_kv_indices = torch.full(
                 (bs, max_seqlen_pad), -1, dtype=torch.int32, device=seq_lens.device

@@ -202,6 +202,7 @@ class SimpleEAGLECudaGraphRunner:
             input_ids=input_ids,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
+            seq_lens_cpu = seq_lens.cpu(),
             req_to_token_pool=self.model_runner.req_to_token_pool,
             token_to_kv_pool=self.model_runner.token_to_kv_pool,
             attn_backend=self.model_runner.attn_backend,
@@ -447,7 +448,6 @@ class SimpleEAGLECudaGraphRunner:
             seq_lens,
             draft_token_num,
             req_to_token.shape[-1],
-            self.page_size,
             next_power_of_2(bs),
         )
         forward_batch.spec_info.kv_indptr = kv_indptr
