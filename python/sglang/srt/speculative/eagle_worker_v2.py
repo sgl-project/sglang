@@ -12,15 +12,14 @@ from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.build_eagle_tree import TreeMaskMode
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_info_v2 import (
     assign_extend_cache_locs,
-    build_tree_kernel_efficient_tmp,
     fill_accepted_out_cache_loc,
     fill_new_verified_id,
     select_top_k_tokens_tmp,
 )
+from sglang.srt.speculative.eagle_utils import TreeMaskMode, build_tree_kernel_efficient
 from sglang.srt.speculative.eagle_worker import EAGLEWorker
 from sglang.srt.utils.common import fast_topk, next_power_of_2
 
@@ -98,7 +97,10 @@ class EAGLEWorkerV2(EAGLEWorker):
                 forward_batch,
             )
         else:
-            self.draft_attn_backend.init_forward_metadata(forward_batch)
+            if self.speculative_num_steps > 1:
+                # Skip attention backend init for 1-step draft,
+                # `draft_forward` only does sample in this case.
+                self.draft_attn_backend.init_forward_metadata(forward_batch)
             parent_list, top_scores_index, draft_tokens = self.draft_forward(
                 forward_batch
             )
@@ -116,7 +118,7 @@ class EAGLEWorkerV2(EAGLEWorker):
             retrive_next_token,
             retrive_next_sibling,
             draft_tokens,
-        ) = build_tree_kernel_efficient_tmp(
+        ) = build_tree_kernel_efficient(
             draft_input.verified_id,
             parent_list,
             top_scores_index,

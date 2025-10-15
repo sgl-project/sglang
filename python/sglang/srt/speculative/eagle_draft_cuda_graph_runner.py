@@ -41,7 +41,6 @@ class EAGLEDraftCudaGraphRunner:
         # Parse args
         self.eagle_worker = eagle_worker
         self.model_runner = model_runner = eagle_worker.model_runner
-        self.model_runner: EAGLEWorker
         self.graphs = {}
         self.output_buffers = {}
         self.enable_torch_compile = model_runner.server_args.enable_torch_compile
@@ -276,11 +275,9 @@ class EAGLEDraftCudaGraphRunner:
         return graph, out
 
     def _postprocess_output_to_raw_bs(self, out, raw_bs):
-        score_list, token_list, parents_list = out
-        score_list = [x[:raw_bs] for x in score_list]
-        token_list = [x[:raw_bs] for x in token_list]
-        parents_list = [x[:raw_bs] for x in parents_list]
-        return (score_list, token_list, parents_list)
+        # Keep the variables name for readability
+        parent_list, top_scores_index, draft_tokens = (t[:raw_bs] for t in out)
+        return parent_list, top_scores_index, draft_tokens
 
     def replay(self, forward_batch: ForwardBatch):
         assert forward_batch.out_cache_loc is not None

@@ -124,6 +124,7 @@ fn create_sample_generate_request() -> GenerateRequest {
     GenerateRequest {
         text: Some("Write a story about artificial intelligence".to_string()),
         sampling_params: Some(SamplingParams {
+            max_new_tokens: Some(100),
             temperature: Some(0.8),
             top_p: Some(0.9),
             top_k: Some(50),
