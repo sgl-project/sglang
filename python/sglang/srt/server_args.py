@@ -196,6 +196,7 @@ class ServerArgs:
     skip_server_warmup: bool = False
     warmups: Optional[str] = None
     nccl_port: Optional[int] = None
+    wait_for_initial_weights: bool = False
 
     # Quantization and data type
     dtype: str = "auto"
@@ -1532,6 +1533,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.nccl_port,
             help="The port for NCCL distributed environment setup. Defaults to a random port.",
+        )
+        parser.add_argument(
+            "--wait-for-initial-weights",
+            action="store_true",
+            help="If set, the server will wait for initial weights to be loaded via checkpoint-engine or other update methods "
+            "before serving inference requests.",
         )
 
         # Quantization and data type

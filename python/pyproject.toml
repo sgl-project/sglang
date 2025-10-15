@@ -73,6 +73,7 @@ dependencies = [
 
 [project.optional-dependencies]
 decord = ["decord"]
+checkpoint-engine = ["checkpoint-engine>=0.1.2"]
 test = [
   "accelerate",
   "expecttest",
@@ -91,7 +92,7 @@ tracing = [
   "opentelemetry-exporter-otlp-proto-grpc",
   "opentelemetry-sdk",
 ]
-all = ["sglang[test]", "sglang[decord]"]
+all = ["sglang[test]", "sglang[decord]", "sglang[checkpoint-engine]"]
 all_aarch64 = ["sglang[test]"]
 dev = ["sglang[test]", "sglang[decord]"]
 

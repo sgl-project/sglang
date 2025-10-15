@@ -129,6 +129,7 @@ logger = logging.getLogger(__name__)
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
+WAIT_WEIGHTS_READY_TIMEOUT = int(os.getenv("SGLANG_WAIT_WEIGHTS_READY_TIMEOUT", 120))
 
 
 # Store global states
@@ -847,6 +848,8 @@ async def update_weights_from_ipc(obj: UpdateWeightsFromIPCReqInput, request: Re
 
     content = {"success": success, "message": message}
     if success:
+        if _global_state.tokenizer_manager.initial_weights_loaded is False:
+            _global_state.tokenizer_manager.initial_weights_loaded = True
         return ORJSONResponse(content)
     else:
         return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
@@ -1284,56 +1287,6 @@ def _update_weight_version_if_provided(weight_version: Optional[str]) -> None:
         _global_state.tokenizer_manager.server_args.weight_version = weight_version
 
 
-@app.post("/collective_rpc")
-async def collective_rpc(request: Request):
-    """Collective RPC endpoint for compatibility with checkpoint-engine (similar to vLLM)."""
-    try:
-        body = await request.json()
-    except json.JSONDecodeError as e:
-        raise HTTPException(
-            status_code=HTTPStatus.BAD_REQUEST, detail=f"JSON decode error: {e}"
-        )
-    method = body.get("method")
-    if method is None:
-        raise HTTPException(
-            status_code=HTTPStatus.BAD_REQUEST,
-            detail="Missing 'method' in request body",
-        )
-    # Handle the update_weights_from_ipc method specifically
-    if method == "update_weights_from_ipc":
-        args = body.get("args", [])
-        if not args or not isinstance(args[0], dict):
-            raise HTTPException(
-                status_code=HTTPStatus.BAD_REQUEST,
-                detail="Invalid args for update_weights_from_ipc",
-            )
-        zmq_handles = args[0]
-        success, message = (
-            await _global_state.tokenizer_manager.update_weights_from_ipc(
-                UpdateWeightsFromIPCReqInput(zmq_handles=zmq_handles), request
-            )
-        )
-        if success:
-            return ORJSONResponse(
-                content={"results": [{"success": True, "message": message}]}
-            )
-        else:
-            return ORJSONResponse(
-                content={"results": [{"success": False, "message": message}]},
-                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-            )
-    else:
-        raise HTTPException(
-            status_code=HTTPStatus.NOT_IMPLEMENTED,
-            detail=f"Method '{method}' not implemented in SGLang collective_rpc",
-        )
-
-
-async def http_health(request: Request):
-    """Check the health of the http server."""
-    return Response(status_code=200)
-
-
 def launch_server(
     server_args: ServerArgs,
     pipe_finish_writer: Optional[multiprocessing.connection.Connection] = None,
@@ -1576,6 +1529,8 @@ def _wait_and_warmup(
     pipe_finish_writer: Optional[multiprocessing.connection.Connection],
     launch_callback: Optional[Callable[[], None]] = None,
 ):
+    if server_args.wait_for_initial_weights:
+        _wait_weights_ready()
     if not server_args.skip_server_warmup:
         if not _execute_server_warmup(
             server_args,
@@ -1598,3 +1553,22 @@ def _wait_and_warmup(
 
     if launch_callback is not None:
         launch_callback()
+
+
+def _wait_weights_ready():
+    """Wait for weights to be ready within the specified timeout."""
+    timeout = WAIT_WEIGHTS_READY_TIMEOUT
+    start_time = time.time()
+
+    for _ in range(timeout):
+        if _global_state.tokenizer_manager.initial_weights_loaded:
+            logger.info(f"Weights are ready after {time.time() - start_time:.2f} seconds")
+            return
+        time.sleep(1)
+
+    # Timeout reached without weights being ready
+    logger.error(
+        f"Weights are not ready after waiting {timeout} seconds. "
+        f"Consider increasing SGLANG_WAIT_WEIGHTS_READY_TIMEOUT environment variable. "
+        f"Current status: initial_weights_loaded={_global_state.tokenizer_manager.initial_weights_loaded}"
+    )

@@ -2278,20 +2278,11 @@ class ModelRunner:
 
                 def get_device_uuid(self) -> str:
                     # Get device UUID for current device
-                    import subprocess
-
                     device_id = torch.cuda.current_device()
-                    result = subprocess.run(
-                        ["nvidia-smi", "-L"], capture_output=True, text=True
-                    )
-                    if result.returncode != 0:
-                        raise RuntimeError(f"Failed to get GPU UUID: {result.stderr}")
-                    lines = result.stdout.strip().split("\n")
-                    for line in lines:
-                        if f"GPU {device_id}:" in line:
-                            uuid = line.split("UUID: ")[1].strip(")")
-                            return uuid
-                    raise RuntimeError(f"Could not find UUID for GPU {device_id}")
+                    try:
+                        return f"GPU-{torch.cuda.get_device_properties(device_id).uuid!s}"
+                    except AssertionError as e:
+                        raise ValueError(f"Failed to get GPU UUID for device {device_id}") from e
 
                 def get_device_id(self) -> int:
                     return torch.cuda.current_device()
