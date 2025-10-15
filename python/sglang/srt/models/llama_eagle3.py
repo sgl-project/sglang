@@ -74,17 +74,6 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
         )
-        # override o_proj (reduce_results=False)
-        self.self_attn.o_proj = RowParallelLinear(
-            self.self_attn.total_num_heads * self.self_attn.head_dim,
-            self.self_attn.hidden_size,
-            bias=self.self_attn.bias,
-            quant_config=quant_config,
-            prefix=add_prefix("o_proj", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
-            reduce_results=False,
-        )
 
         if config.model_type == "llama4_text":
             inter_size = config.intermediate_size_mlp
@@ -97,7 +86,6 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
             config.hidden_act,
             quant_config,
             prefix,
-            reduce_results=not is_dp_attention_enabled(),
         )
 
         self.hidden_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -113,7 +101,6 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.hidden_norm,
             post_attention_layernorm=self.post_attention_layernorm,
-            allow_reduce_scatter=True,
         )
 
     def forward(
@@ -141,16 +128,11 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
             )
         else:
             hidden_states = torch.empty_like(embeds)
-
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
-        # For DP with padding, reduce scatter can be used instead of all-reduce.
-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
         # Fully Connected
-        hidden_states = self.mlp(hidden_states, use_reduce_scatter)
+        hidden_states = self.mlp(hidden_states)
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
         )
