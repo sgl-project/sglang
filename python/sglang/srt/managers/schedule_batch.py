@@ -64,6 +64,7 @@ from sglang.srt.mem_cache.common import (
     alloc_for_decode,
     alloc_for_extend,
     alloc_token_slots,
+    evict_from_tree_cache,
 )
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
@@ -73,7 +74,7 @@ from sglang.srt.metrics.collector import SchedulerMetricsCollector, TimeStats
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.server_args import ServerArgs, get_global_server_args
 from sglang.srt.utils import flatten_nested_list
 from sglang.srt.utils.common import next_power_of_2
 
@@ -83,47 +84,6 @@ if TYPE_CHECKING:
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
-GLOBAL_SERVER_ARGS_KEYS = [
-    "attention_backend",
-    "mm_attention_backend",
-    "debug_tensor_dump_inject",
-    "debug_tensor_dump_output_folder",
-    "chunked_prefill_size",
-    "device",
-    "disable_chunked_prefix_cache",
-    "disable_flashinfer_cutlass_moe_fp4_allgather",
-    "disable_radix_cache",
-    "enable_dp_lm_head",
-    "enable_fp32_lm_head",
-    "flashinfer_mxfp4_moe_precision",
-    "enable_flashinfer_allreduce_fusion",
-    "moe_dense_tp_size",
-    "ep_dispatch_algorithm",
-    "ep_num_redundant_experts",
-    "enable_nan_detection",
-    "flashinfer_mla_disable_ragged",
-    "pp_max_micro_batch_size",
-    "disable_shared_experts_fusion",
-    "sampling_backend",
-    "speculative_accept_threshold_single",
-    "speculative_accept_threshold_acc",
-    "speculative_attention_mode",
-    "torchao_config",
-    "triton_attention_reduce_in_fp32",
-    "num_reserved_decode_tokens",
-    "weight_loader_disable_mmap",
-    "enable_multimodal",
-    "enable_symm_mem",
-    "enable_custom_logit_processor",
-    "disaggregation_mode",
-    "enable_deterministic_inference",
-    "nsa_prefill",
-    "nsa_decode",
-    "multi_item_scoring_delimiter",
-]
-
-# Put some global args for easy access
-global_server_args_dict = {k: getattr(ServerArgs, k) for k in GLOBAL_SERVER_ARGS_KEYS}
 
 logger = logging.getLogger(__name__)
 
@@ -649,6 +609,10 @@ class Req:
         # This is used to compute the average acceptance length per request.
         self.spec_verify_ct = 0
 
+        # The number of accepted tokens in speculative decoding for this request.
+        # This is used to compute the acceptance rate and average acceptance length per request.
+        self.spec_accepted_tokens = 0
+
         # For metrics
         self.metrics_collector = metrics_collector
         self.time_stats: TimeStats = TimeStats(disagg_mode=disagg_mode)
@@ -685,12 +649,9 @@ class Req:
     def is_prefill_only(self) -> bool:
         """Check if this request is prefill-only (no token generation needed)."""
         # NOTE: when spec is enabled, prefill_only optimizations are disabled
-        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
-        spec_alg = global_server_args_dict["speculative_algorithm"]
-        return self.sampling_params.max_new_tokens == 0 and (
-            spec_alg is None or spec_alg == SpeculativeAlgorithm.NONE
-        )
+        spec_alg = get_global_server_args().speculative_algorithm
+        return self.sampling_params.max_new_tokens == 0 and spec_alg is None
 
     def add_latency(self, stage: RequestStage):
         if self.metrics_collector is None:
@@ -1446,7 +1407,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             * self.token_to_kv_pool_allocator.page_size
         )
 
-        self._evict_tree_cache_if_needed(num_tokens)
+        evict_from_tree_cache(self.tree_cache, num_tokens)
         return self._is_available_size_sufficient(num_tokens)
 
     def retract_decode(self, server_args: ServerArgs):
@@ -1494,6 +1455,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             idx = sorted_indices.pop()
             req = self.reqs[idx]
             retracted_reqs.append(req)
+            # release memory and don't insert into the tree because we need the space instantly
             self.release_req(idx, len(sorted_indices), server_args)
 
             if len(retracted_reqs) == 0:
@@ -1518,39 +1480,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
         req = self.reqs[idx]
-        seq_lens_cpu = self.seq_lens_cpu.numpy()
 
         if server_args.disaggregation_mode == "decode":
             req.offload_kv_cache(
                 self.req_to_token_pool, self.token_to_kv_pool_allocator
             )
-        if isinstance(self.tree_cache, ChunkCache):
-            # ChunkCache does not have eviction
-            token_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : seq_lens_cpu[idx]
-            ]
-            self.token_to_kv_pool_allocator.free(token_indices)
-            self.req_to_token_pool.free(req.req_pool_idx)
-        else:
-            # TODO: apply more fine-grained retraction
-            last_uncached_pos = (
-                len(req.prefix_indices) // server_args.page_size
-            ) * server_args.page_size
-            token_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, last_uncached_pos : seq_lens_cpu[idx]
-            ]
-            self.token_to_kv_pool_allocator.free(token_indices)
-            self.req_to_token_pool.free(req.req_pool_idx)
-
-            # release the last node
-            if self.is_hybrid:
-                self.tree_cache.dec_lock_ref(req.last_node, req.swa_uuid_for_lock)
-            else:
-                self.tree_cache.dec_lock_ref(req.last_node)
-
-            # NOTE(lsyin): we should use the newly evictable memory instantly.
-            num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
-            self._evict_tree_cache_if_needed(num_tokens)
+        # TODO (csy): for preempted requests, we may want to insert into the tree
+        self.tree_cache.cache_finished_req(req, is_insert=False)
+        # NOTE(lsyin): we should use the newly evictable memory instantly.
+        num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
+        evict_from_tree_cache(self.tree_cache, num_tokens)
 
         req.reset_for_retract()
 
@@ -1848,24 +1787,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             enable_overlap=self.enable_overlap,
         )
 
-    def _evict_tree_cache_if_needed(self, num_tokens: int):
-        if isinstance(self.tree_cache, (SWAChunkCache, ChunkCache)):
-            return
-
-        if self.is_hybrid:
-            full_available_size = self.token_to_kv_pool_allocator.full_available_size()
-            swa_available_size = self.token_to_kv_pool_allocator.swa_available_size()
-
-            if full_available_size < num_tokens or swa_available_size < num_tokens:
-                if self.tree_cache is not None:
-                    full_num_tokens = max(0, num_tokens - full_available_size)
-                    swa_num_tokens = max(0, num_tokens - swa_available_size)
-                    self.tree_cache.evict(full_num_tokens, swa_num_tokens)
-        else:
-            if self.token_to_kv_pool_allocator.available_size() < num_tokens:
-                if self.tree_cache is not None:
-                    self.tree_cache.evict(num_tokens)
-
     def _is_available_size_sufficient(self, num_tokens: int) -> bool:
         if self.is_hybrid:
             return (
@@ -1950,9 +1871,6 @@ class ModelWorkerBatch:
     # If set, the output of the batch contains the hidden states of the run.
     capture_hidden_mode: CaptureHiddenMode = None
     hicache_consumer_index: int = -1
-
-    # Overlap scheduler related
-    delay_sample_launch: bool = False
 
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
