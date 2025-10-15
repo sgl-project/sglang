@@ -20,6 +20,22 @@ DEFAULT_MOONCAKE_CONFIG_PATH_ENV = "SGLANG_HICACHE_MOONCAKE_CONFIG_PATH"
 logger = logging.getLogger(__name__)
 
 
+def _parse_global_segment_size(value) -> int:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s.endswith("gb"):
+            num = s[:-2].strip()
+            if not num:
+                raise ValueError(
+                    "Invalid global_segment_size: missing number before 'gb'"
+                )
+            return int(num) * 1024 * 1024 * 1024
+        return int(s)
+    return int(value)
+
+
 @dataclass
 class MooncakeStoreConfig:
     local_hostname: str
@@ -43,13 +59,13 @@ class MooncakeStoreConfig:
         return MooncakeStoreConfig(
             local_hostname=config.get("local_hostname"),
             metadata_server=config.get("metadata_server"),
-            global_segment_size=config.get(
-                "global_segment_size", DEFAULT_GLOBAL_SEGMENT_SIZE
+            global_segment_size=_parse_global_segment_size(
+                config.get("global_segment_size", DEFAULT_GLOBAL_SEGMENT_SIZE)
             ),
             # Zero copy interface does not need local buffer
             local_buffer_size=DEFAULT_LOCAL_BUFFER_SIZE,
             protocol=config.get("protocol", "tcp"),
-            device_name=config.get("device_name", "auto"),
+            device_name=config.get("device_name", ""),
             master_server_address=config.get("master_server_address"),
         )
 
@@ -58,7 +74,7 @@ class MooncakeStoreConfig:
         """Load config from a file specified in the environment variable.
         export MOONCAKE_MASTER=10.13.3.232:50051
         export MOONCAKE_PROTOCOL="rdma"
-        export MOONCAKE_DEVICE="auto"
+        export MOONCAKE_DEVICE=""
         export MOONCAKE_TE_META_DATA_SERVER="P2PHANDSHAKE"
         """
         # other required environment variables...
@@ -67,13 +83,13 @@ class MooncakeStoreConfig:
         return MooncakeStoreConfig(
             local_hostname=os.getenv("LOCAL_HOSTNAME", "localhost"),
             metadata_server=os.getenv("MOONCAKE_TE_META_DATA_SERVER", "P2PHANDSHAKE"),
-            global_segment_size=int(
+            global_segment_size=_parse_global_segment_size(
                 os.getenv("MOONCAKE_GLOBAL_SEGMENT_SIZE", DEFAULT_GLOBAL_SEGMENT_SIZE)
             ),
             # Zero copy interface does not need local buffer
             local_buffer_size=DEFAULT_LOCAL_BUFFER_SIZE,
             protocol=os.getenv("MOONCAKE_PROTOCOL", "tcp"),
-            device_name=os.getenv("MOONCAKE_DEVICE", "auto"),
+            device_name=os.getenv("MOONCAKE_DEVICE", ""),
             master_server_address=os.getenv("MOONCAKE_MASTER"),
         )
 
@@ -86,23 +102,16 @@ class MooncakeStoreConfig:
         return MooncakeStoreConfig(
             local_hostname=extra_config.get("local_hostname", "localhost"),
             metadata_server=extra_config.get("metadata_server", "P2PHANDSHAKE"),
-            global_segment_size=extra_config.get(
-                "global_segment_size", DEFAULT_GLOBAL_SEGMENT_SIZE
+            global_segment_size=_parse_global_segment_size(
+                extra_config.get("global_segment_size", DEFAULT_GLOBAL_SEGMENT_SIZE)
             ),
             local_buffer_size=extra_config.get(
                 "local_buffer_size", DEFAULT_LOCAL_BUFFER_SIZE
             ),
             protocol=extra_config.get("protocol", "tcp"),
-            device_name=extra_config.get("device_name", "auto"),
+            device_name=extra_config.get("device_name", ""),
             master_server_address=extra_config["master_server_address"],
         )
-
-    def __post_init__(self):
-        if self.device_name == "auto":
-            os.environ["MC_MS_AUTO_DISC"] = "1"
-            os.environ["MC_MS_FILTERS"] = (
-                "mlx5_bond_0, mlx5_bond_1, mlx5_bond_2, mlx5_bond_3"
-            )
 
 
 class MooncakeStore(HiCacheStorage):
@@ -150,6 +159,12 @@ class MooncakeStore(HiCacheStorage):
                 self.config.global_segment_size // tp_scale_factor
             )
             per_tp_local_buffer_size = self.config.local_buffer_size // tp_scale_factor
+
+            # Check if extra_backend_tag should be passed to MooncakeDistributedStore
+            self.extra_backend_tag = None
+            if extra_config and "extra_backend_tag" in extra_config:
+                self.extra_backend_tag = extra_config["extra_backend_tag"]
+                logger.info(f"Using extra_backend_tag: {self.extra_backend_tag}")
 
             ret_code = self.store.setup(
                 self.config.local_hostname,
@@ -257,6 +272,11 @@ class MooncakeStore(HiCacheStorage):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
+        # Apply extra_backend_tag prefix if available
+        if self.extra_backend_tag is not None:
+            prefix = self.extra_backend_tag
+            keys = [f"{prefix}_{key}" for key in keys]
+
         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
         get_results = self._get_batch_zero_copy_impl(
             key_strs, buffer_ptrs, buffer_sizes
@@ -269,6 +289,11 @@ class MooncakeStore(HiCacheStorage):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
+        # Apply extra_backend_tag prefix if available
+        if self.extra_backend_tag is not None:
+            prefix = self.extra_backend_tag
+            keys = [f"{prefix}_{key}" for key in keys]
+
         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
         exist_result = self._batch_exist(key_strs)
 

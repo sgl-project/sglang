@@ -25,7 +25,6 @@ import signal
 import sys
 import threading
 import time
-import uuid
 from collections import deque
 from contextlib import nullcontext
 from datetime import datetime
@@ -34,6 +33,7 @@ from http import HTTPStatus
 from typing import Any, Awaitable, Dict, List, Optional, Tuple, Union
 
 import fastapi
+import orjson
 import torch
 import uvloop
 import zmq
@@ -157,7 +157,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         self.log_requests = server_args.log_requests
         self.log_requests_level = server_args.log_requests_level
         self.preferred_sampling_params = (
-            json.loads(server_args.preferred_sampling_params)
+            orjson.loads(server_args.preferred_sampling_params)
             if server_args.preferred_sampling_params
             else None
         )
@@ -359,7 +359,8 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 (
                     FreezeGCReq,
                     lambda x: None,
-                ),  # For handling case when scheduler skips detokenizer and forwards back to the tokenizer manager, we ignore it.
+                ),
+                # For handling case when scheduler skips detokenizer and forwards back to the tokenizer manager, we ignore it.
                 (HealthCheckOutput, lambda x: None),
             ]
         )
@@ -586,9 +587,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             )
 
         if self.mm_processor and obj.contains_mm_input():
-            if not isinstance(obj.image_data, list):
+            if not isinstance(obj.image_data, list) and obj.image_data:
                 obj.image_data = [obj.image_data]
-            if not isinstance(obj.audio_data, list):
+            if not isinstance(obj.audio_data, list) and obj.audio_data:
                 obj.audio_data = [obj.audio_data]
             mm_inputs: Dict = await self.mm_processor.process_mm_data_async(
                 image_data=obj.image_data,
@@ -1393,37 +1394,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             state.finished = recv_obj.finished_reasons[i] is not None
             if state.finished:
                 if self.server_args.speculative_algorithm:
-                    meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
-                    if (
-                        recv_obj.spec_verify_ct[i] > 0
-                        and self.server_args.speculative_num_steps is not None
-                        and not isinstance(recv_obj, BatchEmbeddingOutput)
-                        and hasattr(recv_obj, "spec_accepted_tokens")
-                        # Checks that `spec_accepted_tokens[i]` will exist.
-                        and len(recv_obj.spec_accepted_tokens) > i
-                    ):
-                        total_draft_tokens = (
-                            recv_obj.spec_verify_ct[i]
-                            * self.server_args.speculative_num_steps
-                        )
-                        accepted_tokens = recv_obj.spec_accepted_tokens[i]
-
-                        # Calculate per-request acceptance rate and average acceptance length.
-                        if total_draft_tokens > 0:
-                            # Calculate acceptance rate: accepted / (steps * lookahead)
-                            meta_info["spec_accept_rate"] = (
-                                accepted_tokens / total_draft_tokens
-                            )
-                            meta_info["spec_accept_length"] = (
-                                recv_obj.completion_tokens[i]
-                                / recv_obj.spec_verify_ct[i]
-                            )
-                        else:
-                            meta_info["spec_accept_rate"] = 0.0
-                            meta_info["spec_accept_length"] = 0
-                    else:
-                        meta_info["spec_acceptance_rate"] = 0.0
-                        meta_info["spec_accept_length"] = 0
+                    self._calculate_spec_decoding_metrics(meta_info, recv_obj, i)
                 state.finished_time = time.time()
                 meta_info["e2e_latency"] = state.finished_time - state.created_time
 
@@ -1570,6 +1541,43 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             else:
                 ret.append(None)
         return ret
+
+    def _calculate_spec_decoding_metrics(
+        self,
+        meta_info: Dict[str, Any],
+        recv_obj: Union[
+            BatchStrOutput,
+            BatchEmbeddingOutput,
+            BatchMultimodalOutput,
+            BatchTokenIDOutput,
+        ],
+        i: int,
+    ) -> None:
+        """Calculate speculative decoding metrics, such as acceptance rate and acceptance length metrics."""
+        meta_info["spec_accept_rate"] = 0.0
+        meta_info["spec_accept_length"] = 0
+        meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
+
+        if (
+            recv_obj.spec_verify_ct[i] > 0
+            and self.server_args.speculative_num_steps is not None
+            and not isinstance(recv_obj, BatchEmbeddingOutput)
+            and hasattr(recv_obj, "spec_accepted_tokens")
+            # Checks that `spec_accepted_tokens[i]` will exist.
+            and len(recv_obj.spec_accepted_tokens) > i
+        ):
+            total_draft_tokens = (
+                recv_obj.spec_verify_ct[i] * self.server_args.speculative_num_steps
+            )
+            accepted_tokens = recv_obj.spec_accepted_tokens[i]
+
+            # Calculate per-request acceptance rate and average acceptance length.
+            if total_draft_tokens > 0:
+                # Calculate acceptance rate: accepted / (steps * lookahead)
+                meta_info["spec_accept_rate"] = accepted_tokens / total_draft_tokens
+                meta_info["spec_accept_length"] = (
+                    recv_obj.completion_tokens[i] / recv_obj.spec_verify_ct[i]
+                )
 
     def collect_metrics(self, state: ReqState, recv_obj: BatchStrOutput, i: int):
         completion_tokens = (

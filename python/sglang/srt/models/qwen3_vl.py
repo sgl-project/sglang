@@ -189,10 +189,10 @@ class Qwen3_VisionBlock(nn.Module):
             position_embeddings=position_embeddings,
         )
         attn = rearrange(attn, "b s ... -> s b ...")
-        x = x + attn
+        x += attn
         norm2 = self.norm2(x)
         mlp = self.mlp(norm2)
-        x = x + mlp
+        x += mlp
         return x
 
 
@@ -441,7 +441,7 @@ class Qwen3_VisionTransformer(nn.Module):
         x = self.patch_embed(x)
 
         pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
-        x = x + pos_embeds
+        x += pos_embeds
         rotary_pos_emb = self.rot_pos_emb(grid_thw)
 
         seq_len, _ = x.size()
@@ -452,13 +452,15 @@ class Qwen3_VisionTransformer(nn.Module):
         position_embeddings = (emb.cos(), emb.sin())
 
         # compute cu_seqlens
+        cu_seqlens = torch.repeat_interleave(
+            grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
+        ).cumsum(dim=0)
         cu_seqlens = torch.cat(
             [
-                torch.tensor([0], device=grid_thw.device),
-                (grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2]).cumsum(dim=0),
+                torch.zeros(1, dtype=torch.int32, device=cu_seqlens.device),
+                cu_seqlens.to(torch.int32),
             ]
         )
-        cu_seqlens = torch.cat([cu_seqlens.new_zeros(1), cu_seqlens])
 
         # max_seqlen, seqlens = self.compute_attn_mask_seqlen(cu_seqlens)
         x = x.unsqueeze(1)
@@ -574,10 +576,7 @@ class Qwen3LLMModel(Qwen3Model):
                 and layer_idx in self.deepstack_embed_to_decoder_layer
             ):
                 sep = self.hidden_size * layer_idx
-                hidden_states = (
-                    hidden_states
-                    + input_deepstack_embeds[:, sep : sep + self.hidden_size]
-                )
+                hidden_states += input_deepstack_embeds[:, sep : sep + self.hidden_size]
 
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(

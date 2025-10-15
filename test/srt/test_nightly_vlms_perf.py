@@ -3,7 +3,7 @@ import subprocess
 import unittest
 import warnings
 
-from sglang.bench_one_batch_server import BenchmarkResult
+from sglang.bench_one_batch_server import BenchmarkResult, generate_markdown_report
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -27,6 +27,7 @@ MODEL_DEFAULTS = [
     ModelLaunchSettings(
         "google/gemma-3-27b-it",
     ),
+    ModelLaunchSettings("Qwen/Qwen3-VL-30B-A3B-Instruct", extra_args=["--tp=2"]),
     # "OpenGVLab/InternVL2_5-2B",
     # buggy in official transformers impl
     # "openbmb/MiniCPM-V-2_6",
@@ -45,9 +46,7 @@ class TestNightlyVLMModelsPerformance(unittest.TestCase):
             cls.models = []
             model_paths = parse_models(nightly_vlm_models_str)
             for model_path in model_paths:
-                cls.models.append(
-                    ModelLaunchSettings(model_path, extra_args=VLM_EXTRA_ARGS)
-                )
+                cls.models.append(ModelLaunchSettings(model_path))
         else:
             cls.models = MODEL_DEFAULTS
 
@@ -60,6 +59,7 @@ class TestNightlyVLMModelsPerformance(unittest.TestCase):
 
     def test_bench_one_batch(self):
         all_benchmark_results = []
+        all_model_succeed = True
 
         for model_setup in self.models:
             benchmark_results = []
@@ -112,7 +112,6 @@ class TestNightlyVLMModelsPerformance(unittest.TestCase):
                             f"Error running benchmark for {model_setup.model_path} with batch size:"
                         )
                         print(result.stderr)
-                        # Continue to next batch size even if one fails
                         continue
 
                     print(f"Output for {model_setup.model_path} with batch size:")
@@ -136,18 +135,23 @@ class TestNightlyVLMModelsPerformance(unittest.TestCase):
                         )
 
                     else:
+                        all_model_succeed = False
                         print(f"Warning: JSON output file {json_output_file} not found")
 
                 finally:
                     kill_process_tree(process.pid)
 
-                report_part = BenchmarkResult.generate_markdown_report(
-                    PROFILE_DIR, benchmark_results
+                report_part = generate_markdown_report(
+                    PROFILE_DIR,
+                    benchmark_results,
                 )
                 self.full_report += report_part + "\n"
 
         if is_in_ci():
             write_github_step_summary(self.full_report)
+
+        if not all_model_succeed:
+            raise AssertionError("Some models failed the perf tests.")
 
 
 if __name__ == "__main__":
