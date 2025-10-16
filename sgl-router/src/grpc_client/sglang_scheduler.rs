@@ -1,16 +1,23 @@
-use std::convert::TryFrom;
-use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::task::{Context, Poll};
-use std::time::Duration;
+use std::{
+    convert::TryFrom,
+    pin::Pin,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    task::{Context, Poll},
+    time::Duration,
+};
+
 use tonic::{transport::Channel, Request, Streaming};
 use tracing::{debug, warn};
 
-use crate::protocols::chat::ChatCompletionRequest;
-use crate::protocols::common::{ResponseFormat, StringOrArray, ToolChoice, ToolChoiceValue};
-use crate::protocols::generate::GenerateRequest;
-use crate::protocols::sampling_params::SamplingParams as GenerateSamplingParams;
+use crate::protocols::{
+    chat::ChatCompletionRequest,
+    common::{ResponseFormat, StringOrArray, ToolChoice, ToolChoiceValue},
+    generate::GenerateRequest,
+    sampling_params::SamplingParams as GenerateSamplingParams,
+};
 
 // Include the generated protobuf code
 pub mod proto {

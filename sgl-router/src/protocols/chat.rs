@@ -1,10 +1,13 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
 use validator::Validate;
 
-use super::common::*;
-use super::sampling_params::{validate_top_k_value, validate_top_p_value};
+use super::{
+    common::*,
+    sampling_params::{validate_top_k_value, validate_top_p_value},
+};
 use crate::protocols::validated::Normalizable;
 
 // ============================================================================

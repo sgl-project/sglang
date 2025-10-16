@@ -1,19 +1,5 @@
-use super::pd_types::api_path;
-use crate::config::types::RetryConfig;
-use crate::core::{
-    is_retryable_status, RetryExecutor, Worker, WorkerLoadGuard, WorkerRegistry, WorkerType,
-};
-use crate::metrics::RouterMetrics;
-use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
-use crate::protocols::chat::{ChatCompletionRequest, ChatMessage, UserMessageContent};
-use crate::protocols::common::{InputIds, StringOrArray};
-use crate::protocols::completion::CompletionRequest;
-use crate::protocols::embedding::EmbeddingRequest;
-use crate::protocols::generate::GenerateRequest;
-use crate::protocols::rerank::RerankRequest;
-use crate::protocols::responses::{ResponsesGetParams, ResponsesRequest};
-use crate::routers::header_utils;
-use crate::routers::RouterTrait;
+use std::{sync::Arc, time::Instant};
+
 use async_trait::async_trait;
 use axum::{
     body::Body,
@@ -25,10 +11,28 @@ use futures_util::StreamExt;
 use reqwest::Client;
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::sync::Arc;
-use std::time::Instant;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, warn};
+
+use super::pd_types::api_path;
+use crate::{
+    config::types::RetryConfig,
+    core::{
+        is_retryable_status, RetryExecutor, Worker, WorkerLoadGuard, WorkerRegistry, WorkerType,
+    },
+    metrics::RouterMetrics,
+    policies::{LoadBalancingPolicy, PolicyRegistry},
+    protocols::{
+        chat::{ChatCompletionRequest, ChatMessage, UserMessageContent},
+        common::{InputIds, StringOrArray},
+        completion::CompletionRequest,
+        embedding::EmbeddingRequest,
+        generate::GenerateRequest,
+        rerank::RerankRequest,
+        responses::{ResponsesGetParams, ResponsesRequest},
+    },
+    routers::{header_utils, RouterTrait},
+};
 
 #[derive(Debug)]
 pub struct PDRouter {
