@@ -313,7 +313,24 @@ impl RouterTrait for RouterManager {
             .into_response()
     }
 
-    async fn get_models(&self, _req: Request<Body>) -> Response {
+    async fn get_models(&self, req: Request<Body>) -> Response {
+        // In single-router mode, delegate to the router (especially for OpenAI mode)
+        if !self.enable_igw {
+            let router = {
+                let default_router = self.default_router.read().unwrap();
+                if let Some(ref default_id) = *default_router {
+                    self.routers.get(default_id).map(|r| r.clone())
+                } else {
+                    None
+                }
+            }; 
+
+            if let Some(router) = router {
+                return router.get_models(req).await;
+            }
+        }
+
+        // In multi-router mode, aggregate models from worker registry
         let models = self.worker_registry.get_models();
 
         if models.is_empty() {
