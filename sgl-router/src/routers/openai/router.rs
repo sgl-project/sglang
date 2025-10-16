@@ -19,11 +19,13 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use dashmap::DashMap;
 use futures_util::StreamExt;
 use serde_json::{json, to_value, Value};
 use std::{
     any::Any,
     sync::{atomic::AtomicBool, Arc},
+    time::{Duration, Instant},
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -46,12 +48,23 @@ use super::streaming::handle_streaming_response;
 // OpenAIRouter Struct
 // ============================================================================
 
+/// Cached endpoint information
+#[derive(Clone, Debug)]
+struct CachedEndpoint {
+    url: String,
+    cached_at: Instant,
+}
+
 /// Router for OpenAI backend
 pub struct OpenAIRouter {
     /// HTTP client for upstream OpenAI-compatible API
     client: reqwest::Client,
-    /// Base URL for identification (no trailing slash)
-    base_url: String,
+    /// Multiple OpenAI-compatible API endpoints (OpenAI, xAI, etc.)
+    worker_urls: Vec<String>,
+    /// Model cache: model_id -> endpoint URL
+    model_cache: Arc<DashMap<String, CachedEndpoint>>,
+    /// Cache TTL duration
+    cache_ttl: Duration,
     /// Circuit breaker
     circuit_breaker: CircuitBreaker,
     /// Health status
@@ -69,7 +82,7 @@ pub struct OpenAIRouter {
 impl std::fmt::Debug for OpenAIRouter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OpenAIRouter")
-            .field("base_url", &self.base_url)
+            .field("worker_urls", &self.worker_urls)
             .field("healthy", &self.healthy)
             .finish()
     }
@@ -79,28 +92,35 @@ impl OpenAIRouter {
     /// Maximum number of conversation items to attach as input when a conversation is provided
     const MAX_CONVERSATION_HISTORY_ITEMS: usize = 100;
 
+    /// Model discovery cache TTL (1 hour)
+    const MODEL_CACHE_TTL_SECS: u64 = 3600;
+
     /// Create a new OpenAI router
     pub async fn new(
-        base_url: String,
+        worker_urls: Vec<String>,
         circuit_breaker_config: Option<CircuitBreakerConfig>,
         response_storage: SharedResponseStorage,
         conversation_storage: SharedConversationStorage,
         conversation_item_storage: SharedConversationItemStorage,
     ) -> Result<Self, String> {
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(300))
+            .timeout(Duration::from_secs(300))
             .build()
             .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
 
-        let base_url = base_url.trim_end_matches('/').to_string();
+        // Normalize URLs (remove trailing slashes)
+        let worker_urls: Vec<String> = worker_urls
+            .into_iter()
+            .map(|url| url.trim_end_matches('/').to_string())
+            .collect();
 
         // Convert circuit breaker config
         let core_cb_config = circuit_breaker_config
             .map(|cb| CoreCircuitBreakerConfig {
                 failure_threshold: cb.failure_threshold,
                 success_threshold: cb.success_threshold,
-                timeout_duration: std::time::Duration::from_secs(cb.timeout_duration_secs),
-                window_duration: std::time::Duration::from_secs(cb.window_duration_secs),
+                timeout_duration: Duration::from_secs(cb.timeout_duration_secs),
+                window_duration: Duration::from_secs(cb.window_duration_secs),
             })
             .unwrap_or_default();
 
@@ -128,7 +148,9 @@ impl OpenAIRouter {
 
         Ok(Self {
             client,
-            base_url,
+            worker_urls,
+            model_cache: Arc::new(DashMap::new()),
+            cache_ttl: Duration::from_secs(Self::MODEL_CACHE_TTL_SECS),
             circuit_breaker,
             healthy: AtomicBool::new(true),
             response_storage,
@@ -136,6 +158,77 @@ impl OpenAIRouter {
             conversation_item_storage,
             mcp_manager,
         })
+    }
+
+    /// Discover which endpoint has the model
+    async fn find_endpoint_for_model(
+        &self,
+        model_id: &str,
+        auth_header: Option<&str>,
+    ) -> Result<String, Response> {
+        // Single endpoint - fast path
+        if self.worker_urls.len() == 1 {
+            return Ok(self.worker_urls[0].clone());
+        }
+
+        // Check cache
+        if let Some(entry) = self.model_cache.get(model_id) {
+            if entry.cached_at.elapsed() < self.cache_ttl {
+                return Ok(entry.url.clone());
+            }
+        }
+
+        // Probe all endpoints in parallel
+        let mut handles = vec![];
+        for url in &self.worker_urls {
+            let url = url.clone();
+            let model = model_id.to_string();
+            let auth = auth_header.map(|s| s.to_string());
+            let client = self.client.clone();
+
+            let handle = tokio::spawn(async move {
+                let probe_url = format!("{}/v1/models/{}", url.trim_end_matches('/'), model);
+                let mut req = client.get(&probe_url).timeout(Duration::from_secs(5));
+
+                if let Some(a) = auth {
+                    req = req.header("Authorization", a);
+                }
+
+                match req.send().await {
+                    Ok(resp) if resp.status().is_success() => Ok(url),
+                    _ => Err(()),
+                }
+            });
+
+            handles.push(handle);
+        }
+
+        // Return first successful endpoint
+        for handle in handles {
+            if let Ok(Ok(url)) = handle.await {
+                // Cache it
+                self.model_cache.insert(
+                    model_id.to_string(),
+                    CachedEndpoint {
+                        url: url.clone(),
+                        cached_at: Instant::now(),
+                    },
+                );
+                return Ok(url);
+            }
+        }
+
+        // Model not found on any endpoint
+        Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": {
+                    "message": format!("Model '{}' not found on any endpoint", model_id),
+                    "type": "model_not_found",
+                }
+            })),
+        )
+            .into_response())
     }
 
     /// Handle non-streaming response with optional MCP tool loop
@@ -269,85 +362,127 @@ impl crate::routers::RouterTrait for OpenAIRouter {
     }
 
     async fn health_generate(&self, _req: Request<Body>) -> Response {
-        // Simple upstream probe: GET {base}/v1/models without auth
-        let url = format!("{}/v1/models", self.base_url);
-        match self
-            .client
-            .get(&url)
-            .timeout(std::time::Duration::from_secs(2))
-            .send()
-            .await
-        {
-            Ok(resp) => {
-                let code = resp.status();
-                // Treat success and auth-required as healthy (endpoint reachable)
-                if code.is_success() || code.as_u16() == 401 || code.as_u16() == 403 {
-                    (StatusCode::OK, "OK").into_response()
-                } else {
-                    (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        format!("Upstream status: {}", code),
-                    )
-                        .into_response()
+        // Check all endpoints in parallel - only healthy if ALL are healthy
+        if self.worker_urls.is_empty() {
+            return (StatusCode::SERVICE_UNAVAILABLE, "No endpoints configured").into_response();
+        }
+
+        let mut handles = vec![];
+        for url in &self.worker_urls {
+            let url = url.clone();
+            let client = self.client.clone();
+
+            let handle = tokio::spawn(async move {
+                let probe_url = format!("{}/v1/models", url);
+                match client
+                    .get(&probe_url)
+                    .timeout(Duration::from_secs(2))
+                    .send()
+                    .await
+                {
+                    Ok(resp) => {
+                        let code = resp.status();
+                        // Treat success and auth-required as healthy (endpoint reachable)
+                        if code.is_success() || code.as_u16() == 401 || code.as_u16() == 403 {
+                            Ok(())
+                        } else {
+                            Err(format!("Endpoint {} returned status {}", url, code))
+                        }
+                    }
+                    Err(e) => Err(format!("Endpoint {} error: {}", url, e)),
                 }
+            });
+
+            handles.push(handle);
+        }
+
+        // Collect all results
+        let mut errors = Vec::new();
+        for handle in handles {
+            match handle.await {
+                Ok(Ok(())) => continue,
+                Ok(Err(e)) => errors.push(e),
+                Err(e) => errors.push(format!("Task join error: {}", e)),
             }
-            Err(e) => (
+        }
+
+        if errors.is_empty() {
+            (StatusCode::OK, "OK").into_response()
+        } else {
+            (
                 StatusCode::SERVICE_UNAVAILABLE,
-                format!("Upstream error: {}", e),
+                format!("Some endpoints unhealthy: {}", errors.join(", ")),
             )
-                .into_response(),
+                .into_response()
         }
     }
 
     async fn get_server_info(&self, _req: Request<Body>) -> Response {
         let info = json!({
             "router_type": "openai",
-            "workers": 1,
-            "base_url": &self.base_url
+            "workers": self.worker_urls.len(),
+            "worker_urls": &self.worker_urls
         });
         (StatusCode::OK, info.to_string()).into_response()
     }
 
     async fn get_models(&self, req: Request<Body>) -> Response {
-        // Proxy to upstream /v1/models; forward Authorization header if provided
-        let headers = req.headers();
-
-        let mut upstream = self.client.get(format!("{}/v1/models", self.base_url));
-
-        if let Some(auth) = headers
-            .get("authorization")
-            .or_else(|| headers.get("Authorization"))
-        {
-            upstream = upstream.header("Authorization", auth);
+        // Aggregate models from all endpoints
+        if self.worker_urls.is_empty() {
+            return (StatusCode::SERVICE_UNAVAILABLE, "No endpoints configured").into_response();
         }
 
-        match upstream.send().await {
-            Ok(res) => {
-                let status = StatusCode::from_u16(res.status().as_u16())
-                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                let content_type = res.headers().get(CONTENT_TYPE).cloned();
-                match res.bytes().await {
-                    Ok(body) => {
-                        let mut response = Response::new(Body::from(body));
-                        *response.status_mut() = status;
-                        if let Some(ct) = content_type {
-                            response.headers_mut().insert(CONTENT_TYPE, ct);
+        let headers = req.headers();
+        let auth = headers
+            .get("authorization")
+            .or_else(|| headers.get("Authorization"));
+
+        // Query all endpoints in parallel
+        let mut handles = vec![];
+        for url in &self.worker_urls {
+            let url = url.clone();
+            let client = self.client.clone();
+            let auth = auth.cloned();
+
+            let handle = tokio::spawn(async move {
+                let models_url = format!("{}/v1/models", url);
+                let mut req = client.get(&models_url);
+
+                if let Some(auth_header) = auth {
+                    req = req.header("Authorization", auth_header);
+                }
+
+                match req.send().await {
+                    Ok(res) if res.status().is_success() => {
+                        match res.json::<Value>().await {
+                            Ok(json) => Ok(json),
+                            Err(_) => Err(()),
                         }
-                        response
                     }
-                    Err(e) => (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Failed to read upstream response: {}", e),
-                    )
-                        .into_response(),
+                    _ => Err(()),
+                }
+            });
+
+            handles.push(handle);
+        }
+
+        // Collect all model lists
+        let mut all_models = Vec::new();
+        for handle in handles {
+            if let Ok(Ok(json)) = handle.await {
+                if let Some(data) = json.get("data").and_then(|v| v.as_array()) {
+                    all_models.extend_from_slice(data);
                 }
             }
-            Err(e) => (
-                StatusCode::BAD_GATEWAY,
-                format!("Failed to contact upstream: {}", e),
-            )
-                .into_response(),
         }
+
+        // Return aggregated models
+        let response_json = json!({
+            "object": "list",
+            "data": all_models
+        });
+
+        (StatusCode::OK, Json(response_json)).into_response()
     }
 
     async fn get_model_info(&self, _req: Request<Body>) -> Response {
@@ -382,6 +517,22 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         if !self.circuit_breaker.can_execute() {
             return (StatusCode::SERVICE_UNAVAILABLE, "Circuit breaker open").into_response();
         }
+
+        // Extract auth header
+        let auth = headers.and_then(|h| {
+            h.get("authorization")
+                .or_else(|| h.get("Authorization"))
+                .and_then(|v| v.to_str().ok())
+        });
+
+        // Find endpoint for model
+        let base_url = match self
+            .find_endpoint_for_model(body.model.as_str(), auth)
+            .await
+        {
+            Ok(url) => url,
+            Err(response) => return response,
+        };
 
         // Serialize request body, removing SGLang-only fields
         let mut payload = match to_value(body) {
@@ -420,7 +571,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
             }
         }
 
-        let url = format!("{}/v1/chat/completions", self.base_url);
+        let url = format!("{}/v1/chat/completions", base_url);
         let mut req = self.client.post(&url).json(&payload);
 
         // Forward Authorization header if provided
@@ -521,7 +672,21 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         body: &ResponsesRequest,
         model_id: Option<&str>,
     ) -> Response {
-        let url = format!("{}/v1/responses", self.base_url);
+        // Extract auth header
+        let auth = headers.and_then(|h| {
+            h.get("authorization")
+                .or_else(|| h.get("Authorization"))
+                .and_then(|v| v.to_str().ok())
+        });
+
+        // Find endpoint for model
+        let model = model_id.or(body.model.as_deref()).unwrap_or("");
+        let base_url = match self.find_endpoint_for_model(model, auth).await {
+            Ok(url) => url,
+            Err(response) => return response,
+        };
+
+        let url = format!("{}/v1/responses", base_url);
 
         // Validate mutually exclusive params: previous_response_id and conversation
         // TODO: this validation logic should move the right place, also we need a proper error message module
@@ -823,8 +988,12 @@ impl crate::routers::RouterTrait for OpenAIRouter {
     }
 
     async fn cancel_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response {
-        // Forward cancellation to upstream
-        let url = format!("{}/v1/responses/{}/cancel", self.base_url, response_id);
+        // Forward cancellation to upstream (use first endpoint)
+        let base_url = match self.worker_urls.first() {
+            Some(url) => url.as_str(),
+            None => return (StatusCode::SERVICE_UNAVAILABLE, "No endpoints configured").into_response(),
+        };
+        let url = format!("{}/v1/responses/{}/cancel", base_url, response_id);
         let mut req = self.client.post(&url);
 
         if let Some(h) = headers {
