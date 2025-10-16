@@ -12,8 +12,10 @@ from enum import Enum
 from typing import TYPE_CHECKING, Dict, List, Optional
 
 from safetensors import safe_open
+
 try:
     from sgl_kernel import fused_marlin_moe
+
     FUSED_MARLIN_MOE_AVAILABLE = True
 except ImportError:
     FUSED_MARLIN_MOE_AVAILABLE = False
@@ -760,9 +762,7 @@ class CompressedTensorsWNA16AMXMoEMethod(CompressedTensorsMoEMethod):
             )
 
         if not FUSED_MARLIN_MOE_AVAILABLE:
-            raise ImportError(
-                "fused_marlin_moe is not available"
-            )
+            raise ImportError("fused_marlin_moe is not available")
 
         self.tp_rank = get_tensor_model_parallel_rank()
         self.layer_idx = layer_idx
