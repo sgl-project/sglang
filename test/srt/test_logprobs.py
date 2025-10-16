@@ -10,8 +10,9 @@ across different machines.
 This test is designed to be run locally by contributors to verify logprobs accuracy
 before making changes to related code.
 When submitting changes that affect logprobs computation, please:
-1. Run this test locally to ensure accuracy
-2. Include test results in your PR description
+1. Generate baseline
+2. Run test
+3. Submit results
 
 We really appreciate your effort and contribution to SGLang!
 
@@ -22,7 +23,7 @@ and saves them as a baseline. Then, by running the test mode, it validates the a
 logprobs by comparing them against the baseline.
 
 This test ensures that:
-- returned logprobs have correct boundaries;
+- the boundary of log probs requests are correct, eg, the index for tokens that required log probs are strictly followed
 - logprobs remain invariant between test runs, and also before and after your code changes;
 
 ======================
