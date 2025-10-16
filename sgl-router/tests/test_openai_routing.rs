@@ -22,7 +22,7 @@ use sglang_router_rs::{
         ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateRequest, ResponseInput,
         ResponsesGetParams, ResponsesRequest, UserMessageContent,
     },
-    routers::{openai_router::OpenAIRouter, RouterTrait},
+    routers::{openai::OpenAIRouter, RouterTrait},
 };
 use std::collections::HashMap;
 use std::sync::{
@@ -96,7 +96,7 @@ async fn test_openai_router_creation() {
         None,
         Arc::new(MemoryResponseStorage::new()),
         Arc::new(MemoryConversationStorage::new()),
-        Arc::new(sglang_router_rs::data_connector::MemoryConversationItemStorage::new()),
+        Arc::new(MemoryConversationItemStorage::new()),
     )
     .await;
 
@@ -146,7 +146,7 @@ async fn test_openai_router_models() {
         None,
         Arc::new(MemoryResponseStorage::new()),
         Arc::new(MemoryConversationStorage::new()),
-        Arc::new(sglang_router_rs::data_connector::MemoryConversationItemStorage::new()),
+        Arc::new(MemoryConversationItemStorage::new()),
     )
     .await
     .unwrap();
@@ -226,7 +226,7 @@ async fn test_openai_router_responses_with_mock() {
         None,
         storage.clone(),
         Arc::new(MemoryConversationStorage::new()),
-        Arc::new(sglang_router_rs::data_connector::MemoryConversationItemStorage::new()),
+        Arc::new(MemoryConversationItemStorage::new()),
     )
     .await
     .unwrap();
@@ -234,7 +234,7 @@ async fn test_openai_router_responses_with_mock() {
     let request1 = ResponsesRequest {
         model: Some("gpt-4o-mini".to_string()),
         input: ResponseInput::Text("Say hi".to_string()),
-        store: true,
+        store: Some(true),
         ..Default::default()
     };
 
@@ -250,7 +250,7 @@ async fn test_openai_router_responses_with_mock() {
     let request2 = ResponsesRequest {
         model: Some("gpt-4o-mini".to_string()),
         input: ResponseInput::Text("Thanks".to_string()),
-        store: true,
+        store: Some(true),
         previous_response_id: Some(resp1_id.clone()),
         ..Default::default()
     };
@@ -487,7 +487,7 @@ async fn test_openai_router_responses_streaming_with_mock() {
         None,
         storage.clone(),
         Arc::new(MemoryConversationStorage::new()),
-        Arc::new(sglang_router_rs::data_connector::MemoryConversationItemStorage::new()),
+        Arc::new(MemoryConversationItemStorage::new()),
     )
     .await
     .unwrap();
@@ -501,8 +501,8 @@ async fn test_openai_router_responses_streaming_with_mock() {
         instructions: Some("Be kind".to_string()),
         metadata: Some(metadata),
         previous_response_id: Some("resp_prev_chain".to_string()),
-        store: true,
-        stream: true,
+        store: Some(true),
+        stream: Some(true),
         ..Default::default()
     };
 
@@ -592,22 +592,45 @@ async fn test_unsupported_endpoints() {
         None,
         Arc::new(MemoryResponseStorage::new()),
         Arc::new(MemoryConversationStorage::new()),
-        Arc::new(sglang_router_rs::data_connector::MemoryConversationItemStorage::new()),
+        Arc::new(MemoryConversationItemStorage::new()),
     )
     .await
     .unwrap();
 
     let generate_request = GenerateRequest {
-        prompt: None,
         text: Some("Hello world".to_string()),
         input_ids: None,
-        parameters: None,
+        input_embeds: None,
+        image_data: None,
+        video_data: None,
+        audio_data: None,
         sampling_params: None,
         stream: false,
-        return_logprob: false,
-        lora_path: None,
-        session_params: None,
+        return_logprob: Some(false),
+        logprob_start_len: None,
+        top_logprobs_num: None,
+        token_ids_logprob: None,
+        return_text_in_logprobs: false,
+        log_metrics: true,
         return_hidden_states: false,
+        modalities: None,
+        session_params: None,
+        lora_path: None,
+        lora_id: None,
+        custom_logit_processor: None,
+        bootstrap_host: None,
+        bootstrap_port: None,
+        bootstrap_room: None,
+        bootstrap_pair_key: None,
+        data_parallel_rank: None,
+        background: false,
+        conversation_id: None,
+        priority: None,
+        extra_key: None,
+        no_logs: false,
+        custom_labels: None,
+        return_bytes: false,
+        return_entropy: false,
         rid: None,
     };
 
@@ -634,7 +657,7 @@ async fn test_openai_router_chat_completion_with_mock() {
         None,
         Arc::new(MemoryResponseStorage::new()),
         Arc::new(MemoryConversationStorage::new()),
-        Arc::new(sglang_router_rs::data_connector::MemoryConversationItemStorage::new()),
+        Arc::new(MemoryConversationItemStorage::new()),
     )
     .await
     .unwrap();
@@ -642,7 +665,6 @@ async fn test_openai_router_chat_completion_with_mock() {
     // Create a minimal chat completion request
     let mut chat_request = create_minimal_chat_request();
     chat_request.messages = vec![ChatMessage::User {
-        role: "user".to_string(),
         content: UserMessageContent::Text("Hello, how are you?".to_string()),
         name: None,
     }];
@@ -677,7 +699,7 @@ async fn test_openai_e2e_with_server() {
         None,
         Arc::new(MemoryResponseStorage::new()),
         Arc::new(MemoryConversationStorage::new()),
-        Arc::new(sglang_router_rs::data_connector::MemoryConversationItemStorage::new()),
+        Arc::new(MemoryConversationItemStorage::new()),
     )
     .await
     .unwrap();
@@ -748,7 +770,7 @@ async fn test_openai_router_chat_streaming_with_mock() {
         None,
         Arc::new(MemoryResponseStorage::new()),
         Arc::new(MemoryConversationStorage::new()),
-        Arc::new(sglang_router_rs::data_connector::MemoryConversationItemStorage::new()),
+        Arc::new(MemoryConversationItemStorage::new()),
     )
     .await
     .unwrap();
@@ -802,7 +824,7 @@ async fn test_openai_router_circuit_breaker() {
         Some(cb_config),
         Arc::new(MemoryResponseStorage::new()),
         Arc::new(MemoryConversationStorage::new()),
-        Arc::new(sglang_router_rs::data_connector::MemoryConversationItemStorage::new()),
+        Arc::new(MemoryConversationItemStorage::new()),
     )
     .await
     .unwrap();
@@ -831,7 +853,7 @@ async fn test_openai_router_models_auth_forwarding() {
         None,
         Arc::new(MemoryResponseStorage::new()),
         Arc::new(MemoryConversationStorage::new()),
-        Arc::new(sglang_router_rs::data_connector::MemoryConversationItemStorage::new()),
+        Arc::new(MemoryConversationItemStorage::new()),
     )
     .await
     .unwrap();
@@ -867,6 +889,7 @@ async fn test_openai_router_models_auth_forwarding() {
 #[test]
 fn oracle_config_validation_requires_config_when_enabled() {
     let config = RouterConfig {
+        chat_template: None,
         mode: RoutingMode::OpenAI {
             worker_urls: vec!["https://api.openai.com".to_string()],
         },
@@ -891,6 +914,7 @@ fn oracle_config_validation_requires_config_when_enabled() {
 #[test]
 fn oracle_config_validation_accepts_dsn_only() {
     let config = RouterConfig {
+        chat_template: None,
         mode: RoutingMode::OpenAI {
             worker_urls: vec!["https://api.openai.com".to_string()],
         },
@@ -913,6 +937,7 @@ fn oracle_config_validation_accepts_dsn_only() {
 #[test]
 fn oracle_config_validation_accepts_wallet_alias() {
     let config = RouterConfig {
+        chat_template: None,
         mode: RoutingMode::OpenAI {
             worker_urls: vec!["https://api.openai.com".to_string()],
         },
