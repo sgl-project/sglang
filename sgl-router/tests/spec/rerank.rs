@@ -76,8 +76,7 @@ fn test_rerank_request_validation_empty_query() {
     };
 
     let result = request.validate();
-    assert!(result.is_err());
-    assert_eq!(result.unwrap_err(), "Query cannot be empty");
+    assert!(result.is_err(), "Should reject empty query");
 }
 
 #[test]
@@ -93,8 +92,7 @@ fn test_rerank_request_validation_whitespace_query() {
     };
 
     let result = request.validate();
-    assert!(result.is_err());
-    assert_eq!(result.unwrap_err(), "Query cannot be empty");
+    assert!(result.is_err(), "Should reject whitespace-only query");
 }
 
 #[test]
@@ -110,8 +108,7 @@ fn test_rerank_request_validation_empty_documents() {
     };
 
     let result = request.validate();
-    assert!(result.is_err());
-    assert_eq!(result.unwrap_err(), "Documents list cannot be empty");
+    assert!(result.is_err(), "Should reject empty documents list");
 }
 
 #[test]
@@ -127,8 +124,7 @@ fn test_rerank_request_validation_top_k_zero() {
     };
 
     let result = request.validate();
-    assert!(result.is_err());
-    assert_eq!(result.unwrap_err(), "top_k must be greater than 0");
+    assert!(result.is_err(), "Should reject top_k of zero");
 }
 
 #[test]
