@@ -267,6 +267,16 @@ pub enum PolicyConfig {
         /// Interval for load monitoring (seconds)
         load_check_interval_secs: u64,
     },
+
+    #[serde(rename = "bucket")]
+    Bucket {
+        /// Absolute load difference threshold for load balancing
+        balance_abs_threshold: usize,
+        /// Relative load ratio threshold for load balancing
+        balance_rel_threshold: f32,
+        /// Interval between bucket boundary adjustment cycles (seconds)
+        bucket_adjust_interval_secs: usize,
+    },
 }
 
 impl PolicyConfig {
@@ -276,6 +286,7 @@ impl PolicyConfig {
             PolicyConfig::RoundRobin => "round_robin",
             PolicyConfig::CacheAware { .. } => "cache_aware",
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
+            PolicyConfig::Bucket { .. } => "bucket",
         }
     }
 }
@@ -748,6 +759,28 @@ mod tests {
                 assert_eq!(load_check_interval_secs, 120);
             }
             _ => panic!("Expected PowerOfTwo"),
+        }
+    }
+
+    #[test]
+    fn test_bucket_parameters() {
+        let bucket = PolicyConfig::Bucket {
+            balance_abs_threshold: 20,
+            balance_rel_threshold: 2.0,
+            bucket_adjust_interval_secs: 5,
+        };
+
+        match bucket {
+            PolicyConfig::Bucket {
+                balance_abs_threshold,
+                balance_rel_threshold,
+                bucket_adjust_interval_secs,
+            } => {
+                assert_eq!(balance_abs_threshold, 20);
+                assert!((balance_rel_threshold - 2.0).abs() < 0.0001);
+                assert_eq!(bucket_adjust_interval_secs, 5);
+            }
+            _ => panic!("Expected Bucket"),
         }
     }
 

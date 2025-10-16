@@ -13,6 +13,7 @@ mod power_of_two;
 mod random;
 mod registry;
 mod round_robin;
+mod bucket;
 
 pub use cache_aware::CacheAwarePolicy;
 pub use factory::PolicyFactory;
@@ -20,6 +21,7 @@ pub use power_of_two::PowerOfTwoPolicy;
 pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;
 pub use round_robin::RoundRobinPolicy;
+pub use bucket::BucketPolicy;
 
 /// Core trait for load balancing policies
 ///
@@ -104,6 +106,23 @@ impl Default for CacheAwareConfig {
             balance_rel_threshold: 1.1,
             eviction_interval_secs: 30,
             max_tree_size: 10000,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct BucketConfig {
+    pub balance_abs_threshold: usize,
+    pub balance_rel_threshold: f32,
+    pub bucket_adjust_interval_secs: usize,
+}
+
+impl Default for BucketConfig {
+    fn default() -> Self {
+        Self {
+            balance_abs_threshold: 32,
+            balance_rel_threshold: 1.0001,
+            bucket_adjust_interval_secs: 5
         }
     }
 }

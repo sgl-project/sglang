@@ -6,7 +6,7 @@
 /// When the last worker of a model is removed, the policy mapping is cleaned up.
 use super::{
     CacheAwareConfig, CacheAwarePolicy, LoadBalancingPolicy, PowerOfTwoPolicy, RandomPolicy,
-    RoundRobinPolicy,
+    RoundRobinPolicy, BucketConfig, BucketPolicy,
 };
 use crate::config::types::PolicyConfig;
 use crate::core::Worker;
@@ -173,6 +173,7 @@ impl PolicyRegistry {
             "random" => Arc::new(RandomPolicy::new()),
             "cache_aware" => Arc::new(CacheAwarePolicy::new()),
             "power_of_two" => Arc::new(PowerOfTwoPolicy::new()),
+            "bucket" => Arc::new(BucketPolicy::new()),
             _ => {
                 warn!("Unknown policy type '{}', using default", policy_type);
                 Arc::clone(&self.default_policy)
@@ -202,6 +203,18 @@ impl PolicyRegistry {
                 Arc::new(CacheAwarePolicy::with_config(cache_config))
             }
             PolicyConfig::PowerOfTwo { .. } => Arc::new(PowerOfTwoPolicy::new()),
+            PolicyConfig::Bucket {
+                balance_abs_threshold,
+                balance_rel_threshold,
+                bucket_adjust_interval_secs,
+            } => {
+                let config = BucketConfig {
+                    balance_abs_threshold: *balance_abs_threshold,
+                    balance_rel_threshold: *balance_rel_threshold,
+                    bucket_adjust_interval_secs: *bucket_adjust_interval_secs,
+                };
+                Arc::new(BucketPolicy::with_config(config))
+            },
         }
     }
 
@@ -351,6 +364,21 @@ impl PolicyRegistry {
                             prefill_workers.len()
                         );
                         cache_aware.init_workers(prefill_workers);
+                    }
+                }
+            }
+        }
+        if let Some(prefill_policy) = self.prefill_policy.read().unwrap().as_ref() {
+            if prefill_policy.name() == "bucket" {
+                if let Some(bucket) =
+                    prefill_policy.as_any().downcast_ref::<BucketPolicy>()
+                {
+                    if !prefill_workers.is_empty() {
+                        debug!(
+                            "Initializing prefill bucket policy with {} workers",
+                            prefill_workers.len()
+                        );
+                        bucket.init_prefill_worker_urls(prefill_workers);
                     }
                 }
             }

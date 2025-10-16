@@ -976,6 +976,8 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         .worker_job_queue
         .set(worker_job_queue)
         .expect("JobQueue should only be initialized once");
+    
+    let router_manager = RouterManager::from_config(&config, &app_context).await?;
 
     info!(
         "Initializing workers for routing mode: {:?}",
@@ -995,7 +997,6 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         worker_stats.total_workers, worker_stats.healthy_workers
     );
 
-    let router_manager = RouterManager::from_config(&config, &app_context).await?;
     let router: Arc<dyn RouterTrait> = router_manager.clone();
 
     let _health_checker = app_context
