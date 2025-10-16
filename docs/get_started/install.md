@@ -12,7 +12,7 @@ It is recommended to use uv for faster installation:
 ```bash
 pip install --upgrade pip
 pip install uv
-uv pip install "sglang[all]>=0.5.3.post1"
+uv pip install sglang --upgrade
 ```
 
 **Quick fixes to common problems**
@@ -24,12 +24,12 @@ uv pip install "sglang[all]>=0.5.3.post1"
 
 ```bash
 # Use the last release branch
-git clone -b v0.5.3.post1 https://github.com/sgl-project/sglang.git
+git clone -b v0.5.3.post2 https://github.com/sgl-project/sglang.git
 cd sglang
 
 # Install the python packages
 pip install --upgrade pip
-pip install -e "python[all]"
+pip install -e "python"
 ```
 
 **Quick fixes to common problems**
@@ -50,6 +50,8 @@ docker run --gpus all \
     lmsysorg/sglang:latest \
     python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --host 0.0.0.0 --port 30000
 ```
+
+You can also find the nightly docker images [here](https://hub.docker.com/r/lmsysorg/sglang/tags?name=nightly).
 
 ## Method 4: Using Kubernetes
 

@@ -20,6 +20,8 @@ suites = {
         TestFile("hicache/test_hicache_mla.py", 127),
         TestFile("hicache/test_hicache_storage.py", 127),
         TestFile("lora/test_lora.py", 200),
+        TestFile("lora/test_lora_eviction.py", 200),
+        TestFile("lora/test_lora_eviction_policy.py", 200),
         TestFile("lora/test_lora_backend.py", 99),
         TestFile("lora/test_lora_eviction.py", 200),
         TestFile("lora/test_lora_qwen3.py", 97),
@@ -67,6 +69,7 @@ suites = {
         TestFile("test_chunked_prefill.py", 313),
         TestFile("test_create_kvindices.py", 2),
         TestFile("test_deterministic.py", 300),
+        TestFile("test_build_eagle_tree.py", 8),
         TestFile("test_eagle_infer_a.py", 370),
         TestFile("test_eagle_infer_b.py", 700),
         TestFile("test_eagle_infer_beta.py", 300),
@@ -160,6 +163,7 @@ suites = {
         TestFile("test_deepseek_v3_basic.py", 275),
         TestFile("test_deepseek_v3_mtp.py", 275),
         TestFile("test_disaggregation_different_tp.py", 600),
+        TestFile("test_disaggregation_hybrid_attention.py", 200),
         TestFile("test_disaggregation_pp.py", 140),
     ],
     "per-commit-4-gpu-b200": [
@@ -168,6 +172,7 @@ suites = {
     ],
     "per-commit-4-gpu-deepep": [
         TestFile("ep/test_deepep_small.py", 531),
+        TestFile("ep/test_mooncake_ep_small.py", 450),
     ],
     "per-commit-8-gpu-deepep": [
         TestFile("ep/test_deepep_large.py", 338),
@@ -307,8 +312,17 @@ suite_xeon = {
         TestFile("cpu/test_rope.py"),
         TestFile("cpu/test_shared_expert.py"),
         TestFile("cpu/test_topk.py"),
-        TestFile("test_cpu_graph.py"),
-        TestFile("test_intel_amx_attention_backend.py"),
+        TestFile("cpu/test_cpu_graph.py"),
+        TestFile("cpu/test_intel_amx_attention_backend_a.py"),
+        TestFile("cpu/test_intel_amx_attention_backend_b.py"),
+        TestFile("cpu/test_intel_amx_attention_backend_c.py"),
+    ],
+}
+
+# Add Intel XPU tests
+suite_xpu = {
+    "per-commit-xpu": [
+        TestFile("xpu/test_intel_xpu_backend.py"),
     ],
 }
 
@@ -337,6 +351,7 @@ suite_ascend = {
 suites.update(suite_amd)
 suites.update(suite_xeon)
 suites.update(suite_ascend)
+suites.update(suite_xpu)
 
 
 def auto_partition(files, rank, size):
