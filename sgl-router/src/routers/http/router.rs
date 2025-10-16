@@ -4,10 +4,13 @@ use crate::core::{
 };
 use crate::metrics::RouterMetrics;
 use crate::policies::PolicyRegistry;
-use crate::protocols::{
-    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, GenerationRequest,
-    RerankRequest, RerankResponse, RerankResult, ResponsesGetParams, ResponsesRequest,
-};
+use crate::protocols::chat::ChatCompletionRequest;
+use crate::protocols::common::GenerationRequest;
+use crate::protocols::completion::CompletionRequest;
+use crate::protocols::embedding::EmbeddingRequest;
+use crate::protocols::generate::GenerateRequest;
+use crate::protocols::rerank::{RerankRequest, RerankResponse, RerankResult};
+use crate::protocols::responses::{ResponsesGetParams, ResponsesRequest};
 use crate::routers::header_utils;
 use crate::routers::RouterTrait;
 use axum::body::to_bytes;

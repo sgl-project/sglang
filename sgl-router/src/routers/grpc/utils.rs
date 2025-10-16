@@ -4,10 +4,11 @@ use super::ProcessedMessages;
 use crate::core::Worker;
 use crate::grpc_client::sglang_scheduler::AbortOnDropStream;
 use crate::grpc_client::{proto, SglangSchedulerClient};
-use crate::protocols::{
-    ChatCompletionRequest, ChatLogProbs, ChatLogProbsContent, ChatMessage, FunctionCallResponse,
-    GenerateFinishReason, StringOrArray, Tool, ToolCall, ToolChoice, ToolChoiceValue, TopLogProb,
+use crate::protocols::chat::{ChatCompletionRequest, ChatMessage};
+use crate::protocols::common::{
+    ChatLogProbs, ChatLogProbsContent, FunctionCallResponse, StringOrArray, Tool, ToolCall, ToolChoice, ToolChoiceValue, TopLogProb,
 };
+use crate::protocols::generate::GenerateFinishReason;
 use crate::tokenizer::chat_template::{ChatTemplateContentFormat, ChatTemplateParams};
 use crate::tokenizer::traits::Tokenizer;
 use crate::tokenizer::HuggingFaceTokenizer;
@@ -952,7 +953,8 @@ pub fn parse_finish_reason(reason_str: &str, completion_tokens: i32) -> Generate
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocols::{ChatMessage, ContentPart, ImageUrl, UserMessageContent};
+    use crate::protocols::chat::{ChatMessage, UserMessageContent};
+    use crate::protocols::common::{ContentPart, ImageUrl};
     use crate::tokenizer::chat_template::ChatTemplateContentFormat;
     use serde_json::json;
 
