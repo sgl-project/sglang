@@ -1,46 +1,44 @@
 """
 Logprobs Accuracy Test for SGLang
 
-The test is designed to be run locally by users to
-verify logprobs accuracy before contributing changes on related code.
-We really appreciate your effort and contribution to SGLang!
+======================
+With deterministic/batch invariant kernels, we can make sure that with the same input for SGLang,
+we can get exactly the same results on its log probs.
+However, log probs are highly sensitive to GPU machines, kernels, torch version and a lot of other factors,
+so we cannot have a unified generated log probs baseline across different machines.
 
-### Contributing
-
-When submitting changes that affect logprobs computation:
+This test is designed to be run locally by contributors to
+verify logprobs accuracy before making changes on related code.
+When submitting changes that affect logprobs computation, please:
 1. Run this test locally to ensure accuracy
 2. Include test results in your PR description
 
+We really appreciate your effort and contribution to SGLang!
 
-## How to Run Locally
-### Usage
+======================
+What does this test do?
+This test will fetch 1000 requests from ShareGPT dataset, and generate log probs for each request and save it as a baseline.
+Then by running the test mode, it will test the accuracy of the log probs by comparing it with the baseline.
 
-This script supports two modes: **generation** and **testing**.
+This test makes sure that:
+- the boundary of log probs requests are correct;
+- the log probs are invariant between two test runs, also before and after the code changes;
 
-#### Step 1: Generate Baseline (Before Code Changes)
+======================
+Usage
+
+Step 1: Generate Baseline (Without applying Code Changes)
 ```bash
 python test/srt/test_logprobs.py gen
 ```
-This will download ShareGPT dataset and generate a local baseline using SGLang.
 
-#### Step 2: Test Against Baseline (After Code Changes, with your commit changes)
+Step 2: Test Against Baseline (After Code Changes, with your commit changes)
 ```bash
 python test/srt/test_logprobs.py test
 ```
 This will test your changes against the locally generated baseline from Step 1.
-
-### Interpreting Results
-
-The test will output:
-- `max Δ`: Maximum difference across all logprobs
-- `mean Δ`: Mean difference across all logprobs
-- Pass/fail status based on tolerance thresholds
-
-## Note
-
-This test is NOT run in CI due to hardware variability and the need for deterministic
-baselines. It's designed for local validation by developers and contributors.
-The test mode requires a locally generated baseline from gen mode.
+The test should pass if the max and mean differences are within the tolerance thresholds.
+======================
 """
 
 import argparse
