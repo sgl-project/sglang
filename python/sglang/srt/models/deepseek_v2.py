@@ -513,6 +513,7 @@ class DeepseekV2MoE(nn.Module):
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
+        self.moe_ep_size = get_moe_expert_parallel_world_size()
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
         self.num_fused_shared_experts = (
@@ -543,6 +544,13 @@ class DeepseekV2MoE(nn.Module):
             is_nextn=is_nextn,
         )
 
+        fused_shared_experts_scaling_factor = None
+        if self.moe_ep_size > 1 and self.num_fused_shared_experts > 0:
+            # if enable_ep_moe tp_szie == ep_size, every gpu get shared experts gemm output
+            # so we scale with 1 / self.moe_ep_size in ep mode which will make it equalation as in tp mode 
+            # with fused_shared_experts
+            fused_shared_experts_scaling_factor = 1.0 / float(self.moe_ep_size)
+
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.n_routed_experts
             + self.num_fused_shared_experts
@@ -568,6 +576,7 @@ class DeepseekV2MoE(nn.Module):
             quant_config=quant_config,
             routed_scaling_factor=self.routed_scaling_factor,
             apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
+            fused_shared_experts_scaling_factor=fused_shared_experts_scaling_factor,
             # Some Fp4 MoE backends require the output format to be bypassed but the MTP layers are unquantized
             # and requires the output format to be standard. We use quant_config to determine the output format.
             output_format=TopKOutputFormat.STANDARD if quant_config is None else None,
@@ -2831,15 +2840,36 @@ class DeepseekV2ForCausalLM(nn.Module):
         # Only Deepseek V3/R1 can use shared experts fusion optimization now.
         disable_reason = None
         if (
-            not _is_cuda
-            or torch.cuda.get_device_capability("cuda") < (8, 0)
-            or self.config.architectures[0] != architecture
+            self.config.architectures[0] != architecture
             or self.config.n_routed_experts != 256
             or self.config.n_shared_experts != 1
         ):
-            disable_reason = "Only Deepseek V3/R1 on NV-platform with capability >= 80 can use shared experts fusion optimization."
-        elif get_moe_expert_parallel_world_size() > 1:
-            disable_reason = "Deepseek V3/R1 can not use shared experts fusion optimization under expert parallelism."
+            disable_reason = "Config not support fused shared expert(s)."
+        elif (
+            disable_reason is None 
+            and (not _is_cuda or torch.cuda.get_device_capability("cuda") < (8, 0))
+            and (not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4))
+        ) :
+            disable_reason = (
+                "Only Deepseek V3/R1 on NV-platform with capability >= 80 "
+                "or AMD-platform with capability >= 94 can use shared experts fusion optimization."
+            )
+        
+        elif (
+            disable_reason is None
+            and get_moe_a2a_backend().is_deepep()
+        ):
+            disable_reason = "Deepseek V3/R1 can not use shared experts fusion optimization under deepep expert parallelism."
+        
+        # Deepseek V3/R1 default use fused shared expert in TP mode, but need to enable shared_expert_mode
+        # to used shared experts in EP moe mode
+        elif (
+            disable_reason is None
+            and get_moe_expert_parallel_world_size() > 1
+            and global_server_args_dict["shared_expert_mode"] != "fused" 
+        ):
+            disable_reason = "Deepseek V3/R1 not used fused shared experts in default ep moe mode unless shared_expert_mode=fused"
+
         elif self.quant_config.get_name() == "w4afp8":
             disable_reason = "Deepseek V3/R1 W4AFP8 model uses different quant method for routed experts and shared experts."
 

@@ -334,6 +334,7 @@ class ServerArgs:
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
     enable_flashinfer_allreduce_fusion: bool = False
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
+    shared_expert_mode: Literal["default", "fused"] = "default"
     ep_num_redundant_experts: int = 0
     ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
     init_expert_location: str = "trivial"
@@ -2248,6 +2249,13 @@ class ServerArgs:
             choices=["normal", "low_latency", "auto"],
             default="auto",
             help="Select the mode when enable DeepEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch.",
+        )
+        parser.add_argument(
+            "--shared-expert-mode",
+            type=str,
+            choices=["default", "fused"],
+            default="auto",
+            help="Select the mode when there is shared experts in MoE model, could be `default`, `fused`",
         )
         parser.add_argument(
             "--ep-num-redundant-experts",

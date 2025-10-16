@@ -99,6 +99,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "flashinfer_mla_disable_ragged",
     "pp_max_micro_batch_size",
     "disable_shared_experts_fusion",
+    "shared_expert_mode",
     "sampling_backend",
     "speculative_accept_threshold_single",
     "speculative_accept_threshold_acc",
