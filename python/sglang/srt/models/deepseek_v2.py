@@ -3394,6 +3394,13 @@ class DeepseekV2ForCausalLM(nn.Module):
             self.config.q_lora_rank is not None
         )
         cached_a_proj = {} if fuse_qkv_a_proj else None
+        # NSA Indexer wk and weights_proj can be fused in FP4 model because they are both in BF16
+        fuse_wk_and_weights_proj = (
+            is_deepseek_nsa(self.config)
+            and self.quant_config is not None
+            and self.quant_config.get_name() == "modelopt_fp4"
+        )
+        cached_wk_and_weights_proj = {} if fuse_wk_and_weights_proj else None
 
         if is_nextn:
             nextn_layer_prefix = f"model.layers.{nextn_layer_id}"
@@ -3565,6 +3572,53 @@ class DeepseekV2ForCausalLM(nn.Module):
                                 )
                                 cached_a_proj.pop(q_a_proj_name)
                                 cached_a_proj.pop(kv_a_proj_name)
+                        elif fuse_wk_and_weights_proj and (
+                            "wk" in name or "weights_proj" in name
+                        ):
+                            cached_wk_and_weights_proj[name] = loaded_weight
+                            wk_name = (
+                                name
+                                if "wk" in name
+                                else name.replace("weights_proj", "wk")
+                            )
+                            weights_proj_name = (
+                                name
+                                if "weights_proj" in name
+                                else name.replace("wk", "weights_proj")
+                            )
+
+                            # When both wk and weights_proj has been cached, load the fused weight to parameter
+                            if (
+                                wk_name in cached_wk_and_weights_proj
+                                and weights_proj_name in cached_wk_and_weights_proj
+                            ):
+                                wk_weight = cached_wk_and_weights_proj[wk_name]
+                                weights_proj_weight = cached_wk_and_weights_proj[
+                                    weights_proj_name
+                                ]
+                                # todo dequantize wk for fp8
+                                assert wk_weight.dtype == weights_proj_weight.dtype
+                                fused_weight = torch.cat(
+                                    [wk_weight, weights_proj_weight], dim=0
+                                )
+                                param_name = (
+                                    name.replace("wk", "fused_wk_and_weights_proj")
+                                    if "wk" in name
+                                    else name.replace(
+                                        "weights_proj",
+                                        "fused_wk_and_weights_proj",
+                                    )
+                                )
+                                param = params_dict[param_name]
+
+                                weight_loader = getattr(
+                                    param, "weight_loader", default_weight_loader
+                                )
+                                futures.append(
+                                    executor.submit(weight_loader, param, fused_weight)
+                                )
+                                cached_wk_and_weights_proj.pop(wk_name)
+                                cached_wk_and_weights_proj.pop(weights_proj_name)
                         else:
                             if (
                                 "k_scale" in name or "v_scale" in name
