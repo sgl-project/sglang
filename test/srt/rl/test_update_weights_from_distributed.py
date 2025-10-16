@@ -344,6 +344,20 @@ def init_process_sgl(
             )
     param_queue.put((f"sgl_dp_{rank}_base_params", base_params))
 
+    if backend == "Engine":
+        success, _ = engine.destroy_weights_update_group(
+            group_name="test_parameter_update_group",
+        )
+        assert success is True
+    else:
+        response = requests.post(
+            f"{url}/destroy_weights_update_group",
+            json={
+                "group_name": "test_parameter_update_group",
+            },
+        )
+        assert response.status_code == 200
+
     # Shutdown the engine or terminate the server process.
     if backend == "Engine":
         engine.shutdown()

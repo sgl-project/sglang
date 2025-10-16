@@ -46,7 +46,7 @@ include(FetchContent)
 FetchContent_Declare(
     repo-cutlass
     GIT_REPOSITORY https://github.com/NVIDIA/cutlass
-    GIT_TAG        a49a78ffefc86a87160dfe0ccc3a3a2d1622c918
+    GIT_TAG        57e3cfb47a2d9e0d46eb6335c3dc411498efa198
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-cutlass)
@@ -55,11 +55,12 @@ FetchContent_Populate(repo-cutlass)
 FetchContent_Declare(
     repo-deepgemm
     GIT_REPOSITORY https://github.com/sgl-project/DeepGEMM
-    GIT_TAG        sgl
+    GIT_TAG        4d23df0a07b057fbb4a44ff8666e528a600feb5e
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-deepgemm)
 
+# fmt
 FetchContent_Declare(
     repo-fmt
     GIT_REPOSITORY https://github.com/fmtlib/fmt
@@ -81,7 +82,7 @@ FetchContent_Populate(repo-triton)
 FetchContent_Declare(
     repo-flashinfer
     GIT_REPOSITORY https://github.com/flashinfer-ai/flashinfer.git
-    GIT_TAG        018b551825c8e5579206e6eb9d3229fa679202b3
+    GIT_TAG        bc29697ba20b7e6bdb728ded98f04788e16ee021
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-flashinfer)
@@ -90,10 +91,19 @@ FetchContent_Populate(repo-flashinfer)
 FetchContent_Declare(
     repo-flash-attention
     GIT_REPOSITORY https://github.com/sgl-project/sgl-attn
-    GIT_TAG        sgl-kernel
+    GIT_TAG        f9af0c2a1d82ab1812e6987e9338363cc2bf0f8d
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-flash-attention)
+
+# flash-attention origin
+FetchContent_Declare(
+    repo-flash-attention-origin
+    GIT_REPOSITORY https://github.com/Dao-AILab/flash-attention.git
+    GIT_TAG        203b9b3dba39d5d08dffb49c09aa622984dff07d
+    GIT_SHALLOW    OFF
+)
+FetchContent_Populate(repo-flash-attention-origin)
 
 # mscclpp
 FetchContent_Declare(
@@ -103,6 +113,15 @@ FetchContent_Declare(
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-mscclpp)
+
+# fast-hadamard-transform
+FetchContent_Declare(
+    repo-fast-hadamard-transform
+    GIT_REPOSITORY https://github.com/sgl-project/fast-hadamard-transform.git
+    GIT_TAG 48f3c13764dc2ec662ade842a4696a90a137f1bc
+    GIT_SHALLOW OFF
+)
+FetchContent_Populate(repo-fast-hadamard-transform)
 
 # ccache option
 option(ENABLE_CCACHE "Whether to use ccache" ON)
@@ -129,6 +148,7 @@ include_directories(
     ${repo-flashinfer_SOURCE_DIR}/include
     ${repo-flashinfer_SOURCE_DIR}/csrc
     ${repo-mscclpp_SOURCE_DIR}/include
+    ${repo-fast-hadamard-transform}/csrc
 )
 
 set(SGL_KERNEL_CUDA_FLAGS
@@ -148,7 +168,11 @@ set(SGL_KERNEL_CUDA_FLAGS
     "-DCUTLASS_DEBUG_TRACE_LEVEL=0"
     "--expt-relaxed-constexpr"
     "--expt-extended-lambda"
-    "--threads=32"
+
+    # The following flag leads to the CMAKE_BUILD_PARALLEL_LEVEL breaking,
+    # it triggers OOM with low memory host. Extract the threads number to
+    # option named SGL_KERNEL_COMPILE_THREADS, default value 32.
+    # "--threads=32"
 
     # Supress warnings
     "-Xcompiler=-Wno-clang-format-violations"
@@ -157,11 +181,26 @@ set(SGL_KERNEL_CUDA_FLAGS
     "-Xcompiler=-Wno-terminate"
     "-Xcompiler=-Wfatal-errors"
     "-Xcompiler=-ftemplate-backtrace-limit=1"
-    "-Xcudafe=--diag_suppress=177"  # variable was declared but never referenced
+    "-Xcudafe=--diag_suppress=177"   # variable was declared but never referenced
+    "-Xcudafe=--diag_suppress=2361"  # invalid narrowing conversion from "char" to "signed char"
 
     # uncomment to debug
     # "--ptxas-options=-v"
     # "--ptxas-options=--verbose,--register-usage-level=10,--warn-on-local-memory-usage"
+)
+
+set(SGL_KERNEL_COMPILE_THREADS 32 CACHE STRING "Set compilation threads, default 32")
+
+# When SGL_KERNEL_COMPILE_THREADS value is less than 1, set it to 1
+if (NOT SGL_KERNEL_COMPILE_THREADS MATCHES "^[0-9]+$")
+    message(FATAL_ERROR "SGL_KERNEL_COMPILE_THREADS must be an integer, but was set to '${SGL_KERNEL_COMPILE_THREADS}'.")
+elseif (SGL_KERNEL_COMPILE_THREADS LESS 1)
+    message(STATUS "SGL_KERNEL_COMPILE_THREADS was set to a value less than 1. Using 1 instead.")
+    set(SGL_KERNEL_COMPILE_THREADS 1)
+endif()
+
+list(APPEND SGL_KERNEL_CUDA_FLAGS
+    "--threads=${SGL_KERNEL_COMPILE_THREADS}"
 )
 
 option(SGL_KERNEL_ENABLE_BF16             "Enable BF16"             ON)
@@ -194,37 +233,26 @@ endif()
 
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
-        "-gencode=arch=compute_100,code=sm_100"
         "-gencode=arch=compute_100a,code=sm_100a"
-        "-gencode=arch=compute_120,code=sm_120"
         "-gencode=arch=compute_120a,code=sm_120a"
     )
 
     # refer sm_121, sm_110 and sm_101 description  https://github.com/pytorch/pytorch/pull/156176
     if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "13.0")
         list(APPEND SGL_KERNEL_CUDA_FLAGS
-            "-gencode=arch=compute_103,code=sm_103"
             "-gencode=arch=compute_103a,code=sm_103a"
-            "-gencode=arch=compute_110,code=sm_110"
             "-gencode=arch=compute_110a,code=sm_110a"
-            "-gencode=arch=compute_121,code=sm_121"
             "-gencode=arch=compute_121a,code=sm_121a"
             "--compress-mode=size"
         )
     else()
         list(APPEND SGL_KERNEL_CUDA_FLAGS
-            "-gencode=arch=compute_101,code=sm_101"
             "-gencode=arch=compute_101a,code=sm_101a"
         )
     endif()
-
-else()
-    list(APPEND SGL_KERNEL_CUDA_FLAGS
-        "-use_fast_math"
-    )
 endif()
 
-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4" OR SGL_KERNEL_ENABLE_SM90A)
+if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4")
     set(SGL_KERNEL_ENABLE_FA3 ON)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-gencode=arch=compute_90a,code=sm_90a"
@@ -247,9 +275,14 @@ set(SOURCES
     "csrc/attention/vertical_slash_index.cu"
     "csrc/elementwise/activation.cu"
     "csrc/elementwise/cast.cu"
+    "csrc/elementwise/copy.cu"
+    "csrc/elementwise/concat_mla.cu"
     "csrc/elementwise/fused_add_rms_norm_kernel.cu"
     "csrc/elementwise/rope.cu"
+    "csrc/elementwise/topk.cu"
     "csrc/common_extension.cc"
+
+    "csrc/quantization/gguf/gguf_kernel.cu"
 
     "csrc/gemm/awq_kernel.cu"
     "csrc/gemm/bmm_fp8.cu"
@@ -267,6 +300,7 @@ set(SOURCES
     "csrc/gemm/nvfp4_scaled_mm_kernels.cu"
     "csrc/gemm/per_tensor_quant_fp8.cu"
     "csrc/gemm/per_token_group_quant_8bit.cu"
+    "csrc/gemm/per_token_group_quant_8bit_v2.cu"
     "csrc/gemm/per_token_quant_fp8.cu"
     "csrc/gemm/qserve_w4a8_per_chn_gemm.cu"
     "csrc/gemm/qserve_w4a8_per_group_gemm.cu"
@@ -277,29 +311,37 @@ set(SOURCES
 
     "csrc/grammar/apply_token_bitmask_inplace_cuda.cu"
 
+    "csrc/mamba/causal_conv1d.cu"
+
     "csrc/moe/cutlass_moe/w4a8/scaled_mm_entry.cu"
     "csrc/moe/cutlass_moe/w4a8/w4a8_moe_data.cu"
     "csrc/moe/cutlass_moe/w4a8/w4a8_grouped_mm_c3x.cu"
     "csrc/moe/marlin_moe_wna16/ops.cu"
     "csrc/moe/moe_align_kernel.cu"
     "csrc/moe/moe_fused_gate.cu"
+    "csrc/moe/moe_sum.cu"
+    "csrc/moe/moe_sum_reduce.cu"
     "csrc/moe/moe_topk_softmax_kernels.cu"
     "csrc/moe/nvfp4_blockwise_moe.cu"
     "csrc/moe/fp8_blockwise_moe_kernel.cu"
     "csrc/moe/prepare_moe_input.cu"
-    "csrc/moe/ep_moe_reorder_kernel.cu"
-    "csrc/moe/ep_moe_silu_and_mul_kernel.cu"
 
     "csrc/memory/store.cu"
     "csrc/kvcacheio/transfer.cu"
 
     "csrc/speculative/eagle_utils.cu"
+    "csrc/speculative/ngram_utils.cu"
     "csrc/speculative/packbit.cu"
     "csrc/speculative/speculative_sampling.cu"
+
+    "csrc/expert_specialization/es_fp8_blockwise.cu"
 
     "${repo-flashinfer_SOURCE_DIR}/csrc/norm.cu"
     "${repo-flashinfer_SOURCE_DIR}/csrc/renorm.cu"
     "${repo-flashinfer_SOURCE_DIR}/csrc/sampling.cu"
+
+    "${repo-fast-hadamard-transform_SOURCE_DIR}/csrc/fast_hadamard_transform_cuda.cu"
+    "${repo-fast-hadamard-transform_SOURCE_DIR}/csrc/fast_hadamard_transform.cpp"
 
     "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_bf16_causal_sm80.cu"
     "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_bf16_sm80.cu"
@@ -308,13 +350,46 @@ set(SOURCES
     "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/flash_sparse_api.cpp"
 )
 
-Python_add_library(common_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
+# Build SM90 library with fast math optimization (same namespace, different directory)
+Python_add_library(common_ops_sm90_build MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
 
-target_compile_options(common_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>)
-target_include_directories(common_ops PRIVATE
+target_compile_definitions(common_ops_sm90_build PRIVATE
+    USE_FAST_MATH=1
+)
+target_compile_options(common_ops_sm90_build PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS} -use_fast_math>
+)
+target_include_directories(common_ops_sm90_build PRIVATE
+    ${PROJECT_SOURCE_DIR}/csrc
     ${repo-cutlass_SOURCE_DIR}/examples/77_blackwell_fmha
     ${repo-cutlass_SOURCE_DIR}/examples/common
     ${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src
+)
+# Set output name and separate build directory to avoid conflicts
+set_target_properties(common_ops_sm90_build PROPERTIES
+    OUTPUT_NAME "common_ops"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/sm90"
+)
+
+# Build SM100+ library with precise math (same namespace, different directory)
+Python_add_library(common_ops_sm100_build MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
+
+target_compile_definitions(common_ops_sm100_build PRIVATE
+    USE_FAST_MATH=0
+)
+target_compile_options(common_ops_sm100_build PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>
+)
+target_include_directories(common_ops_sm100_build PRIVATE
+    ${PROJECT_SOURCE_DIR}/csrc
+    ${repo-cutlass_SOURCE_DIR}/examples/77_blackwell_fmha
+    ${repo-cutlass_SOURCE_DIR}/examples/common
+    ${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src
+)
+# Set output name and separate build directory to avoid conflicts
+set_target_properties(common_ops_sm100_build PROPERTIES
+    OUTPUT_NAME "common_ops"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/sm100"
 )
 
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
@@ -341,16 +416,26 @@ add_subdirectory(
     ${repo-mscclpp_SOURCE_DIR}
     ${CMAKE_CURRENT_BINARY_DIR}/mscclpp-build
 )
-target_link_libraries(common_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
+target_link_libraries(common_ops_sm90_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
+target_link_libraries(common_ops_sm100_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
 
 # flash attention
-target_compile_definitions(common_ops PRIVATE
+target_compile_definitions(common_ops_sm90_build PRIVATE
+    FLASHATTENTION_DISABLE_BACKWARD
+    FLASHATTENTION_DISABLE_DROPOUT
+    FLASHATTENTION_DISABLE_UNEVEN_K
+)
+target_compile_definitions(common_ops_sm100_build PRIVATE
     FLASHATTENTION_DISABLE_BACKWARD
     FLASHATTENTION_DISABLE_DROPOUT
     FLASHATTENTION_DISABLE_UNEVEN_K
 )
 
-install(TARGETS common_ops LIBRARY DESTINATION sgl_kernel)
+# Install to different subdirectories
+# CMake will find the built libraries in their respective LIBRARY_OUTPUT_DIRECTORY locations
+# and install them to the specified destinations
+install(TARGETS common_ops_sm90_build LIBRARY DESTINATION sgl_kernel/sm90)
+install(TARGETS common_ops_sm100_build LIBRARY DESTINATION sgl_kernel/sm100)
 
 # ============================ Optional Install ============================= #
 # set flash-attention sources file
@@ -501,3 +586,13 @@ install(DIRECTORY "${repo-triton_SOURCE_DIR}/python/triton_kernels/triton_kernel
         DESTINATION "triton_kernels"
         PATTERN ".git*" EXCLUDE
         PATTERN "__pycache__" EXCLUDE)
+
+# flash attention 4
+# TODO: find a better install condition.
+if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
+    # flash_attn/cute
+    install(DIRECTORY "${repo-flash-attention-origin_SOURCE_DIR}/flash_attn/cute/"
+            DESTINATION "flash_attn/cute"
+            PATTERN ".git*" EXCLUDE
+            PATTERN "__pycache__" EXCLUDE)
+    endif()

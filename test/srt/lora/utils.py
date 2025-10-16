@@ -13,7 +13,8 @@
 # ==============================================================================
 
 import dataclasses
-from typing import List
+import random
+from typing import List, Optional
 
 import torch
 
@@ -49,7 +50,7 @@ class LoRAModelCase:
 
 
 TORCH_DTYPES = [torch.float16]
-BACKENDS = ["triton"]
+BACKENDS = ["triton", "csgmv"]
 DEFAULT_PROMPTS = [
     "AI is a field of computer science focused on",
     """
@@ -134,7 +135,7 @@ def run_lora_test_one_by_one(
     model_case: LoRAModelCase,
     torch_dtype: torch.dtype,
     max_new_tokens: int,
-    backend: str,
+    backend: str = "csgmv",
     disable_cuda_graph: bool = False,
     disable_radix_cache: bool = False,
     mem_fraction_static: float = 0.88,
@@ -386,3 +387,11 @@ def run_lora_test_by_batch(
             srt_no_lora_outputs.output_strs[i].strip(" "),
             hf_no_lora_outputs.output_strs[i].strip(" "),
         )
+
+
+def ensure_reproducibility():
+    seed = 42
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.use_deterministic_algorithms(True)

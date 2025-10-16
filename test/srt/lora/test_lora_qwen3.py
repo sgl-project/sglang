@@ -18,7 +18,7 @@ import random
 import unittest
 from typing import List
 
-from utils import TORCH_DTYPES, LoRAAdaptor, LoRAModelCase
+from utils import TORCH_DTYPES, LoRAAdaptor, LoRAModelCase, ensure_reproducibility
 
 from sglang.test.runners import HFRunner, SRTRunner
 from sglang.test.test_utils import CustomTestCase, calculate_rouge_l, is_in_ci
@@ -59,20 +59,18 @@ TEST_MULTIPLE_BATCH_PROMPTS = [
     The Transformers are large language models,
     They're used to make predictions on text.
     """,
-    # "AI is a field of computer science focused on", TODO: Add it back after fixing its bug
+    "AI is a field of computer science focused on",
     "Computer science is the study of",
     "Write a short story.",
     "What are the main components of a computer?",
 ]
 
 
-class TestLoRA(CustomTestCase):
-
+class TestLoRAQwen3(CustomTestCase):
     def _run_lora_multiple_batch_on_model_cases(self, model_cases: List[LoRAModelCase]):
         for model_case in model_cases:
             for torch_dtype in TORCH_DTYPES:
-                max_new_tokens = 10
-                backend = "triton"
+                max_new_tokens = 32
                 base_path = model_case.base
                 lora_adapter_paths = [a.name for a in model_case.adaptors]
                 assert len(lora_adapter_paths) >= 2
@@ -129,18 +127,22 @@ class TestLoRA(CustomTestCase):
                 ]
 
                 print(
-                    f"\n========== Testing multiple batches on base '{base_path}' with backend={backend}, dtype={torch_dtype} ---"
+                    f"\n========== Testing multiple batches on base '{base_path}', dtype={torch_dtype} ---"
                 )
 
                 # Initialize runners
+                ensure_reproducibility()
                 srt_runner = SRTRunner(
                     base_path,
                     torch_dtype=torch_dtype,
                     model_type="generation",
                     lora_paths=[lora_adapter_paths[0], lora_adapter_paths[1]],
                     max_loras_per_batch=len(lora_adapter_paths) + 1,
-                    lora_backend=backend,
+                    sleep_on_idle=True,  # Eliminate non-determinism by forcing all requests to be processed in one batch.
+                    attention_backend="torch_native",
                 )
+
+                ensure_reproducibility()
                 hf_runner = HFRunner(
                     base_path,
                     torch_dtype=torch_dtype,
@@ -179,7 +181,7 @@ class TestLoRA(CustomTestCase):
                             if rouge_score < rouge_tol:
                                 raise AssertionError(
                                     f"ROUGE-L score {rouge_score} below tolerance {rouge_tol} "
-                                    f"for base '{base_path}', adaptor '{lora_paths}', backend '{backend}', prompt: '{prompts}...'"
+                                    f"for base '{base_path}', adaptor '{lora_paths}', prompt: '{prompts}...'"
                                 )
 
                         print(f"--- Batch {i+1} Comparison Passed --- ")

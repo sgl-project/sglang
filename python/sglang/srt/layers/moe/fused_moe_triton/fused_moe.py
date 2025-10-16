@@ -1,3 +1,4 @@
+# NOTE: this file will be separated into sglang/srt/layers/moe/moe_runner/triton_utils.py
 # Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/model_executor/layers/fused_moe/fused_moe.py
 
 """Fused MoE kernel."""
@@ -7,7 +8,7 @@ from __future__ import annotations
 import functools
 import os
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 import triton
@@ -16,7 +17,6 @@ from sgl_kernel import machete_mm
 from sgl_kernel.scalar_type import ScalarType, scalar_types
 
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
-from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.utils import (
     cpu_has_amx_support,
     direct_register_custom_op,
@@ -29,6 +29,9 @@ from sglang.srt.utils import (
 from .fused_moe_triton_config import get_config_dtype_str, try_get_optimal_moe_config
 from .fused_moe_triton_kernels import invoke_fused_moe_kernel, moe_sum_reduce_triton
 from .moe_align_block_size import moe_align_block_size
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.moe.topk import StandardTopKOutput
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
