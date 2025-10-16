@@ -345,24 +345,24 @@ impl WorkerSelectionStage {
             false,
         );
 
-        let available_prefill: Vec<_> = all_workers
-            .iter()
-            .filter(|w| {
-                matches!(w.metadata().worker_type, WorkerType::Prefill { .. }) && w.is_available()
-            })
-            .cloned()
-            .collect();
+        let (available_prefill, available_decode): (Vec<_>, Vec<_>) =
+            all_workers
+                .into_iter()
+                .fold((Vec::new(), Vec::new()), |mut acc, w| {
+                    if w.is_available() {
+                        match w.metadata().worker_type {
+                            WorkerType::Prefill { .. } => acc.0.push(w),
+                            WorkerType::Decode => acc.1.push(w),
+                            _ => {}
+                        }
+                    }
+                    acc
+                });
 
         if available_prefill.is_empty() {
             warn!("No available prefill workers");
             return None;
         }
-
-        let available_decode: Vec<_> = all_workers
-            .iter()
-            .filter(|w| matches!(w.metadata().worker_type, WorkerType::Decode) && w.is_available())
-            .cloned()
-            .collect();
 
         if available_decode.is_empty() {
             warn!("No available decode workers");
