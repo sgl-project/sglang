@@ -113,7 +113,7 @@ class OpenAIServingClassify(OpenAIServingBase):
         try:
             hf_config = self.tokenizer_manager.model_config.hf_config
             # Check for id2label in hf_config
-            if hf_config.label2id:
+            if hf_config.id2label:
                 return hf_config.id2label
             # Check for num_labels and create default mapping if needed
             if hasattr(hf_config, "num_labels") and hf_config.num_labels:
