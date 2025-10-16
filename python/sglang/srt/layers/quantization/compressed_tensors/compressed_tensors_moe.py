@@ -115,7 +115,11 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
         # TODO: @dsikka: refactor this to use schemes as other kernels
         # are supported + check if the layer is being ignored.
         match = re.search(r"(\d+)\.mlp", prefix)
-        assert match
+        if not match:
+            raise ValueError(
+                f"Unable to extract layer number from prefix '{prefix}'. "
+                f"Expected format: '<layer_number>.mlp'"
+            )
         layer_number = int(match.group(1))
 
         if os.environ.get("MOE_AMX_WEIGHT_PATH") is not None:
@@ -744,7 +748,6 @@ class CompressedTensorsWNA16AMXMoEMethod(CompressedTensorsMoEMethod):
         subpool_count,
         amx_weight_path,
         chunked_prefill_size,
-        cpu_save,
     ):
 
         if not KTRANSFORMERS_AVAILABLE:
@@ -757,7 +760,6 @@ class CompressedTensorsWNA16AMXMoEMethod(CompressedTensorsMoEMethod):
         self.num_gpu_experts = num_gpu_experts
         self.amx_weight_path = amx_weight_path
         self.chunked_prefill_size = chunked_prefill_size
-        self.cpu_save = cpu_save
         self.cpuinfer = cpuinfer
         self.subpool_count = subpool_count
         self.amx_wrapper = None
@@ -789,7 +791,6 @@ class CompressedTensorsWNA16AMXMoEMethod(CompressedTensorsMoEMethod):
             subpool_count=self.subpool_count,
             amx_weight_path=self.amx_weight_path,
             chunked_prefill_size=self.chunked_prefill_size,
-            cpu_save=self.cpu_save,
         )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -888,7 +889,6 @@ def override_config(
     chunked_prefill_size,
     enable_defer,
     cpu_embed,
-    cpu_save,
 ):
     """Override MOE configuration via environment variables."""
     # Mapping of config parameters to environment variable names
@@ -901,7 +901,6 @@ def override_config(
         "CPU_EMBED": cpu_embed,
         "MOE_CHUNKED_PREFILL_SIZE": chunked_prefill_size,
         "MOE_ENABLE_DEFER": enable_defer,
-        "MOE_CPU_SAVE": cpu_save,
     }
 
     # Set environment variables, converting values to strings
@@ -932,7 +931,6 @@ class CompressedTensorsWNA16AMXEPMoEMethod(CompressedTensorsMoEMethod):
         subpool_count = int(os.environ.get("SUBPOOL_COUNT"))
         amx_weight_path = os.environ.get("MOE_AMX_WEIGHT_PATH")
         chunked_prefill_size = int(os.environ.get("MOE_CHUNKED_PREFILL_SIZE"))
-        cpu_save = os.environ.get("MOE_CPU_SAVE", "False").lower() == "true"
         self.enable_defer = (
             os.environ.get("MOE_ENABLE_DEFER", "False").lower() == "true"
         )
@@ -944,7 +942,6 @@ class CompressedTensorsWNA16AMXEPMoEMethod(CompressedTensorsMoEMethod):
             subpool_count,
             amx_weight_path,
             chunked_prefill_size,
-            cpu_save,
         )
         self.marlin_method = CompressedTensorsWNA16MoEMethod(
             quant_config, self.num_gpu_experts

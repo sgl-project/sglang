@@ -198,7 +198,6 @@ class ServerArgs:
     cpu_embed: Optional[str] = None
     cpuinfer: Optional[int] = None
     subpool_count: Optional[int] = None
-    cpu_save: bool = False
     num_gpu_experts: Optional[int] = None
     enable_defer: bool = False
 
@@ -608,7 +607,6 @@ class ServerArgs:
             self.chunked_prefill_size,
             self.enable_defer,
             self.cpu_embed,
-            self.cpu_save,
         )
 
     def _handle_missing_default_values(self):
@@ -1445,8 +1443,7 @@ class ServerArgs:
         )
         parser.add_argument(
             "--cpu-embed",
-            type=str,
-            default=False,
+            action="store_true",
             help="Enable moving embed_token to cpu",
         )
         parser.add_argument(
@@ -1459,12 +1456,6 @@ class ServerArgs:
             type=int,
             default=2,
             help="The number of NUMA nodes.",
-        )
-        parser.add_argument(
-            "--cpu-save",
-            type=bool,
-            default=False,
-            help="Enable saving expert weights on cpu",
         )
         parser.add_argument(
             "--num-gpu-experts",

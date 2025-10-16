@@ -146,10 +146,7 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         if isinstance(layer, FusedMoE):
             # Ktransformers use CompressedTensorsWNA16AMXMOEMethod if AMX weights are provided
-            if "MOE_AMX_WEIGHT_PATH" in os.environ and "decoder" in prefix:
-                return Fp8MoEMethod(CompressedTensorsConfig.FP8Config)
-            else:
-                return CompressedTensorsMoEMethod.get_moe_method(self, layer, prefix)
+            return CompressedTensorsMoEMethod.get_moe_method(self, layer, prefix)
         return None
 
     @classmethod
