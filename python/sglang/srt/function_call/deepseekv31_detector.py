@@ -122,7 +122,7 @@ class DeepSeekV31Detector(BaseFormatDetector):
             if partial_match:
                 func_name = partial_match.group(1).strip()
                 func_args_raw = partial_match.group(2).strip()
-                tool_end_match = partial_match.group(3)
+                is_tool_end = partial_match.group(3)
 
                 # Initialize state if this is the first tool call
                 if self.current_tool_id == -1:
@@ -181,7 +181,7 @@ class DeepSeekV31Detector(BaseFormatDetector):
                             pass
 
                         # Find the end of the current tool call and remove only that part from buffer
-                        if tool_end_match:
+                        if is_tool_end:
                             # Remove the completed tool call from buffer, keep any remaining content
                             self._buffer = current_text[partial_match.end(3) :]
                         else:
