@@ -17,6 +17,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_npu,
+    is_xpu,
 )
 
 _is_cuda = is_cuda()
@@ -25,6 +26,7 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+_is_xpu = is_xpu()
 
 if _is_cuda:
     from sgl_kernel import FusedSetKVBufferArg, apply_rope_with_cos_sin_cache_inplace
@@ -109,8 +111,10 @@ class RotaryEmbedding(CustomOp):
             cache = cache.to(dtype)
 
         if (
-            not (_is_cuda or _is_npu) or self.head_size not in [64, 128, 256, 512]
-        ) and not (_is_cpu and _is_cpu_amx_available):
+            (not (_is_cuda or _is_npu) or self.head_size not in [64, 128, 256, 512])
+            and not (_is_cpu and _is_cpu_amx_available)
+            and not _is_xpu
+        ):
             from vllm._custom_ops import rotary_embedding
 
             self.vllm_rotary_embedding = rotary_embedding
@@ -283,6 +287,16 @@ class RotaryEmbedding(CustomOp):
         s += f", max_position_embeddings={self.max_position_embeddings}"
         s += f", base={self.base}, is_neox_style={self.is_neox_style}"
         return s
+
+    def forward_xpu(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        offsets: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # TODO: make a wrapper, and XPU will implement this kernel later.
+        return self.forward_native(positions, query, key, offsets)
 
 
 class LinearScalingRotaryEmbedding(RotaryEmbedding):
