@@ -371,7 +371,7 @@ class ServerArgs:
     # Mamba cache
     max_mamba_cache_size: Optional[int] = None
     mamba_ssm_dtype: str = "float32"
-    mamba_full_memory_ratio: float = 0.2
+    mamba_full_memory_ratio: float = 0.9
 
     # Hierarchical cache
     enable_hierarchical_cache: bool = False
