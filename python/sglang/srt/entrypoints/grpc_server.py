@@ -988,9 +988,9 @@ def _execute_grpc_server_warmup(
 
         if is_generation:
             # Create tokenized input for warmup
-            warmup_request = sglang_scheduler_pb2.GenerateRequest(
-                request_id=f"WARMUP_{time.time()}",
-                tokenized=sglang_scheduler_pb2.TokenizedInput(
+            warmup_request_kwargs = {
+                "request_id": f"WARMUP_{time.time()}",
+                "tokenized": sglang_scheduler_pb2.TokenizedInput(
                     input_ids=[
                         954,
                         15541,
@@ -1002,11 +1002,24 @@ def _execute_grpc_server_warmup(
                     ],  # Simple token sequence
                     original_text="The capital city of France is",
                 ),
-                sampling_params=sglang_scheduler_pb2.SamplingParams(
+                "sampling_params": sglang_scheduler_pb2.SamplingParams(
                     temperature=0.0,
                     max_new_tokens=max_new_tokens,
                 ),
-                stream=False,
+                "stream": False,
+            }
+
+            # Set disaggregation params if needed
+            if server_args.disaggregation_mode != DisaggregationMode.NULL:
+                warmup_request_kwargs["disaggregated_params"] = (
+                    sglang_scheduler_pb2.DisaggregatedParams(
+                        bootstrap_host=FAKE_BOOTSTRAP_HOST,
+                        bootstrap_room=0,
+                    )
+                )
+
+            warmup_request = sglang_scheduler_pb2.GenerateRequest(
+                **warmup_request_kwargs
             )
 
             # Send the warmup request

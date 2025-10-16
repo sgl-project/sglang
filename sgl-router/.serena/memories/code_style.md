@@ -1,5 +1,0 @@
-# Code Style & Conventions
-- **Rust**: Follow idiomatic Rust with `rustfmt` formatting and `clippy` linting (`cargo fmt`, `cargo clippy`). Extensive use of `anyhow` for error handling, `Arc` for shared state, and builder patterns for configuration (e.g., stop decoders). Structs often derive `Debug`, `Clone`, and domain-specific traits.
-- **Python**: Lightweight support code; adhere to standard PEP8 style (no project-specific formatter defined). Wheel builds preferred over editable installs.
-- **General Patterns**: Trait-based abstraction layers (e.g., tokenizers), builder APIs for complex configuration, `HashSet` / `HashMap` for lookup performance, incremental decoding utilities respecting UTF-8 boundaries. Comments favor concise explanations for non-obvious logic (e.g., streaming decoder offsets).
-- **Naming**: Snake_case for functions/modules, CamelCase for types. Tokenizer traits use descriptive names (`Encoder`, `Decoder`, `Tokenizer`).
