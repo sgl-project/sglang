@@ -1020,6 +1020,7 @@ class CompressedTensorsWNA16AMXEPMoEMethod(CompressedTensorsMoEMethod):
             num_bits=self.marlin_method.num_bits,
             is_k_full=self.marlin_method.is_k_full,
             global_num_experts=self.global_num_experts,
+            expert_map=torch.empty(1, device=x.device),
         )
         return StandardCombineInput(hidden_states=output)
 
@@ -1072,6 +1073,7 @@ class CompressedTensorsWNA16AMXEPMoEMethod(CompressedTensorsMoEMethod):
             num_bits=self.marlin_method.num_bits,
             is_k_full=self.marlin_method.is_k_full,
             global_num_experts=self.global_num_experts,
+            expert_map=torch.empty(1, device=x.device),
         )
 
         # Step 3: Sync AMX results and combine with GPU results
