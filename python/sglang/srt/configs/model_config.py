@@ -703,10 +703,20 @@ class ModelConfig:
         default_sampling_params: dict[str, Any] = {}
 
         base = GenerationConfig()
+
+        explicit_keys = getattr(self.hf_generation_config, "_explicit_keys", set())
+
         for param in available_params:
             value = getattr(self.hf_generation_config, param, None)
             if value is None:
                 continue
+
+            # respect explicit keys from the JSON
+            if param in explicit_keys:
+                default_sampling_params[param] = value
+                continue
+
+            # otherwise, only include if it differs from HF base defaults
             base_default = getattr(base, param, None)
             if base_default is None or value != base_default:
                 default_sampling_params[param] = value
