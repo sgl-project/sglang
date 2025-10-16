@@ -36,7 +36,6 @@ else:
     Image = Any
 
 
-# Parameters for a session
 @dataclass
 class BaseReq(ABC):
     rid: Optional[Union[str, List[str]]] = field(default=None, kw_only=True)
@@ -60,9 +59,11 @@ class BaseBatchReq(ABC):
         return self.rids
 
 
+# Parameters for a session
 @dataclass
 class SessionParams:
     id: Optional[str] = None
+    rid: Optional[str] = None
     offset: Optional[int] = None
     replace: Optional[bool] = None
     drop_previous_output: Optional[bool] = None
@@ -166,10 +167,11 @@ class GenerateReqInput(BaseReq):
     # For custom metric labels
     custom_labels: Optional[Dict[str, str]] = None
 
-    # (Deprecated, please use custom_labels) Label for the request
-    label: Optional[str] = None
     # (Internal) Whether to return bytes for image generation
     return_bytes: bool = False
+
+    # Whether to return entropy
+    return_entropy: bool = False
 
     def contains_mm_input(self) -> bool:
         return (
@@ -568,8 +570,8 @@ class GenerateReqInput(BaseReq):
             extra_key=self.extra_key,
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
-            label=self.label,
             return_bytes=self.return_bytes,
+            return_entropy=self.return_entropy,
         )
 
 
@@ -632,10 +634,11 @@ class TokenizedGenerateReqInput(BaseReq):
     # tracing context
     trace_context: Optional[Dict] = None
 
-    # (Deprecated, please use custom_labels) Label for the request
-    label: Optional[str] = None
     # (Internal) Whether to return bytes for image generation
     return_bytes: bool = False
+
+    # Whether to return entropy
+    return_entropy: bool = False
 
 
 @dataclass
@@ -820,6 +823,7 @@ class BatchTokenIDOutput(BaseBatchReq):
     completion_tokens: List[int]
     cached_tokens: List[int]
     spec_verify_ct: List[int]
+    spec_accepted_tokens: List[int]
 
     # Logprobs
     input_token_logprobs_val: List[float]
@@ -834,6 +838,7 @@ class BatchTokenIDOutput(BaseBatchReq):
     input_token_ids_logprobs_idx: List[List]
     output_token_ids_logprobs_val: List[List]
     output_token_ids_logprobs_idx: List[List]
+    output_token_entropy_val: List[float]
 
     # Hidden states
     output_hidden_states: List[List[float]]
@@ -843,6 +848,9 @@ class BatchTokenIDOutput(BaseBatchReq):
     # val is the length of padded tokens after expansion.
     placeholder_tokens_idx: List[Optional[List[int]]]
     placeholder_tokens_val: List[Optional[List[int]]]
+
+    # The trainer step id. Used to know which step's weights are used for sampling.
+    token_steps: List[List[int]] = None
 
 
 @dataclass
@@ -865,11 +873,14 @@ class BatchMultimodalDecodeReq(BaseBatchReq):
     completion_tokens: List[int]
     cached_tokens: List[int]
 
-    # Placeholder token info
+    # The information of placeholder tokens (e.g., image token)
+    # idx is the index of the token in the prompt after expansion.
+    # val is the length of padded tokens after expansion.
     placeholder_tokens_idx: List[Optional[List[int]]]
     placeholder_tokens_val: List[Optional[List[int]]]
 
-    return_bytes: bool = False
+    # The trainer step id. Used to know which step's weights are used for sampling.
+    token_steps: List[List[int]] = None
 
 
 @dataclass
@@ -886,6 +897,7 @@ class BatchStrOutput(BaseBatchReq):
     completion_tokens: List[int]
     cached_tokens: List[int]
     spec_verify_ct: List[int]
+    spec_accepted_tokens: List[int]
 
     # Logprobs
     input_token_logprobs_val: List[float]
@@ -900,12 +912,19 @@ class BatchStrOutput(BaseBatchReq):
     input_token_ids_logprobs_idx: List[List]
     output_token_ids_logprobs_val: List[List]
     output_token_ids_logprobs_idx: List[List]
+    output_token_entropy_val: List[float]
 
     # Hidden states
     output_hidden_states: List[List[float]]
 
+    # The information of placeholder tokens (e.g., image token)
+    # idx is the index of the token in the prompt after expansion.
+    # val is the length of padded tokens after expansion.
     placeholder_tokens_idx: List[Optional[List[int]]]
     placeholder_tokens_val: List[Optional[List[int]]]
+
+    # The trainer step id. Used to know which step's weights are used for sampling.
+    token_steps: List[List[int]] = None
 
 
 @dataclass
@@ -983,6 +1002,8 @@ class UpdateWeightFromDiskReqInput(BaseReq):
     torch_empty_cache: bool = False
     # Whether to keep the scheduler paused after weight update
     keep_pause: bool = False
+    # The trainer step id. Used to know which step's weights are used for sampling.
+    token_step: int = 0
 
 
 @dataclass
@@ -1211,6 +1232,8 @@ class ProfileReqInput(BaseReq):
     profile_by_stage: bool = False
     with_stack: Optional[bool] = None
     record_shapes: Optional[bool] = None
+    # Merge profiles from all ranks into a single trace
+    merge_profiles: bool = False
 
 
 class ProfileReqType(Enum):
@@ -1229,6 +1252,8 @@ class ProfileReq(BaseReq):
     with_stack: Optional[bool] = None
     record_shapes: Optional[bool] = None
     profile_id: Optional[str] = None
+    # Merge profiles from all ranks into a single trace
+    merge_profiles: bool = False
 
 
 @dataclass
@@ -1418,6 +1443,16 @@ class GetLoadReqOutput(BaseReq):
 @dataclass
 class WatchLoadUpdateReq(BaseReq):
     loads: List[GetLoadReqOutput]
+
+
+@dataclass
+class LazyDumpTensorsReqInput(BaseReq):
+    pass
+
+
+@dataclass
+class LazyDumpTensorsReqOutput(BaseReq):
+    success: bool
 
 
 def _check_all_req_types():
