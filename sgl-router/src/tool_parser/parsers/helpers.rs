@@ -1,4 +1,4 @@
-use crate::protocols::Tool;
+use crate::protocols::common::Tool;
 use serde_json::Value;
 use std::collections::HashMap;
 

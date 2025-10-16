@@ -11,15 +11,3 @@ pub mod responses;
 pub mod sampling_params;
 pub mod validated;
 pub mod worker_spec;
-
-// Re-export all public types for backward compatibility
-pub use chat::*;
-pub use common::*;
-pub use completion::*;
-pub use embedding::*;
-pub use generate::*;
-pub use rerank::*;
-pub use responses::*;
-pub use sampling_params::*;
-pub use validated::*;
-pub use worker_spec::*;

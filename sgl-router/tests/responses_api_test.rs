@@ -1,10 +1,12 @@
 // Integration test for Responses API
 
 use axum::http::StatusCode;
-use sglang_router_rs::protocols::{
-    GenerationRequest, ReasoningEffort, ResponseInput, ResponseReasoningParam, ResponseTool,
-    ResponseToolType, ResponsesRequest, ServiceTier, ToolChoice, ToolChoiceValue, Truncation,
-    UsageInfo,
+use sglang_router_rs::protocols::common::{
+    GenerationRequest, ToolChoice, ToolChoiceValue, UsageInfo,
+};
+use sglang_router_rs::protocols::responses::{
+    ReasoningEffort, ResponseInput, ResponseReasoningParam, ResponseTool, ResponseToolType,
+    ResponsesRequest, ServiceTier, Truncation,
 };
 
 mod common;
@@ -438,7 +440,7 @@ fn test_usage_conversion() {
         completion_tokens: 25,
         total_tokens: 40,
         reasoning_tokens: Some(8),
-        prompt_tokens_details: Some(sglang_router_rs::protocols::PromptTokenUsageInfo {
+        prompt_tokens_details: Some(sglang_router_rs::protocols::common::PromptTokenUsageInfo {
             cached_tokens: 3,
         }),
     };

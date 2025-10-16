@@ -9,18 +9,20 @@ use axum::{
     Json, Router,
 };
 use serde_json::json;
-use sglang_router_rs::data_connector::MemoryConversationItemStorage;
 use sglang_router_rs::{
     config::{
         ConfigError, ConfigValidator, HistoryBackend, OracleConfig, RouterConfig, RoutingMode,
     },
     data_connector::{
-        MemoryConversationStorage, MemoryResponseStorage, ResponseId, ResponseStorage,
-        StoredResponse,
+        MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
+        ResponseId, ResponseStorage, StoredResponse,
     },
     protocols::{
-        ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateRequest, ResponseInput,
-        ResponsesGetParams, ResponsesRequest, UserMessageContent,
+        chat::{ChatCompletionRequest, ChatMessage, UserMessageContent},
+        common::StringOrArray,
+        completion::CompletionRequest,
+        generate::GenerateRequest,
+        responses::{ResponseInput, ResponsesGetParams, ResponsesRequest},
     },
     routers::{openai::OpenAIRouter, RouterTrait},
 };
@@ -52,7 +54,7 @@ fn create_minimal_chat_request() -> ChatCompletionRequest {
 fn create_minimal_completion_request() -> CompletionRequest {
     CompletionRequest {
         model: "gpt-3.5-turbo".to_string(),
-        prompt: sglang_router_rs::protocols::StringOrArray::String("Hello".to_string()),
+        prompt: StringOrArray::String("Hello".to_string()),
         suffix: None,
         max_tokens: Some(100),
         temperature: None,
