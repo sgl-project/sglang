@@ -232,9 +232,7 @@ def _chunk_state_fwd_kernel(
             scale = tl.exp(dA_cs_last - dA_cs_k) * dt_k
         else:
             scale = tl.where(
-                (seq_idx_last >= 0) & (seq_idx_k == seq_idx_last),
-                tl.exp(dA_cs_last - dA_cs_k) * dt_k,
-                0.0,
+                seq_idx_k == seq_idx_last, tl.exp(dA_cs_last - dA_cs_k) * dt_k, 0.0
             )
         b *= scale[:, None]
         b = b.to(x_ptr.dtype.element_ty)
