@@ -1,9 +1,8 @@
 use serde_json::{from_str, to_string, Number, Value};
-use sglang_router_rs::protocols::{
-    GenerationRequest, RerankRequest, RerankResponse, RerankResult, StringOrArray, UsageInfo,
-    V1RerankReqInput,
-};
+use sglang_router_rs::protocols::common::{GenerationRequest, StringOrArray, UsageInfo};
+use sglang_router_rs::protocols::rerank::{RerankRequest, RerankResponse, RerankResult, V1RerankReqInput};
 use std::collections::HashMap;
+use validator::Validate;
 
 #[test]
 fn test_rerank_request_serialization() {
