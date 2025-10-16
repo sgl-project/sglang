@@ -141,6 +141,7 @@ suites = {
         TestFile("hicache/test_hicache_storage_mooncake_backend.py", 400),
         TestFile("layers/attention/mamba/test_mamba2_mixer.py", 110),
         TestFile("lora/test_lora_tp.py", 116),
+        TestFile("models/test_glm4_moe_models.py", 100),
         TestFile("rl/test_update_weights_from_distributed.py", 103),
         TestFile("test_data_parallelism.py", 73),
         TestFile("test_disaggregation_basic.py", 400),
@@ -161,9 +162,7 @@ suites = {
         TestFile("lora/test_lora_llama4.py", 400),
         TestFile("test_deepseek_v3_basic.py", 275),
         TestFile("test_deepseek_v3_mtp.py", 275),
-        TestFile("test_disaggregation_different_tp.py", 600),
         TestFile("test_disaggregation_hybrid_attention.py", 200),
-        TestFile("test_disaggregation_pp.py", 140),
     ],
     "per-commit-4-gpu-b200": [
         # TestFile("test_gpt_oss_4gpu.py", 600),
@@ -180,6 +179,8 @@ suites = {
         TestFile("test_deepseek_v32_basic.py", 275),
     ],
     "per-commit-8-gpu-h20": [
+        TestFile("test_disaggregation_different_tp.py", 600),
+        TestFile("test_disaggregation_pp.py", 140),
         TestFile("quant/test_w4a8_deepseek_v3.py", 371),
     ],
     "vllm_dependency_test": [
