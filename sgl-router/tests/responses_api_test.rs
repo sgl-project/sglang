@@ -2,9 +2,9 @@
 
 use axum::http::StatusCode;
 use sglang_router_rs::protocols::{
-    GenerationRequest, ReasoningEffort, ResponseInput, ResponseReasoningParam, ResponseStatus,
-    ResponseTool, ResponseToolType, ResponsesRequest, ResponsesResponse, ServiceTier, ToolChoice,
-    ToolChoiceValue, Truncation, UsageInfo,
+    GenerationRequest, ReasoningEffort, ResponseInput, ResponseReasoningParam, ResponseTool,
+    ResponseToolType, ResponsesRequest, ServiceTier, ToolChoice, ToolChoiceValue, Truncation,
+    UsageInfo,
 };
 
 mod common;
@@ -428,21 +428,6 @@ fn test_responses_request_sglang_extensions() {
     assert_eq!(parsed.top_k, 10);
     assert_eq!(parsed.min_p, 0.05);
     assert_eq!(parsed.repetition_penalty, 1.1);
-}
-
-#[test]
-fn test_responses_response_creation() {
-    let response = ResponsesResponse::new(
-        "resp_test789".to_string(),
-        "test-model".to_string(),
-        ResponseStatus::Completed,
-    );
-
-    assert_eq!(response.id, "resp_test789");
-    assert_eq!(response.model, "test-model");
-    assert!(response.is_complete());
-    assert!(!response.is_in_progress());
-    assert!(!response.is_failed());
 }
 
 #[test]

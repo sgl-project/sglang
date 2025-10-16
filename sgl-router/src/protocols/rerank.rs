@@ -9,6 +9,7 @@ fn default_rerank_object() -> String {
     "rerank".to_string()
 }
 
+/// TODO: Create timestamp should not be in protocol layer
 fn current_timestamp() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -174,6 +175,7 @@ impl RerankResponse {
     }
 
     /// Sort results by score in descending order
+    /// TODO: The logic should be moved to the python worker(serving_rerank.py), router just proxy it
     pub fn sort_by_score(&mut self) {
         self.results.sort_by(|a, b| {
             b.score

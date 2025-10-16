@@ -7,7 +7,8 @@ use std::collections::HashMap;
 
 // Import shared types from common module
 use super::common::{
-    ChatLogProbs, GenerationRequest, PromptTokenUsageInfo, StringOrArray, ToolChoice, UsageInfo,
+    default_true, ChatLogProbs, GenerationRequest, PromptTokenUsageInfo, StringOrArray, ToolChoice,
+    UsageInfo,
 };
 
 // ============================================================================
@@ -632,25 +633,9 @@ impl GenerationRequest for ResponsesRequest {
     }
 }
 
-fn generate_response_id() -> String {
-    format!("resp_{}", uuid::Uuid::new_v4().simple())
-}
-
-fn current_timestamp() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_else(|_| std::time::Duration::from_secs(0))
-        .as_secs() as i64
-}
-
-fn default_true() -> bool {
-    true
-}
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ResponsesResponse {
     /// Response ID
-    #[serde(default = "generate_response_id")]
     pub id: String,
 
     /// Object type
@@ -658,7 +643,6 @@ pub struct ResponsesResponse {
     pub object: String,
 
     /// Creation timestamp
-    #[serde(default = "current_timestamp")]
     pub created_at: i64,
 
     /// Response status
@@ -749,81 +733,6 @@ fn default_tool_choice() -> String {
 }
 
 impl ResponsesResponse {
-    /// Create a new response with default values
-    pub fn new(request_id: String, model: String, status: ResponseStatus) -> Self {
-        Self {
-            id: request_id,
-            object: "response".to_string(),
-            created_at: current_timestamp(),
-            status,
-            error: None,
-            incomplete_details: None,
-            instructions: None,
-            max_output_tokens: None,
-            model,
-            output: Vec::new(),
-            parallel_tool_calls: true,
-            previous_response_id: None,
-            reasoning: None,
-            store: true,
-            temperature: None,
-            text: None,
-            tool_choice: "auto".to_string(),
-            tools: Vec::new(),
-            top_p: None,
-            truncation: None,
-            usage: None,
-            user: None,
-            metadata: HashMap::new(),
-        }
-    }
-
-    /// Create a response from a request
-    pub fn from_request(
-        request: &ResponsesRequest,
-        model_name: String,
-        created_time: i64,
-        output: Vec<ResponseOutputItem>,
-        status: ResponseStatus,
-        usage: Option<UsageInfo>,
-    ) -> Self {
-        Self {
-            id: request
-                .request_id
-                .clone()
-                .expect("request_id should be set by middleware"),
-            object: "response".to_string(),
-            created_at: created_time,
-            status,
-            error: None,
-            incomplete_details: None,
-            instructions: request.instructions.clone(),
-            max_output_tokens: request.max_output_tokens,
-            model: model_name,
-            output,
-            parallel_tool_calls: request.parallel_tool_calls.unwrap_or(true),
-            previous_response_id: request.previous_response_id.clone(),
-            reasoning: request.reasoning.as_ref().map(|r| ReasoningInfo {
-                effort: r.effort.as_ref().map(|e| format!("{:?}", e)),
-                summary: None,
-            }),
-            store: request.store.unwrap_or(false),
-            temperature: request.temperature,
-            text: None,
-            tool_choice: request
-                .tool_choice
-                .as_ref()
-                .map(|tc| format!("{:?}", tc))
-                .unwrap_or_else(|| "auto".to_string()),
-            tools: request.tools.clone().unwrap_or_default(),
-            top_p: request.top_p,
-            truncation: request.truncation.as_ref().map(|t| format!("{:?}", t)),
-            usage: usage.map(ResponsesUsage::Classic),
-            user: request.user.clone(),
-            metadata: request.metadata.clone().unwrap_or_default(),
-        }
-    }
-
     /// Check if the response is complete
     pub fn is_complete(&self) -> bool {
         matches!(self.status, ResponseStatus::Completed)
