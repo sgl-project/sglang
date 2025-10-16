@@ -631,7 +631,7 @@ impl Router {
         let rerank_results = serde_json::from_slice::<Vec<RerankResult>>(&body_bytes)?;
         let mut rerank_response =
             RerankResponse::new(rerank_results, req.model.clone(), req.rid.clone());
-        rerank_response.sort_by_score();
+        // Sorting is handled by Python worker (serving_rerank.py)
         if let Some(top_k) = req.top_k {
             rerank_response.apply_top_k(top_k);
         }

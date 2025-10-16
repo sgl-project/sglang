@@ -174,16 +174,6 @@ impl RerankResponse {
         }
     }
 
-    /// Sort results by score in descending order
-    /// TODO: The logic should be moved to the python worker(serving_rerank.py), router just proxy it
-    pub fn sort_by_score(&mut self) {
-        self.results.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-    }
-
     /// Apply top_k limit to results
     pub fn apply_top_k(&mut self, k: usize) {
         self.results.truncate(k);
