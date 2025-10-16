@@ -88,14 +88,6 @@ def _apply_rotary_emb(
 
 
 # Adapted from https://github.com/linkedin/Liger-Kernel/blob/v0.6.2/src/liger_kernel/ops/qwen2vl_mrope.py
-
-_mrope_forward_autotune = triton.autotune(
-    configs=[triton.Config({}, num_warps=num_warps) for num_warps in (2, 4, 8)],
-    key=["n_qh", "n_kh", "hd"],
-)
-
-
-@_mrope_forward_autotune
 @triton.jit
 def _triton_qwen2vl_mrope_forward(
     q_ptr,
