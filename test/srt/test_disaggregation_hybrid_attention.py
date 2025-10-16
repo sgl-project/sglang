@@ -1,22 +1,21 @@
-import time
+import os
 import unittest
 from types import SimpleNamespace
 
-from sglang.test.few_shot_gsm8k import run_eval
+from sglang.srt.environ import envs
+from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_disaggregation_utils import TestDisaggregationBase
 from sglang.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     popen_launch_pd_server,
-    try_cached_model,
 )
 
 
-class TestDisaggregationPPAccuracy(TestDisaggregationBase):
+class TestDisaggregationHybridAttentionMamba(TestDisaggregationBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST)
+        cls.model = "Qwen/Qwen3-Next-80B-A3B-Instruct"
 
         # Non blocking start servers
         cls.start_prefill()
@@ -34,11 +33,8 @@ class TestDisaggregationPPAccuracy(TestDisaggregationBase):
             "--trust-remote-code",
             "--disaggregation-mode",
             "prefill",
-            "--tp-size",
-            "2",
-            "--pp-size",
-            "2",
-            "--disable-overlap-schedule",
+            "--tp",
+            "4",
         ]
         prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
@@ -55,7 +51,7 @@ class TestDisaggregationPPAccuracy(TestDisaggregationBase):
             "--disaggregation-mode",
             "decode",
             "--tp",
-            "2",
+            "4",
             "--base-gpu-id",
             "4",
         ]
@@ -77,12 +73,10 @@ class TestDisaggregationPPAccuracy(TestDisaggregationBase):
             host=f"http://{self.base_host}",
             port=int(self.lb_port),
         )
-        metrics = run_eval(args)
-        print(f"{metrics=}")
+        metrics = run_eval_few_shot_gsm8k(args)
+        print(f"Evaluation metrics: {metrics}")
 
-        self.assertGreater(metrics["accuracy"], 0.24)
-        # Wait a little bit so that the memory check happens.
-        time.sleep(5)
+        self.assertGreater(metrics["accuracy"], 0.93)
 
 
 if __name__ == "__main__":
