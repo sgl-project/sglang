@@ -163,6 +163,7 @@ suites = {
         TestFile("test_deepseek_v3_basic.py", 275),
         TestFile("test_deepseek_v3_mtp.py", 275),
         TestFile("test_disaggregation_different_tp.py", 600),
+        TestFile("test_disaggregation_hybrid_attention.py", 200),
         TestFile("test_disaggregation_pp.py", 140),
     ],
     "per-commit-4-gpu-b200": [
@@ -311,8 +312,17 @@ suite_xeon = {
         TestFile("cpu/test_rope.py"),
         TestFile("cpu/test_shared_expert.py"),
         TestFile("cpu/test_topk.py"),
-        TestFile("test_cpu_graph.py"),
-        TestFile("test_intel_amx_attention_backend.py"),
+        TestFile("cpu/test_cpu_graph.py"),
+        TestFile("cpu/test_intel_amx_attention_backend_a.py"),
+        TestFile("cpu/test_intel_amx_attention_backend_b.py"),
+        TestFile("cpu/test_intel_amx_attention_backend_c.py"),
+    ],
+}
+
+# Add Intel XPU tests
+suite_xpu = {
+    "per-commit-xpu": [
+        TestFile("xpu/test_intel_xpu_backend.py"),
     ],
 }
 
@@ -341,6 +351,7 @@ suite_ascend = {
 suites.update(suite_amd)
 suites.update(suite_xeon)
 suites.update(suite_ascend)
+suites.update(suite_xpu)
 
 
 def auto_partition(files, rank, size):
