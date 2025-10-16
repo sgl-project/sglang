@@ -54,6 +54,7 @@ jobs:
         run: |
           source "$HOME/.cargo/env"
           cd sgl-router/
+          rustup component add --toolchain nightly-x86_64-unknown-linux-gnu rustfmt
           rustup toolchain install nightly --profile minimal
           cargo +nightly fmt -- --check
 
