@@ -64,7 +64,7 @@ if is_cuda():
     from sgl_kernel import segment_packbits
 
 logger = logging.getLogger(__name__)
-RETURN_ORIGINAL_LOGPROB = get_bool_env_var("RETURN_ORIGINAL_LOGPROB")
+SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
 
 
 @contextmanager
@@ -741,7 +741,7 @@ class EAGLEWorker(TpModelWorker):
         # acceptance indices are the indices in a "flattened" batch.
         # dividing it to num_draft_tokens will yield the actual batch index.
         temperatures = temperatures[accepted_indices // num_draft_tokens]
-        if RETURN_ORIGINAL_LOGPROB:
+        if SGLANG_RETURN_ORIGINAL_LOGPROB:
             logprobs = torch.nn.functional.log_softmax(
                 logits_output.next_token_logits, dim=-1
             )
