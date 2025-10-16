@@ -11,7 +11,7 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
 from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
-from utils import is_hopper
+from sglang.test.test_utils import is_hopper
 
 # Force sgl_kernel.flash_attn wrappers to use FA4 (Cute-DSL) implementations.
 # The wrappers accept a superset of args; for FA4, extra args are ignored.
