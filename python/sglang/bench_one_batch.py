@@ -72,6 +72,8 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     configure_logger,
     get_bool_env_var,
+    is_cuda_alike,
+    is_xpu,
     kill_process_tree,
     require_mlp_sync,
     require_mlp_tp_gather,
@@ -79,6 +81,15 @@ from sglang.srt.utils import (
     suppress_other_loggers,
 )
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+
+profile_activities = [torch.profiler.ProfilerActivity.CPU] + [
+    profiler_activity
+    for available, profiler_activity in [
+        (is_cuda_alike(), torch.profiler.ProfilerActivity.CUDA),
+        (is_xpu(), torch.profiler.ProfilerActivity.XPU),
+    ]
+    if available
+]
 
 
 @dataclasses.dataclass
@@ -424,10 +435,7 @@ def latency_test_run_once(
     profiler = None
     if profile:
         profiler = torch.profiler.profile(
-            activities=[
-                torch.profiler.ProfilerActivity.CPU,
-                torch.profiler.ProfilerActivity.CUDA,
-            ],
+            activities=profile_activities,
             with_stack=True,
             record_shapes=profile_record_shapes,
         )
@@ -460,10 +468,7 @@ def latency_test_run_once(
         if profile and i == output_len / 2:
             profiler = None
             profiler = torch.profiler.profile(
-                activities=[
-                    torch.profiler.ProfilerActivity.CPU,
-                    torch.profiler.ProfilerActivity.CUDA,
-                ],
+                activities=profile_activities,
                 with_stack=True,
                 record_shapes=profile_record_shapes,
             )
