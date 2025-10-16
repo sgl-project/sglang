@@ -1293,6 +1293,20 @@ class ServerArgs:
                 raise ValueError(
                     "Currently ngram speculative decoding does not support dp attention."
                 )
+                
+            #If sepculative_num_steps >= speculative_num_draft_tokens, the additional tokens will definitely be discarded.
+            # assert self.speculative_num_steps < self.speculative_num_draft_tokens
+
+            # Set parameters for SIMPLE_EAGLE
+            if self.speculative_algorithm == "SIMPLE_EAGLE":
+                self.speculative_num_steps = 1
+                self.speculative_eagle_topk = 1
+                self.speculative_num_draft_tokens = 2
+                # self.attention_backend = "flashinfer"
+                logger.warning(
+                    "SIMPLE_EAGLE only supports using flashinfer attention backend currently. "
+                    "Attention backend is automatically set to flashinfer."
+                )
 
     def _handle_load_format(self):
         if (
