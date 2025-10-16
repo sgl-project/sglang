@@ -20,7 +20,7 @@ from enum import Enum, IntEnum, auto
 from typing import Any, Dict, List, Optional, Set, Union
 
 import torch
-from transformers import PretrainedConfig
+from transformers import GenerationConfig, PretrainedConfig
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
@@ -701,8 +701,6 @@ class ModelConfig:
             "min_p",
         ]
         default_sampling_params: dict[str, Any] = {}
-
-        from transformers import GenerationConfig
 
         base = GenerationConfig()
         for param in available_params:
