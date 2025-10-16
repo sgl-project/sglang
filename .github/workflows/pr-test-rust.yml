@@ -54,7 +54,8 @@ jobs:
         run: |
           source "$HOME/.cargo/env"
           cd sgl-router/
-          cargo fmt -- --check
+          rustup toolchain install nightly --profile minimal
+          cargo +nightly fmt -- --check
 
       - name: Run Rust tests
         timeout-minutes: 20
