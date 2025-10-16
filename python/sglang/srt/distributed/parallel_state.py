@@ -43,6 +43,7 @@ from sglang.srt.utils import (
     direct_register_custom_op,
     get_bool_env_var,
     get_int_env_var,
+    get_local_ip_auto,
     is_cpu,
     is_cuda_alike,
     is_hip,
@@ -258,11 +259,14 @@ class GroupCoordinator:
             device_group = torch.distributed.new_group(
                 ranks, backend=torch_distributed_backend
             )
-            # a group with `gloo` backend, to allow direct coordination between
-            # processes through the CPU.
-            cpu_group = torch.distributed.new_group(
-                ranks, backend="gloo", timeout=gloo_timeout
-            )
+            # a cpu_group to allow direct coordination between processes through
+            # the CPU. The backend is chosen based on `torch_distributed_backend`
+            if "mooncake" in torch_distributed_backend:
+                cpu_group = torch.distributed.new_group(ranks, backend="mooncake-cpu")
+            else:
+                cpu_group = torch.distributed.new_group(
+                    ranks, backend="gloo", timeout=gloo_timeout
+                )
             if self.rank in ranks:
                 self.ranks = ranks
                 self.world_size = len(ranks)
@@ -337,7 +341,6 @@ class GroupCoordinator:
             else:
                 ca_max_size = 8 * 1024 * 1024
             try:
-                # print(f"ca_max_size: {ca_max_size}")
                 self.ca_comm = CustomAllreduce(
                     group=self.cpu_group,
                     device=self.device,
@@ -615,8 +618,11 @@ class GroupCoordinator:
 
     def _all_reduce_in_place(self, input_: torch.Tensor) -> None:
         pynccl_comm = self.pynccl_comm
+        symm_mem_comm = self.symm_mem_comm
         if pynccl_comm is not None and not pynccl_comm.disabled:
             pynccl_comm.all_reduce(input_)
+        elif symm_mem_comm is not None and not symm_mem_comm.disabled:
+            symm_mem_comm.all_reduce(input_)
         else:
             torch.distributed.all_reduce(input_, group=self.device_group)
 
@@ -1408,6 +1414,17 @@ def init_distributed_environment(
         distributed_init_method,
         backend,
     )
+    if "mooncake" in backend:
+        try:
+            from mooncake import ep as mooncake_ep
+        except ImportError as e:
+            raise ImportError(
+                "Please install mooncake by following the instructions at "
+                "https://github.com/kvcache-ai/Mooncake/blob/main/doc/en/build.md "  # noqa: E501
+                "to run SGLang with Mooncake Backend."
+            ) from e
+        mooncake_ep.set_host_ip(get_local_ip_auto())
+
     if not torch.distributed.is_initialized():
         assert distributed_init_method is not None, (
             "distributed_init_method must be provided when initializing "

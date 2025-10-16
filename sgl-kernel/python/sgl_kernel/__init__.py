@@ -244,7 +244,7 @@ from sgl_kernel.elementwise import (
     rmsnorm,
     silu_and_mul,
 )
-from sgl_kernel.expert_specilization import es_fp8_blockwise_scaled_grouped_mm
+from sgl_kernel.expert_specialization import es_fp8_blockwise_scaled_grouped_mm
 from sgl_kernel.fused_moe import fused_marlin_moe
 from sgl_kernel.gemm import (
     awq_dequantize,
@@ -270,6 +270,13 @@ from sgl_kernel.gemm import (
     silu_and_mul_scaled_fp4_grouped_quant,
 )
 from sgl_kernel.grammar import apply_token_bitmask_inplace_cuda
+from sgl_kernel.hadamard import (
+    hadamard_transform,
+    hadamard_transform_12n,
+    hadamard_transform_20n,
+    hadamard_transform_28n,
+    hadamard_transform_40n,
+)
 from sgl_kernel.kvcacheio import (
     transfer_kv_all_layer,
     transfer_kv_all_layer_mla,
