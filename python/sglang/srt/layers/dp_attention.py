@@ -31,6 +31,7 @@ if TYPE_CHECKING:
 _ATTN_TP_GROUP: Optional[GroupCoordinator] = None
 _ATTN_TP_RANK: Optional[int] = None
 _ATTN_TP_SIZE: Optional[int] = None
+_ATTN_TP_ACTIVE_RANKS: Optional[torch.Tensor] = None
 _ATTN_DP_RANK: Optional[int] = None
 _ATTN_DP_SIZE: Optional[int] = None
 _LOCAL_ATTN_DP_SIZE: Optional[int] = None
@@ -252,6 +253,11 @@ def initialize_dp_attention(
         _ATTN_DP_SIZE = 1
         _LOCAL_ATTN_DP_SIZE = 1
 
+    global _ATTN_TP_ACTIVE_RANKS
+    _ATTN_TP_ACTIVE_RANKS = torch.ones(
+        (_ATTN_TP_SIZE,), dtype=torch.int32, device="cuda"
+    )
+
     tp_group = get_tp_group()
     _ATTN_TP_GROUP = GroupCoordinator(
         [
@@ -268,6 +274,7 @@ def initialize_dp_attention(
         use_xpu_communicator=False,
         use_npu_communicator=False,
         group_name="attention_tp",
+        active_ranks=_ATTN_TP_ACTIVE_RANKS,
     )
 
     _DpGatheredBufferWrapper.set_metadata(

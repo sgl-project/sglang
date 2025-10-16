@@ -242,6 +242,8 @@ class GroupCoordinator:
         group_name: Optional[str] = None,
         torch_compile: Optional[bool] = None,
         gloo_timeout: timedelta = timedelta(seconds=120 * 60),
+        active_ranks: Optional[torch.Tensor] = None,
+        active_ranks_cpu: Optional[torch.Tensor] = None,
     ):
         # Set group info
         group_name = group_name or "anonymous"
@@ -1279,6 +1281,8 @@ def init_model_parallel_group(
     use_mscclpp_allreduce: Optional[bool] = None,
     use_symm_mem_allreduce: Optional[bool] = None,
     torch_compile: Optional[bool] = None,
+    active_ranks: Optional[torch.Tensor] = None,
+    active_ranks_cpu: Optional[torch.Tensor] = None,
 ) -> GroupCoordinator:
     if use_custom_allreduce is None:
         use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
@@ -1290,7 +1294,7 @@ def init_model_parallel_group(
         group_ranks=group_ranks,
         local_rank=local_rank,
         torch_distributed_backend=backend,
-        use_pynccl=not _is_npu,
+        use_pynccl=not _is_npu and not "mooncake" in backend,
         use_pymscclpp=use_mscclpp_allreduce,
         use_custom_allreduce=use_custom_allreduce,
         use_torch_symm_mem=use_symm_mem_allreduce,
@@ -1300,10 +1304,23 @@ def init_model_parallel_group(
         use_message_queue_broadcaster=use_message_queue_broadcaster,
         group_name=group_name,
         torch_compile=torch_compile,
+        active_ranks=active_ranks,
+        active_ranks_cpu=active_ranks_cpu,
     )
 
 
 _TP: Optional[GroupCoordinator] = None
+_TP_ACTIVE_RANKS: Optional[torch.Tensor] = None
+_TP_ACTIVE_RANKS_CPU: Optional[torch.Tensor] = None
+
+
+def get_tp_active_ranks():
+    return _TP_ACTIVE_RANKS
+
+
+def get_tp_active_ranks_cpu():
+    return _TP_ACTIVE_RANKS_CPU
+
 
 # duplicate GroupCoordinator for prefill in PD-Multiplexing
 _PDMUX_PREFILL_TP_GROUP: Optional[GroupCoordinator] = None
@@ -1517,6 +1534,14 @@ def initialize_model_parallel(
         )
         group_ranks.append(ranks)
 
+    global _TP_ACTIVE_RANKS
+    _TP_ACTIVE_RANKS = torch.ones(
+        (tensor_model_parallel_size,), dtype=torch.int32, device="cuda"
+    )
+    global _TP_ACTIVE_RANKS_CPU
+    _TP_ACTIVE_RANKS_CPU = torch.ones(
+        (tensor_model_parallel_size,), dtype=torch.int32, device="cpu"
+    )
     # message queue broadcaster is only used in tensor model parallel group
     _TP = init_model_parallel_group(
         group_ranks,
@@ -1527,6 +1552,8 @@ def initialize_model_parallel(
         ),
         group_name="tp",
         torch_compile=torch_compile,
+        active_ranks=_TP_ACTIVE_RANKS,
+        active_ranks_cpu=_TP_ACTIVE_RANKS_CPU,
     )
 
     if duplicate_tp_group:
