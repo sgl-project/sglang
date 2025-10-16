@@ -22,18 +22,25 @@ import torch
 from torch import nn
 
 from sglang.srt.configs import NemotronHConfig
-from sglang.srt.configs.nemotron_h import ATTENTION, MAMBA, MLP
-from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from sglang.srt.configs.nemotron_h import ATTENTION, MAMBA, MOE, MLP
+from sglang.srt.distributed import (
+    get_moe_ep_group,
+    get_pp_group,
+    get_tensor_model_parallel_world_size,
+)
 from sglang.srt.layers.activation import ReLU2
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
     Mamba2AttnBackend,
 )
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,
+    ReplicatedLinear,
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -59,22 +66,13 @@ class NemotronHMLP(nn.Module):
     def __init__(
         self,
         config: NemotronHConfig,
-        layer_idx: int,
+        intermediate_size: int,
         quant_config: Optional[QuantizationConfig] = None,
         bias: bool = False,
+        reduce_results: bool = True,
         prefix: str = "",
     ) -> None:
         super().__init__()
-
-        hybrid_override_pattern = config.hybrid_override_pattern
-        mlp_index = hybrid_override_pattern[: layer_idx + 1].count("-") - 1
-        if isinstance(config.intermediate_size, list):
-            if len(config.intermediate_size) == 1:
-                intermediate_size = config.intermediate_size[0]
-            else:
-                intermediate_size = config.intermediate_size[mlp_index]
-        else:
-            intermediate_size = config.intermediate_size
 
         self.up_proj = ColumnParallelLinear(
             input_size=config.hidden_size,
@@ -88,6 +86,7 @@ class NemotronHMLP(nn.Module):
             output_size=config.hidden_size,
             bias=bias,
             quant_config=quant_config,
+            reduce_results=reduce_results,
             prefix=f"{prefix}.down_proj",
         )
         self.act_fn = ReLU2()
@@ -97,6 +96,73 @@ class NemotronHMLP(nn.Module):
         x = self.act_fn(x)
         x, _ = self.down_proj(x)
         return x
+
+
+class NemotronHMoE(nn.Module):
+    def __init__(
+        self,
+        config: NemotronHConfig,
+        layer_idx: int,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        print("Another MoE", layer_idx)
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.routed_scaling_factor = config.routed_scaling_factor
+
+        self.ep_group = get_moe_ep_group().device_group
+        self.ep_rank = self.ep_group.rank()
+        self.ep_size = self.ep_group.size()
+        self.n_routed_experts = config.n_routed_experts
+        self.n_shared_experts = config.n_shared_experts
+
+        self.gate = ReplicatedLinear(
+            config.hidden_size,
+            config.n_routed_experts,
+            bias=False,
+            params_dtype=torch.float32,
+            quant_config=None,
+            prefix=f"{prefix}.gate",
+        )
+        self.gate.e_score_correction_bias = nn.Parameter(
+            torch.empty(config.n_routed_experts, dtype=torch.float32)
+        )
+
+        self.topk = TopK(
+            top_k=config.num_experts_per_tok,
+            use_grouped_topk=True,
+            topk_group=config.topk_group,
+            num_expert_group=config.n_group,
+            renormalize=config.norm_topk_prob,
+            scoring_func="sigmoid",
+            correction_bias=self.gate.e_score_correction_bias,
+            routed_scaling_factor=self.routed_scaling_factor,
+            num_fused_shared_experts=config.n_shared_experts,
+        )
+        self.experts = FusedMoE(
+            num_experts=config.n_routed_experts,
+            top_k=config.num_experts_per_tok,
+            hidden_size=config.hidden_size,
+            intermediate_size=config.moe_intermediate_size,
+            reduce_results=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.experts",
+            activation=config.mlp_hidden_act,
+            layer_id=layer_idx,
+            is_gated=False,
+            num_fused_shared_experts=config.n_shared_experts,
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        num_tokens, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_dim)
+
+        # router_logits: (num_tokens, n_experts)
+        router_logits, _ = self.gate(hidden_states.to(dtype=torch.float32))
+        topk_output = self.topk(hidden_states, router_logits)
+        final_hidden_states = self.experts(hidden_states, topk_output)
+        return final_hidden_states.view(num_tokens, hidden_dim)
 
 
 class NemotronHMLPDecoderLayer(nn.Module):
@@ -110,15 +176,61 @@ class NemotronHMLPDecoderLayer(nn.Module):
         super().__init__()
         self.config = config
 
+        hybrid_override_pattern = config.hybrid_override_pattern
+        mlp_index = hybrid_override_pattern[: layer_idx + 1].count("-") - 1
+        if isinstance(config.intermediate_size, list):
+            if len(config.intermediate_size) == 1:
+                intermediate_size = config.intermediate_size[0]
+            else:
+                intermediate_size = config.intermediate_size[mlp_index]
+        else:
+            intermediate_size = config.intermediate_size
+
         self.mixer = NemotronHMLP(
             config,
+            intermediate_size=intermediate_size,
             quant_config=quant_config,
             bias=config.mlp_bias,
             prefix=f"{prefix}.mixer",
-            layer_idx=layer_idx,
         )
 
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+
+    def forward(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.norm(hidden_states)
+        else:
+            hidden_states, residual = self.norm(hidden_states, residual)
+
+        hidden_states = self.mixer.forward(hidden_states)
+        return hidden_states, residual
+
+
+class NemotronHMoEDecoderLayer(nn.Module):
+    def __init__(
+        self,
+        config: NemotronHConfig,
+        layer_idx: int,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+
+        self.mixer = NemotronHMoE(
+            config,
+            layer_idx=layer_idx,
+            quant_config=quant_config,
+            prefix=f"{prefix}.mixer",
+        )
+
+        self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
 
     def forward(
         self,
@@ -154,13 +266,13 @@ class NemotronHMambaDecoderLayer(nn.Module):
             use_conv_bias=config.use_conv_bias,
             use_bias=config.use_bias,
             n_groups=config.mamba_n_groups,
-            rms_norm_eps=config.rms_norm_eps,
+            rms_norm_eps=config.layer_norm_epsilon,
             activation=config.mamba_hidden_act,
             quant_config=quant_config,
             prefix=f"{prefix}.mixer",
         )
 
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
 
     def forward(
         self,
@@ -275,7 +387,7 @@ class NemotronHAttentionDecoderLayer(nn.Module):
             prefix=f"{prefix}.mixer",
         )
 
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
 
     def forward(
         self,
@@ -300,11 +412,13 @@ Layers = (
     NemotronHAttentionDecoderLayer
     | NemotronHMLPDecoderLayer
     | NemotronHMambaDecoderLayer
+    | NemotronHMoEDecoderLayer
 )
 ALL_DECODER_LAYER_TYPES: dict[str, type[Layers]] = {
     ATTENTION: NemotronHAttentionDecoderLayer,
     MLP: NemotronHMLPDecoderLayer,
     MAMBA: NemotronHMambaDecoderLayer,
+    MOE: NemotronHMoEDecoderLayer,
 }
 
 
@@ -341,7 +455,7 @@ class NemotronHModel(nn.Module):
         self.layers = make_layers_non_pp(
             len(config.hybrid_override_pattern), get_layer, prefix=f"{prefix}.layers"
         )
-        self.norm_f = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm_f = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)

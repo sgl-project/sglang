@@ -24,7 +24,6 @@ if TYPE_CHECKING:
 
 @dataclass
 class MoeRunnerConfig:
-
     # MoE parameters
     num_experts: Optional[int] = None
     num_local_experts: Optional[int] = None
@@ -37,6 +36,7 @@ class MoeRunnerConfig:
 
     # Runner configuration
     activation: str = "silu"
+    is_gated: bool = (True,)
     apply_router_weight_on_input: bool = False
     inplace: bool = True
     no_combine: bool = False
@@ -47,7 +47,6 @@ class MoeRunnerConfig:
 
 @dataclass
 class RunnerInput(ABC):
-
     @property
     @abstractmethod
     def runner_backend(self) -> MoeRunnerBackend: ...
@@ -57,7 +56,6 @@ class RunnerInput(ABC):
 
 
 class RunnerOutput(ABC):
-
     @property
     @abstractmethod
     def runner_backend(self) -> MoeRunnerBackend: ...
@@ -74,7 +72,6 @@ class MoeQuantInfo(ABC):
 
 
 class MoeRunnerCore(ABC):
-
     def __init__(self, config: MoeRunnerConfig):
         self.config = config
 
@@ -93,7 +90,6 @@ class MoeRunnerCore(ABC):
 
 
 class FusedOpPool:
-
     _fused_funcs: dict[str, Callable] = {}
 
     @classmethod
@@ -105,12 +101,12 @@ class FusedOpPool:
             raise ValueError(
                 f"Fused function for {a2a_backend_name} to {runner_backend_name} is already registered."
             )
-        assert MoeA2ABackend(
-            a2a_backend_name
-        ), f"Invalid dispatch name: {a2a_backend_name}"
-        assert MoeRunnerBackend(
-            runner_backend_name
-        ), f"Invalid runner name: {runner_backend_name}"
+        assert MoeA2ABackend(a2a_backend_name), (
+            f"Invalid dispatch name: {a2a_backend_name}"
+        )
+        assert MoeRunnerBackend(runner_backend_name), (
+            f"Invalid runner name: {runner_backend_name}"
+        )
         cls._fused_funcs[key] = fused_func
 
     @classmethod
@@ -121,7 +117,6 @@ class FusedOpPool:
 
 
 class PermuteMethodPool:
-
     _pre_permute_methods: dict[
         Tuple[DispatchOutputFormat, MoeRunnerBackend], Callable
     ] = {}
@@ -188,9 +183,9 @@ class PermuteMethodPool:
         """
         key = (dispatch_output_format, runner_input_format)
         pre_permute_func = cls._pre_permute_methods.get(key)
-        assert (
-            pre_permute_func is not None
-        ), f"Pre-permute function for {dispatch_output_format} to {runner_input_format} is not registered"
+        assert pre_permute_func is not None, (
+            f"Pre-permute function for {dispatch_output_format} to {runner_input_format} is not registered"
+        )
         return pre_permute_func
 
     @classmethod
@@ -208,9 +203,9 @@ class PermuteMethodPool:
         """
         key = (runner_output_format, combine_input_format)
         post_permute_func = cls._post_permute_methods.get(key)
-        assert (
-            post_permute_func is not None
-        ), f"Post-permute function for {runner_output_format} to {combine_input_format} is not registered"
+        assert post_permute_func is not None, (
+            f"Post-permute function for {runner_output_format} to {combine_input_format} is not registered"
+        )
         return post_permute_func
 
 
@@ -250,9 +245,8 @@ def register_pre_permute(
     def decorator(
         permute_func: Callable[
             [DispatchOutput, MoeQuantInfo, MoeRunnerConfig, dict], RunnerInput
-        ]
+        ],
     ) -> Callable:
-
         PermuteMethodPool.register_pre_permute(
             dispatch_output_name, runner_backend_name, permute_func
         )
@@ -276,7 +270,7 @@ def register_post_permute(
     def decorator(
         permute_func: Callable[
             [RunnerOutput, MoeQuantInfo, MoeRunnerConfig, dict], CombineInput
-        ]
+        ],
     ) -> Callable:
         PermuteMethodPool.register_post_permute(
             runner_backend_name, combine_input_name, permute_func
