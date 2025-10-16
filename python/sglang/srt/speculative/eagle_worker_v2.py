@@ -292,7 +292,6 @@ class EAGLEWorkerV2(EAGLEWorker):
         ) = verify_input.sample(batch, logits_output)
         new_seq_lens = batch.seq_lens + accept_length
         verify_done = torch.cuda.Event()
-
         verify_done.record()
 
         all_verified_id = predict[accept_index]
