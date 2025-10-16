@@ -247,6 +247,20 @@ pub enum ConnectionMode {
     },
 }
 
+impl ConnectionMode {
+    /// Check if this connection mode matches another, with special handling for gRPC
+    /// This allows matching any gRPC connection regardless of port when comparing
+    /// Grpc { port: None } as a wildcard
+    pub fn matches(&self, filter: &ConnectionMode) -> bool {
+        match (self, filter) {
+            (ConnectionMode::Http, ConnectionMode::Http) => true,
+            (ConnectionMode::Grpc { .. }, ConnectionMode::Grpc { port: None }) => true,
+            (ConnectionMode::Grpc { port: p1 }, ConnectionMode::Grpc { port: p2 }) => p1 == p2,
+            _ => false,
+        }
+    }
+}
+
 impl fmt::Display for ConnectionMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

@@ -6,7 +6,7 @@ use crate::data_connector::{
     NewConversationItem, ResponseId, ResponseStorage, SharedConversationItemStorage,
     SharedConversationStorage,
 };
-use crate::protocols::spec::{ResponseInput, ResponsesRequest};
+use crate::protocols::responses::{ResponseInput, ResponseInputOutputItem, ResponsesRequest};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -1028,7 +1028,7 @@ async fn persist_items_with_storages(
             ResponseInput::Items(items_array) => {
                 for input_item in items_array {
                     match input_item {
-                        crate::protocols::spec::ResponseInputOutputItem::Message {
+                        ResponseInputOutputItem::Message {
                             role,
                             content,
                             status,
