@@ -23,7 +23,6 @@
 # limitations under the License.
 """Inference-only Qwen2-VL model compatible with HuggingFace weights."""
 import logging
-import re
 from functools import lru_cache, partial
 from typing import Iterable, List, Optional, Tuple, Type, TypedDict
 
@@ -442,10 +441,6 @@ class Qwen2VLForConditionalGeneration(nn.Module):
         "up_proj": ("gate_up_proj", 1),
     }
 
-    lora_pattern = re.compile(
-        r"^model\.layers\.(\d+)\.(?:self_attn|mlp)\.(?:qkv_proj|o_proj|down_proj|gate_up_proj)"
-    )
-
     def __init__(
         self,
         config: Qwen2VLConfig,
@@ -519,7 +514,8 @@ class Qwen2VLForConditionalGeneration(nn.Module):
         return self.model.embed_tokens
 
     def should_apply_lora(self, module_name: str) -> bool:
-        return bool(self.lora_pattern.match(module_name))
+        # skip visual tower
+        return not module_name.startswith("visual")
 
     def forward(
         self,
