@@ -6,8 +6,12 @@ use crate::data_connector::{
     conversation_items::ListParams, conversation_items::SortOrder, ConversationId, ResponseId,
     SharedConversationItemStorage, SharedConversationStorage, SharedResponseStorage,
 };
-use crate::protocols::spec::{
-    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest,
+use crate::protocols::chat::ChatCompletionRequest;
+use crate::protocols::completion::CompletionRequest;
+use crate::protocols::embedding::EmbeddingRequest;
+use crate::protocols::generate::GenerateRequest;
+use crate::protocols::rerank::RerankRequest;
+use crate::protocols::responses::{
     ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponsesGetParams,
     ResponsesRequest,
 };

@@ -9,7 +9,9 @@
 //! - Metadata injection for MCP operations
 
 use crate::mcp::McpClientManager;
-use crate::protocols::spec::{ResponseInput, ResponseToolType, ResponsesRequest};
+use crate::protocols::responses::{
+    ResponseInput, ResponseTool, ResponseToolType, ResponsesRequest,
+};
 use crate::routers::header_utils::apply_request_headers;
 use axum::http::HeaderMap;
 use bytes::Bytes;
@@ -127,7 +129,7 @@ impl FunctionCallInProgress {
 
 /// Build a request-scoped MCP manager from request tools, if present.
 pub(super) async fn mcp_manager_from_request_tools(
-    tools: &[crate::protocols::spec::ResponseTool],
+    tools: &[ResponseTool],
 ) -> Option<Arc<McpClientManager>> {
     let tool = tools
         .iter()
