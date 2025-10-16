@@ -619,7 +619,6 @@ class Qwen3VLForConditionalGeneration(nn.Module):
     ) -> None:
         super().__init__()
 
-        self.config: Qwen3VLConfig = config
         self.visual = Qwen3VLMoeVisionModel(
             config.vision_config,
             # NOTE: Qwen3-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
@@ -629,24 +628,30 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             prefix=add_prefix("visual", prefix),
         )
 
+        # TODO: make it more elegant
+        if language_model_cls is Qwen3LLMModel:
+            self.config: Qwen3VLConfig = config  # for qwen3-vl
+        else:
+            self.config = config.text_config  # for qwen3-omni
+
         self.model = language_model_cls(
-            config=config.text_config,
+            config=self.config,
             quant_config=quant_config,
             prefix=add_prefix("model", prefix),
         )
 
-        if config.text_config.tie_word_embeddings:
+        if self.config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
         else:
             self.lm_head = ParallelLMHead(
-                config.text_config.vocab_size,
-                config.text_config.hidden_size,
+                self.config.vocab_size,
+                self.config.hidden_size,
                 quant_config=quant_config,
                 prefix=add_prefix("lm_head", prefix),
             )
-        self.is_mrope_enabled = "mrope_section" in self.config.text_config.rope_scaling
+        self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
 
-        self.logits_processor = LogitsProcessor(config.text_config)
+        self.logits_processor = LogitsProcessor(self.config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
         # like {8:0, 16:1, 24:2}, which stands for the captured deepstack features on
         # 8, 16, 24 layer will be merged to 0, 1, 2 layer of decoder output hidden_states
@@ -661,7 +666,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             embedding.shape[-1] % (1 + self.num_deepstack_embeddings) == 0
         ), f"hidden_state of {embedding.shape} should be divisible by ({1 + self.num_deepstack_embeddings})"
 
-        separate_index = self.config.text_config.hidden_size
+        separate_index = self.config.hidden_size
         input_embeds = embedding[:, :separate_index]
         input_deepstack_embeds = embedding[:, separate_index:]
         return input_embeds, input_deepstack_embeds
