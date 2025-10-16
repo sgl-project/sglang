@@ -20,6 +20,8 @@ suites = {
         TestFile("hicache/test_hicache_mla.py", 127),
         TestFile("hicache/test_hicache_storage.py", 127),
         TestFile("lora/test_lora.py", 200),
+        TestFile("lora/test_lora_eviction.py", 200),
+        TestFile("lora/test_lora_eviction_policy.py", 200),
         TestFile("lora/test_lora_backend.py", 99),
         TestFile("lora/test_lora_eviction.py", 200),
         TestFile("lora/test_lora_qwen3.py", 97),
@@ -29,7 +31,7 @@ suites = {
         TestFile("models/test_compressed_tensors_models.py", 42),
         TestFile("models/test_cross_encoder_models.py", 100),
         TestFile("models/test_embedding_models.py", 73),
-        TestFile("models/test_encoder_embedding_models.py", 100),
+        TestFile("models/test_encoder_embedding_models.py", 460),
         TestFile("models/test_generation_models.py", 103),
         TestFile("models/test_nvidia_nemotron_nano_v2.py", 180),
         TestFile("models/test_qwen_models.py", 82),
@@ -67,6 +69,7 @@ suites = {
         TestFile("test_chunked_prefill.py", 313),
         TestFile("test_create_kvindices.py", 2),
         TestFile("test_deterministic.py", 300),
+        TestFile("test_build_eagle_tree.py", 8),
         TestFile("test_eagle_infer_a.py", 370),
         TestFile("test_eagle_infer_b.py", 700),
         TestFile("test_eagle_infer_beta.py", 300),
@@ -84,6 +87,7 @@ suites = {
         TestFile("test_io_struct.py", 8),
         TestFile("test_jinja_template_utils.py", 1),
         TestFile("test_logprobs.py", 55),
+        TestFile("test_mamba_unittest.py", 4),
         TestFile("test_metrics.py", 32),
         TestFile("test_metrics_utils.py", 1),
         TestFile("test_mla.py", 167),
@@ -107,13 +111,15 @@ suites = {
         TestFile("test_regex_constrained.py", 64),
         TestFile("test_request_queue_validation.py", 30),
         TestFile("test_retract_decode.py", 54),
-        TestFile("test_score_api.py", 180),
+        TestFile("test_score_api.py", 310),
         TestFile("test_server_args.py", 1),
         TestFile("test_skip_tokenizer_init.py", 117),
         TestFile("test_srt_endpoint.py", 130),
         TestFile("test_srt_engine.py", 261),
         TestFile("test_standalone_speculative_decoding.py", 250),
         TestFile("test_start_profile.py", 60),
+        TestFile("test_profile_merger.py", 60),
+        TestFile("test_profile_merger_http_api.py", 15),
         TestFile("test_swa_unittest.py", 1),
         TestFile("test_torch_compile.py", 76),
         TestFile("test_torch_compile_moe.py", 172),
@@ -136,6 +142,7 @@ suites = {
         TestFile("hicache/test_hicache_storage_mooncake_backend.py", 400),
         TestFile("layers/attention/mamba/test_mamba2_mixer.py", 110),
         TestFile("lora/test_lora_tp.py", 116),
+        TestFile("models/test_glm4_moe_models.py", 100),
         TestFile("rl/test_update_weights_from_distributed.py", 103),
         TestFile("test_data_parallelism.py", 73),
         TestFile("test_disaggregation_basic.py", 400),
@@ -157,6 +164,7 @@ suites = {
         TestFile("test_deepseek_v3_basic.py", 275),
         TestFile("test_deepseek_v3_mtp.py", 275),
         TestFile("test_disaggregation_different_tp.py", 600),
+        TestFile("test_disaggregation_hybrid_attention.py", 200),
         TestFile("test_disaggregation_pp.py", 140),
     ],
     "per-commit-4-gpu-b200": [
@@ -165,9 +173,13 @@ suites = {
     ],
     "per-commit-4-gpu-deepep": [
         TestFile("ep/test_deepep_small.py", 531),
+        TestFile("ep/test_mooncake_ep_small.py", 450),
     ],
     "per-commit-8-gpu-deepep": [
         TestFile("ep/test_deepep_large.py", 338),
+    ],
+    "per-commit-8-gpu-deepseek-v32": [
+        TestFile("test_deepseek_v32_basic.py", 275),
     ],
     "per-commit-8-gpu-h20": [
         TestFile("quant/test_w4a8_deepseek_v3.py", 371),
@@ -301,8 +313,17 @@ suite_xeon = {
         TestFile("cpu/test_rope.py"),
         TestFile("cpu/test_shared_expert.py"),
         TestFile("cpu/test_topk.py"),
-        TestFile("test_cpu_graph.py"),
-        TestFile("test_intel_amx_attention_backend.py"),
+        TestFile("cpu/test_cpu_graph.py"),
+        TestFile("cpu/test_intel_amx_attention_backend_a.py"),
+        TestFile("cpu/test_intel_amx_attention_backend_b.py"),
+        TestFile("cpu/test_intel_amx_attention_backend_c.py"),
+    ],
+}
+
+# Add Intel XPU tests
+suite_xpu = {
+    "per-commit-xpu": [
+        TestFile("xpu/test_intel_xpu_backend.py"),
     ],
 }
 
@@ -331,6 +352,7 @@ suite_ascend = {
 suites.update(suite_amd)
 suites.update(suite_xeon)
 suites.update(suite_ascend)
+suites.update(suite_xpu)
 
 
 def auto_partition(files, rank, size):

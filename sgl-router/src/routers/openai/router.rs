@@ -27,7 +27,7 @@ use std::{
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tracing::{info, warn};
+use tracing::warn;
 
 // Import from sibling modules
 use super::conversations::{
@@ -148,7 +148,11 @@ impl OpenAIRouter {
         original_previous_response_id: Option<String>,
     ) -> Response {
         // Check if MCP is active for this request
-        let req_mcp_manager = mcp_manager_from_request_tools(&original_body.tools).await;
+        let req_mcp_manager = if let Some(ref tools) = original_body.tools {
+            mcp_manager_from_request_tools(tools.as_slice()).await
+        } else {
+            None
+        };
         let active_mcp = req_mcp_manager.as_ref().or(self.mcp_manager.as_ref());
 
         let mut response_json: Value;
@@ -183,6 +187,7 @@ impl OpenAIRouter {
             }
         } else {
             // No MCP - simple request
+
             let mut request_builder = self.client.post(&url).json(&payload);
             if let Some(h) = headers {
                 request_builder = apply_request_headers(h, request_builder, true);
@@ -192,6 +197,11 @@ impl OpenAIRouter {
                 Ok(r) => r,
                 Err(e) => {
                     self.circuit_breaker.record_failure();
+                    tracing::error!(
+                        url = %url,
+                        error = %e,
+                        "Failed to forward request to OpenAI"
+                    );
                     return (
                         StatusCode::BAD_GATEWAY,
                         format!("Failed to forward request to OpenAI: {}", e),
@@ -385,6 +395,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
             }
         };
         if let Some(obj) = payload.as_object_mut() {
+            // Always remove SGLang-specific fields (unsupported by OpenAI)
             for key in [
                 "top_k",
                 "min_p",
@@ -512,12 +523,6 @@ impl crate::routers::RouterTrait for OpenAIRouter {
     ) -> Response {
         let url = format!("{}/v1/responses", self.base_url);
 
-        info!(
-            requested_store = body.store,
-            is_streaming = body.stream,
-            "openai_responses_request"
-        );
-
         // Validate mutually exclusive params: previous_response_id and conversation
         // TODO: this validation logic should move the right place, also we need a proper error message module
         if body.previous_response_id.is_some() && body.conversation.is_some() {
@@ -535,7 +540,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                 .into_response();
         }
 
-        // Clone the body and override model if needed
+        // Clone the body for validation and logic, but we'll build payload differently
         let mut request_body = body.clone();
         if let Some(model) = model_id {
             request_body.model = Some(model.to_string());
@@ -690,7 +695,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         }
 
         // Always set store=false for upstream (we store internally)
-        request_body.store = false;
+        request_body.store = Some(false);
 
         // Convert to JSON and strip SGLang-specific fields
         let mut payload = match to_value(&request_body) {
@@ -704,14 +709,13 @@ impl crate::routers::RouterTrait for OpenAIRouter {
             }
         };
 
-        // Remove SGLang-specific fields
+        // Remove SGLang-specific fields only
         if let Some(obj) = payload.as_object_mut() {
+            // Remove SGLang-specific fields (not part of OpenAI API)
             for key in [
                 "request_id",
                 "priority",
                 "top_k",
-                "frequency_penalty",
-                "presence_penalty",
                 "min_p",
                 "min_tokens",
                 "regex",
@@ -732,10 +736,38 @@ impl crate::routers::RouterTrait for OpenAIRouter {
             ] {
                 obj.remove(key);
             }
+            // XAI doesn't support the OPENAI item type input: https://platform.openai.com/docs/api-reference/responses/create#responses-create-input-input-item-list-item
+            // To Achieve XAI compatibility, strip extra fields from input messages (id, status)
+            // XAI doesn't support output_text as type for content with role of assistant
+            // so normalize content types: output_text -> input_text
+            if let Some(input_arr) = obj.get_mut("input").and_then(Value::as_array_mut) {
+                for item_obj in input_arr.iter_mut().filter_map(Value::as_object_mut) {
+                    // Remove fields not universally supported
+                    item_obj.remove("id");
+                    item_obj.remove("status");
+
+                    // Normalize content types to input_text (xAI compatibility)
+                    if let Some(content_arr) =
+                        item_obj.get_mut("content").and_then(Value::as_array_mut)
+                    {
+                        for content_obj in content_arr.iter_mut().filter_map(Value::as_object_mut) {
+                            // Change output_text to input_text
+                            if content_obj.get("type").and_then(Value::as_str)
+                                == Some("output_text")
+                            {
+                                content_obj.insert(
+                                    "type".to_string(),
+                                    Value::String("input_text".to_string()),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // Delegate to streaming or non-streaming handler
-        if body.stream {
+        if body.stream.unwrap_or(false) {
             handle_streaming_response(
                 &self.client,
                 &self.circuit_breaker,

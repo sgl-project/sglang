@@ -123,6 +123,7 @@ fn create_test_tools() -> Vec<Tool> {
                         "limit": {"type": "number"}
                     }
                 }),
+                strict: None,
             },
         },
         Tool {
@@ -137,6 +138,7 @@ fn create_test_tools() -> Vec<Tool> {
                         "code": {"type": "string"}
                     }
                 }),
+                strict: None,
             },
         },
     ]

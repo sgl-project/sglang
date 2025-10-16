@@ -52,8 +52,13 @@ if _is_cuda:
         gemma_rmsnorm,
         rmsnorm,
     )
-
-
+elif _is_xpu:
+    from sgl_kernel import (
+        fused_add_rmsnorm,
+        gemma_fused_add_rmsnorm,
+        gemma_rmsnorm,
+        rmsnorm,
+    )
 if _use_aiter:
     from aiter import rmsnorm2d_fwd as rms_norm
     from aiter import rmsnorm2d_fwd_with_add as fused_add_rms_norm
@@ -216,6 +221,19 @@ class RMSNorm(CustomOp):
         else:
             return self.forward_native(x, residual)
 
+    def forward_xpu(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if self.variance_size_override is not None:
+            return self.forward_native(x, residual)
+        if residual is not None:
+            fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
+            return x, residual
+        out = rmsnorm(x, self.weight.data, self.variance_epsilon)
+        return out
+
     def forward_with_allreduce_fusion(
         self,
         x: torch.Tensor,
@@ -263,6 +281,19 @@ class GemmaRMSNorm(CustomOp):
         if _is_hip:
             self._forward_method = self.forward_native
 
+    def _forward_impl(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if residual is not None:
+            gemma_fused_add_rmsnorm(
+                x, residual, self.weight.data, self.variance_epsilon
+            )
+            return x, residual
+        out = gemma_rmsnorm(x, self.weight.data, self.variance_epsilon)
+        return out
+
     def forward_native(
         self,
         x: torch.Tensor,
@@ -285,13 +316,7 @@ class GemmaRMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        if residual is not None:
-            gemma_fused_add_rmsnorm(
-                x, residual, self.weight.data, self.variance_epsilon
-            )
-            return x, residual
-        out = gemma_rmsnorm(x, self.weight.data, self.variance_epsilon)
-        return out
+        return self._forward_impl(x, residual)
 
     def forward_npu(
         self,
@@ -304,6 +329,13 @@ class GemmaRMSNorm(CustomOp):
 
         x, _ = torch_npu.npu_gemma_rms_norm(x, self.weight, self.variance_epsilon)
         return x if residual is None else (x, residual)
+
+    def forward_xpu(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        return self._forward_impl(x, residual)
 
 
 class Gemma3RMSNorm(CustomOp):

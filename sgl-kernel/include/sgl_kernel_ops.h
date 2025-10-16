@@ -821,3 +821,27 @@ void causal_conv1d_fwd(
     const std::optional<at::Tensor>& has_initial_state,
     bool silu_activation,
     int64_t pad_slot_id);
+
+/*
+ * From csrc/expert_specialization
+ */
+void es_fp8_blockwise_scaled_grouped_mm(
+    torch::Tensor& output,
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    const torch::Tensor& scales_a,
+    const torch::Tensor& scales_b,
+    const torch::Tensor& stride_a,
+    const torch::Tensor& stride_b,
+    const torch::Tensor& stride_d,
+    const torch::Tensor& problem_sizes,
+    const torch::Tensor& expert_offsets,
+    const torch::Tensor& workspace);
+/*
+ * From fast-hadamard-transform
+ */
+torch::Tensor fast_hadamard_transform(torch::Tensor& x, double scale);
+torch::Tensor fast_hadamard_transform_12N(torch::Tensor& x, double scale);
+torch::Tensor fast_hadamard_transform_20N(torch::Tensor& x, double scale);
+torch::Tensor fast_hadamard_transform_28N(torch::Tensor& x, double scale);
+torch::Tensor fast_hadamard_transform_40N(torch::Tensor& x, double scale);
