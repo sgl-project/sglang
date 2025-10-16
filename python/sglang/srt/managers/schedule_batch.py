@@ -64,6 +64,7 @@ from sglang.srt.mem_cache.common import (
     alloc_for_decode,
     alloc_for_extend,
     alloc_token_slots,
+    evict_from_tree_cache,
 )
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
@@ -1413,7 +1414,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             * self.token_to_kv_pool_allocator.page_size
         )
 
-        self._evict_tree_cache_if_needed(num_tokens)
+        evict_from_tree_cache(self.tree_cache, num_tokens)
         return self._is_available_size_sufficient(num_tokens)
 
     def retract_decode(self, server_args: ServerArgs):
@@ -1461,6 +1462,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             idx = sorted_indices.pop()
             req = self.reqs[idx]
             retracted_reqs.append(req)
+            # release memory and don't insert into the tree because we need the space instantly
             self.release_req(idx, len(sorted_indices), server_args)
 
             if len(retracted_reqs) == 0:
@@ -1485,39 +1487,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
         req = self.reqs[idx]
-        seq_lens_cpu = self.seq_lens_cpu.numpy()
 
         if server_args.disaggregation_mode == "decode":
             req.offload_kv_cache(
                 self.req_to_token_pool, self.token_to_kv_pool_allocator
             )
-        if isinstance(self.tree_cache, ChunkCache):
-            # ChunkCache does not have eviction
-            token_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : seq_lens_cpu[idx]
-            ]
-            self.token_to_kv_pool_allocator.free(token_indices)
-            self.req_to_token_pool.free(req.req_pool_idx)
-        else:
-            # TODO: apply more fine-grained retraction
-            last_uncached_pos = (
-                len(req.prefix_indices) // server_args.page_size
-            ) * server_args.page_size
-            token_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, last_uncached_pos : seq_lens_cpu[idx]
-            ]
-            self.token_to_kv_pool_allocator.free(token_indices)
-            self.req_to_token_pool.free(req.req_pool_idx)
-
-            # release the last node
-            if self.is_hybrid:
-                self.tree_cache.dec_lock_ref(req.last_node, req.swa_uuid_for_lock)
-            else:
-                self.tree_cache.dec_lock_ref(req.last_node)
-
-            # NOTE(lsyin): we should use the newly evictable memory instantly.
-            num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
-            self._evict_tree_cache_if_needed(num_tokens)
+        # TODO (csy): for preempted requests, we may want to insert into the tree
+        self.tree_cache.cache_finished_req(req, is_insert=False)
+        # NOTE(lsyin): we should use the newly evictable memory instantly.
+        num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
+        evict_from_tree_cache(self.tree_cache, num_tokens)
 
         req.reset_for_retract()
 
@@ -1814,24 +1793,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             seq_lens_cpu=self.seq_lens_cpu,
             enable_overlap=self.enable_overlap,
         )
-
-    def _evict_tree_cache_if_needed(self, num_tokens: int):
-        if isinstance(self.tree_cache, (SWAChunkCache, ChunkCache)):
-            return
-
-        if self.is_hybrid:
-            full_available_size = self.token_to_kv_pool_allocator.full_available_size()
-            swa_available_size = self.token_to_kv_pool_allocator.swa_available_size()
-
-            if full_available_size < num_tokens or swa_available_size < num_tokens:
-                if self.tree_cache is not None:
-                    full_num_tokens = max(0, num_tokens - full_available_size)
-                    swa_num_tokens = max(0, num_tokens - swa_available_size)
-                    self.tree_cache.evict(full_num_tokens, swa_num_tokens)
-        else:
-            if self.token_to_kv_pool_allocator.available_size() < num_tokens:
-                if self.tree_cache is not None:
-                    self.tree_cache.evict(num_tokens)
 
     def _is_available_size_sufficient(self, num_tokens: int) -> bool:
         if self.is_hybrid:

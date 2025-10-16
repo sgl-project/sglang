@@ -19,7 +19,14 @@ use tracing::{debug, error, warn};
 use super::context;
 use super::utils;
 use crate::grpc_client::proto;
-use crate::protocols::spec::*;
+use crate::protocols::chat::{
+    ChatCompletionRequest, ChatCompletionStreamResponse, ChatMessageDelta, ChatStreamChoice,
+};
+use crate::protocols::common::{
+    ChatLogProbs, FunctionCallDelta, StringOrArray, Tool, ToolCallDelta, ToolChoice,
+    ToolChoiceValue, Usage,
+};
+use crate::protocols::generate::GenerateRequest;
 use crate::reasoning_parser::ReasoningParser;
 use crate::tokenizer::stop::{SequenceDecoderOutput, StopSequenceDecoder};
 use crate::tokenizer::traits::Tokenizer;
