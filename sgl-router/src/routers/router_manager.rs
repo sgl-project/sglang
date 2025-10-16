@@ -323,7 +323,7 @@ impl RouterTrait for RouterManager {
                 } else {
                     None
                 }
-            }; 
+            };
 
             if let Some(router) = router {
                 return router.get_models(req).await;
