@@ -15,7 +15,9 @@ from sglang.test.test_utils import (
 ib_devices = get_rdma_devices_args()
 
 
-class _BaseTestMooncakeEp(CustomTestCase):
+class TestTP(CustomTestCase):
+    extra_args = []
+
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
@@ -27,9 +29,6 @@ class _BaseTestMooncakeEp(CustomTestCase):
             other_args=[
                 "--trust-remote-code",
                 "--tp",
-                "4",
-                "--enable-dp-attention",
-                "--dp",
                 "4",
                 "--elastic-ep-backend",
                 "mooncake",
@@ -71,7 +70,7 @@ class _BaseTestMooncakeEp(CustomTestCase):
         self.assertGreater(metrics["accuracy"], 0.60)
 
 
-class TestPureDP(_BaseTestMooncakeEp):
+class TestPureDP(TestTP):
     extra_args = [
         "--tp",
         "4",
@@ -81,7 +80,7 @@ class TestPureDP(_BaseTestMooncakeEp):
     ]
 
 
-class TestHybridDPTP(_BaseTestMooncakeEp):
+class TestHybridDPTP(TestTP):
     extra_args = [
         "--tp",
         "4",
@@ -91,14 +90,7 @@ class TestHybridDPTP(_BaseTestMooncakeEp):
     ]
 
 
-class TestTP(_BaseTestMooncakeEp):
-    extra_args = [
-        "--tp",
-        "4",
-    ]
-
-
-class TestNoGatherdBuffer(_BaseTestMooncakeEp):
+class TestNoGatherdBuffer(TestTP):
     extra_args = [
         "--tp",
         "4",
@@ -110,7 +102,7 @@ class TestNoGatherdBuffer(_BaseTestMooncakeEp):
     ]
 
 
-class TestTBO(_BaseTestMooncakeEp):
+class TestTBO(TestTP):
     extra_args = [
         "--tp",
         "4",
@@ -123,7 +115,7 @@ class TestTBO(_BaseTestMooncakeEp):
     ]
 
 
-class TestMooncakeWitchEPLB(_BaseTestMooncakeEp):
+class TestMooncakeWitchEPLB(TestTP):
     extra_args = [
         "--tp",
         "4",
