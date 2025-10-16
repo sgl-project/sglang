@@ -3,10 +3,11 @@ use serde_json::{from_str, to_string, to_value, to_vec};
 use std::time::Instant;
 
 use sglang_router_rs::core::{BasicWorker, BasicWorkerBuilder, Worker, WorkerType};
-use sglang_router_rs::protocols::spec::{
-    ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateRequest, SamplingParams,
-    StringOrArray, UserMessageContent,
-};
+use sglang_router_rs::protocols::chat::{ChatCompletionRequest, ChatMessage, UserMessageContent};
+use sglang_router_rs::protocols::common::StringOrArray;
+use sglang_router_rs::protocols::completion::CompletionRequest;
+use sglang_router_rs::protocols::generate::GenerateRequest;
+use sglang_router_rs::protocols::sampling_params::SamplingParams;
 use sglang_router_rs::routers::http::pd_types::{generate_room_id, RequestWithBootstrap};
 
 fn create_test_worker() -> BasicWorker {

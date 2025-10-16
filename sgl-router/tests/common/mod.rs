@@ -15,7 +15,7 @@ use sglang_router_rs::data_connector::{
 };
 use sglang_router_rs::middleware::TokenBucket;
 use sglang_router_rs::policies::PolicyRegistry;
-use sglang_router_rs::protocols::spec::{Function, Tool};
+use sglang_router_rs::protocols::common::{Function, Tool};
 use sglang_router_rs::server::AppContext;
 use std::fs;
 use std::path::PathBuf;

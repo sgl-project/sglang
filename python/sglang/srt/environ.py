@@ -113,7 +113,7 @@ class Envs:
 
     # Test & Debug
     SGLANG_IS_IN_CI = EnvBool(False)
-    SGLANG_AMD_CI = EnvBool(False)
+    SGLANG_IS_IN_CI_AMD = EnvBool(False)
     SGLANG_TEST_RETRACT = EnvBool(False)
     SGLANG_SET_CPU_AFFINITY = EnvBool(False)
     SGLANG_PROFILE_WITH_STACK = EnvBool(True)
@@ -197,12 +197,12 @@ class Envs:
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
 
-    # vLLM dependencies
+    # vLLM dependencies (TODO: they have been deprecated, we can remove them safely)
     USE_VLLM_CUSTOM_ALLREDUCE = EnvBool(False)
     USE_VLLM_CUTLASS_W8A8_FP8_KERNEL = EnvBool(False)
 
     USE_TRITON_W8A8_FP8_KERNEL = EnvBool(False)
-    RETURN_ORIGINAL_LOGPROB = EnvBool(False)
+    SGLANG_RETURN_ORIGINAL_LOGPROB = EnvBool(False)
     SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN = EnvBool(False)
     SGLANG_MOE_PADDING = EnvBool(False)
     SGLANG_CUTLASS_MOE = EnvBool(False)

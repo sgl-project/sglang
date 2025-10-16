@@ -9,7 +9,7 @@
 
 use criterion::{black_box, criterion_group, BenchmarkId, Criterion, Throughput};
 use serde_json::json;
-use sglang_router_rs::protocols::spec::{Function, Tool};
+use sglang_router_rs::protocols::common::{Function, Tool};
 use sglang_router_rs::tool_parser::{JsonParser, ParserFactory as ToolParserFactory, ToolParser};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
