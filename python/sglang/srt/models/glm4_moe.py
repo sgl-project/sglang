@@ -56,18 +56,13 @@ from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.fp8_kernel import (
-    is_fp8_fnuz,
-    per_tensor_quant_mla_fp8,
-    per_token_group_quant_mla_deep_gemm_masked_fp8,
-)
+from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -77,6 +72,7 @@ from sglang.srt.models.deepseek_v2 import (
     DeepseekV2Model,
     DeepseekV2MoE,
 )
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.two_batch_overlap import MaybeTboDeepEPDispatcher
 from sglang.srt.utils import (
     BumpAllocator,
@@ -395,7 +391,7 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
         self.n_shared_experts = config.n_shared_experts
         self.num_fused_shared_experts = (
             0
-            if global_server_args_dict["disable_shared_experts_fusion"]
+            if get_global_server_args().disable_shared_experts_fusion
             else config.n_shared_experts
         )
         self.config = config
@@ -432,7 +428,7 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.n_routed_experts
             + self.num_fused_shared_experts
-            + global_server_args_dict["ep_num_redundant_experts"],
+            + get_global_server_args().ep_num_redundant_experts,
             num_fused_shared_experts=self.num_fused_shared_experts,
             top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
             hidden_size=config.hidden_size,
@@ -471,12 +467,12 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
 
         self.top_k = config.num_experts_per_tok
 
-        if get_moe_a2a_backend().is_deepep():
+        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
             # TODO: we will support tp < ep in the future
             self.ep_size = get_moe_expert_parallel_world_size()
             self.num_experts = (
                 config.n_routed_experts
-                + global_server_args_dict["ep_num_redundant_experts"]
+                + get_global_server_args().ep_num_redundant_experts
             )
             self.renormalize = config.norm_topk_prob
             self.topk_group = config.topk_group
@@ -500,7 +496,9 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
                 return_recv_hook=True,
             )
 
-        self._enable_deepep_moe = get_moe_a2a_backend().is_deepep()
+        self._enable_a2a_moe = (
+            get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake()
+        )
 
     def forward_normal_dual_stream(
         self,
@@ -758,7 +756,7 @@ class Glm4MoeForCausalLM(DeepseekV2ForCausalLM):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=global_server_args_dict["enable_dp_lm_head"],
+            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
 
@@ -774,7 +772,7 @@ class Glm4MoeForCausalLM(DeepseekV2ForCausalLM):
         self, architecture: str = "Glm4MoeForCausalLM"
     ):
         self.num_fused_shared_experts = 0
-        if global_server_args_dict["disable_shared_experts_fusion"]:
+        if get_global_server_args().disable_shared_experts_fusion:
             return
 
         # Only Deepseek V3/R1 can use shared experts fusion optimization now.
@@ -790,7 +788,7 @@ class Glm4MoeForCausalLM(DeepseekV2ForCausalLM):
             disable_reason = "Deepseek and GLM-4.5 or GLM-4.6 can not use shared experts fusion optimization under expert parallelism."
 
         if disable_reason is not None:
-            global_server_args_dict["disable_shared_experts_fusion"] = True
+            get_global_server_args().disable_shared_experts_fusion = True
             self.num_fused_shared_experts = 0
             log_info_on_rank0(
                 logger,

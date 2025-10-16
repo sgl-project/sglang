@@ -69,6 +69,8 @@ fn generate_request_id(path: &str) -> String {
         "cmpl-"
     } else if path.contains("/generate") {
         "gnt-"
+    } else if path.contains("/responses") {
+        "resp-"
     } else {
         "req-"
     };
@@ -236,7 +238,7 @@ impl Default for ResponseLogger {
 }
 
 impl<B> OnResponse<B> for ResponseLogger {
-    fn on_response(self, response: &Response<B>, latency: std::time::Duration, span: &Span) {
+    fn on_response(self, response: &Response<B>, latency: Duration, span: &Span) {
         let status = response.status();
 
         // Record these in the span for structured logging/observability tools
@@ -345,10 +347,10 @@ pub struct QueuedRequest {
 /// Queue metrics for monitoring
 #[derive(Debug, Default)]
 pub struct QueueMetrics {
-    pub total_queued: std::sync::atomic::AtomicU64,
-    pub current_queued: std::sync::atomic::AtomicU64,
-    pub total_timeout: std::sync::atomic::AtomicU64,
-    pub total_rejected: std::sync::atomic::AtomicU64,
+    pub total_queued: AtomicU64,
+    pub current_queued: AtomicU64,
+    pub total_timeout: AtomicU64,
+    pub total_rejected: AtomicU64,
 }
 
 /// Queue processor that handles queued requests
@@ -424,22 +426,23 @@ pub struct ConcurrencyLimiter {
 impl ConcurrencyLimiter {
     /// Create new concurrency limiter with optional queue
     pub fn new(
-        token_bucket: Arc<TokenBucket>,
+        token_bucket: Option<Arc<TokenBucket>>,
         queue_size: usize,
         queue_timeout: Duration,
     ) -> (Self, Option<QueueProcessor>) {
-        if queue_size > 0 {
-            let (queue_tx, queue_rx) = mpsc::channel(queue_size);
-            let processor = QueueProcessor::new(token_bucket, queue_rx, queue_timeout);
-
-            (
-                Self {
-                    queue_tx: Some(queue_tx),
-                },
-                Some(processor),
-            )
-        } else {
-            (Self { queue_tx: None }, None)
+        match (token_bucket, queue_size) {
+            (None, _) => (Self { queue_tx: None }, None),
+            (Some(bucket), size) if size > 0 => {
+                let (queue_tx, queue_rx) = mpsc::channel(size);
+                let processor = QueueProcessor::new(bucket, queue_rx, queue_timeout);
+                (
+                    Self {
+                        queue_tx: Some(queue_tx),
+                    },
+                    Some(processor),
+                )
+            }
+            (Some(_), _) => (Self { queue_tx: None }, None),
         }
     }
 }
@@ -447,15 +450,22 @@ impl ConcurrencyLimiter {
 /// Middleware function for concurrency limiting with optional queuing
 pub async fn concurrency_limit_middleware(
     State(app_state): State<Arc<AppState>>,
-    request: Request<axum::body::Body>,
+    request: Request<Body>,
     next: Next,
 ) -> Response {
+    let token_bucket = match &app_state.context.rate_limiter {
+        Some(bucket) => bucket.clone(),
+        None => {
+            // Rate limiting disabled, pass through immediately
+            return next.run(request).await;
+        }
+    };
+
     // Static counter for embeddings queue size
     static EMBEDDINGS_QUEUE_SIZE: AtomicU64 = AtomicU64::new(0);
 
     // Identify if this is an embeddings request based on path
     let is_embeddings = request.uri().path().contains("/v1/embeddings");
-    let token_bucket = app_state.context.rate_limiter.clone();
 
     // Try to acquire token immediately
     if token_bucket.try_acquire(1.0).await.is_ok() {
