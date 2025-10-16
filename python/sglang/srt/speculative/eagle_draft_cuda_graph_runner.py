@@ -20,7 +20,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.speculative.eagle_utils import EagleDraftInput
+from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.utils import (
     require_attn_tp_gather,
     require_gathered_buffer,
@@ -90,6 +90,9 @@ class EAGLEDraftCudaGraphRunner:
                 (self.max_num_token * self.speculative_num_steps,), dtype=torch.int64
             )
             self.positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
+            self.mrope_positions = torch.zeros(
+                (3, self.max_num_token), dtype=torch.int64
+            )
             self.topk_p = torch.zeros((self.max_bs, self.topk), dtype=torch.float32)
             self.topk_index = torch.zeros((self.max_bs, self.topk), dtype=torch.int64)
             self.hidden_states = torch.zeros(
@@ -158,6 +161,7 @@ class EAGLEDraftCudaGraphRunner:
         seq_lens = self.seq_lens[:num_seqs]
         out_cache_loc = self.out_cache_loc[: num_tokens * self.speculative_num_steps]
         positions = self.positions[:num_tokens]
+        mrope_positions = self.mrope_positions[:, :num_tokens]
         topk_p = self.topk_p[:num_seqs]
         topk_index = self.topk_index[:num_seqs]
         hidden_states = self.hidden_states[:num_seqs]
@@ -223,6 +227,7 @@ class EAGLEDraftCudaGraphRunner:
             seq_lens_sum=seq_lens.sum().item(),
             return_logprob=False,
             positions=positions,
+            mrope_positions=mrope_positions,
             global_num_tokens_gpu=global_num_tokens,
             dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
             global_dp_buffer_len=global_dp_buffer_len,
@@ -270,11 +275,9 @@ class EAGLEDraftCudaGraphRunner:
         return graph, out
 
     def _postprocess_output_to_raw_bs(self, out, raw_bs):
-        score_list, token_list, parents_list = out
-        score_list = [x[:raw_bs] for x in score_list]
-        token_list = [x[:raw_bs] for x in token_list]
-        parents_list = [x[:raw_bs] for x in parents_list]
-        return (score_list, token_list, parents_list)
+        # Keep the variables name for readability
+        parent_list, top_scores_index, draft_tokens = (t[:raw_bs] for t in out)
+        return parent_list, top_scores_index, draft_tokens
 
     def replay(self, forward_batch: ForwardBatch):
         assert forward_batch.out_cache_loc is not None
@@ -296,6 +299,7 @@ class EAGLEDraftCudaGraphRunner:
         if bs != raw_bs:
             self.seq_lens.fill_(self.seq_len_fill_value)
             self.out_cache_loc.zero_()
+            self.positions.zero_()
 
         num_tokens = bs * self.num_tokens_per_bs
 

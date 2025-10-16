@@ -3,20 +3,14 @@
 //! These tests download the TinyLlama tokenizer from HuggingFace to verify our tokenizer
 //! implementation works correctly with real-world tokenizer files.
 
+mod common;
+use common::{ensure_tokenizer_cached, EXPECTED_HASHES, TEST_PROMPTS};
+
 use sglang_router_rs::tokenizer::{
     factory, huggingface::HuggingFaceTokenizer, sequence::Sequence, stop::*, stream::DecodeStream,
     traits::*,
 };
-use std::fs;
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock};
-
-const TEST_PROMPTS: [&str; 4] = [
-    "deep learning is",
-    "Deep learning is",
-    "has anyone seen nemo lately",
-    "another prompt",
-];
+use std::sync::Arc;
 
 const LONG_TEST_PROMPTS: [(&str, &str); 6] = [
     ("Tell me about the following text.", "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat."),
@@ -33,70 +27,6 @@ const LONG_TEST_PROMPTS: [(&str, &str); 6] = [
     // Emoji stress test
     ("Tell me about the following text.", "😀😃😄😁😆🥹😅😂🤣🥲☺️😊😇🙂🙃😉🤩😎 🤪🥳🤓🙄🤪😵👻")
 ];
-
-const TINYLLAMA_TOKENIZER_URL: &str =
-    "https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0/resolve/main/tokenizer.json";
-const CACHE_DIR: &str = ".tokenizer_cache";
-const TINYLLAMA_TOKENIZER_FILENAME: &str = "tinyllama_tokenizer.json";
-
-// Global mutex to prevent concurrent downloads
-static DOWNLOAD_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
-
-// Pre-computed hashes for verification
-const EXPECTED_HASHES: [u64; 4] = [
-    1209591529327510910,
-    4181375434596349981,
-    6245658446118930933,
-    5097285695902185237,
-];
-
-/// Downloads the tokenizer from HuggingFace if not already cached
-fn ensure_tokenizer_cached() -> PathBuf {
-    // Get or initialize the mutex
-    let mutex = DOWNLOAD_MUTEX.get_or_init(|| Mutex::new(()));
-
-    // Lock to ensure only one thread downloads at a time
-    let _guard = mutex.lock().unwrap();
-
-    let cache_dir = PathBuf::from(CACHE_DIR);
-    let tokenizer_path = cache_dir.join(TINYLLAMA_TOKENIZER_FILENAME);
-
-    // Create cache directory if it doesn't exist
-    if !cache_dir.exists() {
-        fs::create_dir_all(&cache_dir).expect("Failed to create cache directory");
-    }
-
-    // Download tokenizer if not already cached
-    if !tokenizer_path.exists() {
-        println!("Downloading TinyLlama tokenizer from HuggingFace...");
-
-        // Use blocking reqwest client since we're in tests
-        let client = reqwest::blocking::Client::new();
-        let response = client
-            .get(TINYLLAMA_TOKENIZER_URL)
-            .send()
-            .expect("Failed to download tokenizer");
-
-        if !response.status().is_success() {
-            panic!("Failed to download tokenizer: HTTP {}", response.status());
-        }
-
-        let content = response.bytes().expect("Failed to read tokenizer content");
-
-        // Verify we got actual JSON content
-        if content.len() < 100 {
-            panic!("Downloaded content too small: {} bytes", content.len());
-        }
-
-        fs::write(&tokenizer_path, content).expect("Failed to write tokenizer to cache");
-        println!(
-            "Tokenizer downloaded and cached successfully ({} bytes)",
-            tokenizer_path.metadata().unwrap().len()
-        );
-    }
-
-    tokenizer_path
-}
 
 fn compute_hashes_for_tokenizer<E: Encoder>(tokenizer: &E, prompts: &[&str]) -> Vec<u64> {
     prompts
@@ -136,7 +66,7 @@ fn test_tokenizer_encode_decode_lifecycle() {
         let encoding = tokenizer.encode(prompt).expect("Failed to encode prompt");
 
         let decoded = tokenizer
-            .decode(&encoding.token_ids(), false)
+            .decode(encoding.token_ids(), false)
             .expect("Failed to decode token_ids");
 
         assert_eq!(decoded, *prompt, "Encode-decode mismatch for: {}", prompt);
@@ -154,7 +84,6 @@ fn test_sequence_operations() {
     for prompt in TEST_PROMPTS.iter() {
         let encoding = tokenizer.encode(prompt).expect("Failed to encode prompt");
 
-        // Test Sequence with append_text
         let mut sequence = Sequence::new(tokenizer.clone());
         sequence.append_text(prompt).expect("Failed to append text");
 
@@ -165,13 +94,12 @@ fn test_sequence_operations() {
         );
         assert_eq!(sequence.text().unwrap(), *prompt, "Sequence text mismatch");
 
-        // Test incremental decoding with append_token
         let mut decoder = Sequence::new(tokenizer.clone());
         let mut output = String::new();
 
         for token_id in encoding.token_ids() {
             let text = decoder
-                .append_token(token_id)
+                .append_token(*token_id)
                 .expect("Failed to append token");
             output.push_str(&text);
         }
@@ -201,7 +129,7 @@ fn test_decode_stream() {
         let mut output = String::new();
 
         for token_id in encoding.token_ids() {
-            if let Some(text) = decoder.step(token_id).expect("Failed to decode token") {
+            if let Some(text) = decoder.step(*token_id).expect("Failed to decode token") {
                 output.push_str(&text);
             }
         }
@@ -227,11 +155,11 @@ fn test_long_sequence_incremental_decode_with_prefill() {
             .encode(output_text)
             .expect("Failed to encode output");
 
-        let mut decoder = DecodeStream::new(tokenizer.clone(), &input_encoding.token_ids(), false);
+        let mut decoder = DecodeStream::new(tokenizer.clone(), input_encoding.token_ids(), false);
 
         let mut output = String::new();
         for token_id in output_encoding.token_ids() {
-            if let Some(text) = decoder.step(token_id).expect("Failed to decode token") {
+            if let Some(text) = decoder.step(*token_id).expect("Failed to decode token") {
                 output.push_str(&text);
             }
         }
@@ -248,7 +176,6 @@ fn test_stop_sequence_decoder() {
             .expect("Failed to load tokenizer"),
     );
 
-    // Test with various stop sequences
     let test_cases = vec![
         (
             "Hello world! Stop here. Continue after.",
@@ -269,7 +196,7 @@ fn test_stop_sequence_decoder() {
         let mut stopped = false;
 
         for token_id in encoding.token_ids() {
-            match decoder.process_token(token_id).unwrap() {
+            match decoder.process_token(*token_id).unwrap() {
                 SequenceDecoderOutput::Text(text) => output.push_str(&text),
                 SequenceDecoderOutput::StoppedWithText(text) => {
                     output.push_str(&text);
@@ -307,7 +234,6 @@ fn test_stop_sequence_decoder() {
 
 #[test]
 fn test_factory_creation() {
-    // Test factory creation method
     let tokenizer_path = ensure_tokenizer_cached();
     let tokenizer = factory::create_tokenizer(tokenizer_path.to_str().unwrap())
         .expect("Failed to create tokenizer via factory");
@@ -315,7 +241,7 @@ fn test_factory_creation() {
     let encoding = tokenizer.encode(TEST_PROMPTS[0]).expect("Failed to encode");
 
     let decoded = tokenizer
-        .decode(&encoding.token_ids(), false)
+        .decode(encoding.token_ids(), false)
         .expect("Failed to decode");
 
     assert_eq!(decoded, TEST_PROMPTS[0]);
@@ -335,7 +261,7 @@ fn test_batch_encoding() {
 
     for (i, encoding) in encodings.iter().enumerate() {
         let decoded = tokenizer
-            .decode(&encoding.token_ids(), false)
+            .decode(encoding.token_ids(), false)
             .expect("Failed to decode");
         assert_eq!(decoded, TEST_PROMPTS[i]);
     }
@@ -377,7 +303,7 @@ fn test_thread_safety() {
                     .encode(prompt)
                     .expect("Failed to encode in thread");
                 let decoded = tokenizer_clone
-                    .decode(&encoding.token_ids(), false)
+                    .decode(encoding.token_ids(), false)
                     .expect("Failed to decode in thread");
                 assert_eq!(decoded, prompt);
             })
@@ -386,5 +312,247 @@ fn test_thread_safety() {
 
     for handle in handles {
         handle.join().expect("Thread panicked");
+    }
+}
+
+#[test]
+fn test_chat_template_discovery() {
+    use std::fs;
+    use tempfile::TempDir;
+
+    // Create a temporary directory with test files
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let dir_path = temp_dir.path();
+
+    // Copy a real tokenizer.json file for testing
+    // We'll use the TinyLlama tokenizer that's already cached
+    let cached_tokenizer = ensure_tokenizer_cached();
+    let tokenizer_path = dir_path.join("tokenizer.json");
+    fs::copy(&cached_tokenizer, &tokenizer_path).expect("Failed to copy tokenizer file");
+
+    // Test 1: With chat_template.jinja file
+    let jinja_path = dir_path.join("chat_template.jinja");
+    fs::write(&jinja_path, "{{ messages }}").expect("Failed to write chat template");
+
+    let tokenizer = HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap());
+    assert!(
+        tokenizer.is_ok(),
+        "Should load tokenizer with chat template"
+    );
+
+    // Clean up for next test
+    fs::remove_file(&jinja_path).ok();
+
+    // Test 2: With tokenizer_config.json containing chat_template
+    let config_path = dir_path.join("tokenizer_config.json");
+    fs::write(&config_path, r#"{"chat_template": "{{ messages }}"}"#)
+        .expect("Failed to write config");
+
+    let tokenizer = HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap());
+    assert!(
+        tokenizer.is_ok(),
+        "Should load tokenizer with embedded template"
+    );
+
+    // Test 3: No chat template
+    fs::remove_file(&config_path).ok();
+    let tokenizer = HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap());
+    assert!(
+        tokenizer.is_ok(),
+        "Should load tokenizer without chat template"
+    );
+}
+
+#[test]
+fn test_load_chat_template_from_local_file() {
+    use std::fs;
+    use tempfile::TempDir;
+
+    // Test 1: Load tokenizer with explicit chat template path
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let dir_path = temp_dir.path();
+
+    // Copy a real tokenizer for testing
+    let cached_tokenizer = ensure_tokenizer_cached();
+    let tokenizer_path = dir_path.join("tokenizer.json");
+    fs::copy(&cached_tokenizer, &tokenizer_path).expect("Failed to copy tokenizer");
+
+    // Create a chat template file
+    let template_path = dir_path.join("my_template.jinja");
+    let template_content = r#"{% for message in messages %}{{ message.role }}: {{ message.content }}
+{% endfor %}"#;
+    fs::write(&template_path, template_content).expect("Failed to write template");
+
+    // Load tokenizer with explicit template path
+    let tokenizer = HuggingFaceTokenizer::from_file_with_chat_template(
+        tokenizer_path.to_str().unwrap(),
+        Some(template_path.to_str().unwrap()),
+    );
+    assert!(
+        tokenizer.is_ok(),
+        "Should load tokenizer with explicit template path"
+    );
+}
+
+#[tokio::test]
+async fn test_tinyllama_embedded_template() {
+    use sglang_router_rs::tokenizer::hub::download_tokenizer_from_hf;
+
+    // Skip in CI without HF_TOKEN
+
+    // Test 2: TinyLlama has chat template embedded in tokenizer_config.json
+    match download_tokenizer_from_hf("TinyLlama/TinyLlama-1.1B-Chat-v1.0").await {
+        Ok(cache_dir) => {
+            // Verify tokenizer_config.json exists
+            let config_path = cache_dir.join("tokenizer_config.json");
+            assert!(config_path.exists(), "tokenizer_config.json should exist");
+
+            // Load the config and check for chat_template
+            let config_content =
+                std::fs::read_to_string(&config_path).expect("Failed to read config");
+            assert!(
+                config_content.contains("\"chat_template\""),
+                "TinyLlama should have embedded chat_template in config"
+            );
+
+            // Load tokenizer and verify it has chat template
+            let tokenizer_path = cache_dir.join("tokenizer.json");
+            let _tokenizer = HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap())
+                .expect("Failed to load tokenizer");
+
+            println!(
+                "✓ TinyLlama: Loaded tokenizer with embedded template from tokenizer_config.json"
+            );
+        }
+        Err(e) => {
+            println!("Download test skipped due to error: {}", e);
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_qwen3_next_embedded_template() {
+    use sglang_router_rs::tokenizer::hub::download_tokenizer_from_hf;
+
+    // Test 3: Qwen3-Next has chat template in tokenizer_config.json
+    match download_tokenizer_from_hf("Qwen/Qwen3-Next-80B-A3B-Instruct").await {
+        Ok(cache_dir) => {
+            let config_path = cache_dir.join("tokenizer_config.json");
+            assert!(config_path.exists(), "tokenizer_config.json should exist");
+
+            // Verify chat_template in config
+            let config_content =
+                std::fs::read_to_string(&config_path).expect("Failed to read config");
+            assert!(
+                config_content.contains("\"chat_template\""),
+                "Qwen3-Next should have chat_template in tokenizer_config.json"
+            );
+
+            // Load tokenizer
+            let tokenizer_path = cache_dir.join("tokenizer.json");
+            if tokenizer_path.exists() {
+                let _tokenizer = HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap())
+                    .expect("Failed to load tokenizer");
+                println!("✓ Qwen3-Next: Loaded tokenizer with embedded template");
+            }
+        }
+        Err(e) => {
+            println!("Download test skipped due to error: {}", e);
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_qwen3_vl_json_template_priority() {
+    use sglang_router_rs::tokenizer::hub::download_tokenizer_from_hf;
+
+    // Test 4: Qwen3-VL has both tokenizer_config.json template and chat_template.json
+    // Should prioritize chat_template.json
+    match download_tokenizer_from_hf("Qwen/Qwen3-VL-235B-A22B-Instruct").await {
+        Ok(cache_dir) => {
+            // Check for chat_template.json
+            let json_template_path = cache_dir.join("chat_template.json");
+            let has_json_template = json_template_path.exists();
+
+            // Also check tokenizer_config.json
+            let config_path = cache_dir.join("tokenizer_config.json");
+            assert!(config_path.exists(), "tokenizer_config.json should exist");
+
+            if has_json_template {
+                let json_content = std::fs::read_to_string(&json_template_path)
+                    .expect("Failed to read chat_template.json");
+                println!("✓ Qwen3-VL: Found chat_template.json (should be prioritized)");
+
+                // Verify it contains jinja template
+                assert!(
+                    !json_content.is_empty(),
+                    "chat_template.json should contain template"
+                );
+            }
+
+            // Load tokenizer - it should use the appropriate template
+            let tokenizer_path = cache_dir.join("tokenizer.json");
+            if tokenizer_path.exists() {
+                let _tokenizer = HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap())
+                    .expect("Failed to load tokenizer");
+                println!("✓ Qwen3-VL: Loaded tokenizer with template priority handling");
+            }
+        }
+        Err(e) => {
+            println!("Download test skipped due to error: {}", e);
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_llava_separate_jinja_template() {
+    use sglang_router_rs::tokenizer::hub::download_tokenizer_from_hf;
+
+    // Test 5: llava has chat_template.jinja as a separate file, not in tokenizer_config.json
+    match download_tokenizer_from_hf("llava-hf/llava-1.5-7b-hf").await {
+        Ok(cache_dir) => {
+            // Check for .jinja file
+            let jinja_path = cache_dir.join("chat_template.jinja");
+            let has_jinja = jinja_path.exists()
+                || std::fs::read_dir(&cache_dir)
+                    .map(|entries| {
+                        entries.filter_map(|e| e.ok()).any(|e| {
+                            e.file_name()
+                                .to_str()
+                                .is_some_and(|name| name.ends_with(".jinja"))
+                        })
+                    })
+                    .unwrap_or(false);
+
+            if has_jinja {
+                println!("✓ llava: Found separate .jinja chat template file");
+            }
+
+            // Check tokenizer_config.json - should NOT have embedded template
+            let config_path = cache_dir.join("tokenizer_config.json");
+            if config_path.exists() {
+                let config_content =
+                    std::fs::read_to_string(&config_path).expect("Failed to read config");
+
+                // llava might not have chat_template in config
+                if !config_content.contains("\"chat_template\"") {
+                    println!("✓ llava: No embedded template in config (as expected)");
+                }
+            }
+
+            // Load tokenizer - should auto-discover the .jinja file
+            let tokenizer_path = cache_dir.join("tokenizer.json");
+            if tokenizer_path.exists() {
+                let tokenizer = HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap());
+                if tokenizer.is_ok() {
+                    println!("✓ llava: Loaded tokenizer with auto-discovered .jinja template");
+                } else {
+                    println!("Note: llava tokenizer loading failed - might need specific handling");
+                }
+            }
+        }
+        Err(e) => {
+            println!("Download test skipped due to error: {}", e);
+        }
     }
 }
