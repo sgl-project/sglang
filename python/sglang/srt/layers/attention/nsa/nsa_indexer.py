@@ -609,6 +609,7 @@ class Indexer(CustomOp):
         forward_batch: ForwardBatch,
         layer_id: int,
     ) -> torch.Tensor:
+        import custom_ops  # noqa: F401
         import torch_npu
 
         from sglang.srt.layers.dp_attention import (
