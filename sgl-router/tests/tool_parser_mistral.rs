@@ -11,11 +11,12 @@ async fn test_mistral_single_tool() {
     let input = r#"Let me search for that.
 [TOOL_CALLS] [{"name": "search_web", "arguments": {"query": "latest news", "max_results": 5}}]"#;
 
-    let result = parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 1);
-    assert_eq!(result[0].function.name, "search_web");
+    let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(normal_text, "Let me search for that.\n");
+    assert_eq!(tools[0].function.name, "search_web");
 
-    let args: serde_json::Value = serde_json::from_str(&result[0].function.arguments).unwrap();
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
     assert_eq!(args["query"], "latest news");
     assert_eq!(args["max_results"], 5);
 }
@@ -29,15 +30,16 @@ async fn test_mistral_multiple_tools() {
     {"name": "search_news", "arguments": {"query": "AI developments", "limit": 10}}
 ]"#;
 
-    let result = parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 2);
+    let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 2);
+    assert_eq!(normal_text, "I'll help you with both tasks.\n");
 
-    assert_eq!(result[0].function.name, "get_weather");
-    let args0: serde_json::Value = serde_json::from_str(&result[0].function.arguments).unwrap();
+    assert_eq!(tools[0].function.name, "get_weather");
+    let args0: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
     assert_eq!(args0["city"], "Tokyo");
 
-    assert_eq!(result[1].function.name, "search_news");
-    let args1: serde_json::Value = serde_json::from_str(&result[1].function.arguments).unwrap();
+    assert_eq!(tools[1].function.name, "search_news");
+    let args1: serde_json::Value = serde_json::from_str(&tools[1].function.arguments).unwrap();
     assert_eq!(args1["query"], "AI developments");
 }
 
@@ -47,10 +49,11 @@ async fn test_mistral_nested_json() {
     let input = r#"Processing complex data.
 [TOOL_CALLS] [{"name": "process_data", "arguments": {"config": {"nested": {"value": [1, 2, 3]}}, "enabled": true}}]"#;
 
-    let result = parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 1);
+    let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(normal_text, "Processing complex data.\n");
 
-    let args: serde_json::Value = serde_json::from_str(&result[0].function.arguments).unwrap();
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
     assert_eq!(args["config"]["nested"]["value"], json!([1, 2, 3]));
     assert_eq!(args["enabled"], true);
 }
@@ -62,9 +65,9 @@ async fn test_mistral_with_text_after() {
 
 And here's some text after the tool call that should be ignored."#;
 
-    let result = parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 1);
-    assert_eq!(result[0].function.name, "test");
+    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].function.name, "test");
 }
 
 #[tokio::test]
@@ -72,9 +75,9 @@ async fn test_mistral_empty_arguments() {
     let parser = MistralParser::new();
     let input = r#"[TOOL_CALLS] [{"name": "ping", "arguments": {}}]"#;
 
-    let result = parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 1);
-    assert_eq!(result[0].function.name, "ping");
+    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].function.name, "ping");
 }
 
 #[tokio::test]
@@ -82,10 +85,10 @@ async fn test_mistral_with_brackets_in_strings() {
     let parser = MistralParser::new();
     let input = r#"[TOOL_CALLS] [{"name": "echo", "arguments": {"text": "Array notation: arr[0] = value[1]"}}]"#;
 
-    let result = parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 1);
+    let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 1);
 
-    let args: serde_json::Value = serde_json::from_str(&result[0].function.arguments).unwrap();
+    let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
     assert_eq!(args["text"], "Array notation: arr[0] = value[1]");
 }
 
@@ -93,10 +96,10 @@ async fn test_mistral_with_brackets_in_strings() {
 async fn test_mistral_format_detection() {
     let parser = MistralParser::new();
 
-    assert!(parser.detect_format("[TOOL_CALLS] ["));
-    assert!(parser.detect_format("Some text [TOOL_CALLS] ["));
-    assert!(!parser.detect_format("Just plain text"));
-    assert!(!parser.detect_format("[{\"name\": \"test\"}]")); // JSON array without TOOL_CALLS
+    assert!(parser.has_tool_markers("[TOOL_CALLS] ["));
+    assert!(parser.has_tool_markers("Some text [TOOL_CALLS] ["));
+    assert!(!parser.has_tool_markers("Just plain text"));
+    assert!(!parser.has_tool_markers("[{\"name\": \"test\"}]")); // JSON array without TOOL_CALLS
 }
 
 #[tokio::test]
@@ -105,15 +108,15 @@ async fn test_mistral_malformed_json() {
 
     // Missing closing bracket
     let input = r#"[TOOL_CALLS] [{"name": "test", "arguments": {}"#;
-    if let Ok(result) = parser.parse_complete(input).await {
-        assert_eq!(result.len(), 0);
+    if let Ok((_normal_text, tools)) = parser.parse_complete(input).await {
+        assert_eq!(tools.len(), 0);
     }
     // Error is also acceptable for malformed input
 
     // Invalid JSON inside
     let input = r#"[TOOL_CALLS] [{"name": invalid}]"#;
-    if let Ok(result) = parser.parse_complete(input).await {
-        assert_eq!(result.len(), 0);
+    if let Ok((_normal_text, tools)) = parser.parse_complete(input).await {
+        assert_eq!(tools.len(), 0);
     }
     // Error is also acceptable for malformed input
 }
@@ -146,8 +149,9 @@ async fn test_mistral_real_world_output() {
 
 Let me execute these searches for you."#;
 
-    let result = parser.parse_complete(input).await.unwrap();
-    assert_eq!(result.len(), 2);
-    assert_eq!(result[0].function.name, "web_search");
-    assert_eq!(result[1].function.name, "get_weather");
+    let (normal_text, tools) = parser.parse_complete(input).await.unwrap();
+    assert_eq!(tools.len(), 2);
+    assert_eq!(normal_text, "I'll search for information about Rust programming and check the weather in San Francisco.\n\n");
+    assert_eq!(tools[0].function.name, "web_search");
+    assert_eq!(tools[1].function.name, "get_weather");
 }

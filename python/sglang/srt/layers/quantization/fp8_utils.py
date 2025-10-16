@@ -2,11 +2,10 @@ from typing import Callable, List, Optional, Tuple
 
 import torch
 
-from sglang.srt import offloader
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
-from sglang.srt.utils import is_sm100_supported
+from sglang.srt.utils import is_sm100_supported, offloader
 
 try:
     from vllm import _custom_ops as ops
@@ -29,7 +28,6 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 )
 from sglang.srt.utils import (
     align,
-    ceil_div,
     get_bool_env_var,
     get_cuda_version,
     get_device_capability,
@@ -732,7 +730,7 @@ def apply_fp8_linear(
                 # final solution should be: 1. add support to per-tensor activation scaling.
                 # 2. solve the torch.compile error from weight_scale.numel() == 1 and x_scale.numel() > 1 (below line#308)
                 if _is_hip and weight_scale.numel() == 1:
-                    qinput, x_scale = ops.scaled_fp8_quant(
+                    qinput, x_scale = scaled_fp8_quant(
                         input_2d,
                         input_scale,
                         use_per_token_if_dynamic=use_per_token_if_dynamic,

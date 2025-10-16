@@ -191,30 +191,31 @@ class TestQwen2AudioServer(AudioOpenAITestMixin):
         cls.base_url += "/v1"
 
 
-class TestKimiVLServer(ImageOpenAITestMixin):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = "moonshotai/Kimi-VL-A3B-Instruct"
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--trust-remote-code",
-                "--context-length",
-                "4096",
-                "--dtype",
-                "bfloat16",
-                "--cuda-graph-max-bs",
-                "4",
-            ],
-        )
-        cls.base_url += "/v1"
+# Temporarily skip Kimi-VL for CI test due to issue in transformers=4.57.0
+# class TestKimiVLServer(ImageOpenAITestMixin):
+#     @classmethod
+#     def setUpClass(cls):
+#         cls.model = "moonshotai/Kimi-VL-A3B-Instruct"
+#         cls.base_url = DEFAULT_URL_FOR_TEST
+#         cls.api_key = "sk-123456"
+#         cls.process = popen_launch_server(
+#             cls.model,
+#             cls.base_url,
+#             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+#             other_args=[
+#                 "--trust-remote-code",
+#                 "--context-length",
+#                 "4096",
+#                 "--dtype",
+#                 "bfloat16",
+#                 "--cuda-graph-max-bs",
+#                 "4",
+#             ],
+#         )
+#         cls.base_url += "/v1"
 
-    def test_video_images_chat_completion(self):
-        pass
+#     def test_video_images_chat_completion(self):
+#         pass
 
 
 class TestGLM41VServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
@@ -240,11 +241,35 @@ class TestGLM41VServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
         cls.base_url += "/v1"
 
 
+class TestQwen3OmniServer(OmniOpenAITestMixin):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[  # workaround to fit into H100
+                "--trust-remote-code",
+                "--mem-fraction-static",
+                "0.90",
+                "--disable-cuda-graph",
+                "--disable-fast-image-processor",
+                "--grammar-backend",
+                "none",
+            ],
+        )
+        cls.base_url += "/v1"
+
+
 if __name__ == "__main__":
     del (
-        TestOpenAIOmniServerBase,
+        TestOpenAIMLLMServerBase,
         ImageOpenAITestMixin,
         VideoOpenAITestMixin,
         AudioOpenAITestMixin,
+        OmniOpenAITestMixin,
     )
     unittest.main()

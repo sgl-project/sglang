@@ -11,11 +11,7 @@ from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_moe_tensor_parallel_rank,
     get_moe_tensor_parallel_world_size,
-    get_tp_group,
     tensor_model_parallel_all_reduce,
-)
-from sglang.srt.distributed.device_communicators.pynccl_allocator import (
-    use_symmetric_memory,
 )
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.layers.moe import (
@@ -24,7 +20,6 @@ from sglang.srt.layers.moe import (
     should_use_flashinfer_trtllm_moe,
 )
 from sglang.srt.layers.moe.token_dispatcher.standard import (
-    CombineInput,
     StandardDispatcher,
     StandardDispatchOutput,
 )
@@ -32,12 +27,10 @@ from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputChecker
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
-    QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -161,8 +154,7 @@ class FusedMoE(torch.nn.Module):
         self.moe_tp_rank = get_moe_tensor_parallel_rank()
         assert num_experts % self.moe_ep_size == 0
         self.num_local_experts = num_experts // self.moe_ep_size
-        self.start_expert_id = self.moe_ep_rank * self.num_local_experts
-        self.end_expert_id = self.start_expert_id + self.num_local_experts - 1
+
         if self.moe_ep_size > 1:
             # TODO(ch-wan): support shared experts fusion
             # Create a tensor of size num_experts filled with -1
@@ -212,15 +204,11 @@ class FusedMoE(torch.nn.Module):
             gemm1_clamp_limit=gemm1_clamp_limit,
         )
 
-        if quant_config is None:
-            self.quant_method: FusedMoEMethodBase = UnquantizedFusedMoEMethod(
-                self.use_triton_kernels
-            )
-        else:
-            self.quant_method: FusedMoEMethodBase = quant_config.get_quant_method(
-                self, prefix
-            )
-        assert self.quant_method is not None
+        self.quant_method: Optional[FusedMoEMethodBase] = None
+        if quant_config is not None:
+            self.quant_method = quant_config.get_quant_method(self, prefix)
+        if self.quant_method is None:
+            self.quant_method = UnquantizedFusedMoEMethod(self.use_triton_kernels)
 
         self.quant_method.create_weights(
             layer=self,
@@ -238,6 +226,13 @@ class FusedMoE(torch.nn.Module):
 
         self.quant_method.create_moe_runner(self, self.moe_runner_config)
         self.dispatcher = StandardDispatcher()
+
+        self.should_fuse_routed_scaling_factor_in_topk = isinstance(
+            self.quant_method, ModelOptNvFp4FusedMoEMethod
+        ) or (
+            isinstance(self.quant_method, Fp8MoEMethod)
+            and self.quant_method.use_cutlass_fused_experts_fp8
+        )
 
     def _load_per_tensor_weight_scale(
         self,
@@ -575,7 +570,10 @@ class FusedMoE(torch.nn.Module):
             )
 
         # Flashinfer assumes w31 format for w13_weight. Same for the scales.
-        if should_use_flashinfer_trtllm_moe():
+        if should_use_flashinfer_trtllm_moe() and (
+            isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
+            or isinstance(self.quant_method, Fp8MoEMethod)
+        ):
             shard_id = {"w1": "w3", "w3": "w1", "w2": "w2"}[shard_id]
 
         WEIGHT_SCALE_SUPPORTED = [e.value for e in FusedMoeWeightScaleSupported]
@@ -937,12 +935,6 @@ class FusedMoE(torch.nn.Module):
             for expert_id in range(num_experts)
             for shard_id in ["w1", "w2", "w3"]
         ]
-
-    def should_fuse_routed_scaling_factor_in_topk(self):
-        return isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod) or (
-            isinstance(self.quant_method, Fp8MoEMethod)
-            and self.quant_method.use_cutlass_fused_experts_fp8
-        )
 
 
 class FlashInferFusedMoE(FusedMoE):

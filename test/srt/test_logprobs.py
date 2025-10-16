@@ -49,7 +49,7 @@ class TestLogprobsDense(unittest.TestCase):
             model_path=DENSE_MODEL_NAME,
             random_seed=42,
             skip_tokenizer_init=True,
-            mem_fraction_static=0.85,
+            mem_fraction_static=0.80,
         )
 
     @classmethod
