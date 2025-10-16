@@ -251,14 +251,14 @@ class TestQwen3OmniServer(OmniOpenAITestMixin):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
+            other_args=[  # workaround to fit into H100
                 "--trust-remote-code",
                 "--mem-fraction-static",
-                "0.68",
-                "--cuda-graph-max-bs",
-                "4",
-                "--quantization",
-                "fp8",
+                "0.90",
+                "--disable-cuda-graph",
+                "--disable-fast-image-processor",
+                "--grammar-backend",
+                "none",
             ],
         )
         cls.base_url += "/v1"
