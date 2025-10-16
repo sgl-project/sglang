@@ -316,14 +316,12 @@ impl RouterTrait for RouterManager {
     async fn get_models(&self, req: Request<Body>) -> Response {
         // In single-router mode, delegate to the router (especially for OpenAI mode)
         if !self.enable_igw {
-            let router = {
-                let default_router = self.default_router.read().unwrap();
-                if let Some(ref default_id) = *default_router {
-                    self.routers.get(default_id).map(|r| r.clone())
-                } else {
-                    None
-                }
-            };
+            let router = self
+                .default_router
+                .read()
+                .expect("Default router lock is poisoned")
+                .as_ref()
+                .and_then(|id| self.routers.get(id).map(|r| r.value().clone()));
 
             if let Some(router) = router {
                 return router.get_models(req).await;
