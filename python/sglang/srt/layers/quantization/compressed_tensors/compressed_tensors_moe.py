@@ -12,7 +12,11 @@ from enum import Enum
 from typing import TYPE_CHECKING, Dict, List, Optional
 
 from safetensors import safe_open
-from sgl_kernel import fused_marlin_moe
+try:
+    from sgl_kernel import fused_marlin_moe
+    FUSED_MARLIN_MOE_AVAILABLE = True
+except ImportError:
+    FUSED_MARLIN_MOE_AVAILABLE = False
 
 try:
     from kt_kernel import AMXMoEWrapper
@@ -753,6 +757,11 @@ class CompressedTensorsWNA16AMXMoEMethod(CompressedTensorsMoEMethod):
         if not KTRANSFORMERS_AVAILABLE:
             raise ImportError(
                 "kt_kernel is not installed, to use CompressedTensorsWNA16AMXEPMoEMethod, please install kt_kernel."
+            )
+
+        if not FUSED_MARLIN_MOE_AVAILABLE:
+            raise ImportError(
+                "fused_marlin_moe is not available"
             )
 
         self.tp_rank = get_tensor_model_parallel_rank()
