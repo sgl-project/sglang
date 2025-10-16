@@ -2,6 +2,7 @@ from dataclasses import astuple, dataclass
 from functools import lru_cache
 from typing import Optional, Union
 
+import einops
 import torch
 import torch.nn.functional as F
 
@@ -22,6 +23,10 @@ from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
 from sglang.srt.layers.attention.mamba.mamba2_metadata import (
     ForwardMetadata,
     Mamba2Metadata,
+)
+from sglang.srt.layers.lightning_attn import (
+    lightning_attention,
+    linear_decode_forward_triton,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, MambaPool
@@ -528,13 +533,198 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         )
 
 
+class LightningBackend(MambaAttnBackendBase):
+    """Attention backend using Lightning kernel."""
+
+    @staticmethod
+    def _get_num_prefills(forward_batch: ForwardBatch):
+        if forward_batch.forward_mode.is_extend():
+            return forward_batch.batch_size
+        elif forward_batch.forward_mode.is_mixed():
+            return (
+                len(forward_batch.extend_seq_lens)
+                if forward_batch.extend_seq_lens is not None
+                else 0
+            )
+        else:
+            return 0
+
+    @staticmethod
+    def _get_num_prefill_tokens(forward_batch: ForwardBatch):
+        if (
+            forward_batch.forward_mode.is_extend()
+            or forward_batch.forward_mode.is_mixed()
+        ):
+            if forward_batch.extend_num_tokens is not None:
+                return forward_batch.extend_num_tokens
+            elif forward_batch.extend_seq_lens is not None:
+                return int(forward_batch.extend_seq_lens.sum().item())
+            else:
+                return 0
+        else:
+            return 0
+
+    @staticmethod
+    def _get_num_decode_tokens(forward_batch: ForwardBatch):
+        if forward_batch.forward_mode.is_decode():
+            return forward_batch.batch_size
+        elif forward_batch.forward_mode.is_mixed():
+            num_prefills = LightningBackend._get_num_prefills(forward_batch)
+            return max(0, forward_batch.batch_size - num_prefills)
+        else:
+            return 0
+
+    def forward_decode(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
+        **kwargs,
+    ):
+        layer_id = kwargs["layer_id"]
+        slope_rate = kwargs["slope_rate"]
+
+        num_prefill_tokens = LightningBackend._get_num_prefill_tokens(forward_batch)
+        q = q[num_prefill_tokens:].unsqueeze(2).contiguous()
+        k = k[num_prefill_tokens:].unsqueeze(2).contiguous()
+        v = v[num_prefill_tokens:].unsqueeze(2).contiguous()
+
+        state_cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
+        slot_id = self.forward_metadata.mamba_cache_indices
+
+        hidden = linear_decode_forward_triton(
+            q, k, v, state_cache, slope_rate, slot_id, 32
+        )
+        return hidden
+
+    def forward_extend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
+        **kwargs,
+    ):
+        layer_id = kwargs["layer_id"]
+        slope_rate = kwargs["slope_rate"]
+        block_size = kwargs.get("BLOCK", 256)
+
+        state_cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
+        query_start_loc = self.forward_metadata.query_start_loc
+
+        hidden = []
+        for _prefill_idx in range(self._get_num_prefills(forward_batch)):
+            if _prefill_idx >= len(forward_batch.extend_start_loc):
+                break
+            if _prefill_idx >= len(query_start_loc):
+                break
+
+            _start = forward_batch.extend_start_loc[_prefill_idx]
+
+            if _prefill_idx + 1 < len(forward_batch.extend_start_loc):
+                _end = forward_batch.extend_start_loc[_prefill_idx + 1]
+            else:
+                if forward_batch.extend_seq_lens is not None and _prefill_idx < len(
+                    forward_batch.extend_seq_lens
+                ):
+                    seq_len = forward_batch.extend_seq_lens[_prefill_idx]
+                    _end = _start + seq_len
+                else:
+                    _end = q.shape[0]
+
+            slot_id = self.forward_metadata.mamba_cache_indices[_prefill_idx]
+            qs = q[_start:_end].transpose(0, 1).contiguous()
+            ks = k[_start:_end].transpose(0, 1).contiguous()
+            vs = v[_start:_end].transpose(0, 1).contiguous()
+            slice_layer_cache = state_cache[slot_id, ...]
+
+            def jit_linear_forward_prefix(
+                q: torch.Tensor,
+                k: torch.Tensor,
+                v: torch.Tensor,
+                kv_caches: torch.Tensor,
+                slope_rate: torch.Tensor,
+                block_size: int,
+                layer_idx: int = None,
+                **kwargs,
+            ) -> torch.Tensor:
+
+                slope_rate = slope_rate.to(torch.float32)
+                should_pad_dim = q.dim() == 3
+                if should_pad_dim:
+                    q = q.unsqueeze(0)
+                    k = k.unsqueeze(0)
+                    v = v.unsqueeze(0)
+                b, h, n, d = q.shape
+                e = d
+                kv_history = kv_caches.reshape(1, h, d, e).contiguous()
+                output, kv_history = lightning_attention(
+                    q, k, v, slope_rate, block_size=block_size, kv_history=kv_history
+                )
+                kv_caches.copy_(kv_history[:, :, -1, :, :].reshape(h, d, e))
+                assert output.shape[0] == 1, "batch size must be 1"
+                return einops.rearrange(output.squeeze(0), "h n d -> n (h d)")
+
+            out_slice = jit_linear_forward_prefix(
+                qs,
+                ks,
+                vs,
+                slice_layer_cache,
+                slope_rate,
+                block_size,
+                layer_id,
+            )
+            hidden.append(out_slice.contiguous())
+        if self._get_num_decode_tokens(forward_batch) > 0:
+            hidden.append(
+                self.forward_decode(
+                    q, k, v, layer, forward_batch, save_kv_cache, **kwargs
+                )
+            )
+
+        if not hidden:
+            return torch.empty((0, q.size(-1)), device=q.device, dtype=q.dtype)
+
+        hidden = torch.concat(hidden, dim=0).contiguous()
+        return hidden
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
+        **kwargs,
+    ):
+        mode = forward_batch.forward_mode
+        if mode.is_idle():
+            return torch.empty_like(q)
+        elif mode.is_decode():
+            return self.forward_decode(
+                q, k, v, layer, forward_batch, save_kv_cache, **kwargs
+            )
+        elif mode.is_extend():
+            return self.forward_extend(
+                q, k, v, layer, forward_batch, save_kv_cache, **kwargs
+            )
+        else:
+            raise ValueError(f"Unsupported forward mode: {mode}")
+
+
 class HybridLinearAttnBackend(AttentionBackend):
     """Manages a full and linear attention backend"""
 
     def __init__(
         self,
         full_attn_backend: AttentionBackend,
-        linear_attn_backend: MambaAttnBackendBase,
+        linear_attn_backend: MambaAttnBackendBase | LightningBackend,
         full_attn_layers: list[int],
     ):
         self.full_attn_layers = full_attn_layers

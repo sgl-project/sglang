@@ -115,3 +115,14 @@ class Mamba2CacheParams:
             int(np.prod(self.shape.conv)) * self.dtype.conv.itemsize
             + int(np.prod(self.shape.temporal)) * self.dtype.temporal.itemsize
         ) * len(self.layers)
+
+
+@dataclass(kw_only=True, frozen=True)
+class MinimaxCacheParams:
+    shape: tuple[int, int, int]  # (H, D, D)
+    dtype: torch.dtype
+    layers: list[int]
+
+    @property
+    def mamba_cache_per_req(self) -> int:
+        return int(np.prod(self.shape)) * self.dtype.itemsize * len(self.layers)

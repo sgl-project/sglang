@@ -29,7 +29,12 @@ from typing import List, Optional, Tuple, Union
 import torch
 import torch.distributed as dist
 
-from sglang.srt.configs import FalconH1Config, NemotronHConfig, Qwen3NextConfig
+from sglang.srt.configs import (
+    FalconH1Config,
+    MiniMaxText01Config,
+    NemotronHConfig,
+    Qwen3NextConfig,
+)
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.configs.model_config import (
@@ -398,8 +403,8 @@ class ModelRunner:
             if architectures and not any("Llama4" in arch for arch in architectures):
                 self.is_hybrid = self.model_config.is_hybrid = True
 
-        if config := self.mamba2_config:
-            class_name = config.__class__.__name__
+        if self.mamba2_config is not None or self.minimax_config is not None:
+            class_name = self.mambaish_config.__class__.__name__
             logger.warning(f"{class_name} model detected, disable radix cache")
             self.server_args.disable_radix_cache = True
 
@@ -1437,8 +1442,15 @@ class ModelRunner:
         return None
 
     @property
+    def minimax_config(self):
+        config = self.model_config.hf_config
+        if isinstance(config, MiniMaxText01Config):
+            return config
+        return None
+
+    @property
     def mambaish_config(self):
-        return self.mamba2_config or self.hybrid_gdn_config
+        return self.mamba2_config or self.hybrid_gdn_config or self.minimax_config
 
     def set_num_token_hybrid(self):
         if (

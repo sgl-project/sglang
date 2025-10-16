@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from sglang.srt.configs.mamba_utils import Mamba2CacheParams
+from sglang.srt.configs.mamba_utils import Mamba2CacheParams, MinimaxCacheParams
 from sglang.srt.layers.attention.nsa import index_buf_accessor
 from sglang.srt.layers.attention.nsa.quant_k_cache import quantize_k_cache
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -254,6 +254,69 @@ class MambaPool:
         return dst_index
 
 
+class MinimaxCachePool:
+    def __init__(
+        self,
+        size: int,
+        cache_params: MinimaxCacheParams,
+        device: str,
+    ):
+        state_shape = cache_params.shape
+        state_dtype = cache_params.dtype
+        num_linear_layers = len(cache_params.layers)
+        state = torch.zeros(
+            size=(num_linear_layers, size + 1) + state_shape,
+            dtype=state_dtype,
+            device=device,
+        )
+
+        self.minimax_cache = state
+        logger.info(
+            f"[MinimaxCachePool] Allocated. "
+            f"state: L={num_linear_layers}, slots={size}, D={state_shape[0]}x{state_shape[1]}x{state_shape[2]}, "
+            f"state size={get_tensor_size_bytes(state) / GB:.2f} GB"
+        )
+        self.size = size
+        self.device = device
+        self.free_slots = torch.arange(self.size, dtype=torch.int64, device=self.device)
+        self.mem_usage = get_tensor_size_bytes(state) / GB
+
+    def mamba2_layer_cache(self, layer_id: int):
+        return self.minimax_cache[layer_id]
+
+    def available_size(self):
+        return len(self.free_slots)
+
+    def alloc(self, need_size: int) -> Optional[torch.Tensor]:
+        if need_size > len(self.free_slots):
+            return None
+
+        select_index = self.free_slots[:need_size]
+        self.free_slots = self.free_slots[need_size:]
+
+        return select_index
+
+    def free(self, free_index: torch.Tensor):
+        if free_index.numel() == 0:
+            return
+        self.free_slots = torch.cat((self.free_slots, free_index))
+        self.minimax_cache[:, free_index] = 0
+
+    def clear(self):
+        self.free_slots = torch.arange(self.size, dtype=torch.int64, device=self.device)
+
+    def copy_from(self, src_index: torch.Tensor, dst_index: torch.Tensor):
+        self.minimax_cache[:, dst_index] = self.minimax_cache[:, src_index]
+        return
+
+    def fork_from(self, src_index: torch.Tensor) -> Optional[torch.Tensor]:
+        dst_index = self.alloc(1)
+        if dst_index == None:
+            return None
+        self.copy_from(src_index, dst_index)
+        return dst_index
+
+
 class HybridReqToTokenPool(ReqToTokenPool):
     """A memory pool that maps a request to its token locations."""
 
@@ -265,7 +328,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         max_context_len: int,
         device: str,
         enable_memory_saver: bool,
-        cache_params: "Mamba2CacheParams",
+        cache_params: Mamba2CacheParams | MinimaxCacheParams,
         speculative_num_draft_tokens: int = None,
     ):
         super().__init__(
@@ -275,12 +338,20 @@ class HybridReqToTokenPool(ReqToTokenPool):
             enable_memory_saver=enable_memory_saver,
         )
 
-        self.mamba_pool = MambaPool(
-            size=mamba_size,
-            cache_params=cache_params,
-            device=device,
-            speculative_num_draft_tokens=speculative_num_draft_tokens,
-        )
+        if isinstance(cache_params, Mamba2CacheParams):
+            self.mamba_pool = MambaPool(
+                size=mamba_size,
+                cache_params=cache_params,
+                device=device,
+                speculative_num_draft_tokens=speculative_num_draft_tokens,
+            )
+        elif isinstance(cache_params, MinimaxCacheParams):
+            self.mamba_pool = MinimaxCachePool(
+                size=mamba_size,
+                cache_params=cache_params,
+                device=device,
+            )
+
         self.mamba_map = {layer_id: i for i, layer_id in enumerate(cache_params.layers)}
 
         self.device = device

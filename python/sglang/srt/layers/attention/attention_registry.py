@@ -187,6 +187,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
             GDNAttnBackend,
             HybridLinearAttnBackend,
+            LightningBackend,
             Mamba2AttnBackend,
         )
         from sglang.srt.utils import is_blackwell, is_npu
@@ -205,9 +206,11 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             linear_attn_backend = GDNAttnBackend(runner)
         elif runner.mamba2_config is not None:
             linear_attn_backend = Mamba2AttnBackend(runner)
+        elif runner.minimax_config is not None:
+            linear_attn_backend = LightningBackend(runner)
         else:
             raise ValueError(
-                "Expected hybrid GDN or NemotronH models, but got unknown model."
+                "Expected hybrid GDN, NemotronH, or MiniMax models, but got unknown model."
             )
         full_attn_layers = cfg.full_attention_layer_ids
         return HybridLinearAttnBackend(
