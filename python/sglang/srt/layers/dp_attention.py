@@ -317,6 +317,13 @@ def initialize_dp_attention(
     )
 
 
+def destroy_dp_attention():
+    global _ATTN_TP_GROUP
+    if _ATTN_TP_GROUP is not None:
+        _ATTN_TP_GROUP.destroy()
+    _ATTN_TP_GROUP = None
+
+
 def is_dp_attention_enabled() -> bool:
     return _ENABLE_DP_ATTENTION_FLAG
 

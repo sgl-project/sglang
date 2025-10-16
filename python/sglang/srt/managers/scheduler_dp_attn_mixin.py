@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Callable
 
 import torch
 
+from sglang.srt.distributed import parallel_state
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.two_batch_overlap import TboDPAttentionPreparer
 from sglang.srt.utils.common import require_mlp_tp_gather
@@ -179,7 +180,7 @@ class SchedulerDPAttnMixin:
             local_batch,
             dp_size=self.server_args.dp_size,
             attn_tp_size=self.attn_tp_size,
-            tp_group=self.tp_group,
+            tp_group=parallel_state.get_tp_group(),
             get_idle_batch=self.get_idle_batch,
             disable_cuda_graph=self.server_args.disable_cuda_graph,
             require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),

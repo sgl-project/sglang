@@ -25,6 +25,7 @@ from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.dllm.algorithm.base import DllmAlgorithm
 from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
+    ExtendWorldReqInput,
     GetWeightsByNameReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
@@ -242,6 +243,8 @@ class TpModelWorker(BaseTpWorker):
         if server_args.dllm_algorithm is not None:
             self.dllm_algorithm = DllmAlgorithm.from_server_args(server_args)
 
+        logger.info("init model runner")
+
         self._model_runner = ModelRunner(
             model_config=self.model_config,
             mem_fraction_static=server_args.mem_fraction_static,
@@ -310,13 +313,15 @@ class TpModelWorker(BaseTpWorker):
         ), "Memory pool size is too small"
 
         # Sync random seed across TP workers
-        self.random_seed = broadcast_pyobj(
-            [server_args.random_seed],
-            self.tp_size * self.pp_rank + tp_rank,
-            self.world_group.cpu_group,
-            src=self.world_group.ranks[0],
-        )[0]
-        set_random_seed(self.random_seed)
+        # self.random_seed = broadcast_pyobj(
+        #     [server_args.random_seed],
+        #     self.tp_size * self.pp_rank + tp_rank,
+        #     self.world_group.cpu_group,
+        #     src=self.world_group.ranks[0],
+        # )[0]
+        # set_random_seed(self.random_seed)
+        self.random_seed = server_args.random_seed
+        set_random_seed(server_args.random_seed)
 
         self.enable_overlap = not server_args.disable_overlap_schedule
         self.enable_spec = server_args.speculative_algorithm is not None
@@ -473,3 +478,6 @@ class TpModelWorker(BaseTpWorker):
         )
         batch_result.next_token_ids = next_token_ids
         return batch_result
+
+    def extend_world(self, recv_req: ExtendWorldReqInput):
+        self.model_runner.extend_world(recv_req.new_size)

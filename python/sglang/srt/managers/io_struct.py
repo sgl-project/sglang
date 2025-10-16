@@ -1449,6 +1449,11 @@ class OpenSessionReqOutput(BaseReq):
 
 
 @dataclass
+class ExtendWorldReqInput(BaseReq):
+    new_size: int
+
+
+@dataclass
 class HealthCheckOutput(BaseReq):
     pass
 

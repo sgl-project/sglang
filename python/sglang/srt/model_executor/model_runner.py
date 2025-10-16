@@ -53,6 +53,8 @@ from sglang.srt.debug_utils.tensor_dump_forward_hook import (
     register_forward_hook_for_model,
 )
 from sglang.srt.distributed import (
+    destroy_distributed_environment,
+    destroy_model_parallel,
     get_pp_group,
     get_tp_group,
     get_world_group,
@@ -84,6 +86,7 @@ from sglang.srt.layers.attention.attention_registry import (
 )
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.dp_attention import (
+    destroy_dp_attention,
     get_attention_tp_group,
     get_attention_tp_size,
     initialize_dp_attention,
@@ -175,6 +178,9 @@ from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorBucket,
     FlattenedTensorMetadata,
 )
+from sglang.srt.layers.moe.token_dispatcher.mooncake import EPBuffer
+from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
+from sglang.srt.utils import broadcast_pyobj
 
 MLA_ATTENTION_BACKENDS = [
     "aiter",
@@ -1381,7 +1387,7 @@ class ModelRunner:
         available_gpu_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
-            distributed=get_world_group().world_size > 1,
+            distributed=False,
             cpu_group=get_world_group().cpu_group,
         )
         if self.is_draft_worker:
@@ -2452,6 +2458,53 @@ class ModelRunner:
             ),
         )
         return next_token_ids
+
+    def extend_world(self, new_size: int):
+        logger.info(f"Extending world to {new_size}")
+        assert self.server_args.elastic_ep_backend == "mooncake"
+        destroy_dp_attention()
+        destroy_model_parallel()
+        destroy_distributed_environment()
+
+        assert self.server_args.enable_dp_attention
+        assert self.server_args.pp_size == 1
+        old_tp_size = self.server_args.tp_size
+        old_dp_size = self.server_args.dp_size
+        tp_attn_size = self.server_args.tp_size // self.server_args.dp_size
+        assert new_size % self.server_args.pp_size == 0
+        self.tp_size = self.server_args.tp_size = new_size // self.server_args.pp_size
+        self.moe_ep_size = self.server_args.ep_size = self.server_args.tp_size
+        assert self.server_args.tp_size % tp_attn_size == 0
+        self.dp_size = self.server_args.dp_size = self.server_args.tp_size // tp_attn_size
+
+        num_logical_experts = self.model_config.hf_config.n_routed_experts
+        old_num_physical_experts = num_logical_experts + self.server_args.ep_num_redundant_experts
+        assert old_num_physical_experts % old_dp_size == 0
+        new_num_physical_experts = old_num_physical_experts // old_dp_size * self.server_args.dp_size
+        self.server_args.ep_num_redundant_experts = new_num_physical_experts - num_logical_experts
+
+        self.init_torch_distributed()
+
+        # To sync with the new ranks' load_weight barrier
+        dist.barrier(group=get_tp_group().cpu_group)
+
+        EPBuffer.clear_ep_buffer()
+        ElasticEPStateManager.reinit(self.server_args)
+        if isinstance(self.model, DeepseekV2ForCausalLM):
+            self.model.reset_token_dispatcher()
+        self.init_device_graphs()
+        self.forward_pass_id = 0
+        self.tp_group = get_tp_group()
+
+        # Broadcast ctrl reqs to make the new schedulers happy
+        control_reqs = []
+        broadcast_pyobj(
+            control_reqs,
+            self.tp_group.rank,
+            self.tp_group.cpu_group,
+            src=self.tp_group.ranks[0],
+        )
+        logger.info("extend world done")
 
     def compute_logprobs_only(
         self,

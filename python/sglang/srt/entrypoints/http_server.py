@@ -82,6 +82,7 @@ from sglang.srt.managers.io_struct import (
     ContinueGenerationReqInput,
     DestroyWeightsUpdateGroupReqInput,
     EmbeddingReqInput,
+    ExtendWorldReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -606,6 +607,12 @@ async def generate_request(obj: GenerateReqInput, request: Request):
         except ValueError as e:
             logger.error(f"[http_server] Error: {e}")
             return _create_error_response(e)
+
+
+@app.post("/extend_world")
+async def extend_world(obj: ExtendWorldReqInput, request: Request):
+    _global_state.tokenizer_manager.extend_world(obj, request)
+    return {}
 
 
 @app.api_route("/generate_from_file", methods=["POST"])

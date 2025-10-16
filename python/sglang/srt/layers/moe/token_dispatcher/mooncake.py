@@ -104,6 +104,10 @@ class EPBuffer:
         cls._buffer = Buffer(group, num_ep_buffer_bytes)
         return cls._buffer
 
+    @classmethod
+    def clear_ep_buffer(cls):
+        cls._buffer = None
+
 
 class _MooncakeEPDispatcherImpl:
     def __init__(

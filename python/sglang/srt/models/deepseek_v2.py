@@ -41,6 +41,7 @@ from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_pp_group,
     get_tensor_model_parallel_world_size,
+    parallel_state,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -137,6 +138,8 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.single_batch_overlap import SboFlags, compute_overlap_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.two_batch_overlap import model_forward_maybe_tbo
+from sglang.srt.two_batch_overlap import MaybeTboDeepEPDispatcher
+from sglang.srt.layers.moe.utils import DEEPEP_MODE
 from sglang.srt.utils import (
     BumpAllocator,
     LazyValue,
@@ -744,6 +747,22 @@ class DeepseekV2MoE(nn.Module):
             for name, x in self.experts.named_parameters()
             if name not in ["correction_bias"]
         ]
+
+    def reset_token_dispatcher(self):
+        # TODO: avoid hardcode
+        self.experts.dispatcher = MaybeTboDeepEPDispatcher(
+            group=parallel_state.get_tp_group().device_group,
+            router_topk=self.top_k,
+            permute_fusion=True,
+            num_experts=self.config.n_routed_experts
+            + self.num_fused_shared_experts
+            + get_global_server_args().ep_num_redundant_experts,
+            hidden_size=self.config.hidden_size,
+            params_dtype=self.config.torch_dtype,
+            deepep_mode=DEEPEP_MODE.LOW_LATENCY,
+            async_finish=True,
+            return_recv_hook=True,
+        )
 
     def forward(
         self,
@@ -3106,6 +3125,10 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
         return output
 
+    def reset_token_dispatcher(self):
+        if isinstance(self.mlp, DeepseekV2MoE):
+            self.mlp.reset_token_dispatcher()
+
 
 class DeepseekV2Model(nn.Module):
     fall_back_to_pt_during_load = False
@@ -3725,6 +3748,11 @@ class DeepseekV2ForCausalLM(nn.Module):
                 transform_scale_ue8m0_inplace(w[1], mn=w[0].shape[-2])
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
+        # TODO: avoid hardcode
+        # if parallel_state.get_tp_group().rank >= 4:
+        #     weights = (
+        #         (name, weight) for name, weight in weights if "mlp.experts" not in name or "mlp.shared_experts" in name
+        #     )
 
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):
@@ -4091,6 +4119,11 @@ class DeepseekV2ForCausalLM(nn.Module):
             # we plus 1 here because in sglang, for the ith layer, it takes the output
             # of the (i-1)th layer as aux hidden state
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
+
+    def reset_token_dispatcher(self):
+        for layer in self.model.layers:
+            if hasattr(layer, "reset_token_dispatcher") and callable(layer.reset_token_dispatcher):
+                layer.reset_token_dispatcher()
 
 
 AttentionBackendRegistry.register("ascend", handle_attention_ascend)
