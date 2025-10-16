@@ -286,8 +286,6 @@ class ModelRunner:
         self.forward_pass_id = 0
 
         # Apply the rank zero filter to logger
-        if not any(isinstance(f, RankZeroFilter) for f in logger.filters):
-            logger.addFilter(RankZeroFilter(tp_rank == 0))
         if server_args.show_time_cost:
             enable_show_time_cost()
 
@@ -577,8 +575,9 @@ class ModelRunner:
                     server_args.attention_backend = "ascend"
                 else:
                     server_args.attention_backend = "triton"
-            logger.info(
-                f"Attention backend not explicitly specified. Use {server_args.attention_backend} backend by default."
+            log_info_on_rank0(
+                logger,
+                f"Attention backend not explicitly specified. Use {server_args.attention_backend} backend by default.",
             )
         elif self.use_mla_backend:
             if server_args.device != "cpu":

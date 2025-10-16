@@ -2484,13 +2484,7 @@ class ServerArgs:
             default=ServerArgs.mamba_full_memory_ratio,
             help="The ratio of mamba state memory to full kv cache memory.",
         )
-        # Args for multi-item-scoring
-        parser.add_argument(
-            "--multi-item-scoring-delimiter",
-            type=int,
-            default=ServerArgs.multi_item_scoring_delimiter,
-            help="Delimiter token ID for multi-item scoring. Used to combine Query and Items into a single sequence: Query<delimiter>Item1<delimiter>Item2<delimiter>... This enables efficient batch processing of multiple items against a single query.",
-        )
+
         # Hierarchical cache
         parser.add_argument(
             "--enable-hierarchical-cache",
@@ -2634,6 +2628,14 @@ class ServerArgs:
             type=str,
             default=ServerArgs.offload_mode,
             help="Mode of offloading.",
+        )
+
+        # Args for multi-item-scoring
+        parser.add_argument(
+            "--multi-item-scoring-delimiter",
+            type=int,
+            default=ServerArgs.multi_item_scoring_delimiter,
+            help="Delimiter token ID for multi-item scoring. Used to combine Query and Items into a single sequence: Query<delimiter>Item1<delimiter>Item2<delimiter>... This enables efficient batch processing of multiple items against a single query.",
         )
 
         # Optimization/debug options
