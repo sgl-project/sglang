@@ -681,7 +681,7 @@ class ModelRunner:
                 if (moe_intermediate_size // moe_tp_size) % weight_block_size_n != 0:
                     raise ValueError(
                         f"For qwen3-vl-fp8 models, please make sure ({moe_intermediate_size=} / {moe_tp_size=}) % {weight_block_size_n=} == 0 "
-                        f"where moe_tp_size is equal to tp_size ({self.tp_size}) divided by moe_ep_size ({self.moe_ep_size})."
+                        f"where moe_tp_size is equal to tp_size ({self.tp_size}) divided by moe_ep_size ({self.moe_ep_size}). "
                         f"You can fix this by setting arguments `--tp-size` and `--ep-size` correctly."
                     )
 
