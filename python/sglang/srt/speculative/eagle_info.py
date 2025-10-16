@@ -150,37 +150,52 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         paged_kernel_lens: torch.Tensor,
         paged_kernel_lens_sum: int,
         req_to_token: torch.Tensor,
+        page_size: int = 1,
     ):
+
+        device = req_to_token.device
         batch_size = len(req_pool_indices)
+
         qo_indptr = torch.arange(
             0,
             (1 + batch_size) * self.draft_token_num,
             step=self.draft_token_num,
             dtype=torch.int32,
-            device="cuda",
+            device=device,
         )
         cum_kv_seq_len = torch.zeros(
-            (batch_size + 1,), dtype=torch.int32, device="cuda"
+            (batch_size + 1,), dtype=torch.int32, device=device
         )
 
-        paged_kernel_lens = paged_kernel_lens + self.draft_token_num
-        cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
+        seq_lens_with_draft_tokens = paged_kernel_lens + self.draft_token_num
+        cum_kv_seq_len[1:] = torch.cumsum(seq_lens_with_draft_tokens, dim=0)
+
+        kv_indptr = torch.zeros((batch_size + 1,), dtype=torch.int32, device=device)
+        num_pages_per_req = (seq_lens_with_draft_tokens + page_size - 1) // page_size
+        kv_indptr[1 : batch_size + 1] = torch.cumsum(num_pages_per_req, dim=0)
 
         kv_indices = torch.empty(
-            paged_kernel_lens_sum + self.draft_token_num * batch_size,
+            kv_indptr[-1],
             dtype=torch.int32,
-            device="cuda",
+            device=device,
         )
+
         create_flashinfer_kv_indices_triton[(batch_size,)](
             req_to_token,
             req_pool_indices,
-            paged_kernel_lens,
-            cum_kv_seq_len,
+            seq_lens_with_draft_tokens,
+            kv_indptr,
             None,
             kv_indices,
             req_to_token.size(1),
+            page_size,
         )
-        return kv_indices, cum_kv_seq_len, qo_indptr, self.custom_mask
+        return (
+            kv_indices,
+            kv_indptr,
+            qo_indptr,
+            self.custom_mask,
+        )
 
     def verify(
         self,
@@ -691,6 +706,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         paged_kernel_lens: torch.Tensor,
         paged_kernel_lens_sum: int,
         req_to_token: torch.Tensor,
+        page_size: int = 1,
     ):
         bs = self.accept_length.numel()
         qo_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device="cuda")
@@ -713,6 +729,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             None,
             kv_indices,
             req_to_token.size(1),
+            page_size,
         )
         return kv_indices, cum_kv_seq_len, qo_indptr, None
 
