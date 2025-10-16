@@ -76,6 +76,7 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     ExpertDistributionReqType,
+    ExtendWorldReqInput,
     FlushCacheReqInput,
     FlushCacheReqOutput,
     FreezeGCReq,
@@ -540,6 +541,7 @@ class Scheduler(
                 (FreezeGCReq, self.handle_freeze_gc),
                 (GetInternalStateReq, self.get_internal_state),
                 (SetInternalStateReq, self.set_internal_state),
+                (ExtendWorldReqInput, self.extend_world),
                 (RpcReqInput, self.handle_rpc_request),
                 (ExpertDistributionReq, self.expert_distribution_handle),
                 (LoadLoRAAdapterReqInput, self.load_lora_adapter),
@@ -739,7 +741,7 @@ class Scheduler(
                     use_hicache=self.enable_hierarchical_cache,
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool=self.token_to_kv_pool_allocator,
-                    tp_cache_group=self.tp_cpu_group,
+                    tp_cache_group=self.tp_worker.get_tp_group().cpu_group,
                     page_size=self.page_size,
                     hicache_ratio=server_args.hicache_ratio,
                     hicache_size=server_args.hicache_size,
@@ -753,7 +755,7 @@ class Scheduler(
                     tp_cache_group=(
                         self.attn_tp_cpu_group
                         if self.server_args.enable_dp_attention
-                        else self.tp_cpu_group
+                        else self.tp_worker.get_tp_group().cpu_group
                     ),
                     page_size=self.page_size,
                     eviction_policy=server_args.radix_eviction_policy,
@@ -801,7 +803,7 @@ class Scheduler(
                     model_config=self.model_config,
                     tp_size=self.tp_size,
                     rank=self.tp_rank,
-                    tp_group=self.tp_group,
+                    tp_group=self.tp_worker.get_tp_group(),
                     eviction_policy=server_args.radix_eviction_policy,
                 )
             else:
@@ -825,7 +827,7 @@ class Scheduler(
                 tp_group=(
                     self.attn_tp_cpu_group
                     if self.server_args.enable_dp_attention
-                    else self.tp_cpu_group
+                    else self.tp_worker.get_tp_group().cpu_group
                 ),
                 tree_cache=self.tree_cache,
                 server_args=self.server_args,
@@ -1080,6 +1082,7 @@ class Scheduler(
                             TokenizedEmbeddingReqInput,
                             BatchTokenizedGenerateReqInput,
                             BatchTokenizedEmbeddingReqInput,
+                            ExtendWorldReqInput,
                         ),
                     )
                 ]
@@ -1093,6 +1096,7 @@ class Scheduler(
                             TokenizedEmbeddingReqInput,
                             BatchTokenizedGenerateReqInput,
                             BatchTokenizedEmbeddingReqInput,
+                            ExtendWorldReqInput,
                         ),
                     )
                 ]
@@ -1111,7 +1115,7 @@ class Scheduler(
                 control_reqs = broadcast_pyobj(
                     control_reqs,
                     self.tp_group.rank,
-                    self.tp_cpu_group,
+                    self.tp_worker.get_tp_group().cpu_group,
                     src=self.tp_group.ranks[0],
                 )
             recv_reqs = work_reqs + control_reqs
@@ -1119,7 +1123,7 @@ class Scheduler(
             recv_reqs = broadcast_pyobj(
                 recv_reqs,
                 self.tp_group.rank,
-                self.tp_cpu_group,
+                self.tp_worker.get_tp_group().cpu_group,
                 src=self.tp_group.ranks[0],
             )
 
@@ -2040,7 +2044,7 @@ class Scheduler(
             local_batch,
             dp_size=self.server_args.dp_size,
             attn_tp_size=self.attn_tp_size,
-            tp_group=self.tp_group,
+            tp_group=self.tp_worker.get_tp_group(),
             get_idle_batch=self.get_idle_batch,
             disable_cuda_graph=self.server_args.disable_cuda_graph,
             spec_algorithm=self.spec_algorithm,
@@ -2199,7 +2203,7 @@ class Scheduler(
             tp_group = self.attn_tp_cpu_group
         else:
             tp_size = self.tp_size
-            tp_group = self.tp_cpu_group
+            tp_group = self.tp_worker.get_tp_group().cpu_group
 
         if tp_size > 1:
             # Sync across TP ranks to make sure they have the same number of ready requests
@@ -2445,6 +2449,9 @@ class Scheduler(
             server_args=vars(get_global_server_args()),
         )
 
+    def extend_world(self, recv_req: ExtendWorldReqInput):
+        self.tp_worker.extend_world(recv_req)
+
     def handle_rpc_request(self, recv_req: RpcReqInput):
         # Handle RPC requests
         logger.info(
@@ -2689,6 +2696,7 @@ def is_work_request(recv_req):
             TokenizedEmbeddingReqInput,
             BatchTokenizedGenerateReqInput,
             BatchTokenizedEmbeddingReqInput,
+            ExtendWorldReqInput,
         ),
     )
 

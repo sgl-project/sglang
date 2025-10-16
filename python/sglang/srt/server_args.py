@@ -240,6 +240,7 @@ class ServerArgs:
     device: Optional[str] = None
     elastic_ep_backend: Literal[None, "mooncake"] = None
     mooncake_ib_device: Optional[str] = None
+    max_workers_per_node: int = 8
     tp_size: int = 1
     pp_size: int = 1
     pp_max_micro_batch_size: Optional[int] = None
@@ -1964,6 +1965,12 @@ class ServerArgs:
             help="The InfiniBand devices for Mooncake Backend transfer, accepts multiple comma-separated devices "
             "(e.g., --mooncake-ib-device mlx5_0,mlx5_1). "
             "Default is None, which triggers automatic device detection when Mooncake Backend is enabled.",
+        )
+        parser.add_argument(
+            "--max-workers-per-node",
+            type=int,
+            default=ServerArgs.max_workers_per_node,
+            help="max_workers_per_node",
         )
         parser.add_argument(
             "--tensor-parallel-size",

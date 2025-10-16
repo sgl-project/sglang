@@ -43,6 +43,11 @@ class ElasticEPStateManager:
             cls._instance = cls._build_state(ep_size=None, device=None)
         return cls._instance
 
+    @classmethod
+    def reinit(cls, server_args: ServerArgs):
+        cls._instance = None
+        return cls.init(server_args)
+
     @staticmethod
     def _select_device() -> torch.device:
         if is_cuda():

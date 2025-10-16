@@ -55,6 +55,7 @@ from sglang.srt.managers.io_struct import (
     BatchTokenizedGenerateReqInput,
     ConfigureLoggingReq,
     EmbeddingReqInput,
+    ExtendWorldReqInput,
     FreezeGCReq,
     GenerateReqInput,
     GetLoadReqInput,
@@ -421,6 +422,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     obj, request, created_time
                 ):
                     yield response
+
+    def extend_world(self, obj: ExtendWorldReqInput, request: Optional[fastapi.Request] = None):
+        self.send_to_scheduler.send_pyobj(obj)
 
     def _detect_input_format(
         self, texts: Union[str, List[str]], is_cross_encoder: bool

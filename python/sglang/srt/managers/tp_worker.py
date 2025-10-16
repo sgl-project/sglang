@@ -24,6 +24,7 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
+    ExtendWorldReqInput,
     GetWeightsByNameReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
@@ -232,6 +233,8 @@ class TpModelWorker(BaseTpWorker):
             is_draft_model=is_draft_worker,
         )
 
+        logger.info("init model runner")
+
         self._model_runner = ModelRunner(
             model_config=self.model_config,
             mem_fraction_static=server_args.mem_fraction_static,
@@ -300,13 +303,15 @@ class TpModelWorker(BaseTpWorker):
         ), "Memory pool size is too small"
 
         # Sync random seed across TP workers
-        self.random_seed = broadcast_pyobj(
-            [server_args.random_seed],
-            self.tp_size * self.pp_rank + tp_rank,
-            self.world_group.cpu_group,
-            src=self.world_group.ranks[0],
-        )[0]
-        set_random_seed(self.random_seed)
+        # self.random_seed = broadcast_pyobj(
+        #     [server_args.random_seed],
+        #     self.tp_size * self.pp_rank + tp_rank,
+        #     self.world_group.cpu_group,
+        #     src=self.world_group.ranks[0],
+        # )[0]
+        # set_random_seed(self.random_seed)
+        self.random_seed = server_args.random_seed
+        set_random_seed(server_args.random_seed)
 
         self.enable_overlap = not server_args.disable_overlap_schedule
         self.hicache_layer_transfer_counter = None
@@ -425,3 +430,6 @@ class TpModelWorker(BaseTpWorker):
                 pp_hidden_states_proxy_tensors=pp_proxy_tensors,
                 can_run_cuda_graph=can_run_cuda_graph,
             )
+
+    def extend_world(self, recv_req: ExtendWorldReqInput):
+        self.model_runner.extend_world(recv_req.new_size)
