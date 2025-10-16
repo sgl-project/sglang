@@ -338,24 +338,18 @@ impl WorkerSelectionStage {
         model_id: Option<&str>,
         text: Option<&str>,
     ) -> Option<(Arc<dyn Worker>, Arc<dyn Worker>)> {
-        // Get prefill workers - use None for WorkerType filter to get all types,
-        // then filter manually (since Prefill is a struct variant)
         let all_workers = self.worker_registry.get_workers_filtered(
             model_id,
-            None, // Get all types
-            Some(ConnectionMode::Grpc { port: None }),
+            None,
+            Some(ConnectionMode::Grpc { port: None }), // Match any gRPC worker
             false,
         );
 
-        let prefill_workers: Vec<_> = all_workers
+        let available_prefill: Vec<_> = all_workers
             .iter()
-            .filter(|w| matches!(w.metadata().worker_type, WorkerType::Prefill { .. }))
-            .cloned()
-            .collect();
-
-        let available_prefill: Vec<_> = prefill_workers
-            .iter()
-            .filter(|w| w.is_available())
+            .filter(|w| {
+                matches!(w.metadata().worker_type, WorkerType::Prefill { .. }) && w.is_available()
+            })
             .cloned()
             .collect();
 
@@ -364,16 +358,9 @@ impl WorkerSelectionStage {
             return None;
         }
 
-        // Get decode workers from the same all_workers list
-        let decode_workers: Vec<_> = all_workers
+        let available_decode: Vec<_> = all_workers
             .iter()
-            .filter(|w| matches!(w.metadata().worker_type, WorkerType::Decode))
-            .cloned()
-            .collect();
-
-        let available_decode: Vec<_> = decode_workers
-            .iter()
-            .filter(|w| w.is_available())
+            .filter(|w| matches!(w.metadata().worker_type, WorkerType::Decode) && w.is_available())
             .cloned()
             .collect();
 
