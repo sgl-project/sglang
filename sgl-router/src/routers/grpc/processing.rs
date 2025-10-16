@@ -9,11 +9,13 @@ use serde_json::Value;
 use tracing::error;
 
 use crate::grpc_client::proto;
-use crate::protocols::spec::{
+use crate::protocols::chat::{
     ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse,
-    FunctionCallResponse, GenerateMetaInfo, GenerateRequest, GenerateResponse, ToolCall,
-    ToolChoice, ToolChoiceValue, Usage,
 };
+use crate::protocols::common::{
+    FunctionCallResponse, ToolCall, ToolChoice, ToolChoiceValue, Usage,
+};
+use crate::protocols::generate::{GenerateMetaInfo, GenerateRequest, GenerateResponse};
 use crate::reasoning_parser::ParserFactory as ReasoningParserFactory;
 use crate::tokenizer::stop::{SequenceDecoderOutput, StopSequenceDecoder};
 use crate::tokenizer::traits::Tokenizer;

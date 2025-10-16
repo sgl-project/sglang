@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use regex::Regex;
 use serde_json::Value;
 
-use crate::protocols::spec::Tool;
+use crate::protocols::common::Tool;
 
 use crate::tool_parser::{
     errors::{ParserError, ParserResult},
