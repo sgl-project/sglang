@@ -1,7 +1,9 @@
 // Integration test for Responses API
 
 use axum::http::StatusCode;
-use sglang_router_rs::protocols::common::{GenerationRequest, ToolChoice, ToolChoiceValue, UsageInfo};
+use sglang_router_rs::protocols::common::{
+    GenerationRequest, ToolChoice, ToolChoiceValue, UsageInfo,
+};
 use sglang_router_rs::protocols::responses::{
     ReasoningEffort, ResponseInput, ResponseReasoningParam, ResponseStatus, ResponseTool,
     ResponseToolType, ResponsesRequest, ResponsesResponse, ServiceTier, Truncation,

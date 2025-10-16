@@ -9,7 +9,9 @@
 //! - Metadata injection for MCP operations
 
 use crate::mcp::McpClientManager;
-use crate::protocols::responses::{ResponseInput, ResponseTool, ResponseToolType, ResponsesRequest};
+use crate::protocols::responses::{
+    ResponseInput, ResponseTool, ResponseToolType, ResponsesRequest,
+};
 use crate::routers::header_utils::apply_request_headers;
 use axum::http::HeaderMap;
 use bytes::Bytes;

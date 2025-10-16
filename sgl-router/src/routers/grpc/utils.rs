@@ -6,7 +6,8 @@ use crate::grpc_client::sglang_scheduler::AbortOnDropStream;
 use crate::grpc_client::{proto, SglangSchedulerClient};
 use crate::protocols::chat::{ChatCompletionRequest, ChatMessage};
 use crate::protocols::common::{
-    ChatLogProbs, ChatLogProbsContent, FunctionCallResponse, StringOrArray, Tool, ToolCall, ToolChoice, ToolChoiceValue, TopLogProb,
+    ChatLogProbs, ChatLogProbsContent, FunctionCallResponse, StringOrArray, Tool, ToolCall,
+    ToolChoice, ToolChoiceValue, TopLogProb,
 };
 use crate::protocols::generate::GenerateFinishReason;
 use crate::tokenizer::chat_template::{ChatTemplateContentFormat, ChatTemplateParams};

@@ -12,7 +12,9 @@ use crate::grpc_client::proto;
 use crate::protocols::chat::{
     ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse,
 };
-use crate::protocols::common::{FunctionCallResponse, ToolCall, ToolChoice, ToolChoiceValue, Usage};
+use crate::protocols::common::{
+    FunctionCallResponse, ToolCall, ToolChoice, ToolChoiceValue, Usage,
+};
 use crate::protocols::generate::{GenerateMetaInfo, GenerateRequest, GenerateResponse};
 use crate::reasoning_parser::ParserFactory as ReasoningParserFactory;
 use crate::tokenizer::stop::{SequenceDecoderOutput, StopSequenceDecoder};
