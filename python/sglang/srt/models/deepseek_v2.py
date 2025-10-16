@@ -43,6 +43,10 @@ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.amx_utils import PackWeightMethod
+from sglang.srt.layers.attention.npu_ops.mla_preprocess import (
+    NPUFusedMLAPreprocess,
+    is_mla_preprocess_enabled,
+)
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
@@ -65,13 +69,11 @@ from sglang.srt.layers.moe import (
     get_deepep_mode,
     get_moe_a2a_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
+    should_use_flashinfer_trtllm_moe,
 )
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
-from sglang.srt.layers.moe.fused_moe_triton.layer import (
-    FusedMoE,
-    _is_fp4_quantization_enabled,
-)
-from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_kernel import (
@@ -154,6 +156,7 @@ if _is_cuda:
     from sgl_kernel import (
         awq_dequantize,
         bmm_fp8,
+        concat_mla_k,
         dsv3_fused_a_gemm,
         dsv3_router_gemm,
         merge_state_v2,
@@ -165,7 +168,7 @@ elif _is_hip:
         awq_dequantize_triton as awq_dequantize,
     )
 else:
-    from vllm._custom_ops import awq_dequantize
+    pass
 
 if _is_hip:
     from sglang.srt.layers.attention.triton_ops.rocm_mla_decode_rope import (
@@ -177,6 +180,20 @@ _is_sm100_supported = is_cuda() and is_sm100_supported()
 
 
 logger = logging.getLogger(__name__)
+
+FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
+    "fa3",
+    "flashinfer",
+    "cutlass_mla",
+    "trtllm_mla",
+    "ascend",
+]
+
+
+def add_forward_absorb_core_attention_backend(backend_name):
+    if backend_name not in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
+        FORWARD_ABSORB_CORE_ATTENTION_BACKENDS.append(backend_name)
+        logger.info(f"Added {backend_name} to FORWARD_ABSORB_CORE_ATTENTION_BACKENDS.")
 
 
 class AttnForwardMethod(IntEnum):
@@ -195,6 +212,134 @@ class AttnForwardMethod(IntEnum):
 
     # Use MLA with fused RoPE kernel for CPU
     MLA_FUSED_ROPE_CPU = auto()
+
+
+def _dispatch_mla_subtype(attn, forward_batch):
+    if _is_hip:
+        if attn.rocm_fused_decode_mla and forward_batch.forward_mode.is_decode():
+            return AttnForwardMethod.MLA_FUSED_ROPE
+        else:
+            return AttnForwardMethod.MLA
+    else:
+        if hasattr(attn, "fused_qkv_a_proj_with_mqa") and use_intel_amx_backend(attn):
+            return AttnForwardMethod.MLA_FUSED_ROPE_CPU
+        else:
+            return AttnForwardMethod.MLA
+
+
+class BackendRegistry:
+    _handlers = {}
+
+    @classmethod
+    def register(cls, backend_name, handler_func):
+        cls._handlers[backend_name] = handler_func
+
+    @classmethod
+    def get_handler(cls, backend_name):
+        return cls._handlers.get(backend_name, cls._handlers.get("triton"))
+
+
+def handle_ascend(attn, forward_batch):
+    if (
+        forward_batch.forward_mode.is_extend()
+        and not forward_batch.forward_mode.is_target_verify()
+        and not forward_batch.forward_mode.is_draft_extend()
+    ):
+        return AttnForwardMethod.MHA
+    else:
+        return AttnForwardMethod.MLA
+
+
+def _get_sum_extend_prefix_lens(forward_batch):
+    return (
+        sum(forward_batch.extend_prefix_lens_cpu)
+        if forward_batch.extend_prefix_lens_cpu is not None
+        else 0
+    )
+
+
+def _is_extend_without_speculative(forward_batch):
+    return (
+        forward_batch.forward_mode.is_extend()
+        and not forward_batch.forward_mode.is_target_verify()
+        and not forward_batch.forward_mode.is_draft_extend()
+    )
+
+
+def _handle_backend(attn, forward_batch, backend_name):
+    sum_extend_prefix_lens = _get_sum_extend_prefix_lens(forward_batch)
+    disable_ragged = (
+        backend_name in ["flashinfer", "flashmla"]
+    ) and attn.flashinfer_mla_disable_ragged
+
+    if (
+        not disable_ragged
+        and _is_extend_without_speculative(forward_batch)
+        and (
+            (
+                sum_extend_prefix_lens >= attn.chunked_prefix_cache_threshold
+                and not attn.disable_chunked_prefix_cache
+            )
+            or sum_extend_prefix_lens == 0
+        )
+    ):
+        return AttnForwardMethod.MHA_CHUNKED_KV
+    else:
+        return _dispatch_mla_subtype(attn, forward_batch)
+
+
+def handle_flashinfer(attn, forward_batch):
+    return _handle_backend(attn, forward_batch, "flashinfer")
+
+
+def handle_fa3(attn, forward_batch):
+    return _handle_backend(attn, forward_batch, "fa3")
+
+
+def handle_flashmla(attn, forward_batch):
+    return _handle_backend(attn, forward_batch, "flashmla")
+
+
+def handle_cutlass_mla(attn, forward_batch):
+    return _handle_backend(attn, forward_batch, "cutlass_mla")
+
+
+def handle_fa4(attn, forward_batch):
+    # TODO(cicirori): use FA4 MHA for DeepSeekV3 for now
+    return AttnForwardMethod.MHA_CHUNKED_KV
+
+
+def handle_trtllm_mla(attn, forward_batch):
+    sum_extend_prefix_lens = _get_sum_extend_prefix_lens(forward_batch)
+    if _is_extend_without_speculative(forward_batch) and (
+        not attn.disable_chunked_prefix_cache or sum_extend_prefix_lens == 0
+    ):
+        return AttnForwardMethod.MHA_CHUNKED_KV
+    else:
+        return _dispatch_mla_subtype(attn, forward_batch)
+
+
+def handle_aiter(attn, forward_batch):
+    if _is_extend_without_speculative(forward_batch):
+        if is_dp_attention_enabled():
+            if sum(forward_batch.extend_prefix_lens_cpu) == 0:
+                return AttnForwardMethod.MHA
+            else:
+                return AttnForwardMethod.MLA
+        else:
+            return AttnForwardMethod.MHA
+    else:
+        return AttnForwardMethod.MLA
+
+
+def handle_triton(attn, forward_batch):
+    if (
+        _is_extend_without_speculative(forward_batch)
+        and sum(forward_batch.extend_prefix_lens_cpu) == 0
+    ):
+        return AttnForwardMethod.MHA
+    else:
+        return _dispatch_mla_subtype(attn, forward_batch)
 
 
 class DeepseekV2MLP(nn.Module):
@@ -271,6 +416,7 @@ class MoEGate(nn.Module):
     def __init__(
         self,
         config,
+        quant_config,
         prefix: str = "",
         is_nextn: bool = False,
     ):
@@ -280,8 +426,15 @@ class MoEGate(nn.Module):
             torch.empty((config.n_routed_experts, config.hidden_size))
         )
         if config.topk_method == "noaux_tc":
+            correction_bias_dtype = (
+                torch.bfloat16
+                if quant_config is not None
+                and quant_config.get_name() == "modelopt_fp4"
+                and should_use_flashinfer_trtllm_moe()
+                else torch.float32
+            )
             self.e_score_correction_bias = nn.Parameter(
-                torch.empty((config.n_routed_experts), dtype=torch.float32)
+                torch.empty((config.n_routed_experts), dtype=correction_bias_dtype)
             )
         else:
             self.e_score_correction_bias = None
@@ -302,7 +455,7 @@ class MoEGate(nn.Module):
             _is_cuda
             and hidden_states.shape[0] <= 16
             and hidden_states.shape[1] == 7168
-            and self.weight.shape[0] == 256
+            and (self.weight.shape[0] == 256 or self.weight.shape[0] == 384)
             and _device_sm >= 90
         ):
             # router gemm output float32
@@ -356,7 +509,10 @@ class DeepseekV2MoE(nn.Module):
             )
 
         self.gate = MoEGate(
-            config=config, prefix=add_prefix("gate", prefix), is_nextn=is_nextn
+            config=config,
+            quant_config=quant_config,
+            prefix=add_prefix("gate", prefix),
+            is_nextn=is_nextn,
         )
 
         self.experts = get_moe_impl_class(quant_config)(
@@ -373,9 +529,6 @@ class DeepseekV2MoE(nn.Module):
             prefix=add_prefix("experts", prefix),
         )
 
-        correction_bias = self.gate.e_score_correction_bias
-        if _is_fp4_quantization_enabled():
-            correction_bias = correction_bias.to(torch.bfloat16)
         self.topk = TopK(
             top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
             renormalize=config.norm_topk_prob,
@@ -383,10 +536,13 @@ class DeepseekV2MoE(nn.Module):
             num_expert_group=config.n_group,
             num_fused_shared_experts=self.num_fused_shared_experts,
             topk_group=config.topk_group,
-            correction_bias=correction_bias,
+            correction_bias=self.gate.e_score_correction_bias,
+            quant_config=quant_config,
             routed_scaling_factor=self.routed_scaling_factor,
             apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk(),
-            force_topk=quant_config is None,
+            # Some Fp4 MoE backends require the output format to be bypassed but the MTP layers are unquantized
+            # and requires the output format to be standard. We use quant_config to determine the output format.
+            output_format=TopKOutputFormat.STANDARD if quant_config is None else None,
         )
 
         self.shared_experts_is_int8 = False
@@ -673,10 +829,14 @@ class DeepseekV2MoE(nn.Module):
 
         if shared_output is not None:
             x = shared_output
-            x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
+            if self.experts.should_fuse_routed_scaling_factor_in_topk():
+                x.add_(final_hidden_states)
+            else:
+                x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
             final_hidden_states = x
         else:
-            final_hidden_states *= self.routed_scaling_factor
+            if not self.experts.should_fuse_routed_scaling_factor_in_topk():
+                final_hidden_states *= self.routed_scaling_factor
 
         return final_hidden_states
 
@@ -1021,27 +1181,16 @@ class DeepseekV2AttentionMLA(nn.Module):
                 self.weight_block_size = (
                     self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.weight_block_size
                 )
+        self.is_mla_preprocess_enabled = is_mla_preprocess_enabled()
+        if self.is_mla_preprocess_enabled:
+            assert (
+                quant_config.get_name() == "w8a8_int8"
+            ), "MLA Preprocess only works with W8A8Int8"
+            self.mla_preprocess = None
 
     def dispatch_attn_forward_method(
         self, forward_batch: ForwardBatch
     ) -> AttnForwardMethod:
-        def _dispatch_mla_subtype():
-            if _is_hip:
-                if (
-                    self.rocm_fused_decode_mla
-                    and forward_batch.forward_mode.is_decode()
-                ):
-                    return AttnForwardMethod.MLA_FUSED_ROPE
-                else:
-                    return AttnForwardMethod.MLA
-            else:
-                if hasattr(self, "fused_qkv_a_proj_with_mqa") and use_intel_amx_backend(
-                    self
-                ):
-                    return AttnForwardMethod.MLA_FUSED_ROPE_CPU
-                else:
-                    return AttnForwardMethod.MLA
-
         # Determine attention backend used by current forward batch
         if forward_batch.forward_mode.is_decode_or_idle():
             attention_backend = global_server_args_dict["decode_attention_backend"]
@@ -1050,7 +1199,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             or forward_batch.forward_mode.is_draft_extend()
         ):
             # Use the specified backend for speculative operations (both verify and draft extend)
-            if global_server_args_dict["speculative_attention_backend"] == "decode":
+            if global_server_args_dict["speculative_attention_mode"] == "decode":
                 attention_backend = global_server_args_dict["decode_attention_backend"]
             else:  # default to prefill
                 attention_backend = global_server_args_dict["prefill_attention_backend"]
@@ -1058,82 +1207,8 @@ class DeepseekV2AttentionMLA(nn.Module):
             attention_backend = global_server_args_dict["prefill_attention_backend"]
         self.current_attention_backend = attention_backend
 
-        if attention_backend == "ascend":
-            if (
-                forward_batch.forward_mode.is_extend()
-                and not forward_batch.forward_mode.is_target_verify()
-                and not forward_batch.forward_mode.is_draft_extend()
-            ):
-                return AttnForwardMethod.MHA
-            else:
-                return AttnForwardMethod.MLA
-        elif (
-            attention_backend == "flashinfer"
-            or attention_backend == "fa3"
-            or attention_backend == "flashmla"
-            or attention_backend == "cutlass_mla"
-        ):
-            # Use MHA with chunked KV cache when prefilling on long sequences.
-            sum_extend_prefix_lens = (
-                sum(forward_batch.extend_prefix_lens_cpu)
-                if forward_batch.extend_prefix_lens_cpu is not None
-                else 0
-            )
-            # Flashinfer MLA: Do not absorb when enabling ragged prefill
-            disable_ragged = (
-                attention_backend == "flashinfer" or attention_backend == "flashmla"
-            ) and self.flashinfer_mla_disable_ragged
-            if (
-                not disable_ragged
-                and forward_batch.forward_mode.is_extend()
-                and not forward_batch.forward_mode.is_target_verify()
-                and not forward_batch.forward_mode.is_draft_extend()
-                and (
-                    (
-                        sum_extend_prefix_lens >= self.chunked_prefix_cache_threshold
-                        and not self.disable_chunked_prefix_cache
-                    )
-                    or sum_extend_prefix_lens == 0
-                )
-            ):
-                return AttnForwardMethod.MHA_CHUNKED_KV
-            else:
-                return _dispatch_mla_subtype()
-        elif attention_backend == "trtllm_mla":
-            if (
-                forward_batch.forward_mode.is_extend()
-                and not forward_batch.forward_mode.is_target_verify()
-                and not forward_batch.forward_mode.is_draft_extend()
-            ):
-                return AttnForwardMethod.MHA_CHUNKED_KV
-            else:
-                return _dispatch_mla_subtype()
-        elif attention_backend == "aiter":
-            if (
-                forward_batch.forward_mode.is_extend()
-                and not forward_batch.forward_mode.is_target_verify()
-                and not forward_batch.forward_mode.is_draft_extend()
-            ):
-                if is_dp_attention_enabled():
-                    if sum(forward_batch.extend_prefix_lens_cpu) == 0:
-                        return AttnForwardMethod.MHA
-                    else:
-                        return AttnForwardMethod.MLA
-                else:
-                    return AttnForwardMethod.MHA
-            else:
-                return AttnForwardMethod.MLA
-        else:
-            # Triton: Use normal computation for prefill and use weight absorption for extend/decode
-            if (
-                forward_batch.forward_mode.is_extend()
-                and not forward_batch.forward_mode.is_target_verify()
-                and not forward_batch.forward_mode.is_draft_extend()
-                and sum(forward_batch.extend_prefix_lens_cpu) == 0
-            ):
-                return AttnForwardMethod.MHA
-            else:
-                return _dispatch_mla_subtype()
+        handler = BackendRegistry.get_handler(attention_backend)
+        return handler(self, forward_batch)
 
     def op_prepare(self, state):
         state.attn_intermediate_state = self.forward_prepare(
@@ -1198,9 +1273,28 @@ class DeepseekV2AttentionMLA(nn.Module):
                 positions, hidden_states, forward_batch, zero_allocator
             )
         elif attn_forward_method == AttnForwardMethod.MLA:
-            inner_state = self.forward_absorb_prepare(
-                positions, hidden_states, forward_batch, zero_allocator
-            )
+            if not self.is_mla_preprocess_enabled:
+                inner_state = self.forward_absorb_prepare(
+                    positions, hidden_states, forward_batch, zero_allocator
+                )
+            else:
+                # TODO(iforgetmyname): to be separated as a standalone func
+                if self.mla_preprocess is None:
+                    self.mla_preprocess = NPUFusedMLAPreprocess(
+                        self.fused_qkv_a_proj_with_mqa,
+                        self.q_a_layernorm,
+                        self.kv_a_layernorm,
+                        self.q_b_proj,
+                        self.w_kc,
+                        self.rotary_emb,
+                        self.layer_id,
+                        self.num_local_heads,
+                        self.qk_nope_head_dim,
+                        self.qk_rope_head_dim,
+                    )
+                inner_state = self.mla_preprocess.forward(
+                    positions, hidden_states, forward_batch, zero_allocator
+                )
         elif attn_forward_method == AttnForwardMethod.MLA_FUSED_ROPE:
             inner_state = self.forward_absorb_fused_mla_rope_prepare(
                 positions, hidden_states, forward_batch, zero_allocator
@@ -1264,8 +1358,18 @@ class DeepseekV2AttentionMLA(nn.Module):
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
         q[..., self.qk_nope_head_dim :] = q_pe
         k = torch.empty_like(q)
-        k[..., : self.qk_nope_head_dim] = k_nope
-        k[..., self.qk_nope_head_dim :] = k_pe
+
+        # Temporary for DeepSeek V3/R1 only, but can generalize if needed
+        if (
+            _is_cuda
+            and (self.num_local_heads == 128)
+            and (self.qk_nope_head_dim == 128)
+            and (self.qk_rope_head_dim == 64)
+        ):
+            concat_mla_k(k=k, k_nope=k_nope, k_rope=k_pe)
+        else:
+            k[..., : self.qk_nope_head_dim] = k_nope
+            k[..., self.qk_nope_head_dim :] = k_pe
 
         if not _is_npu:
             latent_cache[:, :, : self.kv_lora_rank] = kv_a.unsqueeze(1)
@@ -1420,13 +1524,7 @@ class DeepseekV2AttentionMLA(nn.Module):
     def forward_absorb_core(
         self, q_pe, k_pe, q_nope_out, k_nope, forward_batch, zero_allocator, positions
     ):
-        if (
-            self.current_attention_backend == "fa3"
-            or self.current_attention_backend == "flashinfer"
-            or self.current_attention_backend == "cutlass_mla"
-            or self.current_attention_backend == "trtllm_mla"
-            or self.current_attention_backend == "ascend"
-        ):
+        if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
             extra_args = {}
             if self._fuse_rope_for_trtllm_mla(forward_batch):
                 extra_args = {
@@ -2027,7 +2125,10 @@ class DeepseekV2DecoderLayer(nn.Module):
         quant_format = (
             "mxfp4"
             if _is_gfx95_supported
-            and self.self_attn.fused_qkv_a_proj_with_mqa.weight == torch.uint8
+            and getattr(self.self_attn, "fused_qkv_a_proj_with_mqa", None) is not None
+            and getattr(self.self_attn.fused_qkv_a_proj_with_mqa, "weight", None)
+            is not None
+            and self.self_attn.fused_qkv_a_proj_with_mqa.weight.dtype == torch.uint8
             else ""
         )
 
@@ -2199,8 +2300,15 @@ class DeepseekV2Model(nn.Module):
                     [
                         "w13_weight",
                         "w2_weight",
-                        "w13_blockscale_swizzled",
-                        "w2_blockscale_swizzled",
+                        # only for nvfp4
+                        *(
+                            [
+                                "w13_blockscale_swizzled",
+                                "w2_blockscale_swizzled",
+                            ]
+                            if hasattr(module, "w13_blockscale_swizzled")
+                            else []
+                        ),
                     ]
                     if isinstance(module, FusedMoE)
                     else []
@@ -2582,7 +2690,11 @@ class DeepseekV2ForCausalLM(nn.Module):
                 0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
             ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
 
-            if _use_aiter_gfx95 and self.quant_config.get_name() == "quark":
+            if (
+                _use_aiter_gfx95
+                and self.quant_config is not None
+                and self.quant_config.get_name() == "quark"
+            ):
                 w_kc, self_attn.w_scale_k, w_vc, self_attn.w_scale_v = (
                     quark_post_load_weights(self_attn, w, "mxfp4")
                 )
@@ -2964,6 +3076,17 @@ class DeepseekV2ForCausalLM(nn.Module):
             num_logical_experts=config.n_routed_experts,
             num_groups=config.n_group,
         )
+
+
+BackendRegistry.register("ascend", handle_ascend)
+BackendRegistry.register("flashinfer", handle_flashinfer)
+BackendRegistry.register("fa3", handle_fa3)
+BackendRegistry.register("flashmla", handle_flashmla)
+BackendRegistry.register("cutlass_mla", handle_cutlass_mla)
+BackendRegistry.register("fa4", handle_fa4)
+BackendRegistry.register("trtllm_mla", handle_trtllm_mla)
+BackendRegistry.register("aiter", handle_aiter)
+BackendRegistry.register("triton", handle_triton)
 
 
 class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):

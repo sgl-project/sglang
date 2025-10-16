@@ -206,7 +206,6 @@ mod tests {
         // The incremental text should be " world" (with the space that the mock tokenizer adds)
         assert_eq!(text2, " world");
 
-        // Verify the full text
         assert_eq!(seq.text().unwrap(), "Hello world");
     }
 

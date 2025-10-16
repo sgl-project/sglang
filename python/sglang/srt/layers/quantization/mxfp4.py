@@ -731,8 +731,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             quant_info = TritonMoeQuantInfo(
                 w13_weight=layer.w13_weight,
                 w2_weight=layer.w2_weight,
-                w13_weight_bias=layer.w13_weight_bias,
-                w2_weight_bias=layer.w2_weight_bias,
+                b13=getattr(layer, "w13_weight_bias", None),
+                b2=getattr(layer, "w2_weight_bias", None),
             )
             return self.runner.run(dispatch_output, quant_info)
 
@@ -843,10 +843,18 @@ class Mxfp4DynamicQuantMoEMethod(FusedMoEMethodBase):
             topk_weights = topk_weights.to(
                 torch.float32
             )  # aiter's moe_sorting requires topk_weights to be FP32
+
+        if hasattr(torch, "float4_e2m1fn_x2"):
+            w13_weight = layer.w13_weight.view(torch.float4_e2m1fn_x2)
+            w2_weight = layer.w2_weight.view(torch.float4_e2m1fn_x2)
+        else:
+            w13_weight = layer.w13_weight
+            w2_weight = layer.w2_weight
+
         output = fused_moe(
             x,
-            layer.w13_weight,
-            layer.w2_weight,
+            w13_weight,
+            w2_weight,
             topk_weights,
             topk_ids,
             quant_type=QuantType.per_1x32,

@@ -258,7 +258,10 @@ Detailed example in [structured outputs](../advanced_features/structured_outputs
 Launch a server with `--enable-custom-logit-processor` flag on.
 
 ```bash
-python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --port 30000 --enable-custom-logit-processor
+python -m sglang.launch_server \
+  --model-path meta-llama/Meta-Llama-3-8B-Instruct \
+  --port 30000 \
+  --enable-custom-logit-processor
 ```
 
 Define a custom logit processor that will always sample a specific token id.

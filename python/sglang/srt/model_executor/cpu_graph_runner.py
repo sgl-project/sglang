@@ -607,7 +607,7 @@ class CPUGraphRunner:
     def get_spec_info(self, num_tokens: int):
         spec_info = None
         if self.model_runner.spec_algorithm.is_eagle():
-            from sglang.srt.speculative.eagle_utils import EagleVerifyInput
+            from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
             if self.model_runner.is_draft_worker:
                 raise RuntimeError("This should not happen.")

@@ -20,6 +20,7 @@ from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 from sglang.srt.function_call.qwen25_detector import Qwen25Detector
 from sglang.srt.function_call.step3_detector import Step3Detector
+from sglang.srt.function_call.utils import get_json_schema_constraint
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +70,8 @@ class FunctionCallParser:
         Returns:
             True if the text contains a tool call, False otherwise
         """
+        if not self.tools:
+            return False
         return self.detector.has_tool_call(text)
 
     def parse_non_stream(self, full_text: str) -> Tuple[str, list[ToolCallItem]]:
@@ -83,6 +86,8 @@ class FunctionCallParser:
             - The remaining text after parsing that was not consumed by the detector (can be treated as normal text)
             - A list of tool calls parsed from the text
         """
+        if not self.tools:
+            return full_text, []
         parsed_result = self.detector.detect_and_parse(full_text, self.tools)
         tool_call_list = parsed_result.calls
         if tool_call_list:
@@ -102,6 +107,8 @@ class FunctionCallParser:
             - The normal text that should be displayed to the user
             - A list of tool calls parsed from the chunk
         """
+        if not self.tools:
+            return chunk_text, []
         final_normal_text = ""
         final_calls = []
 
@@ -172,8 +179,8 @@ class FunctionCallParser:
             strict_tag = self.get_structure_tag()
             return ("structural_tag", strict_tag)
         elif tool_choice == "required" or isinstance(tool_choice, ToolChoice):
-            ebnf = self.get_ebnf(tool_choice)
-            return ("ebnf", ebnf) if ebnf is not None else None
+            json_schema = get_json_schema_constraint(self.tools, tool_choice)
+            return ("json_schema", json_schema)
 
     def get_ebnf(
         self, tool_choice: Union[ToolChoice, Literal["required"]]
