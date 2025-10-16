@@ -2,13 +2,13 @@
 Logprobs Accuracy Test for SGLang
 
 ======================
-With deterministic/batch invariant kernels, we can make sure that with the same input for SGLang,
-we can get exactly the same results on its log probs.
-However, log probs are highly sensitive to GPU machines, kernels, torch version and a lot of other factors,
-so we cannot have a unified generated log probs baseline across different machines.
+With deterministic/batch invariant kernels, we can ensure that SGLang produces exactly the same
+logprobs results for identical inputs. However, logprobs are highly sensitive to GPU hardware,
+kernels, torch versions, and other factors, so we cannot maintain a unified logprobs baseline
+across different machines.
 
-This test is designed to be run locally by contributors to
-verify logprobs accuracy before making changes on related code.
+This test is designed to be run locally by contributors to verify logprobs accuracy
+before making changes to related code.
 When submitting changes that affect logprobs computation, please:
 1. Run this test locally to ensure accuracy
 2. Include test results in your PR description
@@ -17,27 +17,28 @@ We really appreciate your effort and contribution to SGLang!
 
 ======================
 What does this test do?
-This test will fetch 1000 requests from ShareGPT dataset, and generate log probs for each request and save it as a baseline.
-Then by running the test mode, it will test the accuracy of the log probs by comparing it with the baseline.
+This test fetches 1000 samples from the ShareGPT dataset, generates logprobs for each sample,
+and saves them as a baseline. Then, by running the test mode, it validates the accuracy of
+logprobs by comparing them against the baseline.
 
-This test makes sure that:
-- the boundary of log probs requests are correct;
-- the log probs are invariant between two test runs, also before and after the code changes;
+This test ensures that:
+- returned logprobs have correct boundaries;
+- logprobs remain invariant between test runs, and also before and after your code changes;
 
 ======================
 Usage
 
-Step 1: Generate Baseline (Without applying Code Changes)
+Step 1: Generate Baseline (Before Code Changes)
 ```bash
 python test/srt/test_logprobs.py gen
 ```
 
-Step 2: Test Against Baseline (After Code Changes, with your commit changes)
+Step 2: Test Against Baseline (After Code Changes)
 ```bash
 python test/srt/test_logprobs.py test
 ```
-This will test your changes against the locally generated baseline from Step 1.
-The test should pass if the max and mean differences are within the tolerance thresholds.
+This tests your changes against the locally generated baseline from Step 1.
+The test passes if the maximum and mean differences are within the tolerance thresholds.
 ======================
 """
 
