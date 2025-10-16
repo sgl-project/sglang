@@ -5,6 +5,7 @@ Collect performance data based on actual log format
 """
 
 import argparse
+import base64
 import csv
 import os
 import re
@@ -109,6 +110,10 @@ class SGLangPerfAnalyzer:
         # Setup matplotlib fonts and styles
         self._setup_matplotlib()
 
+        # GitHub data repository settings
+        self.data_repo = "sglang-bot/sglang-ci-data"
+        self.data_branch = "main"
+
     def _setup_matplotlib(self):
         """Setup matplotlib fonts and styles"""
         # Set fonts
@@ -122,9 +127,32 @@ class SGLangPerfAnalyzer:
         rcParams["axes.grid"] = True
         rcParams["grid.alpha"] = 0.3
 
-    def get_recent_runs(self, limit: int = 100) -> List[Dict]:
-        """Get recent CI run data"""
-        print(f"Getting recent {limit} PR Test runs...")
+    def get_recent_runs(
+        self,
+        limit: int = 100,
+        start_date: str = None,
+        end_date: str = None,
+        branch: str = None,
+    ) -> List[Dict]:
+        """Get recent CI run data with multiple collection strategies"""
+
+        # If date range is specified, get all data in that range
+        if start_date or end_date:
+            return self._get_date_range_runs(start_date, end_date, branch)
+
+        branch_info = f" from branch '{branch}'" if branch else ""
+        print(f"Getting PR Test runs{branch_info} (limit: {limit})...")
+
+        # Use sampling strategy if limit >= 500, otherwise use sequential
+        if limit >= 500:
+            print(f"Using uniform sampling for {limit} runs to cover ~30 days...")
+            return self._get_sampled_runs(limit, branch)
+        else:
+            return self._get_sequential_runs(limit, branch)
+
+    def _get_sequential_runs(self, limit: int, branch: str = None) -> List[Dict]:
+        """Original sequential method for smaller limits"""
+        print(f"Using sequential sampling for {limit} runs...")
 
         pr_test_runs = []
         page = 1
@@ -133,6 +161,8 @@ class SGLangPerfAnalyzer:
         while len(pr_test_runs) < limit:
             url = f"{self.base_url}/repos/{self.repo}/actions/runs"
             params = {"per_page": per_page, "page": page}
+            if branch:
+                params["branch"] = branch
 
             try:
                 response = self.session.get(url, params=params)
@@ -168,6 +198,296 @@ class SGLangPerfAnalyzer:
                 break
 
         return pr_test_runs
+
+    def _get_sampled_runs(self, limit: int, branch: str = None) -> List[Dict]:
+        """Uniform sampling method for 30-day coverage"""
+        from datetime import datetime, timedelta
+
+        # Uniform sampling across 30 days
+        sampled_runs = self._sample_time_period(
+            limit, days_back=30, uniform=True, branch=branch
+        )
+
+        print(
+            f"Sampled {len(sampled_runs)} runs from 30-day period (requested: {limit})"
+        )
+        return sampled_runs
+
+    def _sample_time_period(
+        self,
+        target_samples: int,
+        days_back: int,
+        skip_recent_days: int = 0,
+        uniform: bool = False,
+        branch: str = None,
+    ) -> List[Dict]:
+        """Sample runs from a specific time period"""
+        from datetime import datetime, timedelta
+
+        # Calculate time range
+        end_time = datetime.utcnow() - timedelta(days=skip_recent_days)
+        start_time = end_time - timedelta(days=days_back - skip_recent_days)
+
+        sampling_type = "uniform" if uniform else "systematic"
+        print(
+            f"  {sampling_type.title()} sampling {target_samples} runs from {start_time.strftime('%Y-%m-%d')} to {end_time.strftime('%Y-%m-%d')}"
+        )
+
+        collected_runs = []
+        page = 1
+        per_page = 100
+        total_in_period = 0
+
+        while True:
+            url = f"{self.base_url}/repos/{self.repo}/actions/runs"
+            params = {"per_page": per_page, "page": page}
+            if branch:
+                params["branch"] = branch
+
+            try:
+                response = self.session.get(url, params=params)
+                response.raise_for_status()
+                data = response.json()
+
+                if not data.get("workflow_runs"):
+                    break
+
+                period_runs = []
+                for run in data["workflow_runs"]:
+                    if run.get("name") != "PR Test":
+                        continue
+
+                    created_at = run.get("created_at", "")
+                    if created_at:
+                        try:
+                            run_time = datetime.fromisoformat(
+                                created_at.replace("Z", "+00:00")
+                            ).replace(tzinfo=None)
+                            if start_time <= run_time <= end_time:
+                                period_runs.append(run)
+                                total_in_period += 1
+                        except:
+                            continue
+
+                collected_runs.extend(period_runs)
+
+                # Progress indicator every 5 pages
+                if page % 5 == 0:
+                    print(
+                        f"    Page {page}: Found {total_in_period} runs in target period, collected {len(collected_runs)} total"
+                    )
+
+                # Check if we've gone past our time window
+                if data["workflow_runs"]:
+                    last_run_time_str = data["workflow_runs"][-1].get("created_at", "")
+                    if last_run_time_str:
+                        try:
+                            last_run_time = datetime.fromisoformat(
+                                last_run_time_str.replace("Z", "+00:00")
+                            ).replace(tzinfo=None)
+                            if last_run_time < start_time:
+                                print(f"  Reached time boundary at page {page}")
+                                break
+                        except:
+                            pass
+
+                if len(data["workflow_runs"]) < per_page:
+                    break
+
+                page += 1
+                time.sleep(0.1)
+
+            except requests.exceptions.RequestException as e:
+                print(f"  Error getting data for time period: {e}")
+                break
+
+        print(
+            f"  Found {total_in_period} runs in time period, collected {len(collected_runs)} for sampling"
+        )
+
+        # Debug: Show time range of collected data
+        if collected_runs:
+            collected_runs_sorted = sorted(
+                collected_runs, key=lambda x: x.get("created_at", "")
+            )
+            earliest = (
+                collected_runs_sorted[0].get("created_at", "")[:10]
+                if collected_runs_sorted
+                else "N/A"
+            )
+            latest = (
+                collected_runs_sorted[-1].get("created_at", "")[:10]
+                if collected_runs_sorted
+                else "N/A"
+            )
+            print(f"  Collected data spans from {earliest} to {latest}")
+
+        # Sample from collected runs
+        if len(collected_runs) <= target_samples:
+            return collected_runs
+
+        if uniform:
+            # Uniform sampling: sort by time and select evenly distributed samples
+            collected_runs.sort(key=lambda x: x.get("created_at", ""))
+            step = len(collected_runs) / target_samples
+            sampled_runs = []
+
+            for i in range(target_samples):
+                index = int(i * step)
+                if index < len(collected_runs):
+                    sampled_runs.append(collected_runs[index])
+        else:
+            # Systematic sampling for even distribution
+            step = len(collected_runs) / target_samples
+            sampled_runs = []
+
+            for i in range(target_samples):
+                index = int(i * step)
+                if index < len(collected_runs):
+                    sampled_runs.append(collected_runs[index])
+
+        print(
+            f"  Sampled {len(sampled_runs)} runs from {len(collected_runs)} available"
+        )
+
+        # Debug: Show time range of sampled data
+        if sampled_runs:
+            sampled_runs_sorted = sorted(
+                sampled_runs, key=lambda x: x.get("created_at", "")
+            )
+            earliest = (
+                sampled_runs_sorted[0].get("created_at", "")[:10]
+                if sampled_runs_sorted
+                else "N/A"
+            )
+            latest = (
+                sampled_runs_sorted[-1].get("created_at", "")[:10]
+                if sampled_runs_sorted
+                else "N/A"
+            )
+            print(f"  Sampled data spans from {earliest} to {latest}")
+
+        return sampled_runs
+
+    def _get_date_range_runs(
+        self, start_date: str = None, end_date: str = None, branch: str = None
+    ) -> List[Dict]:
+        """Get all CI runs within specified date range"""
+        from datetime import datetime, timedelta
+
+        # Parse dates
+        if start_date:
+            try:
+                start_time = datetime.strptime(start_date, "%Y-%m-%d")
+            except ValueError:
+                raise ValueError(
+                    f"Invalid start_date format. Use YYYY-MM-DD, got: {start_date}"
+                )
+        else:
+            # Default to 30 days ago if no start date
+            start_time = datetime.utcnow() - timedelta(days=30)
+
+        if end_date:
+            try:
+                end_time = datetime.strptime(end_date, "%Y-%m-%d") + timedelta(
+                    days=1
+                )  # Include the end date
+            except ValueError:
+                raise ValueError(
+                    f"Invalid end_date format. Use YYYY-MM-DD, got: {end_date}"
+                )
+        else:
+            # Default to now if no end date
+            end_time = datetime.utcnow()
+
+        # Validate date range
+        if start_time >= end_time:
+            raise ValueError(
+                f"start_date ({start_date}) must be before end_date ({end_date})"
+            )
+
+        branch_info = f" from branch '{branch}'" if branch else ""
+        print(
+            f"Getting ALL CI runs{branch_info} from {start_time.strftime('%Y-%m-%d')} to {end_time.strftime('%Y-%m-%d')}"
+        )
+
+        collected_runs = []
+        page = 1
+        per_page = 100
+        total_in_period = 0
+
+        while True:
+            url = f"{self.base_url}/repos/{self.repo}/actions/runs"
+            params = {"per_page": per_page, "page": page}
+            if branch:
+                params["branch"] = branch
+
+            try:
+                response = self.session.get(url, params=params)
+                response.raise_for_status()
+                data = response.json()
+
+                if not data.get("workflow_runs"):
+                    break
+
+                # Filter runs in date range and PR Test runs
+                period_runs = []
+                for run in data["workflow_runs"]:
+                    if run.get("name") != "PR Test":
+                        continue
+
+                    created_at = run.get("created_at", "")
+                    if created_at:
+                        try:
+                            run_time = datetime.fromisoformat(
+                                created_at.replace("Z", "+00:00")
+                            ).replace(tzinfo=None)
+                            if start_time <= run_time <= end_time:
+                                period_runs.append(run)
+                                total_in_period += 1
+                        except:
+                            continue
+
+                collected_runs.extend(period_runs)
+
+                # Progress indicator every 5 pages
+                if page % 5 == 0:
+                    print(
+                        f"    Page {page}: Found {total_in_period} runs in date range, collected {len(collected_runs)} total"
+                    )
+
+                # Check if we've gone past our time window
+                if data["workflow_runs"]:
+                    last_run_time_str = data["workflow_runs"][-1].get("created_at", "")
+                    if last_run_time_str:
+                        try:
+                            last_run_time = datetime.fromisoformat(
+                                last_run_time_str.replace("Z", "+00:00")
+                            ).replace(tzinfo=None)
+                            if last_run_time < start_time:
+                                print(f"  Reached time boundary at page {page}")
+                                break
+                        except:
+                            pass
+
+                if len(data["workflow_runs"]) < per_page:
+                    break
+
+                page += 1
+                time.sleep(0.1)
+
+            except requests.exceptions.RequestException as e:
+                print(f"  Error getting data for date range: {e}")
+                break
+
+        print(
+            f"Found {total_in_period} runs in date range {start_time.strftime('%Y-%m-%d')} to {end_time.strftime('%Y-%m-%d')}"
+        )
+
+        # Sort by creation time (newest first)
+        collected_runs.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+
+        return collected_runs
 
     def get_job_logs(self, run_id: int, job_name: str) -> Optional[str]:
         """Get logs for specific job with early exit optimization"""
@@ -349,8 +669,7 @@ class SGLangPerfAnalyzer:
                         f"    Found {test_name} performance data: {list(perf_data.keys())}"
                     )
 
-            time.sleep(0.2)  # Slightly longer delay between runs to be API-friendly
-
+            time.sleep(0.2)
         return all_test_data
 
     def generate_performance_tables(
@@ -682,6 +1001,321 @@ class SGLangPerfAnalyzer:
 
         print("\n" + "=" * 60)
 
+    def upload_file_to_github(
+        self, file_path: str, github_path: str, commit_message: str
+    ) -> bool:
+        """Upload a file to GitHub repository with retry logic"""
+        max_retries = 30
+        retry_count = 0
+
+        while retry_count < max_retries:
+            try:
+                # Read file content
+                with open(file_path, "rb") as f:
+                    content = f.read()
+
+                # Encode content to base64
+                content_encoded = base64.b64encode(content).decode("utf-8")
+
+                # Check if file exists to get SHA
+                check_url = (
+                    f"{self.base_url}/repos/{self.data_repo}/contents/{github_path}"
+                )
+                check_response = self.session.get(check_url)
+
+                sha = None
+                if check_response.status_code == 200:
+                    sha = check_response.json().get("sha")
+
+                # Prepare upload data
+                upload_data = {
+                    "message": commit_message,
+                    "content": content_encoded,
+                    "branch": self.data_branch,
+                }
+
+                if sha:
+                    upload_data["sha"] = sha
+
+                # Upload file
+                response = self.session.put(check_url, json=upload_data)
+
+                if response.status_code in [200, 201]:
+                    print(f"    ✅ Uploaded: {github_path}")
+                    return True
+                elif response.status_code == 403:
+                    retry_count += 1
+                    wait_time = min(2**retry_count, 30)
+                    print(
+                        f"    ⚠️ Upload forbidden (403) for {github_path}, retrying in {wait_time}s... (attempt {retry_count}/{max_retries})"
+                    )
+                    if retry_count >= max_retries:
+                        print(
+                            f"    ❌ Failed to upload {github_path} after {max_retries} attempts (403 Forbidden)"
+                        )
+                        return False
+                    time.sleep(wait_time)
+                else:
+                    response.raise_for_status()
+
+            except requests.exceptions.RequestException as e:
+                retry_count += 1
+                wait_time = min(2**retry_count, 30)
+                print(
+                    f"    ⚠️ Upload error for {github_path} (attempt {retry_count}/{max_retries}): {e}"
+                )
+                if retry_count >= max_retries:
+                    print(
+                        f"    ❌ Failed to upload {github_path} after {max_retries} attempts: {e}"
+                    )
+                    return False
+                print(f"    Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+            except Exception as e:
+                print(f"    ❌ Failed to upload {github_path}: {e}")
+                return False
+
+        return False
+
+    def upload_performance_data_to_github(self, output_dir: str):
+        """Upload performance_tables to GitHub with original structure"""
+        print("📤 Uploading performance data to GitHub...")
+
+        # Check if target repository exists with retry logic
+        repo_url = f"{self.base_url}/repos/{self.data_repo}"
+        max_retries = 30
+        retry_count = 0
+
+        print(f"🔍 Checking repository access to {self.data_repo}...")
+
+        while retry_count < max_retries:
+            try:
+                repo_response = self.session.get(repo_url)
+
+                if repo_response.status_code == 200:
+                    print(f"✅ Repository {self.data_repo} is accessible")
+                    break
+                elif repo_response.status_code == 404:
+                    print(
+                        f"❌ Repository {self.data_repo} does not exist or is not accessible"
+                    )
+                    print("   Please ensure:")
+                    print("   1. The repository exists")
+                    print("   2. Your GitHub token has access to this repository")
+                    print("   3. Your token has 'contents:write' permission")
+                    return
+                elif repo_response.status_code == 403:
+                    retry_count += 1
+                    wait_time = min(2**retry_count, 60)  # Exponential backoff, max 60s
+                    print(
+                        f"⚠️ Repository access forbidden (403), retrying in {wait_time}s... (attempt {retry_count}/{max_retries})"
+                    )
+                    if retry_count >= max_retries:
+                        print(
+                            f"❌ Failed to access repository after {max_retries} attempts"
+                        )
+                        print("   This might be due to:")
+                        print("   1. GitHub API rate limiting")
+                        print("   2. Token permissions issue")
+                        print("   3. Repository access restrictions")
+                        return
+                    time.sleep(wait_time)
+                else:
+                    retry_count += 1
+                    wait_time = min(2**retry_count, 60)
+                    print(
+                        f"⚠️ Repository access failed with status {repo_response.status_code}, retrying in {wait_time}s... (attempt {retry_count}/{max_retries})"
+                    )
+                    if retry_count >= max_retries:
+                        print(
+                            f"❌ Failed to access repository {self.data_repo} after {max_retries} attempts"
+                        )
+                        return
+                    time.sleep(wait_time)
+
+            except Exception as e:
+                retry_count += 1
+                wait_time = min(2**retry_count, 60)
+                print(
+                    f"⚠️ Error checking repository (attempt {retry_count}/{max_retries}): {e}"
+                )
+                if retry_count >= max_retries:
+                    print(
+                        f"❌ Failed to check repository after {max_retries} attempts: {e}"
+                    )
+                    return
+                print(f"   Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+
+        # Generate timestamp for this upload
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        uploaded_count = 0
+
+        # Upload all files maintaining original structure
+        for root, dirs, files in os.walk(output_dir):
+            for file in files:
+                local_path = os.path.join(root, file)
+
+                # Keep original directory structure
+                rel_path = os.path.relpath(local_path, output_dir)
+                github_path = f"performance_data/{timestamp}/{rel_path}".replace(
+                    "\\", "/"
+                )
+
+                # Upload file
+                commit_msg = f"Add performance data: {rel_path} ({timestamp})"
+                if self.upload_file_to_github(local_path, github_path, commit_msg):
+                    uploaded_count += 1
+
+        print(f"📤 Uploaded {uploaded_count} files to GitHub")
+
+        # Print access info
+        base_url = f"https://github.com/{self.data_repo}/tree/{self.data_branch}/performance_data/{timestamp}"
+        print(f"🔗 View uploaded data at: {base_url}")
+
+        # Generate GitHub Actions summary
+        self._generate_github_summary(output_dir, timestamp)
+
+    def _generate_github_summary(self, output_dir: str, timestamp: str):
+        """Generate GitHub Actions summary with performance data"""
+        try:
+            # Check if running in GitHub Actions
+            github_step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
+            if not github_step_summary:
+                print("ℹ️  Not running in GitHub Actions, skipping summary generation")
+                return
+
+            print("📊 Generating GitHub Actions summary...")
+
+            # Collect all CSV and PNG files
+            csv_files = []
+            png_files = []
+
+            for root, dirs, files in os.walk(output_dir):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    rel_path = os.path.relpath(file_path, output_dir)
+
+                    if file.endswith(".csv"):
+                        csv_files.append((file_path, rel_path))
+                    elif file.endswith(".png"):
+                        png_files.append((file_path, rel_path))
+
+            # Sort files by job and test name
+            csv_files.sort(key=lambda x: x[1])
+            png_files.sort(key=lambda x: x[1])
+
+            # Generate markdown summary
+            summary_lines = []
+            summary_lines.append("# 📊 SGLang Performance Analysis Report")
+            summary_lines.append("")
+            summary_lines.append(f"**Analysis Timestamp:** {timestamp}")
+            summary_lines.append(f"**Total CSV Files:** {len(csv_files)}")
+            summary_lines.append(f"**Total Chart Files:** {len(png_files)}")
+            summary_lines.append("")
+
+            # GitHub data repository link
+            base_url = f"https://github.com/{self.data_repo}/tree/{self.data_branch}/performance_data/{timestamp}"
+            summary_lines.append(f"🔗 **[View All Data on GitHub]({base_url})**")
+            summary_lines.append("")
+
+            # Group by job
+            job_groups = {}
+            for csv_path, rel_path in csv_files:
+                # Extract job name from path: job_summary/test_name.csv
+                parts = rel_path.split("/")
+                if len(parts) >= 2:
+                    job_name = parts[0].replace("_summary", "")
+                    test_name = parts[1].replace(".csv", "")
+
+                    if job_name not in job_groups:
+                        job_groups[job_name] = []
+                    job_groups[job_name].append((csv_path, test_name, rel_path))
+
+            # Generate summary for each job
+            for job_name in sorted(job_groups.keys()):
+                summary_lines.append(f"## 🚀 {job_name}")
+                summary_lines.append("")
+
+                tests = job_groups[job_name]
+                tests.sort(key=lambda x: x[1])  # Sort by test name
+
+                for csv_path, test_name, rel_path in tests:
+                    summary_lines.append(f"### 📈 {test_name}")
+
+                    # Add CSV data preview
+                    try:
+                        with open(csv_path, "r", encoding="utf-8") as f:
+                            lines = f.readlines()
+                            if len(lines) > 1:  # Has header and data
+                                summary_lines.append("")
+                                summary_lines.append("**Recent Performance Data:**")
+                                summary_lines.append("")
+
+                                # Show header
+                                header = lines[0].strip()
+                                summary_lines.append(
+                                    f"| {' | '.join(header.split(','))} |"
+                                )
+                                summary_lines.append(
+                                    f"| {' | '.join(['---'] * len(header.split(',')))} |"
+                                )
+
+                                # Show most recent 5 records (CSV is already sorted newest first)
+                                data_lines = lines[1:]
+                                for line in data_lines[
+                                    :5
+                                ]:  # Take first 5 lines (most recent)
+                                    if line.strip():
+                                        summary_lines.append(
+                                            f"| {' | '.join(line.strip().split(','))} |"
+                                        )
+
+                                summary_lines.append("")
+                    except Exception as e:
+                        summary_lines.append(f"*Error reading CSV data: {e}*")
+                        summary_lines.append("")
+
+                    # Add chart image if exists
+                    test_prefix = rel_path.replace(".csv", "")
+                    matching_charts = [
+                        (png_path, png_rel)
+                        for png_path, png_rel in png_files
+                        if png_rel.startswith(test_prefix)
+                    ]
+
+                    for png_path, chart_rel_path in matching_charts:
+                        chart_url = f"https://github.com/{self.data_repo}/raw/{self.data_branch}/performance_data/{timestamp}/{chart_rel_path}"
+                        # Extract metric name from filename: test_name_metric_name.png
+                        filename = os.path.basename(chart_rel_path)
+                        metric_name = filename.replace(f"{test_name}_", "").replace(
+                            ".png", ""
+                        )
+                        summary_lines.append(
+                            f"**{self._format_metric_name(metric_name)} Trend:**"
+                        )
+                        summary_lines.append("")
+                        summary_lines.append(
+                            f"![{test_name}_{metric_name}]({chart_url})"
+                        )
+                        summary_lines.append("")
+
+                    summary_lines.append("---")
+                    summary_lines.append("")
+
+            # Write summary to GitHub Actions
+            with open(github_step_summary, "w", encoding="utf-8") as f:
+                f.write("\n".join(summary_lines))
+
+            print("✅ GitHub Actions summary generated successfully")
+
+        except Exception as e:
+            print(f"❌ Failed to generate GitHub Actions summary: {e}")
+            import traceback
+
+            traceback.print_exc()
+
 
 def main():
     parser = argparse.ArgumentParser(description="SGLang CI Performance Analyzer")
@@ -697,6 +1331,26 @@ def main():
         default="performance_tables",
         help="Output directory (default: performance_tables)",
     )
+    parser.add_argument(
+        "--upload-to-github",
+        action="store_true",
+        help="Upload results to sglang-bot/sglang-ci-data repository",
+    )
+    parser.add_argument(
+        "--start-date",
+        type=str,
+        help="Start date for date range query (YYYY-MM-DD format). When specified with --end-date, gets ALL runs in range.",
+    )
+    parser.add_argument(
+        "--end-date",
+        type=str,
+        help="End date for date range query (YYYY-MM-DD format). When specified with --start-date, gets ALL runs in range.",
+    )
+    parser.add_argument(
+        "--branch",
+        default="main",
+        help="Filter runs by branch (default: 'main'). Set to empty string '' to analyze all branches.",
+    )
 
     args = parser.parse_args()
 
@@ -705,7 +1359,11 @@ def main():
 
     try:
         # Get CI run data
-        runs = analyzer.get_recent_runs(args.limit)
+        # Use None for branch if empty string is provided (to scan all branches)
+        branch = args.branch if args.branch else None
+        runs = analyzer.get_recent_runs(
+            args.limit, args.start_date, args.end_date, branch
+        )
 
         if not runs:
             print("No CI run data found")
@@ -716,6 +1374,10 @@ def main():
 
         # Generate performance tables
         analyzer.generate_performance_tables(test_data, args.output_dir)
+
+        # Upload to GitHub if requested
+        if args.upload_to_github:
+            analyzer.upload_performance_data_to_github(args.output_dir)
 
         # Generate summary report
         analyzer.generate_summary_report(test_data)

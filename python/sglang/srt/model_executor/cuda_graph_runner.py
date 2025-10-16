@@ -48,18 +48,22 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
     enable_num_token_non_padded,
 )
-from sglang.srt.patch_torch import monkey_patch_torch_compile
 from sglang.srt.two_batch_overlap import TboCudaGraphRunnerPlugin
 from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
+    get_bool_env_var,
     get_device_memory_capacity,
+    is_hip,
     log_info_on_rank0,
     require_attn_tp_gather,
     require_gathered_buffer,
     require_mlp_sync,
     require_mlp_tp_gather,
 )
+from sglang.srt.utils.patch_torch import monkey_patch_torch_compile
+
+_is_hip = is_hip()
 
 logger = logging.getLogger(__name__)
 
@@ -137,7 +141,7 @@ def patch_model(
                 mode=os.environ.get(
                     "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
                 ),
-                dynamic=False,
+                dynamic=_is_hip and get_bool_env_var("SGLANG_TORCH_DYNAMIC_SHAPE"),
             )
         else:
             yield model.forward
@@ -437,6 +441,7 @@ class CudaGraphRunner:
                 activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
                 record_shapes=True,
             )
+            torch.cuda.memory._record_memory_history()
 
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
@@ -485,6 +490,8 @@ class CudaGraphRunner:
                     save_gemlite_cache()
 
         if self.enable_profile_cuda_graph:
+            torch.cuda.memory._dump_snapshot(f"cuda_graph_runner_memory_usage.pickle")
+            torch.cuda.memory._record_memory_history(enabled=None)
             log_message = (
                 "Sorted by CUDA Time:\n"
                 + prof.key_averages(group_by_input_shape=True).table(
@@ -494,6 +501,7 @@ class CudaGraphRunner:
                 + prof.key_averages(group_by_input_shape=True).table(
                     sort_by="cpu_time_total", row_limit=10
                 )
+                + "\n\nMemory Usage is saved to cuda_graph_runner_memory_usage.pickle\n"
             )
             logger.info(log_message)
 
@@ -514,6 +522,7 @@ class CudaGraphRunner:
         input_ids = self.input_ids[:num_tokens]
         req_pool_indices = self.req_pool_indices[:bs]
         seq_lens = self.seq_lens[:bs]
+        seq_lens_cpu = self.seq_lens_cpu[:bs]
         out_cache_loc = self.out_cache_loc[:num_tokens]
         positions = self.positions[:num_tokens]
         if self.is_encoder_decoder:
@@ -584,6 +593,7 @@ class CudaGraphRunner:
             input_ids=input_ids,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
             next_token_logits_buffer=next_token_logits_buffer,
             orig_seq_lens=seq_lens,
             req_to_token_pool=self.model_runner.req_to_token_pool,
@@ -668,8 +678,9 @@ class CudaGraphRunner:
         capture_hidden_mode_required_by_forward_batch = (
             forward_batch.capture_hidden_mode
         )
-        capture_hidden_mode_required_by_spec_info = getattr(
-            forward_batch.spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL
+        capture_hidden_mode_required_by_spec_info = (
+            getattr(forward_batch.spec_info, "capture_hidden_mode", None)
+            or CaptureHiddenMode.NULL
         )
         capture_hidden_mode_required_for_returning_hidden_states = (
             CaptureHiddenMode.FULL
@@ -817,7 +828,7 @@ class CudaGraphRunner:
             self.model_runner.spec_algorithm.is_eagle()
             or self.model_runner.spec_algorithm.is_standalone()
         ):
-            from sglang.srt.speculative.eagle_utils import EagleVerifyInput
+            from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
             if self.model_runner.is_draft_worker:
                 raise RuntimeError("This should not happen.")
@@ -839,7 +850,7 @@ class CudaGraphRunner:
                 )
 
         elif self.model_runner.spec_algorithm.is_ngram():
-            from sglang.srt.speculative.ngram_utils import NgramVerifyInput
+            from sglang.srt.speculative.ngram_info import NgramVerifyInput
 
             spec_info = NgramVerifyInput(
                 draft_token=None,

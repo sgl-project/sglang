@@ -102,6 +102,19 @@ BASIC_TESTS = [
         ],
         op_sequence=[
             Operation(
+                type=OperationType.LOAD,
+                data="philschmid/code-llama-3-1-8b-text-to-sql-lora",
+                expected_error="already loaded",
+            ),
+            Operation(
+                type=OperationType.UNLOAD,
+                data="philschmid/code-llama-3-1-8b-text-to-sql-lora",
+            ),
+            Operation(
+                type=OperationType.LOAD,
+                data="philschmid/code-llama-3-1-8b-text-to-sql-lora",
+            ),
+            Operation(
                 type=OperationType.FORWARD,
                 data=create_batch_data(
                     [
@@ -223,6 +236,19 @@ BASIC_TESTS = [
             Operation(
                 type=OperationType.LOAD,
                 data="pbevan11/llama-3.1-8b-ocr-correction",
+            ),
+            Operation(
+                type=OperationType.LOAD,
+                data="philschmid/code-llama-3-1-8b-text-to-sql-lora",
+                expected_error="already loaded",
+            ),
+            Operation(
+                type=OperationType.UNLOAD,
+                data="philschmid/code-llama-3-1-8b-text-to-sql-lora",
+            ),
+            Operation(
+                type=OperationType.LOAD,
+                data="philschmid/code-llama-3-1-8b-text-to-sql-lora",
             ),
             Operation(
                 type=OperationType.FORWARD,
@@ -737,7 +763,7 @@ class LoRAUpdateTestSessionBase:
         max_lora_rank: Optional[int],
         enable_lora: Optional[bool] = None,
         lora_target_modules: Optional[List[str]] = None,
-        lora_backend: str = "triton",
+        lora_backend: str = "csgmv",
         disable_cuda_graph: bool = False,
         cuda_graph_max_bs: int = 4,
     ):
