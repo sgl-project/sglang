@@ -231,45 +231,6 @@ fn test_rerank_response_serialization() {
 }
 
 #[test]
-fn test_rerank_response_sort_by_score() {
-    let results = vec![
-        RerankResult {
-            score: 0.6,
-            document: Some("doc2".to_string()),
-            index: 1,
-            meta_info: None,
-        },
-        RerankResult {
-            score: 0.8,
-            document: Some("doc1".to_string()),
-            index: 0,
-            meta_info: None,
-        },
-        RerankResult {
-            score: 0.4,
-            document: Some("doc3".to_string()),
-            index: 2,
-            meta_info: None,
-        },
-    ];
-
-    let mut response = RerankResponse::new(
-        results,
-        "test-model".to_string(),
-        Some(StringOrArray::String("req-123".to_string())),
-    );
-
-    response.sort_by_score();
-
-    assert_eq!(response.results[0].score, 0.8);
-    assert_eq!(response.results[0].index, 0);
-    assert_eq!(response.results[1].score, 0.6);
-    assert_eq!(response.results[1].index, 1);
-    assert_eq!(response.results[2].score, 0.4);
-    assert_eq!(response.results[2].index, 2);
-}
-
-#[test]
 fn test_rerank_response_apply_top_k() {
     let results = vec![
         RerankResult {
@@ -588,9 +549,6 @@ fn test_full_rerank_workflow() {
 
     // Create response
     let mut response = RerankResponse::new(results, request.model.clone(), request.rid.clone());
-
-    // Sort by score
-    response.sort_by_score();
 
     // Apply top_k
     response.apply_top_k(request.effective_top_k());
