@@ -206,6 +206,9 @@ class ModelConfig:
             self.hf_config, "image_token_id", None
         ) or getattr(self.hf_config, "image_token_index", None)
 
+        # Validate quantize-and-serve configuration
+        self._validate_quantize_and_serve_config()
+
     @staticmethod
     def from_server_args(
         server_args: ServerArgs,

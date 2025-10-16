@@ -21,6 +21,14 @@ from sglang.srt.model_loader.loader import ModelOptModelLoader
 
 # Note: PYTHONPATH=python should be set when running tests
 
+# Check if modelopt is available
+try:
+    import modelopt
+
+    MODELOPT_AVAILABLE = True
+except ImportError:
+    MODELOPT_AVAILABLE = False
+
 
 class TestModelOptExport(unittest.TestCase):
     """Test suite for ModelOpt export functionality."""
@@ -109,6 +117,7 @@ class TestModelOptExport(unittest.TestCase):
         with open(os.path.join(export_dir, "model.safetensors"), "w") as f:
             f.write("mock_model_data")
 
+    @unittest.skipIf(not MODELOPT_AVAILABLE, "nvidia-modelopt not available")
     @patch("sglang.srt.model_loader.loader.os.makedirs")
     @patch("modelopt.torch.export.export_hf_checkpoint")
     def test_export_modelopt_checkpoint_success(self, mock_export, mock_makedirs):
@@ -124,6 +133,7 @@ class TestModelOptExport(unittest.TestCase):
         mock_makedirs.assert_called_once_with(self.export_dir, exist_ok=True)
         mock_export.assert_called_once_with(self.mock_model, export_dir=self.export_dir)
 
+    @unittest.skipIf(not MODELOPT_AVAILABLE, "nvidia-modelopt not available")
     @patch("modelopt.torch.opt.restore")
     @patch("modelopt.torch.quantization.utils.is_quantized")
     def test_setup_quantization_with_export_from_checkpoint(
@@ -150,6 +160,7 @@ class TestModelOptExport(unittest.TestCase):
             mock_restore.assert_called_once_with(self.mock_model, self.checkpoint_dir)
             mock_export.assert_called_once_with(self.mock_model, self.export_dir, None)
 
+    @unittest.skipIf(not MODELOPT_AVAILABLE, "nvidia-modelopt not available")
     @patch("modelopt.torch.quantization.quantize")
     @patch("modelopt.torch.quantization.print_quant_summary")
     @patch("modelopt.torch.quantization.utils.is_quantized")
@@ -190,6 +201,7 @@ class TestModelOptExport(unittest.TestCase):
             )
             mock_export.assert_called_once_with(self.mock_model, self.export_dir, None)
 
+    @unittest.skipIf(not MODELOPT_AVAILABLE, "nvidia-modelopt not available")
     def test_setup_quantization_without_export(self):
         """Test quantization setup without export path specified."""
         with patch("modelopt.torch.quantization.utils.is_quantized", return_value=True):
@@ -230,6 +242,7 @@ class TestModelOptExport(unittest.TestCase):
             )
         self.assertIn("requires ModelOpt quantization", str(context.exception))
 
+    @unittest.skipIf(not MODELOPT_AVAILABLE, "nvidia-modelopt not available")
     def test_standard_workflow_selection(self):
         """Test that standard workflow is selected by default."""
         with patch(
@@ -278,6 +291,7 @@ class TestModelOptExport(unittest.TestCase):
             return None
 
 
+@unittest.skipIf(not MODELOPT_AVAILABLE, "nvidia-modelopt not available")
 class TestModelOptExportIntegration(unittest.TestCase):
     """Integration tests for ModelOpt export with full model loading workflow."""
 
