@@ -496,7 +496,9 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
                 return_recv_hook=True,
             )
 
-        self._enable_deepep_moe = get_moe_a2a_backend().is_deepep()
+        self._enable_a2a_moe = (
+            get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake()
+        )
 
     def forward_normal_dual_stream(
         self,
