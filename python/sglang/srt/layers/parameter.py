@@ -7,6 +7,9 @@ from typing import Callable, Optional, Union
 import torch
 from torch.nn import Parameter
 
+from sglang.srt.layers.utils import pad_or_narrow_weight
+from sglang.srt.utils import is_cpu
+
 __all__ = [
     "BasevLLMParameter",
     "PackedvLLMParameter",
@@ -20,6 +23,8 @@ __all__ = [
 ]
 
 logger = logging.getLogger(__name__)
+
+_is_cpu = is_cpu()
 
 
 class BasevLLMParameter(Parameter):
@@ -93,9 +98,28 @@ class _ColumnvLLMParameter(BasevLLMParameter):
     ):
         if not use_presharded_weights:
             shard_size = self.data.shape[self.output_dim]
-            loaded_weight = loaded_weight.narrow(
-                self.output_dim, tp_rank * shard_size, shard_size
+
+            from sglang.srt.model_loader.weight_utils import (
+                narrow_padded_param_and_loaded_weight,
             )
+
+            if _is_cpu:
+                param_data, loaded_weight = narrow_padded_param_and_loaded_weight(
+                    self.data,
+                    loaded_weight,
+                    0,  # param_data_start
+                    tp_rank * shard_size,
+                    self.output_dim,
+                    shard_size,
+                )
+                assert param_data.shape == loaded_weight.shape
+                param_data.copy_(loaded_weight)
+                return
+            else:
+                loaded_weight = loaded_weight.narrow(
+                    self.output_dim, tp_rank * shard_size, shard_size
+                )
+
         assert self.data.shape == loaded_weight.shape
         self.data.copy_(loaded_weight)
 
@@ -116,10 +140,35 @@ class _ColumnvLLMParameter(BasevLLMParameter):
         param_data = self.data
 
         param_data = param_data.narrow(self.output_dim, shard_offset, shard_size)
-        if not use_presharded_weights:
-            loaded_weight = loaded_weight.narrow(
-                self.output_dim, tp_rank * shard_size, shard_size
+
+        from sglang.srt.model_loader.weight_utils import (
+            narrow_padded_param_and_loaded_weight,
+        )
+
+        if _is_cpu:
+            param_data, loaded_weight = narrow_padded_param_and_loaded_weight(
+                param_data,
+                loaded_weight,
+                0,  # param_data_start
+                tp_rank * shard_size,
+                self.output_dim,
+                shard_size,
+                not use_presharded_weights,
             )
+        else:
+            if not use_presharded_weights:
+                # Padding for special case like qwen2_5_VL's mlp which is not 8-aligned
+                start_idx = tp_rank * shard_size
+                end_idx = start_idx + shard_size
+                if end_idx > loaded_weight.shape[self.output_dim]:
+                    loaded_weight = pad_or_narrow_weight(
+                        loaded_weight, self.output_dim, start_idx, shard_size
+                    )
+                else:
+                    loaded_weight = loaded_weight.narrow(
+                        self.output_dim, start_idx, shard_size
+                    )
+
         assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
 
@@ -147,10 +196,26 @@ class _ColumnvLLMParameter(BasevLLMParameter):
         param_data = self.data
         shard_id = tp_rank if shard_id == "q" else tp_rank // num_heads
         param_data = param_data.narrow(self.output_dim, shard_offset, shard_size)
-        if not use_presharded_weights:
-            loaded_weight = loaded_weight.narrow(
-                self.output_dim, shard_id * shard_size, shard_size
+
+        if _is_cpu:
+            from sglang.srt.model_loader.weight_utils import (
+                narrow_padded_param_and_loaded_weight,
             )
+
+            param_data, loaded_weight = narrow_padded_param_and_loaded_weight(
+                param_data,
+                loaded_weight,
+                0,  # param_data_start
+                shard_id * shard_size,
+                self.output_dim,
+                shard_size,
+                not use_presharded_weights,
+            )
+        else:
+            if not use_presharded_weights:
+                loaded_weight = loaded_weight.narrow(
+                    self.output_dim, shard_id * shard_size, shard_size
+                )
 
         assert (
             param_data.shape == loaded_weight.shape
@@ -182,9 +247,37 @@ class RowvLLMParameter(BasevLLMParameter):
     ):
         if not use_presharded_weights:
             shard_size = self.data.shape[self.input_dim]
-            loaded_weight = loaded_weight.narrow(
-                self.input_dim, tp_rank * shard_size, shard_size
+
+            from sglang.srt.model_loader.weight_utils import (
+                narrow_padded_param_and_loaded_weight,
             )
+
+            if _is_cpu:
+                param_data, loaded_weight = narrow_padded_param_and_loaded_weight(
+                    self.data,
+                    loaded_weight,
+                    0,  # param_data_start
+                    tp_rank * shard_size,
+                    self.input_dim,
+                    shard_size,
+                )
+
+                assert param_data.shape == loaded_weight.shape
+                param_data.copy_(loaded_weight)
+
+                return
+            else:
+                # Padding for special case like qwen2_5_VL's mlp which is not 8-aligned
+                start_idx = tp_rank * shard_size
+                end_idx = start_idx + shard_size
+                if end_idx > loaded_weight.shape[self.input_dim]:
+                    loaded_weight = pad_or_narrow_weight(
+                        loaded_weight, self.input_dim, start_idx, shard_size
+                    )
+                else:
+                    loaded_weight = loaded_weight.narrow(
+                        self.input_dim, start_idx, shard_size
+                    )
 
         if len(loaded_weight.shape) == 0:
             loaded_weight = loaded_weight.reshape(1)

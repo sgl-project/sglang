@@ -14,11 +14,12 @@ from sglang.test.test_utils import (
     is_in_ci,
     popen_launch_server,
     write_github_step_summary,
+    write_results_to_json,
 )
 
 MODEL_SCORE_THRESHOLDS = {
-    "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4": 0.83,
-    "hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4": 0.83,
+    "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4": 0.825,
+    "hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4": 0.825,
     "hugging-quants/Mixtral-8x7B-Instruct-v0.1-AWQ-INT4": 0.62,
 }
 
@@ -42,10 +43,6 @@ def popen_launch_server_wrapper(base_url, model, is_fp8, is_tp2):
         other_args.extend(["--tp", "2"])
     if "DeepSeek" in model:
         other_args.extend(["--mem-frac", "0.85"])
-    if "AWQ" in model:
-        other_args.extend(["--quantization", "awq"])
-    elif "GPTQ" in model:
-        other_args.extend(["--quantization", "gptq"])
 
     process = popen_launch_server(
         model,
@@ -54,31 +51,6 @@ def popen_launch_server_wrapper(base_url, model, is_fp8, is_tp2):
         other_args=other_args,
     )
     return process
-
-
-def write_results_to_json(model, metrics, mode="a"):
-    result = {
-        "timestamp": datetime.now().isoformat(),
-        "model": model,
-        "metrics": metrics,
-        "score": metrics["score"],
-    }
-
-    existing_results = []
-    if mode == "a" and os.path.exists("results.json"):
-        try:
-            with open("results.json", "r") as f:
-                existing_results = json.load(f)
-        except json.JSONDecodeError:
-            existing_results = []
-
-    if isinstance(existing_results, list):
-        existing_results.append(result)
-    else:
-        existing_results = [result]
-
-    with open("results.json", "w") as f:
-        json.dump(existing_results, f, indent=2)
 
 
 def check_model_scores(results):

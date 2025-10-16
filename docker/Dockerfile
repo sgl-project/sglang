@@ -1,11 +1,30 @@
-ARG CUDA_VERSION=12.6.1
-FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04
+ARG CUDA_VERSION=12.9.1
+FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04 AS base
+ARG TARGETARCH
 
 ARG BUILD_TYPE=all
+ARG BRANCH_TYPE=remote
+ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
+ARG FLASHMLA_COMMIT=1408756a88e52a25196b759eaf8db89d2b51b5a1
+ARG FAST_HADAMARD_TRANSFORM_COMMIT=7fd811c2b47f63b0b08d2582619f939e14dad77c
+ARG CMAKE_BUILD_PARALLEL_LEVEL=2
+ARG SGL_KERNEL_VERSION=0.3.15
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
     GDRCOPY_HOME=/usr/src/gdrdrv-2.4.4/ \
     NVSHMEM_DIR=/sgl-workspace/nvshmem/install
+# Add GKE default lib and bin locations.
+ENV PATH="${PATH}:/usr/local/nvidia/bin" \
+    LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
+
+RUN apt update && apt install wget -y && apt install software-properties-common -y \
+ && add-apt-repository ppa:deadsnakes/ppa -y \
+  && apt install python3.12-full python3.12-dev python3.10-venv -y \
+ && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1 \
+ && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 2 \
+ && update-alternatives --set python3 /usr/bin/python3.12 \
+ && wget https://bootstrap.pypa.io/get-pip.py \
+ && python3 get-pip.py
 
 # Set timezone and install all packages
 RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
@@ -14,7 +33,6 @@ RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
     tzdata \
     software-properties-common netcat-openbsd kmod unzip openssh-server \
     curl wget lsof zsh ccache tmux htop git-lfs tree \
-    python3 python3-pip python3-dev libpython3-dev \
     build-essential cmake \
     libopenmpi-dev libnuma1 libnuma-dev \
     libibverbs-dev libibverbs1 libibumad3 \
@@ -22,7 +40,7 @@ RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
     ibverbs-providers infiniband-diags perftest \
     libgoogle-glog-dev libgtest-dev libjsoncpp-dev libunwind-dev \
     libboost-all-dev libssl-dev \
-    libgrpc-dev libgrpc++-dev libprotobuf-dev protobuf-compiler-grpc \
+    libgrpc-dev libgrpc++-dev libprotobuf-dev protobuf-compiler protobuf-compiler-grpc \
     pybind11-dev \
     libhiredis-dev libcurl4-openssl-dev \
     libczmq4 libczmq-dev \
@@ -30,7 +48,7 @@ RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
     patchelf \
     nvidia-dkms-550 \
     devscripts debhelper fakeroot dkms check libsubunit0 libsubunit-dev \
- && ln -sf /usr/bin/python3 /usr/bin/python \
+ && ln -sf /usr/bin/python3.12 /usr/bin/python \
  && rm -rf /var/lib/apt/lists/* \
  && apt-get clean
 
@@ -43,33 +61,59 @@ RUN mkdir -p /tmp/gdrcopy && cd /tmp \
  && cd / && rm -rf /tmp/gdrcopy
 
 # Fix DeepEP IBGDA symlink
-RUN ln -sf /usr/lib/x86_64-linux-gnu/libmlx5.so.1 /usr/lib/x86_64-linux-gnu/libmlx5.so
+RUN ln -sf /usr/lib/$(uname -m)-linux-gnu/libmlx5.so.1 /usr/lib/$(uname -m)-linux-gnu/libmlx5.so
 
-# Clone and install SGLang
+FROM scratch AS local_src
+COPY . /src
+
+FROM base AS build-image
+# Install SGLang
 WORKDIR /sgl-workspace
+ARG BRANCH_TYPE
+COPY --from=local_src /src /tmp/local_src
+RUN if [ "$BRANCH_TYPE" = "local" ]; then \
+        cp -r /tmp/local_src /sgl-workspace/sglang; \
+    else \
+        git clone --depth=1 https://github.com/sgl-project/sglang.git /sgl-workspace/sglang; \
+    fi \
+ && rm -rf /tmp/local_src
 RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5lib six \
- && git clone --depth=1 https://github.com/sgl-project/sglang.git \
  && cd sglang \
  && case "$CUDA_VERSION" in \
       12.6.1) CUINDEX=126 ;; \
       12.8.1) CUINDEX=128 ;; \
+      12.9.1) CUINDEX=129 ;; \
       *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
+ && if [ "$CUDA_VERSION" = "12.6.1" ]; then \
+     python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}+cu124-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps ; \
+   fi \
+&& if [ "$CUDA_VERSION" = "12.8.1" ] || [ "$CUDA_VERSION" = "12.9.1" ]; then \
+     python3 -m pip install --no-cache-dir sgl-kernel==${SGL_KERNEL_VERSION} ; \
+   fi \
  && python3 -m pip install --no-cache-dir -e "python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
- && if [ "$CUDA_VERSION" = "12.8.1" ]; then \
-      python3 -m pip install --no-cache-dir nvidia-nccl-cu12==2.27.3 --force-reinstall --no-deps ; \
-      python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v0.2.0/sgl_kernel-0.2.0+cu128-cp39-abi3-manylinux2014_x86_64.whl --force-reinstall --no-deps ; \
-    fi
+ && python3 -m pip install --no-cache-dir nvidia-nccl-cu12==2.27.6 --force-reinstall --no-deps \
+ && FLASHINFER_LOGGING_LEVEL=warning python3 -m flashinfer --download-cubin
 
-# Build and install NVSHMEM + DeepEP
-RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.2.5/source/nvshmem_src_3.2.5-1.txz \
- && git clone https://github.com/deepseek-ai/DeepEP.git \
- && tar -xf nvshmem_src_3.2.5-1.txz && mv nvshmem_src nvshmem \
- && cd nvshmem \
- && git apply /sgl-workspace/DeepEP/third-party/nvshmem.patch \
- && sed -i '1i#include <unistd.h>' examples/moe_shuffle.cu \
- && rm -f /sgl-workspace/nvshmem_src_3.2.5-1.txz \
- && NVSHMEM_SHMEM_SUPPORT=0 \
+
+# Download NVSHMEM source files
+# We use Tom's DeepEP fork for GB200 for now
+RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.3.9/source/nvshmem_src_cuda12-all-all-3.3.9.tar.gz && \
+    if [ "$BUILD_TYPE" = "blackwell_aarch64" ]; then \
+      git clone https://github.com/fzyzcjy/DeepEP.git \
+      && cd DeepEP && git checkout 1b14ad661c7640137fcfe93cccb2694ede1220b0 && sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && cd .. ; \
+    else \
+      git clone https://github.com/deepseek-ai/DeepEP.git \
+      && cd DeepEP && git checkout ${DEEPEP_COMMIT} && sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && cd .. ; \
+    fi \
+    && tar -xf nvshmem_src_cuda12-all-all-3.3.9.tar.gz \
+    && mv nvshmem_src nvshmem \
+    && rm -f /sgl-workspace/nvshmem_src_cuda12-all-all-3.3.9.tar.gz
+
+# Build and install NVSHMEM
+RUN cd /sgl-workspace/nvshmem && \
+    if [ "$BUILD_TYPE" = "blackwell" ] || [ "$BUILD_TYPE" = "blackwell_aarch" ]; then CUDA_ARCH="90;100;120"; else CUDA_ARCH="90"; fi && \
+    NVSHMEM_SHMEM_SUPPORT=0 \
     NVSHMEM_UCX_SUPPORT=0 \
     NVSHMEM_USE_NCCL=0 \
     NVSHMEM_MPI_SUPPORT=0 \
@@ -77,15 +121,48 @@ RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.2.5/sour
     NVSHMEM_PMIX_SUPPORT=0 \
     NVSHMEM_TIMEOUT_DEVICE_POLLING=0 \
     NVSHMEM_USE_GDRCOPY=1 \
-    cmake -S . -B build/ -DCMAKE_INSTALL_PREFIX=${NVSHMEM_DIR} -DCMAKE_CUDA_ARCHITECTURES=90 \
- && cmake --build build --target install -j \
- && cd /sgl-workspace/DeepEP \
- && NVSHMEM_DIR=${NVSHMEM_DIR} pip install .
+    cmake -S . -B build/ -DCMAKE_INSTALL_PREFIX=${NVSHMEM_DIR} -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH} && \
+    cmake --build build --target install -j${CMAKE_BUILD_PARALLEL_LEVEL}
+
+# Install DeepEP
+RUN cd /sgl-workspace/DeepEP && \
+    case "$CUDA_VERSION" in \
+      12.6.1) \
+        CHOSEN_TORCH_CUDA_ARCH_LIST='9.0' \
+        ;; \
+      12.8.1|12.9.1) \
+        CHOSEN_TORCH_CUDA_ARCH_LIST='9.0;10.0' \
+        ;; \
+      *) \
+        echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 \
+        ;; \
+    esac && \
+    NVSHMEM_DIR=${NVSHMEM_DIR} TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" pip install .
+
+# Install flashmla
+RUN if [ "$TARGETARCH" = "amd64" ]; then \
+      git clone https://github.com/deepseek-ai/FlashMLA.git flash-mla && \
+      cd flash-mla && \
+      git checkout ${FLASHMLA_COMMIT} && \
+      git submodule update --init --recursive && \
+      if [ "$CUDA_VERSION" = "12.6.1" ]; then \
+        export FLASH_MLA_DISABLE_SM100=1; \
+      fi && \
+      pip install -v . ; \
+    fi
+
+# Install fast-hadamard-transform
+RUN if [ "$TARGETARCH" = "amd64" ]; then \
+      git clone https://github.com/Dao-AILab/fast-hadamard-transform && \
+      cd fast-hadamard-transform && \
+      git checkout ${FAST_HADAMARD_TRANSFORM_COMMIT} && \
+      pip install . ; \
+    fi
 
 # Python tools
 RUN python3 -m pip install --no-cache-dir \
     datamodel_code_generator \
-    mooncake_transfer_engine==0.3.4.post2 \
+    mooncake-transfer-engine==0.3.6.post1 \
     pre-commit \
     pytest \
     black \
@@ -93,7 +170,9 @@ RUN python3 -m pip install --no-cache-dir \
     icdiff \
     uv \
     wheel \
-    scikit-build-core
+    scikit-build-core \
+    nixl \
+    py-spy
 
 # Install development tools and utilities
 RUN apt-get update && apt-get install -y \
@@ -124,16 +203,16 @@ RUN apt-get update && apt-get install -y \
 
 RUN apt update -y \
     && apt install -y --no-install-recommends gnupg \
-    && echo "deb http://developer.download.nvidia.com/devtools/repos/ubuntu2004/amd64 /" | tee /etc/apt/sources.list.d/nvidia-devtools.list \
-    && apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/x86_64/7fa2af80.pub \
+    && echo "deb http://developer.download.nvidia.com/devtools/repos/ubuntu2004/$(if [ "$(uname -m)" = "aarch64" ]; then echo "arm64"; else echo "amd64"; fi) /" | tee /etc/apt/sources.list.d/nvidia-devtools.list \
+    && apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/$(if [ "$(uname -m)" = "aarch64" ]; then echo "arm64"; else echo "x86_64"; fi)/7fa2af80.pub \
     && apt update -y \
     && apt install nsight-systems-cli -y
 
 # Set up locale
 RUN locale-gen en_US.UTF-8
-ENV LANG en_US.UTF-8
-ENV LANGUAGE en_US:en
-ENV LC_ALL en_US.UTF-8
+ENV LANG=en_US.UTF-8
+ENV LANGUAGE=en_US:en
+ENV LC_ALL=en_US.UTF-8
 
 # Install minimal Python packages
 RUN python3 -m pip install --no-cache-dir --break-system-packages \
@@ -141,9 +220,12 @@ RUN python3 -m pip install --no-cache-dir --break-system-packages \
     black \
     isort \
     icdiff \
-    scikit_build_core \
+    scikit-build-core \
     uv \
-    pre-commit
+    pre-commit \
+    pandas \
+    matplotlib \
+    tabulate
 
 # Install diff-so-fancy
 RUN curl -LSso /usr/local/bin/diff-so-fancy https://github.com/so-fancy/diff-so-fancy/releases/download/v1.4.4/diff-so-fancy \
@@ -161,11 +243,27 @@ RUN curl -L https://github.com/clangd/clangd/releases/download/18.1.3/clangd-lin
     && rm -rf clangd_18.1.3 clangd.zip
 
 # Install CMake
-RUN wget https://github.com/Kitware/CMake/releases/download/v3.31.1/cmake-3.31.1-linux-x86_64.tar.gz \
-    && tar -xzf cmake-3.31.1-linux-x86_64.tar.gz \
-    && cp -r cmake-3.31.1-linux-x86_64/bin/* /usr/local/bin/ \
-    && cp -r cmake-3.31.1-linux-x86_64/share/* /usr/local/share/ \
-    && rm -rf cmake-3.31.1-linux-x86_64 cmake-3.31.1-linux-x86_64.tar.gz
+RUN CMAKE_VERSION=3.31.1 \
+    && ARCH=$(uname -m) \
+    && CMAKE_INSTALLER="cmake-${CMAKE_VERSION}-linux-${ARCH}" \
+    && wget "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/${CMAKE_INSTALLER}.tar.gz" \
+    && tar -xzf "${CMAKE_INSTALLER}.tar.gz" \
+    && cp -r "${CMAKE_INSTALLER}/bin/"* /usr/local/bin/ \
+    && cp -r "${CMAKE_INSTALLER}/share/"* /usr/local/share/ \
+    && rm -rf "${CMAKE_INSTALLER}" "${CMAKE_INSTALLER}.tar.gz"
+
+# Install Rust toolchain for sgl-router
+ENV PATH="/root/.cargo/bin:${PATH}"
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
+    && rustc --version && cargo --version
+
+# Build and install sgl-router
+RUN python3 -m pip install --no-cache-dir setuptools-rust \
+    && cd /sgl-workspace/sglang/sgl-router \
+    && cargo build --release \
+    && python3 -m pip install --no-cache-dir . \
+    && rm -rf /root/.cache
+
 
 # Add yank script
 COPY --chown=root:root <<-"EOF" /usr/local/bin/yank
@@ -267,6 +365,7 @@ set-window-option -g mode-keys vi
 set-option -g escape-time 0
 set-option -g base-index 1
 set-window-option -g mouse on
+set -g history-limit 100000
 EOF
 
 # Configure Git

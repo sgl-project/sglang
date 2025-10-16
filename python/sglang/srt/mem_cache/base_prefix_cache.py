@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, List, NamedTuple, Tuple
+from typing import TYPE_CHECKING, Any, List, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -36,11 +36,11 @@ class BasePrefixCache(ABC):
         pass
 
     @abstractmethod
-    def match_prefix(self, key: List[int], **kwargs) -> MatchResult:
+    def match_prefix(self, key: Any, **kwargs) -> MatchResult:
         pass
 
     @abstractmethod
-    def cache_finished_req(self, req: Req, **kwargs):
+    def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs):
         pass
 
     @abstractmethod
@@ -56,13 +56,25 @@ class BasePrefixCache(ABC):
         pass
 
     @abstractmethod
-    def dec_lock_ref(self, node: Any):
+    def dec_lock_ref(self, node: Any, swa_uuid_for_lock: Optional[str] = None):
         pass
 
     def evictable_size(self):
         return 0
 
+    def full_evictable_size(self):
+        return 0
+
+    def swa_evictable_size(self):
+        return 0
+
     def protected_size(self):
+        return 0
+
+    def full_protected_size(self):
+        return 0
+
+    def swa_protected_size(self):
         return 0
 
     def total_size(self):
