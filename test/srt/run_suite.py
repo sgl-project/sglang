@@ -316,6 +316,13 @@ suite_xeon = {
     ],
 }
 
+# Add Intel XPU tests
+suite_xpu = {
+    "per-commit-xpu": [
+        TestFile("xpu/test_intel_xpu_backend.py"),
+    ],
+}
+
 # Add Ascend NPU tests
 # NOTE: please sort the test cases alphabetically by the test file name
 suite_ascend = {
@@ -341,6 +348,7 @@ suite_ascend = {
 suites.update(suite_amd)
 suites.update(suite_xeon)
 suites.update(suite_ascend)
+suites.update(suite_xpu)
 
 
 def auto_partition(files, rank, size):
