@@ -6,11 +6,10 @@ from typing import TYPE_CHECKING, Callable
 import torch
 
 from sglang.srt.layers.dp_attention import DpPaddingMode, set_dp_buffer_len
-from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
-from sglang.srt.layers.moe.utils import get_deepep_mode, get_moe_a2a_backend
 from sglang.srt.model_executor.cuda_graph_runner import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
     CudaGraphRunner,
+    DeepEPCudaGraphRunnerAdapter,
     get_batch_sizes_to_capture,
     get_global_graph_memory_pool,
     model_capture_mode,
@@ -59,8 +58,7 @@ class EAGLEDraftCudaGraphRunner:
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
         )
-        # Record the resolved DeepEP mode used during capture to ensure replay consistency
-        self._captured_deepep_mode = None
+        self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
         server_args = model_runner.server_args
 
         # Batch sizes to capture
@@ -264,14 +262,7 @@ class EAGLEDraftCudaGraphRunner:
             forward_batch.spec_info.hidden_states = hidden_states_backup
             return ret
 
-        # Resolve and pin DeepEP mode to avoid AUTO flipping between runs
-        if get_moe_a2a_backend().is_deepep():
-            resolved = get_deepep_mode().resolve(is_extend_in_batch=False)
-            if resolved.is_low_latency():
-                DeepEPBuffer.set_dispatch_mode_as_low_latency()
-            else:
-                DeepEPBuffer.set_dispatch_mode_as_normal()
-            self._captured_deepep_mode = resolved
+        self.deepep_adapter.capture(is_extend_in_batch=False)
 
         for _ in range(2):
             torch.cuda.synchronize()
@@ -294,15 +285,10 @@ class EAGLEDraftCudaGraphRunner:
 
     def replay(self, forward_batch: ForwardBatch):
         assert forward_batch.out_cache_loc is not None
+        self.deepep_adapter.replay()
+
         raw_bs = forward_batch.batch_size
         raw_num_token = raw_bs * self.num_tokens_per_bs
-
-        # Re-pin DeepEP mode to the one captured to avoid AUTO switching
-        if get_moe_a2a_backend().is_deepep() and self._captured_deepep_mode is not None:
-            if self._captured_deepep_mode.is_low_latency():
-                DeepEPBuffer.set_dispatch_mode_as_low_latency()
-            else:
-                DeepEPBuffer.set_dispatch_mode_as_normal()
 
         # Pad
         if self.require_mlp_tp_gather:

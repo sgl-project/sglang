@@ -239,11 +239,11 @@ class CudaGraphRunner:
         self.tp_size = model_runner.server_args.tp_size
         self.dp_size = model_runner.server_args.dp_size
         self.pp_size = model_runner.server_args.pp_size
-        # Record DeepEP mode used during capture to ensure replay consistency
-        self._captured_deepep_mode = None
 
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
+
+        self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
 
         # Batch sizes to capture
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
@@ -659,15 +659,7 @@ class CudaGraphRunner:
             )
             return logits_output_or_pp_proxy_tensors
 
-        # Resolve and pin DeepEP mode to avoid AUTO flipping between capture and replay
-        if get_moe_a2a_backend().is_deepep():
-            # Base runner handles decode/verify; not extend-in-batch
-            resolved = get_deepep_mode().resolve(is_extend_in_batch=False)
-            if resolved.is_low_latency():
-                DeepEPBuffer.set_dispatch_mode_as_low_latency()
-            else:
-                DeepEPBuffer.set_dispatch_mode_as_normal()
-            self._captured_deepep_mode = resolved
+        self.deepep_adapter.capture(is_extend_in_batch=False)
 
         for _ in range(2):
             self.device_module.synchronize()
@@ -812,12 +804,7 @@ class CudaGraphRunner:
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
-        # Re-apply captured DeepEP mode before replay to keep CUDA Graph stable under AUTO
-        if get_moe_a2a_backend().is_deepep() and self._captured_deepep_mode is not None:
-            if self._captured_deepep_mode.is_low_latency():
-                DeepEPBuffer.set_dispatch_mode_as_low_latency()
-            else:
-                DeepEPBuffer.set_dispatch_mode_as_normal()
+        self.deepep_adapter.replay()
 
         if not skip_attn_backend_init:
             self.replay_prepare(forward_batch, pp_proxy_tensors)
@@ -895,3 +882,23 @@ CUDA_GRAPH_CAPTURE_FAILED_MSG = (
     "4. disable CUDA graph by --disable-cuda-graph. (Not recommended. Huge performance loss)\n"
     "Open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose \n"
 )
+
+
+class DeepEPCudaGraphRunnerAdapter:
+    def __init__(self):
+        # Record DeepEP mode used during capture to ensure replay consistency
+        self._captured_deepep_mode = None
+
+    def capture(self, is_extend_in_batch: bool):
+        if not get_moe_a2a_backend().is_deepep():
+            return
+        self._captured_deepep_mode = get_deepep_mode().resolve(
+            is_extend_in_batch=is_extend_in_batch
+        )
+        DeepEPBuffer.set_dispatch_mode(self._captured_deepep_mode)
+
+    def replay(self):
+        if not get_moe_a2a_backend().is_deepep():
+            return
+        assert self._captured_deepep_mode is not None
+        DeepEPBuffer.set_dispatch_mode(self._captured_deepep_mode)
