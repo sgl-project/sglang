@@ -37,7 +37,7 @@ class FixFunctionalizationPass(SGLangInductorPass):
         print(f"  Auto-functionalized nodes: {len(auto_func_nodes)}")
         if auto_func_nodes:
             print(f"  Auto-functionalized node details:")
-            for i, node in enumerate(auto_func_nodes[:5], 1):  # 只显示前5个
+            for i, node in enumerate(auto_func_nodes[:5], 1):  # Show first 5 nodes
                 print(f"    {i}. {node.name}: {node.target}")
                 if len(node.args) > 0:
                     print(f"       First arg: {node.args[0]}")
