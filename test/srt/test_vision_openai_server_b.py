@@ -241,7 +241,7 @@ class TestGLM41VServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
         cls.base_url += "/v1"
 
 
-class TestQwen3OmniMoeServer(OmniOpenAITestMixin):
+class TestQwen3OmniServer(OmniOpenAITestMixin):
     @classmethod
     def setUpClass(cls):
         cls.model = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
@@ -257,7 +257,8 @@ class TestQwen3OmniMoeServer(OmniOpenAITestMixin):
                 "0.68",
                 "--cuda-graph-max-bs",
                 "4",
-                "--tp=2",
+                "--quantization",
+                "fp8",
             ],
         )
         cls.base_url += "/v1"
