@@ -5,10 +5,13 @@ use crate::core::{
 };
 use crate::metrics::RouterMetrics;
 use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
-use crate::protocols::spec::{
-    ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateRequest, RerankRequest,
-    ResponsesGetParams, ResponsesRequest, StringOrArray, UserMessageContent,
-};
+use crate::protocols::chat::{ChatCompletionRequest, ChatMessage, UserMessageContent};
+use crate::protocols::common::{InputIds, StringOrArray};
+use crate::protocols::completion::CompletionRequest;
+use crate::protocols::embedding::EmbeddingRequest;
+use crate::protocols::generate::GenerateRequest;
+use crate::protocols::rerank::RerankRequest;
+use crate::protocols::responses::{ResponsesGetParams, ResponsesRequest};
 use crate::routers::header_utils;
 use crate::routers::RouterTrait;
 use async_trait::async_trait;
@@ -150,14 +153,10 @@ impl PDRouter {
     }
 
     fn get_generate_batch_size(req: &GenerateRequest) -> Option<usize> {
-        if let Some(StringOrArray::Array(arr)) = &req.prompt {
-            if !arr.is_empty() {
-                return Some(arr.len());
-            }
-        }
-        if let Some(text) = &req.text {
-            if text.contains("[") && text.contains("]") {
-                return None;
+        // GenerateRequest doesn't support batch via arrays, only via input_ids
+        if let Some(InputIds::Batch(batches)) = &req.input_ids {
+            if !batches.is_empty() {
+                return Some(batches.len());
             }
         }
         None
@@ -1061,18 +1060,10 @@ impl RouterTrait for PDRouter {
         model_id: Option<&str>,
     ) -> Response {
         let is_stream = body.stream;
-        let return_logprob = body.return_logprob;
+        let return_logprob = body.return_logprob.unwrap_or(false);
 
         let request_text = if self.policies_need_request_text() {
-            body.text
-                .as_deref()
-                .or_else(|| {
-                    body.prompt.as_ref().and_then(|p| match p {
-                        StringOrArray::String(s) => Some(s.as_str()),
-                        StringOrArray::Array(v) => v.first().map(|s| s.as_str()),
-                    })
-                })
-                .map(|s| s.to_string())
+            body.text.as_deref().map(|s| s.to_string())
         } else {
             None
         };
@@ -1198,7 +1189,7 @@ impl RouterTrait for PDRouter {
     async fn route_embeddings(
         &self,
         _headers: Option<&HeaderMap>,
-        _body: &crate::protocols::spec::EmbeddingRequest,
+        _body: &EmbeddingRequest,
         _model_id: Option<&str>,
     ) -> Response {
         (

@@ -12,13 +12,12 @@ use serde_json::Value;
 
 use crate::core::Worker;
 use crate::grpc_client::{proto, SglangSchedulerClient};
-use crate::protocols::spec::{
-    ChatCompletionRequest, ChatCompletionResponse, GenerateRequest, GenerateResponse,
-};
-use crate::reasoning_parser::ReasoningParserFactory;
+use crate::protocols::chat::{ChatCompletionRequest, ChatCompletionResponse};
+use crate::protocols::generate::{GenerateRequest, GenerateResponse};
+use crate::reasoning_parser::ParserFactory as ReasoningParserFactory;
 use crate::tokenizer::stop::StopSequenceDecoder;
 use crate::tokenizer::traits::Tokenizer;
-use crate::tool_parser::ToolParserFactory;
+use crate::tool_parser::ParserFactory as ToolParserFactory;
 
 // ============================================================================
 // Core Context Types
@@ -371,16 +370,17 @@ impl ClientSelection {
 // Execution and Response Types
 // ============================================================================
 
-use tonic::codec::Streaming;
+use crate::grpc_client::sglang_scheduler::AbortOnDropStream;
 
 /// Result of request execution (streams from workers)
+/// Uses AbortOnDropStream to automatically abort on cancellation
 pub enum ExecutionResult {
     Single {
-        stream: Streaming<proto::GenerateResponse>,
+        stream: AbortOnDropStream,
     },
     Dual {
-        prefill: Streaming<proto::GenerateResponse>,
-        decode: Box<Streaming<proto::GenerateResponse>>,
+        prefill: AbortOnDropStream,
+        decode: Box<AbortOnDropStream>,
     },
 }
 

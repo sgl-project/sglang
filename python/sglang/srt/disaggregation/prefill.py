@@ -49,6 +49,11 @@ from sglang.srt.managers.schedule_batch import (
     RequestStage,
     ScheduleBatch,
 )
+from sglang.srt.mem_cache.memory_pool import (
+    HybridLinearKVPool,
+    NSATokenToKVPool,
+    SWAKVPool,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.utils import (
     DynamicGradMode,
@@ -145,6 +150,28 @@ class PrefillBootstrapQueue:
         )
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.gpu_id
+
+        if hasattr(self.token_to_kv_pool, "get_state_buf_infos"):
+            state_data_ptrs, state_data_lens, state_item_lens = (
+                self.token_to_kv_pool.get_state_buf_infos()
+            )
+            kv_args.state_data_ptrs = state_data_ptrs
+            kv_args.state_data_lens = state_data_lens
+            kv_args.state_item_lens = state_item_lens
+
+            if isinstance(self.token_to_kv_pool, SWAKVPool):
+                kv_args.state_type = "swa"
+            elif isinstance(self.token_to_kv_pool, HybridLinearKVPool):
+                kv_args.state_type = "mamba"
+            elif isinstance(self.token_to_kv_pool, NSATokenToKVPool):
+                kv_args.state_type = "nsa"
+            else:
+                kv_args.state_type = "none"
+        else:
+            kv_args.state_data_ptrs = []
+            kv_args.state_data_lens = []
+            kv_args.state_item_lens = []
+            kv_args.state_type = "none"
 
         kv_manager_class: Type[BaseKVManager] = get_kv_class(
             self.transfer_backend, KVClassType.MANAGER
@@ -321,8 +348,6 @@ class SchedulerDisaggregationPrefillMixin:
         self.result_queue = deque()
 
         while True:
-            self.launch_last_batch_sample_if_needed()
-
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             self.waiting_queue.extend(
@@ -334,9 +359,11 @@ class SchedulerDisaggregationPrefillMixin:
             if require_mlp_sync(self.server_args):
                 batch = self.prepare_mlp_sync_batch(batch)
             self.cur_batch = batch
+
+            batch_result = None
             if batch:
-                result = self.run_batch(batch)
-                self.result_queue.append((batch.copy(), result))
+                batch_result = self.run_batch(batch)
+                self.result_queue.append((batch.copy(), batch_result))
 
             if self.last_batch:
                 tmp_batch, tmp_result = self.result_queue.popleft()
@@ -344,6 +371,8 @@ class SchedulerDisaggregationPrefillMixin:
 
             if len(self.disagg_prefill_inflight_queue) > 0:
                 self.process_disagg_prefill_inflight_queue()
+
+            self.launch_batch_sample_if_needed(batch_result)
 
             if batch is None and len(self.disagg_prefill_inflight_queue) == 0:
                 self.self_check_during_idle()
@@ -616,15 +645,58 @@ class SchedulerDisaggregationPrefillMixin:
             .numpy()
         )
         req.start_send_idx = end_idx
+        state_indices = None
         if last_chunk:
             self.disagg_metadata_buffers.set_buf(req)
+
+            # Prepare extra pool indices for hybrid models
+            if isinstance(
+                self.token_to_kv_pool_allocator.get_kvcache(), HybridLinearKVPool
+            ):
+                # Mamba hybrid model: send single mamba state index
+                state_indices = [
+                    self.req_to_token_pool.req_index_to_mamba_index_mapping[
+                        req.req_pool_idx
+                    ]
+                    .cpu()
+                    .numpy()
+                ]
+            elif isinstance(self.token_to_kv_pool_allocator.get_kvcache(), SWAKVPool):
+                # SWA hybrid model: send last window KV indices
+                seq_len = len(req.fill_ids)
+                window_size = self.sliding_window_size
+                window_start = max(0, seq_len - window_size)
+                window_start = (window_start // page_size) * page_size
+
+                window_kv_indices_full = self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, window_start:seq_len
+                ]
+
+                # Translate to SWA pool indices
+                window_kv_indices_swa = (
+                    self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+                        window_kv_indices_full
+                    )
+                )
+                state_indices = window_kv_indices_swa.cpu().numpy()
+                state_indices = kv_to_page_indices(state_indices, page_size)
+            elif isinstance(
+                self.token_to_kv_pool_allocator.get_kvcache(), NSATokenToKVPool
+            ):
+                seq_len = len(req.fill_ids)
+                kv_indices_full = self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, :seq_len
+                ]
+                state_indices = kv_indices_full.cpu().numpy()
+                state_indices = kv_to_page_indices(state_indices, page_size)
+
         page_indices = kv_to_page_indices(kv_indices, page_size)
         if len(page_indices) == 0:
             logger.info(
                 f"Skip sending kv chunk for request {req.rid=} {req.bootstrap_room=} because page_indices is empty"
             )
             return
-        req.disagg_kv_sender.send(page_indices)
+        req.disagg_kv_sender.send(page_indices, state_indices)
 
     # PP
     @DynamicGradMode()

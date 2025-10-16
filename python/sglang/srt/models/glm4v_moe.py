@@ -16,10 +16,10 @@ from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.glm4_moe import Glm4MoeModel
 from sglang.srt.models.glm4v import Glm4vForConditionalGeneration, Glm4vVisionModel
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, is_cuda, log_info_on_rank0
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
@@ -47,7 +47,7 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
         self.determine_num_fused_shared_experts("Glm4MoeForCausalLM")
         self.num_fused_shared_experts = (
             0
-            if global_server_args_dict["disable_shared_experts_fusion"]
+            if get_global_server_args().disable_shared_experts_fusion
             else config.n_shared_experts
         )
 
@@ -68,7 +68,7 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=global_server_args_dict["enable_dp_lm_head"],
+            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
@@ -81,7 +81,7 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
         self, architecture: str = "Glm4MoeForCausalLM"
     ):
         self.num_fused_shared_experts = 0
-        if global_server_args_dict["disable_shared_experts_fusion"]:
+        if get_global_server_args().disable_shared_experts_fusion:
             return
 
         # Only Deepseek V3/R1 can use shared experts fusion optimization now.
@@ -97,7 +97,7 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
             disable_reason = "Deepseek and GLM-4.5 can not use shared experts fusion optimization under expert parallelism."
 
         if disable_reason is not None:
-            global_server_args_dict["disable_shared_experts_fusion"] = True
+            get_global_server_args().disable_shared_experts_fusion = True
             self.num_fused_shared_experts = 0
             log_info_on_rank0(
                 logger,

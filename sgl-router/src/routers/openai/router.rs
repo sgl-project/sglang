@@ -6,8 +6,12 @@ use crate::data_connector::{
     conversation_items::ListParams, conversation_items::SortOrder, ConversationId, ResponseId,
     SharedConversationItemStorage, SharedConversationStorage, SharedResponseStorage,
 };
-use crate::protocols::spec::{
-    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest,
+use crate::protocols::chat::ChatCompletionRequest;
+use crate::protocols::completion::CompletionRequest;
+use crate::protocols::embedding::EmbeddingRequest;
+use crate::protocols::generate::GenerateRequest;
+use crate::protocols::rerank::RerankRequest;
+use crate::protocols::responses::{
     ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponsesGetParams,
     ResponsesRequest,
 };
@@ -27,18 +31,19 @@ use std::{
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tracing::{info, warn};
+use tracing::warn;
 
 // Import from sibling modules
 use super::conversations::{
-    create_conversation, delete_conversation, get_conversation, list_conversation_items,
-    persist_conversation_items, update_conversation,
+    create_conversation, create_conversation_items, delete_conversation, delete_conversation_item,
+    get_conversation, get_conversation_item, list_conversation_items, persist_conversation_items,
+    update_conversation,
 };
 use super::mcp::{
     execute_tool_loop, mcp_manager_from_request_tools, prepare_mcp_payload_for_streaming,
     McpLoopConfig,
 };
-use super::responses::{mask_tools_as_mcp, patch_streaming_response_json, store_response_internal};
+use super::responses::{mask_tools_as_mcp, patch_streaming_response_json};
 use super::streaming::handle_streaming_response;
 
 // ============================================================================
@@ -147,7 +152,11 @@ impl OpenAIRouter {
         original_previous_response_id: Option<String>,
     ) -> Response {
         // Check if MCP is active for this request
-        let req_mcp_manager = mcp_manager_from_request_tools(&original_body.tools).await;
+        let req_mcp_manager = if let Some(ref tools) = original_body.tools {
+            mcp_manager_from_request_tools(tools.as_slice()).await
+        } else {
+            None
+        };
         let active_mcp = req_mcp_manager.as_ref().or(self.mcp_manager.as_ref());
 
         let mut response_json: Value;
@@ -182,6 +191,7 @@ impl OpenAIRouter {
             }
         } else {
             // No MCP - simple request
+
             let mut request_builder = self.client.post(&url).json(&payload);
             if let Some(h) = headers {
                 request_builder = apply_request_headers(h, request_builder, true);
@@ -191,6 +201,11 @@ impl OpenAIRouter {
                 Ok(r) => r,
                 Err(e) => {
                     self.circuit_breaker.record_failure();
+                    tracing::error!(
+                        url = %url,
+                        error = %e,
+                        "Failed to forward request to OpenAI"
+                    );
                     return (
                         StatusCode::BAD_GATEWAY,
                         format!("Failed to forward request to OpenAI: {}", e),
@@ -230,26 +245,17 @@ impl OpenAIRouter {
             original_previous_response_id.as_deref(),
         );
 
-        // Persist conversation items if conversation is provided
-        if original_body.conversation.is_some() {
-            if let Err(err) = persist_conversation_items(
-                self.conversation_storage.clone(),
-                self.conversation_item_storage.clone(),
-                self.response_storage.clone(),
-                &response_json,
-                original_body,
-            )
-            .await
-            {
-                warn!("Failed to persist conversation items: {}", err);
-            }
-        } else {
-            // Store response only if no conversation (persist_conversation_items already stores it)
-            if let Err(err) =
-                store_response_internal(&self.response_storage, &response_json, original_body).await
-            {
-                warn!("Failed to store response: {}", err);
-            }
+        // Always persist conversation items and response (even without conversation)
+        if let Err(err) = persist_conversation_items(
+            self.conversation_storage.clone(),
+            self.conversation_item_storage.clone(),
+            self.response_storage.clone(),
+            &response_json,
+            original_body,
+        )
+        .await
+        {
+            warn!("Failed to persist conversation items: {}", err);
         }
 
         (StatusCode::OK, Json(response_json)).into_response()
@@ -393,6 +399,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
             }
         };
         if let Some(obj) = payload.as_object_mut() {
+            // Always remove SGLang-specific fields (unsupported by OpenAI)
             for key in [
                 "top_k",
                 "min_p",
@@ -520,12 +527,6 @@ impl crate::routers::RouterTrait for OpenAIRouter {
     ) -> Response {
         let url = format!("{}/v1/responses", self.base_url);
 
-        info!(
-            requested_store = body.store,
-            is_streaming = body.stream,
-            "openai_responses_request"
-        );
-
         // Validate mutually exclusive params: previous_response_id and conversation
         // TODO: this validation logic should move the right place, also we need a proper error message module
         if body.previous_response_id.is_some() && body.conversation.is_some() {
@@ -543,7 +544,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                 .into_response();
         }
 
-        // Clone the body and override model if needed
+        // Clone the body for validation and logic, but we'll build payload differently
         let mut request_body = body.clone();
         if let Some(model) = model_id {
             request_body.model = Some(model.to_string());
@@ -698,7 +699,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         }
 
         // Always set store=false for upstream (we store internally)
-        request_body.store = false;
+        request_body.store = Some(false);
 
         // Convert to JSON and strip SGLang-specific fields
         let mut payload = match to_value(&request_body) {
@@ -712,14 +713,13 @@ impl crate::routers::RouterTrait for OpenAIRouter {
             }
         };
 
-        // Remove SGLang-specific fields
+        // Remove SGLang-specific fields only
         if let Some(obj) = payload.as_object_mut() {
+            // Remove SGLang-specific fields (not part of OpenAI API)
             for key in [
                 "request_id",
                 "priority",
                 "top_k",
-                "frequency_penalty",
-                "presence_penalty",
                 "min_p",
                 "min_tokens",
                 "regex",
@@ -740,10 +740,38 @@ impl crate::routers::RouterTrait for OpenAIRouter {
             ] {
                 obj.remove(key);
             }
+            // XAI doesn't support the OPENAI item type input: https://platform.openai.com/docs/api-reference/responses/create#responses-create-input-input-item-list-item
+            // To Achieve XAI compatibility, strip extra fields from input messages (id, status)
+            // XAI doesn't support output_text as type for content with role of assistant
+            // so normalize content types: output_text -> input_text
+            if let Some(input_arr) = obj.get_mut("input").and_then(Value::as_array_mut) {
+                for item_obj in input_arr.iter_mut().filter_map(Value::as_object_mut) {
+                    // Remove fields not universally supported
+                    item_obj.remove("id");
+                    item_obj.remove("status");
+
+                    // Normalize content types to input_text (xAI compatibility)
+                    if let Some(content_arr) =
+                        item_obj.get_mut("content").and_then(Value::as_array_mut)
+                    {
+                        for content_obj in content_arr.iter_mut().filter_map(Value::as_object_mut) {
+                            // Change output_text to input_text
+                            if content_obj.get("type").and_then(Value::as_str)
+                                == Some("output_text")
+                            {
+                                content_obj.insert(
+                                    "type".to_string(),
+                                    Value::String("input_text".to_string()),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // Delegate to streaming or non-streaming handler
-        if body.stream {
+        if body.stream.unwrap_or(false) {
             handle_streaming_response(
                 &self.client,
                 &self.circuit_breaker,
@@ -903,6 +931,53 @@ impl crate::routers::RouterTrait for OpenAIRouter {
             &self.conversation_item_storage,
             conversation_id,
             query_params,
+        )
+        .await
+    }
+
+    async fn create_conversation_items(
+        &self,
+        _headers: Option<&HeaderMap>,
+        conversation_id: &str,
+        body: &Value,
+    ) -> Response {
+        create_conversation_items(
+            &self.conversation_storage,
+            &self.conversation_item_storage,
+            conversation_id,
+            body.clone(),
+        )
+        .await
+    }
+
+    async fn get_conversation_item(
+        &self,
+        _headers: Option<&HeaderMap>,
+        conversation_id: &str,
+        item_id: &str,
+        include: Option<Vec<String>>,
+    ) -> Response {
+        get_conversation_item(
+            &self.conversation_storage,
+            &self.conversation_item_storage,
+            conversation_id,
+            item_id,
+            include,
+        )
+        .await
+    }
+
+    async fn delete_conversation_item(
+        &self,
+        _headers: Option<&HeaderMap>,
+        conversation_id: &str,
+        item_id: &str,
+    ) -> Response {
+        delete_conversation_item(
+            &self.conversation_storage,
+            &self.conversation_item_storage,
+            conversation_id,
+            item_id,
         )
         .await
     }
