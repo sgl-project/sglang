@@ -29,8 +29,8 @@ def _load_aiter_ops():
     if _aiter_ops is not None and _aiter_module is not None:
         return _aiter_ops
 
-    import aiter as _aiter  # type: ignore
-    import aiter.ops.sampling  # noqa: F401  # ensure sampling ops are loaded
+    import aiter as _aiter
+    import aiter.ops.sampling
 
     _aiter_ops = torch.ops.aiter
     _aiter_module = _aiter
