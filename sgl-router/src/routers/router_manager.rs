@@ -614,6 +614,76 @@ impl RouterTrait for RouterManager {
                 .into_response()
         }
     }
+
+    async fn create_conversation_items(
+        &self,
+        headers: Option<&HeaderMap>,
+        conversation_id: &str,
+        body: &Value,
+    ) -> Response {
+        let router = self.select_router_for_request(headers, None);
+        if let Some(router) = router {
+            router
+                .create_conversation_items(headers, conversation_id, body)
+                .await
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                format!(
+                    "No router available to create conversation items for '{}'",
+                    conversation_id
+                ),
+            )
+                .into_response()
+        }
+    }
+
+    async fn get_conversation_item(
+        &self,
+        headers: Option<&HeaderMap>,
+        conversation_id: &str,
+        item_id: &str,
+        include: Option<Vec<String>>,
+    ) -> Response {
+        let router = self.select_router_for_request(headers, None);
+        if let Some(router) = router {
+            router
+                .get_conversation_item(headers, conversation_id, item_id, include)
+                .await
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                format!(
+                    "No router available to get conversation item '{}' in '{}'",
+                    item_id, conversation_id
+                ),
+            )
+                .into_response()
+        }
+    }
+
+    async fn delete_conversation_item(
+        &self,
+        headers: Option<&HeaderMap>,
+        conversation_id: &str,
+        item_id: &str,
+    ) -> Response {
+        let router = self.select_router_for_request(headers, None);
+        if let Some(router) = router {
+            router
+                .delete_conversation_item(headers, conversation_id, item_id)
+                .await
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                format!(
+                    "No router available to delete conversation item '{}' in '{}'",
+                    item_id, conversation_id
+                ),
+            )
+                .into_response()
+        }
+    }
 }
 
 impl std::fmt::Debug for RouterManager {

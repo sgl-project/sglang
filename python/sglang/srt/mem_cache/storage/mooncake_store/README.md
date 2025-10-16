@@ -91,8 +91,8 @@ First, create and save a configuration file in JSON format. For example:
     "metadata_server": "http://localhost:8080/metadata",
     "master_server_address": "localhost:50051",
     "protocol": "rdma",
-    "device_name": "mlx5_0,mlx5_1",
-    "global_segment_size": 2684354560,
+    "device_name": "",
+    "global_segment_size": "4gb",
     "local_buffer_size": 0
 }
 ```
@@ -102,9 +102,9 @@ Parameter Explanation:
 * `local_hostname`: The hostname of the `store service`.
 * `metadata_server`: The network address of the `metadata service`. The default port is 8080.
 * `master_server_address`: The network address of the `master service`. The default port is 50051.
-* `protocol`: The protocol used by the Mooncake. Supported values are `"rdma"` or `"tcp"`. For optimal performance, `"rdma"` is recommended.
-* `device_name`: The RDMA devices used by Mooncake. This parameter is required only when the protocol is set to `"rdma"`. Available devices can be listed using the `ibv_devices` command.
-* `global_segment_size`: The amount of memory (in bytes) contributed to the global memory pool. A larger value allows Mooncake to cache more KV tensors.
+* `protocol`: The protocol used by Mooncake. Supported values are `"rdma"` or `"tcp"`. For optimal performance, `"rdma"` is recommended.
+* `device_name`: For `"rdma"`, you can leave this empty in most cases. Mooncake auto-discovers RDMA NICs by default. If you want to pin specific NICs (e.g., `mlx5_0,mlx5_1`), just set `device_name` accordingly. To list available devices, use `ibv_devices`.
+* `global_segment_size`: The amount of memory contributed to the global memory pool. Accepts either bytes (integer) or a string with the `gb` suffix, e.g., `"16gb"`. A larger value allows Mooncake to cache more KV tensors.
 * `local_buffer_size`: Local buffer is used to do request operations such as `Get` or `Put`. In this case, it is set to 0 because the instance functions solely as a storage server, contributing memory to the global pool without issuing any request operations.
 
 Then start the `store service`:
@@ -130,8 +130,11 @@ There are three ways to prepare mooncakes:
 MOONCAKE_TE_META_DATA_SERVER="http://127.0.0.1:8080/metadata" \
 MOONCAKE_MASTER=127.0.0.1:50051 \
 MOONCAKE_PROTOCOL="rdma" \
-MOONCAKE_DEVICE="mlx5_0,mlx5_1" \
-MOONCAKE_GLOBAL_SEGMENT_SIZE=4294967296 \
+# Leave MOONCAKE_DEVICE empty for auto-discovery (default)
+# To pin NICs, disable auto-discovery then set MOONCAKE_DEVICE, e.g.:
+# export MC_MS_AUTO_DISC=0
+# export MOONCAKE_DEVICE="mlx5_0,mlx5_1"
+MOONCAKE_GLOBAL_SEGMENT_SIZE=4gb \
 python -m sglang.launch_server \
     --enable-hierarchical-cache \
     --hicache-storage-backend mooncake\
@@ -143,8 +146,8 @@ Parameter Explanation:
 * `MOONCAKE_TE_META_DATA_SERVER`: The network address of the `metadata service`. The default port is 8080.
 * `MOONCAKE_MASTER`: The network address of the `master service`. The default port is 50051.
 * `MOONCAKE_PROTOCOL`: The protocol used by Mooncake. Supported values are `"rdma"` or `"tcp"`. For optimal performance, `"rdma"` is recommended.
-* `MOONCAKE_DEVICE`: The RDMA devices used by Mooncake. This parameter is required only when the protocol is set to `"rdma"`. Available devices can be listed using the `ibv_devices` command.
-* `MOONCAKE_GLOBAL_SEGMENT_SIZE`: The amount of memory (in bytes) contributed to the global memory pool. If at least one `store service` is launched, then this value could be set to `0`. In this case, the `SGLang server` will not contribute any memory to the system. Note that KV tensors cached in the contributed memory will be lost once this process terminates; however, this will not cause any system errors.
+* `MOONCAKE_DEVICE`: Optional for `"rdma"`. By default, Mooncake auto-discovers RDMA NICs. If you need to pin specific NICs, set `MOONCAKE_DEVICE` (comma-separated list, e.g., `mlx5_0,mlx5_1`).
+* `MOONCAKE_GLOBAL_SEGMENT_SIZE`: The amount of memory contributed to the global memory pool. Accepts either bytes (integer) or a value with the `gb` suffix, e.g., `16gb`. If at least one `store service` is launched, this value can be set to `0`. In this case, the `SGLang server` will not contribute any memory to the system. Note that KV tensors cached in the contributed memory will be lost once this process terminates; however, this will not cause any system errors.
 
 **Using JSON file to configure Mooncake**
 
@@ -155,8 +158,8 @@ echo '{
     "metadata_server": "http://localhost:8080/metadata",
     "master_server_address": "localhost:50051",
     "protocol": "rdma",
-    "device_name": "mlx5_0,mlx5_1",
-    "global_segment_size": 2684354560,
+    "device_name": "",
+    "global_segment_size": "4gb",
     "local_buffer_size": 0
 }' > ${SGLANG_HICACHE_MOONCAKE_CONFIG_PATH}
 ```
@@ -168,7 +171,7 @@ python -m sglang.launch_server \
     --enable-hierarchical-cache \
     --hicache-storage-backend mooncake \
     --model-path [model_path] \
-    --hicache-storage-backend-extra-config '{"master_server_address": "127.0.0.1:50051", "local_hostname": "localhost", "metadata_server": "http://127.0.0.1:8080/metadata", "global_segment_size": 4294967296, "local_buffer_size": 16777216, "protocol": "rdma", "device_name": "mlx5_0,mlx5_1"}'
+    --hicache-storage-backend-extra-config '{"master_server_address": "127.0.0.1:50051", "local_hostname": "localhost", "metadata_server": "http://127.0.0.1:8080/metadata", "global_segment_size": "4gb", "local_buffer_size": 16777216, "protocol": "rdma", "device_name": ""}'
 ```
 
 **Important: Understanding Global Segment Size**
@@ -193,7 +196,8 @@ First, start the `metadata service` and `master service`. Then run the `test_moo
 MOONCAKE_TE_META_DATA_SERVER="http://127.0.0.1:8080/metadata" \
 MOONCAKE_MASTER=127.0.0.1:50051 \
 MOONCAKE_PROTOCOL="rdma" \
-MOONCAKE_DEVICE="mlx5_0,mlx5_1" \
+# Auto-discovery by default. To pin NICs:
+# export MOONCAKE_DEVICE="mlx5_0,mlx5_1"
 MOONCAKE_GLOBAL_SEGMENT_SIZE=16777216 \
 python3 [path of test_mooncake_store.py]
 ```

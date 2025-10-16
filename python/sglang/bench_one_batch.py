@@ -51,6 +51,7 @@ import logging
 import multiprocessing
 import os
 import time
+from types import SimpleNamespace
 from typing import Tuple
 
 import numpy as np
@@ -71,6 +72,8 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     configure_logger,
     get_bool_env_var,
+    is_cuda_alike,
+    is_xpu,
     kill_process_tree,
     require_mlp_sync,
     require_mlp_tp_gather,
@@ -78,6 +81,15 @@ from sglang.srt.utils import (
     suppress_other_loggers,
 )
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+
+profile_activities = [torch.profiler.ProfilerActivity.CPU] + [
+    profiler_activity
+    for available, profiler_activity in [
+        (is_cuda_alike(), torch.profiler.ProfilerActivity.CUDA),
+        (is_xpu(), torch.profiler.ProfilerActivity.XPU),
+    ]
+    if available
+]
 
 
 @dataclasses.dataclass
@@ -257,11 +269,18 @@ def prepare_synthetic_inputs_for_latency_test(
 
 @torch.no_grad
 def extend(reqs, model_runner):
+    # Create dummy tree_cache for benchmarks (no prefix caching, just allocation)
+    dummy_tree_cache = SimpleNamespace(
+        page_size=1,
+        device=model_runner.device,
+        token_to_kv_pool_allocator=model_runner.token_to_kv_pool_allocator,
+    )
+
     batch = ScheduleBatch.init_new(
         reqs=reqs,
         req_to_token_pool=model_runner.req_to_token_pool,
         token_to_kv_pool_allocator=model_runner.token_to_kv_pool_allocator,
-        tree_cache=None,
+        tree_cache=dummy_tree_cache,
         model_config=model_runner.model_config,
         enable_overlap=False,
         spec_algorithm=SpeculativeAlgorithm.NONE,
@@ -416,10 +435,7 @@ def latency_test_run_once(
     profiler = None
     if profile:
         profiler = torch.profiler.profile(
-            activities=[
-                torch.profiler.ProfilerActivity.CPU,
-                torch.profiler.ProfilerActivity.CUDA,
-            ],
+            activities=profile_activities,
             with_stack=True,
             record_shapes=profile_record_shapes,
         )
@@ -452,10 +468,7 @@ def latency_test_run_once(
         if profile and i == output_len / 2:
             profiler = None
             profiler = torch.profiler.profile(
-                activities=[
-                    torch.profiler.ProfilerActivity.CPU,
-                    torch.profiler.ProfilerActivity.CUDA,
-                ],
+                activities=profile_activities,
                 with_stack=True,
                 record_shapes=profile_record_shapes,
             )
@@ -510,7 +523,9 @@ def latency_test(
 
     # Set CPU affinity
     if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
-        set_gpu_proc_affinity(server_args.tp_size, server_args.nnodes, tp_rank)
+        set_gpu_proc_affinity(
+            server_args.pp_size, server_args.tp_size, server_args.nnodes, tp_rank
+        )
 
     # Configure the logger
     configure_logger(server_args, prefix=f" TP{tp_rank}")

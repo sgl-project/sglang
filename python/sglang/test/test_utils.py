@@ -75,6 +75,11 @@ DEFAULT_MODEL_NAME_FOR_TEST_FP8_WITH_MOE = "gaunernst/DeepSeek-V2-Lite-Chat-FP8"
 DEFAULT_MODEL_NAME_FOR_TEST_W8A8 = "RedHatAI/Llama-3.2-3B-quantized.w8a8"
 DEFAULT_MODEL_NAME_FOR_TEST_W8A8_WITH_MOE = "nytopop/Qwen3-30B-A3B.w8a8"
 
+# INT4 models
+DEFAULT_MODEL_NAME_FOR_TEST_AWQ_INT4 = (
+    "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4"
+)
+
 # EAGLE
 DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST = "meta-llama/Llama-2-7b-chat-hf"
 DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST = "lmsys/sglang-EAGLE-llama2-chat-7B"
@@ -135,11 +140,11 @@ def _use_cached_default_models(model_repo: str):
 
 if is_in_ci():
     DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
-        5000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 100
+        10000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 1000
     )
 else:
     DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
-        7000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 100
+        20000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 1000
     )
 DEFAULT_URL_FOR_TEST = f"http://127.0.0.1:{DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 1000}"
 
@@ -396,8 +401,6 @@ def _get_call_generate(args: argparse.Namespace):
         return partial(call_generate_vllm, url=f"{args.host}:{args.port}/generate")
     elif args.backend == "srt-raw":
         return partial(call_generate_srt_raw, url=f"{args.host}:{args.port}/generate")
-    elif args.backend == "gserver":
-        return partial(call_generate_gserver, url=f"{args.host}:{args.port}")
     elif args.backend == "outlines":
         return partial(call_generate_outlines, url=f"{args.host}:{args.port}/generate")
     elif args.backend == "guidance":
@@ -503,7 +506,7 @@ def popen_launch_server(
     base_url: str,
     timeout: float,
     api_key: Optional[str] = None,
-    other_args: list[str] = [],
+    other_args: Optional[list[str]] = None,
     env: Optional[dict] = None,
     return_stdout_stderr: Optional[tuple] = None,
     device: str = "auto",
@@ -516,10 +519,11 @@ def popen_launch_server(
         device: Device type ("auto", "cuda", "rocm" or "cpu").
                 If "auto", will detect available platforms automatically.
     """
+    other_args = other_args or []
+
     # Auto-detect device if needed
     if device == "auto":
         device = auto_config_device()
-        print(f"Auto-configed device: {device}", flush=True)
         other_args = list(other_args)
         other_args += ["--device", str(device)]
 
