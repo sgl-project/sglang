@@ -12,6 +12,7 @@ def es_fp8_blockwise_scaled_grouped_mm(
     stride_d,
     problem_sizes,
     expert_offsets,
+    workspace,
 ):
     torch.ops.sgl_kernel.es_fp8_blockwise_scaled_grouped_mm.default(
         output,
@@ -24,4 +25,5 @@ def es_fp8_blockwise_scaled_grouped_mm(
         stride_d,
         problem_sizes,
         expert_offsets,
+        workspace,
     )

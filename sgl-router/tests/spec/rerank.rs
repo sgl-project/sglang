@@ -1,7 +1,7 @@
 use serde_json::{from_str, to_string, Number, Value};
 use sglang_router_rs::protocols::spec::{
-    default_model_name, GenerationRequest, RerankRequest, RerankResponse, RerankResult,
-    StringOrArray, UsageInfo, V1RerankReqInput,
+    GenerationRequest, RerankRequest, RerankResponse, RerankResult, StringOrArray, UsageInfo,
+    V1RerankReqInput,
 };
 use std::collections::HashMap;
 
@@ -40,7 +40,7 @@ fn test_rerank_request_deserialization_with_defaults() {
 
     assert_eq!(request.query, "test query");
     assert_eq!(request.documents, vec!["doc1", "doc2"]);
-    assert_eq!(request.model, default_model_name());
+    assert_eq!(request.model, "unknown");
     assert_eq!(request.top_k, None);
     assert!(request.return_documents);
     assert_eq!(request.rid, None);
@@ -414,7 +414,7 @@ fn test_v1_to_rerank_request_conversion() {
 
     assert_eq!(request.query, "test query");
     assert_eq!(request.documents, vec!["doc1", "doc2"]);
-    assert_eq!(request.model, default_model_name());
+    assert_eq!(request.model, "unknown");
     assert_eq!(request.top_k, None);
     assert!(request.return_documents);
     assert_eq!(request.rid, None);
