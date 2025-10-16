@@ -1199,6 +1199,11 @@ class AbortReq(BaseReq):
 
 
 @dataclass
+class Ranks:
+    status: List[int]
+
+
+@dataclass
 class GetInternalStateReq(BaseReq):
     pass
 
