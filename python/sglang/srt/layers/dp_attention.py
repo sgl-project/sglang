@@ -17,6 +17,7 @@ from sglang.srt.distributed import (
     get_tp_group,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.utils import get_bool_env_var, is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -36,6 +37,9 @@ _LOCAL_ATTN_DP_SIZE: Optional[int] = None
 _LOCAL_ATTN_DP_RANK: Optional[int] = None
 _ENABLE_DP_ATTENTION_FLAG: bool = False
 
+_is_hip = is_hip()
+_USE_ROCM700A_WA = _is_hip and get_bool_env_var("SGLANG_USE_ROCM700A")
+
 
 class DpPaddingMode(IntEnum):
 
@@ -51,7 +55,12 @@ class DpPaddingMode(IntEnum):
         return self == DpPaddingMode.SUM_LEN
 
     @classmethod
-    def get_dp_padding_mode(cls, global_num_tokens: List[int]) -> DpPaddingMode:
+    def get_dp_padding_mode(
+        cls, is_extend_in_batch, global_num_tokens: List[int]
+    ) -> DpPaddingMode:
+        if is_extend_in_batch:
+            return DpPaddingMode.SUM_LEN
+
         # we choose the mode that minimizes the communication cost
         max_len = max(global_num_tokens)
         sum_len = sum(global_num_tokens)
@@ -62,7 +71,12 @@ class DpPaddingMode(IntEnum):
 
     @classmethod
     def get_default_mode_in_cuda_graph(cls) -> DpPaddingMode:
-        return cls.MAX_LEN
+        # TODO(kkhuang-amd): noqa, temporary work-around for rocm 7.0.0 alpha
+        # it can be safely removed later, once RCCL fixed
+        if _USE_ROCM700A_WA:
+            return cls.SUM_LEN
+        else:
+            return cls.MAX_LEN
 
 
 class _DpGatheredBufferWrapper:
@@ -249,6 +263,7 @@ def initialize_dp_attention(
         use_pynccl=SYNC_TOKEN_IDS_ACROSS_TP,
         use_pymscclpp=False,
         use_custom_allreduce=False,
+        use_torch_symm_mem=False,
         use_hpu_communicator=False,
         use_xpu_communicator=False,
         use_npu_communicator=False,

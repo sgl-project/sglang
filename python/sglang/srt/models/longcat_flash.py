@@ -32,14 +32,10 @@
 
 import concurrent.futures
 import logging
-import os
-from enum import IntEnum, auto
-from typing import Any, Dict, Iterable, Optional, Tuple, Union
+from typing import Iterable, Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 from torch import nn
-from tqdm import tqdm
 
 from sglang.srt.configs import LongcatFlashConfig
 from sglang.srt.distributed import (
@@ -85,10 +81,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     BumpAllocator,
     LazyValue,
@@ -131,7 +127,7 @@ elif _is_hip:
         awq_dequantize_triton as awq_dequantize,
     )
 else:
-    from vllm._custom_ops import awq_dequantize
+    pass
 
 logger = logging.getLogger(__name__)
 
@@ -260,7 +256,7 @@ class LongcatFlashMoE(nn.Module):
         )
         self.topk.forward = self.topk.forward_native
 
-        self.experts = get_moe_impl_class()(
+        self.experts = get_moe_impl_class(quant_config)(
             num_experts=self.num_experts,
             top_k=self.top_k,
             layer_id=self.layer_id,
@@ -595,7 +591,7 @@ class LongcatFlashForCausalLM(nn.Module):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=global_server_args_dict["enable_dp_lm_head"],
+            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
 
@@ -853,7 +849,7 @@ class LongcatFlashForCausalLM(nn.Module):
 
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
-        expert_params_mapping = get_moe_impl_class().make_expert_params_mapping(
+        expert_params_mapping = FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",

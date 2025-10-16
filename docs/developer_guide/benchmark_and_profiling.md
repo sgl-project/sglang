@@ -47,6 +47,48 @@ Please make sure that the `SGLANG_TORCH_PROFILER_DIR` should be set at both serv
 
 For more details, please refer to [Bench Serving Guide](./bench_serving.md).
 
+### Profile In PD Disaggregation Mode
+
+When profiling in PD disaggregation mode, prefill and decode workers **must be profiled separately** due to torch profiler limitations. The `bench_serving` command provides dedicated options for this:
+
+#### Profile Prefill Workers
+
+```bash
+# set trace path
+export SGLANG_TORCH_PROFILER_DIR=/root/sglang/profile_log
+
+# start prefill and decode servers (see PD disaggregation docs for setup)
+python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --disaggregation-mode prefill
+python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --disaggregation-mode decode --port 30001 --base-gpu-id 1
+
+# start router
+python -m sglang_router.launch_router --pd-disaggregation --prefill http://127.0.0.1:30000 --decode http://127.0.0.1:30001 --host 0.0.0.0 --port 8000
+
+# send profiling request targeting prefill workers
+python -m sglang.bench_serving --backend sglang --model meta-llama/Llama-3.1-8B-Instruct --num-prompts 10 --sharegpt-output-len 100 --profile --pd-separated --profile-prefill-url http://127.0.0.1:30000
+```
+
+#### Profile Decode Workers
+
+```bash
+# send profiling request targeting decode workers
+python -m sglang.bench_serving --backend sglang --model meta-llama/Llama-3.1-8B-Instruct --num-prompts 10 --sharegpt-output-len 100 --profile --pd-separated --profile-decode-url http://127.0.0.1:30001
+```
+
+#### Important Notes
+
+- `--profile-prefill-url` and `--profile-decode-url` are **mutually exclusive** - you cannot profile both at the same time
+- Both options support multiple worker URLs for multi-instance setups:
+  ```bash
+  # Profile multiple prefill workers
+  python -m sglang.bench_serving --backend sglang --model meta-llama/Llama-3.1-8B-Instruct --num-prompts 10 --profile --pd-separated --profile-prefill-url http://127.0.0.1:30000 http://127.0.0.1:30002
+
+  # Profile multiple decode workers
+  python -m sglang.bench_serving --backend sglang --model meta-llama/Llama-3.1-8B-Instruct --num-prompts 10 --profile --pd-separated --profile-decode-url http://127.0.0.1:30001 http://127.0.0.1:30003
+  ```
+- Make sure `SGLANG_TORCH_PROFILER_DIR` is set on all worker nodes before starting the servers
+- For more details on setting up PD disaggregation, see [PD Disaggregation Guide](../advanced_features/pd_disaggregation.md)
+
 ### Profile a server with `sglang.bench_offline_throughput`
 ```bash
 export SGLANG_TORCH_PROFILER_DIR=/root/sglang/profile_log
@@ -73,6 +115,47 @@ python3 -m sglang.test.send_one
 # It will generate a profile of the above request for several decoding batches.
 python3 -m sglang.profiler
 ```
+
+### Profiler Trace Merger for Distributed Traces
+
+SGLang now supports automatic merging of profiling traces from distributed setups with multiple parallelism types (TP, DP, PP, EP). This feature is particularly useful for analyzing performance across distributed runs.
+
+#### Multi-Node Profiling and Shared Storage Considerations
+
+Single-node profiler output merging is completely supported. When profiling in distributed environments spanning multiple nodes, shared storage (e.g., NFS, Lustre) should be accessible by all nodes for the output directory to enable merging of trace files.
+
+If there is no shared storage accessible across nodes, automatic merging of trace files during profiling is not supported directly as of now.
+
+#### HTTP API Usage
+
+```bash
+# Start profiling with automatic trace merging enabled
+curl -X POST <BASE_URL>/start_profile \
+  -H "Content-Type: application/json" \
+  -d '{
+    "output_dir": "/tmp/profiles", # where to store profile traces
+    "num_steps": 10,
+    "activities": ["CPU", "GPU"],
+    "merge_profiles": true # optional argument to merge profile traces (default=False)
+  }'
+```
+
+#### Command Line Usage
+
+```bash
+# Start profiling with merge enabled
+python -m sglang.profiler \
+  --num-steps 10 \
+  --activities CPU GPU \
+  --output-dir /tmp/profiles \
+  --merge-profiles # optional argument to merge profile traces (default=False)
+```
+
+#### Output Files
+
+The profile merger generates:
+- Individual rank trace files: `{profile_id}-TP-{tp}-DP-{dp}-PP-{pp}-EP-{ep}.trace.json.gz`
+- Merged trace file: `merged-{profile_id}.trace.json.gz`
 
 ### Possible PyTorch bugs
 If in any cases you encounter the following error (for example, using qwen 2.5 VL):
