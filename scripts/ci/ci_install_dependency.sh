@@ -26,7 +26,7 @@ if [ "$IS_BLACKWELL" = "1" ]; then
     PIP_INSTALL_SUFFIX="--break-system-packages"
 
     # Clean up existing installations
-    $PIP_CMD uninstall -y flashinfer_python sgl-kernel sglang vllm $PIP_INSTALL_SUFFIX || true
+    $PIP_CMD uninstall -y flashinfer_python flashinfer_cubin sgl-kernel sglang vllm $PIP_INSTALL_SUFFIX || true
 else
     # In normal cases, we use uv, which is much faster than pip.
     pip install --upgrade pip
@@ -37,7 +37,7 @@ else
     PIP_INSTALL_SUFFIX="--index-strategy unsafe-best-match"
 
     # Clean up existing installations
-    $PIP_CMD uninstall flashinfer_python sgl-kernel sglang vllm || true
+    $PIP_CMD uninstall flashinfer_python flashinfer_cubin sgl-kernel sglang vllm || true
 fi
 
 # Install the main package
