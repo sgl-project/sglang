@@ -238,9 +238,13 @@ class EAGLEWorkerV2(EAGLEWorker):
         batch: ModelWorkerBatch,
         pre_draft_allocate_lens: torch.Tensor,
     ):
+        # Since batch.seq_lens is allocated in another stream, we need
+        # record_stream() to prevent pytorch gc and reuse the gpu memory
+        # while forward_stream is still running.
+        batch.seq_lens.record_stream(torch.cuda.current_stream())
+
         # Parse args
         verify_input: EagleVerifyInput = batch.spec_info
-        seq_lens_backup = batch.seq_lens
         bs = len(batch.seq_lens)
 
         # Batch 1: Target verify
@@ -286,16 +290,8 @@ class EAGLEWorkerV2(EAGLEWorker):
             accept_length,
             accept_index,
         ) = verify_input.sample(batch, logits_output)
-        new_seq_lens = seq_lens_backup + accept_length
+        new_seq_lens = batch.seq_lens + accept_length
         verify_done = torch.cuda.Event()
-
-        # Move the accepted tokens to the target KV cache locations
-        batch.seq_lens = seq_lens_backup
-        self.move_accepted_tokens_to_target_kvcache(
-            batch,
-            accept_index,
-            accept_length,
-        )
 
         verify_done.record()
 
@@ -346,11 +342,6 @@ class EAGLEWorkerV2(EAGLEWorker):
         probs = torch.softmax(draft_logits_output.next_token_logits, dim=-1)
         ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
         ret_hidden_states = draft_logits_output.hidden_states
-
-        # Since seq_lens_backup's tensor is allocated in another stream, we
-        # need record_stream() to prevent pytorch gc and reuse the gpu memory
-        # while forward_stream is still running.
-        seq_lens_backup.record_stream(torch.cuda.current_stream())
 
         # Construct the return values
         next_draft_input = EagleDraftInput(
