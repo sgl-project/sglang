@@ -1,9 +1,9 @@
-import os
 import unittest
 from types import SimpleNamespace
 
 import requests
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import get_device_sm, kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
@@ -77,14 +77,16 @@ class BaseFlashAttentionTest(CustomTestCase):
     def setUpClass(cls):
         # disable deep gemm precompile to make launch server faster
         # please don't do this if you want to make your inference workload faster
-        os.environ["SGL_JIT_DEEPGEMM_PRECOMPILE"] = "false"
-        os.environ["SGL_ENABLE_JIT_DEEPGEMM"] = "false"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=cls.get_server_args(),
-        )
+        with (
+            envs.SGLANG_JIT_DEEPGEMM_PRECOMPILE.override(False),
+            envs.SGLANG_ENABLE_JIT_DEEPGEMM.override(False),
+        ):
+            cls.process = popen_launch_server(
+                cls.model,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=cls.get_server_args(),
+            )
 
     @classmethod
     def tearDownClass(cls):
@@ -143,10 +145,10 @@ class TestFlashAttention3SpeculativeDecode(BaseFlashAttentionTest):
         args.extend(
             [
                 "--cuda-graph-max-bs",
-                "2",
+                "4",
                 "--speculative-algorithm",
                 "EAGLE3",
-                "--speculative-draft",
+                "--speculative-draft-model-path",
                 DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3,
                 "--speculative-num-steps",
                 "3",
@@ -169,7 +171,7 @@ class TestFlashAttention3SpeculativeDecodeTopk(BaseFlashAttentionTest):
     model = DEFAULT_MODEL_NAME_FOR_TEST
     accuracy_threshold = 0.65
     speculative_decode = True
-    spec_decode_threshold = 1.5
+    spec_decode_threshold = 1.6
 
     @classmethod
     def get_server_args(cls):
@@ -177,10 +179,10 @@ class TestFlashAttention3SpeculativeDecodeTopk(BaseFlashAttentionTest):
         args.extend(
             [
                 "--cuda-graph-max-bs",
-                "2",
+                "4",
                 "--speculative-algorithm",
                 "EAGLE3",
-                "--speculative-draft",
+                "--speculative-draft-model-path",
                 DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3,
                 "--speculative-num-steps",
                 "5",
@@ -201,7 +203,7 @@ class TestFlashAttention3MLASpeculativeDecode(BaseFlashAttentionTest):
     model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
     accuracy_threshold = 0.60
     speculative_decode = True
-    spec_decode_threshold = 1.5
+    spec_decode_threshold = 2.5
 
     @classmethod
     def get_server_args(cls):
@@ -209,10 +211,10 @@ class TestFlashAttention3MLASpeculativeDecode(BaseFlashAttentionTest):
         args.extend(
             [
                 "--cuda-graph-max-bs",
-                "2",
+                "4",
                 "--speculative-algorithm",
                 "EAGLE",
-                "--speculative-draft",
+                "--speculative-draft-model-path",
                 DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN,
                 "--speculative-num-steps",
                 "3",
@@ -233,7 +235,7 @@ class TestFlashAttention3MLASpeculativeDecodeTopk(BaseFlashAttentionTest):
     model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
     accuracy_threshold = 0.60
     speculative_decode = True
-    spec_decode_threshold = 1.5
+    spec_decode_threshold = 2.95
 
     @classmethod
     def get_server_args(cls):
@@ -241,10 +243,10 @@ class TestFlashAttention3MLASpeculativeDecodeTopk(BaseFlashAttentionTest):
         args.extend(
             [
                 "--cuda-graph-max-bs",
-                "2",
+                "4",
                 "--speculative-algorithm",
                 "EAGLE",
-                "--speculative-draft",
+                "--speculative-draft-model-path",
                 DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN,
                 "--speculative-num-steps",
                 "5",

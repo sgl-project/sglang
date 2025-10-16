@@ -12,8 +12,8 @@ import torch
 
 import sglang as sgl
 from sglang.bench_offline_throughput import BenchArgs, throughput_test
-from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.few_shot_gsm8k_engine import run_eval
 from sglang.test.test_utils import (
     DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST,
@@ -141,11 +141,11 @@ class TestSRTEngine(CustomTestCase):
             model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
             local_data_path=None,
             num_shots=5,
-            num_questions=200,
+            num_questions=1400,
         )
 
         metrics = run_eval(args)
-        self.assertGreater(metrics["accuracy"], 0.3)
+        self.assertGreater(metrics["accuracy"], 0.33)
 
     def test_6_engine_cpu_offload(self):
         prompt = "Today is a sunny day and I like"

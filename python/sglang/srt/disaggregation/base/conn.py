@@ -1,23 +1,42 @@
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import numpy as np
 import numpy.typing as npt
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.server_args import ServerArgs
+
+if TYPE_CHECKING:
+    from sglang.srt.disaggregation.utils import DisaggregationMode
 
 
 class KVArgs:
     engine_rank: int
-    kv_data_ptrs: list[int]
-    kv_data_lens: list[int]
-    kv_item_lens: list[int]
-    aux_data_ptrs: list[int]
-    aux_data_lens: list[int]
-    aux_item_lens: list[int]
+    kv_data_ptrs: List[int]
+    kv_data_lens: List[int]
+    kv_item_lens: List[int]
+    aux_data_ptrs: List[int]
+    aux_data_lens: List[int]
+    aux_item_lens: List[int]
+    state_data_ptrs: List[int]
+    state_data_lens: List[int]
+    state_item_lens: List[int]
+    state_type: str  # "none", "mamba", "swa"
     ib_device: str
+    ib_traffic_class: str
     gpu_id: int
+    # for different tp
+    decode_tp_size: int
+    kv_head_num: int
+    page_size: int
+    # for pp prefill
+    prefill_pp_size: int
+    pp_rank: int
+    prefill_start_layer: int
+    # for system dp
+    system_dp_rank: int
 
 
 class KVPoll:
@@ -45,7 +64,12 @@ class BaseKVSender(ABC):
 
     @abstractmethod
     def __init__(
-        self, mgr: BaseKVManager, bootstrap_addr: str, bootstrap_room: int
+        self,
+        mgr: BaseKVManager,
+        bootstrap_addr: str,
+        bootstrap_room: int,
+        dest_tp_ranks: List[int],
+        pp_rank: int,
     ): ...
 
     @abstractmethod
@@ -56,9 +80,13 @@ class BaseKVSender(ABC):
         ...
 
     @abstractmethod
-    def send(self, kv_indices: npt.NDArray[np.int64]):
+    def send(
+        self,
+        kv_indices: npt.NDArray[np.int32],
+        state_indices: Optional[List[int]] = None,
+    ):
         """
-        Send the kv cache at the given kv indices to the decoder server
+        Send the kv cache at the given kv indices and the extra cache/state at the given indices to the decoder server
         """
         ...
 
@@ -88,9 +116,14 @@ class BaseKVReceiver(ABC):
     ): ...
 
     @abstractmethod
-    def init(self, kv_indices: npt.NDArray[np.int64], aux_index: Optional[int] = None):
+    def init(
+        self,
+        kv_indices: npt.NDArray[np.int32],
+        aux_index: Optional[int] = None,
+        state_indices: Optional[List[int]] = None,
+    ):
         """
-        Notify the prefill server about the kv indices and aux index
+        Notify the prefill server about the kv indices, aux index, and state_indices.
         """
         ...
 
@@ -111,4 +144,4 @@ class BaseKVReceiver(ABC):
 
 class BaseKVBootstrapServer(ABC):
     @abstractmethod
-    def __init__(self, port: int): ...
+    def __init__(self, host: str, port: int): ...

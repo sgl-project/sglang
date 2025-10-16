@@ -1,4 +1,4 @@
-from .conn import (
+from sglang.srt.disaggregation.base.conn import (
     BaseKVBootstrapServer,
     BaseKVManager,
     BaseKVReceiver,

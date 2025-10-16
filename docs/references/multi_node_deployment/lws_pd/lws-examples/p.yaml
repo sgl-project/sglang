@@ -1,0 +1,304 @@
+apiVersion: leaderworkerset.x-k8s.io/v1
+kind: LeaderWorkerSet
+metadata:
+  name: deepseekr10528-prefill-main
+spec:
+  leaderWorkerTemplate:
+    leaderTemplate:
+      metadata:
+        labels:
+          role: leader
+      spec:
+        containers:
+        - command:
+          - python3
+          - -m
+          - sglang.launch_server
+          - --port
+          - "30000"
+          - --host
+          - "0.0.0.0"
+          - --model-path
+          - /work/models
+          - --disaggregation-ib-device
+          # should modify according your rdma env
+          - mlx5_bond_0,mlx5_bond_1,mlx5_bond_2,mlx5_bond_3
+          - --chunked-prefill-size
+          - "524288"
+          - --max-prefill-tokens
+          - "32768"
+          - --page-size
+          - "64"
+          - --ep-dispatch-algorithm
+          - dynamic
+          - --eplb-algorithm
+          - deepseek
+          - --enable-dp-lm-head
+          - --enable-dp-attention
+          - --dp-size
+          - "16"
+          - --disable-radix-cache
+          - --moe-a2a-backend
+          - deepep
+          - --disaggregation-mode
+          - prefill
+          - --mem-fraction-static
+          - "0.7"
+          - --context-length
+          - "32768"
+          - --tp
+          - "16"
+          - --dist-init-addr
+          - $(LWS_LEADER_ADDRESS):20102
+          - --nnodes
+          - $(LWS_GROUP_SIZE)
+          - --node-rank
+          - $(LWS_WORKER_INDEX)
+          - --trust-remote-code
+          - --ep-num-redundant-experts
+          - "32"
+          - --moe-dense-tp-size
+          - "1"
+          - --max-running-requests
+          - "1024"
+          env:
+          - name: NVSHMEM_HCA_PE_MAPPING
+            # should modify according your rdma env
+            value: "mlx5_bond_0:1:2,mlx5_bond_1:1:2,mlx5_bond_2:1:2,mlx5_bond_3:1:2"
+          - name: NVSHMEM_IB_GID_INDEX
+            value: "3"
+          - name: NVSHMEM_ENABLE_NIC_PE_MAPPING
+            value: "1"
+          - name: SGLANG_SET_CPU_AFFINITY
+            value: "true"
+          - name: SGLANG_ENABLE_JIT_DEEPGEMM
+            value: "1"
+          - name: NCCL_IB_QPS_PER_CONNECTION
+            value: "8"
+          - name: NCCL_IB_SPLIT_DATA_ON_QPS
+            value: "1"
+          - name: NCCL_NET_PLUGIN
+            value: none
+          - name: NCCL_IB_TC
+            value: "136"
+          - name: NCCL_MIN_NCHANNELS
+            value: "4"
+          - name: MC_TE_METRIC
+            value: "false"
+          - name: NCCL_IB_SL
+            value: "5"
+          - name: NCCL_IB_HCA
+            value: ^=mlx5_0,mlx5_5,mlx5_6
+          - name: LWS_WORKER_INDEX
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.labels['leaderworkerset.sigs.k8s.io/worker-index']
+          image: lmsysorg/sglang:latest
+          name: sglang-leader
+          ports:
+          - containerPort: 30000
+            protocol: TCP
+          readinessProbe:
+            periodSeconds: 30
+            tcpSocket:
+              port: 30000
+          resources:
+            limits:
+              nvidia.com/gpu: "8"
+          securityContext:
+            capabilities:
+              add:
+              - IPC_LOCK
+            privileged: true
+          volumeMounts:
+          - mountPath: /dev/shm
+            name: dshm
+          - mountPath: /work/models
+            name: model
+          - mountPath: /dev/infiniband
+            name: ib
+          - mountPath: /sgl-workspace/sglang/python/sglang/srt/layers/moe/fused_moe_triton/configs
+            name: cf
+          - mountPath: /root/.cache
+            name: sgl-cache
+        dnsPolicy: ClusterFirstWithHostNet
+        hostIPC: true
+        hostNetwork: true
+        nodeSelector:
+        # should modify according your deployment env
+          pd: "yes"
+        tolerations:
+        # should modify according your deployment env
+        - key: bopd
+          operator: Exists
+        - key: node-role
+          operator: Exists
+        volumes:
+        - emptyDir:
+            medium: Memory
+          name: dshm
+        - hostPath:
+            path: /data1/maas_hosted_models/models/DeepSeek-R1-0528/deepseek_r1_0528
+          name: model
+        - hostPath:
+            path: /dev/infiniband
+          name: ib
+        - hostPath:
+            path: /data1/maas_hosted_models/models/fused_moe_triton/configs
+          name: cf
+        - hostPath:
+            path: /data1/sgl_cache
+            type: DirectoryOrCreate
+          name: sgl-cache
+    restartPolicy: RecreateGroupOnPodRestart
+    size: 2
+    workerTemplate:
+      metadata: {}
+      spec:
+        containers:
+        - command:
+          - python3
+          - -m
+          - sglang.launch_server
+          - --model-path
+          - /work/models
+          - --disaggregation-ib-device
+          # should modify according your rdma env
+          - mlx5_bond_0,mlx5_bond_1,mlx5_bond_2,mlx5_bond_3
+          - --chunked-prefill-size
+          - "524288"
+          - --max-prefill-tokens
+          - "32768"
+          - --page-size
+          - "64"
+          - --ep-dispatch-algorithm
+          - dynamic
+          - --eplb-algorithm
+          - deepseek
+          #          - --deepep-config
+          #          -  /home/aiges/tuned/tuned_8sms.json
+          # can be tuned using deepep test scripts
+          - --enable-dp-lm-head
+          - --enable-dp-attention
+          - --dp-size
+          - "16"
+          - --disable-radix-cache
+          - --moe-a2a-backend
+          - deepep
+          - --disaggregation-mode
+          - prefill
+          - --mem-fraction-static
+          - "0.7"
+          - --context-length
+          - "32768"
+          - --tp
+          - "16"
+          - --dist-init-addr
+          - $(LWS_LEADER_ADDRESS):20102
+          - --nnodes
+          - $(LWS_GROUP_SIZE)
+          - --node-rank
+          - $(LWS_WORKER_INDEX)
+          - --trust-remote-code
+          - --ep-num-redundant-experts
+          - "32"
+          - --moe-dense-tp-size
+          - "1"
+          - --max-running-requests
+          - "1024"
+          env:
+          - name: SGLANG_SET_CPU_AFFINITY
+            value: "true"
+          - name: NVSHMEM_HCA_PE_MAPPING
+            # should modify according your rdma env
+            value: "mlx5_bond_0:1:2,mlx5_bond_1:1:2,mlx5_bond_2:1:2,mlx5_bond_3:1:2"
+          - name: NCCL_IB_HCA
+            value: ^=mlx5_0,mlx5_5,mlx5_6
+          - name: NVSHMEM_IB_TRAFFIC_CLASS
+            value: "16"
+          - name: NVSHMEM_IB_GID_INDEX
+            value: "3"
+          - name: NVSHMEM_ENABLE_NIC_PE_MAPPING
+            value: "1"
+          - name: CUDA_LAUNCH_BLOCKING
+            value: "0"
+          - name: SGLANG_MOONCAKE_TRANS_THREAD
+            value: "8"
+          - name: SGLANG_ENABLE_JIT_DEEPGEMM
+            value: "1"
+          - name: SGL_CHUNKED_PREFIX_CACHE_THRESHOLD
+            value: "0"
+          - name: NCCL_IB_QPS_PER_CONNECTION
+            value: "8"
+          - name: NCCL_IB_SPLIT_DATA_ON_QPS
+            value: "1"
+          - name: NCCL_NET_PLUGIN
+            value: none
+          - name: NCCL_IB_TC
+            value: "136"
+          - name: NCCL_MIN_NCHANNELS
+            value: "4"
+          - name: MC_TE_METRIC
+            value: "true"
+          - name: NCCL_IB_SL
+            value: "5"
+          - name: LWS_WORKER_INDEX
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.labels['leaderworkerset.sigs.k8s.io/worker-index']
+          image: lmsysorg/sglang:latest
+          name: sglang-worker
+          ports:
+          - containerPort: 30001
+            protocol: TCP
+          resources:
+            limits:
+              nvidia.com/gpu: "8"
+          securityContext:
+            capabilities:
+              add:
+              - IPC_LOCK
+            privileged: true
+          volumeMounts:
+          - mountPath: /root/.cache
+            name: sgl-cache
+          - mountPath: /dev/shm
+            name: dshm
+          - mountPath: /work/models
+            name: model
+          - mountPath: /dev/infiniband
+            name: ib
+          - mountPath: /sgl-workspace/sglang/python/sglang/srt/layers/moe/fused_moe_triton/configs
+            name: cf
+        dnsPolicy: ClusterFirstWithHostNet
+        hostIPC: true
+        hostNetwork: true
+        nodeSelector:
+        # should modify according your deployment env
+          pd: "yes"
+        tolerations:
+        # should modify according your deployment env
+        - key: bopd
+          operator: Exists
+        - key: node-role
+          operator: Exists
+        volumes:
+        - emptyDir:
+            medium: Memory
+          name: dshm
+        - hostPath:
+            path: /dev/infiniband
+          name: ib
+        - hostPath:
+            # modify according to you deployment env
+            path: /data1/maas_hosted_models/models/DeepSeek-R1-0528/deepseek_r1_0528
+          name: model
+        - hostPath:
+            # modify according to you deployment env
+            path: /data1/maas_hosted_models/models/fused_moe_triton/configs
+          name: cf
+        - hostPath:
+            # modify according to you deployment env
+            path: /data1/sgl_cache
+            type: DirectoryOrCreate
+          name: sgl-cache

@@ -1,5 +1,6 @@
 import itertools
 import math
+import os
 
 import torch
 import triton
@@ -7,6 +8,12 @@ import triton.language as tl
 from sgl_kernel import moe_fused_gate
 
 from sglang.srt.layers.moe.topk import biased_grouped_topk
+
+# CI environment detection
+IS_CI = (
+    os.getenv("CI", "false").lower() == "true"
+    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
+)
 
 
 def biased_grouped_topk_org(scores, bias, num_expert_group, topk_group, topk):
@@ -18,14 +25,22 @@ def biased_grouped_topk_org(scores, bias, num_expert_group, topk_group, topk):
         renormalize=True,
         num_expert_group=num_expert_group,
         topk_group=topk_group,
+        routed_scaling_factor=2.5,  # DeepSeek-R1 : 2.5, Kimi K2: 2.872
     )
 
 
-def biased_grouped_topk_org_kernel(scores, bias, num_expert_group, topk_group, topk):
+def biased_grouped_topk_org_fuse_kernel(
+    scores, bias, num_expert_group, topk_group, topk
+):
     return moe_fused_gate(scores, bias, num_expert_group, topk_group, topk)
 
 
-seq_length_range = [5000, 10000, 15000, 20000, 25000, 30000, 35000, 40000]
+# CI environment uses simplified parameters
+if IS_CI:
+    seq_length_range = [5000]  # Only test one sequence length in CI
+else:
+    seq_length_range = [5000, 10000, 15000, 20000, 25000, 30000, 35000, 40000]
+
 configs = [(sq,) for sq in seq_length_range]
 
 
@@ -43,7 +58,7 @@ configs = [(sq,) for sq in seq_length_range]
     )
 )
 def benchmark(seq_length, provider):
-    dtype = torch.bfloat16
+    dtype = torch.float32
     device = torch.device("cuda")
     num_experts, num_expert_group, topk_group, topk = 256, 8, 4, 8
 
@@ -53,15 +68,15 @@ def benchmark(seq_length, provider):
     quantiles = [0.5, 0.2, 0.8]
 
     if provider == "original":
-        ms, min_ms, max_ms = triton.testing.do_bench(
+        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
             lambda: biased_grouped_topk_org(
                 scores.clone(), bias.clone(), num_expert_group, topk_group, topk
             ),
             quantiles=quantiles,
         )
     elif provider == "kernel":
-        ms, min_ms, max_ms = triton.testing.do_bench(
-            lambda: biased_grouped_topk_org_kernel(
+        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
+            lambda: biased_grouped_topk_org_fuse_kernel(
                 scores.clone(), bias.clone(), num_expert_group, topk_group, topk
             ),
             quantiles=quantiles,

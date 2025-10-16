@@ -15,7 +15,6 @@ from functools import partial
 from typing import TYPE_CHECKING, Callable, Optional, Union
 
 import torch
-import triton
 
 if os.environ["SGLANG_ENABLE_TORCH_COMPILE"] == "1":
     import logging
@@ -23,21 +22,25 @@ if os.environ["SGLANG_ENABLE_TORCH_COMPILE"] == "1":
     torch._logging.set_logs(dynamo=logging.ERROR)
     torch._dynamo.config.suppress_errors = True
 
-from sglang.global_config import global_config
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.flashinfer_backend import (
     create_flashinfer_kv_indices_triton,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
-from sglang.srt.utils import is_flashinfer_available
+from sglang.srt.server_args import get_global_server_args
+from sglang.srt.speculative.spec_info import SpecInput
+from sglang.srt.utils import (
+    is_flashinfer_available,
+    is_sm100_supported,
+    next_power_of_2,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
-    from sglang.srt.speculative.spec_info import SpecInfo
+    from sglang.srt.speculative.spec_info import SpecInput
 
 if is_flashinfer_available():
     from flashinfer import (
@@ -61,6 +64,117 @@ class PrefillMetadata:
 global_workspace_buffer = None
 
 
+class FlashInferMhaChunkKVRunner:
+    def __init__(
+        self, model_runner: ModelRunner, attn_backend: "FlashInferMlaAttnBackend"
+    ):
+        # Parse Constants
+        self.num_local_heads = (
+            model_runner.model_config.num_attention_heads // get_attention_tp_size()
+        )
+        self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
+        self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
+        self.v_head_dim = model_runner.model_config.v_head_dim
+        self.data_type = model_runner.dtype
+        self.q_data_type = model_runner.dtype
+
+        # Buffers and wrappers
+        self.qo_indptr = attn_backend.qo_indptr
+        self.workspace_buffer = attn_backend.workspace_buffer
+        self.fmha_backend = attn_backend.fmha_backend
+
+        self.chunk_ragged_wrappers = []
+        self.ragged_wrapper = attn_backend.prefill_wrapper_ragged
+
+    def update_prefix_chunks(self, num_prefix_chunks: int):
+        while num_prefix_chunks > len(self.chunk_ragged_wrappers):
+            ragged_wrapper = BatchPrefillWithRaggedKVCacheWrapper(
+                self.workspace_buffer, "NHD", backend=self.fmha_backend
+            )
+            self.chunk_ragged_wrappers.append(ragged_wrapper)
+
+    def update_wrapper(
+        self,
+        forward_batch: ForwardBatch,
+        disable_flashinfer_ragged: bool = False,
+    ):
+        assert forward_batch.num_prefix_chunks is not None
+        num_prefix_chunks = forward_batch.num_prefix_chunks
+        self.update_prefix_chunks(num_prefix_chunks)
+
+        prefix_lens = forward_batch.extend_prefix_lens
+        seq_lens = forward_batch.seq_lens
+
+        bs = len(seq_lens)
+        qo_indptr = self.qo_indptr
+        qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
+        qo_indptr = qo_indptr[: bs + 1]
+
+        for chunk_idx in range(forward_batch.num_prefix_chunks):
+            # MHA for chunked prefix kv cache when running model with MLA
+            assert forward_batch.prefix_chunk_idx is not None
+            assert forward_batch.prefix_chunk_cu_seq_lens is not None
+            assert forward_batch.prefix_chunk_max_seq_lens is not None
+
+            kv_indptr = forward_batch.prefix_chunk_cu_seq_lens[chunk_idx]
+            wrapper = self.chunk_ragged_wrappers[chunk_idx]
+            wrapper.begin_forward(
+                qo_indptr=qo_indptr,
+                kv_indptr=kv_indptr,
+                num_qo_heads=self.num_local_heads,
+                num_kv_heads=self.num_local_heads,
+                head_dim_qk=self.qk_nope_head_dim + self.qk_rope_head_dim,
+                head_dim_vo=self.v_head_dim,
+                q_data_type=self.q_data_type,
+                causal=False,
+            )
+        # ragged prefill
+        if not disable_flashinfer_ragged:
+            self.ragged_wrapper.begin_forward(
+                qo_indptr=qo_indptr,
+                kv_indptr=qo_indptr,
+                num_qo_heads=self.num_local_heads,
+                num_kv_heads=self.num_local_heads,
+                head_dim_qk=self.qk_nope_head_dim + self.qk_rope_head_dim,
+                head_dim_vo=self.v_head_dim,
+                q_data_type=self.q_data_type,
+                causal=True,
+            )
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+    ):
+        logits_soft_cap = layer.logit_cap
+        if forward_batch.attn_attend_prefix_cache:
+            chunk_idx = forward_batch.prefix_chunk_idx
+            assert chunk_idx >= 0
+            wrapper = self.chunk_ragged_wrappers[chunk_idx]
+            o1, s1 = wrapper.forward_return_lse(
+                q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
+                v.view(-1, layer.tp_v_head_num, layer.v_head_dim).to(q.dtype),
+                causal=False,
+                sm_scale=layer.scaling,
+                logits_soft_cap=logits_soft_cap,
+            )
+        else:
+            o1, s1 = self.ragged_wrapper.forward_return_lse(
+                q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
+                v.view(-1, layer.tp_v_head_num, layer.v_head_dim).to(q.dtype),
+                causal=True,
+                sm_scale=layer.scaling,
+                logits_soft_cap=logits_soft_cap,
+            )
+
+        return o1, s1
+
+
 class FlashInferMLAAttnBackend(AttentionBackend):
     """Flashinfer attention kernels."""
 
@@ -77,12 +191,20 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.max_context_len = model_runner.model_config.context_len
         self.device = model_runner.device
         self.skip_prefill = skip_prefill
+        self.enable_chunk_kv = (
+            not skip_prefill
+            and get_global_server_args().disaggregation_mode != "decode"
+            and not get_global_server_args().disable_chunked_prefix_cache
+            and not get_global_server_args().flashinfer_mla_disable_ragged
+        )
+        self.page_size = model_runner.page_size
 
         # Allocate buffers
         global global_workspace_buffer
         if global_workspace_buffer is None:
+            # different from flashinfer zero_init_global_workspace_buffer
             global_workspace_buffer = torch.empty(
-                global_config.flashinfer_workspace_size,
+                envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
                 dtype=torch.uint8,
                 device=model_runner.device,
             )
@@ -108,8 +230,11 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         else:
             self.q_indptr_decode = q_indptr_decode_buf
 
+        self.fmha_backend = "auto"
+        if is_sm100_supported():
+            self.fmha_backend = "cutlass"
         self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
-            self.workspace_buffer, "NHD"
+            self.workspace_buffer, "NHD", backend=self.fmha_backend
         )
 
         if not self.skip_prefill:
@@ -133,6 +258,8 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             self.indices_updater_prefill = FlashInferMLAIndicesUpdaterPrefill(
                 model_runner, self
             )
+            if self.enable_chunk_kv:
+                self.mha_chunk_kv_cache = FlashInferMhaChunkKVRunner(model_runner, self)
 
         self.indices_updater_decode = FlashInferMLAIndicesUpdaterDecode(
             model_runner, self
@@ -179,7 +306,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             prefix_lens = forward_batch.extend_prefix_lens
             extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
             use_ragged = (
-                not global_server_args_dict["flashinfer_mla_disable_ragged"]
+                not get_global_server_args().flashinfer_mla_disable_ragged
                 and extend_no_prefix
             )
 
@@ -196,7 +323,10 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             )
 
     def init_cuda_graph_state(
-        self, max_bs: int, kv_indices_buf: Optional[torch.Tensor] = None
+        self,
+        max_bs: int,
+        max_num_tokens: int,
+        kv_indices_buf: Optional[torch.Tensor] = None,
     ):
         if kv_indices_buf is None:
             cuda_graph_kv_indices = torch.zeros(
@@ -231,7 +361,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         seq_lens: torch.Tensor,
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
-        spec_info: Optional[SpecInfo],
+        spec_info: Optional[SpecInput],
     ):
         if forward_mode.is_decode_or_idle():
             decode_wrapper = BatchMLAPagedAttentionWrapper(
@@ -278,6 +408,28 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             )
             self.prefill_cuda_graph_metadata[bs] = verify_wrapper
             self.forward_metadata = PrefillMetadata(verify_wrapper, False)
+        elif forward_mode.is_draft_extend():
+            draft_extend_wrapper = BatchMLAPagedAttentionWrapper(
+                self.workspace_buffer,
+                use_cuda_graph=True,
+                qo_indptr=self.cuda_graph_qo_indptr[: bs + 1],
+                kv_indptr=self.cuda_graph_kv_indptr[: bs + 1],
+                kv_indices=self.cuda_graph_kv_indices,
+                kv_len_arr=self.cuda_graph_kv_lens[:bs],
+                backend="auto",
+            )
+            seq_lens_sum = seq_lens.sum().item()
+            self.indices_updater_prefill.update(
+                req_pool_indices,
+                seq_lens,
+                seq_lens_sum,
+                prefix_lens=None,
+                prefill_wrapper_paged=draft_extend_wrapper,
+                use_ragged=False,
+                spec_info=spec_info,
+            )
+            self.prefill_cuda_graph_metadata[bs] = draft_extend_wrapper
+            self.forward_metadata = PrefillMetadata(draft_extend_wrapper, False)
         else:
             raise ValueError(f"Invalid mode: {forward_mode=}")
 
@@ -289,7 +441,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         seq_lens_sum: int,
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
-        spec_info: Optional[SpecInfo],
+        spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
         if forward_mode.is_decode_or_idle():
@@ -325,11 +477,27 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 use_ragged=False,
                 spec_info=spec_info,
             )
+        elif forward_mode.is_draft_extend():
+            self.indices_updater_prefill.update(
+                req_pool_indices[:bs],
+                seq_lens[:bs],
+                seq_lens_sum,
+                prefix_lens=None,
+                prefill_wrapper_paged=self.prefill_cuda_graph_metadata[bs],
+                use_ragged=False,
+                spec_info=spec_info,
+            )
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
 
     def get_cuda_graph_seq_len_fill_value(self):
-        return 0
+        return 1
+
+    def init_mha_chunk_metadata(
+        self, forward_batch: ForwardBatch, disable_flashinfer_ragged: bool = False
+    ):
+        """Init the metadata for a forward pass."""
+        self.mha_chunk_kv_cache.update_wrapper(forward_batch, disable_flashinfer_ragged)
 
     def forward_extend(
         self,
@@ -342,6 +510,15 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
     ):
+        if (
+            forward_batch.attn_attend_prefix_cache is not None
+            and forward_batch.mha_return_lse
+        ):  # MHA Chunk
+            assert self.enable_chunk_kv
+            assert q_rope is None
+            assert k_rope is None
+            o1, s1 = self.mha_chunk_kv_cache.forward(q, k, v, layer, forward_batch)
+            return o1, s1
 
         cache_loc = forward_batch.out_cache_loc
         logits_soft_cap = layer.logit_cap
@@ -372,8 +549,8 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 k = torch.cat([k, k_rope], dim=-1)
             o = self.prefill_wrapper_ragged.forward(
                 qall,
-                k.view(-1, layer.tp_k_head_num, layer.head_dim),
-                v.view(-1, layer.tp_k_head_num, layer.v_head_dim),
+                k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
+                v.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(q.dtype),
                 causal=True,
                 sm_scale=layer.scaling,
                 logits_soft_cap=logits_soft_cap,
@@ -486,7 +663,7 @@ class FlashInferMLAIndicesUpdaterDecode:
         seq_lens_sum: int,
         decode_wrapper: BatchMLAPagedAttentionWrapper,
         init_metadata_replay: bool = False,
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]] = None,
+        spec_info: Optional[SpecInput] = None,
         **fast_decode_kwargs,
     ):
         decode_wrapper = decode_wrapper or self.decode_wrapper
@@ -511,7 +688,7 @@ class FlashInferMLAIndicesUpdaterDecode:
         q_indptr: torch.Tensor,
         kv_indptr: torch.Tensor,
         init_metadata_replay: bool = False,
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]] = None,
+        spec_info: Optional[SpecInput] = None,
         **fast_decode_kwargs,
     ):
         bs = len(req_pool_indices)
@@ -599,7 +776,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
         prefix_lens: torch.Tensor,
         prefill_wrapper_paged: BatchMLAPagedAttentionWrapper,
         use_ragged: bool,
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]] = None,
+        spec_info: Optional[SpecInput] = None,
     ):
         if use_ragged:
             paged_kernel_lens = prefix_lens
@@ -634,7 +811,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
         kv_indptr: torch.Tensor,
         qo_indptr: torch.Tensor,
         use_ragged: bool,
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]] = None,
+        spec_info: Optional[SpecInput] = None,
     ):
         bs = len(seq_lens)
         sm_scale = self.scaling
@@ -661,9 +838,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
             qo_indptr = qo_indptr[: bs + 1]
             custom_mask = None
         else:
-            assert isinstance(spec_info, EagleDraftInput) or isinstance(
-                spec_info, EagleVerifyInput
-            )
+            assert isinstance(spec_info, SpecInput)
             # TODO: Support topk > 1 with custom mask
             kv_indices, kv_indptr, qo_indptr, custom_mask = (
                 spec_info.generate_attn_arg_prefill(
@@ -684,6 +859,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
                 head_dim_qk=self.qk_nope_head_dim + self.qk_rope_head_dim,
                 head_dim_vo=self.v_head_dim,
                 q_data_type=self.q_data_type,
+                causal=True,
             )
         else:
             # mla paged prefill
@@ -716,11 +892,11 @@ class FlashInferMLAMultiStepDraftBackend:
         topk: int,
         speculative_num_steps: int,
     ):
-        from sglang.srt.speculative.eagle_utils import generate_draft_decode_kv_indices
+        from sglang.srt.speculative.spec_utils import generate_draft_decode_kv_indices
 
         if topk > 1:
             raise ValueError(
-                f"Currently Flashinfer MLA only supports topk=1 for speculative decoding"
+                "Currently Flashinfer MLA only supports topk=1 for speculative decoding"
             )
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
@@ -740,7 +916,7 @@ class FlashInferMLAMultiStepDraftBackend:
         )
 
         self.attn_backends = []
-        for i in range(self.speculative_num_steps):
+        for i in range(self.speculative_num_steps - 1):
             self.attn_backends.append(
                 FlashInferMLAAttnBackend(
                     model_runner,
@@ -754,6 +930,7 @@ class FlashInferMLAMultiStepDraftBackend:
 
         # Cached variables for generate_draft_decode_kv_indices
         self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
+        self.page_size = model_runner.server_args.page_size
 
     def common_template(
         self,
@@ -774,18 +951,17 @@ class FlashInferMLAMultiStepDraftBackend:
             kv_indices_buffer,
             self.kv_indptr,
             forward_batch.positions,
-            num_seqs,
-            self.topk,
             self.pool_len,
             kv_indices_buffer.shape[1],
             self.kv_indptr.shape[1],
-            triton.next_power_of_2(num_seqs),
-            triton.next_power_of_2(self.speculative_num_steps),
-            triton.next_power_of_2(bs),
+            next_power_of_2(num_seqs),
+            next_power_of_2(self.speculative_num_steps),
+            next_power_of_2(bs),
+            self.page_size,
         )
 
         assert forward_batch.spec_info is not None
-        assert isinstance(forward_batch.spec_info, EagleDraftInput)
+        assert forward_batch.spec_info.is_draft_input()
 
         for i in range(self.speculative_num_steps - 1):
             forward_batch.spec_info.kv_indptr = self.kv_indptr[i, : bs + 1]
@@ -805,8 +981,6 @@ class FlashInferMLAMultiStepDraftBackend:
         )
 
         def call_fn(i, forward_batch):
-            assert forward_batch.spec_info is not None
-            assert isinstance(forward_batch.spec_info, EagleDraftInput)
             forward_batch.spec_info.kv_indptr = (
                 forward_batch.spec_info.kv_indptr.clone()
             )
@@ -817,16 +991,16 @@ class FlashInferMLAMultiStepDraftBackend:
 
         self.common_template(forward_batch, kv_indices, call_fn)
 
-    def init_cuda_graph_state(self, max_bs: int):
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         self.cuda_graph_kv_indices = torch.zeros(
             (self.speculative_num_steps, max_bs * self.max_context_len),
             dtype=torch.int32,
             device="cuda",
         )
 
-        for i in range(self.speculative_num_steps):
+        for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_cuda_graph_state(
-                max_bs, kv_indices_buf=self.cuda_graph_kv_indices[i]
+                max_bs, max_num_tokens, kv_indices_buf=self.cuda_graph_kv_indices[i]
             )
 
     def init_forward_metadata_capture_cuda_graph(self, forward_batch: ForwardBatch):
@@ -884,19 +1058,18 @@ def fast_mla_decode_plan(
     self._page_size = page_size
     self._sm_scale = sm_scale
 
-    with self.device as device:
-        try:
-            # Standard version with just the required arguments (no use_profiler)
-            self._cached_module.plan.default(
-                self._float_workspace_buffer,
-                self._int_workspace_buffer,
-                self._pin_memory_int_workspace_buffer,
-                qo_indptr_cpu,
-                kv_indptr_cpu,
-                kv_len_arr_cpu,
-                num_heads,
-                head_dim_ckv,
-                causal,
-            )
-        except Exception as e:
-            raise RuntimeError(f"Error in alternate MLA plan: {e}")
+    try:
+        # Standard version with just the required arguments (no use_profiler)
+        self._cached_module.plan(
+            self._float_workspace_buffer,
+            self._int_workspace_buffer,
+            self._pin_memory_int_workspace_buffer,
+            qo_indptr_cpu,
+            kv_indptr_cpu,
+            kv_len_arr_cpu,
+            num_heads,
+            head_dim_ckv,
+            causal,
+        )
+    except Exception as e:
+        raise RuntimeError(f"Error in alternate MLA plan: {e}")

@@ -23,7 +23,7 @@ spec:
         - /bin/bash
         - -c
         # please modify the sglang serving arguments below, as necessary.
-        # NOTE: the --expert-parallel-size and --enable-ep-moe are for MoE model like DeepSeek-R1
+        # NOTE: the --expert-parallel-size is for MoE model like DeepSeek-R1
         args:
         - |
           python3 -m sglang.launch_server \
@@ -36,7 +36,6 @@ spec:
           --host 0.0.0.0 \
           --port 8000 \
           --enable-metrics \
-          --enable-ep-moe \
           --expert-parallel-size 16
         env:
         - name: POD_INDEX     # reflects the node-rank

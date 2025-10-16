@@ -28,6 +28,7 @@ from llguidance.torch import (
 )
 
 from sglang.srt.constrained.base_grammar_backend import (
+    INVALID_GRAMMAR_OBJ,
     BaseGrammarBackend,
     BaseGrammarObject,
 )
@@ -47,7 +48,6 @@ class GuidanceGrammar(BaseGrammarObject):
             self.serialized_grammar,
             log_level=int(os.environ.get("LLGUIDANCE_LOG_LEVEL", "1")),
         )
-        self.finished = False
         self.bitmask = None
 
     def accept_token(self, token: int):
@@ -110,12 +110,14 @@ class GuidanceBackend(BaseGrammarBackend):
     def __init__(
         self,
         tokenizer,
+        any_whitespace: bool = True,
         whitespace_pattern: Optional[str] = None,
         n_vocab: Optional[int] = None,
     ):
         super().__init__()
 
         self.tokenizer = tokenizer
+        self.any_whitespace = any_whitespace
         self.whitespace_pattern = whitespace_pattern
         self.llguidance_tokenizer = from_tokenizer(self.tokenizer, n_vocab)
 
@@ -126,20 +128,21 @@ class GuidanceBackend(BaseGrammarBackend):
                 serialized_grammar=serialized_grammar,
             )
         except Exception as e:
-            logger.warning(f"Skip invalid grammar: {serialized_grammar}, {e=}")
-            return None
+            logger.error(f"Hit invalid grammar: {serialized_grammar=}, {e=}")
+            return INVALID_GRAMMAR_OBJ
 
     def dispatch_json(self, key_string: str) -> Optional[GuidanceGrammar]:
         try:
             serialized_grammar = LLMatcher.grammar_from_json_schema(
                 key_string,
                 defaults={
+                    "whitespace_flexible": self.any_whitespace,
                     "whitespace_pattern": self.whitespace_pattern,
                 },
             )
         except Exception as e:
-            logger.warning(f"Skip invalid grammar: {key_string=}, {e=}")
-            return None
+            logger.error(f"Hit invalid json_schema: {key_string=}, {e=}")
+            return INVALID_GRAMMAR_OBJ
         return self._from_serialized(serialized_grammar)
 
     def dispatch_regex(self, key_string: str) -> Optional[GuidanceGrammar]:
@@ -151,8 +154,8 @@ class GuidanceBackend(BaseGrammarBackend):
             serialized_grammar = grammar_from("ebnf", key_string)
             return self._from_serialized(serialized_grammar)
         except ValueError as e:
-            logger.warning(f"Skip invalid ebnf: regex={key_string}, {e=}")
-            return None
+            logger.error(f"Hit invalid ebnf: {key_string=}, {e=}")
+            return INVALID_GRAMMAR_OBJ
 
     def dispatch_structural_tag(self, key_string: str) -> Optional[GuidanceGrammar]:
         try:
@@ -169,5 +172,5 @@ class GuidanceBackend(BaseGrammarBackend):
             g = StructTag.to_grammar(tags)
             return self._from_serialized(g)
         except Exception as e:
-            logging.warning(f"Skip invalid structural_tag: {key_string}, {e=}")
-            return None
+            logging.error(f"Hit invalid structural_tag: {key_string=}, {e=}")
+            return INVALID_GRAMMAR_OBJ

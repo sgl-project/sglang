@@ -1,15 +1,14 @@
+import unittest
+
 from test_vision_openai_server_common import *
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    DEFAULT_URL_FOR_TEST,
-    CustomTestCase,
     popen_launch_server,
 )
 
 
-class TestPixtralServer(TestOpenAIVisionServer):
+class TestPixtralServer(ImageOpenAITestMixin):
     @classmethod
     def setUpClass(cls):
         cls.model = "mistral-community/pixtral-12b"
@@ -22,16 +21,15 @@ class TestPixtralServer(TestOpenAIVisionServer):
             other_args=[
                 "--trust-remote-code",
                 "--mem-fraction-static",
-                "0.73",
+                "0.70",
+                "--cuda-graph-max-bs",
+                "4",
             ],
         )
         cls.base_url += "/v1"
 
-    def test_video_chat_completion(self):
-        pass
 
-
-class TestMistral3_1Server(TestOpenAIVisionServer):
+class TestMistral3_1Server(ImageOpenAITestMixin):
     @classmethod
     def setUpClass(cls):
         cls.model = "unsloth/Mistral-Small-3.1-24B-Instruct-2503"
@@ -44,16 +42,15 @@ class TestMistral3_1Server(TestOpenAIVisionServer):
             other_args=[
                 "--trust-remote-code",
                 "--mem-fraction-static",
-                "0.8",
+                "0.75",
+                "--cuda-graph-max-bs",
+                "4",
             ],
         )
         cls.base_url += "/v1"
 
-    def test_video_chat_completion(self):
-        pass
 
-
-class TestDeepseekVL2Server(TestOpenAIVisionServer):
+class TestDeepseekVL2Server(ImageOpenAITestMixin):
     @classmethod
     def setUpClass(cls):
         cls.model = "deepseek-ai/deepseek-vl2-small"
@@ -67,37 +64,14 @@ class TestDeepseekVL2Server(TestOpenAIVisionServer):
                 "--trust-remote-code",
                 "--context-length",
                 "4096",
+                "--cuda-graph-max-bs",
+                "4",
             ],
         )
         cls.base_url += "/v1"
 
-    def test_video_chat_completion(self):
-        pass
 
-
-class TestDeepseekVL2TinyServer(TestOpenAIVisionServer):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = "deepseek-ai/deepseek-vl2-tiny"
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--trust-remote-code",
-                "--context-length",
-                "4096",
-            ],
-        )
-        cls.base_url += "/v1"
-
-    def test_video_chat_completion(self):
-        pass
-
-
-class TestJanusProServer(TestOpenAIVisionServer):
+class TestJanusProServer(ImageOpenAITestMixin):
     @classmethod
     def setUpClass(cls):
         cls.model = "deepseek-ai/Janus-Pro-7B"
@@ -110,16 +84,14 @@ class TestJanusProServer(TestOpenAIVisionServer):
             other_args=[
                 "--trust-remote-code",
                 "--mem-fraction-static",
-                "0.4",
+                "0.35",
+                "--cuda-graph-max-bs",
+                "4",
             ],
         )
         cls.base_url += "/v1"
 
-    def test_video_chat_completion(self):
-        pass
-
-    def test_single_image_chat_completion(self):
-        # Skip this test because it is flaky
+    def test_video_images_chat_completion(self):
         pass
 
 
@@ -141,15 +113,16 @@ class TestJanusProServer(TestOpenAIVisionServer):
 #                 "0.8",
 #                 "--tp-size=8",
 #                 "--context-length=8192",
+#                 "--mm-attention-backend",
+#                 "fa3",
+#                 "--cuda-graph-max-bs",
+#                 "4",
 #             ],
 #         )
 #         cls.base_url += "/v1"
 
-#     def test_video_chat_completion(self):
-#         pass
 
-
-class TestGemma3itServer(TestOpenAIVisionServer):
+class TestGemma3itServer(ImageOpenAITestMixin):
     @classmethod
     def setUpClass(cls):
         cls.model = "google/gemma-3-4b-it"
@@ -162,44 +135,19 @@ class TestGemma3itServer(TestOpenAIVisionServer):
             other_args=[
                 "--trust-remote-code",
                 "--mem-fraction-static",
-                "0.75",
+                "0.70",
                 "--enable-multimodal",
+                "--cuda-graph-max-bs",
+                "4",
             ],
         )
         cls.base_url += "/v1"
 
-    def test_video_chat_completion(self):
-        pass
 
-
-class TestKimiVLServer(TestOpenAIVisionServer):
+class TestGemma3nServer(ImageOpenAITestMixin, AudioOpenAITestMixin):
     @classmethod
     def setUpClass(cls):
-        cls.model = "moonshotai/Kimi-VL-A3B-Instruct"
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--trust-remote-code",
-                "--context-length",
-                "4096",
-                "--dtype",
-                "bfloat16",
-            ],
-        )
-        cls.base_url += "/v1"
-
-    def test_video_chat_completion(self):
-        pass
-
-
-class TestPhi4MMServer(TestOpenAIVisionServer):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = "microsoft/Phi-4-multimodal-instruct"
+        cls.model = "google/gemma-3n-E4B-it"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
         cls.process = popen_launch_server(
@@ -209,18 +157,95 @@ class TestPhi4MMServer(TestOpenAIVisionServer):
             other_args=[
                 "--trust-remote-code",
                 "--mem-fraction-static",
-                "0.75",
+                "0.70",
+                "--cuda-graph-max-bs",
+                "4",
             ],
         )
         cls.base_url += "/v1"
 
-    def test_video_chat_completion(self):
+    # This _test_audio_ambient_completion test is way too complicated to pass for a small LLM
+    def test_audio_ambient_completion(self):
         pass
 
-    def test_multi_images_chat_completion(self):
-        # TODO (lifuhuang): support LoRA to enable Phi4MM multi-image understanding capability.
-        pass
+    def _test_mixed_image_audio_chat_completion(self):
+        self._test_mixed_image_audio_chat_completion()
+
+
+class TestQwen2AudioServer(AudioOpenAITestMixin):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "Qwen/Qwen2-Audio-7B-Instruct"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--trust-remote-code",
+                "--mem-fraction-static",
+                "0.70",
+            ],
+        )
+        cls.base_url += "/v1"
+
+
+# Temporarily skip Kimi-VL for CI test due to issue in transformers=4.57.0
+# class TestKimiVLServer(ImageOpenAITestMixin):
+#     @classmethod
+#     def setUpClass(cls):
+#         cls.model = "moonshotai/Kimi-VL-A3B-Instruct"
+#         cls.base_url = DEFAULT_URL_FOR_TEST
+#         cls.api_key = "sk-123456"
+#         cls.process = popen_launch_server(
+#             cls.model,
+#             cls.base_url,
+#             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+#             other_args=[
+#                 "--trust-remote-code",
+#                 "--context-length",
+#                 "4096",
+#                 "--dtype",
+#                 "bfloat16",
+#                 "--cuda-graph-max-bs",
+#                 "4",
+#             ],
+#         )
+#         cls.base_url += "/v1"
+
+#     def test_video_images_chat_completion(self):
+#         pass
+
+
+class TestGLM41VServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "zai-org/GLM-4.1V-9B-Thinking"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--trust-remote-code",
+                "--mem-fraction-static",
+                "0.68",
+                "--cuda-graph-max-bs",
+                "4",
+                "--reasoning-parser",
+                "glm45",
+            ],
+        )
+        cls.base_url += "/v1"
 
 
 if __name__ == "__main__":
+    del (
+        TestOpenAIOmniServerBase,
+        ImageOpenAITestMixin,
+        VideoOpenAITestMixin,
+        AudioOpenAITestMixin,
+    )
     unittest.main()

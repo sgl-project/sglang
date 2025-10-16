@@ -11,11 +11,12 @@ The eval output will be logged
 
 import argparse
 import asyncio
+import re
 import sys
 import time
 import traceback
 from dataclasses import dataclass, field
-from typing import Any, List, Tuple
+from typing import Any, List, Optional, Tuple
 
 import aiohttp
 import openai
@@ -73,7 +74,7 @@ def _get_prefix_suffix(prompt: str) -> Tuple[str, str]:
 
 
 async def process_sample(
-    client: Any, sample: dict, sampling_params: dict
+    client: Any, sample: dict, sampling_params: dict, lora_path: Optional[str] = None
 ) -> Tuple[dict, str]:
     """Send a single sample to the LLM and return (sample, response)."""
     prompt = sample["final_input_prompt"]
@@ -81,6 +82,7 @@ async def process_sample(
     image = sample["image"]
     assert image is not None
     image_path = sample["image_path"]
+    extra_body = None if lora_path is None else {"lora_path": lora_path}
     response = await client.chat.completions.create(
         model="default",
         messages=[
@@ -96,16 +98,21 @@ async def process_sample(
         temperature=0,
         max_completion_tokens=sampling_params["max_new_tokens"],
         max_tokens=sampling_params["max_new_tokens"],
+        extra_body=extra_body,
     )
     return sample, response.choices[0].message.content
 
 
 async def process_sample_with_semaphore(
-    semaphore: asyncio.Semaphore, client: Any, sample: dict, sampling_params: dict
+    semaphore: asyncio.Semaphore,
+    client: Any,
+    sample: dict,
+    sampling_params: dict,
+    lora_path: Optional[str] = None,
 ) -> Tuple[dict, str]:
     """Wrap process_sample with a semaphore for concurrency control."""
     async with semaphore:
-        return await process_sample(client, sample, sampling_params)
+        return await process_sample(client, sample, sampling_params, lora_path)
 
 
 async def eval_mmmu(args) -> None:
@@ -113,12 +120,14 @@ async def eval_mmmu(args) -> None:
     eval_args = EvalArgs.from_cli_args(args)
     sampling_params = get_sampling_params(eval_args)
     samples = prepare_samples(eval_args)
+    lora_path = eval_args.lora_path
     answer_dict = {}
     out_samples = {}
     client = openai.AsyncOpenAI(
-        api_key="sk", base_url=f"http://127.0.0.1:{args.port}/v1"
+        api_key="sk",
+        base_url=f"http://127.0.0.1:{args.port}/v1",
+        timeout=20 * 60 * 60,
     )
-    semaphore = asyncio.Semaphore(args.concurrency)
     start = time.perf_counter()
     base_url = f"http://127.0.0.1:{args.port}"
 
@@ -132,14 +141,48 @@ async def eval_mmmu(args) -> None:
 
         samples = samples[: args.profile_number]
 
-    tasks = [
-        process_sample_with_semaphore(semaphore, client, sample, sampling_params)
-        for sample in samples
-    ]
+    if args.concurrency == 1:
+        # For concurrency == 1, run in sequential mode to ensure consistent order
+        # this is mainly for profiling
+        for sample in tqdm(samples):
+            _, response = await process_sample(
+                client, sample, sampling_params, lora_path
+            )
+            sample["original_response"] = response
+            answer = (
+                re.search(args.response_answer_regex, response)
+                if response is not None
+                else None
+            )
+            process_result(
+                answer.group(1).strip() if answer else response,
+                sample,
+                answer_dict,
+                out_samples,
+            )
+    else:
+        semaphore = asyncio.Semaphore(args.concurrency)
+        tasks = [
+            process_sample_with_semaphore(
+                semaphore, client, sample, sampling_params, lora_path
+            )
+            for sample in samples
+        ]
 
-    for coro in tqdm(asyncio.as_completed(tasks), total=len(tasks)):
-        sample, response = await coro
-        process_result(response, sample, answer_dict, out_samples)
+        for coro in tqdm(asyncio.as_completed(tasks), total=len(tasks)):
+            sample, response = await coro
+            sample["original_response"] = response
+            answer = (
+                re.search(args.response_answer_regex, response)
+                if response is not None
+                else None
+            )
+            process_result(
+                answer.group(1).strip() if answer else response,
+                sample,
+                answer_dict,
+                out_samples,
+            )
 
     if args.profile:
         print("Stopping profiler...")
@@ -148,9 +191,13 @@ async def eval_mmmu(args) -> None:
             print("Profiler stopped")
 
     print(f"Benchmark time: {time.perf_counter() - start}")
-    args.output_path = f"./val_sglang.json"
+    args.output_path = "./answer_sglang.json"
     save_json(args.output_path, out_samples)
-    eval_result(model_answer_path=args.output_path, answer_dict=answer_dict)
+    eval_result(
+        model_answer_path=args.output_path,
+        answer_dict=answer_dict,
+        eval_output_path="./val_sglang.json",
+    )
 
 
 def parse_args():

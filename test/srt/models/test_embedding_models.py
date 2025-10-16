@@ -20,12 +20,18 @@ import torch
 from transformers import AutoConfig, AutoTokenizer
 
 from sglang.test.runners import DEFAULT_PROMPTS, HFRunner, SRTRunner
-from sglang.test.test_utils import CustomTestCase, get_similarities, is_in_ci
+from sglang.test.test_utils import (
+    CustomTestCase,
+    get_similarities,
+    is_in_amd_ci,
+    is_in_ci,
+)
 
 MODELS = [
     ("Alibaba-NLP/gte-Qwen2-1.5B-instruct", 1, 1e-5),
     ("intfloat/e5-mistral-7b-instruct", 1, 1e-5),
     ("marco/mcdse-2b-v1", 1, 1e-5),
+    ("Qwen/Qwen3-Embedding-8B", 1, 1e-5),
     # Temporarily disable before this model is fixed
     # ("jason9693/Qwen2.5-1.5B-apeach", 1, 1e-5),
 ]
@@ -73,11 +79,13 @@ class TestEmbeddingModels(CustomTestCase):
         ) as hf_runner:
             hf_outputs = hf_runner.forward(truncated_prompts)
 
+        attention_backend = "triton" if is_in_amd_ci() else None
         with SRTRunner(
             model_path,
             tp_size=tp_size,
             torch_dtype=torch_dtype,
             model_type="embedding",
+            attention_backend=attention_backend,
         ) as srt_runner:
             srt_outputs = srt_runner.forward(truncated_prompts)
 
