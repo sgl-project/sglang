@@ -69,7 +69,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqOutput,
 )
 from sglang.srt.server_args import LoRARef, ServerArgs
-from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils import get_bool_env_var, merge_communicator_results
 from sglang.utils import TypeBasedDispatcher
 
 if TYPE_CHECKING:
@@ -362,14 +362,7 @@ class TokenizerCommunicatorMixin:
         ), "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
 
         results = await self.init_weights_update_group_communicator(obj)
-        if self.server_args.dp_size == 1:
-            result = results[0]
-            return result.success, result.message
-        else:
-            all_success = all([r.success for r in results])
-            all_message = [r.message for r in results]
-            all_message = " | ".join(all_message)
-            return all_success, all_message
+        return merge_communicator_results(results)
 
     async def destroy_weights_update_group(
         self,
@@ -382,14 +375,7 @@ class TokenizerCommunicatorMixin:
         ), "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
 
         results = await self.destroy_weights_update_group_communicator(obj)
-        if self.server_args.dp_size == 1:
-            result = results[0]
-            return result.success, result.message
-        else:
-            all_success = all([r.success for r in results])
-            all_message = [r.message for r in results]
-            all_message = " | ".join(all_message)
-            return all_success, all_message
+        return merge_communicator_results(results)
 
     async def update_weights_from_distributed(
         self: TokenizerManager,
@@ -408,14 +394,7 @@ class TokenizerCommunicatorMixin:
         # cannot run while requests are in progress.
         async with self.model_update_lock.writer_lock:
             results = await self.update_weights_from_distributed_communicator(obj)
-            if self.server_args.dp_size == 1:
-                result = results[0]
-                return result.success, result.message
-            else:
-                all_success = all([r.success for r in results])
-                all_message = [r.message for r in results]
-                all_message = " | ".join(all_message)
-                return all_success, all_message
+            return merge_communicator_results(results)
 
     async def init_weights_send_group_for_remote_instance(
         self,

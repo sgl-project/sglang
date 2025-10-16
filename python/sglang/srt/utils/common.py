@@ -3214,6 +3214,13 @@ def check_cuda_result(raw_output):
     return results
 
 
+def merge_communicator_results(results):
+    all_success = all([r.success for r in results])
+    all_message = [r.message for r in results]
+    all_message = " | ".join(all_message)
+    return all_success, all_message
+
+
 def get_physical_device_id(pytorch_device_id: int) -> int:
     """
     Convert PyTorch logical device ID to physical device ID.
