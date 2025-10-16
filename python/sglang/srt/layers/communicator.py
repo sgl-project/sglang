@@ -15,7 +15,7 @@
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import partial
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 
@@ -110,14 +110,14 @@ def use_attn_input_tp_scattered(forward_batch: ForwardBatch):
     )
 
 
-def tp_all_gather_qkv_latent(qkv_latent, forward_batch):
+def tp_all_gather_hidden_states(hidden_states, forward_batch):
     tp_group = get_tp_group()
     sum_seq_len = forward_batch.input_ids.shape[0]
     tp_size = tp_group.world_size
 
-    output = qkv_latent.new_empty((sum_seq_len, qkv_latent.shape[-1]))
+    output = hidden_states.new_empty((sum_seq_len, hidden_states.shape[-1]))
     tp_group.all_gather(
-        qkv_latent, output_tensor_list=list(output.tensor_split(tp_size))
+        hidden_states, output_tensor_list=list(output.tensor_split(tp_size))
     )
     return output
 
@@ -137,6 +137,46 @@ class _LayerModeComputationContext:
             is_previous_layer_sparse=None,
             num_layers=self.num_layers,
         )
+
+
+class AttentionInputs:
+
+    def __init__(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        qkv_latent_func: Callable,
+    ):
+        self.hidden_states_local = hidden_states
+        self.forward_batch = forward_batch
+        self.qkv_latent_func = qkv_latent_func
+        self.hidden_states_ = None
+        self.qkv_latent_ = None
+
+    @property
+    def qkv_latent(self):
+        if self.qkv_latent_ is not None:
+            return self.qkv_latent_
+        assert self.qkv_latent_func is not None
+        self.qkv_latent_ = self.qkv_latent_func(
+            self.hidden_states_local, self.forward_batch
+        )
+        if self.forward_batch.attn_input_tp_scattered:
+            self.qkv_latent_ = tp_all_gather_hidden_states(
+                self.qkv_latent_, self.forward_batch
+            )
+        return self.qkv_latent_
+
+    @property
+    def hidden_states(self):
+        if self.hidden_states_ is not None:
+            return self.hidden_states_
+        self.hidden_states_ = self.hidden_states_local
+        if self.forward_batch.attn_input_tp_scattered:
+            self.hidden_states_ = tp_all_gather_hidden_states(
+                self.hidden_states_, self.forward_batch
+            )
+        return self.hidden_states_
 
 
 @dataclass
@@ -218,12 +258,14 @@ class LayerCommunicator:
         # Reduce scatter requires skipping all-reduce in model code after MoE/MLP, so only enable for models which have that implemented. Remove flag once done for all models that use LayerCommunicator.
         allow_reduce_scatter: bool = False,
         is_last_layer: bool = False,
+        qkv_latent_func: Optional[Callable] = None,
     ):
         self.layer_scatter_modes = layer_scatter_modes
         self.input_layernorm = input_layernorm
         self.post_attention_layernorm = post_attention_layernorm
         self.allow_reduce_scatter = allow_reduce_scatter
         self.is_last_layer = is_last_layer
+        self.qkv_latent_func = qkv_latent_func
 
         self._context = CommunicateContext.init_new()
         self._communicate_simple_fn = CommunicateSimpleFn.get_fn(
@@ -337,7 +379,10 @@ class LayerCommunicator:
             forward_batch=forward_batch,
             context=self._context,
         )
-
+        if self.qkv_latent_func is not None:
+            hidden_states = AttentionInputs(
+                hidden_states, forward_batch, self.qkv_latent_func
+            )
         return hidden_states, residual
 
     def _tp_reduce_scatter(
