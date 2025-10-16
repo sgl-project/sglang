@@ -14,13 +14,10 @@ use super::utils;
 use crate::core::{ConnectionMode, Worker, WorkerRegistry, WorkerType};
 use crate::grpc_client::proto;
 use crate::policies::PolicyRegistry;
-use crate::protocols::spec::{
-    ChatCompletionRequest, ChatCompletionResponse, GenerateMetaInfo, GenerateRequest,
-    GenerateResponse, InputIds, Usage,
-};
-use crate::tokenizer::stop::SequenceDecoderOutput;
+use crate::protocols::spec::{ChatCompletionRequest, GenerateRequest, InputIds};
+use crate::reasoning_parser::ParserFactory as ReasoningParserFactory;
 use crate::tokenizer::traits::Tokenizer;
-use proto::generate_complete::MatchedStop;
+use crate::tool_parser::ParserFactory as ToolParserFactory;
 use proto::DisaggregatedParams;
 use rand::Rng;
 use std::sync::Arc;
@@ -109,9 +106,13 @@ impl PreparationStage {
         let token_ids = encoding.token_ids().to_vec();
 
         // Step 4: Build tool constraints if needed
-        let tool_call_constraint = body_ref.tools.as_ref().and_then(|tools| {
-            utils::generate_tool_constraints(tools, &request.tool_choice, &request.model)
-        });
+        let tool_call_constraint = if let Some(tools) = body_ref.tools.as_ref() {
+            utils::generate_tool_constraints(tools, &request.tool_choice, &request.model).map_err(
+                |e| utils::bad_request_error(format!("Invalid tool configuration: {}", e)),
+            )?
+        } else {
+            None
+        };
 
         // Step 5: Create stop sequence decoder (build once, reuse in non-stream)
         let stop_decoder = utils::create_stop_decoder(
@@ -790,114 +791,32 @@ impl ResponseProcessingStage {
             .take()
             .ok_or_else(|| utils::internal_error_static("No execution result"))?;
 
-        if is_streaming {
-            // Get dispatch metadata for consistent response fields
-            let dispatch = ctx
-                .state
-                .dispatch
-                .as_ref()
-                .ok_or_else(|| utils::internal_error_static("Dispatch metadata not set"))?;
+        // Get dispatch metadata (needed by both streaming and non-streaming)
+        let dispatch = ctx
+            .state
+            .dispatch
+            .as_ref()
+            .ok_or_else(|| utils::internal_error_static("Dispatch metadata not set"))?
+            .clone();
 
+        if is_streaming {
             // Streaming: Use StreamingProcessor and return SSE response (done)
             return Ok(Some(
                 self.streaming_processor.clone().process_streaming_response(
                     execution_result,
                     ctx.chat_request_arc(), // Cheap Arc clone (8 bytes)
-                    dispatch.clone(),
+                    dispatch,
                 ),
             ));
         }
 
-        // Non-streaming: Extract chat request details before mutable borrows
+        // Non-streaming: Delegate to ResponseProcessor
         let request_logprobs = match &ctx.input.request_type {
             RequestType::Chat(req) => req.logprobs,
             _ => false,
         };
 
-        // Collect all responses from the execution result
-        let all_responses = match execution_result {
-            ExecutionResult::Single { mut stream } => {
-                let responses = utils::collect_stream_responses(&mut stream, "Single").await?;
-                stream.mark_completed();
-                responses
-            }
-            ExecutionResult::Dual {
-                mut prefill,
-                decode,
-            } => {
-                // Collect prefill for input_logprobs (don't mark completed yet)
-                let prefill_responses =
-                    utils::collect_stream_responses(&mut prefill, "Prefill").await?;
-
-                // Collect decode for actual output (don't mark completed yet)
-                let mut decode_stream = *decode;
-                let mut decode_responses =
-                    utils::collect_stream_responses(&mut decode_stream, "Decode").await?;
-
-                // Mark both streams as completed now that both succeeded
-                prefill.mark_completed();
-                decode_stream.mark_completed();
-
-                // Merge prefill input_logprobs if requested
-                if request_logprobs {
-                    if let Some(prefill_input_logprobs) = prefill_responses
-                        .first()
-                        .and_then(|r| r.input_logprobs.clone())
-                    {
-                        for response in &mut decode_responses {
-                            response.input_logprobs = Some(prefill_input_logprobs.clone());
-                        }
-                    }
-                }
-
-                decode_responses
-            }
-        };
-
-        if all_responses.is_empty() {
-            return Err(utils::internal_error_static("No responses from server"));
-        }
-
         let chat_request = ctx.chat_request_arc();
-        let history_tool_calls_count = utils::get_history_tool_calls_count(&chat_request);
-
-        // Check parser availability once upfront (not per choice)
-        let reasoning_parser_available = chat_request.separate_reasoning
-            && utils::check_reasoning_parser_availability(
-                &self.processor.reasoning_parser_factory,
-                self.processor.configured_reasoning_parser.as_ref(),
-                &chat_request.model,
-            );
-
-        let tool_choice_enabled = !matches!(
-            &chat_request.tool_choice,
-            Some(crate::protocols::spec::ToolChoice::Value(
-                crate::protocols::spec::ToolChoiceValue::None
-            ))
-        );
-
-        let tool_parser_available = tool_choice_enabled
-            && chat_request.tools.is_some()
-            && utils::check_tool_parser_availability(
-                &self.processor.tool_parser_factory,
-                self.processor.configured_tool_parser.as_ref(),
-                &chat_request.model,
-            );
-
-        // Log once per request (not per choice)
-        if chat_request.separate_reasoning && !reasoning_parser_available {
-            debug!(
-                "No reasoning parser found for model '{}', skipping reasoning parsing",
-                chat_request.model
-            );
-        }
-
-        if chat_request.tools.is_some() && tool_choice_enabled && !tool_parser_available {
-            debug!(
-                "No tool parser found for model '{}', skipping tool call parsing",
-                chat_request.model
-            );
-        }
 
         let stop_decoder = ctx
             .state
@@ -906,60 +825,16 @@ impl ResponseProcessingStage {
             .as_mut()
             .ok_or_else(|| utils::internal_error_static("Stop decoder not initialized"))?;
 
-        let mut choices = Vec::new();
-        for (index, complete) in all_responses.iter().enumerate() {
-            match self
-                .processor
-                .process_single_choice(
-                    complete,
-                    index,
-                    &chat_request,
-                    stop_decoder,
-                    history_tool_calls_count,
-                    reasoning_parser_available,
-                    tool_parser_available,
-                )
-                .await
-            {
-                Ok(choice) => choices.push(choice),
-                Err(e) => {
-                    return Err(utils::internal_error_message(format!(
-                        "Failed to process choice {}: {}",
-                        index, e
-                    )));
-                }
-            }
-        }
-
-        // Build usage
-        let total_prompt_tokens: u32 = all_responses.iter().map(|r| r.prompt_tokens as u32).sum();
-        let total_completion_tokens: u32 = all_responses
-            .iter()
-            .map(|r| r.completion_tokens as u32)
-            .sum();
-        let usage = Usage {
-            prompt_tokens: total_prompt_tokens,
-            completion_tokens: total_completion_tokens,
-            total_tokens: total_prompt_tokens + total_completion_tokens,
-            completion_tokens_details: None,
-        };
-
-        // Build final ChatCompletionResponse
-        let dispatch = ctx
-            .state
-            .dispatch
-            .as_ref()
-            .ok_or_else(|| utils::internal_error_static("Dispatch metadata not set"))?;
-
-        let response = ChatCompletionResponse {
-            id: dispatch.request_id.clone(),
-            object: "chat.completion".to_string(),
-            created: dispatch.created,
-            model: dispatch.model.clone(),
-            choices,
-            usage: Some(usage),
-            system_fingerprint: dispatch.weight_version.clone(),
-        };
+        let response = self
+            .processor
+            .process_non_streaming_chat_response(
+                execution_result,
+                chat_request,
+                dispatch,
+                stop_decoder,
+                request_logprobs,
+            )
+            .await?;
 
         // Store the final response
         ctx.state.response.final_response = Some(FinalResponse::Chat(response));
@@ -982,70 +857,29 @@ impl ResponseProcessingStage {
             .take()
             .ok_or_else(|| utils::internal_error_static("No execution result"))?;
 
-        if is_streaming {
-            // Get dispatch metadata for consistent response fields
-            let dispatch = ctx
-                .state
-                .dispatch
-                .as_ref()
-                .ok_or_else(|| utils::internal_error_static("Dispatch metadata not set"))?;
+        // Get dispatch metadata (needed by both streaming and non-streaming)
+        let dispatch = ctx
+            .state
+            .dispatch
+            .as_ref()
+            .ok_or_else(|| utils::internal_error_static("Dispatch metadata not set"))?
+            .clone();
 
+        if is_streaming {
             // Streaming: Use StreamingProcessor and return SSE response (done)
             return Ok(Some(
                 self.streaming_processor.clone().process_streaming_generate(
                     execution_result,
                     ctx.generate_request_arc(), // Cheap Arc clone (8 bytes)
-                    dispatch.clone(),
+                    dispatch,
                 ),
             ));
         }
 
-        // Non-streaming: Collect all responses
-        let request_logprobs = ctx.generate_request().return_logprob;
-        let all_responses = match execution_result {
-            ExecutionResult::Single { mut stream } => {
-                let responses = utils::collect_stream_responses(&mut stream, "Single").await?;
-                stream.mark_completed();
-                responses
-            }
-            ExecutionResult::Dual {
-                mut prefill,
-                decode,
-            } => {
-                // Collect prefill for input_logprobs (don't mark completed yet)
-                let prefill_responses =
-                    utils::collect_stream_responses(&mut prefill, "Prefill").await?;
+        // Non-streaming: Delegate to ResponseProcessor
+        let request_logprobs = ctx.generate_request().return_logprob.unwrap_or(false);
+        let generate_request = ctx.generate_request_arc();
 
-                // Collect decode for actual output (don't mark completed yet)
-                let mut decode_stream = *decode;
-                let mut decode_responses =
-                    utils::collect_stream_responses(&mut decode_stream, "Decode").await?;
-
-                // Mark both streams as completed now that both succeeded
-                prefill.mark_completed();
-                decode_stream.mark_completed();
-
-                // Merge prefill input_logprobs if requested
-                if request_logprobs {
-                    if let Some(prefill_input_logprobs) = prefill_responses
-                        .first()
-                        .and_then(|r| r.input_logprobs.clone())
-                    {
-                        for response in &mut decode_responses {
-                            response.input_logprobs = Some(prefill_input_logprobs.clone());
-                        }
-                    }
-                }
-
-                decode_responses
-            }
-        };
-
-        if all_responses.is_empty() {
-            return Err(utils::internal_error_static("No responses from server"));
-        }
-
-        // Get stop decoder for processing
         let stop_decoder = ctx
             .state
             .response
@@ -1053,103 +887,17 @@ impl ResponseProcessingStage {
             .as_mut()
             .ok_or_else(|| utils::internal_error_static("Stop decoder not initialized"))?;
 
-        // Get dispatch metadata
-        let dispatch = ctx
-            .state
-            .dispatch
-            .as_ref()
-            .ok_or_else(|| utils::internal_error_static("Dispatch metadata not set"))?;
-
-        // Process each completion (similar to router.rs:336-400)
-        let mut result_array = Vec::new();
-        for mut complete in all_responses {
-            stop_decoder.reset();
-
-            // Process tokens through stop decoder
-            let outputs = match stop_decoder.process_tokens(&complete.output_ids) {
-                Ok(outputs) => outputs,
-                Err(e) => {
-                    return Err(utils::internal_error_message(format!(
-                        "Failed to process tokens: {}",
-                        e
-                    )))
-                }
-            };
-
-            // Accumulate text with early breaks
-            let mut decoded_text = String::new();
-            for output in outputs {
-                match output {
-                    SequenceDecoderOutput::Text(t) => decoded_text.push_str(&t),
-                    SequenceDecoderOutput::StoppedWithText(t) => {
-                        decoded_text.push_str(&t);
-                        break;
-                    }
-                    SequenceDecoderOutput::Stopped => break,
-                    SequenceDecoderOutput::Held => {}
-                }
-            }
-
-            // Flush remaining text
-            if let SequenceDecoderOutput::Text(t) = stop_decoder.flush() {
-                decoded_text.push_str(&t);
-            }
-
-            let output_ids = std::mem::take(&mut complete.output_ids);
-            let finish_reason_str = std::mem::take(&mut complete.finish_reason);
-
-            // Parse finish_reason from string to proper type
-            let finish_reason =
-                utils::parse_finish_reason(&finish_reason_str, complete.completion_tokens);
-
-            // Handle matched_stop if present
-            let matched_stop = complete.matched_stop.take().map(|matched| match matched {
-                MatchedStop::MatchedTokenId(id) => serde_json::json!(id),
-                MatchedStop::MatchedStopStr(s) => serde_json::json!(s),
-            });
-
-            // Extract logprobs if requested (convert proto types to Generate format)
-            let input_token_logprobs = if request_logprobs {
-                complete
-                    .input_logprobs
-                    .as_ref()
-                    .map(utils::convert_generate_input_logprobs)
-            } else {
-                None
-            };
-
-            let output_token_logprobs = if request_logprobs {
-                complete
-                    .output_logprobs
-                    .as_ref()
-                    .map(utils::convert_generate_output_logprobs)
-            } else {
-                None
-            };
-
-            // Build GenerateResponse struct
-            let meta_info = GenerateMetaInfo {
-                id: dispatch.request_id.clone(),
-                finish_reason,
-                prompt_tokens: complete.prompt_tokens as u32,
-                weight_version: dispatch
-                    .weight_version
-                    .clone()
-                    .unwrap_or_else(|| "default".to_string()),
-                input_token_logprobs,
-                output_token_logprobs,
-                completion_tokens: complete.completion_tokens as u32,
-                cached_tokens: complete.cached_tokens as u32,
-                e2e_latency: start_time.elapsed().as_secs_f64(),
-                matched_stop,
-            };
-
-            result_array.push(GenerateResponse {
-                text: decoded_text,
-                output_ids,
-                meta_info,
-            });
-        }
+        let result_array = self
+            .processor
+            .process_non_streaming_generate_response(
+                execution_result,
+                generate_request,
+                dispatch,
+                stop_decoder,
+                request_logprobs,
+                start_time,
+            )
+            .await?;
 
         // Store the final response
         ctx.state.response.final_response = Some(FinalResponse::Generate(result_array));
@@ -1162,23 +910,44 @@ impl ResponseProcessingStage {
 // Pipeline Orchestrator
 // ============================================================================
 
-/// Complete chat completion pipeline
+/// Generic request pipeline for all request types
 ///
 /// Orchestrates all stages from request preparation to response delivery.
 /// Configured differently for regular vs PD mode.
 #[derive(Clone)]
-pub struct ChatCompletionPipeline {
+pub struct RequestPipeline {
     stages: Arc<Vec<Box<dyn PipelineStage>>>,
 }
 
-impl ChatCompletionPipeline {
+impl RequestPipeline {
     /// Create a regular (single-worker) pipeline
     pub fn new_regular(
         worker_registry: Arc<WorkerRegistry>,
         policy_registry: Arc<PolicyRegistry>,
-        processor: processing::ResponseProcessor,
-        streaming_processor: Arc<streaming::StreamingProcessor>,
+        tokenizer: Arc<dyn Tokenizer>,
+        tool_parser_factory: ToolParserFactory,
+        reasoning_parser_factory: ReasoningParserFactory,
+        configured_tool_parser: Option<String>,
+        configured_reasoning_parser: Option<String>,
     ) -> Self {
+        // Create response processor
+        let processor = processing::ResponseProcessor::new(
+            tokenizer.clone(),
+            tool_parser_factory.clone(),
+            reasoning_parser_factory.clone(),
+            configured_tool_parser.clone(),
+            configured_reasoning_parser.clone(),
+        );
+
+        // Create streaming processor
+        let streaming_processor = Arc::new(streaming::StreamingProcessor::new(
+            tokenizer,
+            tool_parser_factory,
+            reasoning_parser_factory,
+            configured_tool_parser,
+            configured_reasoning_parser,
+        ));
+
         let stages: Vec<Box<dyn PipelineStage>> = vec![
             Box::new(PreparationStage),
             Box::new(WorkerSelectionStage::new(
@@ -1190,10 +959,7 @@ impl ChatCompletionPipeline {
             Box::new(RequestBuildingStage::new(false)), // No PD metadata
             Box::new(DispatchMetadataStage),
             Box::new(RequestExecutionStage::new(ExecutionMode::Single)),
-            Box::new(ResponseProcessingStage::new(
-                processor,
-                streaming_processor.clone(),
-            )),
+            Box::new(ResponseProcessingStage::new(processor, streaming_processor)),
         ];
 
         Self {
@@ -1205,9 +971,30 @@ impl ChatCompletionPipeline {
     pub fn new_pd(
         worker_registry: Arc<WorkerRegistry>,
         policy_registry: Arc<PolicyRegistry>,
-        processor: processing::ResponseProcessor,
-        streaming_processor: Arc<streaming::StreamingProcessor>,
+        tokenizer: Arc<dyn Tokenizer>,
+        tool_parser_factory: ToolParserFactory,
+        reasoning_parser_factory: ReasoningParserFactory,
+        configured_tool_parser: Option<String>,
+        configured_reasoning_parser: Option<String>,
     ) -> Self {
+        // Create response processor
+        let processor = processing::ResponseProcessor::new(
+            tokenizer.clone(),
+            tool_parser_factory.clone(),
+            reasoning_parser_factory.clone(),
+            configured_tool_parser.clone(),
+            configured_reasoning_parser.clone(),
+        );
+
+        // Create streaming processor
+        let streaming_processor = Arc::new(streaming::StreamingProcessor::new(
+            tokenizer,
+            tool_parser_factory,
+            reasoning_parser_factory,
+            configured_tool_parser,
+            configured_reasoning_parser,
+        ));
+
         let stages: Vec<Box<dyn PipelineStage>> = vec![
             Box::new(PreparationStage),
             Box::new(WorkerSelectionStage::new(
@@ -1219,10 +1006,7 @@ impl ChatCompletionPipeline {
             Box::new(RequestBuildingStage::new(true)), // Inject PD metadata
             Box::new(DispatchMetadataStage),
             Box::new(RequestExecutionStage::new(ExecutionMode::DualDispatch)),
-            Box::new(ResponseProcessingStage::new(
-                processor,
-                streaming_processor.clone(),
-            )),
+            Box::new(ResponseProcessingStage::new(processor, streaming_processor)),
         ];
 
         Self {

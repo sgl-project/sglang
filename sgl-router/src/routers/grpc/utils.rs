@@ -158,51 +158,54 @@ pub fn generate_tool_constraints(
     tools: &[Tool],
     tool_choice: &Option<ToolChoice>,
     _model: &str,
-) -> Option<(String, String)> {
-    let choice = tool_choice.as_ref()?;
+) -> Result<Option<(String, String)>, String> {
+    let Some(choice) = tool_choice.as_ref() else {
+        return Ok(None);
+    };
 
     match choice {
         // Specific function: Return parameters schema directly
         // tools should already be filtered to contain only the specific function
         ToolChoice::Function { .. } => {
             if tools.is_empty() {
-                return None;
+                return Ok(None);
             }
             let tool = &tools[0];
 
             // Return the tool's parameters schema directly (not wrapped in array)
-            let params_schema = serde_json::to_string(&tool.function.parameters).ok()?;
-            Some(("json_schema".to_string(), params_schema))
+            let params_schema = serde_json::to_string(&tool.function.parameters)
+                .map_err(|e| format!("Failed to serialize tool parameters: {}", e))?;
+            Ok(Some(("json_schema".to_string(), params_schema)))
         }
 
         // Required: Array of tool calls with minItems: 1
         ToolChoice::Value(ToolChoiceValue::Required) => {
             let schema = build_required_array_schema(tools)?;
-            Some(("json_schema".to_string(), schema))
+            Ok(Some(("json_schema".to_string(), schema)))
         }
 
         // AllowedTools with required mode: tools are already filtered
         ToolChoice::AllowedTools { mode, .. } => {
             if mode == "required" {
                 if tools.is_empty() {
-                    return None;
+                    return Ok(None);
                 }
                 let schema = build_required_array_schema(tools)?;
-                Some(("json_schema".to_string(), schema))
+                Ok(Some(("json_schema".to_string(), schema)))
             } else {
                 // "auto" mode - no constraint needed
-                None
+                Ok(None)
             }
         }
 
         // "auto" or "none" - no constraint
-        _ => None,
+        _ => Ok(None),
     }
 }
 
 /// Build JSON schema for required tool calls (array with minItems: 1)
 /// Includes $defs consolidation from all tools (matching Python's behavior)
-pub fn build_required_array_schema(tools: &[Tool]) -> Option<String> {
+pub fn build_required_array_schema(tools: &[Tool]) -> Result<String, String> {
     // Build anyOf schemas for each tool
     let mut any_of_schemas = Vec::new();
     for tool in tools {
@@ -228,11 +231,12 @@ pub fn build_required_array_schema(tools: &[Tool]) -> Option<String> {
                     if let Some(existing) = all_defs.get(def_name) {
                         // Check for conflicts
                         if existing != def_schema {
-                            error!(
-                                "Tool definition '{}' has multiple schemas, which is not supported",
+                            let error_msg = format!(
+                                "Tool definition '{}' has multiple conflicting schemas, which is not supported",
                                 def_name
                             );
-                            return None;
+                            error!("{}", error_msg);
+                            return Err(error_msg);
                         }
                     } else {
                         all_defs.insert(def_name.clone(), def_schema.clone());
@@ -260,7 +264,8 @@ pub fn build_required_array_schema(tools: &[Tool]) -> Option<String> {
         }
     }
 
-    serde_json::to_string(&array_schema).ok()
+    serde_json::to_string(&array_schema)
+        .map_err(|e| format!("Failed to serialize tool schema: {}", e))
 }
 
 /// Filter tools based on tool_choice (shared by both routers)
@@ -954,7 +959,6 @@ mod tests {
     #[test]
     fn test_transform_messages_string_format() {
         let messages = vec![ChatMessage::User {
-            role: "user".to_string(),
             content: UserMessageContent::Parts(vec![
                 ContentPart::Text {
                     text: "Hello".to_string(),
@@ -988,7 +992,6 @@ mod tests {
     #[test]
     fn test_transform_messages_openai_format() {
         let messages = vec![ChatMessage::User {
-            role: "user".to_string(),
             content: UserMessageContent::Parts(vec![
                 ContentPart::Text {
                     text: "Describe this image:".to_string(),
@@ -1023,7 +1026,6 @@ mod tests {
     #[test]
     fn test_transform_messages_simple_string_content() {
         let messages = vec![ChatMessage::User {
-            role: "user".to_string(),
             content: UserMessageContent::Text("Simple text message".to_string()),
             name: None,
         }];
@@ -1044,12 +1046,10 @@ mod tests {
     fn test_transform_messages_multiple_messages() {
         let messages = vec![
             ChatMessage::System {
-                role: "system".to_string(),
                 content: "System prompt".to_string(),
                 name: None,
             },
             ChatMessage::User {
-                role: "user".to_string(),
                 content: UserMessageContent::Parts(vec![
                     ContentPart::Text {
                         text: "User message".to_string(),
@@ -1081,7 +1081,6 @@ mod tests {
     #[test]
     fn test_transform_messages_empty_text_parts() {
         let messages = vec![ChatMessage::User {
-            role: "user".to_string(),
             content: UserMessageContent::Parts(vec![ContentPart::ImageUrl {
                 image_url: ImageUrl {
                     url: "https://example.com/image.jpg".to_string(),
@@ -1104,12 +1103,10 @@ mod tests {
     fn test_transform_messages_mixed_content_types() {
         let messages = vec![
             ChatMessage::User {
-                role: "user".to_string(),
                 content: UserMessageContent::Text("Plain text".to_string()),
                 name: None,
             },
             ChatMessage::User {
-                role: "user".to_string(),
                 content: UserMessageContent::Parts(vec![
                     ContentPart::Text {
                         text: "With image".to_string(),
