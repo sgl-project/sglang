@@ -10,10 +10,9 @@ class EvalArgs:
     split: str = "lvb_val.json"
     result_filename: str = "./val_sglang.json"
     output_path: str = "."
-    dataset_path: str = "longvideobench/LongVideoBench"
+    dataset_path: str = "lmms-lab/Video-MME"
     concurrency: int = 1
     max_new_tokens: int = 30
-    response_answer_regex: str = "(.*)"
     max_num_frames: int = 64
     batch_size: int = 1
 
@@ -30,11 +29,6 @@ class EvalArgs:
         parser.add_argument("--concurrency", type=int, default=EvalArgs.concurrency)
         parser.add_argument(
             "--max-new-tokens", type=int, default=EvalArgs.max_new_tokens
-        )
-        parser.add_argument(
-            "--response-answer-regex",
-            type=str,
-            default=EvalArgs.response_answer_regex,
         )
         parser.add_argument(
             "--max-num-frames", type=int, default=EvalArgs.max_num_frames

@@ -16,7 +16,7 @@ This directory contains scripts to benchmark VLMs on the lmms-lab/Video-MME benc
    ```shell
    python -m sglang.launch_server --model-path <your-vlm-model-path> --port 30000
    ```
-    
+
 For Video benchmark, we recommend you leave as much memory as possible to avoid OOM
 
 2. **Run the benchmark script:**
