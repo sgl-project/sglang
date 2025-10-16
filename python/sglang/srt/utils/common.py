@@ -430,7 +430,6 @@ def get_available_gpu_memory(
         else:
             free_gpu_memory, _ = torch.cuda.mem_get_info(gpu_id)
 
-
     elif device == "xpu":
         num_gpus = torch.xpu.device_count()
         assert gpu_id < num_gpus
