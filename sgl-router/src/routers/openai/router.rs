@@ -63,8 +63,6 @@ pub struct OpenAIRouter {
     worker_urls: Vec<String>,
     /// Model cache: model_id -> endpoint URL
     model_cache: Arc<DashMap<String, CachedEndpoint>>,
-    /// Cache TTL duration
-    cache_ttl: Duration,
     /// Circuit breaker
     circuit_breaker: CircuitBreaker,
     /// Health status
@@ -150,7 +148,6 @@ impl OpenAIRouter {
             client,
             worker_urls,
             model_cache: Arc::new(DashMap::new()),
-            cache_ttl: Duration::from_secs(Self::MODEL_CACHE_TTL_SECS),
             circuit_breaker,
             healthy: AtomicBool::new(true),
             response_storage,
@@ -173,7 +170,7 @@ impl OpenAIRouter {
 
         // Check cache
         if let Some(entry) = self.model_cache.get(model_id) {
-            if entry.cached_at.elapsed() < self.cache_ttl {
+            if entry.cached_at.elapsed() < Duration::from_secs(Self::MODEL_CACHE_TTL_SECS) {
                 return Ok(entry.url.clone());
             }
         }
