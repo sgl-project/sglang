@@ -984,38 +984,12 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         }
     }
 
-    async fn cancel_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response {
-        // Forward cancellation to upstream (use first endpoint)
-        let base_url = match self.worker_urls.first() {
-            Some(url) => url.as_str(),
-            None => return (StatusCode::SERVICE_UNAVAILABLE, "No endpoints configured").into_response(),
-        };
-        let url = format!("{}/v1/responses/{}/cancel", base_url, response_id);
-        let mut req = self.client.post(&url);
-
-        if let Some(h) = headers {
-            req = apply_request_headers(h, req, false);
-        }
-
-        match req.send().await {
-            Ok(resp) => {
-                let status = StatusCode::from_u16(resp.status().as_u16())
-                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                match resp.text().await {
-                    Ok(body) => (status, body).into_response(),
-                    Err(e) => (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Failed to read response: {}", e),
-                    )
-                        .into_response(),
-                }
-            }
-            Err(e) => (
-                StatusCode::BAD_GATEWAY,
-                format!("Failed to contact upstream: {}", e),
-            )
-                .into_response(),
-        }
+    async fn cancel_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Cancel response not implemented for OpenAI router",
+        )
+            .into_response()
     }
 
     async fn route_embeddings(
