@@ -16,7 +16,7 @@
 import logging
 import sre_parse
 from dataclasses import InitVar, dataclass, field
-from typing import Any, Dict, List, Optional, Set, Union
+from typing import Any, Dict, List, Optional, Union
 
 _SAMPLING_EPS = 1e-6
 TOP_K_ALL = 1 << 30
@@ -35,7 +35,7 @@ class SamplingParams:
     """
 
     max_new_tokens: int = 128
-    stop_token_ids: Optional[Set[int]] = None
+    stop_token_ids: Optional[List[int]] = None
     temperature: float = 1.0
     top_p: float = 1.0
     top_k: int = -1
