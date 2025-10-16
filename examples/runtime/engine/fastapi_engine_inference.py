@@ -164,7 +164,7 @@ if __name__ == "__main__":
         "--startup-timeout",
         type=int,
         default=60,
-        help="Time in seconds to wait for the server to be ready",
+        help="Time in seconds to wait for the server to be ready (default: %(default)s)",
     )
     args = parser.parse_args()
 
