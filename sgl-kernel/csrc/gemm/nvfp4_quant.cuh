@@ -50,8 +50,8 @@ constexpr int CVT_FP4_SF_VEC_SIZE = 16;
 
 // Convert 8 float32 values into 8 e2m1 values (represented as one uint32_t).
 inline __device__ uint32_t fp32_vec_to_e2m1(float (&array)[8]) {
-  // PTX instructions used here requires sm100a/sm103a.
-#if CUTLASS_ARCH_MMA_SM100A_ENABLED || CUTLASS_ARCH_MMA_SM103A_ENABLED
+  // PTX instructions used here requires sm100a/sm103a/sm120a.
+#if CUTLASS_ARCH_MMA_SM100A_ENABLED || CUTLASS_ARCH_MMA_SM103A_ENABLED || CUTLASS_ARCH_MMA_SM120A_ENABLED
   uint32_t val;
   asm volatile(
       "{\n"
@@ -82,8 +82,8 @@ inline __device__ uint32_t fp32_vec_to_e2m1(float (&array)[8]) {
 
 // Convert 4 float2 values into 8 e2m1 values (represented as one uint32_t).
 inline __device__ uint32_t fp32_vec_to_e2m1(float2 (&array)[4]) {
-  // PTX instructions used here requires sm100a/sm103a.
-#if CUTLASS_ARCH_MMA_SM100A_ENABLED || CUTLASS_ARCH_MMA_SM103A_ENABLED
+  // PTX instructions used here requires sm100a/sm103a/sm120a.
+#if CUTLASS_ARCH_MMA_SM100A_ENABLED || CUTLASS_ARCH_MMA_SM103A_ENABLED || CUTLASS_ARCH_MMA_SM120A_ENABLED
   uint32_t val;
   asm volatile(
       "{\n"
