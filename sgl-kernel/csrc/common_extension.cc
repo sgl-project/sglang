@@ -580,7 +580,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("dense_prefill_fwd", torch::kCUDA, &FMHACutlassSM100FwdRun);
 
   m.def("sparse_prefill_fwd(Tensor q, Tensor kv, Tensor indices, float sm_scale, int d_v) -> Tensor[]");
-  m.impl("sparse_prefill_fwd", torch::kCUDA, &sparse);
+  m.impl("sparse_prefill_fwd", torch::kCUDA, &sparse_prefill_fwd);
 }
 
 REGISTER_EXTENSION(common_ops)

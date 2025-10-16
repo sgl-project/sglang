@@ -161,7 +161,6 @@ include_directories(
     ${repo-flashmla_SOURCE_DIR}/csrc/sm90
     ${repo-flashmla_SOURCE_DIR}/cutlass/include
     ${repo-flashmla_SOURCE_DIR}/cutlass/tools/utils/include
-    ${repo-fast-hadamard-transform_SOURCE_DIR}/csrc
 )
 
 set(SGL_KERNEL_CUDA_FLAGS
