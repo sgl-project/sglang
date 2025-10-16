@@ -142,6 +142,7 @@ suites = {
         TestFile("hicache/test_hicache_storage_mooncake_backend.py", 400),
         TestFile("layers/attention/mamba/test_mamba2_mixer.py", 110),
         TestFile("lora/test_lora_tp.py", 116),
+        TestFile("models/test_glm4_moe_models.py", 100),
         TestFile("rl/test_update_weights_from_distributed.py", 103),
         TestFile("test_data_parallelism.py", 73),
         TestFile("test_disaggregation_basic.py", 400),
