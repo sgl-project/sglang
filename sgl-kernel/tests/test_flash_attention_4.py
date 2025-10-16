@@ -11,8 +11,8 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
 from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
-
-from sglang.test.test_utils import is_hopper
+from sgl_kernel.testing.rotary_embedding import _apply_rotary_emb as apply_rotary_emb
+from utils import is_hopper
 
 # Force sgl_kernel.flash_attn wrappers to use FA4 (Cute-DSL) implementations.
 # The wrappers accept a superset of args; for FA4, extra args are ignored.
@@ -1420,6 +1420,7 @@ def test_flash_attn_kvcache(
                 .to(dtype_ref)
             )
             page_table = None
+            num_blocks = None
         else:
             (
                 k_cache,
@@ -1499,7 +1500,15 @@ def test_flash_attn_kvcache(
         if rotary_dim > 0:
             angle = (
                 torch.rand(
-                    seqlen_k if page_size is None else num_blocks * page_size,
+                    (
+                        seqlen_k
+                        if page_size is None
+                        else (
+                            num_blocks * page_size
+                            if num_blocks is not None
+                            else seqlen_k
+                        )
+                    ),
                     rotary_dim // 2,
                     device=device,
                 )
