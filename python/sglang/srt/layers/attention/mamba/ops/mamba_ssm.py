@@ -128,6 +128,7 @@ def _selective_scan_update_kernel(
     C_ptr += pid_b * stride_C_batch + (pid_h // nheads_ngroups_ratio) * stride_C_group
     if HAS_Z:
         z_ptr += pid_b * stride_z_batch + pid_h * stride_z_head
+    out_ptr += pid_b * stride_out_batch + pid_h * stride_out_head
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_n = tl.arange(0, BLOCK_SIZE_DSTATE)
     state_ptrs = state_ptr + (
@@ -148,7 +149,6 @@ def _selective_scan_update_kernel(
         D_ptrs = D_ptr + offs_m * stride_D_dim
     if HAS_Z:
         z_ptrs = z_ptr + offs_m * stride_z_dim
-    out_ptr += pid_b * stride_out_batch + pid_h * stride_out_head
     out_ptrs = out_ptr + offs_m * stride_out_dim
     mask = (offs_m[:, None] < dim) & (offs_n[None, :] < dstate)
     if HAS_STATE_BATCH_INDICES:
