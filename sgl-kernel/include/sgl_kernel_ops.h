@@ -835,4 +835,5 @@ void es_fp8_blockwise_scaled_grouped_mm(
     const torch::Tensor& stride_b,
     const torch::Tensor& stride_d,
     const torch::Tensor& problem_sizes,
-    const torch::Tensor& expert_offsets);
+    const torch::Tensor& expert_offsets,
+    const torch::Tensor& workspace);
