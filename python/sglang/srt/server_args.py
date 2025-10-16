@@ -596,8 +596,8 @@ class ServerArgs:
             logger.warning(
                 f"self.disable_radix_cache will be assigned as true and self.attention_backend will be assigned as flashinfer when you turn on --enable-prefill-cuda-graph"
             )
-            self.disable_radix_cache = True
             self.attention_backend = "flashinfer"
+            self.flashinfer_mla_disable_ragged = True
 
         if self.attention_backend == "dual_chunk_flash_attn":
             logger.warning(

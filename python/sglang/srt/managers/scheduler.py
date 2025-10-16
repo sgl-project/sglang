@@ -787,8 +787,12 @@ class Scheduler(
             self.cur_batch = batch
 
             if batch:
+                #t0 = time.time()
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
+                #t1 = time.time()
+                #if self.attn_tp_rank == 0:
+                #    logger.info(f"run dt: {(t1-t0)*1000} ms")
             else:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()

@@ -1691,7 +1691,6 @@ class ModelRunner:
     ) -> LogitsProcessorOutput:
         if not skip_attn_backend_init:
             self.attn_backend.init_forward_metadata(forward_batch)
-
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
@@ -1699,12 +1698,14 @@ class ModelRunner:
             kwargs["input_embeds"] = forward_batch.input_embeds.bfloat16()
         if not self.is_generation:
             kwargs["get_embedding"] = True
-        return self.model.forward(
+
+        out = self.model.forward(
             forward_batch.input_ids,
             forward_batch.positions,
             forward_batch,
             **kwargs,
         )
+        return out
 
     def forward_idle(
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None
@@ -1781,13 +1782,13 @@ class ModelRunner:
             else (
                 forward_batch.forward_mode.is_cuda_graph
                 or (
-                    forward_batch.forward_mode == ForwardMode.EXTEND
+                    forward_batch.forward_mode.is_extend()
                     and self.graph_runner.enable_prefill_cuda_graph
                 )
             )
         )
-        can_run_graph = bool(
-            mode_check()
+        can_run_cuda_graph = bool(
+            mode_check
             and self.graph_runner
             and self.graph_runner.can_run(forward_batch)
         )

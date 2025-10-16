@@ -253,7 +253,7 @@ class FlashInferAttnBackend(AttentionBackend):
         else:
             prefix_lens = forward_batch.extend_prefix_lens
 
-            if self.is_multimodal:
+            if self.is_multimodal or self.model_runner.graph_runner.enable_prefill_cuda_graph:
                 use_ragged = False
                 extend_no_prefix = False
             else:
@@ -309,7 +309,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
                 self.cuda_graph_qk_indptr = [x.clone() for x in self.kv_indptr]
                 self.cuda_graph_qo_indptr = [x.clone() for x in self.kv_indptr]
-
+            self.cuda_graph_kv_indptr = [x.clone() for x in self.kv_indptr]
             self.first_init = False
 
     def init_forward_metadata_capture_cuda_graph(
@@ -395,18 +395,20 @@ class FlashInferAttnBackend(AttentionBackend):
                         backend="fa2",
                         use_cuda_graph=True,
                         qo_indptr_buf=self.cuda_graph_qo_indptr[i][: bs + 1],
-                        paged_kv_indptr_buf=self.kv_indptr[i][: bs + 1],
+                        paged_kv_indptr_buf=self.cuda_graph_kv_indptr[i][: bs + 1],
                         paged_kv_indices_buf=self.cuda_graph_kv_indices[i],
                         paged_kv_last_page_len_buf=self.kv_last_page_len[:bs],
                     )
                 )
 
-            seq_lens_sum = seq_lens.sum().item()
+            extend_seq_lens_sum = seq_lens_sum = seq_lens.sum().item()
+            if forward_mode.is_extend(): 
+                extend_seq_lens_sum = seq_lens_sum - extend_prefix_lens.sum().item()
             self.indices_updater_prefill.update(
                 req_pool_indices,
                 seq_lens,
                 seq_lens.cpu(),  # may add a little overhead in capture stage
-                seq_lens_sum,
+                extend_seq_lens_sum,
                 prefix_lens=extend_prefix_lens if forward_mode.is_extend() else None,
                 prefill_wrappers=prefill_wrappers,
                 use_ragged=False,
@@ -414,9 +416,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 spec_info=spec_info,
             )
             if forward_mode.is_extend():
-                if seq_lens_sum not in self.prefill_cuda_graph_metadata:
-                    self.prefill_cuda_graph_metadata[seq_lens_sum] = {}
-                self.prefill_cuda_graph_metadata[seq_lens_sum][bs] = prefill_wrappers
+                if extend_seq_lens_sum not in self.prefill_cuda_graph_metadata:
+                    self.prefill_cuda_graph_metadata[extend_seq_lens_sum] = {}
+                self.prefill_cuda_graph_metadata[extend_seq_lens_sum][bs] = prefill_wrappers
             else:
                 self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
@@ -465,6 +467,7 @@ class FlashInferAttnBackend(AttentionBackend):
             else:
                 prefill_cuda_graph_metadata_tmp = self.prefill_cuda_graph_metadata[bs]
             prefix_lens = extend_prefix_lens if forward_mode.is_extend() else None
+            extend_seq_lens_sum = seq_lens[:bs].sum().item()
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
@@ -898,7 +901,6 @@ class FlashInferIndicesUpdaterPrefill:
         else:
             paged_kernel_lens = seq_lens
             paged_kernel_lens_sum = seq_lens_sum
-
         self.call_begin_forward(
             self.prefill_wrapper_ragged,
             prefill_wrappers[0],
@@ -1021,15 +1023,15 @@ class FlashInferIndicesUpdaterPrefill:
             # Normal extend
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
             kv_indptr = kv_indptr[: bs + 1]
-            if wrapper_paged.is_cuda_graph_enabled:
-                # Directly write to the cuda graph input buffer
-                kv_indices = wrapper_paged._paged_kv_indices_buf
-            else:
-                kv_indices = torch.empty(
-                    paged_kernel_lens_sum + 256,
-                    dtype=torch.int32,
-                    device=req_pool_indices.device,
-                )
+            #if wrapper_paged.is_cuda_graph_enabled:
+            # Directly write to the cuda graph input buffer
+            # kv_indices = wrapper_paged._paged_kv_indices_buf
+            #else:
+            kv_indices = torch.empty(
+                paged_kernel_lens_sum + 256,
+                dtype=torch.int32,
+                device=req_pool_indices.device,
+            )
             create_flashinfer_kv_indices_triton[(bs,)](
                 self.req_to_token,
                 req_pool_indices,
