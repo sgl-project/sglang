@@ -19,7 +19,14 @@ use tracing::{debug, error, warn};
 use super::context;
 use super::utils;
 use crate::grpc_client::proto;
-use crate::protocols::spec::*;
+use crate::protocols::chat::{
+    ChatCompletionRequest, ChatCompletionStreamResponse, ChatMessageDelta, ChatStreamChoice,
+};
+use crate::protocols::common::{
+    ChatLogProbs, FunctionCallDelta, StringOrArray, Tool, ToolCallDelta, ToolChoice,
+    ToolChoiceValue, Usage,
+};
+use crate::protocols::generate::GenerateRequest;
 use crate::reasoning_parser::ReasoningParser;
 use crate::tokenizer::stop::{SequenceDecoderOutput, StopSequenceDecoder};
 use crate::tokenizer::traits::Tokenizer;
@@ -616,7 +623,7 @@ impl StreamingProcessor {
         generate_request: Arc<GenerateRequest>,
         dispatch: context::DispatchMetadata,
     ) -> Response {
-        let return_logprob = generate_request.return_logprob;
+        let return_logprob = generate_request.return_logprob.unwrap_or(false);
 
         // Create SSE channel
         let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, io::Error>>();

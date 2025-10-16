@@ -14,15 +14,20 @@ use tracing::debug;
 use crate::config::types::RetryConfig;
 use crate::core::WorkerRegistry;
 use crate::policies::PolicyRegistry;
-use crate::protocols::spec::{
-    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest,
-    ResponsesGetParams, ResponsesRequest,
-};
+use crate::protocols::chat::ChatCompletionRequest;
+use crate::protocols::completion::CompletionRequest;
+use crate::protocols::embedding::EmbeddingRequest;
+use crate::protocols::generate::GenerateRequest;
+use crate::protocols::rerank::RerankRequest;
+use crate::protocols::responses::{ResponsesGetParams, ResponsesRequest};
 use crate::reasoning_parser::ParserFactory as ReasoningParserFactory;
 use crate::routers::RouterTrait;
 use crate::server::AppContext;
 use crate::tokenizer::traits::Tokenizer;
 use crate::tool_parser::ParserFactory as ToolParserFactory;
+
+use super::context::SharedComponents;
+use super::pipeline::RequestPipeline;
 
 /// gRPC router implementation for SGLang
 #[derive(Clone)]
@@ -38,8 +43,8 @@ pub struct GrpcRouter {
     retry_config: RetryConfig,
     configured_reasoning_parser: Option<String>,
     configured_tool_parser: Option<String>,
-    pipeline: super::pipeline::ChatCompletionPipeline,
-    shared_components: Arc<super::context::SharedComponents>,
+    pipeline: RequestPipeline,
+    shared_components: Arc<SharedComponents>,
 }
 
 impl GrpcRouter {
@@ -66,36 +71,21 @@ impl GrpcRouter {
         let policy_registry = ctx.policy_registry.clone();
 
         // Create shared components for pipeline
-        let shared_components = Arc::new(super::context::SharedComponents {
+        let shared_components = Arc::new(SharedComponents {
             tokenizer: tokenizer.clone(),
             tool_parser_factory: tool_parser_factory.clone(),
             reasoning_parser_factory: reasoning_parser_factory.clone(),
         });
 
-        // Create response processor
-        let processor = super::processing::ResponseProcessor::new(
-            tokenizer.clone(),
-            tool_parser_factory.clone(),
-            reasoning_parser_factory.clone(),
-            ctx.configured_tool_parser.clone(),
-            ctx.configured_reasoning_parser.clone(),
-        );
-
-        // Create streaming processor
-        let streaming_processor = Arc::new(super::streaming::StreamingProcessor::new(
-            tokenizer.clone(),
-            tool_parser_factory.clone(),
-            reasoning_parser_factory.clone(),
-            ctx.configured_tool_parser.clone(),
-            ctx.configured_reasoning_parser.clone(),
-        ));
-
         // Create pipeline
-        let pipeline = super::pipeline::ChatCompletionPipeline::new_regular(
+        let pipeline = RequestPipeline::new_regular(
             worker_registry.clone(),
             policy_registry.clone(),
-            processor,
-            streaming_processor,
+            tokenizer.clone(),
+            tool_parser_factory.clone(),
+            reasoning_parser_factory.clone(),
+            ctx.configured_tool_parser.clone(),
+            ctx.configured_reasoning_parser.clone(),
         );
 
         Ok(GrpcRouter {

@@ -1,7 +1,7 @@
 //! gRPC router implementations
 
 use crate::grpc_client::proto;
-use crate::protocols::spec::StringOrArray;
+use crate::protocols::common::StringOrArray;
 
 pub mod context;
 pub mod pd_router;

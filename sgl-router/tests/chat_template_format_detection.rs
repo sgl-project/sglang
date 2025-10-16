@@ -1,4 +1,4 @@
-use sglang_router_rs::protocols::spec;
+use sglang_router_rs::protocols::chat::{ChatMessage, UserMessageContent};
 use sglang_router_rs::tokenizer::chat_template::{
     detect_chat_template_content_format, ChatTemplateContentFormat, ChatTemplateParams,
     ChatTemplateProcessor,
@@ -172,15 +172,13 @@ assistant:
 
     let processor = ChatTemplateProcessor::new(template.to_string());
 
-    let messages = vec![
-        spec::ChatMessage::System {
-            role: "system".to_string(),
+    let messages = [
+        ChatMessage::System {
             content: "You are helpful".to_string(),
             name: None,
         },
-        spec::ChatMessage::User {
-            role: "user".to_string(),
-            content: spec::UserMessageContent::Text("Hello".to_string()),
+        ChatMessage::User {
+            content: UserMessageContent::Text("Hello".to_string()),
             name: None,
         },
     ];
@@ -215,9 +213,8 @@ fn test_chat_template_with_tokens_unit_test() {
 
     let processor = ChatTemplateProcessor::new(template.to_string());
 
-    let messages = [spec::ChatMessage::User {
-        role: "user".to_string(),
-        content: spec::UserMessageContent::Text("Test".to_string()),
+    let messages = [ChatMessage::User {
+        content: UserMessageContent::Text("Test".to_string()),
         name: None,
     }];
 
