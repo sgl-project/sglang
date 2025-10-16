@@ -84,6 +84,7 @@ def req_inference(
     inference_parallel_size: int,
     timeout: float = 300.0,
     uds: str | None = None,
+    weight_version: str | None = None,
 ) -> Callable[[list[tuple[str, str]]], None]:
     rank = int(os.getenv("RANK", None))
     src = rank // inference_parallel_size * inference_parallel_size
@@ -95,6 +96,7 @@ def req_inference(
                 json={
                     "zmq_handles": dict(socket_paths[src : src + inference_parallel_size]),
                     "flush_cache": True,
+                    "weight_version": weight_version,
                 },
                 timeout=timeout,
             )
@@ -172,10 +174,16 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint-name", type=str, default="my-checkpoint-iter-0")
     parser.add_argument("--update-method", type=str, default="broadcast")
     parser.add_argument("--uds", type=str, default=None)
+    parser.add_argument("--weight-version", type=str, default=None)
     args = parser.parse_args()
     rank = int(os.getenv("RANK"))
     world_size = int(os.getenv("WORLD_SIZE"))
-    req_func = req_inference(args.endpoint, args.inference_parallel_size, args.uds)
+    req_func = req_inference(
+            args.endpoint,
+            args.inference_parallel_size,
+            uds=args.uds,
+            weight_version=args.weight_version,
+    )
     ps = ParameterServer(auto_pg=True)
     ps._p2p_store = None
     if args.load_metas_file:
