@@ -251,12 +251,14 @@ class CustomAllreduce:
         `register_graph_buffers` call at the end of the context.
         It records all the buffer addresses used in the CUDA graph.
         """
+        success = False
         try:
             self._IS_CAPTURING = True
             yield
+            success = True
         finally:
             self._IS_CAPTURING = False
-            if not self.disabled:
+            if success and not self.disabled:
                 self.register_graph_buffers()
 
     def _get_ipc_meta(self, inp: torch.Tensor):
