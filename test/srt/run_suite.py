@@ -192,7 +192,10 @@ suites = {
     ],
     # If the test cases take too long, considering adding them to nightly tests instead of per-commit tests
     "nightly-1-gpu": [],
-    "nightly-8-gpu": [],
+    "nightly-8-gpu": [
+        TestFile("test_disaggregation_uniform_parallelism_nixl.py", 1174),
+        TestFile("test_disaggregation_variable_parallelism_nixl.py", 1174),
+    ],
 }
 
 # Add AMD tests
