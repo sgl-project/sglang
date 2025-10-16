@@ -7,6 +7,8 @@ from typing import Any, List, Optional
 
 import torch
 
+from sglang.srt.mem_cache.memory_pool_host import HostKVCache
+
 logger = logging.getLogger(__name__)
 
 
@@ -32,14 +34,46 @@ class HiCacheStorageConfig:
     extra_config: Optional[dict] = None
 
 
+@dataclass
+class HiCacheStorageExtraInfo:
+    prefix_keys: Optional[List[str]] = (None,)
+    extra_info: Optional[dict] = None
+
+
 class HiCacheStorage(ABC):
     """
     HiCacheStorage is a class that provides a generic key-value interface for storing and retrieving KV cache.
     It abstracts the underlying storage mechanism, allowing different implementations to be used.
     """
 
-    # todo, potentially pass model and TP configs into storage backend
     # todo, the page size of storage backend does not have to be the same as the same as host memory pool
+
+    def register_mem_pool_host(self, mem_pool_host: HostKVCache):
+        self.mem_pool_host = mem_pool_host
+
+    def batch_get_v1(
+        self,
+        keys: List[str],
+        host_indices: torch.Tensor,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> List[bool]:
+        """
+        Retrieve values for multiple keys.
+        Returns a list of tensors or None for each key.
+        """
+        pass
+
+    def batch_set_v1(
+        self,
+        keys: List[str],
+        host_indices: torch.Tensor,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> List[bool]:
+        """
+        Retrieve values for multiple keys.
+        Returns a list of tensors or None for each key.
+        """
+        pass
 
     @abstractmethod
     def get(
@@ -54,6 +88,7 @@ class HiCacheStorage(ABC):
         """
         pass
 
+    # TODO: Deprecate
     @abstractmethod
     def batch_get(
         self,
@@ -81,6 +116,7 @@ class HiCacheStorage(ABC):
         """
         pass
 
+    # TODO: Deprecate
     @abstractmethod
     def batch_set(
         self,
@@ -103,7 +139,10 @@ class HiCacheStorage(ABC):
         """
         pass
 
-    def batch_exists(self, keys: List[str]) -> int:
+    # TODO: Use a finer-grained return type (e.g., List[bool])
+    def batch_exists(
+        self, keys: List[str], extra_info: Optional[HiCacheStorageExtraInfo] = None
+    ) -> int:
         """
         Check if the keys exist in the storage.
         return the number of consecutive existing keys from the start.
@@ -113,6 +152,9 @@ class HiCacheStorage(ABC):
             if not self.exists(keys[i]):
                 return i
         return len(keys)
+
+    def clear(self) -> None:
+        pass
 
     def get_stats(self):
         return None

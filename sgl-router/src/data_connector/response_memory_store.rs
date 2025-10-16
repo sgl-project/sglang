@@ -74,13 +74,16 @@ impl ResponseStorage for MemoryResponseStorage {
 
         // Store the response
         store.responses.insert(response_id.clone(), response);
+        tracing::info!("memory_store_size" = store.responses.len());
 
         Ok(response_id)
     }
 
     async fn get_response(&self, response_id: &ResponseId) -> Result<Option<StoredResponse>> {
         let store = self.store.read();
-        Ok(store.responses.get(response_id).cloned())
+        let result = store.responses.get(response_id).cloned();
+        tracing::info!("memory_get_response" = %response_id.0, found = result.is_some());
+        Ok(result)
     }
 
     async fn delete_response(&self, response_id: &ResponseId) -> Result<()> {
@@ -201,6 +204,20 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn test_store_with_custom_id() {
+        let store = MemoryResponseStorage::new();
+        let mut response = StoredResponse::new("Input".to_string(), "Output".to_string(), None);
+        response.id = ResponseId::from("resp_custom");
+        store.store_response(response.clone()).await.unwrap();
+        let retrieved = store
+            .get_response(&ResponseId::from("resp_custom"))
+            .await
+            .unwrap();
+        assert!(retrieved.is_some());
+        assert_eq!(retrieved.unwrap().output, "Output");
+    }
+
+    #[tokio::test]
     async fn test_memory_store_basic() {
         let store = MemoryResponseStorage::new();
 
@@ -249,7 +266,6 @@ mod tests {
         assert_eq!(chain.responses[1].input, "Second");
         assert_eq!(chain.responses[2].input, "Third");
 
-        // Test with max_depth
         let limited_chain = store.get_response_chain(&id3, Some(2)).await.unwrap();
         assert_eq!(limited_chain.responses.len(), 2);
         assert_eq!(limited_chain.responses[0].input, "Second");
@@ -297,7 +313,6 @@ mod tests {
         let deleted_count = store.delete_user_responses("user1").await.unwrap();
         assert_eq!(deleted_count, 2);
 
-        // Verify they're gone
         let user1_responses_after = store.list_user_responses("user1", None).await.unwrap();
         assert_eq!(user1_responses_after.len(), 0);
 

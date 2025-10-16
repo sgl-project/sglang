@@ -10,7 +10,7 @@ import torch
 from sgl_kernel import causal_conv1d_fwd
 from sgl_kernel import causal_conv1d_update as causal_conv1d_update_kernel
 
-PAD_SLOT_ID = -1
+from .causal_conv1d_triton import PAD_SLOT_ID
 
 
 def causal_conv1d_fn(
@@ -23,6 +23,7 @@ def causal_conv1d_fn(
     conv_states: Optional[torch.Tensor] = None,
     activation: Optional[str] = "silu",
     pad_slot_id: int = PAD_SLOT_ID,
+    **kwargs,
 ):
     """
     x: (batch, dim, seqlen) or (dim,cu_seq_len) for varlen

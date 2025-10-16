@@ -18,7 +18,7 @@ from typing import Literal, Optional
 import torch
 
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
-from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.server_args import get_global_server_args
 
 
 @dataclass
@@ -34,7 +34,7 @@ class ExpertLocationDispatchInfo:
 
     @classmethod
     def init_new(cls, layer_id: int):
-        ep_dispatch_algorithm = global_server_args_dict["ep_dispatch_algorithm"]
+        ep_dispatch_algorithm = get_global_server_args().ep_dispatch_algorithm
         expert_location_metadata = get_global_expert_location_metadata()
         assert expert_location_metadata is not None
 

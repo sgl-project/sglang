@@ -48,18 +48,22 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
     enable_num_token_non_padded,
 )
-from sglang.srt.patch_torch import monkey_patch_torch_compile
 from sglang.srt.two_batch_overlap import TboCudaGraphRunnerPlugin
 from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
+    get_bool_env_var,
     get_device_memory_capacity,
+    is_hip,
     log_info_on_rank0,
     require_attn_tp_gather,
     require_gathered_buffer,
     require_mlp_sync,
     require_mlp_tp_gather,
 )
+from sglang.srt.utils.patch_torch import monkey_patch_torch_compile
+
+_is_hip = is_hip()
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +104,7 @@ def freeze_gc(enable_cudagraph_gc: bool):
     finally:
         if should_freeze:
             gc.unfreeze()
+            gc.collect()
 
 
 def _to_torch(model: torch.nn.Module, reverse: bool, num_tokens: int):
@@ -136,7 +141,7 @@ def patch_model(
                 mode=os.environ.get(
                     "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
                 ),
-                dynamic=False,
+                dynamic=_is_hip and get_bool_env_var("SGLANG_TORCH_DYNAMIC_SHAPE"),
             )
         else:
             yield model.forward
@@ -166,29 +171,6 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
     server_args = model_runner.server_args
     capture_bs = server_args.cuda_graph_bs
 
-    if capture_bs is None:
-        if server_args.speculative_algorithm is None:
-            if server_args.disable_cuda_graph_padding:
-                capture_bs = list(range(1, 33)) + list(range(48, 161, 16))
-            else:
-                capture_bs = [1, 2, 4, 8] + list(range(16, 161, 8))
-        else:
-            # Since speculative decoding requires more cuda graph memory, we
-            # capture less.
-            capture_bs = (
-                list(range(1, 9))
-                + list(range(10, 33, 2))
-                + list(range(40, 64, 8))
-                + list(range(80, 161, 16))
-            )
-
-        gpu_mem = get_device_memory_capacity()
-        if gpu_mem is not None:
-            if gpu_mem > 90 * 1024:  # H200, H20
-                capture_bs += list(range(160, 257, 8))
-            if gpu_mem > 160 * 1000:  # B200, MI300
-                capture_bs += list(range(256, 513, 16))
-
     if max(capture_bs) > model_runner.req_to_token_pool.size:
         # In some cases (e.g., with a small GPU or --max-running-requests), the #max-running-requests
         # is very small. We add more values here to make sure we capture the maximum bs.
@@ -204,12 +186,6 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
 
     capture_bs = [bs for bs in capture_bs if bs % mul_base == 0]
 
-    if server_args.cuda_graph_max_bs:
-        capture_bs = [bs for bs in capture_bs if bs <= server_args.cuda_graph_max_bs]
-        if max(capture_bs) < server_args.cuda_graph_max_bs:
-            capture_bs += list(
-                range(max(capture_bs), server_args.cuda_graph_max_bs + 1, 16)
-            )
     capture_bs = [bs for bs in capture_bs if bs <= model_runner.req_to_token_pool.size]
     capture_bs = list(sorted(set(capture_bs)))
     assert len(capture_bs) > 0 and capture_bs[0] > 0, f"{capture_bs=}"
@@ -274,6 +250,7 @@ class CudaGraphRunner:
         if (
             model_runner.spec_algorithm.is_eagle()
             or model_runner.spec_algorithm.is_standalone()
+            or model_runner.spec_algorithm.is_ngram()
         ):
             if self.model_runner.is_draft_worker:
                 raise RuntimeError("This should not happen")
@@ -440,11 +417,21 @@ class CudaGraphRunner:
             forward_batch.can_run_tbo if self.enable_two_batch_overlap else True
         )
 
+        is_ngram_supported = (
+            (
+                forward_batch.batch_size * self.num_tokens_per_bs
+                == forward_batch.input_ids.numel()
+            )
+            if self.model_runner.spec_algorithm.is_ngram()
+            else True
+        )
+
         return (
             is_bs_supported
             and is_encoder_lens_supported
             and is_tbo_supported
             and capture_hidden_mode_matches
+            and is_ngram_supported
         )
 
     def capture(self) -> None:
@@ -454,6 +441,7 @@ class CudaGraphRunner:
                 activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
                 record_shapes=True,
             )
+            torch.cuda.memory._record_memory_history()
 
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
@@ -502,6 +490,8 @@ class CudaGraphRunner:
                     save_gemlite_cache()
 
         if self.enable_profile_cuda_graph:
+            torch.cuda.memory._dump_snapshot(f"cuda_graph_runner_memory_usage.pickle")
+            torch.cuda.memory._record_memory_history(enabled=None)
             log_message = (
                 "Sorted by CUDA Time:\n"
                 + prof.key_averages(group_by_input_shape=True).table(
@@ -511,6 +501,7 @@ class CudaGraphRunner:
                 + prof.key_averages(group_by_input_shape=True).table(
                     sort_by="cpu_time_total", row_limit=10
                 )
+                + "\n\nMemory Usage is saved to cuda_graph_runner_memory_usage.pickle\n"
             )
             logger.info(log_message)
 
@@ -531,6 +522,7 @@ class CudaGraphRunner:
         input_ids = self.input_ids[:num_tokens]
         req_pool_indices = self.req_pool_indices[:bs]
         seq_lens = self.seq_lens[:bs]
+        seq_lens_cpu = self.seq_lens_cpu[:bs]
         out_cache_loc = self.out_cache_loc[:num_tokens]
         positions = self.positions[:num_tokens]
         if self.is_encoder_decoder:
@@ -601,6 +593,7 @@ class CudaGraphRunner:
             input_ids=input_ids,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
             next_token_logits_buffer=next_token_logits_buffer,
             orig_seq_lens=seq_lens,
             req_to_token_pool=self.model_runner.req_to_token_pool,
@@ -685,8 +678,9 @@ class CudaGraphRunner:
         capture_hidden_mode_required_by_forward_batch = (
             forward_batch.capture_hidden_mode
         )
-        capture_hidden_mode_required_by_spec_info = getattr(
-            forward_batch.spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL
+        capture_hidden_mode_required_by_spec_info = (
+            getattr(forward_batch.spec_info, "capture_hidden_mode", None)
+            or CaptureHiddenMode.NULL
         )
         capture_hidden_mode_required_for_returning_hidden_states = (
             CaptureHiddenMode.FULL
@@ -834,7 +828,7 @@ class CudaGraphRunner:
             self.model_runner.spec_algorithm.is_eagle()
             or self.model_runner.spec_algorithm.is_standalone()
         ):
-            from sglang.srt.speculative.eagle_utils import EagleVerifyInput
+            from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
             if self.model_runner.is_draft_worker:
                 raise RuntimeError("This should not happen.")
@@ -854,6 +848,20 @@ class CudaGraphRunner:
                     seq_lens_sum=None,
                     seq_lens_cpu=None,
                 )
+
+        elif self.model_runner.spec_algorithm.is_ngram():
+            from sglang.srt.speculative.ngram_info import NgramVerifyInput
+
+            spec_info = NgramVerifyInput(
+                draft_token=None,
+                tree_mask=self.custom_mask,
+                positions=None,
+                retrive_index=None,
+                retrive_next_token=None,
+                retrive_next_sibling=None,
+                draft_token_num=self.num_tokens_per_bs,
+            )
+            spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
 
         return spec_info
 

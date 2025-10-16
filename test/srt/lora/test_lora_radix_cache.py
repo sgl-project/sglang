@@ -44,7 +44,6 @@ class TestLoRARadixCache(CustomTestCase):
 
         torch_dtype = torch.float16
         max_new_tokens = 32
-        backend = "triton"
         batch_prompts = (
             PROMPTS
             if not model_case.skip_long_prompt
@@ -57,7 +56,6 @@ class TestLoRARadixCache(CustomTestCase):
             model_case,
             torch_dtype,
             max_new_tokens=max_new_tokens,
-            backend=backend,
             disable_radix_cache=False,
             test_tag="lora-with-radix-cache",
         )
@@ -68,7 +66,6 @@ class TestLoRARadixCache(CustomTestCase):
             model_case,
             torch_dtype,
             max_new_tokens=max_new_tokens,
-            backend=backend,
             disable_radix_cache=True,
             test_tag="lora-without-radix-cache",
         )

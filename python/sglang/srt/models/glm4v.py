@@ -7,7 +7,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers.models.glm4v.configuration_glm4v import Glm4vConfig, Glm4vVisionConfig
 
-from sglang.srt.hf_transformers_utils import get_processor
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.layernorm import RMSNorm
@@ -28,6 +27,7 @@ from sglang.srt.models.qwen2_5_vl import (
     Qwen2_5_VLForConditionalGeneration,
 )
 from sglang.srt.utils import add_prefix
+from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
 
@@ -434,7 +434,7 @@ class Glm4vVisionModel(nn.Module):
         cu_seqlens = torch.repeat_interleave(
             grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
         ).cumsum(dim=0, dtype=torch.int32)
-        cu_seqlens = F.pad(cu_seqlens, (1, 0), "constant", 0)
+        cu_seqlens = torch.cat([cu_seqlens.new_zeros(1), cu_seqlens])
 
         seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
         x = self.embeddings(

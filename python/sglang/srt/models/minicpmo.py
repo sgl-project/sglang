@@ -795,8 +795,10 @@ class ConditionalChatTTS(PreTrainedModel):
         force_no_stop=False,
         min_new_token=10,
         max_new_token=50,
-        logits_warpers: List[LogitsWarper] = [],
-        logits_processors: List[CustomRepetitionPenaltyLogitsProcessorRepeat] = [],
+        logits_warpers: Optional[List[LogitsWarper]] = None,
+        logits_processors: Optional[
+            List[CustomRepetitionPenaltyLogitsProcessorRepeat]
+        ] = None,
         show_tqdm=False,
     ):
         """Generate audio codes in streaming setting or non-streaming setting.
@@ -824,6 +826,9 @@ class ConditionalChatTTS(PreTrainedModel):
         # We only support batch size `1` for now
         assert input_ids.shape[0] == 1
         assert past_key_values is not None
+
+        logits_warpers = logits_warpers or []
+        logits_processors = logits_processors or []
 
         # fix: this should not be `input_ids.shape[1]`
         # start_idx = input_ids.shape[1]

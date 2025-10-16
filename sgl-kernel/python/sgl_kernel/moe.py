@@ -36,6 +36,28 @@ def topk_softmax(
     )
 
 
+def moe_sum_reduce(
+    input_tensor,
+    output_tensor,
+    routed_scaling_factor=0,
+):
+    torch.ops.sgl_kernel.moe_sum_reduce.default(
+        input_tensor,
+        output_tensor,
+        routed_scaling_factor,
+    )
+
+
+def moe_sum(
+    input_tensor: torch.Tensor,
+    output_tensor: torch.Tensor,
+):
+    torch.ops.sgl_kernel.moe_sum.default(
+        input_tensor,
+        output_tensor,
+    )
+
+
 def moe_fused_gate(
     input_tensor,
     bias,
