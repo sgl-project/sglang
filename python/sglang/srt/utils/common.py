@@ -3441,3 +3441,16 @@ def cached_triton_kernel(key_fn=None):
         return CachedKernel(fn, key_fn)
 
     return decorator
+
+
+DEFAULT_DETERMINISTIC_INFERENCE_BACKEND_SIZE = 4096
+DEFAULT_DETERMINISTIC_INFERENCE_BACKEND_SIZE_CONFIG = {
+    "flashinfer": (
+        "SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE",
+        DEFAULT_DETERMINISTIC_INFERENCE_BACKEND_SIZE,
+    ),
+    "triton": (
+        "SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE",
+        DEFAULT_DETERMINISTIC_INFERENCE_BACKEND_SIZE,
+    ),
+}
