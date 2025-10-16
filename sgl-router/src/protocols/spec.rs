@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use serde_json::{to_value, Map, Number, Value};
+use serde_json::{to_value, Map, Value};
 use std::collections::HashMap;
 use validator::Validate;
 
@@ -9,53 +9,6 @@ use crate::protocols::validated::Normalizable;
 fn default_model() -> String {
     "unknown".to_string()
 }
-
-// # Protocol Specifications
-//
-// This module contains all protocol definitions for OpenAI and SGLang APIs.
-//
-// ## Table of Contents
-//
-// 1. **OPENAI SPEC - Chat Completions API**
-//    - Message Types
-//    - Response Format Types
-//    - Tool/Function Types
-//    - Streaming Delta Types
-//    - Request/Response structures
-//
-// 2. **OPENAI SPEC - Completions API**
-//    - Request/Response structures
-//    - Streaming support
-//
-// 3. **OPENAI SPEC - Responses API**
-//    - Tool Definitions
-//    - Reasoning Configuration
-//    - Input/Output Items
-//    - Service Tier & Tool Choice
-//    - Request/Response structures
-//
-// 4. **OPENAI SPEC - Common**
-//    - Shared Request Components
-//    - Tool Choice Types
-//    - Usage Tracking
-//    - Logprobs Types
-//    - Error Response Types
-//
-// 5. **SGLANG SPEC - GENERATE API**
-//    - Generate Parameters
-//    - Sampling Parameters
-//    - Request/Response structures
-//
-// 6. **SGLANG SPEC - RERANK API**
-//    - Request/Response structures
-//
-// 7. **OPENAI SPEC - Embeddings API**
-//    - Request structures
-//
-// 8. **COMMON**
-//    - GenerationRequest trait
-//    - StringOrArray & LoRAPath types
-//    - Helper functions
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "role")]
@@ -356,7 +309,7 @@ pub struct ChatCompletionRequest {
 
     /// Path to LoRA adapter(s) for model customization
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub lora_path: Option<LoRAPath>,
+    pub lora_path: Option<String>,
 
     /// Session parameters for continual prompting
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -905,7 +858,7 @@ pub struct CompletionRequest {
 
     /// Path to LoRA adapter(s) for model customization
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub lora_path: Option<LoRAPath>,
+    pub lora_path: Option<String>,
 
     /// Session parameters for continual prompting
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1372,10 +1325,6 @@ impl ResponsesUsage {
     }
 }
 
-fn generate_request_id() -> String {
-    format!("resp_{}", uuid::Uuid::new_v4().simple())
-}
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ResponsesRequest {
     /// Run the request in the background
@@ -1466,8 +1415,8 @@ pub struct ResponsesRequest {
     pub user: Option<String>,
 
     /// Request ID
-    #[serde(default = "generate_request_id")]
-    pub request_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
 
     /// Request priority
     #[serde(default)]
@@ -1485,15 +1434,15 @@ pub struct ResponsesRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop: Option<StringOrArray>,
 
-    /// Top-k sampling parameter
+    /// Top-k sampling parameter (SGLang extension)
     #[serde(default = "default_top_k")]
     pub top_k: i32,
 
-    /// Min-p sampling parameter
+    /// Min-p sampling parameter (SGLang extension)
     #[serde(default)]
     pub min_p: f32,
 
-    /// Repetition penalty
+    /// Repetition penalty (SGLang extension)
     #[serde(default = "default_repetition_penalty")]
     pub repetition_penalty: f32,
 }
@@ -1538,7 +1487,7 @@ impl Default for ResponsesRequest {
             top_p: None,
             truncation: None,
             user: None,
-            request_id: generate_request_id(),
+            request_id: None,
             priority: 0,
             frequency_penalty: None,
             presence_penalty: None,
@@ -1547,101 +1496,6 @@ impl Default for ResponsesRequest {
             min_p: 0.0,
             repetition_penalty: default_repetition_penalty(),
         }
-    }
-}
-
-impl ResponsesRequest {
-    /// Default sampling parameters
-    const DEFAULT_TEMPERATURE: f32 = 0.7;
-    const DEFAULT_TOP_P: f32 = 1.0;
-
-    /// Convert to sampling parameters for generation
-    pub fn to_sampling_params(
-        &self,
-        default_max_tokens: u32,
-        default_params: Option<HashMap<String, Value>>,
-    ) -> HashMap<String, Value> {
-        let mut params = HashMap::new();
-
-        // Use max_output_tokens if available
-        let max_tokens = if let Some(max_output) = self.max_output_tokens {
-            std::cmp::min(max_output, default_max_tokens)
-        } else {
-            default_max_tokens
-        };
-
-        // Avoid exceeding context length by minus 1 token
-        let max_tokens = max_tokens.saturating_sub(1);
-
-        // Temperature
-        let temperature = self.temperature.unwrap_or_else(|| {
-            default_params
-                .as_ref()
-                .and_then(|p| p.get("temperature"))
-                .and_then(|v| v.as_f64())
-                .map(|v| v as f32)
-                .unwrap_or(Self::DEFAULT_TEMPERATURE)
-        });
-
-        // Top-p
-        let top_p = self.top_p.unwrap_or_else(|| {
-            default_params
-                .as_ref()
-                .and_then(|p| p.get("top_p"))
-                .and_then(|v| v.as_f64())
-                .map(|v| v as f32)
-                .unwrap_or(Self::DEFAULT_TOP_P)
-        });
-
-        params.insert(
-            "max_new_tokens".to_string(),
-            Value::Number(Number::from(max_tokens)),
-        );
-        params.insert(
-            "temperature".to_string(),
-            Value::Number(Number::from_f64(temperature as f64).unwrap()),
-        );
-        params.insert(
-            "top_p".to_string(),
-            Value::Number(Number::from_f64(top_p as f64).unwrap()),
-        );
-        if let Some(fp) = self.frequency_penalty {
-            params.insert(
-                "frequency_penalty".to_string(),
-                Value::Number(Number::from_f64(fp as f64).unwrap()),
-            );
-        }
-        if let Some(pp) = self.presence_penalty {
-            params.insert(
-                "presence_penalty".to_string(),
-                Value::Number(Number::from_f64(pp as f64).unwrap()),
-            );
-        }
-        params.insert("top_k".to_string(), Value::Number(Number::from(self.top_k)));
-        params.insert(
-            "min_p".to_string(),
-            Value::Number(Number::from_f64(self.min_p as f64).unwrap()),
-        );
-        params.insert(
-            "repetition_penalty".to_string(),
-            Value::Number(Number::from_f64(self.repetition_penalty as f64).unwrap()),
-        );
-
-        if let Some(ref stop) = self.stop {
-            match to_value(stop) {
-                Ok(value) => params.insert("stop".to_string(), value),
-                Err(_) => params.insert("stop".to_string(), Value::Null),
-            };
-        }
-
-        // Apply any additional default parameters
-        if let Some(default_params) = default_params {
-            for (key, value) in default_params {
-                params.entry(key).or_insert(value);
-            }
-        }
-
-        params
     }
 }
 
@@ -1823,7 +1677,10 @@ impl ResponsesResponse {
         usage: Option<UsageInfo>,
     ) -> Self {
         Self {
-            id: request.request_id.clone(),
+            id: request
+                .request_id
+                .clone()
+                .expect("request_id should be set by middleware"),
             object: "response".to_string(),
             created_at: created_time,
             status,
@@ -2309,10 +2166,6 @@ fn validate_sampling_params(params: &SamplingParams) -> Result<(), validator::Va
 #[derive(Clone, Debug, Serialize, Deserialize, Validate)]
 #[validate(schema(function = "validate_generate_request"))]
 pub struct GenerateRequest {
-    /// The prompt to generate from (OpenAI style)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub prompt: Option<StringOrArray>,
-
     /// Text input - SGLang native format
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
@@ -2321,31 +2174,144 @@ pub struct GenerateRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_ids: Option<InputIds>,
 
+    /// Input embeddings for direct embedding input
+    /// Can be a 2D array (single request) or 3D array (batch of requests)
+    /// Placeholder for future use
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_embeds: Option<Value>,
+
+    /// Image input data
+    /// Can be an image instance, file name, URL, or base64 encoded string
+    /// Supports single images, lists of images, or nested lists for batch processing
+    /// Placeholder for future use
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_data: Option<Value>,
+
+    /// Video input data
+    /// Can be a file name, URL, or base64 encoded string
+    /// Supports single videos, lists of videos, or nested lists for batch processing
+    /// Placeholder for future use
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_data: Option<Value>,
+
+    /// Audio input data
+    /// Can be a file name, URL, or base64 encoded string
+    /// Supports single audio files, lists of audio, or nested lists for batch processing
+    /// Placeholder for future use
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio_data: Option<Value>,
+
     /// Sampling parameters (sglang style)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sampling_params: Option<SamplingParams>,
+
+    /// Whether to return logprobs
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub return_logprob: Option<bool>,
+
+    /// If return logprobs, the start location in the prompt for returning logprobs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprob_start_len: Option<i32>,
+
+    /// If return logprobs, the number of top logprobs to return at each position.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_logprobs_num: Option<i32>,
+
+    /// If return logprobs, the token ids to return logprob for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_ids_logprob: Option<Vec<u32>>,
+
+    /// Whether to detokenize tokens in text in the returned logprobs.
+    #[serde(default)]
+    pub return_text_in_logprobs: bool,
 
     /// Whether to stream the response
     #[serde(default)]
     pub stream: bool,
 
-    /// Whether to return logprobs
-    #[serde(default)]
-    pub return_logprob: bool,
-
-    /// Path to LoRA adapter(s) for model customization
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub lora_path: Option<LoRAPath>,
-
-    /// Session parameters for continual prompting
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub session_params: Option<HashMap<String, Value>>,
+    /// Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
+    #[serde(default = "default_true")]
+    pub log_metrics: bool,
 
     /// Return model hidden states
     #[serde(default)]
     pub return_hidden_states: bool,
 
-    /// Request ID for tracking
+    /// The modalities of the image data [image, multi-images, video]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modalities: Option<Vec<String>>,
+
+    /// Session parameters for continual prompting
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_params: Option<HashMap<String, Value>>,
+
+    /// Path to LoRA adapter(s) for model customization
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lora_path: Option<String>,
+
+    /// LoRA adapter ID (if pre-loaded)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lora_id: Option<String>,
+
+    /// Custom logit processor for advanced sampling control. Must be a serialized instance
+    /// of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py
+    /// Use the processor's `to_str()` method to generate the serialized string.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custom_logit_processor: Option<String>,
+
+    /// For disaggregated inference
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bootstrap_host: Option<String>,
+
+    /// For disaggregated inference
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bootstrap_port: Option<i32>,
+
+    /// For disaggregated inference
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bootstrap_room: Option<i32>,
+
+    /// For disaggregated inference
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bootstrap_pair_key: Option<String>,
+
+    /// Data parallel rank routing
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_parallel_rank: Option<i32>,
+
+    /// Background response
+    #[serde(default)]
+    pub background: bool,
+
+    /// Conversation ID for tracking
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<String>,
+
+    /// Priority for the request
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub priority: Option<i32>,
+
+    /// Extra key for classifying the request (e.g. cache_salt)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extra_key: Option<String>,
+
+    /// Whether to disallow logging for this request (e.g. due to ZDR)
+    #[serde(default)]
+    pub no_logs: bool,
+
+    /// Custom metric labels
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custom_labels: Option<HashMap<String, String>>,
+
+    /// Whether to return bytes for image generation
+    #[serde(default)]
+    pub return_bytes: bool,
+
+    /// Whether to return entropy
+    #[serde(default)]
+    pub return_entropy: bool,
+
+    /// Request ID for tracking (inherited from BaseReq in Python)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rid: Option<String>,
 }
@@ -2358,7 +2324,7 @@ impl Normalizable for GenerateRequest {
 fn validate_generate_request(req: &GenerateRequest) -> Result<(), validator::ValidationError> {
     // Exactly one of text or input_ids must be provided
     // Note: input_embeds not yet supported in Rust implementation
-    let has_text = req.text.is_some() || req.prompt.is_some();
+    let has_text = req.text.is_some();
     let has_input_ids = req.input_ids.is_some();
 
     let count = [has_text, has_input_ids].iter().filter(|&&x| x).count();
@@ -2389,16 +2355,9 @@ impl GenerationRequest for GenerateRequest {
     }
 
     fn extract_text_for_routing(&self) -> String {
-        // Check fields in priority order: text, prompt, inputs
+        // Check fields in priority order: text, input_ids
         if let Some(ref text) = self.text {
             return text.clone();
-        }
-
-        if let Some(ref prompt) = self.prompt {
-            return match prompt {
-                StringOrArray::String(s) => s.clone(),
-                StringOrArray::Array(v) => v.join(" "),
-            };
         }
 
         if let Some(ref input_ids) = self.input_ids {
@@ -2480,9 +2439,6 @@ pub enum GenerateFinishReason {
     Other(Value),
 }
 
-// Constants for rerank API
-pub const DEFAULT_MODEL_NAME: &str = "default";
-
 /// Rerank request for scoring documents against a query
 /// Used for RAG systems and document relevance scoring
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2494,7 +2450,7 @@ pub struct RerankRequest {
     pub documents: Vec<String>,
 
     /// Model to use for reranking
-    #[serde(default = "default_model_name")]
+    #[serde(default = "default_model")]
     pub model: String,
 
     /// Maximum number of documents to return (optional)
@@ -2510,10 +2466,6 @@ pub struct RerankRequest {
 
     /// User identifier
     pub user: Option<String>,
-}
-
-pub fn default_model_name() -> String {
-    DEFAULT_MODEL_NAME.to_string()
 }
 
 fn default_return_documents() -> bool {
@@ -2579,7 +2531,7 @@ impl From<V1RerankReqInput> for RerankRequest {
         RerankRequest {
             query: v1.query,
             documents: v1.documents,
-            model: default_model_name(),
+            model: default_model(),
             top_k: None,
             return_documents: true,
             rid: None,

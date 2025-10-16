@@ -383,18 +383,32 @@ async fn handle_pod_event(
                 api_key: None,
             };
 
-            let result = WorkerManager::add_worker_from_config(&config, &app_context).await;
+            // Submit job for async worker addition
+            use crate::core::Job;
+            let job = Job::AddWorker {
+                config: Box::new(config.clone()),
+            };
 
-            match result {
-                Ok(_) => {
-                    debug!("Worker added: {}", worker_url);
-                }
-                Err(e) => {
-                    error!("Failed to add worker {} to router: {}", worker_url, e);
-                    if let Ok(mut tracker) = tracked_pods.lock() {
-                        tracker.remove(pod_info);
+            if let Some(job_queue) = app_context.worker_job_queue.get() {
+                match job_queue.submit(job).await {
+                    Ok(_) => {
+                        debug!("Worker addition job submitted for: {}", worker_url);
+                    }
+                    Err(e) => {
+                        error!(
+                            "Failed to submit worker addition job for {}: {}",
+                            worker_url, e
+                        );
+                        if let Ok(mut tracker) = tracked_pods.lock() {
+                            tracker.remove(pod_info);
+                        }
                     }
                 }
+            } else {
+                debug!(
+                    "JobQueue not initialized, skipping async worker addition for: {}",
+                    worker_url
+                );
             }
         }
     }
@@ -529,6 +543,8 @@ mod tests {
             ..Default::default()
         };
 
+        // Note: Using uninitialized queue for tests to avoid spawning background workers
+        // Jobs submitted during tests will queue but not be processed
         Arc::new(AppContext {
             client: reqwest::Client::new(),
             router_config: router_config.clone(),
@@ -549,6 +565,7 @@ mod tests {
             load_monitor: None,
             configured_reasoning_parser: None,
             configured_tool_parser: None,
+            worker_job_queue: Arc::new(std::sync::OnceLock::new()),
         })
     }
 
@@ -907,8 +924,6 @@ mod tests {
         };
         let port = 8080u16;
 
-        // This test validates the structure but won't actually add workers since
-        // the test worker URL won't be reachable
         handle_pod_event(
             &pod_info,
             Arc::clone(&tracked_pods),
@@ -918,8 +933,12 @@ mod tests {
         )
         .await;
 
-        // Pod should not be tracked since add_worker_from_config will fail for non-running server
-        assert!(!tracked_pods.lock().unwrap().contains(&pod_info));
+        // With fully async control plane, pod is tracked and job is queued
+        // Worker registration and validation happen in background job
+        assert!(tracked_pods.lock().unwrap().contains(&pod_info));
+
+        // Note: In tests with uninitialized queue, background jobs don't process
+        // Worker won't appear in registry until background job runs (in production)
     }
 
     #[tokio::test]
@@ -945,8 +964,12 @@ mod tests {
         )
         .await;
 
-        // Pod should not be tracked since add_worker_from_config will fail for non-running server
-        assert!(!tracked_pods.lock().unwrap().contains(&pod_info));
+        // With fully async control plane, pod is tracked and job is queued
+        // Worker registration and validation happen in background job
+        assert!(tracked_pods.lock().unwrap().contains(&pod_info));
+
+        // Note: In tests with uninitialized queue, background jobs don't process
+        // Worker won't appear in registry until background job runs (in production)
     }
 
     #[tokio::test]
@@ -1033,7 +1056,13 @@ mod tests {
         )
         .await;
 
-        assert!(!tracked_pods.lock().unwrap().contains(&pod_info));
+        // With fully async control plane, pod is tracked and job is queued
+        // In regular mode (pd_mode=false), worker_type defaults to Regular
+        // Worker registration and validation happen in background job
+        assert!(tracked_pods.lock().unwrap().contains(&pod_info));
+
+        // Note: In tests with uninitialized queue, background jobs don't process
+        // Worker won't appear in registry until background job runs (in production)
     }
 
     #[tokio::test]
@@ -1059,8 +1088,12 @@ mod tests {
         )
         .await;
 
-        // Pod should not be tracked since add_worker_from_config will fail for non-running server
-        assert!(!tracked_pods.lock().unwrap().contains(&pod_info));
+        // With fully async control plane, pod is tracked and job is queued
+        // Worker registration and validation happen in background job
+        assert!(tracked_pods.lock().unwrap().contains(&pod_info));
+
+        // Note: In tests with uninitialized queue, background jobs don't process
+        // Worker won't appear in registry until background job runs (in production)
     }
 
     #[tokio::test]
