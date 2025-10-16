@@ -118,6 +118,7 @@ DEFAULT_VIDEO_URL = "https://raw.githubusercontent.com/EvolvingLMMs-Lab/sglang/d
 
 DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 600
 
+
 def is_sm10x():
     """Return whether the current GPU is SM 10.x architecture."""
     return torch.cuda.get_device_capability() >= (10, 0)
@@ -126,6 +127,7 @@ def is_sm10x():
 def is_hopper():
     """Return whether the current GPU is Hopper architecture."""
     return torch.cuda.get_device_capability() == (9, 0)
+
 
 def is_in_ci():
     """Return whether it is in CI runner."""
