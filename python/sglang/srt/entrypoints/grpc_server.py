@@ -532,9 +532,20 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         bootstrap_port = None
         bootstrap_room = None
         if grpc_req.HasField("disaggregated_params"):
-            bootstrap_host = grpc_req.disaggregated_params.bootstrap_host or None
-            bootstrap_port = grpc_req.disaggregated_params.bootstrap_port or None
-            bootstrap_room = grpc_req.disaggregated_params.bootstrap_room or None
+            # Don't use 'or None' as it treats 0 as falsy
+            bootstrap_host = (
+                grpc_req.disaggregated_params.bootstrap_host
+                if grpc_req.disaggregated_params.bootstrap_host
+                else None
+            )
+            bootstrap_port = (
+                grpc_req.disaggregated_params.bootstrap_port
+                if grpc_req.disaggregated_params.bootstrap_port
+                else None
+            )
+            bootstrap_room = (
+                grpc_req.disaggregated_params.bootstrap_room
+            )  # Can be 0, don't use 'or None'
 
         # Create request
         return TokenizedGenerateReqInput(
