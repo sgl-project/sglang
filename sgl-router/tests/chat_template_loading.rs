@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use sglang_router_rs::protocols::spec;
+    use sglang_router_rs::protocols::chat::{ChatMessage, UserMessageContent};
     use sglang_router_rs::tokenizer::chat_template::ChatTemplateParams;
     use sglang_router_rs::tokenizer::huggingface::HuggingFaceTokenizer;
     use std::fs;
@@ -58,11 +58,11 @@ mod tests {
         .unwrap();
 
         let messages = [
-            spec::ChatMessage::User {
-                content: spec::UserMessageContent::Text("Hello".to_string()),
+            ChatMessage::User {
+                content: UserMessageContent::Text("Hello".to_string()),
                 name: None,
             },
-            spec::ChatMessage::Assistant {
+            ChatMessage::Assistant {
                 content: Some("Hi there".to_string()),
                 name: None,
                 tool_calls: None,
@@ -140,8 +140,8 @@ mod tests {
         )
         .unwrap();
 
-        let messages = [spec::ChatMessage::User {
-            content: spec::UserMessageContent::Text("Test".to_string()),
+        let messages = [ChatMessage::User {
+            content: UserMessageContent::Text("Test".to_string()),
             name: None,
         }];
 
@@ -199,11 +199,11 @@ mod tests {
         tokenizer.set_chat_template(new_template.to_string());
 
         let messages = [
-            spec::ChatMessage::User {
-                content: spec::UserMessageContent::Text("Hello".to_string()),
+            ChatMessage::User {
+                content: UserMessageContent::Text("Hello".to_string()),
                 name: None,
             },
-            spec::ChatMessage::Assistant {
+            ChatMessage::Assistant {
                 content: Some("World".to_string()),
                 name: None,
                 tool_calls: None,

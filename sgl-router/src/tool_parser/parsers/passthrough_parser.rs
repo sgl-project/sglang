@@ -4,7 +4,7 @@
 //! tool call parsing should be performed. It simply returns the input text
 //! with no tool calls detected.
 
-use crate::protocols::spec::Tool;
+use crate::protocols::common::Tool;
 use crate::tool_parser::errors::ParserResult;
 use crate::tool_parser::traits::ToolParser;
 use crate::tool_parser::types::{StreamingParseResult, ToolCall, ToolCallItem};

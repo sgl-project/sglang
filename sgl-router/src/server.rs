@@ -15,10 +15,12 @@ use crate::{
     middleware::{self, AuthConfig, QueuedRequest, TokenBucket},
     policies::PolicyRegistry,
     protocols::{
-        spec::{
-            ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest,
-            RerankRequest, ResponsesGetParams, ResponsesRequest, V1RerankReqInput,
-        },
+        chat::ChatCompletionRequest,
+        completion::CompletionRequest,
+        embedding::EmbeddingRequest,
+        generate::GenerateRequest,
+        rerank::{RerankRequest, V1RerankReqInput},
+        responses::{ResponsesGetParams, ResponsesRequest},
         validated::ValidatedJson,
         worker_spec::{WorkerConfigRequest, WorkerErrorResponse, WorkerInfo},
     },
@@ -223,7 +225,7 @@ async fn v1_completions(
 async fn rerank(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    Json(body): Json<RerankRequest>,
+    ValidatedJson(body): ValidatedJson<RerankRequest>,
 ) -> Response {
     state.router.route_rerank(Some(&headers), &body, None).await
 }

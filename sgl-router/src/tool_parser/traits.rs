@@ -1,4 +1,4 @@
-use crate::protocols::spec::Tool;
+use crate::protocols::common::Tool;
 use crate::tool_parser::{
     errors::ParserResult,
     types::{StreamingParseResult, ToolCall},

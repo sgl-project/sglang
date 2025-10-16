@@ -6,10 +6,12 @@
 
 use crate::config::{ConnectionMode, RoutingMode};
 use crate::core::{WorkerRegistry, WorkerType};
-use crate::protocols::spec::{
-    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest,
-    ResponsesGetParams, ResponsesRequest,
-};
+use crate::protocols::chat::ChatCompletionRequest;
+use crate::protocols::completion::CompletionRequest;
+use crate::protocols::embedding::EmbeddingRequest;
+use crate::protocols::generate::GenerateRequest;
+use crate::protocols::rerank::RerankRequest;
+use crate::protocols::responses::{ResponsesGetParams, ResponsesRequest};
 use crate::routers::RouterTrait;
 use crate::server::{AppContext, ServerConfig};
 use async_trait::async_trait;
