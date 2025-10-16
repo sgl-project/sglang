@@ -179,7 +179,6 @@ void run_get_group_gemm_starts(
   }
 }
 
-template <typename OutType>
 void run_fp4_blockwise_scaled_group_mm_sm120(
     torch::Tensor& output,
     const torch::Tensor& a,
@@ -201,10 +200,9 @@ void run_fp4_blockwise_scaled_group_mm_sm120(
   using ElementA = cutlass::nv_float4_t<cutlass::float_e2m1_t>;
   using ElementB = cutlass::nv_float4_t<cutlass::float_e2m1_t>;
 
-  using ElementC = OutType;
-  using ElementD = OutType;  
+  using ElementC = cutlass::bfloat16_t;
+  using ElementD = cutlass::bfloat16_t;  
   using ElementAccumulator = float;
-
   // Layout definitions
   using LayoutA = cutlass::layout::RowMajor;
   using LayoutB = cutlass::layout::ColumnMajor;
@@ -222,12 +220,11 @@ void run_fp4_blockwise_scaled_group_mm_sm120(
   using ArchTag = cutlass::arch::Sm120;
   using OperatorClass       = cutlass::arch::OpClassBlockScaledTensorOp;  
   using StageCountType = cutlass::gemm::collective::StageCountAuto;    
-  using ThreadBlockShape    = Shape<_128,_128,_128>;     // Stage count maximized based
-                                                                            // on the tile size
+  using ThreadBlockShape    = Shape<_128,_128,_128>;  
+                                                                              // on the tile size
 
   using ClusterShape = Shape<_1, _1, _1>;
 
-  // 与 79d 示例一致，使用简单的线性组合
   using FusionOperation = cutlass::epilogue::fusion::LinearCombination<
       ElementD, ElementAccumulator, ElementC, ElementAccumulator>;
 
@@ -250,7 +247,7 @@ void run_fp4_blockwise_scaled_group_mm_sm120(
     ThreadBlockShape, ClusterShape,
     cutlass::gemm::collective::StageCountAutoCarveout<
     static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
-    cutlass::gemm::collective::KernelScheduleAuto                             // Auto schedule defaults to cooperative schedule
+    cutlass::gemm::KernelPtrArrayTmaWarpSpecializedPingpong
   >::CollectiveOp;
   
 
@@ -333,7 +330,7 @@ void run_fp4_blockwise_scaled_group_mm_sm120(
       static_cast<const ElementSFType**>(b_scales_ptrs.data_ptr()),
       reinterpret_cast<LayoutSFB*>(layout_sfb.data_ptr())};
 
-  // Epilogue Arguments - 与 79d 示例一致，使用简单的线性组合
+  // Epilogue Arguments 
   typename GemmKernel::EpilogueArguments epilogue_args{
       {},  // epilogue.thread
       nullptr,
@@ -343,7 +340,7 @@ void run_fp4_blockwise_scaled_group_mm_sm120(
   auto& fusion_args = epilogue_args.thread;
   fusion_args.alpha_ptr_array = reinterpret_cast<float**>(alpha_ptrs.data_ptr());
   fusion_args.dAlpha = {_0{}, _0{}, 1};
-  fusion_args.beta = 0.0f;  // 简单的线性组合，beta=0
+  fusion_args.beta = 0.0f; 
 
   // Gemm Arguments
   typename GemmKernel::Arguments args{
@@ -364,7 +361,6 @@ void run_fp4_blockwise_scaled_group_mm_sm120(
 
   // Run the GEMM
   auto status = gemm_op.initialize(args, workspace.data_ptr());
-  // std::cerr << cudaGetErrorString(cudaGetLastError()) << std::endl;
   TORCH_CHECK(status == cutlass::Status::kSuccess, "Failed to initialize GEMM");
 
   status = gemm_op.run(args, workspace.data_ptr(), stream);
@@ -662,8 +658,7 @@ void cutlass_fp4_group_mm(
       }
   } else if (sm_version == 120) {
     if (output.scalar_type() == torch::kBFloat16) {
-      std::cout << "run_fp4_blockwise_scaled_group_mm_sm120 bfloat16" << std::endl;
-      run_fp4_blockwise_scaled_group_mm_sm120<cutlass::bfloat16_t>(
+      run_fp4_blockwise_scaled_group_mm_sm120(
           output,
           a,
           b,
@@ -679,22 +674,7 @@ void cutlass_fp4_group_mm(
           N,
           K);
     } else {
-        std::cout << "run_fp4_blockwise_scaled_group_mm_sm120 half" << std::endl;
-        run_fp4_blockwise_scaled_group_mm_sm120<cutlass::half_t>(
-            output,
-            a,
-            b,
-            a_blockscale,
-            b_blockscales,
-            alphas,
-            ab_strides,
-            c_strides,
-            problem_sizes,
-            expert_offsets,
-            sf_offsets,
-            M,
-            N,
-            K);
+    std::cout << "run_fp4_blockwise_scaled_group_mm_sm120 half no implementation" << std::endl;
     }
   } else {
     TORCH_CHECK_NOT_IMPLEMENTED(
