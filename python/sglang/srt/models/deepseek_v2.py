@@ -134,6 +134,7 @@ from sglang.srt.utils import (
     is_npu,
     is_nvidia_cublas_cu12_version_ge_12_9,
     is_sm100_supported,
+    is_xpu,
     log_info_on_rank0,
     make_layers,
     use_intel_amx_backend,
@@ -148,6 +149,7 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _device_sm = get_device_sm()
 _is_gfx95_supported = is_gfx95_supported()
+_is_xpu = is_xpu()
 
 _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
 
@@ -173,7 +175,7 @@ if _is_cuda:
         dsv3_router_gemm,
         merge_state_v2,
     )
-elif _is_cpu and _is_cpu_amx_available:
+elif (_is_cpu and _is_cpu_amx_available) or _is_xpu:
     pass
 elif _is_hip:
     from sglang.srt.layers.attention.triton_ops.rocm_mla_decode_rope import (

@@ -49,11 +49,13 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
     is_shm_available,
+    is_xpu,
     supports_custom_op,
 )
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
+_is_xpu = is_xpu()
 _supports_custom_op = supports_custom_op()
 
 IS_ONE_DEVICE_PER_PROCESS = get_bool_env_var("SGLANG_ONE_DEVICE_PER_PROCESS")
@@ -1843,6 +1845,9 @@ vllm_get_world_group = None
 
 
 def monkey_patch_vllm_parallel_state(reverse: bool = False):
+    if _is_xpu:
+        return
+
     try:
         import vllm.distributed.parallel_state as vllm_parrlel_state
     except ImportError:
