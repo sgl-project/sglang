@@ -59,9 +59,9 @@ def _load_architecture_specific_ops():
     logger.debug(f"[sgl_kernel] sgl_kernel directory: {sgl_kernel_dir}")
 
     # Determine which version to load based on GPU architecture
-    if compute_capability == 90:
+    if compute_capability <= 90:
         ops_subdir = "sm90"
-        variant_name = "SM90 (Hopper/H100 with fast math optimization)"
+        variant_name = "SM8x/SM90 (With fast math optimization)"
     elif compute_capability is not None:
         ops_subdir = "sm100"
         variant_name = f"SM{compute_capability} (precise math for compatibility)"
