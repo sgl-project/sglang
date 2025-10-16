@@ -477,6 +477,7 @@ class NativeSparseAttnBackend(AttentionBackend):
         assert (
             not forward_batch.forward_mode.is_target_verify()
             and not forward_batch.forward_mode.is_draft_extend()
+            and not forward_batch.forward_mode.is_draft_extend_v2()
         ), "NSA backend doesn't support speculative decoding"
         if k is not None:
             assert v is not None

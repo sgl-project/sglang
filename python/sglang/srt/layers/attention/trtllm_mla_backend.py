@@ -324,6 +324,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             forward_batch.forward_mode.is_extend()
             and not forward_batch.forward_mode.is_target_verify()
             and not forward_batch.forward_mode.is_draft_extend()
+            and not forward_batch.forward_mode.is_draft_extend_v2()
         ):
             if self.disable_chunked_prefix_cache:
                 super().init_forward_metadata(forward_batch)

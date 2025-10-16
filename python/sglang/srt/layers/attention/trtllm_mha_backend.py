@@ -491,6 +491,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             if (
                 any(forward_batch.extend_prefix_lens_cpu)
                 or forward_batch.forward_mode == ForwardMode.DRAFT_EXTEND
+                or forward_batch.forward_mode == ForwardMode.DRAFT_EXTEND_V2
             ):
                 extend_seq_lens = forward_batch.extend_seq_lens
                 metadata.max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
