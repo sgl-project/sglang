@@ -66,6 +66,10 @@ impl GenerationRequest for RerankRequest {
     }
 }
 
+impl super::validated::Normalizable for RerankRequest {
+    // Use default no-op normalization
+}
+
 // ============================================================================
 // Validation Functions
 // ============================================================================

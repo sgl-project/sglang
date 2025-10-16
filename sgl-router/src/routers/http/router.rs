@@ -26,7 +26,6 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error};
-use validator::Validate;
 
 /// Regular router that uses injected load balancing policies
 #[derive(Debug)]
@@ -749,9 +748,6 @@ impl RouterTrait for Router {
         body: &RerankRequest,
         model_id: Option<&str>,
     ) -> Response {
-        if let Err(e) = body.validate() {
-            return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
-        }
         let response = self
             .route_typed_request(headers, body, "/v1/rerank", model_id)
             .await;

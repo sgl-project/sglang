@@ -656,6 +656,20 @@ pub struct ChatCompletionStreamResponse {
     pub usage: Option<Usage>,
 }
 
+/// Delta structure for streaming chat completion responses
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChatMessageDelta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCallDelta>>,
+    /// Reasoning content delta for O1-style models (SGLang extension)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChatStreamChoice {
     pub index: u32,

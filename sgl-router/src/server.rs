@@ -221,7 +221,7 @@ async fn v1_completions(
 async fn rerank(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    Json(body): Json<RerankRequest>,
+    ValidatedJson(body): ValidatedJson<RerankRequest>,
 ) -> Response {
     state.router.route_rerank(Some(&headers), &body, None).await
 }
