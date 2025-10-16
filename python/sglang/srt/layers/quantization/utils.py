@@ -77,6 +77,19 @@ def is_layer_skipped(
                 )
     else:
         is_skipped = prefix in ignored_layers
+        if "gate_up_proj" in prefix:
+            prefix_gate = prefix.replace("gate_up_proj", "gate_proj")
+            prefix_up = prefix.replace("gate_up_proj", "up_proj")
+            if prefix_gate in ignored_layers and prefix_up in ignored_layers:
+                is_skipped = True
+        elif "experts" in prefix:
+            is_skipped = any(
+                [
+                    prefix in layer_name
+                    for layer_name in ignored_layers
+                    if "experts" in layer_name
+                ]
+            )
 
     assert is_skipped is not None
     return is_skipped

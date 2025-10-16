@@ -1,20 +1,12 @@
 """CUTLASS based Fused MoE kernels."""
 
-import functools
-import json
-import logging
-import os
-from typing import Any, Callable, Dict, List, Optional, Tuple
-
 import torch
 
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams
-from sglang.srt.layers.utils import is_sm90_supported, is_sm100_supported
 from sglang.srt.utils import is_cuda
 
 _is_cuda = is_cuda()
 if _is_cuda:
-    import sgl_kernel
     from sgl_kernel import (
         apply_shuffle_mul_sum,
         cutlass_fp4_group_mm,
