@@ -75,7 +75,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         sparsity_ignore_list: list[str],
         kv_cache_scheme: Optional[dict[str, Any]] = None,
         config: Optional[dict[str, Any]] = None,
-        packed_modules_mapping: Optional[dict[str, List[str]]] = None,
+        packed_modules_mapping: Optional[dict[str, list[str]]] = None,
         transform_config: Optional[dict[str, Any]] = None,
     ):
         super().__init__()
