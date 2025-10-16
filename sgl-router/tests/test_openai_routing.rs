@@ -9,18 +9,20 @@ use axum::{
     Json, Router,
 };
 use serde_json::json;
-use sglang_router_rs::data_connector::MemoryConversationItemStorage;
 use sglang_router_rs::{
     config::{
         ConfigError, ConfigValidator, HistoryBackend, OracleConfig, RouterConfig, RoutingMode,
     },
     data_connector::{
-        MemoryConversationStorage, MemoryResponseStorage, ResponseId, ResponseStorage,
-        StoredResponse,
+        MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
+        ResponseId, ResponseStorage, StoredResponse,
     },
-    protocols::spec::{
-        ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateRequest, ResponseInput,
-        ResponsesGetParams, ResponsesRequest, UserMessageContent,
+    protocols::{
+        chat::{ChatCompletionRequest, ChatMessage, UserMessageContent},
+        common::StringOrArray,
+        completion::CompletionRequest,
+        generate::GenerateRequest,
+        responses::{ResponseInput, ResponsesGetParams, ResponsesRequest},
     },
     routers::{openai::OpenAIRouter, RouterTrait},
 };
@@ -52,7 +54,7 @@ fn create_minimal_chat_request() -> ChatCompletionRequest {
 fn create_minimal_completion_request() -> CompletionRequest {
     CompletionRequest {
         model: "gpt-3.5-turbo".to_string(),
-        prompt: sglang_router_rs::protocols::spec::StringOrArray::String("Hello".to_string()),
+        prompt: StringOrArray::String("Hello".to_string()),
         suffix: None,
         max_tokens: Some(100),
         temperature: None,
@@ -605,12 +607,12 @@ async fn test_unsupported_endpoints() {
         video_data: None,
         audio_data: None,
         sampling_params: None,
-        stream: false,
         return_logprob: Some(false),
         logprob_start_len: None,
         top_logprobs_num: None,
         token_ids_logprob: None,
         return_text_in_logprobs: false,
+        stream: false,
         log_metrics: true,
         return_hidden_states: false,
         modalities: None,
@@ -955,4 +957,70 @@ fn oracle_config_validation_accepts_wallet_alias() {
     };
 
     ConfigValidator::validate(&config).expect("wallet-based config should validate");
+}
+
+/// Test that RouterManager delegates /v1/models to OpenAI router in single-router mode
+#[tokio::test]
+async fn test_router_manager_delegates_models_to_openai_router() {
+    use sglang_router_rs::routers::router_manager::RouterManager;
+    use sglang_router_rs::server::ServerConfig;
+
+    // Start a mock OpenAI server
+    let mock_server = MockOpenAIServer::new().await;
+    let base_url = mock_server.base_url();
+
+    // Create router config in OpenAI mode
+    let routing_mode = RoutingMode::OpenAI {
+        worker_urls: vec![base_url.clone()],
+    };
+
+    let router_config =
+        RouterConfig::new(routing_mode, sglang_router_rs::config::PolicyConfig::Random);
+
+    let server_config = ServerConfig {
+        host: "127.0.0.1".to_string(),
+        port: 0,
+        router_config: router_config.clone(),
+        max_payload_size: 1024 * 1024,
+        log_dir: None,
+        log_level: None,
+        service_discovery_config: None,
+        prometheus_config: None,
+        request_timeout_secs: 300,
+        request_id_headers: None,
+    };
+
+    // Create app context
+    let app_context = common::create_test_context(router_config);
+
+    // Create RouterManager (single-router mode, enable_igw=false)
+    let router_manager = RouterManager::from_config(&server_config, &app_context)
+        .await
+        .expect("RouterManager creation should succeed");
+
+    // Make a request to /v1/models
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/v1/models")
+        .body(Body::empty())
+        .unwrap();
+
+    // RouterManager should delegate to OpenAI router, which proxies to mock server
+    let response = router_manager.get_models(req).await;
+
+    // Should succeed (not 503 "No models available")
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "RouterManager should delegate to OpenAI router and return models"
+    );
+
+    // Verify response contains model list
+    let (_, body) = response.into_parts();
+    let body_bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+    let body_str = String::from_utf8(body_bytes.to_vec()).unwrap();
+    let models: serde_json::Value = serde_json::from_str(&body_str).unwrap();
+
+    assert_eq!(models["object"], "list");
+    assert!(models["data"].is_array());
 }

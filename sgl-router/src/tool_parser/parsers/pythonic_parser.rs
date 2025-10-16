@@ -15,7 +15,7 @@ use rustpython_parser::{parse, Mode};
 use serde_json::{Map, Number, Value};
 use std::sync::OnceLock;
 
-use crate::protocols::spec::Tool;
+use crate::protocols::common::Tool;
 
 use crate::tool_parser::{
     errors::{ParserError, ParserResult},

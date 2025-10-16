@@ -10,7 +10,7 @@
 use crate::data_connector::{
     SharedConversationItemStorage, SharedConversationStorage, SharedResponseStorage,
 };
-use crate::protocols::spec::{ResponseToolType, ResponsesRequest};
+use crate::protocols::responses::{ResponseToolType, ResponsesRequest};
 use crate::routers::header_utils::{apply_request_headers, preserve_response_headers};
 use axum::{
     body::Body,
