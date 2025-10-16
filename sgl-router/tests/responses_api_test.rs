@@ -15,8 +15,6 @@ use sglang_router_rs::config::{
     RouterConfig, RoutingMode,
 };
 use sglang_router_rs::routers::RouterFactory;
-use sglang_router_rs::server::AppContext;
-use std::sync::Arc;
 
 #[tokio::test]
 async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
@@ -83,10 +81,8 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
     };
 
     // Create router and context
-    let ctx = AppContext::new(router_cfg, reqwest::Client::new(), 64, None).expect("ctx");
-    let router = RouterFactory::create_router(&Arc::new(ctx))
-        .await
-        .expect("router");
+    let ctx = common::create_test_context(router_cfg);
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Build a simple ResponsesRequest that will trigger the tool call
     let req = ResponsesRequest {
@@ -119,7 +115,7 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
         top_p: None,
         truncation: Some(Truncation::Disabled),
         user: None,
-        request_id: "resp_test_mcp_e2e".to_string(),
+        request_id: Some("resp_test_mcp_e2e".to_string()),
         priority: 0,
         frequency_penalty: Some(0.0),
         presence_penalty: Some(0.0),
@@ -284,10 +280,8 @@ async fn test_conversations_crud_basic() {
         tool_call_parser: None,
     };
 
-    let ctx = AppContext::new(router_cfg, reqwest::Client::new(), 8, None).expect("ctx");
-    let router = RouterFactory::create_router(&Arc::new(ctx))
-        .await
-        .expect("router");
+    let ctx = common::create_test_context(router_cfg);
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create
     let create_body = serde_json::json!({ "metadata": { "project": "alpha" } });
@@ -367,7 +361,7 @@ fn test_responses_request_creation() {
         top_p: Some(0.9),
         truncation: Some(Truncation::Disabled),
         user: Some("test-user".to_string()),
-        request_id: "resp_test123".to_string(),
+        request_id: Some("resp_test123".to_string()),
         priority: 0,
         frequency_penalty: Some(0.0),
         presence_penalty: Some(0.0),
@@ -385,7 +379,8 @@ fn test_responses_request_creation() {
 }
 
 #[test]
-fn test_sampling_params_conversion() {
+fn test_responses_request_sglang_extensions() {
+    // Test that SGLang-specific sampling parameters are present and serializable
     let request = ResponsesRequest {
         background: Some(false),
         include: None,
@@ -395,37 +390,44 @@ fn test_sampling_params_conversion() {
         max_tool_calls: None,
         metadata: None,
         model: Some("test-model".to_string()),
-        parallel_tool_calls: Some(true), // Use default true
+        parallel_tool_calls: Some(true),
         previous_response_id: None,
         reasoning: None,
         service_tier: Some(ServiceTier::Auto),
-        store: Some(true), // Use default true
+        store: Some(true),
         stream: Some(false),
         temperature: Some(0.8),
         tool_choice: Some(ToolChoice::Value(ToolChoiceValue::Auto)),
         tools: Some(vec![]),
-        top_logprobs: Some(0), // Use default 0
+        top_logprobs: Some(0),
         top_p: Some(0.95),
         truncation: Some(Truncation::Auto),
         user: None,
-        request_id: "resp_test456".to_string(),
+        request_id: Some("resp_test456".to_string()),
         priority: 0,
         frequency_penalty: Some(0.1),
         presence_penalty: Some(0.2),
         stop: None,
+        // SGLang-specific extensions:
         top_k: 10,
         min_p: 0.05,
         repetition_penalty: 1.1,
         conversation: None,
     };
 
-    let params = request.to_sampling_params(1000, None);
+    // Verify SGLang extensions are present
+    assert_eq!(request.top_k, 10);
+    assert_eq!(request.min_p, 0.05);
+    assert_eq!(request.repetition_penalty, 1.1);
 
-    // Check that parameters are converted correctly
-    assert!(params.contains_key("temperature"));
-    assert!(params.contains_key("top_p"));
-    assert!(params.contains_key("frequency_penalty"));
-    assert!(params.contains_key("max_new_tokens"));
+    // Verify serialization works with SGLang extensions
+    let json = serde_json::to_string(&request).expect("Serialization should work");
+    let parsed: ResponsesRequest =
+        serde_json::from_str(&json).expect("Deserialization should work");
+
+    assert_eq!(parsed.top_k, 10);
+    assert_eq!(parsed.min_p, 0.05);
+    assert_eq!(parsed.repetition_penalty, 1.1);
 }
 
 #[test]
@@ -522,7 +524,7 @@ fn test_json_serialization() {
         top_p: Some(0.8),
         truncation: Some(Truncation::Auto),
         user: Some("test_user".to_string()),
-        request_id: "resp_comprehensive_test".to_string(),
+        request_id: Some("resp_comprehensive_test".to_string()),
         priority: 1,
         frequency_penalty: Some(0.3),
         presence_penalty: Some(0.4),
@@ -537,7 +539,10 @@ fn test_json_serialization() {
     let parsed: ResponsesRequest =
         serde_json::from_str(&json).expect("Deserialization should work");
 
-    assert_eq!(parsed.request_id, "resp_comprehensive_test");
+    assert_eq!(
+        parsed.request_id,
+        Some("resp_comprehensive_test".to_string())
+    );
     assert_eq!(parsed.model, Some("gpt-4".to_string()));
     assert_eq!(parsed.background, Some(true));
     assert_eq!(parsed.stream, Some(true));
@@ -616,10 +621,8 @@ async fn test_multi_turn_loop_with_mcp() {
         tool_call_parser: None,
     };
 
-    let ctx = AppContext::new(router_cfg, reqwest::Client::new(), 64, None).expect("ctx");
-    let router = RouterFactory::create_router(&Arc::new(ctx))
-        .await
-        .expect("router");
+    let ctx = common::create_test_context(router_cfg);
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Build request with MCP tools
     let req = ResponsesRequest {
@@ -651,7 +654,7 @@ async fn test_multi_turn_loop_with_mcp() {
         top_p: Some(1.0),
         truncation: Some(Truncation::Disabled),
         user: None,
-        request_id: "resp_multi_turn_test".to_string(),
+        request_id: Some("resp_multi_turn_test".to_string()),
         priority: 0,
         frequency_penalty: Some(0.0),
         presence_penalty: Some(0.0),
@@ -794,10 +797,8 @@ async fn test_max_tool_calls_limit() {
         tool_call_parser: None,
     };
 
-    let ctx = AppContext::new(router_cfg, reqwest::Client::new(), 64, None).expect("ctx");
-    let router = RouterFactory::create_router(&Arc::new(ctx))
-        .await
-        .expect("router");
+    let ctx = common::create_test_context(router_cfg);
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     let req = ResponsesRequest {
         background: Some(false),
@@ -826,7 +827,7 @@ async fn test_max_tool_calls_limit() {
         top_p: Some(1.0),
         truncation: Some(Truncation::Disabled),
         user: None,
-        request_id: "resp_max_calls_test".to_string(),
+        request_id: Some("resp_max_calls_test".to_string()),
         priority: 0,
         frequency_penalty: Some(0.0),
         presence_penalty: Some(0.0),
@@ -938,10 +939,8 @@ async fn setup_streaming_mcp_test() -> (
         tool_call_parser: None,
     };
 
-    let ctx = AppContext::new(router_cfg, reqwest::Client::new(), 64, None).expect("ctx");
-    let router = RouterFactory::create_router(&Arc::new(ctx))
-        .await
-        .expect("router");
+    let ctx = common::create_test_context(router_cfg);
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     (mcp, worker, router, dir)
 }
@@ -1023,7 +1022,7 @@ async fn test_streaming_with_mcp_tool_calls() {
         top_p: Some(1.0),
         truncation: Some(Truncation::Disabled),
         user: None,
-        request_id: "resp_streaming_mcp_test".to_string(),
+        request_id: Some("resp_streaming_mcp_test".to_string()),
         priority: 0,
         frequency_penalty: Some(0.0),
         presence_penalty: Some(0.0),
@@ -1302,7 +1301,7 @@ async fn test_streaming_multi_turn_with_mcp() {
         top_p: Some(1.0),
         truncation: Some(Truncation::Disabled),
         user: None,
-        request_id: "resp_streaming_multiturn_test".to_string(),
+        request_id: Some("resp_streaming_multiturn_test".to_string()),
         priority: 0,
         frequency_penalty: Some(0.0),
         presence_penalty: Some(0.0),
@@ -1381,10 +1380,8 @@ async fn test_conversation_items_create_and_get() {
         tool_call_parser: None,
     };
 
-    let ctx = AppContext::new(router_cfg, reqwest::Client::new(), 8, None).expect("ctx");
-    let router = RouterFactory::create_router(&Arc::new(ctx))
-        .await
-        .expect("router");
+    let ctx = common::create_test_context(router_cfg);
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create conversation
     let create_conv = serde_json::json!({});
@@ -1484,10 +1481,8 @@ async fn test_conversation_items_delete() {
         tool_call_parser: None,
     };
 
-    let ctx = AppContext::new(router_cfg, reqwest::Client::new(), 8, None).expect("ctx");
-    let router = RouterFactory::create_router(&Arc::new(ctx))
-        .await
-        .expect("router");
+    let ctx = common::create_test_context(router_cfg);
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create conversation
     let create_conv = serde_json::json!({});
@@ -1593,10 +1588,8 @@ async fn test_conversation_items_max_limit() {
         tool_call_parser: None,
     };
 
-    let ctx = AppContext::new(router_cfg, reqwest::Client::new(), 8, None).expect("ctx");
-    let router = RouterFactory::create_router(&Arc::new(ctx))
-        .await
-        .expect("router");
+    let ctx = common::create_test_context(router_cfg);
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create conversation
     let create_conv = serde_json::json!({});
@@ -1672,10 +1665,8 @@ async fn test_conversation_items_unsupported_type() {
         tool_call_parser: None,
     };
 
-    let ctx = AppContext::new(router_cfg, reqwest::Client::new(), 8, None).expect("ctx");
-    let router = RouterFactory::create_router(&Arc::new(ctx))
-        .await
-        .expect("router");
+    let ctx = common::create_test_context(router_cfg);
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create conversation
     let create_conv = serde_json::json!({});
@@ -1750,10 +1741,8 @@ async fn test_conversation_items_multi_conversation_sharing() {
         tool_call_parser: None,
     };
 
-    let ctx = AppContext::new(router_cfg, reqwest::Client::new(), 8, None).expect("ctx");
-    let router = RouterFactory::create_router(&Arc::new(ctx))
-        .await
-        .expect("router");
+    let ctx = common::create_test_context(router_cfg);
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create two conversations
     let conv_a_resp = router

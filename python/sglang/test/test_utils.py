@@ -16,7 +16,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
-from functools import partial
+from functools import partial, wraps
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, List, Optional, Tuple
@@ -75,6 +75,11 @@ DEFAULT_MODEL_NAME_FOR_TEST_FP8_WITH_MOE = "gaunernst/DeepSeek-V2-Lite-Chat-FP8"
 DEFAULT_MODEL_NAME_FOR_TEST_W8A8 = "RedHatAI/Llama-3.2-3B-quantized.w8a8"
 DEFAULT_MODEL_NAME_FOR_TEST_W8A8_WITH_MOE = "nytopop/Qwen3-30B-A3B.w8a8"
 
+# INT4 models
+DEFAULT_MODEL_NAME_FOR_TEST_AWQ_INT4 = (
+    "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4"
+)
+
 # EAGLE
 DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST = "meta-llama/Llama-2-7b-chat-hf"
 DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST = "lmsys/sglang-EAGLE-llama2-chat-7B"
@@ -121,7 +126,7 @@ def is_in_ci():
 
 def is_in_amd_ci():
     """Return whether it is in an AMD CI runner."""
-    return get_bool_env_var("SGLANG_AMD_CI")
+    return get_bool_env_var("SGLANG_IS_IN_CI_AMD")
 
 
 def _use_cached_default_models(model_repo: str):
@@ -1802,3 +1807,33 @@ def write_results_to_json(model, metrics, mode="a"):
 
     with open("results.json", "w") as f:
         json.dump(existing_results, f, indent=2)
+
+
+def intel_amx_benchmark(extra_args=None, min_throughput=None):
+    def decorator(test_func):
+        @wraps(test_func)
+        def wrapper(self):
+            common_args = [
+                "--attention-backend",
+                "intel_amx",
+                "--disable-radix",
+                "--trust-remote-code",
+            ]
+            full_args = common_args + (extra_args or [])
+
+            model = test_func(self)
+            prefill_latency, decode_throughput, decode_latency = run_bench_one_batch(
+                model, full_args
+            )
+
+            print(f"{model=}")
+            print(f"{prefill_latency=}")
+            print(f"{decode_throughput=}")
+            print(f"{decode_latency=}")
+
+            if is_in_ci() and min_throughput is not None:
+                self.assertGreater(decode_throughput, min_throughput)
+
+        return wrapper
+
+    return decorator

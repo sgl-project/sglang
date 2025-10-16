@@ -27,7 +27,7 @@ use std::{
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tracing::{info, warn};
+use tracing::warn;
 
 // Import from sibling modules
 use super::conversations::{
@@ -197,6 +197,11 @@ impl OpenAIRouter {
                 Ok(r) => r,
                 Err(e) => {
                     self.circuit_breaker.record_failure();
+                    tracing::error!(
+                        url = %url,
+                        error = %e,
+                        "Failed to forward request to OpenAI"
+                    );
                     return (
                         StatusCode::BAD_GATEWAY,
                         format!("Failed to forward request to OpenAI: {}", e),
@@ -517,12 +522,6 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         model_id: Option<&str>,
     ) -> Response {
         let url = format!("{}/v1/responses", self.base_url);
-
-        info!(
-            requested_store = body.store,
-            is_streaming = body.stream,
-            "openai_responses_request"
-        );
 
         // Validate mutually exclusive params: previous_response_id and conversation
         // TODO: this validation logic should move the right place, also we need a proper error message module

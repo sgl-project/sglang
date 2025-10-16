@@ -100,9 +100,27 @@ pub struct WorkerInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chat_template: Option<String>,
 
+    /// Bootstrap port for prefill workers
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bootstrap_port: Option<u16>,
+
     /// Additional metadata
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub metadata: HashMap<String, String>,
+
+    /// Job status for async operations (if available)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job_status: Option<JobStatus>,
+}
+
+/// Job status for async control plane operations
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobStatus {
+    pub job_type: String,
+    pub worker_url: String,
+    pub status: String,
+    pub message: Option<String>,
+    pub timestamp: u64,
 }
 
 /// Worker list response

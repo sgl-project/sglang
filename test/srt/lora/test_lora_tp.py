@@ -48,7 +48,6 @@ class TestLoRATP(CustomTestCase):
                         model_case,
                         torch_dtype,
                         max_new_tokens=32,
-                        backend="triton",
                         test_tag=f"tp={tp_size}",
                     )
 

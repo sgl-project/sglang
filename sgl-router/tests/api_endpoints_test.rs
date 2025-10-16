@@ -1462,39 +1462,6 @@ mod error_tests {
     }
 
     #[tokio::test]
-    async fn test_missing_required_fields() {
-        let ctx = TestContext::new(vec![MockWorkerConfig {
-            port: 18405,
-            worker_type: WorkerType::Regular,
-            health_status: HealthStatus::Healthy,
-            response_delay_ms: 0,
-            fail_rate: 0.0,
-        }])
-        .await;
-
-        let app = ctx.create_app().await;
-
-        // Missing messages in chat completion
-        let payload = json!({
-            "model": "test-model"
-            // missing "messages"
-        });
-
-        let req = Request::builder()
-            .method("POST")
-            .uri("/v1/chat/completions")
-            .header(CONTENT_TYPE, "application/json")
-            .body(Body::from(serde_json::to_string(&payload).unwrap()))
-            .unwrap();
-
-        let resp = app.oneshot(req).await.unwrap();
-        // Axum validates JSON schema - returns 422 for validation errors
-        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
-
-        ctx.shutdown().await;
-    }
-
-    #[tokio::test]
     async fn test_invalid_model() {
         let ctx = TestContext::new(vec![MockWorkerConfig {
             port: 18406,
@@ -2189,7 +2156,7 @@ mod rerank_tests {
         assert!(body_json.get("model").is_some());
 
         // V1 API should use default model name
-        assert_eq!(body_json["model"], "default");
+        assert_eq!(body_json["model"], "unknown");
 
         let results = body_json["results"].as_array().unwrap();
         assert_eq!(results.len(), 3); // All documents should be returned

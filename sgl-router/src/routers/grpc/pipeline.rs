@@ -877,7 +877,7 @@ impl ResponseProcessingStage {
         }
 
         // Non-streaming: Delegate to ResponseProcessor
-        let request_logprobs = ctx.generate_request().return_logprob;
+        let request_logprobs = ctx.generate_request().return_logprob.unwrap_or(false);
         let generate_request = ctx.generate_request_arc();
 
         let stop_decoder = ctx

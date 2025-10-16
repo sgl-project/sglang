@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import json
 import logging
 import time
 from contextlib import AsyncExitStack
@@ -13,7 +14,6 @@ from typing import TYPE_CHECKING, Any, AsyncGenerator, AsyncIterator, Optional, 
 
 import jinja2
 import openai.types.responses as openai_responses_types
-import orjson
 from fastapi import Request
 from fastapi.responses import ORJSONResponse
 from openai.types.responses import (

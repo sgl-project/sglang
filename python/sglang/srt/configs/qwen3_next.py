@@ -27,12 +27,9 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 logger = logging.get_logger(__name__)
 
 
-# NOTE: HybridLayerType
 class HybridLayerType(enum.Enum):
     full_attention = "attention"
-    swa_attention = "swa_attention"
     linear_attention = "linear_attention"
-    mamba2 = "mamba"
 
 
 class Qwen3NextConfig(PretrainedConfig):

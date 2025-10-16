@@ -1213,7 +1213,7 @@ def point_to_point_pyobj(
     """Send data from src to dst in group using DeviceToDevice communication."""
     # Generic way to get current device for any accelerator ('cuda', 'xpu', 'hpu', etc)
     device_module = torch.get_device_module()
-    current_device = torch.device(device_module.__name__.split(".")[-1])
+    current_device = device_module.current_device()
 
     if rank == src:
         if len(data) == 0:
@@ -3436,3 +3436,16 @@ def cached_triton_kernel(key_fn=None):
         return CachedKernel(fn, key_fn)
 
     return decorator
+
+
+DEFAULT_DETERMINISTIC_INFERENCE_BACKEND_SIZE = 4096
+DEFAULT_DETERMINISTIC_INFERENCE_BACKEND_SIZE_CONFIG = {
+    "flashinfer": (
+        "SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE",
+        DEFAULT_DETERMINISTIC_INFERENCE_BACKEND_SIZE,
+    ),
+    "triton": (
+        "SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE",
+        DEFAULT_DETERMINISTIC_INFERENCE_BACKEND_SIZE,
+    ),
+}

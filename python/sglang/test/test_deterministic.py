@@ -226,10 +226,6 @@ def send_prefix(args, batch_size: int, prompts: List[str]):
 
 
 def test_deterministic(args):
-    # First do some warmups
-    for i in range(3):
-        send_single(args, 16, args.profile)
-
     if args.test_mode == "single":
         # In single mode, we test the deterministic behavior by sending the same prompt in batch sizes ranging from 1 to n_trials.
         texts = []
@@ -277,9 +273,10 @@ def test_deterministic(args):
 
     elif args.test_mode == "prefix":
         # In prefix mode, we create prompts from the same long prompt, with different lengths of common prefix.
-        len_prefix = [1, 511, 2048, 4097]
+        len_prefix = [1, 8000, 10000, 12500]
         num_prompts = len(len_prefix)
         outputs = {i: [] for i in range(4)}
+        assert all(i <= len(LONG_PROMPT) for i in len_prefix)
         prompts = [LONG_PROMPT[: len_prefix[i]] for i in range(4)]
         for i in range(args.n_start, args.n_start + args.n_trials):
             batch_size = i

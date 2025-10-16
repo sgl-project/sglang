@@ -172,14 +172,12 @@ assistant:
 
     let processor = ChatTemplateProcessor::new(template.to_string());
 
-    let messages = vec![
+    let messages = [
         spec::ChatMessage::System {
-            role: "system".to_string(),
             content: "You are helpful".to_string(),
             name: None,
         },
         spec::ChatMessage::User {
-            role: "user".to_string(),
             content: spec::UserMessageContent::Text("Hello".to_string()),
             name: None,
         },
@@ -216,7 +214,6 @@ fn test_chat_template_with_tokens_unit_test() {
     let processor = ChatTemplateProcessor::new(template.to_string());
 
     let messages = [spec::ChatMessage::User {
-        role: "user".to_string(),
         content: spec::UserMessageContent::Text("Test".to_string()),
         name: None,
     }];

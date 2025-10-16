@@ -13,6 +13,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_dp_size,
     is_dp_attention_enabled,
 )
+from sglang.srt.utils import log_info_on_rank0
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -24,6 +25,7 @@ class MoeA2ABackend(Enum):
 
     NONE = "none"
     DEEPEP = "deepep"
+    MOONCAKE = "mooncake"
 
     @classmethod
     def _missing_(cls, value):
@@ -40,6 +42,9 @@ class MoeA2ABackend(Enum):
     def is_deepep(self):
         return self == MoeA2ABackend.DEEPEP
 
+    def is_mooncake(self):
+        return self == MoeA2ABackend.MOONCAKE
+
 
 class MoeRunnerBackend(Enum):
 
@@ -51,6 +56,7 @@ class MoeRunnerBackend(Enum):
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
     FLASHINFER_MXFP4 = "flashinfer_mxfp4"
     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
+    CUTLASS = "cutlass"
 
     def is_auto(self):
         return self == MoeRunnerBackend.AUTO
@@ -75,6 +81,9 @@ class MoeRunnerBackend(Enum):
 
     def is_flashinfer_mxfp4(self):
         return self == MoeRunnerBackend.FLASHINFER_MXFP4
+
+    def is_cutlass(self):
+        return self == MoeRunnerBackend.CUTLASS
 
 
 class DeepEPMode(Enum):
@@ -151,8 +160,9 @@ def get_moe_a2a_backend() -> MoeA2ABackend:
 def get_moe_runner_backend() -> MoeRunnerBackend:
     global MOE_RUNNER_BACKEND
     if MOE_RUNNER_BACKEND is None:
-        logger.warning(
-            "MOE_RUNNER_BACKEND is not initialized, the backend will be automatically selected"
+        log_info_on_rank0(
+            logger,
+            "MOE_RUNNER_BACKEND is not initialized, the backend will be automatically selected",
         )
         MOE_RUNNER_BACKEND = MoeRunnerBackend.AUTO
     return MOE_RUNNER_BACKEND

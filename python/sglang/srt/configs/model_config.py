@@ -25,7 +25,7 @@ from transformers import PretrainedConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, retry
 from sglang.srt.utils.hf_transformers_utils import (
     get_config,
     get_context_length,
@@ -492,7 +492,16 @@ class ModelConfig:
                     from huggingface_hub import HfApi, hf_hub_download
 
                     hf_api = HfApi()
-                    if hf_api.file_exists(self.model_path, "hf_quant_config.json"):
+                    # Retry HF API call up to 3 times
+                    file_exists = retry(
+                        lambda: hf_api.file_exists(
+                            self.model_path, "hf_quant_config.json"
+                        ),
+                        max_retry=2,
+                        initial_delay=1.0,
+                        max_delay=5.0,
+                    )
+                    if file_exists:
                         # Download and parse the quantization config for remote models
                         quant_config_file = hf_hub_download(
                             repo_id=self.model_path,
@@ -506,7 +515,10 @@ class ModelConfig:
                     logger.warning(
                         "Offline mode is enabled, skipping hf_quant_config.json check"
                     )
-                    pass
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to check hf_quant_config.json: {self.model_path} {e}"
+                    )
             elif os.path.exists(os.path.join(self.model_path, "hf_quant_config.json")):
                 quant_config_file = os.path.join(
                     self.model_path, "hf_quant_config.json"

@@ -49,9 +49,9 @@ pub fn create_tokenizer_with_chat_template(
     if path.is_dir() {
         let tokenizer_json = path.join("tokenizer.json");
         if tokenizer_json.exists() {
-            let chat_template_path = chat_template_path
-                .map(|s| s.to_string())
-                .or_else(|| discover_chat_template_in_dir(path));
+            // Resolve chat template: provided path takes precedence over auto-discovery
+            let final_chat_template =
+                resolve_and_log_chat_template(chat_template_path, path, file_path);
             let tokenizer_path_str = tokenizer_json.to_str().ok_or_else(|| {
                 Error::msg(format!(
                     "Tokenizer path is not valid UTF-8: {:?}",
@@ -60,7 +60,7 @@ pub fn create_tokenizer_with_chat_template(
             })?;
             return create_tokenizer_with_chat_template(
                 tokenizer_path_str,
-                chat_template_path.as_deref(),
+                final_chat_template.as_deref(),
             );
         }
 

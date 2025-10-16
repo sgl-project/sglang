@@ -71,6 +71,31 @@ pub fn init_metrics() {
         "Total requests processed by each worker"
     );
 
+    describe_gauge!(
+        "sgl_router_job_queue_depth",
+        "Current number of pending jobs in the queue"
+    );
+    describe_histogram!(
+        "sgl_router_job_duration_seconds",
+        "Job processing duration in seconds by job type"
+    );
+    describe_counter!(
+        "sgl_router_job_success_total",
+        "Total successful job completions by job type"
+    );
+    describe_counter!(
+        "sgl_router_job_failure_total",
+        "Total failed job completions by job type"
+    );
+    describe_counter!(
+        "sgl_router_job_queue_full_total",
+        "Total number of jobs rejected due to queue full"
+    );
+    describe_counter!(
+        "sgl_router_job_shutdown_rejected_total",
+        "Total number of jobs rejected due to shutdown"
+    );
+
     describe_counter!(
         "sgl_router_policy_decisions_total",
         "Total routing policy decisions by policy and worker"

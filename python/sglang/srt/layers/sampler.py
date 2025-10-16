@@ -27,7 +27,7 @@ if is_cuda():
 logger = logging.getLogger(__name__)
 
 SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
-RETURN_ORIGINAL_LOGPROB = get_bool_env_var("RETURN_ORIGINAL_LOGPROB")
+SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
 
 
 class Sampler(nn.Module):
@@ -99,7 +99,7 @@ class Sampler(nn.Module):
             )
 
             # If requested, cache probabilities from original logits before temperature scaling.
-            if return_logprob and RETURN_ORIGINAL_LOGPROB:
+            if return_logprob and SGLANG_RETURN_ORIGINAL_LOGPROB:
                 probs_without_temp_scaling = torch.softmax(logits, dim=-1)
 
             # Post process logits
@@ -149,7 +149,7 @@ class Sampler(nn.Module):
 
             if return_logprob:
                 # clamp to avoid -inf
-                if RETURN_ORIGINAL_LOGPROB:
+                if SGLANG_RETURN_ORIGINAL_LOGPROB:
                     logprobs = torch.log(probs_without_temp_scaling).clamp(
                         min=torch.finfo(probs_without_temp_scaling.dtype).min
                     )
