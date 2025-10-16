@@ -18,6 +18,7 @@ processes (TokenizerManager, DetokenizerManager, Scheduler).
 
 import copy
 import uuid
+from abc import ABC
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
@@ -35,6 +36,30 @@ else:
     Image = Any
 
 
+@dataclass
+class BaseReq(ABC):
+    rid: Optional[Union[str, List[str]]] = field(default=None, kw_only=True)
+
+    def regenerate_rid(self):
+        """Generate a new request ID and return it."""
+        if isinstance(self.rid, list):
+            self.rid = [uuid.uuid4().hex for _ in range(len(self.rid))]
+        else:
+            self.rid = uuid.uuid4().hex
+        return self.rid
+
+
+@dataclass
+class BaseBatchReq(ABC):
+    rids: Optional[List[str]] = field(default=None, kw_only=True)
+
+    def regenerate_rids(self):
+        """Generate new request IDs and return them."""
+        self.rids = [uuid.uuid4().hex for _ in range(len(self.rids))]
+        return self.rids
+
+
+# Parameters for a session
 @dataclass
 class SessionParams:
     id: Optional[str] = None
@@ -62,7 +87,7 @@ MultimodalDataInputFormat = Union[
 
 
 @dataclass
-class GenerateReqInput:
+class GenerateReqInput(BaseReq):
     # The input prompt. It can be a single prompt or a batch of prompts.
     text: Optional[Union[List[str], str]] = None
     # The token ids for text; one can specify either text or input_ids
@@ -82,8 +107,6 @@ class GenerateReqInput:
     audio_data: Optional[MultimodalDataInputFormat] = None
     # The sampling_params. See descriptions below.
     sampling_params: Optional[Union[List[Dict], Dict]] = None
-    # The request id.
-    rid: Optional[Union[List[str], str]] = None
     # Whether to return logprobs.
     return_logprob: Optional[Union[List[bool], bool]] = None
     # If return logprobs, the start location in the prompt for returning logprobs.
@@ -132,14 +155,23 @@ class GenerateReqInput:
     # Conversation id used for tracking requests
     conversation_id: Optional[str] = None
 
-    # Label for the request
-    label: Optional[str] = None
-
     # Priority for the request
     priority: Optional[int] = None
 
-    # Image gen grpc migration
+    # Extra key for classifying the request (e.g. cache_salt)
+    extra_key: Optional[Union[List[str], str]] = None
+
+    # Whether to disallow logging for this request (e.g. due to ZDR)
+    no_logs: bool = False
+
+    # For custom metric labels
+    custom_labels: Optional[Dict[str, str]] = None
+
+    # (Internal) Whether to return bytes for image generation
     return_bytes: bool = False
+
+    # Whether to return entropy
+    return_entropy: bool = False
 
     def contains_mm_input(self) -> bool:
         return (
@@ -482,11 +514,6 @@ class GenerateReqInput:
             ):
                 raise ValueError("Session params must be a dict or a list of dicts.")
 
-    def regenerate_rid(self):
-        """Generate a new request ID and return it."""
-        self.rid = uuid.uuid4().hex
-        return self.rid
-
     def __getitem__(self, i):
         return GenerateReqInput(
             text=self.text[i] if self.text is not None else None,
@@ -539,16 +566,17 @@ class GenerateReqInput:
                 self.data_parallel_rank if self.data_parallel_rank is not None else None
             ),
             conversation_id=self.conversation_id,
-            label=self.label,
             priority=self.priority,
+            extra_key=self.extra_key,
+            no_logs=self.no_logs,
+            custom_labels=self.custom_labels,
             return_bytes=self.return_bytes,
+            return_entropy=self.return_entropy,
         )
 
 
 @dataclass
-class TokenizedGenerateReqInput:
-    # The request id
-    rid: str
+class TokenizedGenerateReqInput(BaseReq):
     # The input text
     input_text: str
     # The input token ids
@@ -567,6 +595,7 @@ class TokenizedGenerateReqInput:
     token_ids_logprob: List[int]
     # Whether to stream output
     stream: bool
+
     # Whether to return hidden states
     return_hidden_states: bool = False
 
@@ -593,21 +622,27 @@ class TokenizedGenerateReqInput:
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
 
-    # For dp balance
-    dp_balance_id: int = -1
-
-    # Label for the request
-    label: Optional[str] = None
-
     # Priority for the request
     priority: Optional[int] = None
 
-    # Image gen grpc migration
+    # Extra key for classifying the request (e.g. cache_salt)
+    extra_key: Optional[str] = None
+
+    # Whether to disallow logging for this request (e.g. due to ZDR)
+    no_logs: bool = False
+
+    # tracing context
+    trace_context: Optional[Dict] = None
+
+    # (Internal) Whether to return bytes for image generation
     return_bytes: bool = False
+
+    # Whether to return entropy
+    return_entropy: bool = False
 
 
 @dataclass
-class BatchTokenizedGenerateReqInput:
+class BatchTokenizedGenerateReqInput(BaseBatchReq):
     # The batch of tokenized requests
     batch: List[TokenizedGenerateReqInput]
 
@@ -622,7 +657,7 @@ class BatchTokenizedGenerateReqInput:
 
 
 @dataclass
-class EmbeddingReqInput:
+class EmbeddingReqInput(BaseReq):
     # The input prompt. It can be a single prompt or a batch of prompts.
     text: Optional[Union[List[List[str]], List[str], str]] = None
     # The image input. It can be an image instance, file name, URL, or base64 encoded string.
@@ -638,8 +673,6 @@ class EmbeddingReqInput:
     audio_data: Optional[MultimodalDataInputFormat] = None
     # The token ids for text; one can either specify text or input_ids.
     input_ids: Optional[Union[List[List[int]], List[int]]] = None
-    # The request id.
-    rid: Optional[Union[List[str], str]] = None
     # Dummy sampling params for compatibility
     sampling_params: Optional[Union[List[Dict], Dict]] = None
     # Dummy input embeds for compatibility
@@ -650,9 +683,14 @@ class EmbeddingReqInput:
     modalities: Optional[List[str]] = None
     # For cross-encoder requests
     is_cross_encoder_request: bool = False
+    # Priority for the request
+    priority: Optional[int] = None
 
     # For background responses (OpenAI responses API)
     background: bool = False
+
+    # tracing context
+    trace_context: Optional[Dict] = None
 
     def normalize_batch_and_arguments(self):
         # at least one of text, input_ids, or image should be provided
@@ -705,10 +743,6 @@ class EmbeddingReqInput:
             for i in range(self.batch_size):
                 self.sampling_params[i]["max_new_tokens"] = 0
 
-    def regenerate_rid(self):
-        self.rid = uuid.uuid4().hex
-        return self.rid
-
     def contains_mm_input(self) -> bool:
         return (
             has_valid_data(self.image_data)
@@ -737,9 +771,7 @@ class EmbeddingReqInput:
 
 
 @dataclass
-class TokenizedEmbeddingReqInput:
-    # The request id
-    rid: str
+class TokenizedEmbeddingReqInput(BaseReq):
     # The input text
     input_text: str
     # The input token ids
@@ -752,12 +784,12 @@ class TokenizedEmbeddingReqInput:
     sampling_params: SamplingParams
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
-    # For dp balance
-    dp_balance_id: int = -1
+    # Priority for the request
+    priority: Optional[int] = None
 
 
 @dataclass
-class BatchTokenizedEmbeddingReqInput:
+class BatchTokenizedEmbeddingReqInput(BaseBatchReq):
     # The batch of tokenized embedding requests
     batch: List[TokenizedEmbeddingReqInput]
 
@@ -772,9 +804,7 @@ class BatchTokenizedEmbeddingReqInput:
 
 
 @dataclass
-class BatchTokenIDOut:
-    # The request id
-    rids: List[str]
+class BatchTokenIDOutput(BaseBatchReq):
     # The finish reason
     finished_reasons: List[BaseFinishReason]
     # For incremental decoding
@@ -793,6 +823,7 @@ class BatchTokenIDOut:
     completion_tokens: List[int]
     cached_tokens: List[int]
     spec_verify_ct: List[int]
+    spec_accepted_tokens: List[int]
 
     # Logprobs
     input_token_logprobs_val: List[float]
@@ -807,6 +838,7 @@ class BatchTokenIDOut:
     input_token_ids_logprobs_idx: List[List]
     output_token_ids_logprobs_val: List[List]
     output_token_ids_logprobs_idx: List[List]
+    output_token_entropy_val: List[float]
 
     # Hidden states
     output_hidden_states: List[List[float]]
@@ -817,9 +849,12 @@ class BatchTokenIDOut:
     placeholder_tokens_idx: List[Optional[List[int]]]
     placeholder_tokens_val: List[Optional[List[int]]]
 
+    # The trainer step id. Used to know which step's weights are used for sampling.
+    token_steps: List[List[int]] = None
+
 
 @dataclass
-class BatchMultimodalDecodeReq:
+class BatchMultimodalDecodeReq(BaseBatchReq):
     decoded_ids: List[int]
     input_token_logprobs_val: List[float]
     input_token_logprobs_idx: List[int]
@@ -831,8 +866,6 @@ class BatchMultimodalDecodeReq:
     image_resolutions: List[List[int]]
     resize_image_resolutions: List[List[int]]
 
-    # The request id
-    rids: List[str]
     finished_reasons: List[BaseFinishReason]
 
     # Token counts
@@ -840,17 +873,18 @@ class BatchMultimodalDecodeReq:
     completion_tokens: List[int]
     cached_tokens: List[int]
 
-    # Placeholder token info
+    # The information of placeholder tokens (e.g., image token)
+    # idx is the index of the token in the prompt after expansion.
+    # val is the length of padded tokens after expansion.
     placeholder_tokens_idx: List[Optional[List[int]]]
     placeholder_tokens_val: List[Optional[List[int]]]
 
-    return_bytes: bool = False
+    # The trainer step id. Used to know which step's weights are used for sampling.
+    token_steps: List[List[int]] = None
 
 
 @dataclass
-class BatchStrOut:
-    # The request id
-    rids: List[str]
+class BatchStrOutput(BaseBatchReq):
     # The finish reason
     finished_reasons: List[dict]
     # The output decoded strings
@@ -863,6 +897,7 @@ class BatchStrOut:
     completion_tokens: List[int]
     cached_tokens: List[int]
     spec_verify_ct: List[int]
+    spec_accepted_tokens: List[int]
 
     # Logprobs
     input_token_logprobs_val: List[float]
@@ -877,18 +912,23 @@ class BatchStrOut:
     input_token_ids_logprobs_idx: List[List]
     output_token_ids_logprobs_val: List[List]
     output_token_ids_logprobs_idx: List[List]
+    output_token_entropy_val: List[float]
 
     # Hidden states
     output_hidden_states: List[List[float]]
 
+    # The information of placeholder tokens (e.g., image token)
+    # idx is the index of the token in the prompt after expansion.
+    # val is the length of padded tokens after expansion.
     placeholder_tokens_idx: List[Optional[List[int]]]
     placeholder_tokens_val: List[Optional[List[int]]]
 
+    # The trainer step id. Used to know which step's weights are used for sampling.
+    token_steps: List[List[int]] = None
+
 
 @dataclass
-class BatchMultimodalOut:
-    # The request id
-    rids: List[str]
+class BatchMultimodalOutput(BaseBatchReq):
     # The finish reason
     finished_reasons: List[dict]
     decoded_ids: List[List[int]]
@@ -913,9 +953,7 @@ class BatchMultimodalOut:
 
 
 @dataclass
-class BatchEmbeddingOut:
-    # The request id
-    rids: List[str]
+class BatchEmbeddingOutput(BaseBatchReq):
     # The finish reason
     finished_reasons: List[BaseFinishReason]
     # The output embedding
@@ -929,27 +967,27 @@ class BatchEmbeddingOut:
 
 
 @dataclass
-class ClearHiCacheReqInput:
+class ClearHiCacheReqInput(BaseReq):
     pass
 
 
 @dataclass
-class ClearHiCacheReqOutput:
+class ClearHiCacheReqOutput(BaseReq):
     success: bool
 
 
 @dataclass
-class FlushCacheReqInput:
+class FlushCacheReqInput(BaseReq):
     pass
 
 
 @dataclass
-class FlushCacheReqOutput:
+class FlushCacheReqOutput(BaseReq):
     success: bool
 
 
 @dataclass
-class UpdateWeightFromDiskReqInput:
+class UpdateWeightFromDiskReqInput(BaseReq):
     # The model path with the new weights
     model_path: str
     # The format to load the weights
@@ -964,10 +1002,12 @@ class UpdateWeightFromDiskReqInput:
     torch_empty_cache: bool = False
     # Whether to keep the scheduler paused after weight update
     keep_pause: bool = False
+    # The trainer step id. Used to know which step's weights are used for sampling.
+    token_step: int = 0
 
 
 @dataclass
-class UpdateWeightFromDiskReqOutput:
+class UpdateWeightFromDiskReqOutput(BaseReq):
     success: bool
     message: str
     # Number of paused requests during weight sync.
@@ -975,7 +1015,7 @@ class UpdateWeightFromDiskReqOutput:
 
 
 @dataclass
-class UpdateWeightsFromDistributedReqInput:
+class UpdateWeightsFromDistributedReqInput(BaseReq):
     names: List[str]
     dtypes: List[str]
     shapes: List[List[int]]
@@ -990,13 +1030,13 @@ class UpdateWeightsFromDistributedReqInput:
 
 
 @dataclass
-class UpdateWeightsFromDistributedReqOutput:
+class UpdateWeightsFromDistributedReqOutput(BaseReq):
     success: bool
     message: str
 
 
 @dataclass
-class UpdateWeightsFromTensorReqInput:
+class UpdateWeightsFromTensorReqInput(BaseReq):
     """Update model weights from tensor input.
 
     - Tensors are serialized for transmission
@@ -1015,13 +1055,51 @@ class UpdateWeightsFromTensorReqInput:
 
 
 @dataclass
-class UpdateWeightsFromTensorReqOutput:
+class UpdateWeightsFromTensorReqOutput(BaseReq):
     success: bool
     message: str
 
 
 @dataclass
-class InitWeightsUpdateGroupReqInput:
+class InitWeightsSendGroupForRemoteInstanceReqInput(BaseReq):
+    # The master address
+    master_address: str
+    # The ports for each rank's communication group
+    ports: str
+    # The rank in the communication group
+    group_rank: int
+    # The world size
+    world_size: int
+    # The group name
+    group_name: str = "weight_send_group"
+    # The backend
+    backend: str = "nccl"
+
+
+@dataclass
+class InitWeightsSendGroupForRemoteInstanceReqOutput(BaseReq):
+    success: bool
+    message: str
+
+
+@dataclass
+class SendWeightsToRemoteInstanceReqInput(BaseReq):
+    # The master address
+    master_address: str
+    # The ports for each rank's communication group
+    ports: str
+    # The group name
+    group_name: str = "weight_send_group"
+
+
+@dataclass
+class SendWeightsToRemoteInstanceReqOutput(BaseReq):
+    success: bool
+    message: str
+
+
+@dataclass
+class InitWeightsUpdateGroupReqInput(BaseReq):
     # The master address
     master_address: str
     # The master port
@@ -1037,13 +1115,24 @@ class InitWeightsUpdateGroupReqInput:
 
 
 @dataclass
-class InitWeightsUpdateGroupReqOutput:
+class InitWeightsUpdateGroupReqOutput(BaseReq):
     success: bool
     message: str
 
 
 @dataclass
-class UpdateWeightVersionReqInput:
+class DestroyWeightsUpdateGroupReqInput(BaseReq):
+    group_name: str = "weight_update_group"
+
+
+@dataclass
+class DestroyWeightsUpdateGroupReqOutput(BaseReq):
+    success: bool
+    message: str
+
+
+@dataclass
+class UpdateWeightVersionReqInput(BaseReq):
     # The new weight version
     new_version: str
     # Whether to abort all running requests before updating
@@ -1051,89 +1140,87 @@ class UpdateWeightVersionReqInput:
 
 
 @dataclass
-class GetWeightsByNameReqInput:
+class GetWeightsByNameReqInput(BaseReq):
     name: str
     truncate_size: int = 100
 
 
 @dataclass
-class GetWeightsByNameReqOutput:
+class GetWeightsByNameReqOutput(BaseReq):
     parameter: list
 
 
 @dataclass
-class ReleaseMemoryOccupationReqInput:
+class ReleaseMemoryOccupationReqInput(BaseReq):
     # Optional tags to identify the memory region, which is primarily used for RL
     # Currently we only support `weights` and `kv_cache`
     tags: Optional[List[str]] = None
 
 
 @dataclass
-class ReleaseMemoryOccupationReqOutput:
+class ReleaseMemoryOccupationReqOutput(BaseReq):
     pass
 
 
 @dataclass
-class ResumeMemoryOccupationReqInput:
+class ResumeMemoryOccupationReqInput(BaseReq):
     # Optional tags to identify the memory region, which is primarily used for RL
     # Currently we only support `weights` and `kv_cache`
     tags: Optional[List[str]] = None
 
 
 @dataclass
-class ResumeMemoryOccupationReqOutput:
+class ResumeMemoryOccupationReqOutput(BaseReq):
     pass
 
 
 @dataclass
-class SlowDownReqInput:
+class SlowDownReqInput(BaseReq):
     forward_sleep_time: Optional[float]
 
 
 @dataclass
-class SlowDownReqOutput:
+class SlowDownReqOutput(BaseReq):
     pass
 
 
 @dataclass
-class AbortReq:
-    # The request id
-    rid: str = ""
+class AbortReq(BaseReq):
     # Whether to abort all requests
     abort_all: bool = False
     # The finished reason data
     finished_reason: Optional[Dict[str, Any]] = None
     abort_reason: Optional[str] = None
-    # used in MultiTokenzierManager mode
-    rids: Optional[Union[List[str], str]] = None
 
     def __post_init__(self):
-        self.rids = self.rid
+        # FIXME: This is a hack to keep the same with the old code
+        if self.rid is None:
+            self.rid = ""
 
 
 @dataclass
-class GetInternalStateReq:
+class GetInternalStateReq(BaseReq):
     pass
 
 
 @dataclass
-class GetInternalStateReqOutput:
+class GetInternalStateReqOutput(BaseReq):
     internal_state: Dict[Any, Any]
 
 
 @dataclass
-class SetInternalStateReq:
+class SetInternalStateReq(BaseReq):
     server_args: Dict[str, Any]
 
 
 @dataclass
-class SetInternalStateReqOutput:
+class SetInternalStateReqOutput(BaseReq):
     updated: bool
     server_args: Dict[str, Any]
 
 
 @dataclass
-class ProfileReqInput:
+class ProfileReqInput(BaseReq):
     # The output directory
     output_dir: Optional[str] = None
     # If set, it profile as many as this number of steps.
@@ -1145,6 +1232,8 @@ class ProfileReqInput:
     profile_by_stage: bool = False
     with_stack: Optional[bool] = None
     record_shapes: Optional[bool] = None
+    # Merge profiles from all ranks into a single trace
+    merge_profiles: bool = False
 
 
 class ProfileReqType(Enum):
@@ -1153,7 +1242,7 @@ class ProfileReqType(Enum):
 
 
 @dataclass
-class ProfileReq:
+class ProfileReq(BaseReq):
     type: ProfileReqType
     output_dir: Optional[str] = None
     start_step: Optional[int] = None
@@ -1163,21 +1252,23 @@ class ProfileReq:
     with_stack: Optional[bool] = None
     record_shapes: Optional[bool] = None
     profile_id: Optional[str] = None
+    # Merge profiles from all ranks into a single trace
+    merge_profiles: bool = False
 
 
 @dataclass
-class ProfileReqOutput:
+class ProfileReqOutput(BaseReq):
     success: bool
     message: str
 
 
 @dataclass
-class FreezeGCReq:
+class FreezeGCReq(BaseReq):
     pass
 
 
 @dataclass
-class ConfigureLoggingReq:
+class ConfigureLoggingReq(BaseReq):
     log_requests: Optional[bool] = None
     log_requests_level: Optional[int] = None
     dump_requests_folder: Optional[str] = None
@@ -1186,35 +1277,39 @@ class ConfigureLoggingReq:
 
 
 @dataclass
-class OpenSessionReqInput:
+class OpenSessionReqInput(BaseReq):
     capacity_of_str_len: int
     session_id: Optional[str] = None
 
 
 @dataclass
-class CloseSessionReqInput:
+class CloseSessionReqInput(BaseReq):
     session_id: str
 
 
 @dataclass
-class OpenSessionReqOutput:
+class OpenSessionReqOutput(BaseReq):
     session_id: Optional[str]
     success: bool
 
 
 @dataclass
-class HealthCheckOutput:
+class HealthCheckOutput(BaseReq):
     pass
 
 
-class ExpertDistributionReq(Enum):
+class ExpertDistributionReqType(Enum):
     START_RECORD = 1
     STOP_RECORD = 2
     DUMP_RECORD = 3
 
 
+class ExpertDistributionReq(BaseReq):
+    action: ExpertDistributionReqType
+
+
 @dataclass
-class ExpertDistributionReqOutput:
+class ExpertDistributionReqOutput(BaseReq):
     pass
 
 
@@ -1232,7 +1327,7 @@ class Tool:
 
 
 @dataclass
-class ParseFunctionCallReq:
+class ParseFunctionCallReq(BaseReq):
     text: str  # The text to parse.
     tools: List[Tool] = field(
         default_factory=list
@@ -1243,31 +1338,31 @@ class ParseFunctionCallReq:
 
 
 @dataclass
-class SeparateReasoningReqInput:
+class SeparateReasoningReqInput(BaseReq):
     text: str  # The text to parse.
     reasoning_parser: str  # Specify the parser type, e.g., "deepseek-r1".
 
 
 @dataclass
-class VertexGenerateReqInput:
+class VertexGenerateReqInput(BaseReq):
     instances: List[dict]
     parameters: Optional[dict] = None
 
 
 @dataclass
-class RpcReqInput:
+class RpcReqInput(BaseReq):
     method: str
     parameters: Optional[Dict] = None
 
 
 @dataclass
-class RpcReqOutput:
+class RpcReqOutput(BaseReq):
     success: bool
     message: str
 
 
 @dataclass
-class LoadLoRAAdapterReqInput:
+class LoadLoRAAdapterReqInput(BaseReq):
     # The name of the lora module to newly loaded.
     lora_name: str
     # The path of loading.
@@ -1287,7 +1382,7 @@ class LoadLoRAAdapterReqInput:
 
 
 @dataclass
-class UnloadLoRAAdapterReqInput:
+class UnloadLoRAAdapterReqInput(BaseReq):
     # The name of lora module to unload.
     lora_name: str
     # The unique identifier for the LoRA adapter, which automatically generated in the `TokenizerManager`.
@@ -1301,23 +1396,23 @@ class UnloadLoRAAdapterReqInput:
 
 
 @dataclass
-class LoRAUpdateResult:
+class LoRAUpdateOutput(BaseReq):
     success: bool
     error_message: Optional[str] = None
     loaded_adapters: Optional[Dict[str, LoRARef]] = None
 
 
-LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = LoRAUpdateResult
+LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = LoRAUpdateOutput
 
 
 @dataclass
-class MultiTokenizerRegisterReq:
-    rids: Optional[Union[List[str], str]] = None
+class MultiTokenizerRegisterReq(BaseBatchReq):
     ipc_name: Optional[str] = None
 
 
 @dataclass
 class MultiTokenizerWrapper:
+    # FIXME(lsyin): remove this
     worker_id: int
     obj: Optional[Any] = None
 
@@ -1328,5 +1423,59 @@ class BlockReqType(Enum):
 
 
 @dataclass
-class BlockReqInput:
+class BlockReqInput(BaseReq):
     type: BlockReqType
+
+
+@dataclass
+class GetLoadReqInput(BaseReq):
+    pass
+
+
+@dataclass
+class GetLoadReqOutput(BaseReq):
+    dp_rank: int
+    num_reqs: int
+    num_waiting_reqs: int
+    num_tokens: int
+
+
+@dataclass
+class WatchLoadUpdateReq(BaseReq):
+    loads: List[GetLoadReqOutput]
+
+
+@dataclass
+class LazyDumpTensorsReqInput(BaseReq):
+    pass
+
+
+@dataclass
+class LazyDumpTensorsReqOutput(BaseReq):
+    success: bool
+
+
+def _check_all_req_types():
+    """A helper function to check all request types are defined in this file."""
+    import inspect
+    import sys
+
+    all_classes = inspect.getmembers(sys.modules[__name__], inspect.isclass)
+    for class_type in all_classes:
+        # check its name
+        name = class_type[0]
+        is_io_struct = (
+            name.endswith("Req") or name.endswith("Input") or name.endswith("Output")
+        )
+        is_base_req = issubclass(class_type[1], BaseReq) or issubclass(
+            class_type[1], BaseBatchReq
+        )
+        if is_io_struct and not is_base_req:
+            raise ValueError(f"{name} is not a subclass of BaseReq or BaseBatchReq.")
+        if is_base_req and not is_io_struct:
+            raise ValueError(
+                f"{name} is a subclass of BaseReq but not follow the naming convention."
+            )
+
+
+_check_all_req_types()

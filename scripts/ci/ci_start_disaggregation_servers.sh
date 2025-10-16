@@ -1,4 +1,9 @@
 #!/bin/bash
+set -euo pipefail
+
+# Optional: set DISAGG_READY_FILE to a filepath; when all servers are healthy, the script will
+# create this file as a readiness signal (useful for CI to proceed to next steps).
+DISAGG_READY_FILE="${DISAGG_READY_FILE:-}"
 
 MODEL_PATH="/raid/models/meta-llama/Llama-3.1-8B-Instruct"
 
@@ -81,6 +86,13 @@ while true; do
 
     if [ $HEALTHY_COUNT -eq 8 ]; then
         echo "✅ All 8 servers are healthy!"
+        # Emit readiness signal file if requested
+        if [ -n "$DISAGG_READY_FILE" ]; then
+            echo "Creating readiness flag: $DISAGG_READY_FILE"
+            # Ensure parent dir exists; ignore errors
+            mkdir -p "$(dirname "$DISAGG_READY_FILE")" 2>/dev/null || true
+            touch "$DISAGG_READY_FILE"
+        fi
         break
     else
         sleep 10  # Wait 10 seconds before next check

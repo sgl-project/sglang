@@ -4,8 +4,9 @@ pub mod logging;
 use std::collections::HashMap;
 
 pub mod core;
+pub mod data_connector;
 #[cfg(feature = "grpc-client")]
-pub mod grpc;
+pub mod grpc_client;
 pub mod mcp;
 pub mod metrics;
 pub mod middleware;
@@ -27,6 +28,113 @@ pub enum PolicyType {
     RoundRobin,
     CacheAware,
     PowerOfTwo,
+}
+
+#[pyclass(eq)]
+#[derive(Clone, PartialEq, Debug)]
+pub enum BackendType {
+    Sglang,
+    Openai,
+}
+
+#[pyclass(eq)]
+#[derive(Clone, PartialEq, Debug)]
+pub enum HistoryBackendType {
+    Memory,
+    None,
+    Oracle,
+}
+
+#[pyclass]
+#[derive(Clone, PartialEq)]
+pub struct PyOracleConfig {
+    #[pyo3(get, set)]
+    pub wallet_path: Option<String>,
+    #[pyo3(get, set)]
+    pub connect_descriptor: Option<String>,
+    #[pyo3(get, set)]
+    pub username: Option<String>,
+    #[pyo3(get, set)]
+    pub password: Option<String>,
+    #[pyo3(get, set)]
+    pub pool_min: usize,
+    #[pyo3(get, set)]
+    pub pool_max: usize,
+    #[pyo3(get, set)]
+    pub pool_timeout_secs: u64,
+}
+
+impl std::fmt::Debug for PyOracleConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PyOracleConfig")
+            .field("wallet_path", &self.wallet_path)
+            .field("connect_descriptor", &"<redacted>")
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .field("pool_min", &self.pool_min)
+            .field("pool_max", &self.pool_max)
+            .field("pool_timeout_secs", &self.pool_timeout_secs)
+            .finish()
+    }
+}
+
+#[pymethods]
+impl PyOracleConfig {
+    #[new]
+    #[pyo3(signature = (
+        password = None,
+        username = None,
+        connect_descriptor = None,
+        wallet_path = None,
+        pool_min = 1,
+        pool_max = 16,
+        pool_timeout_secs = 30,
+    ))]
+    fn new(
+        password: Option<String>,
+        username: Option<String>,
+        connect_descriptor: Option<String>,
+        wallet_path: Option<String>,
+        pool_min: usize,
+        pool_max: usize,
+        pool_timeout_secs: u64,
+    ) -> PyResult<Self> {
+        if pool_min == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "pool_min must be at least 1",
+            ));
+        }
+        if pool_max < pool_min {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "pool_max must be >= pool_min",
+            ));
+        }
+
+        Ok(PyOracleConfig {
+            wallet_path,
+            connect_descriptor,
+            username,
+            password,
+            pool_min,
+            pool_max,
+            pool_timeout_secs,
+        })
+    }
+}
+
+impl PyOracleConfig {
+    fn to_config_oracle(&self) -> config::OracleConfig {
+        // Simple conversion - validation happens later in validate_oracle()
+        config::OracleConfig {
+            wallet_path: self.wallet_path.clone(),
+            connect_descriptor: self.connect_descriptor.clone().unwrap_or_default(),
+            username: self.username.clone().unwrap_or_default(),
+            password: self.password.clone().unwrap_or_default(),
+            pool_min: self.pool_min,
+            pool_max: self.pool_max,
+            pool_timeout_secs: self.pool_timeout_secs,
+        }
+    }
 }
 
 #[pyclass]
@@ -64,60 +172,55 @@ struct Router {
     decode_urls: Option<Vec<String>>,
     prefill_policy: Option<PolicyType>,
     decode_policy: Option<PolicyType>,
-    max_concurrent_requests: usize,
+    max_concurrent_requests: i32,
     cors_allowed_origins: Vec<String>,
-    // Retry configuration
     retry_max_retries: u32,
     retry_initial_backoff_ms: u64,
     retry_max_backoff_ms: u64,
     retry_backoff_multiplier: f32,
     retry_jitter_factor: f32,
     disable_retries: bool,
-    // Circuit breaker configuration
     cb_failure_threshold: u32,
     cb_success_threshold: u32,
     cb_timeout_duration_secs: u64,
     cb_window_duration_secs: u64,
     disable_circuit_breaker: bool,
-    // Health check configuration
     health_failure_threshold: u32,
     health_success_threshold: u32,
     health_check_timeout_secs: u64,
     health_check_interval_secs: u64,
     health_check_endpoint: String,
-    // IGW (Inference Gateway) configuration
     enable_igw: bool,
     queue_size: usize,
     queue_timeout_secs: u64,
-    rate_limit_tokens_per_second: Option<usize>,
-    // Connection mode (determined from worker URLs)
+    rate_limit_tokens_per_second: Option<i32>,
     connection_mode: config::ConnectionMode,
-    // Model path for tokenizer
     model_path: Option<String>,
-    // Explicit tokenizer path
     tokenizer_path: Option<String>,
+    chat_template: Option<String>,
+    reasoning_parser: Option<String>,
+    tool_call_parser: Option<String>,
+    backend: BackendType,
+    history_backend: HistoryBackendType,
+    oracle_config: Option<PyOracleConfig>,
 }
 
 impl Router {
     /// Determine connection mode from worker URLs
     fn determine_connection_mode(worker_urls: &[String]) -> config::ConnectionMode {
-        // Only consider it gRPC if explicitly specified with grpc:// or grpcs:// scheme
         for url in worker_urls {
             if url.starts_with("grpc://") || url.starts_with("grpcs://") {
                 return config::ConnectionMode::Grpc;
             }
         }
-        // Default to HTTP for all other cases (including http://, https://, or no scheme)
         config::ConnectionMode::Http
     }
 
-    /// Convert PyO3 Router to RouterConfig
     pub fn to_router_config(&self) -> config::ConfigResult<config::RouterConfig> {
         use config::{
             DiscoveryConfig, MetricsConfig, PolicyConfig as ConfigPolicyConfig, RoutingMode,
         };
 
-        // Convert policy helper function
         let convert_policy = |policy: &PolicyType| -> ConfigPolicyConfig {
             match policy {
                 PolicyType::Random => ConfigPolicyConfig::Random,
@@ -130,16 +233,18 @@ impl Router {
                     max_tree_size: self.max_tree_size,
                 },
                 PolicyType::PowerOfTwo => ConfigPolicyConfig::PowerOfTwo {
-                    load_check_interval_secs: 5, // Default value
+                    load_check_interval_secs: 5,
                 },
             }
         };
 
-        // Determine routing mode
         let mode = if self.enable_igw {
-            // IGW mode - routing mode is not used in IGW, but we need to provide a placeholder
             RoutingMode::Regular {
                 worker_urls: vec![],
+            }
+        } else if matches!(self.backend, BackendType::Openai) {
+            RoutingMode::OpenAI {
+                worker_urls: self.worker_urls.clone(),
             }
         } else if self.pd_disaggregation {
             RoutingMode::PrefillDecode {
@@ -154,10 +259,8 @@ impl Router {
             }
         };
 
-        // Convert main policy
         let policy = convert_policy(&self.policy);
 
-        // Service discovery configuration
         let discovery = if self.service_discovery {
             Some(DiscoveryConfig {
                 enabled: true,
@@ -173,13 +276,26 @@ impl Router {
             None
         };
 
-        // Metrics configuration
         let metrics = match (self.prometheus_port, self.prometheus_host.as_ref()) {
             (Some(port), Some(host)) => Some(MetricsConfig {
                 port,
                 host: host.clone(),
             }),
             _ => None,
+        };
+
+        let history_backend = match self.history_backend {
+            HistoryBackendType::Memory => config::HistoryBackend::Memory,
+            HistoryBackendType::None => config::HistoryBackend::None,
+            HistoryBackendType::Oracle => config::HistoryBackend::Oracle,
+        };
+
+        let oracle = if matches!(self.history_backend, HistoryBackendType::Oracle) {
+            self.oracle_config
+                .as_ref()
+                .map(|cfg| cfg.to_config_oracle())
+        } else {
+            None
         };
 
         Ok(config::RouterConfig {
@@ -229,6 +345,11 @@ impl Router {
             enable_igw: self.enable_igw,
             model_path: self.model_path.clone(),
             tokenizer_path: self.tokenizer_path.clone(),
+            chat_template: self.chat_template.clone(),
+            history_backend,
+            oracle,
+            reasoning_parser: self.reasoning_parser.clone(),
+            tool_call_parser: self.tool_call_parser.clone(),
         })
     }
 }
@@ -239,7 +360,7 @@ impl Router {
     #[pyo3(signature = (
         worker_urls,
         policy = PolicyType::RoundRobin,
-        host = String::from("127.0.0.1"),
+        host = String::from("0.0.0.0"),
         port = 3001,
         worker_startup_timeout_secs = 600,
         worker_startup_check_interval = 30,
@@ -248,7 +369,7 @@ impl Router {
         balance_rel_threshold = 1.5,
         eviction_interval_secs = 120,
         max_tree_size = 2usize.pow(26),
-        max_payload_size = 512 * 1024 * 1024,  // 512MB default for large batches
+        max_payload_size = 512 * 1024 * 1024,
         dp_aware = false,
         api_key = None,
         log_dir = None,
@@ -262,42 +383,43 @@ impl Router {
         bootstrap_port_annotation = String::from("sglang.ai/bootstrap-port"),
         prometheus_port = None,
         prometheus_host = None,
-        request_timeout_secs = 1800,  // Add configurable request timeout
-        request_id_headers = None,  // Custom request ID headers
-        pd_disaggregation = false,  // New flag for PD mode
+        request_timeout_secs = 1800,
+        request_id_headers = None,
+        pd_disaggregation = false,
         prefill_urls = None,
         decode_urls = None,
         prefill_policy = None,
         decode_policy = None,
-        max_concurrent_requests = 256,
+        max_concurrent_requests = -1,
         cors_allowed_origins = vec![],
-        // Retry defaults
         retry_max_retries = 5,
         retry_initial_backoff_ms = 50,
         retry_max_backoff_ms = 30_000,
         retry_backoff_multiplier = 1.5,
         retry_jitter_factor = 0.2,
         disable_retries = false,
-        // Circuit breaker defaults
         cb_failure_threshold = 10,
         cb_success_threshold = 3,
         cb_timeout_duration_secs = 60,
         cb_window_duration_secs = 120,
         disable_circuit_breaker = false,
-        // Health check defaults
         health_failure_threshold = 3,
         health_success_threshold = 2,
         health_check_timeout_secs = 5,
         health_check_interval_secs = 60,
         health_check_endpoint = String::from("/health"),
-        // IGW defaults
         enable_igw = false,
         queue_size = 100,
         queue_timeout_secs = 60,
         rate_limit_tokens_per_second = None,
-        // Tokenizer defaults
         model_path = None,
         tokenizer_path = None,
+        chat_template = None,
+        reasoning_parser = None,
+        tool_call_parser = None,
+        backend = BackendType::Sglang,
+        history_backend = HistoryBackendType::Memory,
+        oracle_config = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -333,7 +455,7 @@ impl Router {
         decode_urls: Option<Vec<String>>,
         prefill_policy: Option<PolicyType>,
         decode_policy: Option<PolicyType>,
-        max_concurrent_requests: usize,
+        max_concurrent_requests: i32,
         cors_allowed_origins: Vec<String>,
         retry_max_retries: u32,
         retry_initial_backoff_ms: u64,
@@ -354,21 +476,24 @@ impl Router {
         enable_igw: bool,
         queue_size: usize,
         queue_timeout_secs: u64,
-        rate_limit_tokens_per_second: Option<usize>,
+        rate_limit_tokens_per_second: Option<i32>,
         model_path: Option<String>,
         tokenizer_path: Option<String>,
+        chat_template: Option<String>,
+        reasoning_parser: Option<String>,
+        tool_call_parser: Option<String>,
+        backend: BackendType,
+        history_backend: HistoryBackendType,
+        oracle_config: Option<PyOracleConfig>,
     ) -> PyResult<Self> {
-        // Determine connection mode from worker URLs
         let mut all_urls = worker_urls.clone();
 
-        // Add prefill URLs if in PD mode
         if let Some(ref prefill_urls) = prefill_urls {
             for (url, _) in prefill_urls {
                 all_urls.push(url.clone());
             }
         }
 
-        // Add decode URLs if in PD mode
         if let Some(ref decode_urls) = decode_urls {
             all_urls.extend(decode_urls.clone());
         }
@@ -433,16 +558,20 @@ impl Router {
             connection_mode,
             model_path,
             tokenizer_path,
+            chat_template,
+            reasoning_parser,
+            tool_call_parser,
+            backend,
+            history_backend,
+            oracle_config,
         })
     }
 
     fn start(&self) -> PyResult<()> {
-        // Convert to RouterConfig and validate
         let router_config = self.to_router_config().map_err(|e| {
             pyo3::exceptions::PyValueError::new_err(format!("Configuration error: {}", e))
         })?;
 
-        // Validate the configuration
         router_config.validate().map_err(|e| {
             pyo3::exceptions::PyValueError::new_err(format!(
                 "Configuration validation failed: {}",
@@ -450,7 +579,6 @@ impl Router {
             ))
         })?;
 
-        // Create service discovery config if enabled
         let service_discovery_config = if self.service_discovery {
             Some(service_discovery::ServiceDiscoveryConfig {
                 enabled: true,
@@ -467,7 +595,6 @@ impl Router {
             None
         };
 
-        // Create Prometheus config if enabled
         let prometheus_config = Some(PrometheusConfig {
             port: self.prometheus_port.unwrap_or(29000),
             host: self
@@ -476,11 +603,9 @@ impl Router {
                 .unwrap_or_else(|| "127.0.0.1".to_string()),
         });
 
-        // Use tokio runtime instead of actix-web System for better compatibility
         let runtime = tokio::runtime::Runtime::new()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
-        // Block on the async startup function
         runtime.block_on(async move {
             server::startup(server::ServerConfig {
                 host: self.host.clone(),
@@ -503,6 +628,9 @@ impl Router {
 #[pymodule]
 fn sglang_router_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PolicyType>()?;
+    m.add_class::<BackendType>()?;
+    m.add_class::<HistoryBackendType>()?;
+    m.add_class::<PyOracleConfig>()?;
     m.add_class::<Router>()?;
     Ok(())
 }

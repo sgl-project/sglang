@@ -8,6 +8,9 @@ default = ["grpc-client"]
 grpc-client = []
 grpc-server = []
 
+[lints.rust]
+unused_qualifications = "warn"
+
 [lib]
 name = "sglang_router_rs"
 # Pure Rust library: Just omit crate-type (defaults to rlib)
@@ -19,12 +22,15 @@ name = "sglang-router"
 path = "src/main.rs"
 
 [dependencies]
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 axum = { version = "0.8.4", features = ["macros", "ws", "tracing"] }
 tower = { version = "0.5", features = ["full"] }
 tower-http = { version = "0.6", features = ["trace", "compression-gzip", "cors", "timeout", "limit", "request-id", "util"] }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", default-features = false, features = [
+    "std",
+    "preserve_order",
+] }
 bytes = "1.8.0"
 rand = "0.9.2"
 reqwest = { version = "0.12.8", features = ["stream", "blocking", "json"] }
@@ -45,14 +51,17 @@ k8s-openapi = { version = "0.25.0", features = ["v1_33"] }
 metrics = "0.24.2"
 metrics-exporter-prometheus = "0.17.0"
 uuid = { version = "1.10", features = ["v4", "serde"] }
+ulid = "1.2.1"
+parking_lot = "0.12.4"
 thiserror = "2.0.12"
 regex = "1.10"
 url = "2.5.4"
+validator = { version = "0.18", features = ["derive"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 anyhow = "1.0"
 tokenizers = { version = "0.22.0" }
 tiktoken-rs = { version = "0.7.0" }
-minijinja = { version = "2.0" }
+minijinja = { version = "2.0", features = ["unstable_machinery", "json", "builtins"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 hf-hub = { version = "0.4.3", features = ["tokio"] }
 rmcp = { version = "0.6.3", features = ["client", "server",
@@ -64,6 +73,10 @@ rmcp = { version = "0.6.3", features = ["client", "server",
     "reqwest",
     "auth"] }
 serde_yaml = "0.9"
+oracle = { version = "0.6.3", features = ["chrono"] }
+subtle = "2.6"
+rustpython-parser = "0.4.0"
+num-traits = "0.2"
 
 # gRPC and Protobuf dependencies
 tonic = { version = "0.12", features = ["tls", "gzip", "transport"] }

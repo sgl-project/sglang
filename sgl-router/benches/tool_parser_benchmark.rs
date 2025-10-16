@@ -8,9 +8,9 @@
 //! - Different model formats (JSON, Mistral, Qwen, Pythonic, etc.)
 
 use criterion::{black_box, criterion_group, BenchmarkId, Criterion, Throughput};
-use sglang_router_rs::tool_parser::{
-    registry::ParserRegistry, state::ParseState, types::StreamResult,
-};
+use serde_json::json;
+use sglang_router_rs::protocols::spec::{Function, Tool};
+use sglang_router_rs::tool_parser::{JsonParser, ParserFactory as ToolParserFactory, ToolParser};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -108,6 +108,42 @@ const STEP3_FORMAT: &str = r#"<step.tML version="0.1">
 
 const GPT_OSS_FORMAT: &str = r#"<Channel.vector_search>{"collection": "technical_documentation", "query_embedding": [0.0234, -0.1456, 0.0891, 0.2341, -0.0567, 0.1234, 0.0456, -0.0789, 0.1567, 0.0234, -0.1123, 0.0678, 0.2345, -0.0456, 0.0891, 0.1234, -0.0567, 0.0789, 0.1456, -0.0234, 0.0891, 0.1567, -0.0678, 0.0345, 0.1234, -0.0456, 0.0789, 0.1891, -0.0234, 0.0567, 0.1345, -0.0891], "top_k": 10, "similarity_metric": "cosine", "filters": {"language": "en", "last_updated": {"$gte": "2023-01-01"}, "categories": {"$in": ["api", "sdk", "integration"]}}, "include_metadata": true, "rerank_with_cross_encoder": true}</Channel.vector_search>"#;
 
+// Create test tools for parsers that need them
+fn create_test_tools() -> Vec<Tool> {
+    vec![
+        Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "search".to_string(),
+                description: Some("Search for information".to_string()),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "limit": {"type": "number"}
+                    }
+                }),
+                strict: None,
+            },
+        },
+        Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "code_interpreter".to_string(),
+                description: Some("Execute code".to_string()),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "language": {"type": "string"},
+                        "code": {"type": "string"}
+                    }
+                }),
+                strict: None,
+            },
+        },
+    ]
+}
+
 // Large test data for stress testing
 fn generate_large_json(num_tools: usize) -> String {
     let mut tools = Vec::new();
@@ -141,7 +177,7 @@ fn bench_registry_creation(c: &mut Criterion) {
         b.iter_custom(|iters| {
             let start = Instant::now();
             for _ in 0..iters {
-                let registry = black_box(ParserRegistry::new());
+                let registry = black_box(ToolParserFactory::new());
                 // Force evaluation to prevent optimization
                 black_box(registry.list_parsers());
             }
@@ -168,7 +204,7 @@ fn bench_registry_creation(c: &mut Criterion) {
 }
 
 fn bench_parser_lookup(c: &mut Criterion) {
-    let registry = Arc::new(ParserRegistry::new());
+    let registry = Arc::new(ToolParserFactory::new());
     let models = vec![
         "gpt-4",
         "mistral-large",
@@ -227,7 +263,7 @@ fn bench_parser_lookup(c: &mut Criterion) {
 
 fn bench_complete_parsing(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
-    let registry = Arc::new(ParserRegistry::new());
+    let registry = Arc::new(ToolParserFactory::new());
 
     let test_cases = vec![
         ("json_simple", "json", JSON_SIMPLE),
@@ -295,7 +331,6 @@ fn bench_complete_parsing(c: &mut Criterion) {
 
 fn bench_streaming_parsing(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
-    let registry = Arc::new(ParserRegistry::new());
 
     // Streaming test with chunked input
     let chunks = vec![
@@ -315,24 +350,21 @@ fn bench_streaming_parsing(c: &mut Criterion) {
     let printed = Arc::new(AtomicBool::new(false));
     group.bench_function("json_streaming", |b| {
         let printed_clone = printed.clone();
-        let registry = registry.clone();
         let rt = rt.handle().clone();
 
         b.iter_custom(|iters| {
-            let parser = registry.get_parser("json").expect("Parser not found");
+            let tools = create_test_tools();
 
             let start = Instant::now();
             for _ in 0..iters {
-                let parser = parser.clone();
-                let mut state = ParseState::new();
+                let mut parser = JsonParser::new();
                 let mut complete_tools = Vec::new();
 
                 rt.block_on(async {
                     for chunk in &chunks {
-                        if let StreamResult::ToolComplete(tool) =
-                            parser.parse_incremental(chunk, &mut state).await.unwrap()
-                        {
-                            complete_tools.push(tool);
+                        let result = parser.parse_incremental(chunk, &tools).await.unwrap();
+                        if !result.calls.is_empty() {
+                            complete_tools.extend(result.calls);
                         }
                     }
                 });
@@ -368,7 +400,7 @@ fn bench_streaming_parsing(c: &mut Criterion) {
 
 fn bench_concurrent_parsing(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
-    let registry = Arc::new(ParserRegistry::new());
+    let registry = Arc::new(ToolParserFactory::new());
     let parser = registry.get_parser("json").expect("Parser not found");
 
     let thread_counts = vec![1, 2, 4, 8, 16, 32];
@@ -409,7 +441,7 @@ fn bench_concurrent_parsing(c: &mut Criterion) {
                                     let result =
                                         rt.block_on(async { parser.parse_complete(input).await });
 
-                                    if let Ok(tools) = result {
+                                    if let Ok((_normal_text, tools)) = result {
                                         total_p.fetch_add(tools.len() as u64, Ordering::Relaxed);
                                     }
                                 }
@@ -456,7 +488,7 @@ fn bench_concurrent_parsing(c: &mut Criterion) {
 
 fn bench_large_payloads(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
-    let registry = Arc::new(ParserRegistry::new());
+    let registry = Arc::new(ToolParserFactory::new());
     let parser = registry.get_parser("json").expect("Parser not found");
 
     let sizes = vec![1, 10, 50, 100, 500];
@@ -526,7 +558,7 @@ fn bench_parser_reuse(c: &mut Criterion) {
         b.iter_custom(|iters| {
             let start = Instant::now();
             for _ in 0..iters {
-                let registry = ParserRegistry::new();
+                let registry = ToolParserFactory::new();
                 let parser = registry.get_parser("json").unwrap();
                 let result = rt.block_on(async { parser.parse_complete(JSON_SIMPLE).await });
                 black_box(result.unwrap());
@@ -552,7 +584,7 @@ fn bench_parser_reuse(c: &mut Criterion) {
 
     // Benchmark reusing registry
     let printed_reuse = Arc::new(AtomicBool::new(false));
-    let shared_registry = Arc::new(ParserRegistry::new());
+    let shared_registry = Arc::new(ToolParserFactory::new());
 
     group.bench_function("reuse_registry", |b| {
         let printed_clone = printed_reuse.clone();
@@ -627,7 +659,7 @@ fn bench_parser_reuse(c: &mut Criterion) {
 
 fn bench_latency_distribution(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
-    let registry = Arc::new(ParserRegistry::new());
+    let registry = Arc::new(ToolParserFactory::new());
 
     let test_cases = vec![
         ("json", JSON_SIMPLE),

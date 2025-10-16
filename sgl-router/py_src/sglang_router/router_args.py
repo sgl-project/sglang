@@ -1,6 +1,7 @@
 import argparse
 import dataclasses
 import logging
+import os
 from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -10,7 +11,7 @@ logger = logging.getLogger(__name__)
 class RouterArgs:
     # Worker configuration
     worker_urls: List[str] = dataclasses.field(default_factory=list)
-    host: str = "127.0.0.1"
+    host: str = "0.0.0.0"
     port: int = 30000
 
     # PD-specific configuration
@@ -34,6 +35,7 @@ class RouterArgs:
     max_tree_size: int = 2**26
     max_payload_size: int = 512 * 1024 * 1024  # 512MB default for large batches
     dp_aware: bool = False
+    enable_igw: bool = False  # Enable IGW (Inter-Gateway) mode for multi-model support
     api_key: Optional[str] = None
     log_dir: Optional[str] = None
     log_level: Optional[str] = None
@@ -53,8 +55,8 @@ class RouterArgs:
     request_id_headers: Optional[List[str]] = None
     # Request timeout in seconds
     request_timeout_secs: int = 1800
-    # Max concurrent requests for rate limiting
-    max_concurrent_requests: int = 256
+    # Max concurrent requests for rate limiting (-1 to disable)
+    max_concurrent_requests: int = -1
     # Queue size for pending requests when max concurrent limit reached
     queue_size: int = 100
     # Maximum time (in seconds) a request can wait in queue before timing out
@@ -82,9 +84,23 @@ class RouterArgs:
     cb_timeout_duration_secs: int = 60
     cb_window_duration_secs: int = 120
     disable_circuit_breaker: bool = False
-    # Tokenizer configuration
     model_path: Optional[str] = None
     tokenizer_path: Optional[str] = None
+    chat_template: Optional[str] = None
+    reasoning_parser: Optional[str] = None
+    tool_call_parser: Optional[str] = None
+    # Backend selection
+    backend: str = "sglang"
+    # History backend configuration
+    history_backend: str = "memory"
+    oracle_wallet_path: Optional[str] = None
+    oracle_tns_alias: Optional[str] = None
+    oracle_connect_descriptor: Optional[str] = None
+    oracle_username: Optional[str] = None
+    oracle_password: Optional[str] = None
+    oracle_pool_min: int = 1
+    oracle_pool_max: int = 16
+    oracle_pool_timeout_secs: int = 30
 
     @staticmethod
     def add_cli_args(
@@ -108,7 +124,7 @@ class RouterArgs:
                 "--host",
                 type=str,
                 default=RouterArgs.host,
-                help="Host address to bind the router server",
+                help="Host address to bind the router server. Supports IPv4, IPv6 (e.g., ::, ::1), or 0.0.0.0 for all interfaces",
             )
             parser.add_argument(
                 "--port",
@@ -122,7 +138,7 @@ class RouterArgs:
             type=str,
             nargs="*",
             default=[],
-            help="List of worker URLs (e.g., http://worker1:8000 http://worker2:8000)",
+            help="List of worker URLs. Supports IPv4 and IPv6 addresses (use brackets for IPv6, e.g., http://[::1]:8000 http://192.168.1.1:8000)",
         )
 
         # Routing policy configuration
@@ -228,6 +244,11 @@ class RouterArgs:
             help="Enable data parallelism aware schedule",
         )
         parser.add_argument(
+            f"--{prefix}enable-igw",
+            action="store_true",
+            help="Enable IGW (Inference-Gateway) mode for multi-model support",
+        )
+        parser.add_argument(
             f"--{prefix}api-key",
             type=str,
             default=None,
@@ -243,7 +264,7 @@ class RouterArgs:
             f"--{prefix}log-level",
             type=str,
             default="info",
-            choices=["debug", "info", "warning", "error", "critical"],
+            choices=["debug", "info", "warn", "error"],
             help="Set the logging level. If not specified, defaults to INFO.",
         )
         parser.add_argument(
@@ -293,8 +314,8 @@ class RouterArgs:
         parser.add_argument(
             f"--{prefix}prometheus-host",
             type=str,
-            default="127.0.0.1",
-            help="Host address to bind the Prometheus metrics server",
+            default="0.0.0.0",
+            help="Host address to bind the Prometheus metrics server. Supports IPv4, IPv6 (e.g., ::, ::1), or 0.0.0.0 for all interfaces",
         )
         parser.add_argument(
             f"--{prefix}request-id-headers",
@@ -400,7 +421,7 @@ class RouterArgs:
             f"--{prefix}max-concurrent-requests",
             type=int,
             default=RouterArgs.max_concurrent_requests,
-            help="Maximum number of concurrent requests allowed (for rate limiting)",
+            help="Maximum number of concurrent requests allowed (for rate limiting). Set to -1 to disable rate limiting.",
         )
         parser.add_argument(
             f"--{prefix}queue-size",
@@ -439,6 +460,91 @@ class RouterArgs:
             type=str,
             default=None,
             help="Explicit tokenizer path (overrides model_path tokenizer if provided)",
+        )
+        parser.add_argument(
+            f"--{prefix}chat-template",
+            type=str,
+            default=None,
+            help="Chat template path (optional)",
+        )
+        parser.add_argument(
+            f"--{prefix}reasoning-parser",
+            type=str,
+            default=None,
+            help="Specify the parser for reasoning models (e.g., deepseek-r1, qwen3)",
+        )
+        parser.add_argument(
+            f"--{prefix}tool-call-parser",
+            type=str,
+            default=None,
+            help="Specify the parser for handling tool-call interactions",
+        )
+        # Backend selection
+        parser.add_argument(
+            f"--{prefix}backend",
+            type=str,
+            default=RouterArgs.backend,
+            choices=["sglang", "openai"],
+            help="Backend runtime to use (default: sglang)",
+        )
+        # History backend configuration
+        parser.add_argument(
+            f"--{prefix}history-backend",
+            type=str,
+            default=RouterArgs.history_backend,
+            choices=["memory", "none", "oracle"],
+            help="History storage backend for conversations and responses (default: memory)",
+        )
+        # Oracle configuration
+        parser.add_argument(
+            f"--{prefix}oracle-wallet-path",
+            type=str,
+            default=os.getenv("ATP_WALLET_PATH"),
+            help="Path to Oracle ATP wallet directory (env: ATP_WALLET_PATH)",
+        )
+        parser.add_argument(
+            f"--{prefix}oracle-tns-alias",
+            type=str,
+            default=os.getenv("ATP_TNS_ALIAS"),
+            help="Oracle TNS alias from tnsnames.ora (env: ATP_TNS_ALIAS).",
+        )
+        parser.add_argument(
+            f"--{prefix}oracle-connect-descriptor",
+            type=str,
+            default=os.getenv("ATP_DSN"),
+            help="Oracle connection descriptor/DSN (full connection string) (env: ATP_DSN)",
+        )
+        parser.add_argument(
+            f"--{prefix}oracle-username",
+            type=str,
+            default=os.getenv("ATP_USER"),
+            help="Oracle database username (env: ATP_USER)",
+        )
+        parser.add_argument(
+            f"--{prefix}oracle-password",
+            type=str,
+            default=os.getenv("ATP_PASSWORD"),
+            help="Oracle database password (env: ATP_PASSWORD)",
+        )
+        parser.add_argument(
+            f"--{prefix}oracle-pool-min",
+            type=int,
+            default=int(os.getenv("ATP_POOL_MIN", RouterArgs.oracle_pool_min)),
+            help="Minimum Oracle connection pool size (default: 1, env: ATP_POOL_MIN)",
+        )
+        parser.add_argument(
+            f"--{prefix}oracle-pool-max",
+            type=int,
+            default=int(os.getenv("ATP_POOL_MAX", RouterArgs.oracle_pool_max)),
+            help="Maximum Oracle connection pool size (default: 16, env: ATP_POOL_MAX)",
+        )
+        parser.add_argument(
+            f"--{prefix}oracle-pool-timeout-secs",
+            type=int,
+            default=int(
+                os.getenv("ATP_POOL_TIMEOUT_SECS", RouterArgs.oracle_pool_timeout_secs)
+            ),
+            help="Oracle connection pool timeout in seconds (default: 30, env: ATP_POOL_TIMEOUT_SECS)",
         )
 
     @classmethod

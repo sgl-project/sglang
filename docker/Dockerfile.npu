@@ -13,7 +13,8 @@ ARG PYTORCH_VERSION=2.6.0
 ARG TORCHVISION_VERSION=0.21.0
 ARG PTA_URL="https://gitee.com/ascend/pytorch/releases/download/v7.1.0.1-pytorch2.6.0/torch_npu-2.6.0.post1-cp311-cp311-manylinux_2_28_aarch64.whl"
 ARG VLLM_TAG=v0.8.5
-ARG TRITON_ASCEND_URL=https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/sglang/triton_ascend-3.2.0.dev20250729-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl
+ARG TRITON_ASCEND_URL="https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/sglang/triton_ascend-3.2.0%2Bgitb0ea0850-cp311-cp311-linux_aarch64.whl"
+ARG BISHENG_URL="https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/sglang/Ascend-BiSheng-toolkit_aarch64.run"
 ARG SGLANG_TAG=main
 ARG ASCEND_CANN_PATH=/usr/local/Ascend/ascend-toolkit
 ARG SGLANG_KERNEL_NPU_TAG=main
@@ -76,18 +77,22 @@ RUN pip install torch==$PYTORCH_VERSION torchvision==$TORCHVISION_VERSION --inde
 
 # Install SGLang
 RUN git clone https://github.com/sgl-project/sglang --branch $SGLANG_TAG && \
-    (cd sglang/python && pip install -v .[srt_npu] --no-cache-dir) && \
+    (cd sglang/python && rm -rf pyproject.toml && mv pyproject_other.toml pyproject.toml && pip install -v .[srt_npu] --no-cache-dir) && \
     (cd sglang/sgl-router && python -m build && pip install --force-reinstall dist/*.whl) && \
     rm -rf sglang
 
 # Install Deep-ep
-RUN git clone  --branch $SGLANG_KERNEL_NPU_TAG https://github.com/sgl-project/sgl-kernel-npu.git \
+# pin wheel to 0.45.1 ref: https://github.com/pypa/wheel/issues/662
+RUN pip install wheel==0.45.1 && git clone  --branch $SGLANG_KERNEL_NPU_TAG https://github.com/sgl-project/sgl-kernel-npu.git \
     && export LD_LIBRARY_PATH=${ASCEND_CANN_PATH}/latest/runtime/lib64/stub:$LD_LIBRARY_PATH && \
     source ${ASCEND_CANN_PATH}/set_env.sh && \
     cd sgl-kernel-npu && \
     bash build.sh \
-    && pip install output/deep_ep*.whl --no-cache-dir \
+    && pip install output/deep_ep*.whl output/sgl_kernel_npu*.whl --no-cache-dir \
     && cd .. && rm -rf sgl-kernel-npu \
     && cd "$(pip show deep-ep | awk '/^Location:/ {print $2}')" && ln -s deep_ep/deep_ep_cpp*.so
+
+# Install Bisheng
+RUN wget ${BISHENG_URL} && chmod a+x Ascend-BiSheng-toolkit_aarch64.run && ./Ascend-BiSheng-toolkit_aarch64.run --install && rm Ascend-BiSheng-toolkit_aarch64.run
 
 CMD ["/bin/bash"]

@@ -17,6 +17,10 @@ For the design details, please refer to [link](https://docs.google.com/document/
 
 Currently, we support Mooncake and NIXL as the transfer engine.
 
+## Profiling in PD Disaggregation Mode
+
+When you need to profile prefill or decode workers in PD disaggregation mode, please refer to the [Profile In PD Disaggregation Mode](https://docs.sglang.ai/developer_guide/benchmark_and_profiling.html#profile-in-pd-disaggregation-mode) section in the Benchmark and Profiling guide. Due to torch profiler limitations, prefill and decode workers must be profiled separately using dedicated command-line options.
+
 ## Router Integration
 
 For deploying PD disaggregation at scale with load balancing and fault tolerance, SGLang provides a router. The router can distribute requests between prefill and decode instances using various routing policies. For detailed information on setting up routing with PD disaggregation, including configuration options and deployment patterns, see the [SGLang Router documentation](router.md#mode-3-prefill-decode-disaggregation).
@@ -34,26 +38,100 @@ uv pip install mooncake-transfer-engine
 ### Llama Single Node
 
 ```bash
-$ python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --disaggregation-mode prefill --disaggregation-ib-device mlx5_roce0
-$ python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --disaggregation-mode decode --port 30001 --base-gpu-id 1 --disaggregation-ib-device mlx5_roce0
-$ python -m sglang_router.launch_router --pd-disaggregation --prefill http://127.0.0.1:30000 --decode http://127.0.0.1:30001 --host 0.0.0.0 --port 8000
+python -m sglang.launch_server \
+  --model-path meta-llama/Llama-3.1-8B-Instruct \
+  --disaggregation-mode prefill \
+  --disaggregation-ib-device mlx5_roce0
+python -m sglang.launch_server \
+  --model-path meta-llama/Llama-3.1-8B-Instruct \
+  --disaggregation-mode decode \
+  --port 30001 \
+  --base-gpu-id 1 \
+  --disaggregation-ib-device mlx5_roce0
+python -m sglang_router.launch_router --pd-disaggregation --prefill http://127.0.0.1:30000 --decode http://127.0.0.1:30001 --host 0.0.0.0 --port 8000
 ```
 
 ### DeepSeek Multi-Node
 
 ```bash
 # prefill 0
-$ python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3-0324 --disaggregation-ib-device ${device_name} --disaggregation-mode prefill --host ${local_ip} --port 30000 --trust-remote-code --dist-init-addr ${prefill_master_ip}:5000 --nnodes 2 --node-rank 0 --tp-size 16 --dp-size 8 --enable-dp-attention --moe-a2a-backend deepep --mem-fraction-static 0.8
+python -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V3-0324 \
+  --disaggregation-ib-device ${device_name} \
+  --disaggregation-mode prefill \
+  --host ${local_ip} \
+  --port 30000 \
+  --trust-remote-code \
+  --dist-init-addr ${prefill_master_ip}:5000 \
+  --nnodes 2 \
+  --node-rank 0 \
+  --tp-size 16 \
+  --dp-size 8 \
+  --enable-dp-attention \
+  --moe-a2a-backend deepep \
+  --mem-fraction-static 0.8
 # prefill 1
-$ python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3-0324 --disaggregation-ib-device ${device_name} --disaggregation-mode prefill --host ${local_ip} --port 30000 --trust-remote-code --dist-init-addr ${prefill_master_ip}:5000 --nnodes 2 --node-rank 1 --tp-size 16 --dp-size 8 --enable-dp-attention --moe-a2a-backend deepep --mem-fraction-static 0.8
+python -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V3-0324 \
+  --disaggregation-ib-device ${device_name} \
+  --disaggregation-mode prefill \
+  --host ${local_ip} \
+  --port 30000 \
+  --trust-remote-code \
+  --dist-init-addr ${prefill_master_ip}:5000 \
+  --nnodes 2 \
+  --node-rank 1 \
+  --tp-size 16 \
+  --dp-size 8 \
+  --enable-dp-attention \
+  --moe-a2a-backend deepep \
+  --mem-fraction-static 0.8
 # decode 0
-$ python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3-0324 --disaggregation-ib-device ${device_name} --disaggregation-mode decode --host ${local_ip} --port 30001 --trust-remote-code --dist-init-addr ${decode_master_ip}:5000 --nnodes 2 --node-rank 0 --tp-size 16 --dp-size 8 --enable-dp-attention --moe-a2a-backend deepep --mem-fraction-static 0.8 --max-running-requests 128
+python -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V3-0324 \
+  --disaggregation-ib-device ${device_name} \
+  --disaggregation-mode decode \
+  --host ${local_ip} \
+  --port 30001 \
+  --trust-remote-code \
+  --dist-init-addr ${decode_master_ip}:5000 \
+  --nnodes 2 \
+  --node-rank 0 \
+  --tp-size 16 \
+  --dp-size 8 \
+  --enable-dp-attention \
+  --moe-a2a-backend deepep \
+  --mem-fraction-static 0.8 \
+  --max-running-requests 128
 # decode 1
-$ python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3-0324 --disaggregation-ib-device ${device_name} --disaggregation-mode decode --host ${local_ip} --port 30001 --trust-remote-code --dist-init-addr ${decode_master_ip}:5000 --nnodes 2 --node-rank 1 --tp-size 16 --dp-size 8 --enable-dp-attention --moe-a2a-backend deepep --mem-fraction-static 0.8 --max-running-requests 128
+python -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V3-0324 \
+  --disaggregation-ib-device ${device_name} \
+  --disaggregation-mode decode \
+  --host ${local_ip} \
+  --port 30001 \
+  --trust-remote-code \
+  --dist-init-addr ${decode_master_ip}:5000 \
+  --nnodes 2 \
+  --node-rank 1 \
+  --tp-size 16 \
+  --dp-size 8 \
+  --enable-dp-attention \
+  --moe-a2a-backend deepep \
+  --mem-fraction-static 0.8 \
+  --max-running-requests 128
 ```
 ### Advanced Configuration
 
 PD Disaggregation with Mooncake supports the following environment variables for fine-grained control over system behavior.
+
+#### NVLink Transport Configuration
+To enable NVLink transport for KV cache transfers with the mooncake backend (recommended for NVL72 deployments), set the following environment variables. Note that auxiliary data transfer will still use TCP as a temporary workaround.
+
+```bash
+export SGLANG_MOONCAKE_CUSTOM_MEM_POOL=True
+export MC_FORCE_MNNVL=True
+```
 
 #### Prefill Server Configuration
 | Variable | Description | Default |
@@ -98,22 +176,88 @@ pip install . --config-settings=setup-args="-Ducx_path=/path/to/ucx"
 ### Llama Single Node
 
 ```bash
-$ python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --disaggregation-mode prefill --disaggregation-transfer-backend nixl
-$ python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --disaggregation-mode decode --port 30001 --base-gpu-id 1 --disaggregation-transfer-backend nixl
-$ python -m sglang_router.launch_router --pd-disaggregation --prefill http://127.0.0.1:30000 --decode http://127.0.0.1:30001 --host 0.0.0.0 --port 8000
+python -m sglang.launch_server \
+  --model-path meta-llama/Llama-3.1-8B-Instruct \
+  --disaggregation-mode prefill \
+  --disaggregation-transfer-backend nixl
+python -m sglang.launch_server \
+  --model-path meta-llama/Llama-3.1-8B-Instruct \
+  --disaggregation-mode decode \
+  --port 30001 \
+  --base-gpu-id 1 \
+  --disaggregation-transfer-backend nixl
+python -m sglang_router.launch_router --pd-disaggregation --prefill http://127.0.0.1:30000 --decode http://127.0.0.1:30001 --host 0.0.0.0 --port 8000
 ```
 
 ### DeepSeek Multi-Node
 
 ```bash
 # prefill 0
-$ python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3-0324 --disaggregation-transfer-backend nixl --disaggregation-mode prefill --host ${local_ip} --port 30000 --trust-remote-code --dist-init-addr ${prefill_master_ip}:5000 --nnodes 2 --node-rank 0 --tp-size 16 --dp-size 8 --enable-dp-attention --moe-a2a-backend deepep --mem-fraction-static 0.8
+python -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V3-0324 \
+  --disaggregation-transfer-backend nixl \
+  --disaggregation-mode prefill \
+  --host ${local_ip} \
+  --port 30000 \
+  --trust-remote-code \
+  --dist-init-addr ${prefill_master_ip}:5000 \
+  --nnodes 2 \
+  --node-rank 0 \
+  --tp-size 16 \
+  --dp-size 8 \
+  --enable-dp-attention \
+  --moe-a2a-backend deepep \
+  --mem-fraction-static 0.8
 # prefill 1
-$ python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3-0324 --disaggregation-transfer-backend nixl --disaggregation-mode prefill --host ${local_ip} --port 30000 --trust-remote-code --dist-init-addr ${prefill_master_ip}:5000 --nnodes 2 --node-rank 1 --tp-size 16 --dp-size 8 --enable-dp-attention --moe-a2a-backend deepep --mem-fraction-static 0.8
+python -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V3-0324 \
+  --disaggregation-transfer-backend nixl \
+  --disaggregation-mode prefill \
+  --host ${local_ip} \
+  --port 30000 \
+  --trust-remote-code \
+  --dist-init-addr ${prefill_master_ip}:5000 \
+  --nnodes 2 \
+  --node-rank 1 \
+  --tp-size 16 \
+  --dp-size 8 \
+  --enable-dp-attention \
+  --moe-a2a-backend deepep \
+  --mem-fraction-static 0.8
 # decode 0
-$ python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3-0324 --disaggregation-transfer-backend nixl --disaggregation-mode decode --host ${local_ip} --port 30001 --trust-remote-code --dist-init-addr ${decode_master_ip}:5000 --nnodes 2 --node-rank 0 --tp-size 16 --dp-size 8 --enable-dp-attention --moe-a2a-backend deepep --mem-fraction-static 0.8 --max-running-requests 128
+python -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V3-0324 \
+  --disaggregation-transfer-backend nixl \
+  --disaggregation-mode decode \
+  --host ${local_ip} \
+  --port 30001 \
+  --trust-remote-code \
+  --dist-init-addr ${decode_master_ip}:5000 \
+  --nnodes 2 \
+  --node-rank 0 \
+  --tp-size 16 \
+  --dp-size 8 \
+  --enable-dp-attention \
+  --moe-a2a-backend deepep \
+  --mem-fraction-static 0.8 \
+  --max-running-requests 128
 # decode 1
-$ python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3-0324 --disaggregation-transfer-backend nixl --disaggregation-mode decode --host ${local_ip} --port 30001 --trust-remote-code --dist-init-addr ${decode_master_ip}:5000 --nnodes 2 --node-rank 1 --tp-size 16 --dp-size 8 --enable-dp-attention --moe-a2a-backend deepep --mem-fraction-static 0.8 --max-running-requests 128
+python -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V3-0324 \
+  --disaggregation-transfer-backend nixl \
+  --disaggregation-mode decode \
+  --host ${local_ip} \
+  --port 30001 \
+  --trust-remote-code \
+  --dist-init-addr ${decode_master_ip}:5000 \
+  --nnodes 2 \
+  --node-rank 1 \
+  --tp-size 16 \
+  --dp-size 8 \
+  --enable-dp-attention \
+  --moe-a2a-backend deepep \
+  --mem-fraction-static 0.8 \
+  --max-running-requests 128
 ```
 
 ## ASCEND
@@ -135,16 +279,44 @@ export ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE=true
 ### Llama Single Node
 
 ```bash
-$ python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --disaggregation-mode prefill --disaggregation-transfer-backend ascend
-$ python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --disaggregation-mode decode --port 30001 --base-gpu-id 1 --disaggregation-transfer-backend ascend
-$ python -m sglang_router.launch_router --pd-disaggregation --prefill http://127.0.0.1:30000 --decode http://127.0.0.1:30001 --host 0.0.0.0 --port 8000
+python -m sglang.launch_server \
+  --model-path meta-llama/Llama-3.1-8B-Instruct \
+  --disaggregation-mode prefill \
+  --disaggregation-transfer-backend ascend
+python -m sglang.launch_server \
+  --model-path meta-llama/Llama-3.1-8B-Instruct \
+  --disaggregation-mode decode \
+  --port 30001 \
+  --base-gpu-id 1 \
+  --disaggregation-transfer-backend ascend
+python -m sglang_router.launch_router --pd-disaggregation --prefill http://127.0.0.1:30000 --decode http://127.0.0.1:30001 --host 0.0.0.0 --port 8000
 ```
 
 ### DeepSeek Multi-Node
 
 ```bash
 # prefill 0
-$ python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3-0324 --disaggregation-transfer-backend ascend --disaggregation-mode prefill --host ${local_ip} --port 30000 --trust-remote-code --dist-init-addr ${prefill_master_ip}:5000 --nnodes 1 --node-rank 0 --tp-size 16
+python -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V3-0324 \
+  --disaggregation-transfer-backend ascend \
+  --disaggregation-mode prefill \
+  --host ${local_ip} \
+  --port 30000 \
+  --trust-remote-code \
+  --dist-init-addr ${prefill_master_ip}:5000 \
+  --nnodes 1 \
+  --node-rank 0 \
+  --tp-size 16
 # decode 0
-$ python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3-0324 --disaggregation-transfer-backend ascend --disaggregation-mode decode --host ${local_ip} --port 30001 --trust-remote-code --dist-init-addr ${decode_master_ip}:5000 --nnodes 1 --node-rank 0 --tp-size 16
+python -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V3-0324 \
+  --disaggregation-transfer-backend ascend \
+  --disaggregation-mode decode \
+  --host ${local_ip} \
+  --port 30001 \
+  --trust-remote-code \
+  --dist-init-addr ${decode_master_ip}:5000 \
+  --nnodes 1 \
+  --node-rank 0 \
+  --tp-size 16
 ```

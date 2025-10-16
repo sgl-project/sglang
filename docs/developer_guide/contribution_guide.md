@@ -68,13 +68,24 @@ You can identify potential reviewers for your code by checking the [code owners]
 Another effective strategy is to review the file modification history and contact individuals who have frequently edited the files.
 If you modify files protected by code owners, their approval is required to merge the code.
 
+## How to trigger CI
+To trigger CI, the pull request must have the "run-ci" label.
+
+- If you have write access to sgl-project/sglang, your pull request will be automatically tagged by @sglang-bot.
+- If you have triage access to sgl-project/sglang, you can manually add the label by clicking "Labels" on the right side of your pull request page.
+- If you do not have the above access, please request a review and ask other maintainers to add the label for you.
+
 ## General code style
 - Avoid code duplication. If the same code snippet (more than five lines) appears multiple times, extract it into a shared function.
 - Minimize device synchronization. Reduce expensive CPU-GPU synchronization operations, such as `tensor.item()` or `tensor.cpu()`, whenever possible. Use vectorized code.
-- Keep files concise. If a file exceeds 2,000 lines of code, split it into multiple smaller files.
 - Prioritize extreme efficiency. SGLang is a runtime, and most of your code runs on the critical path for every request. Optimize all minor overheads as much as possible, especially in the model forward code.
   - A common pattern is some runtime checks in the model forward pass (e.g., [this](https://github.com/sgl-project/sglang/blob/f1b0eda55c2c4838e8ab90a0fac7fb1e3d7064ab/python/sglang/srt/models/deepseek_v2.py#L486-L491)). These are very likely the same for every layer. Please cache the result as a single boolean value whenever possible.
-- Strive to make functions as pure as possible. Avoid in-place modification of arguments.
+- Make functions as pure as possible. Avoid in-place modification of arguments.
+- Keep files concise. If a file exceeds 2,000 lines of code, split it into multiple smaller files. (e.g., `scheduler.py`, `scheduler_output_processor_mixin.py`)
+- Keep tests run fast.
+  - If a single test file run longer than 500 seconds, split it into multiple smaller files (e.g., `test_eagle_infer_a.py`, `test_eagle_infer_b.py`).
+  - If a single job in a github workflow runs longer than 30 mins, split it into smaller jobs/steps.
+  - Reuse server launches in your unit tests to make tests run faster.
 - When supporting new hardware or features, follow these guidelines:
   - Do not drastically change existing code.
   - Always prefer new files to introduce specific components for your new hardware (e.g., `allocator_ascend.py`).

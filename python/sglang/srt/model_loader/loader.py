@@ -4,7 +4,6 @@ from __future__ import annotations
 
 # ruff: noqa: SIM117
 import collections
-import concurrent
 import dataclasses
 import fnmatch
 import glob
@@ -12,10 +11,11 @@ import json
 import logging
 import math
 import os
+import socket
+import threading
 import time
 from abc import ABC, abstractmethod
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -30,12 +30,25 @@ from typing import (
 
 import huggingface_hub
 import numpy as np
-import safetensors.torch
 import torch
+
+from sglang.srt.server_args import get_global_server_args
+
+# Try to import accelerate (optional dependency)
+try:
+    from accelerate import infer_auto_device_map, init_empty_weights
+    from accelerate.utils import get_max_memory
+
+    HAS_ACCELERATE = True
+except ImportError:
+    HAS_ACCELERATE = False
+    infer_auto_device_map = None
+    init_empty_weights = None
+    get_max_memory = None
+
 from huggingface_hub import HfApi, hf_hub_download
 from torch import nn
-from tqdm.auto import tqdm
-from transformers import AutoModelForCausalLM
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
@@ -49,13 +62,22 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
+    trigger_transferring_weights_request,
+)
 from sglang.srt.model_loader.utils import (
     get_model_architecture,
     post_load_weights,
     set_default_torch_dtype,
 )
+
+# Constants for memory management
+DEFAULT_GPU_MEMORY_FRACTION_FOR_CALIBRATION = (
+    0.8  # Reserve 20% GPU memory headroom for ModelOpt calibration
+)
 from sglang.srt.model_loader.weight_utils import (
-    _BAR_FORMAT,
     download_safetensors_index_file_from_hf,
     download_weights_from_hf,
     filter_duplicate_safetensors_files,
@@ -76,6 +98,7 @@ from sglang.srt.utils import (
     get_device_capability,
     is_npu,
     is_pin_memory_available,
+    rank0_log,
     set_weight_attrs,
 )
 
@@ -85,6 +108,8 @@ if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 _is_npu = is_npu()
+# ModelOpt: QUANT_CFG_CHOICES is imported from modelopt_utils.py
+# which contains the complete mapping of quantization config choices
 
 
 @contextmanager
@@ -197,7 +222,10 @@ def _initialize_model(
     if _is_npu:
         packed_modules_mapping.update(
             {
-                "visual": {"qkv_proj": ["qkv"]},
+                "visual": {
+                    "qkv_proj": ["qkv"],
+                    "gate_up_proj": ["gate_proj", "up_proj"],
+                },
                 "vision_model": {
                     "qkv_proj": ["q_proj", "k_proj", "v_proj"],
                     "proj": ["out_proj"],
@@ -412,10 +440,8 @@ class DefaultModelLoader(BaseModelLoader):
                 hf_weights_files,
             )
         elif use_safetensors:
-            from sglang.srt.managers.schedule_batch import global_server_args_dict
-
-            weight_loader_disable_mmap = global_server_args_dict.get(
-                "weight_loader_disable_mmap"
+            weight_loader_disable_mmap = (
+                get_global_server_args().weight_loader_disable_mmap
             )
 
             if extra_config.get("enable_multithread_load"):
@@ -465,12 +491,78 @@ class DefaultModelLoader(BaseModelLoader):
             model_config.model_path, model_config.revision, fall_back_to_pt=True
         )
 
+    def _load_modelopt_base_model(self, model_config: ModelConfig) -> nn.Module:
+        """Load and prepare the base model for ModelOpt quantization.
+
+        This method handles the common model loading logic shared between
+        DefaultModelLoader (conditional) and ModelOptModelLoader (dedicated).
+        """
+        if not HAS_ACCELERATE:
+            raise ImportError(
+                "accelerate is required for ModelOpt quantization. "
+                "Please install it with: pip install accelerate"
+            )
+
+        hf_config = AutoConfig.from_pretrained(
+            model_config.model_path, trust_remote_code=True
+        )
+        with init_empty_weights():
+            torch_dtype = getattr(hf_config, "torch_dtype", torch.float16)
+            model = AutoModelForCausalLM.from_config(
+                hf_config, torch_dtype=torch_dtype, trust_remote_code=True
+            )
+        max_memory = get_max_memory()
+        inferred_device_map = infer_auto_device_map(model, max_memory=max_memory)
+
+        on_cpu = "cpu" in inferred_device_map.values()
+        model_kwargs = {"torch_dtype": "auto"}
+        device_map = "auto"
+
+        if on_cpu:
+            for device in max_memory.keys():
+                if isinstance(device, int):
+                    max_memory[device] *= DEFAULT_GPU_MEMORY_FRACTION_FOR_CALIBRATION
+
+            logger.warning(
+                "Model does not fit to the GPU mem. "
+                f"We apply the following memory limit for calibration: \n{max_memory}\n"
+                f"If you hit GPU OOM issue, please adjust the memory fraction "
+                f"(currently {DEFAULT_GPU_MEMORY_FRACTION_FOR_CALIBRATION}) or "
+                "reduce the calibration `batch_size` manually."
+            )
+            model_kwargs["max_memory"] = max_memory
+
+        model = AutoModelForCausalLM.from_pretrained(
+            model_config.model_path,
+            device_map=device_map,
+            **model_kwargs,
+            trust_remote_code=True,
+        )
+        rank0_log(f"ModelOpt quantization requested: {model_config.modelopt_quant}")
+
+        quant_choice_str = model_config.modelopt_quant
+        if not isinstance(quant_choice_str, str):
+            raise TypeError(
+                f"modelopt_quant must be a string preset key (e.g., 'fp8'), "
+                f"got {type(quant_choice_str)}"
+            )
+
+        return model
+
     def load_model(
         self,
         *,
         model_config: ModelConfig,
         device_config: DeviceConfig,
     ) -> nn.Module:
+
+        if hasattr(model_config, "modelopt_quant") and model_config.modelopt_quant:
+            # Load base model using shared method
+            model = self._load_modelopt_base_model(model_config)
+            # Note: DefaultModelLoader doesn't do additional quantization processing
+            # For full ModelOpt quantization, use ModelOptModelLoader
+            return model.eval()
+
         target_device = torch.device(device_config.device)
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
@@ -479,9 +571,9 @@ class DefaultModelLoader(BaseModelLoader):
                     self.load_config,
                 )
 
-        self.load_weights_and_postprocess(
-            model, self._get_all_weights(model_config, model), target_device
-        )
+            self.load_weights_and_postprocess(
+                model, self._get_all_weights(model_config, model), target_device
+            )
 
         return model.eval()
 
@@ -517,9 +609,9 @@ class LayeredModelLoader(DefaultModelLoader):
         device_config: DeviceConfig,
     ) -> nn.Module:
         from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
-        from sglang.srt.managers.schedule_batch import global_server_args_dict
+        from sglang.srt.server_args import get_global_server_args
 
-        torchao_config = global_server_args_dict.get("torchao_config")
+        torchao_config = get_global_server_args().torchao_config
         target_device = torch.device(device_config.device)
 
         with set_default_torch_dtype(model_config.dtype):
@@ -1380,6 +1472,105 @@ class GGUFModelLoader(BaseModelLoader):
         return model
 
 
+class RemoteInstanceModelLoader(BaseModelLoader):
+    """Model loader that can load Tensors from remote sglang instance."""
+
+    def __init__(self, load_config: LoadConfig):
+        super().__init__(load_config)
+        if load_config.model_loader_extra_config:
+            raise ValueError(
+                f"Model loader extra config is not supported for "
+                f"load format {load_config.load_format}"
+            )
+
+    def download_model(self, model_config: ModelConfig) -> None:
+        raise NotImplementedError
+
+    def load_model(
+        self,
+        *,
+        model_config: ModelConfig,
+        device_config: DeviceConfig,
+    ) -> nn.Module:
+        logger.info("Loading weights from remote instance ...")
+        load_config = self.load_config
+
+        assert load_config.load_format == LoadFormat.REMOTE_INSTANCE, (
+            f"Model loader {self.load_config.load_format} is not supported for "
+            f"load format {load_config.load_format}"
+        )
+
+        model_weights = f"instance://{load_config.remote_instance_weight_loader_seed_instance_ip}:{load_config.remote_instance_weight_loader_send_weights_group_ports[load_config.tp_rank]}"
+
+        with set_default_torch_dtype(model_config.dtype):
+            with torch.device(device_config.device):
+                model = _initialize_model(model_config, self.load_config)
+
+            with create_remote_connector(model_weights, device_config.device) as client:
+                connector_type = get_connector_type(client)
+                if connector_type == ConnectorType.INSTANCE:
+                    self.load_model_from_remote_instance(
+                        model, client, model_config, device_config
+                    )
+                else:
+                    raise ValueError(
+                        f"Unsupported connector type {connector_type} for "
+                        f"remote tensor model loading."
+                    )
+        return model.eval()
+
+    def load_model_from_remote_instance(
+        self, model, client, model_config: ModelConfig, device_config: DeviceConfig
+    ) -> nn.Module:
+        load_config = self.load_config
+        instance_ip = socket.gethostbyname(socket.gethostname())
+        start_build_group_tic = time.time()
+        client.build_group(
+            gpu_id=device_config.gpu_id,
+            tp_rank=load_config.tp_rank,
+            instance_ip=instance_ip,
+        )
+        torch.cuda.synchronize()
+        end_build_group_tic = time.time()
+        logger.debug(
+            f"finish building group for remote instance, time used: {(end_build_group_tic - start_build_group_tic):.4f}s"
+        )
+
+        if load_config.tp_rank == 0:
+            t = threading.Thread(
+                target=trigger_transferring_weights_request,
+                args=(
+                    load_config.remote_instance_weight_loader_seed_instance_ip,
+                    load_config.remote_instance_weight_loader_seed_instance_service_port,
+                    load_config.remote_instance_weight_loader_send_weights_group_ports,
+                    instance_ip,
+                ),
+            )
+            t.start()
+
+        start_get_weights_tic = time.time()
+        with set_default_torch_dtype(model_config.dtype):
+            for _, tensor in model.named_parameters():
+                torch.distributed.broadcast(
+                    tensor.data,
+                    src=0,
+                    group=client._model_update_group,
+                )
+            torch.cuda.synchronize()
+
+            if hasattr(model, "post_load_weights"):
+                model.post_load_weights()
+        end_get_weights_tic = time.time()
+        logger.debug(
+            f"finish getting all weights from remote instance, time used: {(end_get_weights_tic - start_get_weights_tic):.4f}s"
+        )
+        # destroy the process group after loading weights
+        torch.distributed.distributed_c10d.destroy_process_group(
+            client._model_update_group
+        )
+        torch.cuda.empty_cache()
+
+
 class RemoteModelLoader(BaseModelLoader):
     """Model loader that can load Tensors from remote database."""
 
@@ -1557,8 +1748,184 @@ def load_model_with_cpu_quantization(
     return model.eval()
 
 
-def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:
+class ModelOptModelLoader(DefaultModelLoader):
+    """
+    Model loader that applies NVIDIA Model Optimizer quantization
+    """
+
+    def __init__(self, load_config: LoadConfig):
+        super().__init__(load_config)
+        # Any ModelOpt specific initialization if needed
+
+    def _setup_modelopt_quantization(
+        self,
+        model,
+        tokenizer,
+        quant_cfg,
+        quantized_ckpt_restore_path: str | None = None,
+        quantized_ckpt_save_path: str | None = None,
+    ) -> None:
+        """
+        Set up ModelOpt quantization for the given model.
+
+        Args:
+            model: The model to quantize
+            tokenizer: The tokenizer associated with the model
+            quant_cfg: The quantization configuration
+            quantized_ckpt_restore_path: Path to restore quantized checkpoint from
+            quantized_ckpt_save_path: Path to save quantized checkpoint to
+
+        Raises:
+            ImportError: If ModelOpt is not available
+            Exception: If quantization setup fails
+        """
+        try:
+            import modelopt.torch.opt as mto
+            import modelopt.torch.quantization as mtq
+            from modelopt.torch.quantization.utils import is_quantized
+        except ImportError as e:
+            raise ImportError(
+                "ModelOpt is not available. Please install modelopt."
+            ) from e
+
+        if is_quantized(model):
+            rank0_log("Model is already quantized, skipping quantization setup.")
+            return
+        # Restore from checkpoint if provided
+        if quantized_ckpt_restore_path:
+            try:
+                mto.restore(model, quantized_ckpt_restore_path)
+                rank0_log(
+                    f"Restored quantized model from {quantized_ckpt_restore_path}"
+                )
+                return
+            except Exception as e:
+                logger.warning(
+                    f"Failed to restore from {quantized_ckpt_restore_path}: {e}"
+                )
+                rank0_log("Proceeding with calibration-based quantization...")
+
+        # Set up calibration-based quantization
+        try:
+            # Left padding tends to work better for batched generation with decoder-only LMs
+            with suppress(Exception):
+                tokenizer.padding_side = "left"
+
+            from modelopt.torch.utils.dataset_utils import (
+                create_forward_loop,
+                get_dataset_dataloader,
+            )
+
+            # Create calibration dataloader
+            calib_dataloader = get_dataset_dataloader(
+                dataset_name="cnn_dailymail",  # TODO: Consider making this configurable
+                tokenizer=tokenizer,
+                batch_size=36,  # TODO: Consider making this configurable
+                num_samples=512,  # TODO: Consider making this configurable
+                device=model.device,
+                include_labels=False,
+            )
+
+            calibrate_loop = create_forward_loop(dataloader=calib_dataloader)
+
+            # Apply quantization
+            mtq.quantize(model, quant_cfg, forward_loop=calibrate_loop)
+
+            if get_tensor_model_parallel_rank() == 0:
+                mtq.print_quant_summary(model)
+
+            # Save checkpoint if path provided
+            if quantized_ckpt_save_path:
+                try:
+                    mto.save(model, quantized_ckpt_save_path)
+                    rank0_log(f"Quantized model saved to {quantized_ckpt_save_path}")
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to save quantized checkpoint to {quantized_ckpt_save_path}: {e}"
+                    )
+
+        except Exception as e:
+            raise Exception(f"Failed to set up ModelOpt quantization: {e}") from e
+
+    def load_model(
+        self,
+        *,
+        model_config: ModelConfig,
+        device_config: DeviceConfig,
+    ) -> nn.Module:
+
+        logger.info("ModelOptModelLoader: Loading base model...")
+
+        # Use shared method from parent class to load base model
+        model = self._load_modelopt_base_model(model_config)
+
+        # Import ModelOpt modules (already done in _load_modelopt_base_model, but needed here for quantization)
+        try:
+            import modelopt.torch.quantization as mtq
+        except ImportError:
+            logger.error(
+                "NVIDIA Model Optimizer (modelopt) library not found. "
+                "Please install it to use 'modelopt_quant' feature."
+            )
+            raise
+
+        quant_choice_str = model_config.modelopt_quant
+
+        quant_cfg_name = QUANT_CFG_CHOICES.get(quant_choice_str)
+        if not quant_cfg_name:
+            raise ValueError(
+                f"Invalid modelopt_quant choice: '{quant_choice_str}'. "
+                f"Available choices in QUANT_CFG_CHOICES: {list(QUANT_CFG_CHOICES.keys())}. "
+                "Ensure QUANT_CFG_CHOICES is correctly defined with mappings to "
+                "attribute names of config objects in modelopt.torch.quantization."
+            )
+
+        try:
+            # getattr will fetch the config object, e.g., mtq.FP8_DEFAULT_CFG
+            quant_cfg = getattr(mtq, quant_cfg_name)
+        except AttributeError:
+            raise AttributeError(
+                f"ModelOpt quantization config attribute '{quant_cfg_name}' "
+                f"(from choice '{quant_choice_str}') not found in modelopt.torch.quantization module. "
+                "Please verify QUANT_CFG_CHOICES and the ModelOpt library."
+            )
+
+        logger.info(
+            f"Quantizing model with ModelOpt using config attribute: mtq.{quant_cfg_name}"
+        )
+
+        quantized_ckpt_restore_path = model_config.modelopt_checkpoint_restore_path
+        quantized_ckpt_save_path = model_config.modelopt_checkpoint_save_path
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_config.model_path, use_fast=True
+        )
+        try:
+            self._setup_modelopt_quantization(
+                model,
+                tokenizer,
+                quant_cfg,
+                quantized_ckpt_restore_path=quantized_ckpt_restore_path,
+                quantized_ckpt_save_path=quantized_ckpt_save_path,
+            )
+        except Exception as e:
+            logger.warning(f"ModelOpt quantization failed: {e}")
+            rank0_log("Proceeding without quantization...")
+
+        return model.eval()
+
+
+def get_model_loader(
+    load_config: LoadConfig, model_config: Optional[ModelConfig] = None
+) -> BaseModelLoader:
     """Get a model loader based on the load format."""
+
+    if (
+        model_config
+        and hasattr(model_config, "modelopt_quant")
+        and model_config.modelopt_quant
+    ):
+        logger.info("Using ModelOptModelLoader due to 'modelopt_quant' config.")
+        return ModelOptModelLoader(load_config)
 
     if isinstance(load_config.load_format, type):
         return load_config.load_format(load_config)
@@ -1580,5 +1947,8 @@ def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:
 
     if load_config.load_format == LoadFormat.REMOTE:
         return RemoteModelLoader(load_config)
+
+    if load_config.load_format == LoadFormat.REMOTE_INSTANCE:
+        return RemoteInstanceModelLoader(load_config)
 
     return DefaultModelLoader(load_config)

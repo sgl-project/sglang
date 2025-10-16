@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import logging
-import threading
 import time
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
+import torch
+
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.io_struct import AbortReq, BatchEmbeddingOut, BatchTokenIDOut
+from sglang.srt.managers.io_struct import (
+    AbortReq,
+    BatchEmbeddingOutput,
+    BatchTokenIDOutput,
+)
 from sglang.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
 
 if TYPE_CHECKING:
@@ -33,7 +38,6 @@ class SchedulerOutputProcessorMixin:
         self: Scheduler,
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
-        launch_done: Optional[threading.Event] = None,
     ):
         skip_stream_req = None
 
@@ -43,34 +47,35 @@ class SchedulerOutputProcessorMixin:
                 next_token_ids,
                 extend_input_len_per_req,
                 extend_logprob_start_len_per_req,
+                copy_done,
             ) = (
                 result.logits_output,
                 result.next_token_ids,
                 result.extend_input_len_per_req,
                 result.extend_logprob_start_len_per_req,
+                result.copy_done,
             )
 
-            if self.enable_overlap:
-                logits_output, next_token_ids, _ = (
-                    self.tp_worker.resolve_last_batch_result(launch_done)
-                )
-            else:
-                # Move next_token_ids and logprobs to cpu
-                next_token_ids = next_token_ids.tolist()
-                if batch.return_logprob:
-                    if logits_output.next_token_logprobs is not None:
-                        logits_output.next_token_logprobs = (
-                            logits_output.next_token_logprobs.tolist()
-                        )
-                    if logits_output.input_token_logprobs is not None:
-                        logits_output.input_token_logprobs = tuple(
-                            logits_output.input_token_logprobs.tolist()
-                        )
+            if copy_done is not None:
+                copy_done.synchronize()
+
+            # Move next_token_ids and logprobs to cpu
+            next_token_ids = next_token_ids.tolist()
+            if batch.return_logprob:
+                if logits_output.next_token_logprobs is not None:
+                    logits_output.next_token_logprobs = (
+                        logits_output.next_token_logprobs.tolist()
+                    )
+                if logits_output.input_token_logprobs is not None:
+                    logits_output.input_token_logprobs = tuple(
+                        logits_output.input_token_logprobs.tolist()
+                    )
 
             hidden_state_offset = 0
 
             # Check finish conditions
             logprob_pt = 0
+
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
                 if req.is_retracted:
                     continue
@@ -88,7 +93,7 @@ class SchedulerOutputProcessorMixin:
 
                     if req.finished():
                         self.tree_cache.cache_finished_req(req)
-                        req.time_stats.completion_time = time.time()
+                        req.time_stats.completion_time = time.perf_counter()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         # This updates radix so others can match
                         self.tree_cache.cache_unfinished_req(req)
@@ -98,7 +103,11 @@ class SchedulerOutputProcessorMixin:
                         assert extend_input_len_per_req is not None
                         extend_logprob_start_len = extend_logprob_start_len_per_req[i]
                         extend_input_len = extend_input_len_per_req[i]
-                        num_input_logprobs = extend_input_len - extend_logprob_start_len
+
+                        num_input_logprobs = self._calculate_num_input_logprobs(
+                            req, extend_input_len, extend_logprob_start_len
+                        )
+
                         if req.return_logprob:
                             self.add_logprob_return_values(
                                 i,
@@ -136,7 +145,7 @@ class SchedulerOutputProcessorMixin:
                             logger.error(
                                 f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
                             )
-                            self.abort_request(AbortReq(req.rid))
+                            self.abort_request(AbortReq(rid=req.rid))
                         req.grammar.finished = req.finished()
                 else:
                     # being chunked reqs' prefill is not finished
@@ -152,8 +161,8 @@ class SchedulerOutputProcessorMixin:
                         extend_input_len = extend_input_len_per_req[i]
                         if extend_logprob_start_len < extend_input_len:
                             # Update input logprobs.
-                            num_input_logprobs = (
-                                extend_input_len - extend_logprob_start_len
+                            num_input_logprobs = self._calculate_num_input_logprobs(
+                                req, extend_input_len, extend_logprob_start_len
                             )
                             if req.return_logprob:
                                 self.add_input_logprob_return_values(
@@ -166,11 +175,8 @@ class SchedulerOutputProcessorMixin:
                                 )
                             logprob_pt += num_input_logprobs
 
-            self.set_next_batch_sampling_info_done(batch)
-
         else:  # embedding or reward model
-            embeddings, bid = result.embeddings, result.bid
-            embeddings = embeddings.tolist()
+            embeddings = result.embeddings.tolist()
 
             # Check finish conditions
             for i, req in enumerate(batch.reqs):
@@ -193,29 +199,59 @@ class SchedulerOutputProcessorMixin:
 
         self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
 
+    def hacky_process_eagle_overlap_result(
+        self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
+    ):
+        # TODO(lsyin): try use a copy stream to share SMs with forward
+        # FIXME(lsyin): better organize this token free logic in eagle-overlap
+        last_batch_allocate_lens_cpu = result.last_batch_allocate_lens.tolist()
+        accept_lens_cpu = result.accept_lens.tolist()
+        next_token_ids = result.next_token_ids.tolist()
+
+        predict_tokens = []
+        num_draft_tokens = self.draft_worker.speculative_num_draft_tokens
+        for i, req in enumerate(batch.reqs):
+            predict_tokens.append(
+                next_token_ids[
+                    i * num_draft_tokens : i * num_draft_tokens + accept_lens_cpu[i]
+                ]
+            )
+            # FIXME(lsyin): move this update elsewhere
+            req.spec_verify_ct += 1
+
+        return last_batch_allocate_lens_cpu, accept_lens_cpu, predict_tokens
+
     def process_batch_result_decode(
         self: Scheduler,
         batch: ScheduleBatch,
         result: GenerationBatchResult,
-        launch_done: Optional[threading.Event] = None,
     ):
-        logits_output, next_token_ids, can_run_cuda_graph = (
+        logits_output, next_token_ids, can_run_cuda_graph, copy_done = (
             result.logits_output,
             result.next_token_ids,
             result.can_run_cuda_graph,
+            result.copy_done,
         )
         self.num_generated_tokens += len(batch.reqs)
 
-        if self.enable_overlap:
-            logits_output, next_token_ids, can_run_cuda_graph = (
-                self.tp_worker.resolve_last_batch_result(launch_done)
-            )
-            next_token_logprobs = logits_output.next_token_logprobs
-        elif batch.spec_algorithm.is_none():
-            # spec decoding handles output logprobs inside verify process.
+        if copy_done is not None:
+            copy_done.synchronize()
+
+        if batch.spec_algorithm.is_none():
             next_token_ids = next_token_ids.tolist()
             if batch.return_logprob:
                 next_token_logprobs = logits_output.next_token_logprobs.tolist()
+        elif batch.is_v2_eagle:
+            (
+                last_batch_allocate_lens_cpu,
+                accept_lens_cpu,
+                next_token_ids,
+            ) = self.hacky_process_eagle_overlap_result(result, batch)
+            result.num_accepted_tokens = sum(accept_lens_cpu)
+
+        # FIXME(lsyin): we suppose we have already got the num_accepted_tokens in result
+        if not self.spec_algorithm.is_none():
+            self.update_spec_metrics(batch.batch_size(), result.num_accepted_tokens)
 
         self.token_to_kv_pool_allocator.free_group_begin()
 
@@ -223,31 +259,82 @@ class SchedulerOutputProcessorMixin:
         # NOTE: the length of reqs and next_token_ids don't match if it is spec decoding.
         # We should ignore using next_token_ids for spec decoding cases.
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
+            req: Req
             if req.is_retracted:
                 continue
 
             if self.enable_overlap and req.finished():
-                # Free the one extra delayed token
                 if self.page_size == 1:
-                    self.token_to_kv_pool_allocator.free(batch.out_cache_loc[i : i + 1])
-                else:
-                    # Only free when the extra token is in a new page
-                    if (
-                        len(req.origin_input_ids) + len(req.output_ids) - 1
-                    ) % self.page_size == 0:
+                    if batch.spec_algorithm.is_eagle():
+                        from sglang.srt.speculative.eagle_worker_v2 import (
+                            free_spec_dec_tokens_page_size_1,
+                        )
+
+                        free_spec_dec_tokens_page_size_1(
+                            self.req_to_token_pool,
+                            self.token_to_kv_pool_allocator,
+                            req,
+                            last_batch_allocate_lens_cpu[i],
+                            None,
+                        )
+                    else:
+                        # Free the one extra delayed token
                         self.token_to_kv_pool_allocator.free(
                             batch.out_cache_loc[i : i + 1]
                         )
+                else:
+                    if batch.spec_algorithm.is_eagle():
+                        # TODO(lsyin): support eagle with page_size > 1
+                        raise NotImplementedError()
+                    else:
+                        if (
+                            len(req.origin_input_ids) + len(req.output_ids) - 1
+                        ) % self.page_size == 0:
+                            # Only free when the extra token is in a new page
+                            self.token_to_kv_pool_allocator.free(
+                                batch.out_cache_loc[i : i + 1]
+                            )
                 continue
 
             if batch.spec_algorithm.is_none():
-                # speculative worker will solve the output_ids in speculative decoding
                 req.output_ids.append(next_token_id)
+            elif batch.is_v2_eagle:
+                # FIXME(lsyin): non-overlap spec worker will solve the output_ids in speculative decoding
+                #               !!!unify the logic here!!!
+                req.output_ids.extend(next_token_id)
 
             req.check_finished()
             if req.finished():
-                self.tree_cache.cache_finished_req(req)
-                req.time_stats.completion_time = time.time()
+                if batch.is_v2_eagle and self.cur_batch.forward_mode.is_extend():
+                    # FIXME(lsyin): fix the messy logic here
+                    # 1) when not overlap (v2 impl), we free the extra tokens in the req
+                    # 2) when overlap and current batch is extend, we free the extra tokens in the req of the previous batch
+                    from sglang.srt.speculative.eagle_worker_v2 import (
+                        free_spec_dec_tokens_page_size_1,
+                    )
+
+                    new_seq_len = len(req.origin_input_ids) + len(req.output_ids) - 1
+                    # FIXME(lsyin): remove this assert
+                    assert new_seq_len == int(
+                        batch.seq_lens_cpu[i] + accept_lens_cpu[i]
+                    ), f"{new_seq_len=} vs {batch.seq_lens_cpu[i] + accept_lens_cpu[i]=}"
+
+                    free_spec_dec_tokens_page_size_1(
+                        self.req_to_token_pool,
+                        self.token_to_kv_pool_allocator,
+                        req,
+                        last_batch_allocate_lens_cpu[i],
+                        new_seq_len,
+                    )
+
+                if self.server_args.disaggregation_decode_enable_offload_kvcache:
+                    # Asynchronously offload KV cache; cache_finished_req will be called after Device->Host transfer completes
+                    if not self.decode_offload_manager.offload_kv_cache(req):
+                        self.tree_cache.cache_finished_req(req)
+                else:
+                    self.tree_cache.cache_finished_req(req)
+
+                req.time_stats.completion_time = time.perf_counter()
 
             if req.return_logprob and batch.spec_algorithm.is_none():
                 # speculative worker handles logprob in speculative decoding
@@ -283,10 +370,9 @@ class SchedulerOutputProcessorMixin:
                     logger.error(
                         f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
                     )
-                    self.abort_request(AbortReq(req.rid))
+                    self.abort_request(AbortReq(rid=req.rid))
                 req.grammar.finished = req.finished()
 
-        self.set_next_batch_sampling_info_done(batch)
         self.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
 
@@ -296,6 +382,153 @@ class SchedulerOutputProcessorMixin:
             and self.forward_ct_decode % self.server_args.decode_log_interval == 0
         ):
             self.log_decode_stats(can_run_cuda_graph, running_batch=batch)
+
+    def _process_input_token_logprobs(
+        self, req: Req, input_token_logprobs: List
+    ) -> None:
+        """Process input token logprobs values and indices."""
+        is_multi_item_scoring = self._is_multi_item_scoring(req)
+
+        # Process logprob values - handle multi-item scoring vs regular requests
+        if is_multi_item_scoring:
+            # Multi-item scoring: use all logprobs as-is
+            req.input_token_logprobs_val = input_token_logprobs
+        else:
+            # Regular request: add None at start, remove last (sampling token)
+            req.input_token_logprobs_val = [None] + input_token_logprobs[:-1]
+
+        # Process logprob indices based on scoring type
+        if is_multi_item_scoring:
+            # Multi-item scoring: only include delimiter token positions
+            relevant_tokens = req.origin_input_ids[req.logprob_start_len :]
+            input_token_logprobs_idx = [
+                token_id
+                for token_id in relevant_tokens
+                if token_id == self.server_args.multi_item_scoring_delimiter
+            ]
+        else:
+            # Regular request: include all tokens from logprob_start_len onwards
+            input_token_logprobs_idx = req.origin_input_ids[req.logprob_start_len :]
+
+        # Clip padded hash values from image tokens to prevent detokenization errors
+        req.input_token_logprobs_idx = [
+            x if x < self.model_config.vocab_size - 1 else 0
+            for x in input_token_logprobs_idx
+        ]
+
+    def _process_input_top_logprobs(self, req: Req) -> None:
+        """Process input top logprobs."""
+        if req.top_logprobs_num <= 0:
+            return
+
+        is_multi_item_scoring = self._is_multi_item_scoring(req)
+
+        # Initialize arrays - multi-item scoring starts empty, others start with None
+        req.input_top_logprobs_val = [] if is_multi_item_scoring else [None]
+        req.input_top_logprobs_idx = [] if is_multi_item_scoring else [None]
+
+        # Extend arrays with temp values
+        for val, idx in zip(
+            req.temp_input_top_logprobs_val,
+            req.temp_input_top_logprobs_idx,
+            strict=True,
+        ):
+            req.input_top_logprobs_val.extend(val)
+            req.input_top_logprobs_idx.extend(idx)
+
+        # Remove last token (sampling token) for non multi-item scoring requests
+        if not is_multi_item_scoring:
+            req.input_top_logprobs_val.pop()
+            req.input_top_logprobs_idx.pop()
+
+        # Clean up temp storage
+        req.temp_input_top_logprobs_idx = None
+        req.temp_input_top_logprobs_val = None
+
+    def _process_input_token_ids_logprobs(self, req: Req) -> None:
+        """Process input token IDs logprobs."""
+        if req.token_ids_logprob is None:
+            return
+
+        is_multi_item_scoring = self._is_multi_item_scoring(req)
+
+        # Initialize arrays - multi-item scoring starts empty, others start with None
+        req.input_token_ids_logprobs_val = [] if is_multi_item_scoring else [None]
+        req.input_token_ids_logprobs_idx = [] if is_multi_item_scoring else [None]
+
+        # Process temp values - convert tensors to lists and extend arrays
+        for val, idx in zip(
+            req.temp_input_token_ids_logprobs_val,
+            req.temp_input_token_ids_logprobs_idx,
+            strict=True,
+        ):
+            val_list = val.tolist() if isinstance(val, torch.Tensor) else val
+            req.input_token_ids_logprobs_val.extend(
+                val_list if isinstance(val_list, list) else [val_list]
+            )
+            req.input_token_ids_logprobs_idx.extend(idx)
+
+        # Remove last token (sampling token) for non multi-item scoring requests
+        if not is_multi_item_scoring:
+            req.input_token_ids_logprobs_val.pop()
+            req.input_token_ids_logprobs_idx.pop()
+
+        # Clean up temp storage
+        req.temp_input_token_ids_logprobs_idx = None
+        req.temp_input_token_ids_logprobs_val = None
+
+    def _calculate_relevant_tokens_len(self, req: Req) -> int:
+        """Calculate the expected length of logprob arrays based on whether multi-item scoring is enabled.
+
+        For multi-item scoring, only delimiter positions have logprobs.
+        For regular requests, all positions from logprob_start_len onwards have logprobs.
+        """
+        is_multi_item_scoring = self._is_multi_item_scoring(req)
+
+        if is_multi_item_scoring:
+            # Multi-item scoring: count delimiter tokens from logprob_start_len onwards
+            relevant_tokens = req.origin_input_ids[req.logprob_start_len :]
+            return sum(
+                1
+                for token_id in relevant_tokens
+                if token_id == self.server_args.multi_item_scoring_delimiter
+            )
+        else:
+            # Regular request: all tokens from logprob_start_len onwards
+            return len(req.origin_input_ids) - req.logprob_start_len
+
+    def _calculate_num_input_logprobs(
+        self, req: Req, extend_input_len: int, extend_logprob_start_len: int
+    ) -> int:
+        """Calculate the number of input logprobs based on whether multi-item scoring is enabled.
+
+        For multi-item scoring, only delimiter positions have logprobs.
+        For regular requests, all positions in the range have logprobs.
+        """
+        is_multi_item_scoring = self._is_multi_item_scoring(req)
+
+        if is_multi_item_scoring:
+            # Multi-item scoring: count delimiter tokens in the relevant portion
+            relevant_tokens = req.origin_input_ids[
+                extend_logprob_start_len:extend_input_len
+            ]
+            return sum(
+                1
+                for token_id in relevant_tokens
+                if token_id == self.server_args.multi_item_scoring_delimiter
+            )
+        else:
+            # Regular request: all tokens in the range
+            return extend_input_len - extend_logprob_start_len
+
+    def _is_multi_item_scoring(self, req: Req) -> bool:
+        """Check if request uses multi-item scoring.
+
+        Multi-item scoring applies to prefill-only requests when a delimiter
+        token is configured. In this mode, only positions containing the
+        delimiter token receive logprobs.
+        """
+        return req.is_prefill_only and self.server_args.multi_item_scoring_delimiter
 
     def add_input_logprob_return_values(
         self: Scheduler,
@@ -365,63 +598,14 @@ class SchedulerOutputProcessorMixin:
             assert req.input_top_logprobs_val is None
             assert req.input_top_logprobs_idx is None
 
-            # Compute input_token_logprobs_val
-            # Always pad the first one with None.
-            req.input_token_logprobs_val = [None]
-            req.input_token_logprobs_val.extend(input_token_logprobs)
-            # The last input logprob is for sampling, so just pop it out.
-            req.input_token_logprobs_val.pop()
+            # Process all input logprob types using helper functions
+            self._process_input_token_logprobs(req, input_token_logprobs)
+            self._process_input_top_logprobs(req)
 
-            # Compute input_token_logprobs_idx
-            input_token_logprobs_idx = req.origin_input_ids[req.logprob_start_len :]
-            # Clip the padded hash values from image tokens.
-            # Otherwise, it will lead to detokenization errors.
-            input_token_logprobs_idx = [
-                x if x < self.model_config.vocab_size - 1 else 0
-                for x in input_token_logprobs_idx
-            ]
-            req.input_token_logprobs_idx = input_token_logprobs_idx
-
-            if req.top_logprobs_num > 0:
-                req.input_top_logprobs_val = [None]
-                req.input_top_logprobs_idx = [None]
-                assert len(req.temp_input_token_ids_logprobs_val) == len(
-                    req.temp_input_token_ids_logprobs_idx
-                )
-                for val, idx in zip(
-                    req.temp_input_top_logprobs_val,
-                    req.temp_input_top_logprobs_idx,
-                    strict=True,
-                ):
-                    req.input_top_logprobs_val.extend(val)
-                    req.input_top_logprobs_idx.extend(idx)
-
-                # Last token is a sample token.
-                req.input_top_logprobs_val.pop()
-                req.input_top_logprobs_idx.pop()
-                req.temp_input_top_logprobs_idx = None
-                req.temp_input_top_logprobs_val = None
-
-            if req.token_ids_logprob is not None:
-                req.input_token_ids_logprobs_val = [None]
-                req.input_token_ids_logprobs_idx = [None]
-
-                for val, idx in zip(
-                    req.temp_input_token_ids_logprobs_val,
-                    req.temp_input_token_ids_logprobs_idx,
-                    strict=True,
-                ):
-                    req.input_token_ids_logprobs_val.extend(val)
-                    req.input_token_ids_logprobs_idx.extend(idx)
-
-                # Last token is a sample token.
-                req.input_token_ids_logprobs_val.pop()
-                req.input_token_ids_logprobs_idx.pop()
-                req.temp_input_token_ids_logprobs_idx = None
-                req.temp_input_token_ids_logprobs_val = None
+            self._process_input_token_ids_logprobs(req)
 
             if req.return_logprob:
-                relevant_tokens_len = len(req.origin_input_ids) - req.logprob_start_len
+                relevant_tokens_len = self._calculate_relevant_tokens_len(req)
                 assert len(req.input_token_logprobs_val) == relevant_tokens_len
                 assert len(req.input_token_logprobs_idx) == relevant_tokens_len
                 if req.top_logprobs_num > 0:
@@ -441,26 +625,58 @@ class SchedulerOutputProcessorMixin:
         output: LogitsProcessorOutput,
     ):
         """Attach logprobs to the return values."""
-        req.output_token_logprobs_val.append(output.next_token_logprobs[i])
-        req.output_token_logprobs_idx.append(next_token_ids[i])
+        if output.next_token_logprobs is not None:
+            req.output_token_logprobs_val.append(output.next_token_logprobs[i])
+            req.output_token_logprobs_idx.append(next_token_ids[i])
 
-        self.add_input_logprob_return_values(
-            i, req, output, pt, num_input_logprobs, last_prefill_chunk=True
-        )
+        # Only add input logprobs if there are input tokens to process
+        # Note: For prefill-only requests with default logprob_start_len, this will be 0,
+        # meaning we only compute output logprobs (which is the intended behavior)
+        if num_input_logprobs > 0:
+            self.add_input_logprob_return_values(
+                i, req, output, pt, num_input_logprobs, last_prefill_chunk=True
+            )
+        else:
+            self._initialize_empty_logprob_containers(req)
 
         if req.top_logprobs_num > 0:
             req.output_top_logprobs_val.append(output.next_token_top_logprobs_val[i])
             req.output_top_logprobs_idx.append(output.next_token_top_logprobs_idx[i])
 
-        if req.token_ids_logprob is not None:
-            req.output_token_ids_logprobs_val.append(
-                output.next_token_token_ids_logprobs_val[i]
-            )
+        if (
+            req.token_ids_logprob is not None
+            and output.next_token_token_ids_logprobs_val is not None
+        ):
+            # Convert GPU tensor to list if needed
+            logprobs_val = output.next_token_token_ids_logprobs_val[i]
+            if isinstance(logprobs_val, torch.Tensor):
+                logprobs_val = logprobs_val.tolist()
+            req.output_token_ids_logprobs_val.append(logprobs_val)
             req.output_token_ids_logprobs_idx.append(
                 output.next_token_token_ids_logprobs_idx[i]
             )
 
         return num_input_logprobs
+
+    def _initialize_empty_logprob_containers(self, req: Req) -> None:
+        """
+        Initialize logprob fields to empty lists if unset.
+
+        This is needed for prefill-only requests where the normal initialization
+        flow might be bypassed, but downstream code expects these fields to be lists.
+        """
+        if req.input_token_logprobs_val is None:
+            req.input_token_logprobs_val = []
+        if req.input_token_logprobs_idx is None:
+            req.input_token_logprobs_idx = []
+        if req.input_top_logprobs_val is None:
+            req.input_top_logprobs_val = []
+        if req.input_top_logprobs_idx is None:
+            req.input_top_logprobs_idx = []
+        if req.input_token_ids_logprobs_val is None:
+            req.input_token_ids_logprobs_val = []
+        if req.input_token_ids_logprobs_idx is None:
+            req.input_token_ids_logprobs_idx = []
 
     def stream_output(
         self: Scheduler,
@@ -495,6 +711,7 @@ class SchedulerOutputProcessorMixin:
         completion_tokens = []
         cached_tokens = []
         spec_verify_ct = []
+        spec_accepted_tokens = []
         output_hidden_states = None
 
         if return_logprob:
@@ -541,12 +758,18 @@ class SchedulerOutputProcessorMixin:
                     stream_interval = (
                         req.sampling_params.stream_interval or self.stream_interval
                     )
+
+                    # origin stream_interval logic
                     should_output = (
                         len(req.output_ids) % stream_interval == 1
                         if not self.model_config.is_multimodal_gen
                         and stream_interval > 1
                         else len(req.output_ids) % stream_interval == 0
                     )
+
+                    if should_output:
+                        # check_match_stop_str_prefix if  tail_str's suffix match stop_str prefix
+                        should_output &= not req.check_match_stop_str_prefix()
                 else:
                     should_output = (
                         len(req.output_ids) % DEFAULT_FORCE_STREAM_INTERVAL == 0
@@ -586,6 +809,7 @@ class SchedulerOutputProcessorMixin:
 
                 if not self.spec_algorithm.is_none():
                     spec_verify_ct.append(req.spec_verify_ct)
+                    spec_accepted_tokens.append(req.spec_accepted_tokens)
 
                 if return_logprob:
                     if (
@@ -673,8 +897,7 @@ class SchedulerOutputProcessorMixin:
                 return
 
             self.send_to_detokenizer.send_pyobj(
-                BatchTokenIDOut(
-                    rids,
+                BatchTokenIDOutput(
                     finished_reasons,
                     decoded_texts,
                     decode_ids_list,
@@ -687,6 +910,7 @@ class SchedulerOutputProcessorMixin:
                     completion_tokens,
                     cached_tokens,
                     spec_verify_ct,
+                    spec_accepted_tokens,
                     input_token_logprobs_val,
                     input_token_logprobs_idx,
                     output_token_logprobs_val,
@@ -699,7 +923,9 @@ class SchedulerOutputProcessorMixin:
                     input_token_ids_logprobs_idx,
                     output_token_ids_logprobs_val,
                     output_token_ids_logprobs_idx,
-                    output_hidden_states,
+                    output_token_entropy_val=None,
+                    output_hidden_states=output_hidden_states,
+                    rids=rids,
                     placeholder_tokens_idx=None,
                     placeholder_tokens_val=None,
                 )
@@ -720,12 +946,12 @@ class SchedulerOutputProcessorMixin:
                 prompt_tokens.append(len(req.origin_input_ids))
                 cached_tokens.append(req.cached_tokens)
         self.send_to_detokenizer.send_pyobj(
-            BatchEmbeddingOut(
-                rids,
+            BatchEmbeddingOutput(
                 finished_reasons,
                 embeddings,
                 prompt_tokens,
                 cached_tokens,
+                rids=rids,
                 placeholder_tokens_idx=None,
                 placeholder_tokens_val=None,
             )

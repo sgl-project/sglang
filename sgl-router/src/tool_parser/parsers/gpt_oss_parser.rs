@@ -2,12 +2,14 @@ use async_trait::async_trait;
 use regex::Regex;
 use serde_json::Value;
 
+use crate::protocols::spec::Tool;
+
 use crate::tool_parser::{
-    errors::{ToolParserError, ToolParserResult},
+    errors::{ParserError, ParserResult},
+    parsers::helpers,
     partial_json::PartialJson,
-    state::ParseState,
     traits::ToolParser,
-    types::{FunctionCall, StreamResult, ToolCall},
+    types::{FunctionCall, StreamingParseResult, ToolCall, ToolCallItem},
 };
 
 /// GPT-OSS format parser for tool calls
@@ -26,6 +28,11 @@ pub struct GptOssParser {
     function_call_extractor: Regex,
     /// Regex for extracting streaming function calls
     streaming_extractor: Regex,
+
+    /// Buffer for accumulating chunks
+    buffer: String,
+    /// Whether the tool name has been sent (for streaming)
+    name_sent: bool,
 }
 
 impl GptOssParser {
@@ -33,24 +40,22 @@ impl GptOssParser {
     pub fn new() -> Self {
         // Pattern for complete function calls with to= parameter
         // Handles optional <|start|>assistant prefix and whitespace after function name
-        let function_call_pattern = r"(?s)(?:<\|start\|>assistant)?<\|channel\|>commentary to=([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*)\s*<\|constrain\|>json<\|message\|>(.*?)<\|call\|>(?:commentary)?";
+        let function_call_pattern = r"(?s)(?:<\|start\|>assistant)?<\|channel\|>commentary to=([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_-]*)*)\s*<\|constrain\|>json<\|message\|>(.*?)<\|call\|>(?:commentary)?";
         let function_call_extractor =
             Regex::new(function_call_pattern).expect("Valid regex pattern");
 
         // Pattern for streaming function calls (incomplete)
-        let streaming_pattern = r"(?s)(?:<\|start\|>assistant)?<\|channel\|>commentary to=([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*)\s*<\|constrain\|>json<\|message\|>(.*)";
+        let streaming_pattern = r"(?s)(?:<\|start\|>assistant)?<\|channel\|>commentary to=([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_-]*)*)\s*<\|constrain\|>json<\|message\|>(.*)";
         let streaming_extractor = Regex::new(streaming_pattern).expect("Valid regex pattern");
 
         Self {
             partial_json: PartialJson::default(),
             function_call_extractor,
             streaming_extractor,
-        }
-    }
 
-    /// Check if text contains GPT-OSS tool markers
-    fn has_tool_markers(&self, text: &str) -> bool {
-        text.contains("<|channel|>commentary to=")
+            buffer: String::new(),
+            name_sent: false,
+        }
     }
 
     /// Extract function name from full namespace (e.g., "functions.get_weather" -> "get_weather")
@@ -71,10 +76,10 @@ impl Default for GptOssParser {
 
 #[async_trait]
 impl ToolParser for GptOssParser {
-    async fn parse_complete(&self, text: &str) -> ToolParserResult<Vec<ToolCall>> {
+    async fn parse_complete(&self, text: &str) -> ParserResult<(String, Vec<ToolCall>)> {
         // Check if text contains GPT-OSS format
         if !self.has_tool_markers(text) {
-            return Ok(vec![]);
+            return Ok((text.to_string(), vec![]));
         }
 
         let mut tools = Vec::new();
@@ -95,7 +100,7 @@ impl ToolParser for GptOssParser {
                 } else {
                     match serde_json::from_str::<Value>(args_content) {
                         Ok(value) => serde_json::to_string(&value)
-                            .map_err(|e| ToolParserError::ParsingFailed(e.to_string()))?,
+                            .map_err(|e| ParserError::ParsingFailed(e.to_string()))?,
                         Err(_) => {
                             // Skip malformed JSON
                             continue;
@@ -103,12 +108,7 @@ impl ToolParser for GptOssParser {
                     }
                 };
 
-                // Generate unique ID
-                let id = format!("gpt_oss_call_{}", uuid::Uuid::new_v4());
-
                 tools.push(ToolCall {
-                    id,
-                    r#type: "function".to_string(),
                     function: FunctionCall {
                         name: function_name,
                         arguments,
@@ -119,25 +119,25 @@ impl ToolParser for GptOssParser {
             }
         }
 
-        Ok(tools)
+        Ok((String::new(), tools)) // GPT-OSS parser returns empty normal text
     }
 
     async fn parse_incremental(
-        &self,
+        &mut self,
         chunk: &str,
-        state: &mut ParseState,
-    ) -> ToolParserResult<StreamResult> {
-        state.buffer.push_str(chunk);
+        tools: &[Tool],
+    ) -> ParserResult<StreamingParseResult> {
+        self.buffer.push_str(chunk);
 
         // Check for tool markers
-        if !self.has_tool_markers(&state.buffer) {
+        if !self.has_tool_markers(&self.buffer) {
             // No markers found, clear buffer and return
-            state.buffer.clear();
-            return Ok(StreamResult::Incomplete);
+            self.buffer.clear();
+            return Ok(StreamingParseResult::default());
         }
 
         // Try to match streaming pattern
-        if let Some(captures) = self.streaming_extractor.captures(&state.buffer) {
+        if let Some(captures) = self.streaming_extractor.captures(&self.buffer) {
             if let (Some(name_match), Some(args_match)) = (captures.get(1), captures.get(2)) {
                 let full_function_name = name_match.as_str();
                 let partial_args = args_match.as_str();
@@ -146,16 +146,30 @@ impl ToolParser for GptOssParser {
                 let function_name = self.extract_function_name(full_function_name);
 
                 // Send function name if not sent yet
-                if !state.in_string {
-                    state.in_string = true; // Mark name as sent
-                    return Ok(StreamResult::ToolName {
-                        index: 0,
-                        name: function_name.clone(),
+                if !self.name_sent {
+                    // Validate tool name
+                    let tool_indices = helpers::get_tool_indices(tools);
+                    if !tool_indices.contains_key(&function_name) {
+                        // Invalid tool name - skip
+                        tracing::warn!("Invalid tool name '{}' - skipping", function_name);
+                        self.buffer.clear();
+                        self.name_sent = false;
+                        return Ok(StreamingParseResult::default());
+                    }
+
+                    self.name_sent = true; // Mark name as sent
+                    return Ok(StreamingParseResult {
+                        normal_text: String::new(),
+                        calls: vec![ToolCallItem {
+                            tool_index: 0,
+                            name: Some(function_name.clone()),
+                            parameters: String::new(),
+                        }],
                     });
                 }
 
                 // Check if we have a complete function call
-                if let Some(complete_match) = self.function_call_extractor.captures(&state.buffer) {
+                if let Some(complete_match) = self.function_call_extractor.captures(&self.buffer) {
                     if let Some(args_match) = complete_match.get(2) {
                         let args_content = args_match.as_str().trim();
 
@@ -170,26 +184,22 @@ impl ToolParser for GptOssParser {
                             }
                         };
 
-                        // Generate unique ID
-                        let id = format!("gpt_oss_call_{}", uuid::Uuid::new_v4());
-
-                        let tool = ToolCall {
-                            id,
-                            r#type: "function".to_string(),
-                            function: FunctionCall {
-                                name: function_name,
-                                arguments,
-                            },
-                        };
-
                         // Remove the processed part from buffer
                         let complete_end = complete_match.get(0).unwrap().end();
-                        state.buffer.drain(..complete_end);
+                        self.buffer.drain(..complete_end);
 
                         // Reset state for next tool
-                        state.in_string = false;
+                        self.name_sent = false;
 
-                        return Ok(StreamResult::ToolComplete(tool));
+                        // Return final arguments
+                        return Ok(StreamingParseResult {
+                            normal_text: String::new(),
+                            calls: vec![ToolCallItem {
+                                tool_index: 0,
+                                name: None,
+                                parameters: arguments,
+                            }],
+                        });
                     }
                 } else {
                     // Try to parse partial JSON for streaming arguments
@@ -201,14 +211,18 @@ impl ToolParser for GptOssParser {
                             partial_args
                         };
 
-                        match self.partial_json.parse_value(json_part) {
+                        match self.partial_json.parse_value(json_part, true) {
                             Ok((value, _consumed)) => {
                                 let args_str = serde_json::to_string(&value)
                                     .unwrap_or_else(|_| "{}".to_string());
 
-                                return Ok(StreamResult::ToolArguments {
-                                    index: 0,
-                                    arguments: args_str,
+                                return Ok(StreamingParseResult {
+                                    normal_text: String::new(),
+                                    calls: vec![ToolCallItem {
+                                        tool_index: 0,
+                                        name: None,
+                                        parameters: args_str,
+                                    }],
                                 });
                             }
                             Err(_) => {
@@ -220,73 +234,10 @@ impl ToolParser for GptOssParser {
             }
         }
 
-        Ok(StreamResult::Incomplete)
+        Ok(StreamingParseResult::default())
     }
 
-    fn detect_format(&self, text: &str) -> bool {
-        self.has_tool_markers(text) || text.contains("<|channel|>commentary")
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_parse_gpt_oss_single_tool() {
-        let parser = GptOssParser::new();
-        let input = r#"Some text
-<|channel|>commentary to=functions.get_weather<|constrain|>json<|message|>{"location": "San Francisco"}<|call|>
-More text"#;
-
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.name, "get_weather");
-        assert!(result[0].function.arguments.contains("San Francisco"));
-    }
-
-    #[tokio::test]
-    async fn test_parse_gpt_oss_multiple_tools() {
-        let parser = GptOssParser::new();
-        let input = r#"<|channel|>commentary to=functions.get_weather<|constrain|>json<|message|>{"location": "Paris"}<|call|>commentary
-<|channel|>commentary to=functions.search<|constrain|>json<|message|>{"query": "Paris tourism"}<|call|>"#;
-
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].function.name, "get_weather");
-        assert_eq!(result[1].function.name, "search");
-        assert!(result[0].function.arguments.contains("Paris"));
-        assert!(result[1].function.arguments.contains("Paris tourism"));
-    }
-
-    #[tokio::test]
-    async fn test_parse_gpt_oss_with_prefix() {
-        let parser = GptOssParser::new();
-        let input = r#"<|start|>assistant<|channel|>commentary to=functions.test<|constrain|>json<|message|>{"key": "value"}<|call|>"#;
-
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.name, "test");
-    }
-
-    #[tokio::test]
-    async fn test_parse_gpt_oss_empty_args() {
-        let parser = GptOssParser::new();
-        let input =
-            r#"<|channel|>commentary to=functions.get_time<|constrain|>json<|message|>{}<|call|>"#;
-
-        let result = parser.parse_complete(input).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].function.name, "get_time");
-        assert_eq!(result[0].function.arguments, "{}");
-    }
-
-    #[test]
-    fn test_detect_format() {
-        let parser = GptOssParser::new();
-        assert!(parser.detect_format("<|channel|>commentary to="));
-        assert!(parser.detect_format("<|channel|>commentary"));
-        assert!(!parser.detect_format("plain text"));
-        assert!(!parser.detect_format("[TOOL_CALLS]"));
+    fn has_tool_markers(&self, text: &str) -> bool {
+        text.contains("<|channel|>commentary")
     }
 }

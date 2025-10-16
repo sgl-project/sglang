@@ -144,7 +144,7 @@ With data parallelism attention enabled, we have achieved up to **1.9x** decodin
 
 - **DeepGEMM**: The [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM) kernel library optimized for FP8 matrix multiplications.
 
-**Usage**: The activation and weight optimization above are turned on by default for DeepSeek V3 models. DeepGEMM is enabled by default on NVIDIA Hopper GPUs and disabled by default on other devices. DeepGEMM can also be manually turned off by setting the environment variable `SGL_ENABLE_JIT_DEEPGEMM=0`.
+**Usage**: The activation and weight optimization above are turned on by default for DeepSeek V3 models. DeepGEMM is enabled by default on NVIDIA Hopper GPUs and disabled by default on other devices. DeepGEMM can also be manually turned off by setting the environment variable `SGLANG_ENABLE_JIT_DEEPGEMM=0`.
 
 Before serving the DeepSeek model, precompile the DeepGEMM kernels using:
 ```bash
@@ -158,7 +158,14 @@ The precompilation process typically takes around 10 minutes to complete.
 **Usage**:
 Add arguments `--speculative-algorithm`, `--speculative-num-steps`, `--speculative-eagle-topk` and `--speculative-num-draft-tokens` to enable this feature. For example:
 ```
-python3 -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3-0324 --speculative-algorithm EAGLE --speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2 --trust-remote-code --tp 8
+python3 -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V3-0324 \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 1 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 2 \
+  --trust-remote-code \
+  --tp 8
 ```
 - The best configuration for `--speculative-num-steps`, `--speculative-eagle-topk` and `--speculative-num-draft-tokens` can be searched with [bench_speculative.py](https://github.com/sgl-project/sglang/blob/main/scripts/playground/bench_speculative.py) script for given batch size. The minimum configuration is `--speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2`, which can achieve speedup for larger batch sizes.
 - FlashAttention3, FlashMLA, and Triton backend fully supports MTP usage. For FlashInfer backend (`--attention-backend flashinfer`) with speculative decoding,`--speculative-eagle-topk` parameter should be set to `1`. MTP support for the CutlassMLA and TRTLLM MLA backends are still under development.
@@ -177,7 +184,14 @@ See [Reasoning Parser](https://docs.sglang.ai/advanced_features/separate_reasoni
 Add arguments `--tool-call-parser deepseekv3` and `--chat-template ./examples/chat_template/tool_chat_template_deepseekv3.jinja`(recommended) to enable this feature. For example (running on 1 * H20 node):
 
 ```
-python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3-0324 --tp 8 --port 30000 --host 0.0.0.0 --mem-fraction-static 0.9 --tool-call-parser deepseekv3 --chat-template ./examples/chat_template/tool_chat_template_deepseekv3.jinja
+python3 -m sglang.launch_server \
+  --model deepseek-ai/DeepSeek-V3-0324 \
+  --tp 8 \
+  --port 30000 \
+  --host 0.0.0.0 \
+  --mem-fraction-static 0.9 \
+  --tool-call-parser deepseekv3 \
+  --chat-template ./examples/chat_template/tool_chat_template_deepseekv3.jinja
 ```
 
 Sample Request:

@@ -2,31 +2,25 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use serde_json::{from_str, to_string, to_value, to_vec};
 use std::time::Instant;
 
-use sglang_router_rs::core::{BasicWorker, Worker, WorkerType};
+use sglang_router_rs::core::{BasicWorker, BasicWorkerBuilder, Worker, WorkerType};
 use sglang_router_rs::protocols::spec::{
-    ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateParameters, GenerateRequest,
-    SamplingParams, StringOrArray, UserMessageContent,
+    ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateRequest, SamplingParams,
+    StringOrArray, UserMessageContent,
 };
-use sglang_router_rs::routers::http::pd_types::{
-    generate_room_id, get_hostname, RequestWithBootstrap,
-};
+use sglang_router_rs::routers::http::pd_types::{generate_room_id, RequestWithBootstrap};
 
 fn create_test_worker() -> BasicWorker {
-    BasicWorker::new(
-        "http://test-server:8000".to_string(),
-        WorkerType::Prefill {
+    BasicWorkerBuilder::new("http://test-server:8000")
+        .worker_type(WorkerType::Prefill {
             bootstrap_port: Some(5678),
-        },
-    )
+        })
+        .build()
 }
 
 // Helper function to get bootstrap info from worker
 fn get_bootstrap_info(worker: &BasicWorker) -> (String, Option<u16>) {
-    let hostname = get_hostname(worker.url());
-    let bootstrap_port = match worker.worker_type() {
-        WorkerType::Prefill { bootstrap_port } => bootstrap_port,
-        _ => None,
-    };
+    let hostname = worker.bootstrap_host().to_string();
+    let bootstrap_port = worker.bootstrap_port();
     (hostname, bootstrap_port)
 }
 
@@ -34,65 +28,52 @@ fn get_bootstrap_info(worker: &BasicWorker) -> (String, Option<u16>) {
 fn default_generate_request() -> GenerateRequest {
     GenerateRequest {
         text: None,
-        prompt: None,
         input_ids: None,
-        stream: false,
-        parameters: None,
+        input_embeds: None,
+        image_data: None,
+        video_data: None,
+        audio_data: None,
         sampling_params: None,
-        return_logprob: false,
-        // SGLang Extensions
-        lora_path: None,
-        session_params: None,
+        return_logprob: None,
+        logprob_start_len: None,
+        top_logprobs_num: None,
+        token_ids_logprob: None,
+        return_text_in_logprobs: false,
+        stream: false,
+        log_metrics: true,
         return_hidden_states: false,
+        modalities: None,
+        session_params: None,
+        lora_path: None,
+        lora_id: None,
+        custom_logit_processor: None,
+        bootstrap_host: None,
+        bootstrap_port: None,
+        bootstrap_room: None,
+        bootstrap_pair_key: None,
+        data_parallel_rank: None,
+        background: false,
+        conversation_id: None,
+        priority: None,
+        extra_key: None,
+        no_logs: false,
+        custom_labels: None,
+        return_bytes: false,
+        return_entropy: false,
         rid: None,
     }
 }
 
 /// Create a default ChatCompletionRequest for benchmarks with minimal fields set
+#[allow(deprecated)]
 fn default_chat_completion_request() -> ChatCompletionRequest {
     ChatCompletionRequest {
-        model: String::new(),
+        // Required fields in OpenAI order
         messages: vec![],
-        max_tokens: None,
-        max_completion_tokens: None,
-        temperature: None,
-        top_p: None,
-        n: None,
-        stream: false,
-        stream_options: None,
-        stop: None,
-        presence_penalty: None,
-        frequency_penalty: None,
-        logit_bias: None,
-        logprobs: false,
-        top_logprobs: None,
-        user: None,
-        response_format: None,
-        seed: None,
-        tools: None,
-        tool_choice: None,
-        parallel_tool_calls: None,
-        function_call: None,
-        functions: None,
-        // SGLang Extensions
-        top_k: None,
-        min_p: None,
-        min_tokens: None,
-        repetition_penalty: None,
-        regex: None,
-        ebnf: None,
-        stop_token_ids: None,
-        no_stop_trim: false,
-        ignore_eos: false,
-        continue_final_message: false,
-        skip_special_tokens: true,
-        // SGLang Extensions
-        lora_path: None,
-        session_params: None,
-        separate_reasoning: true,
-        stream_reasoning: true,
-        chat_template_kwargs: None,
-        return_hidden_states: false,
+        model: String::new(),
+
+        // Use default for all other fields
+        ..Default::default()
     }
 }
 
@@ -133,6 +114,7 @@ fn default_completion_request() -> CompletionRequest {
         lora_path: None,
         session_params: None,
         return_hidden_states: false,
+        sampling_seed: None,
         other: serde_json::Map::new(),
     }
 }
@@ -141,15 +123,8 @@ fn default_completion_request() -> CompletionRequest {
 fn create_sample_generate_request() -> GenerateRequest {
     GenerateRequest {
         text: Some("Write a story about artificial intelligence".to_string()),
-        parameters: Some(GenerateParameters {
-            max_new_tokens: Some(100),
-            temperature: Some(0.8),
-            top_p: Some(0.9),
-            top_k: Some(50),
-            repetition_penalty: Some(1.0),
-            ..Default::default()
-        }),
         sampling_params: Some(SamplingParams {
+            max_new_tokens: Some(100),
             temperature: Some(0.8),
             top_p: Some(0.9),
             top_k: Some(50),
@@ -162,17 +137,16 @@ fn create_sample_generate_request() -> GenerateRequest {
     }
 }
 
+#[allow(deprecated)]
 fn create_sample_chat_completion_request() -> ChatCompletionRequest {
     ChatCompletionRequest {
         model: "gpt-3.5-turbo".to_string(),
         messages: vec![
             ChatMessage::System {
-                role: "system".to_string(),
                 content: "You are a helpful assistant".to_string(),
                 name: None,
             },
             ChatMessage::User {
-                role: "user".to_string(),
                 content: UserMessageContent::Text(
                     "Explain quantum computing in simple terms".to_string(),
                 ),
@@ -206,9 +180,9 @@ fn create_sample_completion_request() -> CompletionRequest {
     }
 }
 
+#[allow(deprecated)]
 fn create_large_chat_completion_request() -> ChatCompletionRequest {
     let mut messages = vec![ChatMessage::System {
-        role: "system".to_string(),
         content: "You are a helpful assistant with extensive knowledge.".to_string(),
         name: None,
     }];
@@ -216,16 +190,13 @@ fn create_large_chat_completion_request() -> ChatCompletionRequest {
     // Add many user/assistant pairs to simulate a long conversation
     for i in 0..50 {
         messages.push(ChatMessage::User {
-            role: "user".to_string(),
             content: UserMessageContent::Text(format!("Question {}: What do you think about topic number {} which involves complex reasoning about multiple interconnected systems and their relationships?", i, i)),
             name: None,
         });
         messages.push(ChatMessage::Assistant {
-            role: "assistant".to_string(),
             content: Some(format!("Answer {}: This is a detailed response about topic {} that covers multiple aspects and provides comprehensive analysis of the interconnected systems you mentioned.", i, i)),
             name: None,
             tool_calls: None,
-            function_call: None,
             reasoning_content: None,
         });
     }
@@ -241,7 +212,6 @@ fn create_large_chat_completion_request() -> ChatCompletionRequest {
         presence_penalty: Some(0.1),
         frequency_penalty: Some(0.1),
         top_logprobs: Some(5),
-        user: Some("benchmark_user".to_string()),
         seed: Some(42),
         parallel_tool_calls: Some(true),
         ..default_chat_completion_request()

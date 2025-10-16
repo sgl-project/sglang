@@ -16,13 +16,18 @@ from sglang.srt.utils import (
     get_device_capability,
     is_blackwell,
     is_cuda,
+    is_npu,
     print_info_once,
 )
 
 _is_cuda = is_cuda()
+_is_npu = is_npu()
 
 if _is_cuda:
     from sgl_kernel.flash_attn import flash_attn_varlen_func
+
+if _is_npu:
+    import torch_npu
 
 from sglang.srt.distributed import (
     split_tensor_along_last_dim,
@@ -40,7 +45,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import apply_rotary_pos_emb
-from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
 
 ROTARY_EMBED_CLASSES = {
@@ -331,10 +336,63 @@ class VisionFlash3Attention(nn.Module):
         return output
 
 
+class VisionAscendAttention(nn.Module):
+
+    def __init__(
+        self,
+        **kwargs,
+    ):
+        if not _is_npu:
+            raise Exception("VisionAscendAttention is only available for ascend npu")
+        super().__init__()
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens: Optional[Union[SingletonCache, torch.Tensor]],
+        bsz: int,
+        seq_len: int,
+        **kwargs,
+    ) -> torch.Tensor:
+        r"""
+        Args:
+            cu_seqlens: [b]
+        Returns:
+             [b * s, h, head_size]
+        """
+        if cu_seqlens is None:
+            cu_seqlens = _get_cu_seqlens_for_shape(bsz, seq_len, device=q.device)
+
+        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+        if seq_lens.is_npu:
+            # cu_seqlens must be on cpu because of operator restriction
+            seq_lens = seq_lens.to("cpu")
+        _, num_heads, head_size = q.shape
+        num_kv_heads = k.shape[1]
+        output = torch.empty_like(q)
+
+        # operator requires pta version >= 2.5.1
+        torch_npu._npu_flash_attention_unpad(
+            query=q,
+            key=k,
+            value=v,
+            seq_len=seq_lens.to(torch.int32),
+            scale_value=head_size**-0.5,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            out=output,
+        )
+
+        return output
+
+
 QKV_BACKEND_IMPL = {
     "triton_attn": VisionTritonAttention,
     "sdpa": VisionSdpaAttention,
     "fa3": VisionFlash3Attention,
+    "ascend_attn": VisionAscendAttention,
 }
 
 
@@ -410,7 +468,7 @@ class VisionAttention(nn.Module):
         _passed_backend = qkv_backend
         qkv_backend = self._determine_attention_backend(_passed_backend)
         if (
-            global_server_args_dict["mm_attention_backend"] is None
+            get_global_server_args().mm_attention_backend is None
             and _passed_backend is None
         ):
             print_info_once(f"Multimodal attention backend not set. Use {qkv_backend}.")
@@ -470,7 +528,7 @@ class VisionAttention(nn.Module):
         - CUDA: "triton_attn"
         - Non-CUDA: "sdpa"
         """
-        override_backend = global_server_args_dict["mm_attention_backend"]
+        override_backend = get_global_server_args().mm_attention_backend
         if override_backend is not None:
             backend = override_backend
         elif passed_backend is not None:

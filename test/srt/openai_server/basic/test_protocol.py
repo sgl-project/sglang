@@ -150,9 +150,25 @@ class TestChatCompletionRequest(unittest.TestCase):
         self.assertEqual(len(request.messages), 1)
         self.assertEqual(request.messages[0].role, "user")
         self.assertEqual(request.messages[0].content, "Hello")
-        self.assertEqual(request.temperature, 0.7)  # default
+        self.assertEqual(request.temperature, None)  # default
         self.assertFalse(request.stream)  # default
         self.assertEqual(request.tool_choice, "none")  # default when no tools
+
+    def test_sampling_param_build(self):
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi"}],
+            temperature=0.8,
+            max_tokens=150,
+            min_tokens=5,
+            top_p=0.9,
+            stop=["</s>"],
+        )
+        params = req.to_sampling_params(["</s>"], {}, None)
+        self.assertEqual(params["temperature"], 0.8)
+        self.assertEqual(params["max_new_tokens"], 150)
+        self.assertEqual(params["min_new_tokens"], 5)
+        self.assertEqual(params["stop"], ["</s>"])
 
     def test_chat_completion_tool_choice_validation(self):
         """Test tool choice validation logic"""

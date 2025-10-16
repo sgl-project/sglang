@@ -63,9 +63,13 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.utils import (
+    create_fused_set_kv_buffer_arg,
+    enable_fused_set_kv_buffer,
+)
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
@@ -121,7 +125,7 @@ class GptOssSparseMoeBlock(nn.Module):
         )
 
         self.top_k = config.num_experts_per_tok
-        experts_type = get_moe_impl_class()
+        experts_type = get_moe_impl_class(quant_config)
         extra_kwargs = {}
         if experts_type.__name__ == "FusedMoE":
             quant_config_name = (
@@ -134,7 +138,7 @@ class GptOssSparseMoeBlock(nn.Module):
             }
         self.experts = experts_type(
             num_experts=config.num_local_experts
-            + global_server_args_dict["ep_num_redundant_experts"],
+            + get_global_server_args().ep_num_redundant_experts,
             top_k=config.num_experts_per_tok,
             layer_id=layer_id,
             hidden_size=config.hidden_size,
@@ -191,33 +195,6 @@ class GptOssSparseMoeBlock(nn.Module):
 
         ans = final_hidden_states.view(num_tokens, hidden_dim)
         return ans
-
-
-def _enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
-    """Enable fused set_kv_buffer only on CUDA with bfloat16 KV cache."""
-    return _is_cuda and forward_batch.token_to_kv_pool.dtype == torch.bfloat16
-
-
-# TODO maybe move to a model-common utils
-def _create_fused_set_kv_buffer_arg(
-    value: torch.Tensor,
-    layer: RadixAttention,
-    forward_batch: ForwardBatch,
-):
-    layer_id = layer.layer_id
-    token_to_kv_pool = forward_batch.token_to_kv_pool
-
-    k_buffer = token_to_kv_pool.get_key_buffer(layer_id)
-    v_buffer = token_to_kv_pool.get_value_buffer(layer_id)
-
-    return FusedSetKVBufferArg(
-        value=value,
-        k_buffer=k_buffer.view(k_buffer.shape[0], -1),
-        v_buffer=v_buffer.view(v_buffer.shape[0], -1),
-        k_scale=layer.k_scale,
-        v_scale=layer.v_scale,
-        cache_loc=forward_batch.out_cache_loc,
-    )
 
 
 class GptOssAttention(nn.Module):
@@ -282,7 +259,7 @@ class GptOssAttention(nn.Module):
 
         # Choose dtype of sinks based on attention backend: trtllm_mha requires float32,
         # others can use bfloat16
-        attn_backend = global_server_args_dict.get("attention_backend")
+        attn_backend = get_global_server_args().attention_backend
         sinks_dtype = torch.float32 if attn_backend == "trtllm_mha" else torch.bfloat16
         self.sinks = nn.Parameter(
             torch.empty(self.num_heads, dtype=sinks_dtype), requires_grad=False
@@ -337,12 +314,12 @@ class GptOssAttention(nn.Module):
             q,
             k,
             fused_set_kv_buffer_arg=(
-                _create_fused_set_kv_buffer_arg(
+                create_fused_set_kv_buffer_arg(
                     value=v,
                     layer=self.attn,
                     forward_batch=forward_batch,
                 )
-                if _enable_fused_set_kv_buffer(forward_batch)
+                if enable_fused_set_kv_buffer(forward_batch)
                 else None
             ),
         )
@@ -356,7 +333,7 @@ class GptOssAttention(nn.Module):
         attn_output = self.attn(
             *inner_state,
             sinks=self.sinks,
-            save_kv_cache=not _enable_fused_set_kv_buffer(forward_batch),
+            save_kv_cache=not enable_fused_set_kv_buffer(forward_batch),
         )
         output, _ = self.o_proj(attn_output)
         return output
@@ -614,7 +591,7 @@ class GptOssForCausalLM(nn.Module):
             config.hidden_size,
             # quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=global_server_args_dict["enable_dp_lm_head"],
+            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
         self.capture_aux_hidden_states = False

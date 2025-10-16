@@ -120,7 +120,6 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
         self.use_cutlass_fused_experts_fp8 = (
             get_bool_env_var("SGLANG_CUTLASS_MOE")
             and self.cutlass_fp8_supported
-            and self.weight_quant.strategy == QuantizationStrategy.BLOCK
             and (is_sm100_supported() or is_sm90_supported())
         )
 
@@ -129,12 +128,8 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                 raise RuntimeError(
                     f"For BLOCK quantization strategy, block_structure(weight_block_size) must be set in the QuantConfig."
                 )
-            self.block_quant = True
             self.weight_block_size = self.weight_quant.block_structure
-            if not self.use_cutlass_fused_experts_fp8:
-                raise RuntimeError(
-                    f"BLOCK quantization strategy is only supported with Cutlass fused experts fp8 kernel. Please set SGLANG_CUTLASS_MOE=1 and use sm90 or sm100 GPU."
-                )
+            self.block_quant = True
 
     def create_weights(
         self,
@@ -487,34 +482,50 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
 
         moe_runner_config = self.moe_runner_config
 
-        if self.use_cutlass_fused_experts_fp8:
-            from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
-
-            topk_weights, topk_ids, _ = topk_output
-            output = cutlass_fused_experts_fp8(
-                x,
-                layer.w13_weight.transpose(1, 2),
-                layer.w2_weight.transpose(1, 2),
-                layer.w13_weight_scale.transpose(1, 2),
-                layer.w2_weight_scale.transpose(1, 2),
-                topk_weights,
-                topk_ids,
-                self.ab_strides1,
-                self.c_strides1,
-                self.ab_strides2,
-                self.c_strides2,
-                self.workspace,
-                self.a_ptr,
-                self.b_ptr,
-                self.out_ptr,
-                self.a_scales_ptr,
-                self.b_scales_ptr,
-                self.expert_offsets,
-                self.problem_sizes1,
-                self.problem_sizes2,
-                use_fp8_blockscale=True,
-            )
-            return StandardCombineInput(hidden_states=output)
+        if self.block_quant:
+            if self.use_cutlass_fused_experts_fp8:
+                from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
+                topk_weights, topk_ids, _ = topk_output
+                output = cutlass_fused_experts_fp8(
+                    x,
+                    layer.w13_weight.transpose(1, 2),
+                    layer.w2_weight.transpose(1, 2),
+                    layer.w13_weight_scale.transpose(1, 2),
+                    layer.w2_weight_scale.transpose(1, 2),
+                    topk_weights,
+                    topk_ids,
+                    self.ab_strides1,
+                    self.c_strides1,
+                    self.ab_strides2,
+                    self.c_strides2,
+                    self.workspace,
+                    self.a_ptr,
+                    self.b_ptr,
+                    self.out_ptr,
+                    self.a_scales_ptr,
+                    self.b_scales_ptr,
+                    self.expert_offsets,
+                    self.problem_sizes1,
+                    self.problem_sizes2,
+                    use_fp8_blockscale=True,
+                )
+                return StandardCombineInput(hidden_states=output)
+            else:
+                quant_info = TritonMoeQuantInfo(
+                    w13_weight=layer.w13_weight,
+                    w2_weight=layer.w2_weight,
+                    use_fp8_w8a8=True,
+                    w13_scale=(
+                        layer.w13_weight_scale
+                    ),
+                    w2_scale=(
+                        layer.w2_weight_scale
+                    ),
+                    a13_scale=layer.w13_input_scale,
+                    a2_scale=layer.w2_input_scale,
+                    block_shape=self.weight_block_size,
+                )
+                return self.runner.run(dispatch_output, quant_info)
         elif (
             _use_aiter
             and self.weight_quant.strategy == QuantizationStrategy.CHANNEL

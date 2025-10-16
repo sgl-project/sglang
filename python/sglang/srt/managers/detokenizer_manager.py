@@ -24,13 +24,12 @@ import psutil
 import setproctitle
 import zmq
 
-from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.managers.io_struct import (
-    BatchEmbeddingOut,
+    BatchEmbeddingOutput,
     BatchMultimodalDecodeReq,
-    BatchMultimodalOut,
-    BatchStrOut,
-    BatchTokenIDOut,
+    BatchMultimodalOutput,
+    BatchStrOutput,
+    BatchTokenIDOutput,
     FreezeGCReq,
     MultiTokenizerRegisterReq,
 )
@@ -42,6 +41,7 @@ from sglang.srt.utils import (
     get_zmq_socket,
     kill_itself_when_parent_died,
 )
+from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.utils import (
     TypeBasedDispatcher,
     find_printable_text,
@@ -101,8 +101,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
         self._request_dispatcher = TypeBasedDispatcher(
             [
-                (BatchEmbeddingOut, self.handle_batch_embedding_out),
-                (BatchTokenIDOut, self.handle_batch_token_id_out),
+                (BatchEmbeddingOutput, self.handle_batch_embedding_out),
+                (BatchTokenIDOutput, self.handle_batch_token_id_out),
                 (BatchMultimodalDecodeReq, self.handle_multimodal_decode_req),
                 (MultiTokenizerRegisterReq, lambda x: x),
                 (FreezeGCReq, self.handle_freeze_gc_req),
@@ -145,11 +145,11 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             return output[:-1]
         return output
 
-    def handle_batch_embedding_out(self, recv_obj: BatchEmbeddingOut):
+    def handle_batch_embedding_out(self, recv_obj: BatchEmbeddingOutput):
         # If it is embedding model, no detokenization is needed.
         return recv_obj
 
-    def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOut):
+    def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
         bs = len(recv_obj.rids)
 
         # Initialize decode status
@@ -224,7 +224,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             s.sent_offset = len(output_str)
             output_strs.append(incremental_output)
 
-        return BatchStrOut(
+        return BatchStrOutput(
             rids=recv_obj.rids,
             finished_reasons=recv_obj.finished_reasons,
             output_strs=output_strs,
@@ -233,6 +233,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             completion_tokens=recv_obj.completion_tokens,
             cached_tokens=recv_obj.cached_tokens,
             spec_verify_ct=recv_obj.spec_verify_ct,
+            spec_accepted_tokens=recv_obj.spec_accepted_tokens,
             input_token_logprobs_val=recv_obj.input_token_logprobs_val,
             input_token_logprobs_idx=recv_obj.input_token_logprobs_idx,
             output_token_logprobs_val=recv_obj.output_token_logprobs_val,
@@ -245,14 +246,16 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             input_token_ids_logprobs_idx=recv_obj.input_token_ids_logprobs_idx,
             output_token_ids_logprobs_val=recv_obj.output_token_ids_logprobs_val,
             output_token_ids_logprobs_idx=recv_obj.output_token_ids_logprobs_idx,
+            output_token_entropy_val=recv_obj.output_token_entropy_val,
             output_hidden_states=recv_obj.output_hidden_states,
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
+            token_steps=recv_obj.token_steps,
         )
 
     def handle_multimodal_decode_req(self, recv_obj: BatchMultimodalDecodeReq):
         outputs = self.tokenizer.detokenize(recv_obj)
-        return BatchMultimodalOut(
+        return BatchMultimodalOutput(
             rids=recv_obj.rids,
             finished_reasons=recv_obj.finished_reasons,
             outputs=outputs,
@@ -297,7 +300,7 @@ def run_detokenizer_process(
         else:
             manager.event_loop()
     except Exception:
-        manager.socket_mapping.clear_all_sockets()
+        manager.maybe_clear_socket_mapping()
         traceback = get_exception_traceback()
         logger.error(f"DetokenizerManager hit an exception: {traceback}")
         parent_process.send_signal(signal.SIGQUIT)

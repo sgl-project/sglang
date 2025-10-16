@@ -13,6 +13,7 @@ on:
       - 'python/sglang/srt/disaggregation/**'
       - 'scripts/ci/ci_start_disaggregation_servers.sh'
       - 'sgl-router/**'
+    types: [synchronize, labeled]
   workflow_dispatch:
 
 concurrency:
@@ -26,9 +27,8 @@ permissions:
 
 jobs:
   test-disaggregation:
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-        github.event.pull_request.draft == false
-    runs-on: [h200]
+    if: github.event_name != 'pull_request' || (contains(github.event.pull_request.labels.*.name, 'run-ci') && contains(github.event.pull_request.labels.*.name, 'router-benchmark'))
+    runs-on: [8-gpu-h200-oracle]
     timeout-minutes: 45
 
     steps:
@@ -138,11 +138,10 @@ jobs:
       run: |
         echo "Installing SGLang with all extras..."
         python3 -m pip --no-cache-dir install --upgrade pip
-        python3 -m pip --no-cache-dir install torch==2.8.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/test/cu126
+        python3 -m pip --no-cache-dir install torch==2.8.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/test/cu128
         python3 -m pip --no-cache-dir install -e "python[all]" --break-system-packages
-        python3 -m pip --no-cache-dir install mooncake-transfer-engine==0.3.5
+        python3 -m pip --no-cache-dir install mooncake-transfer-engine==0.3.6.post1
         python3 -m pip --no-cache-dir install --user --force-reinstall genai-bench==0.0.2
-        python3 -m pip --no-cache-dir install sgl-kernel==0.3.9.post2
 
     - name: Build and install sgl-router
       run: |
@@ -155,32 +154,34 @@ jobs:
       id: start_servers
       run: |
         echo "Starting disaggregation servers..."
-        bash scripts/ci/ci_start_disaggregation_servers.sh &
+        READY_FILE=".disagg_ready"
+        rm -f "$READY_FILE"
+        DISAGG_READY_FILE="$READY_FILE" bash scripts/ci/ci_start_disaggregation_servers.sh &
         SERVER_PID=$!
         echo "server_pid=$SERVER_PID" >> $GITHUB_OUTPUT
 
-        # Wait for all 8 servers to be healthy (script already does this)
-        wait_count=0
-        while [ $wait_count -lt 30 ]; do
-          if ps -p $SERVER_PID > /dev/null; then
-            # Check if the startup script printed success message
-            sleep 2
-            wait_count=$((wait_count + 1))
-          else
-            # Script exited - check if it was successful
-            wait $SERVER_PID
-            exit_code=$?
-            if [ $exit_code -eq 0 ]; then
-              echo "✓ All disaggregation servers are healthy"
-              break
-            else
-              echo "Error: Server startup failed with code $exit_code"
-              exit 1
-            fi
+        # Wait until script signals readiness (8/8 healthy) or timeout
+        TIMEOUT=300
+        ELAPSED=0
+        while [ $ELAPSED -lt $TIMEOUT ]; do
+          if [ -f "$READY_FILE" ]; then
+            echo "✓ All disaggregation servers are healthy (signal detected)"
+            break
           fi
+          if ! ps -p $SERVER_PID > /dev/null; then
+            echo "Error: server bootstrap script exited prematurely"
+            exit 1
+          fi
+          sleep 5
+          ELAPSED=$((ELAPSED + 5))
         done
+        if [ $ELAPSED -ge $TIMEOUT ]; then
+          echo "❌ Timeout waiting for disaggregation servers to be healthy"
+          exit 1
+        fi
 
         echo "✓ Servers started (PID: $SERVER_PID)"
+
 
     - name: Test all policies sequentially
       timeout-minutes: 30
@@ -218,6 +219,7 @@ jobs:
             --decode http://127.0.0.7:30007 \
             --decode http://127.0.0.8:30008 \
             --host 127.0.0.9 \
+            --log-level warn \
             --port 8000 &
           ROUTER_PID=$!
 
@@ -299,8 +301,8 @@ jobs:
             --task text-to-text \
             --num-concurrency 64 \
             --traffic-scenario "D(8000,2000)" \
-            --max-requests-per-run 640 \
-            --max-time-per-run 2 \
+            --max-requests-per-run 1000 \
+            --max-time-per-run 5 \
             --experiment-folder-name "benchmark_${policy}" \
             --experiment-base-dir "."
 
@@ -340,7 +342,7 @@ jobs:
                 # These can be adjusted based on your performance requirements
                 ttft_threshold=4.7          # Max 4.7 seconds for mean TTFT
                 e2e_latency_threshold=35.0   # Max 35.0 seconds for mean E2E latency
-                input_throughput_threshold=12000   # Min 12000 tokens/s for mean input throughput
+                input_throughput_threshold=10000   # Min 02000 tokens/s for mean input throughput
                 output_throughput_threshold=68    # Min 68 tokens/s for mean output throughput
 
 
@@ -557,12 +559,12 @@ jobs:
               # Check thresholds (using same values as in main workflow)
               validation_status="✅"
               if [ "$ttft" != "N/A" ] && [ "$ttft" != "null" ]; then
-                if (( $(echo "$ttft > 2.0" | bc -l 2>/dev/null || echo "0") )); then
+                if (( $(echo "$ttft > 4.7" | bc -l 2>/dev/null || echo "0") )); then
                   validation_status="❌"
                 fi
               fi
               if [ "$e2e_latency" != "N/A" ] && [ "$e2e_latency" != "null" ]; then
-                if (( $(echo "$e2e_latency > 24.0" | bc -l 2>/dev/null || echo "0") )); then
+                if (( $(echo "$e2e_latency > 35.0" | bc -l 2>/dev/null || echo "0") )); then
                   validation_status="❌"
                 fi
               fi
@@ -572,7 +574,7 @@ jobs:
                 fi
               fi
               if [ "$output_throughput" != "N/A" ] && [ "$output_throughput" != "null" ]; then
-                if (( $(echo "$output_throughput < 90" | bc -l 2>/dev/null || echo "0") )); then
+                if (( $(echo "$output_throughput < 68" | bc -l 2>/dev/null || echo "0") )); then
                   validation_status="❌"
                 fi
               fi

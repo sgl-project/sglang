@@ -1,6 +1,5 @@
 # Adapted from qwen2.py
 import logging
-from functools import partial
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
@@ -30,12 +29,19 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.qwen2 import Qwen2MLP as Qwen3MLP
 from sglang.srt.models.qwen2 import Qwen2Model
-from sglang.srt.utils import add_prefix, is_cuda
+from sglang.srt.utils import (
+    add_prefix,
+    get_cmo_stream,
+    is_cuda,
+    is_npu,
+    wait_cmo_stream,
+)
 
 Qwen3Config = None
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
+_is_npu = is_npu()
 
 
 class Qwen3Attention(nn.Module):
@@ -235,9 +241,18 @@ class Qwen3DecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
+            hidden_states,
+            residual,
+            forward_batch,
+            cache=(
+                [self.mlp.gate_up_proj.weight, self.mlp.down_proj.weight]
+                if _is_npu
+                else None
+            ),
         )
         hidden_states = self.mlp(hidden_states)
+        if _is_npu and get_cmo_stream():
+            wait_cmo_stream()
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
         )

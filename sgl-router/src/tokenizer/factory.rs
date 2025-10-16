@@ -4,6 +4,7 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
+use tracing::{debug, info};
 
 use super::huggingface::HuggingFaceTokenizer;
 use super::tiktoken::TiktokenTokenizer;
@@ -42,6 +43,31 @@ pub fn create_tokenizer_with_chat_template(
     // Check if file exists
     if !path.exists() {
         return Err(Error::msg(format!("File not found: {}", file_path)));
+    }
+
+    // If path is a directory, search for tokenizer files
+    if path.is_dir() {
+        let tokenizer_json = path.join("tokenizer.json");
+        if tokenizer_json.exists() {
+            // Resolve chat template: provided path takes precedence over auto-discovery
+            let final_chat_template =
+                resolve_and_log_chat_template(chat_template_path, path, file_path);
+            let tokenizer_path_str = tokenizer_json.to_str().ok_or_else(|| {
+                Error::msg(format!(
+                    "Tokenizer path is not valid UTF-8: {:?}",
+                    tokenizer_json
+                ))
+            })?;
+            return create_tokenizer_with_chat_template(
+                tokenizer_path_str,
+                final_chat_template.as_deref(),
+            );
+        }
+
+        return Err(Error::msg(format!(
+            "Directory '{}' does not contain a valid tokenizer file (tokenizer.json, tokenizer_config.json, or vocab.json)",
+            file_path
+        )));
     }
 
     // Try to determine tokenizer type from extension
@@ -134,14 +160,87 @@ fn is_likely_sentencepiece(buffer: &[u8]) -> bool {
             || buffer.windows(4).any(|w| w == b"</s>"))
 }
 
+/// Helper function to discover chat template files in a directory
+pub fn discover_chat_template_in_dir(dir: &Path) -> Option<String> {
+    use std::fs;
+
+    // Priority 1: Look for chat_template.json (contains Jinja in JSON format)
+    let json_template_path = dir.join("chat_template.json");
+    if json_template_path.exists() {
+        return json_template_path.to_str().map(|s| s.to_string());
+    }
+
+    // Priority 2: Look for chat_template.jinja (standard Jinja file)
+    let jinja_path = dir.join("chat_template.jinja");
+    if jinja_path.exists() {
+        return jinja_path.to_str().map(|s| s.to_string());
+    }
+
+    // Priority 3: Look for any .jinja file (for models with non-standard naming)
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                if name.ends_with(".jinja") && name != "chat_template.jinja" {
+                    return entry.path().to_str().map(|s| s.to_string());
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Helper function to resolve and log chat template selection
+///
+/// Resolves the final chat template to use by prioritizing provided path over auto-discovery,
+/// and logs the source for debugging purposes.
+fn resolve_and_log_chat_template(
+    provided_path: Option<&str>,
+    discovery_dir: &Path,
+    model_name: &str,
+) -> Option<String> {
+    let final_chat_template = provided_path
+        .map(|s| s.to_string())
+        .or_else(|| discover_chat_template_in_dir(discovery_dir));
+
+    match (&provided_path, &final_chat_template) {
+        (Some(provided), _) => {
+            info!("Using provided chat template: {}", provided);
+        }
+        (None, Some(discovered)) => {
+            info!(
+                "Auto-discovered chat template in '{}': {}",
+                discovery_dir.display(),
+                discovered
+            );
+        }
+        (None, None) => {
+            debug!(
+                "No chat template provided or discovered for model: {}",
+                model_name
+            );
+        }
+    }
+
+    final_chat_template
+}
+
 /// Factory function to create tokenizer from a model name or path (async version)
 pub async fn create_tokenizer_async(
     model_name_or_path: &str,
 ) -> Result<Arc<dyn traits::Tokenizer>> {
+    create_tokenizer_async_with_chat_template(model_name_or_path, None).await
+}
+
+/// Factory function to create tokenizer with optional chat template (async version)
+pub async fn create_tokenizer_async_with_chat_template(
+    model_name_or_path: &str,
+    chat_template_path: Option<&str>,
+) -> Result<Arc<dyn traits::Tokenizer>> {
     // Check if it's a file path
     let path = Path::new(model_name_or_path);
     if path.exists() {
-        return create_tokenizer_from_file(model_name_or_path);
+        return create_tokenizer_with_chat_template(model_name_or_path, chat_template_path);
     }
 
     // Check if it's a GPT model name that should use Tiktoken
@@ -161,14 +260,43 @@ pub async fn create_tokenizer_async(
             // Look for tokenizer.json in the cache directory
             let tokenizer_path = cache_dir.join("tokenizer.json");
             if tokenizer_path.exists() {
-                create_tokenizer_from_file(tokenizer_path.to_str().unwrap())
+                // Resolve chat template: provided path takes precedence over auto-discovery
+                let final_chat_template = resolve_and_log_chat_template(
+                    chat_template_path,
+                    &cache_dir,
+                    model_name_or_path,
+                );
+
+                let tokenizer_path_str = tokenizer_path.to_str().ok_or_else(|| {
+                    Error::msg(format!(
+                        "Tokenizer path is not valid UTF-8: {:?}",
+                        tokenizer_path
+                    ))
+                })?;
+                create_tokenizer_with_chat_template(
+                    tokenizer_path_str,
+                    final_chat_template.as_deref(),
+                )
             } else {
                 // Try other common tokenizer file names
                 let possible_files = ["tokenizer_config.json", "vocab.json"];
                 for file_name in &possible_files {
                     let file_path = cache_dir.join(file_name);
                     if file_path.exists() {
-                        return create_tokenizer_from_file(file_path.to_str().unwrap());
+                        // Resolve chat template: provided path takes precedence over auto-discovery
+                        let final_chat_template = resolve_and_log_chat_template(
+                            chat_template_path,
+                            &cache_dir,
+                            model_name_or_path,
+                        );
+
+                        let file_path_str = file_path.to_str().ok_or_else(|| {
+                            Error::msg(format!("File path is not valid UTF-8: {:?}", file_path))
+                        })?;
+                        return create_tokenizer_with_chat_template(
+                            file_path_str,
+                            final_chat_template.as_deref(),
+                        );
                     }
                 }
                 Err(Error::msg(format!(
@@ -185,11 +313,22 @@ pub async fn create_tokenizer_async(
 }
 
 /// Factory function to create tokenizer from a model name or path (blocking version)
+///
+/// This delegates to `create_tokenizer_with_chat_template_blocking` with no chat template,
+/// which handles both local files and HuggingFace Hub downloads uniformly.
 pub fn create_tokenizer(model_name_or_path: &str) -> Result<Arc<dyn traits::Tokenizer>> {
+    create_tokenizer_with_chat_template_blocking(model_name_or_path, None)
+}
+
+/// Factory function to create tokenizer with optional chat template (blocking version)
+pub fn create_tokenizer_with_chat_template_blocking(
+    model_name_or_path: &str,
+    chat_template_path: Option<&str>,
+) -> Result<Arc<dyn traits::Tokenizer>> {
     // Check if it's a file path
     let path = Path::new(model_name_or_path);
     if path.exists() {
-        return create_tokenizer_from_file(model_name_or_path);
+        return create_tokenizer_with_chat_template(model_name_or_path, chat_template_path);
     }
 
     // Check if it's a GPT model name that should use Tiktoken
@@ -207,11 +346,19 @@ pub fn create_tokenizer(model_name_or_path: &str) -> Result<Arc<dyn traits::Toke
     // Check if we're already in a tokio runtime
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         // We're in a runtime, use block_in_place
-        tokio::task::block_in_place(|| handle.block_on(create_tokenizer_async(model_name_or_path)))
+        tokio::task::block_in_place(|| {
+            handle.block_on(create_tokenizer_async_with_chat_template(
+                model_name_or_path,
+                chat_template_path,
+            ))
+        })
     } else {
         // No runtime, create a temporary one
         let rt = tokio::runtime::Runtime::new()?;
-        rt.block_on(create_tokenizer_async(model_name_or_path))
+        rt.block_on(create_tokenizer_async_with_chat_template(
+            model_name_or_path,
+            chat_template_path,
+        ))
     }
 }
 
@@ -279,11 +426,9 @@ mod tests {
 
     #[test]
     fn test_create_tiktoken_tokenizer() {
-        // Test creating tokenizer for GPT models
         let tokenizer = create_tokenizer("gpt-4").unwrap();
         assert!(tokenizer.vocab_size() > 0);
 
-        // Test encoding and decoding
         let text = "Hello, world!";
         let encoding = tokenizer.encode(text).unwrap();
         let decoded = tokenizer.decode(encoding.token_ids(), false).unwrap();
@@ -292,7 +437,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_download_tokenizer_from_hf() {
-        // Test with a small model that should have tokenizer files
         // Skip this test if HF_TOKEN is not set and we're in CI
         if std::env::var("CI").is_ok() && std::env::var("HF_TOKEN").is_err() {
             println!("Skipping HF download test in CI without HF_TOKEN");
