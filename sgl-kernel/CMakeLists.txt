@@ -60,6 +60,15 @@ FetchContent_Declare(
 )
 FetchContent_Populate(repo-deepgemm)
 
+# flash_mla
+FetchContent_Declare(
+    repo-flashmla
+    GIT_REPOSITORY https://github.com/sgl-project/FlashMLA
+    GIT_TAG sgl
+    GIT_SHALLOW OFF
+)
+FetchContent_Populate(repo-flashmla)
+
 # fmt
 FetchContent_Declare(
     repo-fmt
@@ -148,7 +157,11 @@ include_directories(
     ${repo-flashinfer_SOURCE_DIR}/include
     ${repo-flashinfer_SOURCE_DIR}/csrc
     ${repo-mscclpp_SOURCE_DIR}/include
-    ${repo-fast-hadamard-transform}/csrc
+    ${repo-flashmla_SOURCE_DIR}/csrc
+    ${repo-flashmla_SOURCE_DIR}/csrc/sm90
+    ${repo-flashmla_SOURCE_DIR}/cutlass/include
+    ${repo-flashmla_SOURCE_DIR}/cutlass/tools/utils/include
+    ${repo-fast-hadamard-transform_SOURCE_DIR}/csrc
 )
 
 set(SGL_KERNEL_CUDA_FLAGS
@@ -339,6 +352,17 @@ set(SOURCES
     "${repo-flashinfer_SOURCE_DIR}/csrc/norm.cu"
     "${repo-flashinfer_SOURCE_DIR}/csrc/renorm.cu"
     "${repo-flashinfer_SOURCE_DIR}/csrc/sampling.cu"
+
+    "${repo-flashmla_SOURCE_DIR}/csrc/python_api.cpp"
+    "${repo-flashmla_SOURCE_DIR}/csrc/smxx/get_mla_metadata.cu"
+    "${repo-flashmla_SOURCE_DIR}/csrc/smxx/mla_combine.cu"
+    "${repo-flashmla_SOURCE_DIR}/csrc/sm90/decode/dense/splitkv_mla.cu"
+    "${repo-flashmla_SOURCE_DIR}/csrc/sm90/decode/sparse_fp8/splitkv_mla.cu"
+    "${repo-flashmla_SOURCE_DIR}/csrc/sm90/prefill/sparse/fwd.cu"
+    "${repo-flashmla_SOURCE_DIR}/csrc/sm100/decode/sparse_fp8/splitkv_mla.cu"
+    "${repo-flashmla_SOURCE_DIR}/csrc/sm100/prefill/dense/fmha_cutlass_fwd_sm100.cu"
+    "${repo-flashmla_SOURCE_DIR}/csrc/sm100/prefill/dense/fmha_cutlass_bwd_sm100.cu"
+    "${repo-flashmla_SOURCE_DIR}/csrc/sm100/prefill/sparse/fwd.cu"
 
     "${repo-fast-hadamard-transform_SOURCE_DIR}/csrc/fast_hadamard_transform_cuda.cu"
     "${repo-fast-hadamard-transform_SOURCE_DIR}/csrc/fast_hadamard_transform.cpp"
