@@ -152,6 +152,9 @@ class FusedMoE(torch.nn.Module):
         self.hidden_size = hidden_size
         self.num_experts = num_experts
         self.num_fused_shared_experts = num_fused_shared_experts
+        self.expert_map_cpu = None
+        self.expert_map_gpu = None
+        self.expert_mask_gpu = None
 
         enable_flashinfer_cutlass_moe = get_moe_runner_backend().is_flashinfer_cutlass()
 

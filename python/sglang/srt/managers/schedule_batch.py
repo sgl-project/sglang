@@ -83,6 +83,48 @@ if TYPE_CHECKING:
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
+GLOBAL_SERVER_ARGS_KEYS = [
+    "attention_backend",
+    "mm_attention_backend",
+    "debug_tensor_dump_inject",
+    "debug_tensor_dump_output_folder",
+    "chunked_prefill_size",
+    "device",
+    "disable_chunked_prefix_cache",
+    "disable_flashinfer_cutlass_moe_fp4_allgather",
+    "disable_radix_cache",
+    "enable_dp_lm_head",
+    "enable_fp32_lm_head",
+    "flashinfer_mxfp4_moe_precision",
+    "enable_flashinfer_allreduce_fusion",
+    "moe_dense_tp_size",
+    "ep_dispatch_algorithm",
+    "ep_num_redundant_experts",
+    "enable_nan_detection",
+    "flashinfer_mla_disable_ragged",
+    "pp_max_micro_batch_size",
+    "disable_shared_experts_fusion",
+    "shared_expert_mode",
+    "sampling_backend",
+    "speculative_accept_threshold_single",
+    "speculative_accept_threshold_acc",
+    "speculative_attention_mode",
+    "torchao_config",
+    "triton_attention_reduce_in_fp32",
+    "num_reserved_decode_tokens",
+    "weight_loader_disable_mmap",
+    "enable_multimodal",
+    "enable_symm_mem",
+    "enable_custom_logit_processor",
+    "disaggregation_mode",
+    "enable_deterministic_inference",
+    "nsa_prefill",
+    "nsa_decode",
+    "multi_item_scoring_delimiter",
+]
+
+# Put some global args for easy access
+global_server_args_dict = {k: getattr(ServerArgs, k) for k in GLOBAL_SERVER_ARGS_KEYS}
 
 logger = logging.getLogger(__name__)
 
