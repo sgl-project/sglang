@@ -82,7 +82,7 @@ SGLang supports various environment variables that can be used to configure its 
 | Environment Variable | Description | Default Value |
 | --- | --- | --- |
 | `SGLANG_IS_IN_CI` | Indicates if running in CI environment | `false` |
-| `SGLANG_AMD_CI` | Indicates running in AMD CI environment | `0` |
+| `SGLANG_IS_IN_CI_AMD` | Indicates running in AMD CI environment | `0` |
 | `SGLANG_TEST_RETRACT` | Enable retract decode testing | `false` |
 | `SGLANG_RECORD_STEP_TIME` | Record step time for profiling | `false` |
 | `SGLANG_TEST_REQUEST_TIME_STATS` | Test request time statistics | `false` |

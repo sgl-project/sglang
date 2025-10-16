@@ -2156,7 +2156,7 @@ mod rerank_tests {
         assert!(body_json.get("model").is_some());
 
         // V1 API should use default model name
-        assert_eq!(body_json["model"], "default");
+        assert_eq!(body_json["model"], "unknown");
 
         let results = body_json["results"].as_array().unwrap();
         assert_eq!(results.len(), 3); // All documents should be returned

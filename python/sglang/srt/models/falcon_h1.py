@@ -450,13 +450,6 @@ class FalconH1Model(nn.Module):
         return hidden_states
 
 
-class HybridLayerType(enum.Enum):
-    full_attention = "attention"
-    swa_attention = "swa_attention"
-    linear_attention = "linear_attention"
-    mamba2 = "mamba"
-
-
 class FalconH1ForCausalLM(nn.Module):
     fall_back_to_pt_during_load = False
 

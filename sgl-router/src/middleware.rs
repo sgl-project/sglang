@@ -69,6 +69,8 @@ fn generate_request_id(path: &str) -> String {
         "cmpl-"
     } else if path.contains("/generate") {
         "gnt-"
+    } else if path.contains("/responses") {
+        "resp-"
     } else {
         "req-"
     };
