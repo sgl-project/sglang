@@ -1,10 +1,12 @@
 // Integration test for Responses API
 
 use axum::http::StatusCode;
-use sglang_router_rs::protocols::spec::{
-    GenerationRequest, ReasoningEffort, ResponseInput, ResponseReasoningParam, ResponseStatus,
-    ResponseTool, ResponseToolType, ResponsesRequest, ResponsesResponse, ServiceTier, ToolChoice,
-    ToolChoiceValue, Truncation, UsageInfo,
+use sglang_router_rs::protocols::common::{
+    GenerationRequest, ToolChoice, ToolChoiceValue, UsageInfo,
+};
+use sglang_router_rs::protocols::responses::{
+    ReasoningEffort, ResponseInput, ResponseReasoningParam, ResponseTool, ResponseToolType,
+    ResponsesRequest, ServiceTier, Truncation,
 };
 
 mod common;
@@ -431,23 +433,17 @@ fn test_responses_request_sglang_extensions() {
 }
 
 #[test]
-fn test_responses_response_creation() {
-    let response = ResponsesResponse::new(
-        "resp_test789".to_string(),
-        "test-model".to_string(),
-        ResponseStatus::Completed,
-    );
-
-    assert_eq!(response.id, "resp_test789");
-    assert_eq!(response.model, "test-model");
-    assert!(response.is_complete());
-    assert!(!response.is_in_progress());
-    assert!(!response.is_failed());
-}
-
-#[test]
 fn test_usage_conversion() {
-    let usage_info = UsageInfo::new_with_cached(15, 25, Some(8), 3);
+    // Construct UsageInfo directly with cached token details
+    let usage_info = UsageInfo {
+        prompt_tokens: 15,
+        completion_tokens: 25,
+        total_tokens: 40,
+        reasoning_tokens: Some(8),
+        prompt_tokens_details: Some(sglang_router_rs::protocols::common::PromptTokenUsageInfo {
+            cached_tokens: 3,
+        }),
+    };
     let response_usage = usage_info.to_response_usage();
 
     assert_eq!(response_usage.input_tokens, 15);
