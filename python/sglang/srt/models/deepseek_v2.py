@@ -593,6 +593,7 @@ class DeepseekV2MoE(nn.Module):
                 **(
                     dict(tp_rank=0, tp_size=1)
                     if get_moe_a2a_backend().is_deepep()
+                    or get_moe_a2a_backend().is_mooncake()
                     or should_use_flashinfer_cutlass_moe_fp4_allgather()
                     else {}
                 ),
@@ -623,7 +624,7 @@ class DeepseekV2MoE(nn.Module):
 
         self.top_k = config.num_experts_per_tok
 
-        if get_moe_a2a_backend().is_deepep():
+        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
             # TODO: we will support tp < ep in the future
             self.ep_size = get_moe_expert_parallel_world_size()
             self.num_experts = (
@@ -652,7 +653,9 @@ class DeepseekV2MoE(nn.Module):
                 return_recv_hook=True,
             )
 
-        self._enable_deepep_moe = get_moe_a2a_backend().is_deepep()
+        self._enable_a2a_moe = (
+            get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake()
+        )
 
     def get_moe_weights(self):
         return [
@@ -669,7 +672,7 @@ class DeepseekV2MoE(nn.Module):
         use_reduce_scatter: bool = False,
         gemm_output_zero_allocator: BumpAllocator = None,
     ) -> torch.Tensor:
-        if not self._enable_deepep_moe:
+        if not self._enable_a2a_moe:
             DUAL_STREAM_TOKEN_THRESHOLD = 1024
             if (
                 self.alt_stream is not None
