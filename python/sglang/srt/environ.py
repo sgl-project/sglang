@@ -221,6 +221,9 @@ class Envs:
     SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE = EnvInt(4096)
     SGLANG_TRITON_DECODE_SPLIT_TILE_SIZE = EnvInt(256)
 
+    # Overlap Spec V2
+    SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
+
     # fmt: on
 
 

@@ -1,9 +1,11 @@
+import contextlib
 import logging
 from typing import List, Optional
 
 import torch
 from torch.cuda import Stream as CudaStream
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, Req
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -50,9 +52,13 @@ class EAGLEWorkerV2(EAGLEWorker):
             self.speculative_num_steps * self.topk, self.speculative_num_draft_tokens
         )
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
-        self.plan_stream: CudaStream = torch.get_device_module(self.device).Stream()
-        # TODO(lsyin): potential bugs with a separate plan stream
-        self.plan_stream_ctx = torch.cuda.stream(self.plan_stream)
+
+        if envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get():
+            self.plan_stream: CudaStream = torch.get_device_module(self.device).Stream()
+            self.plan_stream_ctx = torch.cuda.stream(self.plan_stream)
+        else:
+            self.plan_stream = None
+            self.plan_stream_ctx = contextlib.nullcontext()
 
     def forward_batch_generation(self, model_worker_batch: ModelWorkerBatch):
         if model_worker_batch.forward_mode.is_decode():
