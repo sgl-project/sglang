@@ -119,7 +119,7 @@ class AscendPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             assert len(torch.unique(out_indices)) == len(out_indices)
 
         self.free_pages = self.free_pages[num_new_pages_item:]
-        return out_indices
+        return out_indices.int()
 
     def alloc_decode(
         self,
