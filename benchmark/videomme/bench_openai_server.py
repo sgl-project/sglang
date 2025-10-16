@@ -16,11 +16,12 @@ import os
 import subprocess
 
 from eval_utils import EvalArgs
+
 from sglang.test.test_utils import add_common_sglang_args_and_parse
 
 
 def main(args):
-    
+
     # Set OpenAI API key and base URL environment variables.
     # lmms-eval's openai_compatible model uses these env vars.
     api_key = "sk-123456"
@@ -98,7 +99,9 @@ def main(args):
 def parse_args():
     parser = argparse.ArgumentParser()
     EvalArgs.add_cli_args(parser)
-    args = add_common_sglang_args_and_parse(parser)  # pyright: ignore[reportUndefinedVariable]
+    args = add_common_sglang_args_and_parse(
+        parser
+    )  # pyright: ignore[reportUndefinedVariable]
     return args
 
 

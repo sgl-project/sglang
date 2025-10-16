@@ -22,9 +22,7 @@ class EvalArgs:
         parser.add_argument(
             "--result-filename", type=str, default=EvalArgs.result_filename
         )
-        parser.add_argument(
-            "--output-path", type=str, default=EvalArgs.output_path
-        )
+        parser.add_argument("--output-path", type=str, default=EvalArgs.output_path)
 
         parser.add_argument("--dataset-path", type=str, default=EvalArgs.dataset_path)
         parser.add_argument("--seed", type=int, default=EvalArgs.seed)
@@ -41,9 +39,7 @@ class EvalArgs:
         parser.add_argument(
             "--max-num-frames", type=int, default=EvalArgs.max_num_frames
         )
-        parser.add_argument(
-            "--batch-size", type=int, default=EvalArgs.batch_size
-        )
+        parser.add_argument("--batch-size", type=int, default=EvalArgs.batch_size)
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
