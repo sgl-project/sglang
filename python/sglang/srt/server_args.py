@@ -1065,6 +1065,16 @@ class ServerArgs:
             self.enable_mixed_chunk = False
             self.disable_radix_cache = True
 
+        if self.attention_backend == "fa4" or self.decode_attention_backend == "fa4":
+            raise ValueError(
+                "FA4 backend is only supported for prefill. Please use `--prefill-attention-backend fa4` instead."
+            )
+        if self.prefill_attention_backend == "fa4":
+            logger.warning(
+                f"FA4 backend only supports page size 128, changing page_size from {self.page_size} to 64."
+            )
+            self.page_size = 128
+
     def _handle_page_size(self):
         if self.page_size is None:
             self.page_size = 1

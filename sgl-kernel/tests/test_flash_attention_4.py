@@ -711,7 +711,7 @@ def test_flash_attn_output_disabled(
                 causal=causal,
                 window_size=window_size,
                 softcap=softcap,
-                learnable_sink=learnable_sink,  # FA4 uses learnable_sink, not sinks
+                sinks=learnable_sink,  # FA4 uses learnable_sink, not sinks
                 pack_gqa=pack_gqa,
                 return_softmax_lse=True,
                 ver=4,  # Use FA4
@@ -1062,7 +1062,7 @@ def test_flash_attn_varlen_output(
                 causal=causal,
                 window_size=window_size,
                 softcap=softcap,
-                learnable_sink=learnable_sink,  # FA4 uses learnable_sink, not sinks
+                sinks=learnable_sink,  # FA4 uses learnable_sink, not sinks
                 pack_gqa=pack_gqa,
                 return_softmax_lse=True,
                 ver=4,  # Use FA4
@@ -1617,7 +1617,7 @@ def test_flash_attn_kvcache(
                     page_table=page_table,
                     causal=causal,
                     window_size=window_size,
-                    learnable_sink=learnable_sink,  # FA4 uses learnable_sink, not sinks
+                    sinks=learnable_sink,  # FA4 uses learnable_sink, not sinks
                     softcap=0.0,
                     pack_gqa=None,
                     return_softmax_lse=True,

@@ -24,8 +24,6 @@ class TestFlashAttention4(unittest.TestCase):
             "0.8",
             "--prefill-attention-backend",
             "fa4",
-            "--page-size",
-            "64",
         ]
         cls.process = popen_launch_server(
             cls.model,
