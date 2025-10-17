@@ -190,6 +190,14 @@ def add_mla_attention_backend(backend_name):
         logger.info(f"Added {backend_name} to MLA_ATTENTION_BACKENDS.")
 
 
+def add_chunked_prefix_cache_attention_backend(backend_name):
+    if backend_name not in CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS:
+        CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS.append(backend_name)
+        logger.info(
+            f"Added {backend_name} to CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS."
+        )
+
+
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -276,10 +284,9 @@ class ModelRunner:
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.attention_chunk_size = model_config.attention_chunk_size
         self.forward_pass_id = 0
+        self.init_new_workspace = False
 
         # Apply the rank zero filter to logger
-        if not any(isinstance(f, RankZeroFilter) for f in logger.filters):
-            logger.addFilter(RankZeroFilter(tp_rank == 0))
         if server_args.show_time_cost:
             enable_show_time_cost()
 
@@ -569,8 +576,9 @@ class ModelRunner:
                     server_args.attention_backend = "ascend"
                 else:
                     server_args.attention_backend = "triton"
-            logger.info(
-                f"Attention backend not explicitly specified. Use {server_args.attention_backend} backend by default."
+            log_info_on_rank0(
+                logger,
+                f"Attention backend not explicitly specified. Use {server_args.attention_backend} backend by default.",
             )
         elif self.use_mla_backend:
             if server_args.device != "cpu":
@@ -677,7 +685,18 @@ class ModelRunner:
             raise
 
         if self.device == "cuda":
-            backend = "nccl"
+            if self.server_args.elastic_ep_backend == "mooncake":
+                backend = "mooncake"
+                if self.server_args.mooncake_ib_device:
+                    mooncake_ib_device = self.server_args.mooncake_ib_device.split(",")
+                    try:
+                        from mooncake import ep as mooncake_ep
+
+                        mooncake_ep.set_device_filter(mooncake_ib_device)
+                    except:
+                        pass  # A warning will be raised in `init_distributed_environment`
+            else:
+                backend = "nccl"
         elif self.device == "xpu":
             backend = "xccl"
         elif self.device == "hpu":
@@ -885,17 +904,23 @@ class ModelRunner:
             f"mem usage={self.weight_load_mem_usage:.2f} GB."
         )
 
-        # Handle the case where some ranks do not finish loading.
-        try:
-            dist.monitored_barrier(
-                group=get_tp_group().cpu_group,
-                timeout=datetime.timedelta(seconds=UNBALANCED_MODEL_LOADING_TIMEOUT_S),
-                wait_all_ranks=True,
-            )
-        except RuntimeError:
-            raise ValueError(
-                f"TP rank {self.tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
-            ) from None
+        if self.server_args.elastic_ep_backend == "mooncake":
+            # Mooncake does not support `monitored_barrier`
+            dist.barrier(group=get_tp_group().cpu_group)
+        else:
+            # Handle the case where some ranks do not finish loading.
+            try:
+                dist.monitored_barrier(
+                    group=get_tp_group().cpu_group,
+                    timeout=datetime.timedelta(
+                        seconds=UNBALANCED_MODEL_LOADING_TIMEOUT_S
+                    ),
+                    wait_all_ranks=True,
+                )
+            except RuntimeError:
+                raise ValueError(
+                    f"TP rank {self.tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
+                ) from None
 
     def update_expert_location(
         self,
@@ -1645,19 +1670,34 @@ class ModelRunner:
                 extra_max_context_len += self.server_args.speculative_num_draft_tokens
 
             if self.server_args.disaggregation_mode == "decode":
-                from sglang.srt.disaggregation.decode import DecodeReqToTokenPool
+                from sglang.srt.disaggregation.decode import (
+                    DecodeReqToTokenPool,
+                    HybridMambaDecodeReqToTokenPool,
+                )
 
                 # subscribe memory for pre-allocated requests
                 # if max_num_reqs <= 32, we pre-allocate 2x requests
                 pre_alloc_size = max_num_reqs * 2 if max_num_reqs <= 32 else 0
-                self.req_to_token_pool = DecodeReqToTokenPool(
-                    size=max_num_reqs,
-                    max_context_len=self.model_config.context_len
-                    + extra_max_context_len,
-                    device=self.device,
-                    enable_memory_saver=self.server_args.enable_memory_saver,
-                    pre_alloc_size=pre_alloc_size,
-                )
+                if config := self.mambaish_config:
+                    self.req_to_token_pool = HybridMambaDecodeReqToTokenPool(
+                        size=max_num_reqs,
+                        max_context_len=self.model_config.context_len
+                        + extra_max_context_len,
+                        device=self.device,
+                        enable_memory_saver=self.server_args.enable_memory_saver,
+                        cache_params=config.mamba2_cache_params,
+                        speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
+                        pre_alloc_size=pre_alloc_size,
+                    )
+                else:
+                    self.req_to_token_pool = DecodeReqToTokenPool(
+                        size=max_num_reqs,
+                        max_context_len=self.model_config.context_len
+                        + extra_max_context_len,
+                        device=self.device,
+                        enable_memory_saver=self.server_args.enable_memory_saver,
+                        pre_alloc_size=pre_alloc_size,
+                    )
             elif config := self.mambaish_config:
                 self.req_to_token_pool = HybridReqToTokenPool(
                     size=max_num_reqs,
@@ -1783,6 +1823,7 @@ class ModelRunner:
                     ),
                     enable_kvcache_transpose=False,
                     device=self.device,
+                    mamba_pool=self.req_to_token_pool.mamba_pool,
                 )
             else:
                 self.token_to_kv_pool = MHATokenToKVPool(
