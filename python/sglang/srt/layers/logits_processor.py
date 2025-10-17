@@ -141,6 +141,7 @@ class LogitsMetadata:
             )
             and forward_batch.return_logprob
             and not forward_batch.forward_mode.is_target_verify()
+            and not forward_batch.forward_mode.is_simple_draft()
         ):
             extend_return_top_logprob = any(
                 x > 0 for x in forward_batch.top_logprobs_nums
@@ -381,6 +382,8 @@ class LogitsProcessor(nn.Module):
             logits_metadata.forward_mode.is_decode_or_idle()
             or logits_metadata.forward_mode.is_target_verify()
             or logits_metadata.forward_mode.is_draft_extend_v2()
+            or logits_metadata.forward_mode.is_simple_draft()
+            or logits_metadata.forward_mode.is_simple_verify()
         ):
             pruned_states = hidden_states
             if aux_hidden_states is not None:

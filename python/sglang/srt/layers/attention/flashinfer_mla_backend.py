@@ -291,7 +291,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 spec_info=forward_batch.spec_info,
             )
             self.forward_metadata = PrefillMetadata(self.prefill_wrapper_paged, False)
-        elif forward_batch.forward_mode.is_target_verify():
+        elif forward_batch.forward_mode.is_target_verify() or forward_batch.forward_mode.is_simple_verify():
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
@@ -589,6 +589,8 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
     ):
+        if forward_batch.forward_mode.is_simple_verify() or forward_batch.forward_mode.is_target_verify():
+            return self.forward_extend(q, k, v, layer, forward_batch, save_kv_cache, q_rope, k_rope)
         decode_wrapper = self.forward_metadata.decode_wrapper
         cache_loc = forward_batch.out_cache_loc
 
