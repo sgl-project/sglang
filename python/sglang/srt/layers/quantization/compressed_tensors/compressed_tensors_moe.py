@@ -49,7 +49,9 @@ if _use_aiter:
     from sglang.srt.layers.moe.rocm_moe_utils import rocm_fused_experts_tkw1
 
 try:
-    import vllm
+    from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16 import (
+        WNA16_SUPPORTED_BITS,
+    )
 
     VLLM_AVAILABLE = True
 except ImportError:
