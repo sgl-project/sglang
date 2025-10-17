@@ -27,14 +27,12 @@ class TestQwen3VLServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
 
 class TestQwen3OmniServer(OmniOpenAITestMixin):
     model = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
-    extra_args = (
-        [  # workaround to fit into H100
-            "--mem-fraction-static=0.90",
-            "--disable-cuda-graph",
-            "--disable-fast-image-processor",
-            "--grammar-backend=none",
-        ],
-    )
+    extra_args = [  # workaround to fit into H100
+        "--mem-fraction-static=0.90",
+        "--disable-cuda-graph",
+        "--disable-fast-image-processor",
+        "--grammar-backend=none",
+    ]
 
 
 class TestQwen2VLContextLengthServer(CustomTestCase):
