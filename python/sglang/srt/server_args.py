@@ -1633,7 +1633,7 @@ class ServerArgs:
             type=str,
             default=ServerArgs.kv_cache_dtype,
             choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16"],
-            help='Data type for kv cache storage. "auto" will use model data type. "fp8_e5m2" and "fp8_e4m3" are supported for CUDA 11.8+.',
+            help='Data type for kv cache storage. "auto" will use model data type. "bf16" or "bfloat16" for BF16 KV cache. "fp8_e5m2" and "fp8_e4m3" are supported for CUDA 11.8+.',
         )
         parser.add_argument(
             "--enable-fp32-lm-head",
