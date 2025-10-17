@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from typing import List
 
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.constrained.reasoner_grammar_backend import ReasonerGrammarObject
@@ -35,6 +36,41 @@ class DummyGrammar(BaseGrammarObject):
         return None
 
 
+class TrackingGrammar(BaseGrammarObject):
+    def __init__(self):
+        self.recorded: List[int] = []
+
+    def accept_token(self, token: int) -> None:
+        self.recorded.append(token)
+
+    def allocate_vocab_mask(self, vocab_size: int, batch_size: int, device):
+        return None
+
+    def fill_vocab_mask(self, vocab_mask, idx: int) -> None:
+        return None
+
+    def move_vocab_mask(self, vocab_mask, device):
+        return vocab_mask
+
+    @property
+    def apply_vocab_mask(self):
+        return lambda logits, mask: None
+
+    def copy(self) -> "TrackingGrammar":
+        cloned = TrackingGrammar()
+        cloned.recorded = list(self.recorded)
+        return cloned
+
+    def try_jump_forward(self, tokenizer):
+        return None
+
+    def jump_forward_str_state(self, helper):
+        raise NotImplementedError
+
+    def jump_and_retokenize(self, old_output_ids, new_output_ids, next_state: int):
+        return None
+
+
 def _make_scheduler():
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.tokenizer = SimpleNamespace(reasoning_initial_in_reasoning=False)
@@ -45,7 +81,7 @@ def test_apply_reasoning_state_resets_without_custom_flag():
     scheduler = _make_scheduler()
     grammar = ReasonerGrammarObject(
         DummyGrammar(),
-        think_end_id=None,
+        think_end_ids=None,
         think_start_ids=None,
         initial_in_reasoning=False,
     )
@@ -64,7 +100,7 @@ def test_apply_reasoning_state_with_custom_flag():
     scheduler = _make_scheduler()
     grammar = ReasonerGrammarObject(
         DummyGrammar(),
-        think_end_id=None,
+        think_end_ids=None,
         think_start_ids=None,
         initial_in_reasoning=False,
     )
@@ -78,3 +114,40 @@ def test_apply_reasoning_state_with_custom_flag():
     scheduler._apply_reasoning_initial_state(req)
 
     assert grammar.is_in_reasoning is True
+
+
+def test_multitoken_think_end_sequence_transitions_cleanly():
+    tracking = TrackingGrammar()
+    grammar = ReasonerGrammarObject(
+        tracking,
+        think_end_ids=[5, 6, 7],
+        think_start_ids=[1, 2],
+        initial_in_reasoning=False,
+    )
+
+    # Regular token before reasoning should be forwarded.
+    grammar.accept_token(3)
+    assert tracking.recorded == [3]
+    assert grammar.is_in_reasoning is False
+
+    # Enter reasoning via start sequence.
+    grammar.accept_token(1)
+    grammar.accept_token(2)
+    assert tracking.recorded == [3]
+    assert grammar.is_in_reasoning is True
+
+    # Reasoning content should not reach the downstream grammar.
+    grammar.accept_token(9)
+    assert tracking.recorded == [3]
+
+    # Multi-token end marker should switch back to normal mode without forwarding.
+    grammar.accept_token(5)
+    grammar.accept_token(6)
+    assert grammar.is_in_reasoning is True
+    grammar.accept_token(7)
+    assert grammar.is_in_reasoning is False
+    assert tracking.recorded == [3]
+
+    # Subsequent tokens must be validated by the downstream grammar again.
+    grammar.accept_token(8)
+    assert tracking.recorded == [3, 8]

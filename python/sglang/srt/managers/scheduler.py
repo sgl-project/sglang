@@ -410,8 +410,11 @@ class Scheduler(
                     "reasoning-aware grammar will be disabled.",
                     reasoning_parser.detector.think_end_token,
                 )
+                self.tokenizer.reasoning_think_end_ids = None
                 self.tokenizer.think_end_id = None
             else:
+                self.tokenizer.reasoning_think_end_ids = think_end_ids
+                # Keep the legacy single-token attribute for backward compatibility.
                 self.tokenizer.think_end_id = think_end_ids[0]
 
             think_start_ids = self.tokenizer.encode(
