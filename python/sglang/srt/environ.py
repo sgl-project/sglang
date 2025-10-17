@@ -126,6 +126,7 @@ class Envs:
     SGLANG_SIMULATE_ACC_LEN = EnvFloat(-1)
     SGLANG_SIMULATE_ACC_METHOD = EnvStr("multinomial")
     SGLANG_TORCH_PROFILER_DIR = EnvStr("/tmp")
+    SGLANG_USE_DP_CP_AG_AFTER_DSA = EnvBool(False)
 
     # Scheduler: memory leak test
     SGLANG_TEST_RETRACT = EnvBool(False)

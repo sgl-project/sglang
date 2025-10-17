@@ -30,6 +30,7 @@ from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import get_bool_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -363,6 +364,7 @@ class PrefillAdder:
         self.priority_scheduling_preemption_threshold = (
             priority_scheduling_preemption_threshold
         )
+        self.use_dp_cp_dsa = get_bool_env_var("SGLANG_USE_DP_CP_AG_AFTER_DSA")
 
     def _get_running_request_total_token_offset(self, req: Req) -> int:
         return (
@@ -565,6 +567,9 @@ class PrefillAdder:
     def add_one_req(
         self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
     ):
+        # TODO support cp with multiple requests
+        if len(self.can_run_list) >= 1 and self.use_dp_cp_dsa:
+            return AddReqResult.OTHER
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req, has_chunked_req)
 
