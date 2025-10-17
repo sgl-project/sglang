@@ -767,6 +767,7 @@ class NixlKVReceiver(CommonKVReceiver):
                 f"Could not fetch prefill parallel info from bootstrap_addr: {self.bootstrap_addr}",
             )
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+            return
 
         for bootstrap_info in self.bootstrap_infos:
             logger.debug(

@@ -638,6 +638,7 @@ class MooncakeKVManager(CommonKVManager):
         req: TransferInfo,
         prefill_state_indices: list[int],
         dst_state_data_ptrs: list[int],
+        executor: concurrent.futures.ThreadPoolExecutor,
     ):
         """Send state or extra pool data with type-specific handling."""
         state_type = getattr(self.kv_args, "state_type", "none")
@@ -659,7 +660,7 @@ class MooncakeKVManager(CommonKVManager):
                 item_lens=self.kv_args.state_item_lens,
                 prefill_data_indices=prefill_state_indices,
                 dst_data_indices=dst_state_indices,
-                executor=self.executors,
+                executor=executor,
             )
         else:
             return 0
@@ -807,6 +808,7 @@ class MooncakeKVManager(CommonKVManager):
                                     req,
                                     kv_chunk.state_indices,
                                     target_rank_registration_info.dst_state_data_ptrs,
+                                    executor,
                                 )
 
                             if self.pp_group.is_last_rank:
@@ -1260,6 +1262,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
                 f"Could not fetch prefill parallel info from bootstrap_addr: {self.bootstrap_addr}",
             )
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+            return
 
         for bootstrap_info in self.bootstrap_infos:
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
