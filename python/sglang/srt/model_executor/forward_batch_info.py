@@ -47,6 +47,9 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.utils import get_compiler_backend, is_npu, support_triton
 
+import logging
+logger = logging.getLogger(__name__)
+
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput

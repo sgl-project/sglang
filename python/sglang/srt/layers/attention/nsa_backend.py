@@ -32,6 +32,9 @@ if TYPE_CHECKING:
 
 _is_hip = is_hip()
 
+import logging
+logger = logging.getLogger(__name__)
+
 if _is_hip:
     try:
         from aiter import (
@@ -117,18 +120,30 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
         self,
         logits: torch.Tensor,
         topk: int,
+        cu_seqlens_q: torch.Tensor = None,
+        ke_offset: torch.Tensor = None,
     ) -> torch.Tensor:
         from sgl_kernel import fast_topk_transform_fused, fast_topk_v2
+        
+        if cu_seqlens_q is not None:
+            cu_seqlens_q = cu_seqlens_q.to(torch.int32)
+            cu_seqlens_q_topk = compute_cu_seqlens(cu_seqlens_q)
+        else:
+            cu_seqlens_q_topk = self.attn_metadata.cu_seqlens_q
+        if ke_offset is not None:
+            seq_lens_topk = ke_offset
+        else:
+            seq_lens_topk = self.get_seqlens_expanded() 
 
         if not NSA_FUSE_TOPK:
-            return fast_topk_v2(logits, self.get_seqlens_expanded(), topk)
+            return fast_topk_v2(logits, seq_lens_topk, topk)
 
         # NOTE(dark): if fused, we return a transformed page table directly
         return fast_topk_transform_fused(
             score=logits,
-            lengths=self.get_seqlens_expanded(),
+            lengths=seq_lens_topk,
             page_table_size_1=self.attn_metadata.page_table_1,
-            cu_seqlens_q=self.attn_metadata.cu_seqlens_q,
+            cu_seqlens_q=cu_seqlens_q_topk,
             topk=topk,
         )
 
