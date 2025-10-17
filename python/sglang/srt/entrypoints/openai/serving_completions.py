@@ -138,6 +138,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             "ignore_eos": request.ignore_eos,
             "skip_special_tokens": request.skip_special_tokens,
             "logit_bias": request.logit_bias,
+            "num_diffusion_steps": request.num_diffusion_steps,
         }
 
         # Handle response_format constraints

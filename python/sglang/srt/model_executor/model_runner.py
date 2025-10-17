@@ -2057,7 +2057,12 @@ class ModelRunner:
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors=None,
     ) -> LogitsProcessorOutput:
-        if not skip_attn_backend_init:
+        # RND1 doesn't use KV cache or attention backend
+        is_rnd1 = (
+            hasattr(self.model_config, "hf_text_config")
+            and getattr(self.model_config.hf_text_config, "model_type", None) == "rnd1"
+        )
+        if not skip_attn_backend_init and not is_rnd1:
             self.attn_backend.init_forward_metadata(forward_batch)
         # FIXME: add pp_proxy_tensors arg to all models
         kwargs = {}
@@ -2076,7 +2081,12 @@ class ModelRunner:
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors=None,
     ) -> LogitsProcessorOutput:
-        if not skip_attn_backend_init:
+        # RND1 doesn't use KV cache or attention backend
+        is_rnd1 = (
+            hasattr(self.model_config, "hf_text_config")
+            and getattr(self.model_config.hf_text_config, "model_type", None) == "rnd1"
+        )
+        if not skip_attn_backend_init and not is_rnd1:
             self.attn_backend.init_forward_metadata(forward_batch)
 
         kwargs = {}
@@ -2306,7 +2316,7 @@ class ModelRunner:
         """Detect if the model has "mrope" rope_scaling type.
         mrope requires keep "rope_deltas" between prompt and decoding phases."""
         rope_scaling = getattr(self.model_config.hf_text_config, "rope_scaling", {})
-        if rope_scaling is None:
+        if rope_scaling is None or not isinstance(rope_scaling, dict):
             return False
         is_mrope_enabled = "mrope_section" in rope_scaling
         return is_mrope_enabled

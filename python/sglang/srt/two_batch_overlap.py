@@ -618,10 +618,14 @@ class TboForwardBatchPreparer:
             "out_cache_loc",
         ]:
             old_value = getattr(batch, key)
-            assert (
-                old_value.shape[0] == num_tokens
-            ), f"{key=} {old_value=} {num_tokens=} {batch=}"
-            output_dict[key] = old_value[start_token_index:end_token_index]
+            if key == "out_cache_loc" and old_value is None:
+                # If a model does not use KV cache, keep as None
+                output_dict[key] = None
+            else:
+                assert (
+                    old_value.shape[0] == num_tokens
+                ), f"{key=} {old_value=} {num_tokens=} {batch=}"
+                output_dict[key] = old_value[start_token_index:end_token_index]
 
         for key in [
             "req_pool_indices",

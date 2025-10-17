@@ -116,6 +116,26 @@ class ModelConfig:
             model_override_args=self.model_override_args,
             **kwargs,
         )
+
+        # Ensure architectures is always set (fix for custom configs that don't set it)
+        if (
+            not hasattr(self.hf_config, "architectures")
+            or self.hf_config.architectures is None
+        ):
+            # Set a default based on model_type if available
+            if hasattr(self.hf_config, "model_type"):
+                model_type = self.hf_config.model_type
+                # Map model_type to architecture name (capitalize first letter for standard naming)
+                # Handle special cases
+                if model_type == "rnd1":
+                    self.hf_config.architectures = ["RND1"]
+                else:
+                    # Capitalize first letter for standard architecture naming
+                    arch_name = model_type[0].upper() + model_type[1:] + "ForCausalLM"
+                    self.hf_config.architectures = [arch_name]
+            else:
+                self.hf_config.architectures = []
+
         self.hf_text_config = get_hf_text_config(self.hf_config)
         self.hf_generation_config = get_generation_config(
             self.model_path,
@@ -224,6 +244,8 @@ class ModelConfig:
 
     def _config_draft_model(self):
         is_draft_model = self.is_draft_model
+        if not self.hf_config.architectures:
+            return
 
         if (
             is_draft_model
@@ -807,7 +829,7 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
     # 1. Check the model architecture
     # 2. check the `is_embedding` server args
 
-    if (
+    if model_architectures and (
         "LlamaEmbeddingModel" in model_architectures
         or "MistralModel" in model_architectures
         or "LlamaForSequenceClassification" in model_architectures
@@ -853,7 +875,6 @@ multimodal_model_archs = [
     "Qwen2_5_VLForConditionalGeneration",
     "Qwen3VLForConditionalGeneration",
     "Qwen3VLMoeForConditionalGeneration",
-    "Qwen3OmniMoeForConditionalGeneration",
     "KimiVLForConditionalGeneration",
     "InternVLChatModel",
     "InternS1ForConditionalGeneration",
@@ -867,7 +888,7 @@ multimodal_model_archs = [
 
 
 def is_multimodal_model(model_architectures: List[str]):
-    if any(
+    if model_architectures and any(
         multi_model_arch in model_architectures
         for multi_model_arch in multimodal_model_archs
     ):
@@ -889,11 +910,16 @@ def is_audio_model(model_architectures: List[str]):
 
 
 def is_encoder_decoder_model(model_architectures: List[str]):
-    return "MllamaForConditionalGeneration" in model_architectures
+    return (
+        model_architectures and "MllamaForConditionalGeneration" in model_architectures
+    )
 
 
 def is_multimodal_chunked_prefill_supported(model_architectures: List[str]):
     """Check if chunked prefill is supported for a MultiModal model."""
+    if not model_architectures:
+        return False
+
     unsupported = [
         "Grok1VForCausalLM",
         "Grok1AForCausalLM",
@@ -923,6 +949,7 @@ def is_hybrid_model(
         return None
     elif (
         hybrid_kvcache_ratio > 0
+        and model_architectures
         and model_architectures[0] == "Llama4ForConditionalGeneration"
         and context_length > attention_chunk_size
     ):
@@ -932,7 +959,7 @@ def is_hybrid_model(
 
 
 def get_hybrid_layer_ids(model_architectures: List[str], num_hidden_layers: int):
-    if "Llama4ForConditionalGeneration" in model_architectures:
+    if model_architectures and "Llama4ForConditionalGeneration" in model_architectures:
         swa_attention_layer_ids = [
             i for i in range(num_hidden_layers) if (i + 1) % 4 != 0
         ]

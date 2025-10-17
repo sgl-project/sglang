@@ -228,6 +228,7 @@ class CompletionRequest(BaseModel):
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
     session_params: Optional[Dict] = None
     response_format: Optional[Union[ResponseFormat, StructuralTagResponseFormat]] = None
+    num_diffusion_steps: Optional[int] = None
 
     # For PD disaggregation
     bootstrap_host: Optional[Union[List[str], str]] = None
@@ -485,6 +486,7 @@ class ChatCompletionRequest(BaseModel):
     separate_reasoning: bool = True
     stream_reasoning: bool = True
     chat_template_kwargs: Optional[Dict] = None
+    num_diffusion_steps: Optional[int] = None
 
     # For request id
     rid: Optional[Union[List[str], str]] = None
@@ -618,6 +620,7 @@ class ChatCompletionRequest(BaseModel):
             "ignore_eos": self.ignore_eos,
             "skip_special_tokens": self.skip_special_tokens,
             "logit_bias": self.logit_bias,
+            "num_diffusion_steps": self.num_diffusion_steps,
         }
 
         if self.response_format and self.response_format.type == "json_schema":
@@ -981,6 +984,7 @@ class ResponsesRequest(BaseModel):
             "top_k": self.top_k,
             "min_p": self.min_p,
             "repetition_penalty": self.repetition_penalty,
+            "num_diffusion_steps": self.num_diffusion_steps,
         }
 
         # Apply any additional default parameters
