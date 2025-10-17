@@ -32,12 +32,17 @@ class ReasonerGrammarObject(BaseGrammarObject):
         self.grammar = grammar
         self.think_end_id = think_end_id
         self.think_start_ids = tuple(think_start_ids or [])
-        self.is_in_reasoning = initial_in_reasoning
+        self.initial_in_reasoning = bool(initial_in_reasoning)
+        self.is_in_reasoning = self.initial_in_reasoning
         self._start_match_index = 0
         self._pending_start_tokens: List[int] = []
 
-    def set_initial_reasoning_state(self, is_in_reasoning: bool):
-        self.is_in_reasoning = bool(is_in_reasoning)
+    def set_initial_reasoning_state(self, is_in_reasoning: Optional[bool]):
+        if is_in_reasoning is None:
+            target_state = self.initial_in_reasoning
+        else:
+            target_state = bool(is_in_reasoning)
+        self.is_in_reasoning = target_state
         self._start_match_index = 0
         self._pending_start_tokens.clear()
 
@@ -99,8 +104,9 @@ class ReasonerGrammarObject(BaseGrammarObject):
             self.grammar.copy(),
             self.think_end_id,
             list(self.think_start_ids),
-            self.is_in_reasoning,
+            self.initial_in_reasoning,
         )
+        copied.is_in_reasoning = self.is_in_reasoning
         copied._start_match_index = self._start_match_index
         copied._pending_start_tokens = list(self._pending_start_tokens)
         return copied

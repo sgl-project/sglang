@@ -1578,11 +1578,9 @@ class Scheduler(
 
     def _apply_reasoning_initial_state(self, req: Req) -> None:
         custom_params = getattr(req.sampling_params, "custom_params", None)
-        if not isinstance(custom_params, dict):
-            return
-        initial_flag = custom_params.get("reasoning_initial_in_reasoning")
-        if initial_flag is None:
-            return
+        initial_flag = None
+        if isinstance(custom_params, dict):
+            initial_flag = custom_params.get("reasoning_initial_in_reasoning")
         grammar = getattr(req, "grammar", None)
         if grammar is None or grammar is INVALID_GRAMMAR_OBJ:
             return
