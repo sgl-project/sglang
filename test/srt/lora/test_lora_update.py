@@ -875,7 +875,6 @@ class LoRAUpdateEngineTestSession(LoRAUpdateTestSessionBase):
         if lora_path is None:
             lora_path = lora_name
 
-        print(f"[Test Lora]: load_lora_adapter")
         response = self.handle.load_lora_adapter(
             lora_name=lora_name,
             lora_path=lora_path,
