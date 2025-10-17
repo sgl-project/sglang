@@ -165,6 +165,12 @@ def load_model(server_args, port_args, tp_rank):
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
     moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
 
+    if is_cuda_alike():
+        # Set gpu_id to 0 for CUDA because CUDA_VISIBLE_DEVICES guarantee there's only 1 available GPU.
+        gpu_id = 0
+    else:
+        gpu_id = tp_rank
+
     model_config = ModelConfig.from_server_args(server_args)
     model_runner = ModelRunner(
         model_config=model_config,
@@ -356,10 +362,6 @@ def correctness_test(
     # Configure the logger
     configure_logger(server_args, prefix=f" TP{tp_rank}")
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
-
-    if is_cuda_alike():
-        # Set gpu_id to 0 for CUDA because CUDA_VISIBLE_DEVICES guarantee there's only 1 available GPU.
-        gpu_id = 0
 
     # Load the model
     model_runner, tokenizer = load_model(server_args, port_args, tp_rank)

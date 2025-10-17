@@ -3037,11 +3037,6 @@ def run_scheduler_process(
         gpu_id = 0
         assert torch.cuda.device_count() == 1
 
-    if is_cuda_alike():
-        # Set gpu_id to 0 for CUDA because CUDA_VISIBLE_DEVICES guarantee there's only 1 available GPU.
-        gpu_id = 0
-        assert torch.cuda.device_count() == 1
-
     # Create a scheduler and run the event loop
     try:
         scheduler = Scheduler(
