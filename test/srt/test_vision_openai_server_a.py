@@ -16,14 +16,25 @@ class TestLlavaServer(ImageOpenAITestMixin):
 class TestQwen25VLServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
     model = "Qwen/Qwen2.5-VL-7B-Instruct"
     extra_args = [
-        "--cuda-graph-max-bs",
-        "4",
+        "--cuda-graph-max-bs=4",
     ]
 
 
 class TestQwen3VLServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
     model = "Qwen/Qwen3-VL-30B-A3B-Instruct"
     extra_args = ["--cuda-graph-max-bs=4"]
+
+
+class TestQwen3OmniServer(OmniOpenAITestMixin):
+    model = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
+    extra_args = (
+        [  # workaround to fit into H100
+            "--mem-fraction-static=0.90",
+            "--disable-cuda-graph",
+            "--disable-fast-image-processor",
+            "--grammar-backend=none",
+        ],
+    )
 
 
 class TestQwen2VLContextLengthServer(CustomTestCase):
@@ -90,40 +101,35 @@ class TestQwen2VLContextLengthServer(CustomTestCase):
 class TestInternVL25Server(ImageOpenAITestMixin):
     model = "OpenGVLab/InternVL2_5-2B"
     extra_args = [
-        "--cuda-graph-max-bs",
-        "4",
+        "--cuda-graph-max-bs=4",
     ]
 
 
 class TestMiniCPMV4Server(ImageOpenAITestMixin):
     model = "openbmb/MiniCPM-V-4"
     extra_args = [
-        "--cuda-graph-max-bs",
-        "4",
+        "--cuda-graph-max-bs=4",
     ]
 
 
 class TestMiniCPMo26Server(ImageOpenAITestMixin, AudioOpenAITestMixin):
     model = "openbmb/MiniCPM-o-2_6"
     extra_args = [
-        "--cuda-graph-max-bs",
-        "4",
+        "--cuda-graph-max-bs=4",
     ]
 
 
 class TestGemma3itServer(ImageOpenAITestMixin):
     model = "google/gemma-3-4b-it"
     extra_args = [
-        "--cuda-graph-max-bs",
-        "4",
+        "--cuda-graph-max-bs=4",
     ]
 
 
 class TestKimiVLServer(ImageOpenAITestMixin):
     model = "moonshotai/Kimi-VL-A3B-Instruct"
     extra_args = [
-        "--context-length",
-        "8192",
+        "--context-length=8192",
         "--dtype=bfloat16",
     ]
 
@@ -135,8 +141,7 @@ class TestKimiVLServer(ImageOpenAITestMixin):
 class TestGLM41VServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
     model = "zai-org/GLM-4.1V-9B-Thinking"
     extra_args = [
-        "--reasoning-parser",
-        "glm45",
+        "--reasoning-parser=glm45",
     ]
 
 
