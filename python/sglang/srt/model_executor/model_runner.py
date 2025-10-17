@@ -625,7 +625,7 @@ class ModelRunner:
             server_args.disable_chunked_prefix_cache = True
 
         if not server_args.disable_chunked_prefix_cache:
-            logger.info("Chunked prefix cache is turned on.")
+            log_info_on_rank0(logger, "Chunked prefix cache is turned on.")
 
         if server_args.attention_backend == "aiter":
             if self.model_config.context_len > 8192:
