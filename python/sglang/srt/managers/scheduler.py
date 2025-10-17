@@ -173,7 +173,6 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_int_env_var,
     get_zmq_socket,
-    is_cuda_alike,
     kill_itself_when_parent_died,
     numa_bind_to_node,
     point_to_point_pyobj,

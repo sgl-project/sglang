@@ -3275,7 +3275,7 @@ def json_list_type(value):
 def maybe_reindex_device_id(gpu_id: int):
 
     if envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.get() is False or not is_cuda_alike():
-        yield
+        yield gpu_id
         return
 
     original_cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
