@@ -1,3 +1,6 @@
+import weakref
+from typing import Optional
+
 import torch
 
 from sglang.srt.sampling.penaltylib.orchestrator import (
@@ -10,10 +13,6 @@ class BatchedPresencePenalizer(_BatchedPenalizer):
     """
     Presence penalizer penalizes tokens based on their presence in the output.
     """
-
-    def __init__(self, orchestrator: BatchedPenalizerOrchestrator):
-        self.orchestrator = orchestrator
-        self._is_prepared = False
 
     def _is_required(self) -> bool:
         return any(
@@ -63,3 +62,8 @@ class BatchedPresencePenalizer(_BatchedPenalizer):
             [self.cumulated_presence_penalties, their.cumulated_presence_penalties],
             dim=0,
         )
+
+    def _teardown(self) -> None:
+        for name in ("presence_penalties", "cumulated_presence_penalties"):
+            if hasattr(self, name):
+                delattr(self, name)
