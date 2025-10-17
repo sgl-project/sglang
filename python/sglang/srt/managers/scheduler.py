@@ -215,10 +215,10 @@ class GenerationBatchResult:
     delay_sample_func: Optional[callable] = None
     future_indices: Optional[FutureIndices] = None
 
-    # FIXME(lsyin): maybe move to <BetterPlace> ?
+    # FIXME(lsyin): maybe move to a better place?
     # sync path: forward stream -> output processor
     accept_lens: Optional[torch.Tensor] = None
-    last_batch_allocate_lens: Optional[torch.Tensor] = None
+    allocate_lens: Optional[torch.Tensor] = None
 
     # relay path: forward stream -> next step forward
     next_draft_input: Optional[EagleDraftInput] = None
@@ -246,10 +246,8 @@ class GenerationBatchResult:
         if self.accept_lens is not None:
             self.accept_lens = self.accept_lens.to("cpu", non_blocking=True)
 
-        if self.last_batch_allocate_lens is not None:
-            self.last_batch_allocate_lens = self.last_batch_allocate_lens.to(
-                "cpu", non_blocking=True
-            )
+        if self.allocate_lens is not None:
+            self.allocate_lens = self.allocate_lens.to("cpu", non_blocking=True)
 
         self.copy_done.record()
 
@@ -657,6 +655,12 @@ class Scheduler(
     def launch_draft_worker(
         self, gpu_id, tp_rank, moe_ep_rank, server_args, port_args, dp_rank
     ):
+        if server_args.speculative_draft_load_format is not None:
+            server_args.load_format = server_args.speculative_draft_load_format
+            logger.info(
+                f"Using draft model load_format: '{server_args.speculative_draft_load_format}'"
+            )
+
         if self.spec_algorithm.is_eagle():
             from sglang.srt.speculative.eagle_worker import EAGLEWorker
             from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
@@ -804,9 +808,6 @@ class Scheduler(
                     self.tree_cache.cache_controller.layer_done_counter
                 )
             elif self.is_hybrid:
-                assert (
-                    self.server_args.disaggregation_mode == "null"
-                ), "Hybrid mode does not support disaggregation yet"
                 self.tree_cache = SWARadixCache(
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
@@ -816,9 +817,6 @@ class Scheduler(
                     is_eagle=self.spec_algorithm.is_eagle(),
                 )
             elif self.is_hybrid_gdn:
-                assert (
-                    self.server_args.disaggregation_mode == "null"
-                ), "Hybrid GDN mode does not support disaggregation yet"
                 self.tree_cache = MambaRadixCache(
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
