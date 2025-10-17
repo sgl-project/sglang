@@ -2,14 +2,15 @@ use async_trait::async_trait;
 use regex::Regex;
 use serde_json::Value;
 
-use crate::protocols::spec::Tool;
-
-use crate::tool_parser::{
-    errors::{ToolParserError, ToolParserResult},
-    parsers::helpers,
-    partial_json::PartialJson,
-    traits::ToolParser,
-    types::{FunctionCall, StreamingParseResult, ToolCall},
+use crate::{
+    protocols::common::Tool,
+    tool_parser::{
+        errors::{ParserError, ParserResult},
+        parsers::helpers,
+        partial_json::PartialJson,
+        traits::ToolParser,
+        types::{FunctionCall, StreamingParseResult, ToolCall},
+    },
 };
 
 /// Qwen format parser for tool calls
@@ -76,7 +77,7 @@ impl QwenParser {
     }
 
     /// Parse a single JSON object into a ToolCall
-    fn parse_single_object(&self, obj: &Value) -> ToolParserResult<Option<ToolCall>> {
+    fn parse_single_object(&self, obj: &Value) -> ParserResult<Option<ToolCall>> {
         let name = obj.get("name").and_then(|v| v.as_str());
 
         if let Some(name) = name {
@@ -86,7 +87,7 @@ impl QwenParser {
 
             // Convert arguments to JSON string
             let arguments = serde_json::to_string(args)
-                .map_err(|e| ToolParserError::ParsingFailed(e.to_string()))?;
+                .map_err(|e| ParserError::ParsingFailed(e.to_string()))?;
 
             Ok(Some(ToolCall {
                 function: FunctionCall {
@@ -98,16 +99,6 @@ impl QwenParser {
             Ok(None)
         }
     }
-
-    /// Check if text contains Qwen tool markers
-    fn has_tool_markers(&self, text: &str) -> bool {
-        text.contains("<tool_call>")
-    }
-
-    /// Check if text has tool call
-    fn has_tool_call(&self, text: &str) -> bool {
-        text.contains("<tool_call>")
-    }
 }
 
 impl Default for QwenParser {
@@ -118,7 +109,7 @@ impl Default for QwenParser {
 
 #[async_trait]
 impl ToolParser for QwenParser {
-    async fn parse_complete(&self, text: &str) -> ToolParserResult<(String, Vec<ToolCall>)> {
+    async fn parse_complete(&self, text: &str) -> ParserResult<(String, Vec<ToolCall>)> {
         // Check if text contains Qwen format
         if !self.has_tool_markers(text) {
             return Ok((text.to_string(), vec![]));
@@ -133,7 +124,7 @@ impl ToolParser for QwenParser {
         for captures in self.extractor.captures_iter(text) {
             if let Some(json_str) = captures.get(1) {
                 let parsed = serde_json::from_str::<Value>(json_str.as_str().trim())
-                    .map_err(|e| ToolParserError::ParsingFailed(e.to_string()))
+                    .map_err(|e| ParserError::ParsingFailed(e.to_string()))
                     .and_then(|v| self.parse_single_object(&v));
 
                 match parsed {
@@ -159,13 +150,13 @@ impl ToolParser for QwenParser {
         &mut self,
         chunk: &str,
         tools: &[Tool],
-    ) -> ToolParserResult<StreamingParseResult> {
+    ) -> ParserResult<StreamingParseResult> {
         // Append new text to buffer
         self.buffer.push_str(chunk);
         let current_text = &self.buffer.clone();
 
         // Check if current_text has tool_call
-        let has_tool_start = self.has_tool_call(current_text)
+        let has_tool_start = self.has_tool_markers(current_text)
             || (self.current_tool_id >= 0 && current_text.starts_with(self.tool_call_separator));
 
         if !has_tool_start {
@@ -243,11 +234,21 @@ impl ToolParser for QwenParser {
         Ok(result)
     }
 
-    fn detect_format(&self, text: &str) -> bool {
-        self.has_tool_markers(text)
+    fn has_tool_markers(&self, text: &str) -> bool {
+        text.contains("<tool_call>")
     }
 
     fn get_unstreamed_tool_args(&self) -> Option<Vec<crate::tool_parser::types::ToolCallItem>> {
         helpers::get_unstreamed_args(&self.prev_tool_call_arr, &self.streamed_args_for_tool)
+    }
+
+    fn reset(&mut self) {
+        helpers::reset_parser_state(
+            &mut self.buffer,
+            &mut self.prev_tool_call_arr,
+            &mut self.current_tool_id,
+            &mut self.current_tool_name_sent,
+            &mut self.streamed_args_for_tool,
+        );
     }
 }

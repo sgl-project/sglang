@@ -1,7 +1,9 @@
-use sglang_router_rs::protocols::spec;
-use sglang_router_rs::tokenizer::chat_template::{
-    detect_chat_template_content_format, ChatTemplateContentFormat, ChatTemplateParams,
-    ChatTemplateProcessor,
+use sglang_router_rs::{
+    protocols::chat::{ChatMessage, UserMessageContent},
+    tokenizer::chat_template::{
+        detect_chat_template_content_format, ChatTemplateContentFormat, ChatTemplateParams,
+        ChatTemplateProcessor,
+    },
 };
 
 #[test]
@@ -172,15 +174,13 @@ assistant:
 
     let processor = ChatTemplateProcessor::new(template.to_string());
 
-    let messages = vec![
-        spec::ChatMessage::System {
-            role: "system".to_string(),
+    let messages = [
+        ChatMessage::System {
             content: "You are helpful".to_string(),
             name: None,
         },
-        spec::ChatMessage::User {
-            role: "user".to_string(),
-            content: spec::UserMessageContent::Text("Hello".to_string()),
+        ChatMessage::User {
+            content: UserMessageContent::Text("Hello".to_string()),
             name: None,
         },
     ];
@@ -215,9 +215,8 @@ fn test_chat_template_with_tokens_unit_test() {
 
     let processor = ChatTemplateProcessor::new(template.to_string());
 
-    let messages = [spec::ChatMessage::User {
-        role: "user".to_string(),
-        content: spec::UserMessageContent::Text("Test".to_string()),
+    let messages = [ChatMessage::User {
+        content: UserMessageContent::Text("Test".to_string()),
         name: None,
     }];
 
@@ -248,4 +247,66 @@ fn test_chat_template_with_tokens_unit_test() {
         .unwrap();
     assert!(result.contains("<s>"));
     assert!(result.contains("</s>"));
+}
+
+#[test]
+fn test_detect_openai_format_qwen3vl_macro_style() {
+    // Qwen3-VL style template using macros to handle multimodal content
+    // This tests the macro-based detection pattern
+    let template = r#"{%- set image_count = namespace(value=0) %}
+{%- set video_count = namespace(value=0) %}
+{%- macro render_content(content, do_vision_count) %}
+    {%- if content is string %}
+        {{- content }}
+    {%- else %}
+        {%- for item in content %}
+            {%- if 'image' in item or 'image_url' in item or item.type == 'image' %}
+                {%- if do_vision_count %}
+                    {%- set image_count.value = image_count.value + 1 %}
+                {%- endif %}
+                {%- if add_vision_id %}Picture {{ image_count.value }}: {% endif -%}
+                <|vision_start|><|image_pad|><|vision_end|>
+            {%- elif 'video' in item or item.type == 'video' %}
+                {%- if do_vision_count %}
+                    {%- set video_count.value = video_count.value + 1 %}
+                {%- endif %}
+                {%- if add_vision_id %}Video {{ video_count.value }}: {% endif -%}
+                <|vision_start|><|video_pad|><|vision_end|>
+            {%- elif 'text' in item %}
+                {{- item.text }}
+            {%- endif %}
+        {%- endfor %}
+    {%- endif %}
+{%- endmacro %}
+{%- for message in messages %}
+    {%- set content = render_content(message.content, True) %}
+    {{- '<|im_start|>' + message.role + '\n' + content + '<|im_end|>' + '\n' }}
+{%- endfor %}
+{%- if add_generation_prompt %}
+    {{- '<|im_start|>assistant\n' }}
+{%- endif %}"#;
+
+    assert_eq!(
+        detect_chat_template_content_format(template),
+        ChatTemplateContentFormat::OpenAI
+    );
+}
+
+#[test]
+fn test_detect_openai_format_arbitrary_variable_names() {
+    // Test that detection works with any variable name, not just "message", "msg", "m"
+    // Uses "chat_msg" and "x" as loop variables
+    let template = r#"
+        {%- for chat_msg in messages %}
+        {%- for x in chat_msg.content %}
+        {%- if x.type == 'text' %}{{ x.text }}{%- endif %}
+        {%- if x.type == 'image' %}<image>{%- endif %}
+        {%- endfor %}
+        {%- endfor %}
+        "#;
+
+    assert_eq!(
+        detect_chat_template_content_format(template),
+        ChatTemplateContentFormat::OpenAI
+    );
 }
