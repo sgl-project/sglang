@@ -33,15 +33,7 @@ class DraftBackendFactory:
 
     def create_decode_backend(self):
         if self.speculative_num_steps == 1:
-
-            class DummyAttnBackend:
-                def __init__(self):
-                    pass
-
-                def init_forward_metadata(*args, **kwargs):
-                    pass
-
-            return DummyAttnBackend()
+            return None
 
         backend_map = {
             "flashinfer": self._create_flashinfer_decode_backend,
