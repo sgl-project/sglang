@@ -204,8 +204,9 @@ class SchedulerOutputProcessorMixin:
     ):
         # TODO(lsyin): try use a copy stream to share SMs with forward
         # FIXME(lsyin): better organize this token free logic in eagle-overlap
-        last_batch_allocate_lens_cpu = result.last_batch_allocate_lens.tolist()
-        accept_lens_cpu = result.accept_lens.tolist()
+        result.last_batch_allocate_lens_list = result.last_batch_allocate_lens.tolist()
+        result.accept_lens_list = result.accept_lens.tolist()
+        result.num_accepted_tokens = sum(result.accept_lens_list)
         next_token_ids = result.next_token_ids.tolist()
 
         predict_tokens = []
@@ -213,13 +214,14 @@ class SchedulerOutputProcessorMixin:
         for i, req in enumerate(batch.reqs):
             predict_tokens.append(
                 next_token_ids[
-                    i * num_draft_tokens : i * num_draft_tokens + accept_lens_cpu[i]
+                    i * num_draft_tokens : i * num_draft_tokens
+                    + result.accept_lens_list[i]
                 ]
             )
             # FIXME(lsyin): move this update elsewhere
             req.spec_verify_ct += 1
 
-        return last_batch_allocate_lens_cpu, accept_lens_cpu, predict_tokens
+        return predict_tokens
 
     def process_batch_result_decode(
         self: Scheduler,
@@ -242,12 +244,7 @@ class SchedulerOutputProcessorMixin:
             if batch.return_logprob:
                 next_token_logprobs = logits_output.next_token_logprobs.tolist()
         elif batch.is_v2_eagle:
-            (
-                last_batch_allocate_lens_cpu,
-                accept_lens_cpu,
-                next_token_ids,
-            ) = self.hacky_process_eagle_overlap_result(result, batch)
-            result.num_accepted_tokens = sum(accept_lens_cpu)
+            next_token_ids = self.hacky_process_eagle_overlap_result(result, batch)
 
         # FIXME(lsyin): we suppose we have already got the num_accepted_tokens in result
         if not self.spec_algorithm.is_none():
@@ -274,7 +271,7 @@ class SchedulerOutputProcessorMixin:
                             self.req_to_token_pool,
                             self.token_to_kv_pool_allocator,
                             req,
-                            last_batch_allocate_lens_cpu[i],
+                            result.last_batch_allocate_lens_list[i],
                             None,
                         )
                     else:
@@ -284,7 +281,7 @@ class SchedulerOutputProcessorMixin:
                         )
                 else:
                     if batch.spec_algorithm.is_eagle():
-                        # TODO(lsyin): support eagle with page_size > 1
+                        # TODO(spec-v2): support eagle with page_size > 1
                         raise NotImplementedError()
                     else:
                         if (

@@ -219,6 +219,8 @@ class GenerationBatchResult:
     # sync path: forward stream -> output processor
     accept_lens: Optional[torch.Tensor] = None
     last_batch_allocate_lens: Optional[torch.Tensor] = None
+    accept_lens_list: Optional[List[int]] = None
+    last_batch_allocate_lens_list: Optional[List[int]] = None
 
     # relay path: forward stream -> next step forward
     next_draft_input: Optional[EagleDraftInput] = None
