@@ -183,9 +183,9 @@ elif _is_hip:
         awq_dequantize_triton as awq_dequantize,
     )
 elif _is_npu:
-    import custom_ops
-    import sgl_kernel_npu
-    import torch_npu
+    import custom_ops  # noqa: F401
+    import sgl_kernel_npu  # noqa: F401
+    import torch_npu  # noqa: F401
 else:
     pass
 
