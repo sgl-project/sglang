@@ -762,6 +762,12 @@ class NixlKVReceiver(CommonKVReceiver):
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
     ):
+        if self.bootstrap_infos is None:
+            logger.error(
+                f"Could not fetch prefill parallel info from bootstrap_addr: {self.bootstrap_addr}",
+            )
+            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+
         for bootstrap_info in self.bootstrap_infos:
             logger.debug(
                 f"Fetched bootstrap info: {bootstrap_info} for engine rank: {self.kv_mgr.kv_args.engine_rank}"
