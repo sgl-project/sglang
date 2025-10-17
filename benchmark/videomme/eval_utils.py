@@ -19,6 +19,7 @@ class EvalArgs:
     max_new_tokens: int = 30
     max_num_frames: int = 64
     batch_size: int = 1
+    limit: int = 200
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -39,6 +40,7 @@ class EvalArgs:
             "--max-num-frames", type=int, default=EvalArgs.max_num_frames
         )
         parser.add_argument("--batch-size", type=int, default=EvalArgs.batch_size)
+        parser.add_argument("--limit", type=int, default=EvalArgs.limit)
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):

@@ -14,31 +14,34 @@ import glob
 import json
 import os
 import subprocess
+from argparse import Namespace
 
 from eval_utils import EvalArgs
 
 from sglang.test.test_utils import add_common_sglang_args_and_parse
 
 
-def main(args: EvalArgs):
+def main(args: Namespace):
     # Set OpenAI API key and base URL environment variables.
     # lmms-eval's openai_compatible model uses these env vars.
     api_key = "sk-123456"
     base_url = f"{args.host}:{args.port}/v1"
     os.environ["OPENAI_API_KEY"] = api_key
     os.environ["OPENAI_API_BASE"] = base_url
+    os.environ["HF_HOME"] = "/root/.cache/huggingface"
     print(f"Using OpenAI API Base: {base_url}")
 
     # lmms_eval settings from test_vlm_models.py
     model = "openai_compatible"
     tasks = "videomme"
+    tasks = "video_mmmu_adaptation_question_only"
     log_suffix = "openai_compatible"
     os.makedirs(args.output_path, exist_ok=True)
 
     # compose --model_args
     # `model_version` is passed to the `model` parameter in OpenAI API call.
     # SGLang server will use the model it was launched with.
-    model_args = f""
+    # model_args = f""
 
     # build command list
     cmd = [
@@ -47,8 +50,6 @@ def main(args: EvalArgs):
         "lmms_eval",
         "--model",
         model,
-        "--model_args",
-        model_args,
         "--tasks",
         tasks,
         "--batch_size",
@@ -58,7 +59,7 @@ def main(args: EvalArgs):
         log_suffix,
         "--output_path",
         str(args.output_path),
-        f"--limit={args.num_samples}",
+        f"--limit={args.limit}",
     ]
 
     print("\nRunning lmms_eval command:")
@@ -99,9 +100,7 @@ def main(args: EvalArgs):
 def parse_args():
     parser = argparse.ArgumentParser()
     EvalArgs.add_cli_args(parser)
-    args = add_common_sglang_args_and_parse(
-        parser
-    )  # pyright: ignore[reportUndefinedVariable]
+    args = add_common_sglang_args_and_parse(parser)
     return args
 
 
