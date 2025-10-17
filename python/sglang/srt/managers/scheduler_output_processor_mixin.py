@@ -310,17 +310,12 @@ class SchedulerOutputProcessorMixin:
                         free_spec_dec_tokens_page_size_1,
                     )
 
-                    new_seq_len = len(req.origin_input_ids) + len(req.output_ids) - 1
-                    # FIXME(lsyin): remove this assert
-                    assert new_seq_len == int(
-                        batch.seq_lens_cpu[i] + accept_lens_cpu[i]
-                    ), f"{new_seq_len=} vs {batch.seq_lens_cpu[i] + accept_lens_cpu[i]=}"
-
+                    new_seq_len = batch.seq_lens_cpu[i] + result.accept_lens_list[i]
                     free_spec_dec_tokens_page_size_1(
                         self.req_to_token_pool,
                         self.token_to_kv_pool_allocator,
                         req,
-                        last_batch_allocate_lens_cpu[i],
+                        result.last_batch_allocate_lens_list[i],
                         new_seq_len,
                     )
 
