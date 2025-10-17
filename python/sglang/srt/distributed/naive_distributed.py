@@ -78,8 +78,7 @@ class NaiveDistributed:
             )
 
         _get_path(self._rank).write_text(
-            pybase64.b64encode(pickle.dumps(obj), validate=True).decode("utf-8")
-            + text_postfix
+            pybase64.b64encode(pickle.dumps(obj)).decode("utf-8") + text_postfix
         )
 
         def _read_one(interesting_rank: int):
