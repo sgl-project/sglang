@@ -163,9 +163,7 @@ suites = {
         TestFile("lora/test_lora_llama4.py", 400),
         TestFile("test_deepseek_v3_basic.py", 275),
         TestFile("test_deepseek_v3_mtp.py", 275),
-        TestFile("test_disaggregation_different_tp.py", 600),
         TestFile("test_disaggregation_hybrid_attention.py", 200),
-        TestFile("test_disaggregation_pp.py", 140),
     ],
     "per-commit-4-gpu-b200": [
         # TestFile("test_gpt_oss_4gpu.py", 600),
@@ -182,6 +180,8 @@ suites = {
         TestFile("test_deepseek_v32_basic.py", 275),
     ],
     "per-commit-8-gpu-h20": [
+        TestFile("test_disaggregation_different_tp.py", 600),
+        TestFile("test_disaggregation_pp.py", 140),
         TestFile("quant/test_w4a8_deepseek_v3.py", 371),
     ],
     "vllm_dependency_test": [

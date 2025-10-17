@@ -114,7 +114,7 @@ class EagleDraftInputV2Mixin:
         num_draft_tokens: int,
         draft_model_runner: Any,
     ):
-        seq_lens_cpu_backup = batch.seq_lens_cpu
+        seq_lens_cpu_ = batch.seq_lens_cpu
         extend_num_tokens = len(batch.seq_lens) * num_draft_tokens
 
         batch.spec_info = self
@@ -123,8 +123,7 @@ class EagleDraftInputV2Mixin:
         batch.seq_lens_cpu = batch.seq_lens_cpu + num_draft_tokens
         batch.seq_lens_sum += extend_num_tokens
         batch.extend_seq_lens = [num_draft_tokens for _ in range(len(batch.seq_lens))]
-        batch.extend_prefix_lens = seq_lens_cpu_backup.tolist()
-        batch.extend_prefix_lens_cpu = seq_lens_cpu_backup
+        batch.extend_prefix_lens = seq_lens_cpu_.tolist()
         batch.extend_num_tokens = extend_num_tokens
         batch.capture_hidden_mode = CaptureHiddenMode.FULL
         batch.forward_mode = ForwardMode.DRAFT_EXTEND_V2
