@@ -112,6 +112,17 @@ class ForwardMode(IntEnum):
             )
         )
 
+    def is_context_parallel_extend(self, include_draft_extend_v2: bool = False):
+        return (
+            self == ForwardMode.EXTEND
+            or self == ForwardMode.MIXED
+            or (
+                self == ForwardMode.DRAFT_EXTEND_V2
+                if include_draft_extend_v2
+                else False
+            )
+        )
+    
     def is_decode(self):
         return self == ForwardMode.DECODE
 

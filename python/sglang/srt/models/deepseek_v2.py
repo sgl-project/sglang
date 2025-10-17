@@ -489,7 +489,9 @@ class MoEGate(nn.Module):
         if _is_cpu and _is_cpu_amx_available:
             self.quant_method = PackWeightMethod(weight_names=["weight"])
 
-    def forward(self, hidden_states, gemm_output_zero_allocator: BumpAllocator = None):
+    def forward(self, hidden_states, 
+                gemm_output_zero_allocator: BumpAllocator = None, 
+                forward_batch: ForwardBatch = None):
         if use_intel_amx_backend(self):
             return torch.ops.sgl_kernel.weight_packed_linear(
                 hidden_states,
@@ -497,28 +499,30 @@ class MoEGate(nn.Module):
                 None,  # bias
                 True,  # is_vnni
             )
-        # if get_bool_env_var("SGLANG_USE_DP_CP_AG_AFTER_DSA"):
-        logits = F.linear(hidden_states, self.weight, None)
-        # else:
-        #     # NOTE: For some unknown reason, router_gemm seems degrade accept length.
-        #     if (
-        #         _is_cuda
-        #         and hidden_states.shape[0] <= 16
-        #         and hidden_states.shape[1] == 7168
-        #         and (self.weight.shape[0] == 256 or self.weight.shape[0] == 384)
-        #         and _device_sm >= 90
-        #     ):
+        if forward_batch is not None and \
+            forward_batch.forward_mode.is_context_parallel_extend() and \
+            get_bool_env_var("SGLANG_USE_DP_CP_AG_AFTER_DSA"):
+            logits = F.linear(hidden_states, self.weight, None)
+        else:
+            # NOTE: For some unknown reason, router_gemm seems degrade accept length.
+            if (
+                _is_cuda
+                and hidden_states.shape[0] <= 16
+                and hidden_states.shape[1] == 7168
+                and (self.weight.shape[0] == 256 or self.weight.shape[0] == 384)
+                and _device_sm >= 90
+            ):
                 
-        #         # router gemm output float32
-        #         logits = dsv3_router_gemm(
-        #             hidden_states, self.weight, out_dtype=torch.float32
-        #         )
-        #     elif _use_aiter_gfx95 and hidden_states.shape[0] <= 256:
-        #         logits = aiter_dsv3_router_gemm(
-        #             hidden_states, self.weight, gemm_output_zero_allocator
-        #         )
-        #     else:
-        #         logits = F.linear(hidden_states, self.weight, None)
+                # router gemm output float32
+                logits = dsv3_router_gemm(
+                    hidden_states, self.weight, out_dtype=torch.float32
+                )
+            elif _use_aiter_gfx95 and hidden_states.shape[0] <= 256:
+                logits = aiter_dsv3_router_gemm(
+                    hidden_states, self.weight, gemm_output_zero_allocator
+                )
+            else:
+                logits = F.linear(hidden_states, self.weight, None)
 
         return logits
 
@@ -873,7 +877,7 @@ class DeepseekV2MoE(nn.Module):
         shared_output = None
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
-            router_logits = self.gate(hidden_states)
+            router_logits = self.gate(hidden_states, forward_batch=forward_batch)
             if not self._fuse_shared_experts_inside_sbo:
                 shared_output = self._forward_shared_experts(hidden_states)
             topk_output = self.topk(
@@ -1634,7 +1638,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         q_nope_out = q_nope_out.transpose(0, 1)
 
         if self.cp_input_dict is not None and self.use_nsa and \
-            forward_batch.forward_mode.is_contxt_parallel_mode():
+            forward_batch.forward_mode.is_context_parallel_extend():
             position_id_list = list(torch.split(positions, self.cp_input_dict["split_list"], dim=-1))
             positions = torch.cat(
                 [position_id_list[i] for i in self.cp_input_dict["zigzag_index"]], dim=-1
@@ -1645,7 +1649,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
         if self.cp_input_dict is not None and self.use_nsa and \
-            forward_batch.forward_mode.is_contxt_parallel_mode():
+            forward_batch.forward_mode.is_context_parallel_extend():
             # support allgather+rerrange
             latent_cache[..., : self.kv_lora_rank] = k_nope.squeeze(1)
             latent_cache[..., self.kv_lora_rank :] = k_pe.squeeze(1)
@@ -2445,6 +2449,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             get_global_server_args().speculative_algorithm
         )
+        self.use_dp_cp_ag_after_qlora = get_bool_env_var("SGLANG_USE_DP_CP_AG_AFTER_DSA")
         self.layer_id = layer_id
         self.is_nextn = is_nextn
         self.self_attn = DeepseekV2AttentionMLA(
@@ -2586,8 +2591,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             gemm_output_zero_allocator,
         )
         
-        # if should_allreduce_fusion:
-        #     hidden_states._sglang_needs_allreduce_fusion = True
+        if not self.use_dp_cp_ag_after_qlora:
+            if should_allreduce_fusion:
+                hidden_states._sglang_needs_allreduce_fusion = True
 
         if not should_allreduce_fusion:
             hidden_states, residual = self.layer_communicator.postprocess_layer(
@@ -2811,7 +2817,7 @@ class DeepseekV2Model(nn.Module):
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
-        if cp_input_dict is not None and forward_batch.forward_mode.is_contxt_parallel_mode():
+        if cp_input_dict is not None and forward_batch.forward_mode.is_context_parallel_extend():
             hidden_states_list = list(torch.split(hidden_states, cp_input_dict["split_list"], dim=0))
             hidden_states = torch.cat(
                 [hidden_states_list[i] for i in cp_input_dict["zigzag_index"]], dim=0
@@ -2868,7 +2874,7 @@ class DeepseekV2Model(nn.Module):
                     hidden_states = self.norm(hidden_states)
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
-        if cp_input_dict is not None and forward_batch.forward_mode.is_contxt_parallel_mode():
+        if cp_input_dict is not None and forward_batch.forward_mode.is_context_parallel_extend():
             # allgather + rerrange
             bs_seq_len, hidden_size = hidden_states.shape
             hidden_states = attn_tp_all_gather_reorgan_into_tensor(hidden_states, 
@@ -2988,12 +2994,11 @@ class DeepseekV2ForCausalLM(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
         cp_input_dict = None
-        # logger.info(f"=====deepseekv2====forward=====forward_batch: {forward_batch}======")
         # TODO current just support prefill batch=1 and len(input_ids) > self.cp_size * 2
         cur_cp_seq_len = len(input_ids) // (self.cp_size * 2)
         if (cur_cp_seq_len != 0) and self.cp_size > 1 and \
             self.use_nsa and self.use_dp_cp_ag_after_qlora and \
-            forward_batch.forward_mode.is_contxt_parallel_mode():
+            forward_batch.forward_mode.is_context_parallel_extend():
             cp_input_dict = prepare_input_dp_with_cp_dsa(torch.tensor(len(input_ids)), 
                                                          self.cp_rank, 
                                                          self.cp_size,

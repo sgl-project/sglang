@@ -3641,5 +3641,6 @@ def prepare_input_dp_with_cp_dsa(
         # cp_input_dict.update({"cp_batch_seq_index_next": cp_seq_index[cp_size * 2 - cp_rank - 1]})
         
         cp_input_dict.update({"toatl_seq_lens": kv_len_origin})
-        logger.info(f"SGLANG_USE_DP_CP_AG_AFTER_DSA is ture, prepare_input_cp_nsa: cp_input_dict: {cp_input_dict}")
+        # use for debug
+        # logger.info(f"SGLANG_USE_DP_CP_AG_AFTER_DSA is ture, prepare_input_cp_nsa: cp_input_dict: {cp_input_dict}")
         return cp_input_dict
