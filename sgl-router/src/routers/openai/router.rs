@@ -3,6 +3,7 @@
 use std::{
     any::Any,
     sync::{atomic::AtomicBool, Arc},
+    time::{Duration, Instant},
 };
 
 use axum::{
@@ -15,11 +16,6 @@ use axum::{
 use dashmap::DashMap;
 use futures_util::StreamExt;
 use serde_json::{json, to_value, Value};
-use std::{
-    any::Any,
-    sync::{atomic::AtomicBool, Arc},
-    time::{Duration, Instant},
-};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::warn;
@@ -471,12 +467,20 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                             match res.json::<Value>().await {
                                 Ok(json) => Ok(json),
                                 Err(e) => {
-                                    tracing::warn!("Failed to parse models response from '{}': {}", url, e);
+                                    tracing::warn!(
+                                        "Failed to parse models response from '{}': {}",
+                                        url,
+                                        e
+                                    );
                                     Err(())
                                 }
                             }
                         } else {
-                            tracing::warn!("Getting models from '{}' failed with status: {}", url, res.status());
+                            tracing::warn!(
+                                "Getting models from '{}' failed with status: {}",
+                                url,
+                                res.status()
+                            );
                             Err(())
                         }
                     }
