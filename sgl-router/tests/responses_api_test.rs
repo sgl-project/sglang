@@ -1,22 +1,26 @@
 // Integration test for Responses API
 
 use axum::http::StatusCode;
-use sglang_router_rs::protocols::common::{
-    GenerationRequest, ToolChoice, ToolChoiceValue, UsageInfo,
-};
-use sglang_router_rs::protocols::responses::{
-    ReasoningEffort, ResponseInput, ResponseReasoningParam, ResponseTool, ResponseToolType,
-    ResponsesRequest, ServiceTier, Truncation,
+use sglang_router_rs::protocols::{
+    common::{GenerationRequest, ToolChoice, ToolChoiceValue, UsageInfo},
+    responses::{
+        ReasoningEffort, ResponseInput, ResponseReasoningParam, ResponseTool, ResponseToolType,
+        ResponsesRequest, ServiceTier, Truncation,
+    },
 };
 
 mod common;
-use common::mock_mcp_server::MockMCPServer;
-use common::mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType};
-use sglang_router_rs::config::{
-    CircuitBreakerConfig, ConnectionMode, HealthCheckConfig, PolicyConfig, RetryConfig,
-    RouterConfig, RoutingMode,
+use common::{
+    mock_mcp_server::MockMCPServer,
+    mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType},
 };
-use sglang_router_rs::routers::RouterFactory;
+use sglang_router_rs::{
+    config::{
+        CircuitBreakerConfig, ConnectionMode, HealthCheckConfig, PolicyConfig, RetryConfig,
+        RouterConfig, RoutingMode,
+    },
+    routers::RouterFactory,
+};
 
 #[tokio::test]
 async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {

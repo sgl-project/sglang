@@ -1,16 +1,18 @@
 //! Factory for creating router instances
 
-use super::grpc::pd_router::GrpcPDRouter;
-use super::grpc::router::GrpcRouter;
+use std::sync::Arc;
+
 use super::{
+    grpc::{pd_router::GrpcPDRouter, router::GrpcRouter},
     http::{pd_router::PDRouter, router::Router},
     openai::OpenAIRouter,
     RouterTrait,
 };
-use crate::config::{ConnectionMode, PolicyConfig, RoutingMode};
-use crate::policies::PolicyFactory;
-use crate::server::AppContext;
-use std::sync::Arc;
+use crate::{
+    config::{ConnectionMode, PolicyConfig, RoutingMode},
+    policies::PolicyFactory,
+    server::AppContext,
+};
 
 /// Factory for creating router instances based on configuration
 pub struct RouterFactory;

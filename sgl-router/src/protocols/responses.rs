@@ -1,9 +1,10 @@
 // OpenAI Responses API types
 // https://platform.openai.com/docs/api-reference/responses
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
 
 // Import shared types from common module
 use super::common::{
