@@ -76,11 +76,11 @@ from sglang.srt.utils import (
     is_cuda_alike,
     is_xpu,
     kill_process_tree,
+    maybe_reindex_device_id,
     require_mlp_sync,
     require_mlp_tp_gather,
     set_gpu_proc_affinity,
     suppress_other_loggers,
-    temp_set_cuda_visible_devices,
 )
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
@@ -166,7 +166,7 @@ def load_model(server_args, port_args, tp_rank):
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
     moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
 
-    if is_cuda_alike() and envs.SGLANG_ONE_DEVICE_PER_PROCESS.get():
+    if is_cuda_alike() and envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.get():
         # Set gpu_id to 0 for CUDA because CUDA_VISIBLE_DEVICES guarantee there's only 1 available GPU.
         gpu_id = 0
     else:
@@ -647,7 +647,7 @@ def main(server_args, bench_args):
         workers = []
         for tp_rank in range(server_args.tp_size):
             gpu_id = tp_rank
-            with temp_set_cuda_visible_devices(gpu_id):
+            with maybe_reindex_device_id(gpu_id):
                 proc = multiprocessing.Process(
                     target=work_func,
                     args=(

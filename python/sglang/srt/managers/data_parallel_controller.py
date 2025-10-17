@@ -46,7 +46,7 @@ from sglang.srt.utils import (
     configure_logger,
     get_zmq_socket,
     kill_itself_when_parent_died,
-    temp_set_cuda_visible_devices,
+    maybe_reindex_device_id,
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
@@ -403,7 +403,7 @@ class DataParallelController:
                     + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
                 )
                 moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
-                with self.env_lock, temp_set_cuda_visible_devices(gpu_id):
+                with self.env_lock, maybe_reindex_device_id(gpu_id):
                     proc = mp.Process(
                         target=run_scheduler_process,
                         args=(

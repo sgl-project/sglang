@@ -75,10 +75,10 @@ from sglang.srt.utils import (
     is_cuda,
     kill_process_tree,
     launch_dummy_health_check_server,
+    maybe_reindex_device_id,
     prepare_model_and_tokenizer,
     set_prometheus_multiproc_dir,
     set_ulimit,
-    temp_set_cuda_visible_devices,
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.version import __version__
@@ -784,7 +784,7 @@ def _launch_subprocesses(
                 )
                 moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
 
-                with temp_set_cuda_visible_devices(gpu_id):
+                with maybe_reindex_device_id(gpu_id):
                     proc = mp.Process(
                         target=run_scheduler_process,
                         args=(

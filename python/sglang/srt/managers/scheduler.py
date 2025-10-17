@@ -3037,7 +3037,7 @@ def run_scheduler_process(
             thread_label = "Scheduler"
             trace_set_thread_info(thread_label, tp_rank, dp_rank)
 
-    if is_cuda_alike() and envs.SGLANG_ONE_DEVICE_PER_PROCESS.get():
+    if is_cuda_alike() and envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.get():
         # Set gpu_id to 0 for CUDA because CUDA_VISIBLE_DEVICES guarantee there's only 1 available GPU.
         gpu_id = 0
         assert torch.cuda.device_count() == 1
