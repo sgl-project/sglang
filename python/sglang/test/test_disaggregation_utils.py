@@ -119,6 +119,7 @@ def get_rdma_devices_args():
     logger.info("Resolved rdma_all_devices=%s", rdma_all_devices)
 
     n_rdma = len(rdma_all_devices)
+
     # 1. Get visible GPU indices
     cuda_visible_devices = os.getenv("CUDA_VISIBLE_DEVICES")
     if not cuda_visible_devices:
@@ -132,21 +133,19 @@ def get_rdma_devices_args():
         ]
         if not gpu_indices or len(gpu_indices) > 4:
             return ",".join(_pick_default_pair(rdma_all_devices))
-
     except ValueError:
         warnings.warn(f"Invalid CUDA_VISIBLE_DEVICES format: {cuda_visible_devices}")
         return ",".join(_pick_default_pair(rdma_all_devices))
 
     # 2. Calculate base RDMA index group (each group of 4 GPUs uses consecutive devices)
     base_rdma_group = (min(gpu_indices) // 4) * 4
-
     for gpu_idx in gpu_indices:
         if not (base_rdma_group <= gpu_idx < base_rdma_group + 4):
-
             warnings.warn(
                 f"GPU index {gpu_idx} is outside expected group "
                 f"{base_rdma_group}-{base_rdma_group+3}"
             )
+
     # 3. Generate RDMA device names
     rdma_devices = []
     for gpu_idx in gpu_indices:
