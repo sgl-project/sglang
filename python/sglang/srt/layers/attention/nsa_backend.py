@@ -1190,33 +1190,55 @@ class NativeSparseAttnBackend(AttentionBackend):
         k = k.view(-1, layer.tp_k_head_num, layer.head_dim)
         v = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
 
+        # Determine parameters based on whether processing historical chunks or current tokens
         if is_prefix_chunk:
             chunk_idx = forward_batch.prefix_chunk_idx
-            cu_seqlens_q = (
-                metadata.nsa_cu_seqlens_q
-                if hasattr(metadata, "nsa_cu_seqlens_q")
-                else metadata.cu_seqlens_q
-            )
             cu_seqlens_k = forward_batch.prefix_chunk_cu_seq_lens[chunk_idx]
             max_seqlen_k = forward_batch.prefix_chunk_max_seq_lens[chunk_idx]
             causal = False
+            cu_seqlens_q = metadata.cu_seqlens_q
         else:
             cu_seqlens_q = metadata.cu_seqlens_q
             cu_seqlens_k = metadata.cu_seqlens_k
             max_seqlen_k = metadata.max_seq_len_k
             causal = True
 
-        return flash_attn_varlen_func(
-            q=q,
-            k=k,
-            v=v,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_q=metadata.max_seq_len_q,
-            max_seqlen_k=max_seqlen_k,
-            softmax_scale=layer.scaling,
-            causal=causal,
+        # Verify batch sizes match (length of cu_seqlens should be batch_size + 1)
+        assert len(cu_seqlens_q) == len(cu_seqlens_k), (
+            f"batch_size mismatch: cu_seqlens_q has {len(cu_seqlens_q)-1} requests, "
+            f"cu_seqlens_k has {len(cu_seqlens_k)-1} requests"
         )
+
+        return_lse = getattr(forward_batch, "mha_return_lse", False)
+
+        if return_lse:
+            o, lse, *_ = flash_attn_varlen_func(
+                q=q,
+                k=k,
+                v=v,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=metadata.max_seq_len_q,
+                max_seqlen_k=max_seqlen_k,
+                softmax_scale=layer.scaling,
+                causal=causal,
+                return_softmax_lse=True,
+            )
+            # flash_attn returns (nheads, total_tokens) but merge_state_v2 expects (total_tokens, nheads)
+            lse = lse.T.contiguous()
+            return o, lse
+        else:
+            return flash_attn_varlen_func(
+                q=q,
+                k=k,
+                v=v,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=metadata.max_seq_len_q,
+                max_seqlen_k=max_seqlen_k,
+                softmax_scale=layer.scaling,
+                causal=causal,
+            )
 
     def _forward_tilelang(
         self,
