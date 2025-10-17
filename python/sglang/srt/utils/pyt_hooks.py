@@ -1,5 +1,18 @@
-##
-##
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+"""PyTorch hooks for layerwise NVTX profiling."""
+
 import torch
 import torch.cuda.nvtx as nvtx
 
@@ -20,7 +33,7 @@ class PytHooks(object):
         """Initialize module variables
 
         Args:
-            None:
+            debug: Enable debug logging
 
         Returns:
             None:
@@ -30,101 +43,7 @@ class PytHooks(object):
         """
         super().__init__()
         self.module_to_name_map = {}
-        self.out_tensor_to_name_stack = {}
-        self.iteration = 0
         self.debug = debug
-
-    def module_bwd_hook(self, module, grad_input, grad_output):
-        """Callback function for the backward hook of a module
-
-        Args:
-            module: Pointer to the module object.
-            grad_input: Input tensor used to compute gradients.
-            grad_output: Output tensor of the resulting gradient.
-
-        Returns:
-            None:
-
-        Raises:
-            None:
-        """
-        if self.debug:
-            print(
-                f"BWD hook module:{module} addr:{hex(id(module))} "
-                "grad_input:{grad_input} grad_output:{grad_output} "
-                "params:{module.parameters}"
-            )
-        return
-
-    def param_bwd_hook(self, grad):
-        """Callback function for the backward hook of a tensor
-
-        Args:
-            grad: Tensor which contains the resulting gradient.
-
-        Returns:
-            None:
-
-        Raises:
-            None:
-        """
-        if self.debug:
-            print(
-                f"Param BWD Hook grad tensor type:{type(grad)} val:{grad} "
-                "name:{grad.name} grads:{grad.grad} cdata:{hex(grad._cdata)}"
-            )
-        return
-
-    @staticmethod
-    def format_module_name(module_name):
-        """String formatting function
-
-        Adds '' around the module name string.
-
-        Args:
-            module_name: String name of the module
-
-        Returns:
-            name: String with '' around module name
-
-        Raises:
-            None:
-        """
-        name = "'{}'".format(module_name)
-        return name
-
-    def get_input_tensors(self, tensor_obj):
-        """Returns input tensors in list format
-
-        The in_tensor_seq can be any number of different data types
-        This function puts them in list format.
-
-        Args:
-            tensor_obj: Could be a Tensor or an iterator type that contains Tensors
-            prefix: String name to assign to the Tensor
-
-        Returns:
-            None:
-
-        Raises:
-            None:
-        """
-        tensor_list = []
-        ## We don't know if list or seq is just a list of tensors
-        ## or a list of sequences of tensors.  So need to descend to the
-        ## lowest level and build a list of tensors from there
-        if isinstance(tensor_obj, list) or isinstance(tensor_obj, tuple):
-            for ten in tensor_obj:
-                tmp_list = self.get_input_tensors(ten)
-                tensor_list.extend(tmp_list)
-        elif isinstance(tensor_obj, torch.Tensor):
-            tensor_ptr = hex(id(tensor_obj))
-            if self.debug:
-                print(
-                    f"Input -> shape {list(tensor_obj.size())} pointer:" "{tensor_ptr}"
-                )
-            tensor_list.append(tensor_obj)
-        return tensor_list
 
     @staticmethod
     def print_tensor(tensor_obj, prefix, tensor_list=[]):
@@ -153,39 +72,6 @@ class PytHooks(object):
             tensor_dims = list(tensor_obj.size())
             tensor_list.append(tensor_dims)
         return tensor_list
-
-    def clear_saved_tensors(self):
-        """Clears the saved output tensors at end of each iteration"""
-        if self.debug:
-            print("Clearing saved output tensors")
-        self.out_tensor_to_name_stack.clear()
-        return
-
-    def push_output_tensor(self, tensor_ptr, module_name):
-        """Each output tensor is stored in a stack that maps to the module hierarchy
-
-        Args:
-            tensor_ptr: Tensor address is the key to lookup the stack of module names
-                that the tensor originated from.
-
-            module_name: The current module that output this tensor
-
-        Raises:
-            None
-        Returns:
-            None
-
-        """
-        self.out_tensor_to_name_stack[tensor_ptr] = module_name
-        if self.debug:
-            print(f"Out tensor:{tensor_ptr} from module:{module_name} pushed")
-        return
-
-    def pop_output_tensor(self, tensor_ptr):
-        module_name = None
-        if tensor_ptr in self.out_tensor_to_name_stack:
-            module_name = self.out_tensor_to_name_stack[tensor_ptr]
-        return module_name
 
     def process_layer_params(self, module_obj):
         """Extract the static parameters from each of the nn.Layer types
@@ -296,7 +182,7 @@ class PytHooks(object):
         elif isinstance(module_obj, torch.nn.ReLU):
             param_info["in_place"] = module_obj.inplace
         elif isinstance(module_obj, torch.nn.Dropout):
-            prob = module_obj.p
+            param_info["p"] = module_obj.p
             param_info["in_place"] = module_obj.inplace
         elif isinstance(module_obj, torch.nn.Embedding):
             param_info["num_embeddings"] = module_obj.num_embeddings
@@ -351,18 +237,11 @@ class PytHooks(object):
             None:
         """
         nvtx.range_pop()
-        module_name = self.module_to_name_map[module_obj]
-        module_params = module_obj.named_parameters(prefix=module_name, recurse=False)
 
         if self.debug:
+            module_name = self.module_to_name_map[module_obj]
             print(f"FWD hook module {module_name}")
-        out_tensor_list = PytHooks.print_tensor(out_tensor, "Output")
-        # self.push_output_tensor(out_tensor_ptr, module_name)
-        if module_name == "'top'":
-            self.iteration = self.iteration + 1
-            self.clear_saved_tensors()
-            if self.debug:
-                print(f"Completed {self.iteration} iterations")
+            out_tensor_list = PytHooks.print_tensor(out_tensor, "Output")
 
         return
 
@@ -438,32 +317,3 @@ class PytHooks(object):
             else:
                 raise Exception("Module instance {} is not unique ".format(module))
         return
-
-
-class ANNAProfControl(object):
-    """This class controls the start and stop off the profiler."""
-
-    def __init__(self) -> None:
-        super().__init__()
-
-    @staticmethod
-    def profiler_start():
-        """
-        This method starts the profiler.
-        """
-        torch.cuda.cudart().cudaProfilerStart()
-        torch.autograd.profiler.emit_nvtx(record_shapes=True).__enter__()
-
-    @staticmethod
-    def profiler_stop(exit_program=True):
-        """
-        This method stops the profiler.
-
-        Args:
-            exit_program: (default: True) exits the program after profiling is stopped
-        """
-        torch.cuda.cudart().cudaProfilerStop()
-        torch.autograd.profiler.emit_nvtx().__exit__(None, None, None)
-
-        if exit_program:
-            exit(0)
