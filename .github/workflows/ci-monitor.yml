@@ -35,7 +35,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests matplotlib pandas
+          pip install requests matplotlib pandas numpy
 
       - name: Run CI Analysis
         env:
@@ -44,7 +44,7 @@ jobs:
           PYTHONIOENCODING: utf-8
         run: |
           cd scripts/ci_monitor
-          python ci_analyzer.py --token $GITHUB_TOKEN --limit ${{ github.event.inputs.limit || '1000' }} --output ci_analysis_$(date +%Y%m%d_%H%M%S).json
+          python ci_analyzer.py --token $GITHUB_TOKEN --limit ${{ github.event.inputs.limit || '1000' }} --output ci_analysis_$(date +%Y%m%d_%H%M%S).json --graph-dir ci_analysis_graphs_$(date +%Y%m%d_%H%M%S)
 
       - name: Run Performance Analysis
         env:
@@ -61,5 +61,6 @@ jobs:
           name: ci-analysis-results-${{ github.run_number }}
           path: |
             scripts/ci_monitor/ci_analysis_*.json
+            scripts/ci_monitor/ci_analysis_graphs_*
             scripts/ci_monitor/performance_tables_*
           retention-days: 30
