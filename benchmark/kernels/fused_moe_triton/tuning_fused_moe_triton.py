@@ -401,7 +401,7 @@ def save_configs(
         shard_intermediate_size // 2,
         dtype_str,
         block_shape,
-        # per_channel_quant,
+        per_channel_quant,
     )
 
     print(f"Writing best config to {filename}...")
