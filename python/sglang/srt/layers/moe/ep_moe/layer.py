@@ -30,6 +30,7 @@ from sglang.srt.layers.quantization.modelopt_quant import (
     CUTEDSL_MOE_NVFP4_DISPATCH,
     ModelOptNvFp4FusedMoEMethod,
 )
+from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.single_batch_overlap import DownGemmOverlapArgs
 from sglang.srt.utils import ceil_div, dispose_tensor, get_bool_env_var, is_hip, is_npu
@@ -60,6 +61,7 @@ logger = logging.getLogger(__name__)
 class DeepEPMoE(FusedMoE):
     """
     MoE Expert Parallel Impl based on DeepEP (https://github.com/deepseek-ai/DeepEP/tree/main)
+    Mooncake EP shares the same class, as they expose the same interface.
     """
 
     _has_printed = False
@@ -96,6 +98,11 @@ class DeepEPMoE(FusedMoE):
             self.use_block_quant = getattr(self.quant_method, "block_quant", False)
             self.use_fp8_w8a8 = True
             self.fp8_dtype = torch.float8_e4m3fn
+            self.use_w4afp8 = False
+        elif isinstance(quant_config, W4AFp8Config):
+            self.use_w4afp8 = True
+            self.use_fp8_w8a8 = False
+            self.use_block_quant = False
         else:
             self.use_fp8_w8a8 = False
             self.use_block_quant = False
@@ -142,7 +149,7 @@ class DeepEPMoE(FusedMoE):
                 self.w13_weight,
                 (
                     self.w13_weight_scale_inv
-                    if self.use_block_quant
+                    if self.use_block_quant or self.use_w4afp8
                     else self.w13_weight_scale
                 ),
             )
@@ -150,7 +157,7 @@ class DeepEPMoE(FusedMoE):
                 self.w2_weight,
                 (
                     self.w2_weight_scale_inv
-                    if self.use_block_quant
+                    if self.use_block_quant or self.use_w4afp8
                     else self.w2_weight_scale
                 ),
             )
@@ -214,6 +221,8 @@ class DeepEPMoE(FusedMoE):
             assert DispatchOutputChecker.format_is_deepep(dispatch_output)
             return self.forward_npu(dispatch_output)
         if DispatchOutputChecker.format_is_deepep_normal(dispatch_output):
+            if self.use_w4afp8:
+                return self.forward_cutlass_w4afp8(dispatch_output)
             assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8
             return self.forward_deepgemm_contiguous(dispatch_output)
         elif DispatchOutputChecker.format_is_deepep_ll(dispatch_output):
@@ -441,6 +450,17 @@ class DeepEPMoE(FusedMoE):
             down_gemm_overlap_args=down_gemm_overlap_args,
         )
         return output
+
+    def forward_cutlass_w4afp8(
+        self,
+        dispatch_output: DeepEPNormalOutput,
+    ):
+        assert self.moe_runner_config.activation == "silu"
+        assert isinstance(self.quant_method, W4AFp8MoEMethod)
+        return self.quant_method.apply_deepep_normal(
+            layer=self,
+            dispatch_output=dispatch_output,
+        )
 
     def forward_deepgemm_masked(
         self,
@@ -691,7 +711,7 @@ class DeepEPMoE(FusedMoE):
 
 
 def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
-    if get_moe_a2a_backend().is_deepep():
+    if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
         return DeepEPMoE
 
     # NEW: Direct FP4 detection (bypasses EP requirements)

@@ -11,21 +11,25 @@ use axum::{
 };
 use tracing::debug;
 
-use crate::config::types::RetryConfig;
-use crate::core::WorkerRegistry;
-use crate::policies::PolicyRegistry;
-use crate::protocols::spec::{
-    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest,
-    ResponsesGetParams, ResponsesRequest,
+use super::{context::SharedComponents, pipeline::RequestPipeline};
+use crate::{
+    config::types::RetryConfig,
+    core::WorkerRegistry,
+    policies::PolicyRegistry,
+    protocols::{
+        chat::ChatCompletionRequest,
+        completion::CompletionRequest,
+        embedding::EmbeddingRequest,
+        generate::GenerateRequest,
+        rerank::RerankRequest,
+        responses::{ResponsesGetParams, ResponsesRequest},
+    },
+    reasoning_parser::ParserFactory as ReasoningParserFactory,
+    routers::RouterTrait,
+    server::AppContext,
+    tokenizer::traits::Tokenizer,
+    tool_parser::ParserFactory as ToolParserFactory,
 };
-use crate::reasoning_parser::ParserFactory as ReasoningParserFactory;
-use crate::routers::RouterTrait;
-use crate::server::AppContext;
-use crate::tokenizer::traits::Tokenizer;
-use crate::tool_parser::ParserFactory as ToolParserFactory;
-
-use super::context::SharedComponents;
-use super::pipeline::RequestPipeline;
 
 /// gRPC router implementation for SGLang
 #[derive(Clone)]

@@ -1,5 +1,13 @@
 //! Comprehensive integration tests for OpenAI backend functionality
 
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
+
 use axum::{
     body::Body,
     extract::Request,
@@ -9,28 +17,27 @@ use axum::{
     Json, Router,
 };
 use serde_json::json;
-use sglang_router_rs::data_connector::MemoryConversationItemStorage;
 use sglang_router_rs::{
     config::{
         ConfigError, ConfigValidator, HistoryBackend, OracleConfig, RouterConfig, RoutingMode,
     },
     data_connector::{
-        MemoryConversationStorage, MemoryResponseStorage, ResponseId, ResponseStorage,
-        StoredResponse,
+        MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
+        ResponseId, ResponseStorage, StoredResponse,
     },
-    protocols::spec::{
-        ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateRequest, ResponseInput,
-        ResponsesGetParams, ResponsesRequest, UserMessageContent,
+    protocols::{
+        chat::{ChatCompletionRequest, ChatMessage, UserMessageContent},
+        common::StringOrArray,
+        completion::CompletionRequest,
+        generate::GenerateRequest,
+        responses::{ResponseInput, ResponsesGetParams, ResponsesRequest},
     },
     routers::{openai::OpenAIRouter, RouterTrait},
 };
-use std::collections::HashMap;
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc,
+use tokio::{
+    net::TcpListener,
+    time::{sleep, Duration},
 };
-use tokio::net::TcpListener;
-use tokio::time::{sleep, Duration};
 use tower::ServiceExt;
 
 mod common;
@@ -52,7 +59,7 @@ fn create_minimal_chat_request() -> ChatCompletionRequest {
 fn create_minimal_completion_request() -> CompletionRequest {
     CompletionRequest {
         model: "gpt-3.5-turbo".to_string(),
-        prompt: sglang_router_rs::protocols::spec::StringOrArray::String("Hello".to_string()),
+        prompt: StringOrArray::String("Hello".to_string()),
         suffix: None,
         max_tokens: Some(100),
         temperature: None,
@@ -605,12 +612,12 @@ async fn test_unsupported_endpoints() {
         video_data: None,
         audio_data: None,
         sampling_params: None,
-        stream: false,
         return_logprob: Some(false),
         logprob_start_len: None,
         top_logprobs_num: None,
         token_ids_logprob: None,
         return_text_in_logprobs: false,
+        stream: false,
         log_metrics: true,
         return_hidden_states: false,
         modalities: None,
