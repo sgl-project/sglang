@@ -1,0 +1,37 @@
+FROM nvidia/cuda:13.0.1-cudnn-devel-ubuntu24.04
+
+ARG ARCH=aarch64
+
+ENV TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas
+
+RUN apt update \
+  && apt install -y python3.12-full python3.12-dev python3-pip git wget libnuma-dev libibverbs-dev \
+  && pip3 install --break-system-packages torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130 \
+  && pip3 install --break-system-packages uv scikit-build-core accelerate \
+  && wget https://cmake.org/files/v3.31/cmake-3.31.1-linux-${ARCH}.tar.gz \
+  && tar -xzf cmake-3.31.1-linux-${ARCH}.tar.gz \
+  && mv cmake-3.31.1-linux-${ARCH} /opt/cmake \
+  && rm cmake-3.31.1-linux-${ARCH}.tar.gz \
+  && pip3 uninstall -y --break-system-packages triton \
+  && git clone --branch=spark https://github.com/yvbbrjdr/triton.git \
+  && cd triton \
+  && pip3 install --break-system-packages -r python/requirements.txt \
+  && pip3 install --break-system-packages . \
+  && cd .. \
+  && rm -rf triton
+
+WORKDIR /sgl-workspace/sglang
+COPY . /sgl-workspace/sglang
+
+RUN export PATH=/opt/cmake/bin:$PATH \
+  && export CPLUS_INCLUDE_PATH=/usr/local/cuda/include/cccl${CPLUS_INCLUDE_PATH:+:${CPLUS_INCLUDE_PATH}} \
+  && export C_INCLUDE_PATH=/usr/local/cuda/include/cccl${C_INCLUDE_PATH:+:${C_INCLUDE_PATH}} \
+  && export CUDA_NVCC_FLAGS="-Xcudafe --threads=2" \
+  && export MAKEFLAGS="-j2" \
+  && export CMAKE_BUILD_PARALLEL_LEVEL=2 \
+  && export NINJAFLAGS="-j2" \
+  && cd sgl-kernel \
+  && uv build --wheel -Cbuild-dir=build . --verbose --color=always --no-build-isolation \
+  && pip3 install --break-system-packages dist/*whl --force-reinstall --no-deps \
+  && cd .. \
+  && pip3 install --break-system-packages -e python

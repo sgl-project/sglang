@@ -73,8 +73,8 @@ FetchContent_Populate(repo-fmt)
 # Triton kernel
 FetchContent_Declare(
     repo-triton
-    GIT_REPOSITORY "https://github.com/triton-lang/triton"
-    GIT_TAG        v3.5.1
+    GIT_REPOSITORY "https://github.com/yvbbrjdr/triton"
+    GIT_TAG        spark
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-triton)
@@ -251,7 +251,7 @@ if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
     endif()
 endif()
 
-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4")
+if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4" AND "${CUDA_VERSION}" VERSION_LESS "13.0")
     set(SGL_KERNEL_ENABLE_FA3 ON)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-gencode=arch=compute_90a,code=sm_90a"
