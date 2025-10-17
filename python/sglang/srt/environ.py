@@ -223,6 +223,10 @@ class Envs:
 
     # Overlap Spec V2
     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
+    
+    # VLM
+    SGLANG_IMAGE_MAX_PIXELS = EnvInt(16384 * 28 * 28)
+    SGLANG_RESIZE_RESAMPLE = EnvStr("")
 
     # fmt: on
 
