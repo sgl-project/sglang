@@ -77,9 +77,8 @@ class BatchedPenalizerOrchestrator:
             return
 
         if len(keep_indices) == 0:
-            self.is_required = False
-            for penalizer in self.penalizers.values():
-                penalizer.teardown()
+            # No requests left in the batch, fully release orchestrator resources
+            self.release()
             return
 
         is_required = False
@@ -91,6 +90,23 @@ class BatchedPenalizerOrchestrator:
             else:
                 penalizer.teardown()
         self.is_required = is_required
+
+    # Resource management helpers
+    def release(self) -> None:
+        """Release all penalizers and break references so GC can reclaim promptly."""
+        for penalizer in self.penalizers.values():
+            penalizer.teardown()
+        self.penalizers.clear()
+        # Break reference to ScheduleBatch
+        self._batch_ref = None
+        self.is_required = False
+
+    # Context manager support
+    def __enter__(self) -> "BatchedPenalizerOrchestrator":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.release()
 
     def merge(self, their: "BatchedPenalizerOrchestrator"):
         """
@@ -116,6 +132,22 @@ class _BatchedPenalizer(abc.ABC):
     An abstract class for a batched penalizer.
     """
 
+    def __init__(self, orchestrator: BatchedPenalizerOrchestrator):
+        self._orchestrator_ref: weakref.ReferenceType[BatchedPenalizerOrchestrator] = (
+            weakref.ref(orchestrator)
+        )
+        self._is_prepared = False
+
+    @property
+    def orchestrator(self) -> BatchedPenalizerOrchestrator:
+        orch: Optional[BatchedPenalizerOrchestrator] = self._orchestrator_ref()
+        # This should never happen, but we need to handle it gracefully
+        if orch is None:
+            raise RuntimeError(
+                "BatchedPenalizerOrchestrator has been garbage-collected"
+            )
+        return orch
+
     def is_prepared(self) -> bool:
         return self._is_prepared
 
@@ -135,6 +167,7 @@ class _BatchedPenalizer(abc.ABC):
             return False
 
     def teardown(self):
+        self._teardown()
         self._is_prepared = False
 
     def cumulate_output_tokens(self, output_ids: torch.Tensor):
@@ -205,5 +238,12 @@ class _BatchedPenalizer(abc.ABC):
     def _merge(self, their: "_BatchedPenalizer"):
         """
         Merge the penalizer with another penalizer.
+        """
+        pass
+
+    @abc.abstractmethod
+    def _teardown(self):
+        """
+        Teardown the penalizer.
         """
         pass
