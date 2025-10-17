@@ -2821,9 +2821,10 @@ class DeepseekV2ForCausalLM(nn.Module):
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
-        CompressedTensorsConfig.DeepSeekFP8Config = Fp8Config(
-            True, "dynamic", None, [128, 128]
-        )
+        if os.environ.get("MOE_AMX_WEIGHT_PATH") is not None:
+            CompressedTensorsConfig.DeepSeekFP8Config = Fp8Config(
+                True, "dynamic", None, [128, 128]
+            )
         self.determine_num_fused_shared_experts()
         self.model = DeepseekV2Model(
             config, quant_config, prefix=add_prefix("model", prefix)
@@ -2963,26 +2964,23 @@ class DeepseekV2ForCausalLM(nn.Module):
                 torch.float8_e4m3fn,
                 torch.float8_e4m3fnuz,
             ):
-                if hasattr(self.quant_config, "DeepSeekFP8Config"):
-                    cur_quant_config = self.quant_config.DeepSeekFP8Config
-                else:
-                    cur_quant_config = self.quant_config
-                if (
-                    hasattr(cur_quant_config, "weight_block_size")
-                    and cur_quant_config.weight_block_size is not None
-                ):
-                    weight_block_size = cur_quant_config.weight_block_size
-                    if weight_block_size is not None:
-                        assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
-                        if _is_hip:
-                            weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
-                                weight=w,
-                                weight_scale=self_attn.kv_b_proj.weight_scale_inv,
-                                input_scale=None,
-                            )
-                        else:
-                            weight = w
-                            weight_scale = self_attn.kv_b_proj.weight_scale_inv
+                selected_quant_config = getattr(
+                    self.quant_config, "DeepSeekFP8Config", self.quant_config
+                )
+                weight_block_size = getattr(
+                    selected_quant_config, "weight_block_size", None
+                )
+                if weight_block_size is not None:
+                    assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
+                    if _is_hip:
+                        weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                            weight=w,
+                            weight_scale=self_attn.kv_b_proj.weight_scale_inv,
+                            input_scale=None,
+                        )
+                    else:
+                        weight = w
+                        weight_scale = self_attn.kv_b_proj.weight_scale_inv
 
                     if (
                         _is_cuda
