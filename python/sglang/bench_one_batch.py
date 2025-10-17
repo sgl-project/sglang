@@ -161,16 +161,10 @@ class BenchArgs:
         )
 
 
-def load_model(server_args, port_args, tp_rank):
+def load_model(server_args, port_args, gpu_id, tp_rank):
     suppress_other_loggers()
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
     moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
-
-    if is_cuda_alike() and envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.get():
-        # Set gpu_id to 0 for CUDA because CUDA_VISIBLE_DEVICES guarantee there's only 1 available GPU.
-        gpu_id = 0
-    else:
-        gpu_id = tp_rank
 
     model_config = ModelConfig.from_server_args(server_args)
     model_runner = ModelRunner(
@@ -358,6 +352,7 @@ def correctness_test(
     server_args,
     port_args,
     bench_args,
+    gpu_id,
     tp_rank,
 ):
     # Configure the logger
@@ -365,7 +360,7 @@ def correctness_test(
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
 
     # Load the model
-    model_runner, tokenizer = load_model(server_args, port_args, tp_rank)
+    model_runner, tokenizer = load_model(server_args, port_args, gpu_id, tp_rank)
 
     # Prepare inputs
     custom_prompts = _read_prompts_from_file(bench_args.prompt_filename, rank_print)
@@ -525,6 +520,7 @@ def latency_test(
     server_args,
     port_args,
     bench_args,
+    gpu_id,
     tp_rank,
 ):
     initialize_moe_config(server_args)
@@ -540,7 +536,7 @@ def latency_test(
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
 
     # Load the model
-    model_runner, tokenizer = load_model(server_args, port_args, tp_rank)
+    model_runner, tokenizer = load_model(server_args, port_args, gpu_id, tp_rank)
 
     # Prepare inputs for warm up
     reqs = prepare_synthetic_inputs_for_latency_test(
@@ -642,18 +638,18 @@ def main(server_args, bench_args):
     port_args = PortArgs.init_new(server_args)
 
     if server_args.tp_size == 1:
-        work_func(server_args, port_args, bench_args, 0)
+        work_func(server_args, port_args, bench_args, 0, 0)
     else:
         workers = []
         for tp_rank in range(server_args.tp_size):
-            gpu_id = tp_rank
-            with maybe_reindex_device_id(gpu_id):
+            with maybe_reindex_device_id(tp_rank) as gpu_id:
                 proc = multiprocessing.Process(
                     target=work_func,
                     args=(
                         server_args,
                         port_args,
                         bench_args,
+                        gpu_id,
                         tp_rank,
                     ),
                 )

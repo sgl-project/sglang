@@ -784,7 +784,7 @@ def _launch_subprocesses(
                 )
                 moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
 
-                with maybe_reindex_device_id(gpu_id):
+                with maybe_reindex_device_id(gpu_id) as gpu_id:
                     proc = mp.Process(
                         target=run_scheduler_process,
                         args=(
