@@ -7,12 +7,6 @@ from typing import TYPE_CHECKING, Optional, Sequence
 
 import torch
 
-from sglang.srt.layers.moe.fused_moe_triton.triton_kernels_moe import (
-    triton_kernel_fused_experts,
-    triton_kernel_fused_experts_with_bias,
-    triton_kernel_moe_forward,
-    triton_kernel_moe_with_bias_forward,
-)
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
@@ -102,6 +96,11 @@ class TritonKernelsRunnerCore(MoeRunnerCore):
         quant_info: TritonKernelsQuantInfo,
         running_state: dict,
     ) -> TritonKernelsRunnerOutput:
+        from sglang.srt.layers.moe.fused_moe_triton.triton_kernels_moe import (
+            triton_kernel_fused_experts,
+            triton_kernel_fused_experts_with_bias,
+        )
+
         hidden_states = runner_input.hidden_states
 
         common_kwargs = dict(
@@ -170,6 +169,10 @@ def fused_experts_none_to_triton_kernels(
     quant_info: TritonKernelsQuantInfo,
     runner_config: MoeRunnerConfig,
 ) -> "StandardCombineInput":
+    from sglang.srt.layers.moe.fused_moe_triton.triton_kernels_moe import (
+        triton_kernel_moe_forward,
+        triton_kernel_moe_with_bias_forward,
+    )
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
     from sglang.srt.layers.moe.topk import TopKOutputChecker
 

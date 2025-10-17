@@ -8,7 +8,7 @@ from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton_kernels import TritonKernelsQuantInfo
 from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
-from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -98,7 +98,7 @@ class TestFusedMOE(CustomTestCase):
             renormalize=False,
             use_grouped_topk=False,
         )
-        topk_op.use_triton_kernels = True
+        topk_op.topk_config.output_format = TopKOutputFormat.TRITON_KERNEL
         triton_topk_output = topk_op.forward_cuda(
             hidden_states=a,
             router_logits=score,
