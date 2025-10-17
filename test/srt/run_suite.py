@@ -217,6 +217,7 @@ suite_amd = {
         TestFile("models/test_reward_models.py", 132),
         TestFile("models/test_vlm_models.py", 437),
         TestFile("models/test_transformers_models.py", 320),
+        TestFile("models/test_vlm_models.py", 437),
         TestFile("openai_server/basic/test_openai_embedding.py", 141),
         TestFile("openai_server/basic/test_openai_server.py", 149),
         TestFile("openai_server/basic/test_protocol.py", 10),
@@ -273,6 +274,7 @@ suite_amd = {
         TestFile("test_triton_sliding_window.py", 250),
         # TestFile("test_vision_chunked_prefill.py", 175), # Disabled temporarily and track in #7701
         TestFile("test_wave_attention_kernels.py", 2),
+        TestFile("test_vlm_input_format.py", 300),
         # Disabled temporarily
         # TestFile("models/test_embedding_models.py", 73), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/11127
         # TestFile("openai_server/features/test_openai_server_hidden_states.py", 240),
