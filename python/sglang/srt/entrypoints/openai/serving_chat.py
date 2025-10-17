@@ -770,13 +770,31 @@ class OpenAIServingChat(OpenAIServingBase):
                 and self.tool_call_parser
             ):
                 history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
-                tool_calls, text, finish_reason = self._process_tool_calls(
-                    text,
-                    request.tools,
-                    finish_reason,
-                    request.tool_choice,
-                    history_tool_calls_cnt,
-                )
+                sources = [
+                    ("content", text),
+                    ("reasoning", reasoning_text),
+                ]
+                for source_name, source_value in sources:
+                    if not source_value:
+                        continue
+
+                    result = self._process_tool_calls(
+                        source_value,
+                        request.tools,
+                        finish_reason,
+                        request.tool_choice,
+                        history_tool_calls_cnt,
+                    )
+                    finish_reason = result.finish_reason
+
+                    if source_name == "content":
+                        text = result.remaining_text
+                    else:
+                        reasoning_text = result.remaining_text
+
+                    if result.tool_calls:
+                        tool_calls = result.tool_calls
+                        break
 
             choice_data = ChatCompletionResponseChoice(
                 index=idx,

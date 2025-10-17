@@ -23,8 +23,9 @@ import logging
 import os
 import re
 import uuid
-import requests
 from typing import Optional
+
+import requests
 
 from sglang.srt.parser.code_completion_parser import (
     CompletionTemplate,
@@ -268,7 +269,6 @@ class TemplateManager:
                 override=True,
             )
         self._chat_template_name = template["name"]
-
 
     def _load_json_completion_template(self, template_path: str) -> None:
         """Load a JSON completion template file."""
