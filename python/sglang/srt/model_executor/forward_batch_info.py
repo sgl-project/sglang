@@ -39,6 +39,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
+from sglang.srt.layers.attention.nsa.utils import NSAContextParallelMetadata
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -97,6 +98,17 @@ class ForwardMode(IntEnum):
             or (include_draft_extend_v2 and self == ForwardMode.DRAFT_EXTEND_V2)
             or self == ForwardMode.TARGET_VERIFY
             or self == ForwardMode.SPLIT_PREFILL
+        )
+
+    def is_context_parallel_extend(self, include_draft_extend_v2: bool = False):
+        return (
+            self == ForwardMode.EXTEND
+            or self == ForwardMode.MIXED
+            or (
+                self == ForwardMode.DRAFT_EXTEND_V2
+                if include_draft_extend_v2
+                else False
+            )
         )
 
     def is_decode(self):
@@ -331,6 +343,9 @@ class ForwardBatch:
 
     # For matryoshka embeddings
     dimensions: Optional[list[int]] = None
+
+    # Record the split metadata of the sequence number of NSA context parallels.
+    nsa_cp_metadata: Optional[NSAContextParallelMetadata] = None
 
     @classmethod
     def init_new(
