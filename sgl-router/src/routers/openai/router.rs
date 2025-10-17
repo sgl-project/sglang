@@ -33,6 +33,7 @@ use super::{
     },
     responses::{mask_tools_as_mcp, patch_streaming_response_json},
     streaming::handle_streaming_response,
+    utils::{apply_provider_headers, probe_endpoint_for_model},
 };
 use crate::{
     config::CircuitBreakerConfig,
@@ -195,20 +196,7 @@ impl OpenAIRouter {
             let auth = auth_header.map(|s| s.to_string());
             let client = self.client.clone();
 
-            let handle = tokio::spawn(async move {
-                let probe_url = format!("{}/v1/models/{}", url, model);
-                let mut req = client.get(&probe_url).timeout(Duration::from_secs(5));
-
-                if let Some(a) = auth {
-                    req = req.header("Authorization", a);
-                }
-
-                match req.send().await {
-                    Ok(resp) if resp.status().is_success() => Ok(url),
-                    _ => Err(()),
-                }
-            });
-
+            let handle = tokio::spawn(probe_endpoint_for_model(client, url, model, auth));
             handles.push(handle);
         }
 
@@ -455,11 +443,10 @@ impl crate::routers::RouterTrait for OpenAIRouter {
 
             let handle = tokio::spawn(async move {
                 let models_url = format!("{}/v1/models", url);
-                let mut req = client.get(&models_url);
+                let req = client.get(&models_url);
 
-                if let Some(auth_header) = auth {
-                    req = req.header("Authorization", auth_header);
-                }
+                // Apply provider-specific headers (handles Anthropic, xAI, OpenAI, etc.)
+                let req = apply_provider_headers(req, &url, auth.as_ref());
 
                 match req.send().await {
                     Ok(res) => {
