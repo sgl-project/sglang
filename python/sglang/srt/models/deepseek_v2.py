@@ -655,6 +655,7 @@ class DeepseekV2MoE(nn.Module):
         self._enable_a2a_moe = (
             get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake()
         )
+        self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
 
     def get_moe_weights(self):
         return [
