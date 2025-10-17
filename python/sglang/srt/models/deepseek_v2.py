@@ -402,6 +402,48 @@ def handle_attention_aiter(attn, forward_batch):
 
 
 def handle_attention_nsa(attn, forward_batch):
+    """
+    Dynamic selection between MHA and MLA based on sequence length.
+    
+    Logic:
+    - For prefill with max_kv_len < 2048: Use MHA (NSA topk doesn't help much)
+    - For prefill with max_kv_len >= 2048: Use MLA+NSA (topk can filter effectively)
+    - For decode: Always use MLA (avoid decompression overhead)
+    
+    Note: max_kv_len = prefix_len + extend_len, because all extend tokens are
+    processed together in one forward pass, and the last query token can see
+    all prefix + all previous extend tokens.
+    """
+    # Decode phase: Always use MLA (avoid per-token decompression overhead)
+    if forward_batch.forward_mode.is_decode_or_idle():
+        return AttnForwardMethod.MLA
+    
+    # Prefill/Extend phase: Decide based on max KV cache length
+    if _is_extend_without_speculative(forward_batch):
+        # Decision threshold (configurable)
+        NSA_THRESHOLD = getattr(attn, 'nsa_seq_len_threshold', 2048)
+        
+        # Calculate max KV cache length (what the last query token can see)
+        # In extend mode: max_kv_len = max(prefix_len + extend_len)
+        if forward_batch.extend_prefix_lens is not None and forward_batch.extend_seq_lens is not None:
+            # Calculate prefix + extend for each request
+            max_kv_lens = forward_batch.extend_prefix_lens + forward_batch.extend_seq_lens
+            max_kv_len = max_kv_lens.max().item()
+        elif forward_batch.seq_lens is not None:
+            # Fallback: use seq_lens (for some backends this is already the total length)
+            max_kv_len = forward_batch.seq_lens.max().item()
+        else:
+            max_kv_len = 0
+        
+        # Decision:
+        # - If max KV length < threshold: use MHA_CHUNKED_KV (topk cannot filter, standard MHA has lower compute)
+        # - If max KV length >= threshold: use MLA (topk can effectively filter)
+        if max_kv_len < NSA_THRESHOLD:
+            return AttnForwardMethod.MHA_CHUNKED_KV  # Standard MHA with chunked prefix
+        else:
+            return AttnForwardMethod.MLA  # MLA with NSA sparsity
+    
+    # Default: MLA
     return AttnForwardMethod.MLA
 
 
@@ -1160,6 +1202,10 @@ class DeepseekV2AttentionMLA(nn.Module):
                     config, quant_config
                 ),
             )
+            # NSA sequence length threshold for MHA/MLA selection
+            # When max_kv_len < threshold: use MHA (no TopK filtering, faster for short sequences)
+            # When max_kv_len >= threshold: use MLA+NSA (TopK filtering, efficient for long sequences)
+            self.nsa_seq_len_threshold = getattr(config, 'nsa_seq_len_threshold', 2048)
 
         self.kv_b_proj = ColumnParallelLinear(
             self.kv_lora_rank,
