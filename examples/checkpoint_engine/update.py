@@ -20,7 +20,7 @@ from typing import Literal
 import httpx
 import torch
 import torch.distributed as dist
-from checkpoint_engine.ps import ParameterServer, request_inference_to_update
+from checkpoint_engine.ps import ParameterServer
 from loguru import logger
 from safetensors import safe_open
 
