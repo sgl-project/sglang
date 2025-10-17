@@ -1,19 +1,7 @@
 //! Shared utilities for gRPC routers
 
-use super::ProcessedMessages;
-use crate::core::Worker;
-use crate::grpc_client::sglang_scheduler::AbortOnDropStream;
-use crate::grpc_client::{proto, SglangSchedulerClient};
-use crate::protocols::chat::{ChatCompletionRequest, ChatMessage};
-use crate::protocols::common::{
-    ChatLogProbs, ChatLogProbsContent, FunctionCallResponse, StringOrArray, Tool, ToolCall,
-    ToolChoice, ToolChoiceValue, TopLogProb,
-};
-use crate::protocols::generate::GenerateFinishReason;
-use crate::tokenizer::chat_template::{ChatTemplateContentFormat, ChatTemplateParams};
-use crate::tokenizer::traits::Tokenizer;
-use crate::tokenizer::HuggingFaceTokenizer;
-pub use crate::tokenizer::StopSequenceDecoder;
+use std::{collections::HashMap, sync::Arc};
+
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -21,10 +9,28 @@ use axum::{
 };
 use futures::StreamExt;
 use serde_json::{json, Map, Value};
-use std::collections::HashMap;
-use std::sync::Arc;
 use tracing::{error, warn};
 use uuid::Uuid;
+
+use super::ProcessedMessages;
+pub use crate::tokenizer::StopSequenceDecoder;
+use crate::{
+    core::Worker,
+    grpc_client::{proto, sglang_scheduler::AbortOnDropStream, SglangSchedulerClient},
+    protocols::{
+        chat::{ChatCompletionRequest, ChatMessage},
+        common::{
+            ChatLogProbs, ChatLogProbsContent, FunctionCallResponse, StringOrArray, Tool, ToolCall,
+            ToolChoice, ToolChoiceValue, TopLogProb,
+        },
+        generate::GenerateFinishReason,
+    },
+    tokenizer::{
+        chat_template::{ChatTemplateContentFormat, ChatTemplateParams},
+        traits::Tokenizer,
+        HuggingFaceTokenizer,
+    },
+};
 
 /// Get gRPC client from worker, returning appropriate error response on failure
 pub async fn get_grpc_client_from_worker(
@@ -953,11 +959,16 @@ pub fn parse_finish_reason(reason_str: &str, completion_tokens: i32) -> Generate
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::protocols::chat::{ChatMessage, UserMessageContent};
-    use crate::protocols::common::{ContentPart, ImageUrl};
-    use crate::tokenizer::chat_template::ChatTemplateContentFormat;
     use serde_json::json;
+
+    use super::*;
+    use crate::{
+        protocols::{
+            chat::{ChatMessage, UserMessageContent},
+            common::{ContentPart, ImageUrl},
+        },
+        tokenizer::chat_template::ChatTemplateContentFormat,
+    };
 
     #[test]
     fn test_transform_messages_string_format() {

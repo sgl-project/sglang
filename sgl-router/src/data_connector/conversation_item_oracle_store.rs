@@ -1,18 +1,21 @@
-use crate::config::OracleConfig;
-use crate::data_connector::conversation_items::{
-    make_item_id, ConversationItem, ConversationItemId, ConversationItemStorage,
-    ConversationItemStorageError, ListParams, Result as ItemResult, SortOrder,
-};
-use crate::data_connector::conversations::ConversationId;
+use std::{path::Path, sync::Arc, time::Duration};
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use deadpool::managed::{Manager, Metrics, Pool, PoolError, RecycleError, RecycleResult};
-use oracle::sql_type::ToSql;
-use oracle::Connection;
+use oracle::{sql_type::ToSql, Connection};
 use serde_json::Value;
-use std::path::Path;
-use std::sync::Arc;
-use std::time::Duration;
+
+use crate::{
+    config::OracleConfig,
+    data_connector::{
+        conversation_items::{
+            make_item_id, ConversationItem, ConversationItemId, ConversationItemStorage,
+            ConversationItemStorageError, ListParams, Result as ItemResult, SortOrder,
+        },
+        conversations::ConversationId,
+    },
+};
 
 #[derive(Clone)]
 pub struct OracleConversationItemStorage {

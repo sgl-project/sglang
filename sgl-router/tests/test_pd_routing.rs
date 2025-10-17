@@ -1,12 +1,14 @@
 #[cfg(test)]
 mod test_pd_routing {
     use serde_json::json;
-    use sglang_router_rs::config::{
-        CircuitBreakerConfig, ConnectionMode, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
+    use sglang_router_rs::{
+        config::{
+            CircuitBreakerConfig, ConnectionMode, PolicyConfig, RetryConfig, RouterConfig,
+            RoutingMode,
+        },
+        core::{BasicWorkerBuilder, Worker, WorkerType},
+        routers::{http::pd_types::PDSelectionPolicy, RouterFactory},
     };
-    use sglang_router_rs::core::{BasicWorkerBuilder, Worker, WorkerType};
-    use sglang_router_rs::routers::http::pd_types::PDSelectionPolicy;
-    use sglang_router_rs::routers::RouterFactory;
 
     #[derive(Debug)]
     struct PDRequest {
@@ -201,13 +203,17 @@ mod test_pd_routing {
             };
 
             let app_context = {
-                use sglang_router_rs::core::{LoadMonitor, WorkerRegistry};
-                use sglang_router_rs::data_connector::{
-                    MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
-                };
-                use sglang_router_rs::middleware::TokenBucket;
-                use sglang_router_rs::policies::PolicyRegistry;
                 use std::sync::{Arc, OnceLock};
+
+                use sglang_router_rs::{
+                    core::{LoadMonitor, WorkerRegistry},
+                    data_connector::{
+                        MemoryConversationItemStorage, MemoryConversationStorage,
+                        MemoryResponseStorage,
+                    },
+                    middleware::TokenBucket,
+                    policies::PolicyRegistry,
+                };
 
                 let client = reqwest::Client::new();
 
@@ -421,6 +427,7 @@ mod test_pd_routing {
     #[tokio::test]
     async fn test_background_load_monitoring() {
         use std::collections::HashMap;
+
         use tokio::sync::watch;
 
         let (tx, rx) = watch::channel(HashMap::new());
@@ -466,6 +473,7 @@ mod test_pd_routing {
     #[tokio::test]
     async fn test_watch_channel_behavior() {
         use std::collections::HashMap;
+
         use tokio::sync::watch;
 
         let (tx, rx1) = watch::channel(HashMap::new());
