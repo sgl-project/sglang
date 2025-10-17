@@ -239,8 +239,10 @@ class DeepEPBuffer:
     def set_dispatch_mode(cls, mode: DeepEPMode):
         if mode.is_low_latency():
             cls.set_dispatch_mode_as_low_latency()
-        else:
+        elif mode.is_normal():
             cls.set_dispatch_mode_as_normal()
+        else:
+            raise Exception("unsupported mode")
 
 
 class DeepEPConfig(BaseDispatcherConfig):
