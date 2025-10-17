@@ -1,7 +1,8 @@
 #[cfg(test)]
-use super::*;
-#[cfg(test)]
 use std::sync::Arc;
+
+#[cfg(test)]
+use super::*;
 
 #[test]
 fn test_mock_tokenizer_encode() {
