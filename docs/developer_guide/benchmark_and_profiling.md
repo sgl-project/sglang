@@ -122,6 +122,86 @@ You can also combine the above operations into a single command
 python3 -m sglang.test.send_one --profile
 ```
 
+### Profile a server with HTTP API endpoints
+
+SGLang provides HTTP API endpoints to control profiling on a running server. This allows you to start and stop profiling programmatically, which is useful for capturing specific workload patterns.
+
+#### Using `/start_profile` endpoint
+
+The `/start_profile` endpoint starts profiling on the server. You can control when profiling begins and how long it runs using the following parameters:
+
+**Basic usage:**
+
+```bash
+# Start profiling immediately for 10 steps
+curl -X POST http://127.0.0.1:30000/start_profile \
+  -H "Content-Type: application/json" \
+  -d '{
+    "num_steps": 10
+  }'
+```
+
+**Parameters:**
+
+- `output_dir` (optional): Directory where profile traces will be saved. If not specified, uses `SGLANG_TORCH_PROFILER_DIR` environment variable, or `/tmp` as the default
+- `num_steps` (optional): Number of steps to profile. If not specified, profiling continues until manually stopped with `/end_profile`
+- `start_step` (optional): Number of steps to wait before starting profiling. Useful for skipping warmup iterations
+- `activities` (optional): List of activities to profile, e.g., `["CPU", "GPU"]`. Default is `["CPU", "GPU"]`
+- `merge_profiles` (optional): Whether to merge distributed traces. Default is `false`
+
+**Advanced usage with `start_step`:**
+
+```bash
+# Wait 5 steps (warmup), then profile for 10 steps
+curl -X POST http://127.0.0.1:30000/start_profile \
+  -H "Content-Type: application/json" \
+  -d '{
+    "output_dir": "/tmp/profiles",
+    "start_step": 5,
+    "num_steps": 10,
+    "activities": ["CPU", "GPU"]
+  }'
+```
+
+**Continuous profiling (manual stop):**
+
+```bash
+# Start profiling without num_steps - must manually stop with /end_profile
+curl -X POST http://127.0.0.1:30000/start_profile
+```
+
+#### Using `/end_profile` endpoint
+
+The `/end_profile` endpoint stops an ongoing profiling session and saves the trace file.
+
+```bash
+# Stop profiling and save traces
+curl -X POST http://127.0.0.1:30000/end_profile
+```
+
+This is only needed when you start profiling without specifying `num_steps`. If `num_steps` is specified, profiling will automatically stop after that many steps.
+
+#### Example workflow
+
+```bash
+# Terminal 1: Start the server
+export SGLANG_TORCH_PROFILER_DIR=/tmp/profiles
+python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct
+
+# Terminal 2: Start continuous profiling
+curl -X POST http://127.0.0.1:30000/start_profile \
+  -H "Content-Type: application/json" \
+  -d '{
+    "start_step": 3
+  }'
+
+# Terminal 3: Send requests to generate load
+python -m sglang.bench_serving --backend sglang --num-prompts 100
+
+# Terminal 2: Stop profiling when done
+curl -X POST http://127.0.0.1:30000/end_profile
+```
+
 ### Profiler Trace Merger for Distributed Traces
 
 SGLang now supports automatic merging of profiling traces from distributed setups with multiple parallelism types (TP, DP, PP, EP). This feature is particularly useful for analyzing performance across distributed runs.
@@ -139,12 +219,14 @@ If there is no shared storage accessible across nodes, automatic merging of trac
 curl -X POST <BASE_URL>/start_profile \
   -H "Content-Type: application/json" \
   -d '{
-    "output_dir": "/tmp/profiles", # where to store profile traces
+    "output_dir": "/tmp/profiles",
     "num_steps": 10,
     "activities": ["CPU", "GPU"],
-    "merge_profiles": true # optional argument to merge profile traces (default=False)
+    "merge_profiles": true
   }'
 ```
+
+Note: `merge_profiles` is optional and defaults to `false`. When enabled, profiles from all ranks (TP, DP, PP, EP) will be automatically merged into a single trace file.
 
 #### Command Line Usage
 
@@ -155,7 +237,7 @@ python -m sglang.profiler \
   --cpu \
   --gpu \
   --output-dir /tmp/profiles \
-  --merge-profiles # optional argument to merge profile traces (default=False)
+  --merge-profiles
 ```
 
 #### Output Files
