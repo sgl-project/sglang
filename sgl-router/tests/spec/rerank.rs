@@ -1,9 +1,11 @@
-use serde_json::{from_str, to_string, Number, Value};
-use sglang_router_rs::protocols::spec::{
-    default_model_name, GenerationRequest, RerankRequest, RerankResponse, RerankResult,
-    StringOrArray, UsageInfo, V1RerankReqInput,
-};
 use std::collections::HashMap;
+
+use serde_json::{from_str, to_string, Number, Value};
+use sglang_router_rs::protocols::{
+    common::{GenerationRequest, StringOrArray, UsageInfo},
+    rerank::{RerankRequest, RerankResponse, RerankResult, V1RerankReqInput},
+};
+use validator::Validate;
 
 #[test]
 fn test_rerank_request_serialization() {
@@ -40,7 +42,7 @@ fn test_rerank_request_deserialization_with_defaults() {
 
     assert_eq!(request.query, "test query");
     assert_eq!(request.documents, vec!["doc1", "doc2"]);
-    assert_eq!(request.model, default_model_name());
+    assert_eq!(request.model, "unknown");
     assert_eq!(request.top_k, None);
     assert!(request.return_documents);
     assert_eq!(request.rid, None);
@@ -75,8 +77,7 @@ fn test_rerank_request_validation_empty_query() {
     };
 
     let result = request.validate();
-    assert!(result.is_err());
-    assert_eq!(result.unwrap_err(), "Query cannot be empty");
+    assert!(result.is_err(), "Should reject empty query");
 }
 
 #[test]
@@ -92,8 +93,7 @@ fn test_rerank_request_validation_whitespace_query() {
     };
 
     let result = request.validate();
-    assert!(result.is_err());
-    assert_eq!(result.unwrap_err(), "Query cannot be empty");
+    assert!(result.is_err(), "Should reject whitespace-only query");
 }
 
 #[test]
@@ -109,8 +109,7 @@ fn test_rerank_request_validation_empty_documents() {
     };
 
     let result = request.validate();
-    assert!(result.is_err());
-    assert_eq!(result.unwrap_err(), "Documents list cannot be empty");
+    assert!(result.is_err(), "Should reject empty documents list");
 }
 
 #[test]
@@ -126,8 +125,7 @@ fn test_rerank_request_validation_top_k_zero() {
     };
 
     let result = request.validate();
-    assert!(result.is_err());
-    assert_eq!(result.unwrap_err(), "top_k must be greater than 0");
+    assert!(result.is_err(), "Should reject top_k of zero");
 }
 
 #[test]
@@ -231,45 +229,6 @@ fn test_rerank_response_serialization() {
     assert_eq!(deserialized.model, response.model);
     assert_eq!(deserialized.id, response.id);
     assert_eq!(deserialized.object, response.object);
-}
-
-#[test]
-fn test_rerank_response_sort_by_score() {
-    let results = vec![
-        RerankResult {
-            score: 0.6,
-            document: Some("doc2".to_string()),
-            index: 1,
-            meta_info: None,
-        },
-        RerankResult {
-            score: 0.8,
-            document: Some("doc1".to_string()),
-            index: 0,
-            meta_info: None,
-        },
-        RerankResult {
-            score: 0.4,
-            document: Some("doc3".to_string()),
-            index: 2,
-            meta_info: None,
-        },
-    ];
-
-    let mut response = RerankResponse::new(
-        results,
-        "test-model".to_string(),
-        Some(StringOrArray::String("req-123".to_string())),
-    );
-
-    response.sort_by_score();
-
-    assert_eq!(response.results[0].score, 0.8);
-    assert_eq!(response.results[0].index, 0);
-    assert_eq!(response.results[1].score, 0.6);
-    assert_eq!(response.results[1].index, 1);
-    assert_eq!(response.results[2].score, 0.4);
-    assert_eq!(response.results[2].index, 2);
 }
 
 #[test]
@@ -414,7 +373,7 @@ fn test_v1_to_rerank_request_conversion() {
 
     assert_eq!(request.query, "test query");
     assert_eq!(request.documents, vec!["doc1", "doc2"]);
-    assert_eq!(request.model, default_model_name());
+    assert_eq!(request.model, "unknown");
     assert_eq!(request.top_k, None);
     assert!(request.return_documents);
     assert_eq!(request.rid, None);
@@ -591,9 +550,6 @@ fn test_full_rerank_workflow() {
 
     // Create response
     let mut response = RerankResponse::new(results, request.model.clone(), request.rid.clone());
-
-    // Sort by score
-    response.sort_by_score();
 
     // Apply top_k
     response.apply_top_k(request.effective_top_k());
