@@ -1323,9 +1323,9 @@ def parse_image_resolution(image_resolution: str) -> Tuple[int, int]:
 
 def create_mm_data_row(text_prompt, images: list, images_base64, output_len, processor):
     try:
-        if "Phi4MMProcessor" in str(type(processor)):
+        if type(processor).__name__ == "Phi4MMProcessor":
             # <|endoftext10|> is the image token used in the phi-4-multimodal model.
-            content_items = text_prompt.replace("image 1", "|endoftext10|")
+            content_items = text_prompt.replace("image 1", "<|endoftext10|>")
         else:
             content_items = [
                 {"type": "image", "image": {"url": image_base64}}
