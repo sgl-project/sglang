@@ -116,6 +116,12 @@ python3 -m sglang.test.send_one
 python3 -m sglang.profiler
 ```
 
+You can also combine the above operations into a single command
+
+```
+python3 -m sglang.test.send_one --profile
+```
+
 ### Profiler Trace Merger for Distributed Traces
 
 SGLang now supports automatic merging of profiling traces from distributed setups with multiple parallelism types (TP, DP, PP, EP). This feature is particularly useful for analyzing performance across distributed runs.

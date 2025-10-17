@@ -496,7 +496,6 @@ impl Normalizable for ChatCompletionRequest {
         // Migrate deprecated max_tokens → max_completion_tokens
         #[allow(deprecated)]
         if self.max_completion_tokens.is_none() && self.max_tokens.is_some() {
-            tracing::warn!("max_tokens is deprecated, use max_completion_tokens instead");
             self.max_completion_tokens = self.max_tokens;
             self.max_tokens = None; // Clear deprecated field
         }
