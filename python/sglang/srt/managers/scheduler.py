@@ -215,7 +215,7 @@ class GenerationBatchResult:
     delay_sample_func: Optional[callable] = None
     future_indices: Optional[FutureIndices] = None
 
-    # FIXME(lsyin): maybe move to <BetterPlace> ?
+    # FIXME(lsyin): maybe move to a better place?
     # sync path: forward stream -> output processor
     accept_lens: Optional[torch.Tensor] = None
     allocate_lens: Optional[torch.Tensor] = None

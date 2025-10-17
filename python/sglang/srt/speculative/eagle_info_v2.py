@@ -78,7 +78,7 @@ class EagleDraftInputV2Mixin:
 
         bs = batch.batch_size()
 
-        # FIXME(lsyin): now implementation does not enable over-allocation
+        # TODO(lsyin): implement over-allocation
         # Now seq_lens and allocate_lens are correct
         batch.maybe_wait_verify_done()
 
