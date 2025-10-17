@@ -695,7 +695,7 @@ jobs:
         timeout-minutes: 20
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-8-gpu-deepep
+          python3 run_suite.py --suite per-commit-8-gpu-h200-deepep
 
   unit-test-backend-8-gpu-deepseek-v32:
     needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]
@@ -722,7 +722,7 @@ jobs:
         timeout-minutes: 20
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-8-gpu-deepseek-v32
+          python3 run_suite.py --suite per-commit-8-gpu-h200-deepseek-v32
 
   unit-test-backend-4-gpu-b200:
     needs: [check-changes, unit-test-backend-2-gpu, sgl-kernel-build-wheels]

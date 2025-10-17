@@ -178,10 +178,10 @@ suites = {
         TestFile("ep/test_deepep_small.py", 531),
         TestFile("ep/test_mooncake_ep_small.py", 450),
     ],
-    "per-commit-8-gpu-deepep": [
+    "per-commit-8-gpu-h200-deepep": [
         TestFile("ep/test_deepep_large.py", 338),
     ],
-    "per-commit-8-gpu-deepseek-v32": [
+    "per-commit-8-gpu-h200-deepseek-v32": [
         TestFile("test_deepseek_v32_basic.py", 275),
     ],
     "vllm_dependency_test": [
