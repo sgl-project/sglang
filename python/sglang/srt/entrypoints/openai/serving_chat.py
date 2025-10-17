@@ -130,6 +130,7 @@ class OpenAIServingChat(OpenAIServingBase):
         self,
         request: ChatCompletionRequest,
         raw_request: Request = None,
+        validation_time: float = 0.0,
     ) -> tuple[GenerateReqInput, ChatCompletionRequest]:
         reasoning_effort = (
             request.chat_template_kwargs.pop("reasoning_effort", None)
@@ -185,6 +186,7 @@ class OpenAIServingChat(OpenAIServingBase):
             extra_key=self._compute_extra_key(request),
             priority=request.priority,
             custom_labels=custom_labels,
+            validation_time=validation_time,
         )
 
         return adapted_request, request

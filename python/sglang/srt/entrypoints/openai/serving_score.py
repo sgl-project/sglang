@@ -26,6 +26,7 @@ class OpenAIServingScore(OpenAIServingBase):
         self,
         request: ScoringRequest,
         raw_request: Request = None,
+        validation_time: float = 0.0,
     ) -> tuple[ScoringRequest, ScoringRequest]:
         """Convert OpenAI scoring request to internal format"""
         # For scoring, we pass the request directly as the tokenizer_manager
