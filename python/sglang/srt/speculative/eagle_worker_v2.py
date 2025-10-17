@@ -1,7 +1,7 @@
 import contextlib
 import logging
 import time
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 from torch.cuda import Stream as CudaStream
@@ -42,6 +42,17 @@ from sglang.srt.utils.common import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _get_plan_stream(
+    device: str,
+) -> Tuple[Optional[CudaStream], contextlib.AbstractContextManager]:
+    if envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get():
+        plan_stream: CudaStream = torch.get_device_module(device).Stream()
+        plan_stream_ctx = torch.cuda.stream(plan_stream)
+        return plan_stream, plan_stream_ctx
+    else:
+        return None, contextlib.nullcontext()
 
 
 class EagleDraftWorker(BaseDraftWorker):
@@ -119,12 +130,7 @@ class EagleDraftWorker(BaseDraftWorker):
 
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
 
-        if envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get():
-            self.plan_stream: CudaStream = torch.get_device_module(self.device).Stream()
-            self.plan_stream_ctx = torch.cuda.stream(self.plan_stream)
-        else:
-            self.plan_stream = None
-            self.plan_stream_ctx = contextlib.nullcontext()
+        self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
 
     def init_token_map(self):
         # Load hot token ids
@@ -519,9 +525,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         )
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
-        # TODO(lsyin): potential bugs with a separate plan stream
-        self.plan_stream: CudaStream = torch.get_device_module(self.device).Stream()
-        self.plan_stream_ctx = torch.cuda.stream(self.plan_stream)
+        self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
 
     @property
     def target_worker(self):
