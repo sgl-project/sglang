@@ -1073,6 +1073,7 @@ class InitWeightsSendGroupForRemoteInstanceReqInput(BaseReq):
     # The backend
     backend: str = "nccl"
 
+
 @dataclass
 class UpdateWeightsFromIPCReqInput(BaseReq):
     # ZMQ socket paths for each device UUID

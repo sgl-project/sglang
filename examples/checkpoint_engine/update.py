@@ -20,10 +20,9 @@ from typing import Literal
 import httpx
 import torch
 import torch.distributed as dist
+from checkpoint_engine.ps import ParameterServer, request_inference_to_update
 from loguru import logger
 from safetensors import safe_open
-
-from checkpoint_engine.ps import ParameterServer, request_inference_to_update
 
 
 @contextmanager
@@ -34,7 +33,9 @@ def timer(msg: str):
     logger.info(f"{msg} duration: {end - start:.2f} seconds")
 
 
-def check_sglang_ready(endpoint: str, inference_parallel_size: int, uds: str | None = None):
+def check_sglang_ready(
+    endpoint: str, inference_parallel_size: int, uds: str | None = None
+):
     if rank != rank // inference_parallel_size * inference_parallel_size:
         return
     retry_num = 0
@@ -43,33 +44,45 @@ def check_sglang_ready(endpoint: str, inference_parallel_size: int, uds: str | N
         transport = httpx.HTTPTransport(uds=uds)
     while True:
         try:
-            response = httpx.Client(transport=transport).get(f"{endpoint}/ping", timeout=10)
+            response = httpx.Client(transport=transport).get(
+                f"{endpoint}/ping", timeout=10
+            )
             response.raise_for_status()
             break
         except (httpx.ConnectError, httpx.HTTPStatusError) as e:
             if retry_num % 10 == 0:
-                logger.warning(f"fail to check sglang ready, retry {retry_num} times, error: {e}")
+                logger.warning(
+                    f"fail to check sglang ready, retry {retry_num} times, error: {e}"
+                )
             retry_num += 1
             time.sleep(0.1)
 
 
-def split_checkpoint_files(checkpoint_path: str, rank: int, world_size: int) -> list[str]:
+def split_checkpoint_files(
+    checkpoint_path: str, rank: int, world_size: int
+) -> list[str]:
     checkpoint_files = [
         os.path.join(checkpoint_path, f)
-        for f in filter(lambda x: x.endswith(".safetensors"), os.listdir(checkpoint_path))
+        for f in filter(
+            lambda x: x.endswith(".safetensors"), os.listdir(checkpoint_path)
+        )
     ]
     files_per_rank = (len(checkpoint_files) + world_size - 1) // world_size
     return checkpoint_files[rank * files_per_rank : (rank + 1) * files_per_rank]
 
 
-def split_tensors(checkpoint_path: str, rank: int, world_size: int) -> dict[str, torch.Tensor]:
+def split_tensors(
+    checkpoint_path: str, rank: int, world_size: int
+) -> dict[str, torch.Tensor]:
     index_fn = os.path.join(checkpoint_path, "model.safetensors.index.json")
     with open(index_fn) as f:
         weight_map: dict[str, str] = json.load(f)["weight_map"]
     weights_per_rank = (len(weight_map) + world_size - 1) // world_size
     fn_tensors: dict[str, list[str]] = defaultdict(list)
     weight_keys = list(weight_map.items())
-    for name, file in weight_keys[rank * weights_per_rank : (rank + 1) * weights_per_rank]:
+    for name, file in weight_keys[
+        rank * weights_per_rank : (rank + 1) * weights_per_rank
+    ]:
         fn_tensors[file].append(name)
     named_tensors = {}
     for file, names in fn_tensors.items():
@@ -94,7 +107,9 @@ def req_inference(
             resp = httpx.Client(transport=httpx.HTTPTransport(uds=uds)).post(
                 f"{endpoint}/update_weights_from_ipc",
                 json={
-                    "zmq_handles": dict(socket_paths[src : src + inference_parallel_size]),
+                    "zmq_handles": dict(
+                        socket_paths[src : src + inference_parallel_size]
+                    ),
                     "flush_cache": True,
                     "weight_version": weight_version,
                 },
@@ -117,7 +132,9 @@ def update_weights(
     update_method: Literal["broadcast", "p2p", "all"] = "broadcast",
     uds: str | None = None,
 ):
-    ps.register_checkpoint(checkpoint_name, files=checkpoint_files, named_tensors=named_tensors)
+    ps.register_checkpoint(
+        checkpoint_name, files=checkpoint_files, named_tensors=named_tensors
+    )
     ps.init_process_group()
     check_sglang_ready(endpoint, inference_parallel_size, uds)
     dist.barrier()
@@ -136,7 +153,9 @@ def update_weights(
             # sleep 2s to wait destroy process group
             time.sleep(2)
         with timer("Update weights with setting ranks"):
-            ps.update(checkpoint_name, req_func, ranks=list(range(inference_parallel_size)))
+            ps.update(
+                checkpoint_name, req_func, ranks=list(range(inference_parallel_size))
+            )
 
 
 def join(
@@ -179,10 +198,10 @@ if __name__ == "__main__":
     rank = int(os.getenv("RANK"))
     world_size = int(os.getenv("WORLD_SIZE"))
     req_func = req_inference(
-            args.endpoint,
-            args.inference_parallel_size,
-            uds=args.uds,
-            weight_version=args.weight_version,
+        args.endpoint,
+        args.inference_parallel_size,
+        uds=args.uds,
+        weight_version=args.weight_version,
     )
     ps = ParameterServer(auto_pg=True)
     ps._p2p_store = None
@@ -197,11 +216,15 @@ if __name__ == "__main__":
             args.uds,
         )
     else:
-        if os.path.exists(os.path.join(args.checkpoint_path, "model.safetensors.index.json")):
+        if os.path.exists(
+            os.path.join(args.checkpoint_path, "model.safetensors.index.json")
+        ):
             named_tensors = split_tensors(args.checkpoint_path, rank, world_size)
             checkpoint_files = []
         else:
-            checkpoint_files = split_checkpoint_files(args.checkpoint_path, rank, world_size)
+            checkpoint_files = split_checkpoint_files(
+                args.checkpoint_path, rank, world_size
+            )
             named_tensors = {}
         update_weights(
             ps,

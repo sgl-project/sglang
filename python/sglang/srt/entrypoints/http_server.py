@@ -1562,7 +1562,9 @@ def _wait_weights_ready():
 
     for _ in range(timeout):
         if _global_state.tokenizer_manager.initial_weights_loaded:
-            logger.info(f"Weights are ready after {time.time() - start_time:.2f} seconds")
+            logger.info(
+                f"Weights are ready after {time.time() - start_time:.2f} seconds"
+            )
             return
         time.sleep(1)
 

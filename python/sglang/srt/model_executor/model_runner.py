@@ -2280,9 +2280,13 @@ class ModelRunner:
                     # Get device UUID for current device
                     device_id = torch.cuda.current_device()
                     try:
-                        return f"GPU-{torch.cuda.get_device_properties(device_id).uuid!s}"
+                        return (
+                            f"GPU-{torch.cuda.get_device_properties(device_id).uuid!s}"
+                        )
                     except AssertionError as e:
-                        raise ValueError(f"Failed to get GPU UUID for device {device_id}") from e
+                        raise ValueError(
+                            f"Failed to get GPU UUID for device {device_id}"
+                        ) from e
 
                 def get_device_id(self) -> int:
                     return torch.cuda.current_device()
