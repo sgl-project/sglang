@@ -84,6 +84,9 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.layers.quantization import CompressedTensorsConfig, deep_gemm_wrapper
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe import (
+    CompressedTensorsWNA16AMXEPMoEMethod,
+)
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_kernel import (
     is_fp8_fnuz,
@@ -714,6 +717,10 @@ class DeepseekV2MoE(nn.Module):
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
             topk_output = self.topk(hidden_states, router_logits)
+            if isinstance(
+                self.experts.quant_method, CompressedTensorsWNA16AMXEPMoEMethod
+            ):
+                topk_output.topk_weights.mul_(self.routed_scaling_factor)
             final_hidden_states = self.experts(hidden_states, topk_output)
             if not _is_cuda:
                 final_hidden_states *= self.routed_scaling_factor
