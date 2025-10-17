@@ -12,10 +12,10 @@ from sgl_kernel import (
 )
 
 from sglang.srt.layers.moe.ep_moe.kernels import (
+    deepep_ll_get_cutlass_w4a8_moe_mm_data,
     deepep_permute_triton_kernel,
     deepep_post_reorder_triton_kernel,
     deepep_run_moe_deep_preprocess,
-    deepep_ll_get_cutlass_w4a8_moe_mm_data,
     post_reorder_triton_kernel_for_cutlass_moe,
     pre_reorder_triton_kernel_for_cutlass_moe,
     run_moe_ep_preproess,

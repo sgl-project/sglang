@@ -534,7 +534,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             hidden_states,
             input_global_scale,
             topk_idx,
-            use_fp8=not get_moe_runner_backend().is_cutlass_w4afp8(),
+            use_fp8=not get_moe_runner_backend().is_cutlass(),
         )
         return (
             hidden_states,

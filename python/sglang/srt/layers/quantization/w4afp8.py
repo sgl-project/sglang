@@ -24,8 +24,8 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, EPMoE
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
-        DeepEPNormalOutput,
         DeepEPLLOutput,
+        DeepEPNormalOutput,
         StandardDispatchOutput,
     )
 
