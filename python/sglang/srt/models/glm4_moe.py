@@ -15,7 +15,7 @@
 """Inference-only GLM-4.5, GLM-4.6 model compatible with HuggingFace weights"""
 
 import logging
-from typing import Any, Dict, Iterable, Optional, Tuple, Union, List
+from typing import Any, Dict, Iterable, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -978,12 +978,6 @@ class Glm4MoeForCausalLM(nn.Module):
                 # For decoder layer weights
                 if is_decoder:
                     name = name.replace(nextn_layer_prefix, "model.decoder")
-
-            # this is for GLM-V loading
-            if "language_model." in name:
-                name = name.replace("language_model.", "")
-            if "model.visual." in name:
-                name = name.replace("model.visual.", "visual.")
 
             if "rotary_emb.inv_freq" in name:
                 continue
