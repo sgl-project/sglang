@@ -1,16 +1,17 @@
-use crate::config::OracleConfig;
-use crate::data_connector::responses::{
-    ResponseChain, ResponseId, ResponseStorage, ResponseStorageError, Result as StorageResult,
-    StoredResponse,
-};
+use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
+
 use async_trait::async_trait;
 use deadpool::managed::{Manager, Metrics, Pool, PoolError, RecycleError, RecycleResult};
 use oracle::{Connection, Row};
 use serde_json::Value;
-use std::collections::HashMap;
-use std::path::Path;
-use std::sync::Arc;
-use std::time::Duration;
+
+use crate::{
+    config::OracleConfig,
+    data_connector::responses::{
+        ResponseChain, ResponseId, ResponseStorage, ResponseStorageError, Result as StorageResult,
+        StoredResponse,
+    },
+};
 
 const SELECT_BASE: &str = "SELECT id, previous_response_id, input, instructions, output, \
     tool_calls, metadata, created_at, user_id, model, conversation_id, raw_response FROM responses";
@@ -510,8 +511,9 @@ impl OracleErrorExt for ResponseStorageError {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use serde_json::json;
+
+    use super::*;
 
     #[test]
     fn parse_tool_calls_handles_empty_input() {

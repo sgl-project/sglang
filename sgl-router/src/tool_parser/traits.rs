@@ -1,9 +1,12 @@
-use crate::protocols::spec::Tool;
-use crate::tool_parser::{
-    errors::ParserResult,
-    types::{StreamingParseResult, ToolCall},
-};
 use async_trait::async_trait;
+
+use crate::{
+    protocols::common::Tool,
+    tool_parser::{
+        errors::ParserResult,
+        types::{StreamingParseResult, ToolCall},
+    },
+};
 
 /// Core trait for all tool parsers
 #[async_trait]

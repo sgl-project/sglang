@@ -657,6 +657,12 @@ class Scheduler(
     def launch_draft_worker(
         self, gpu_id, tp_rank, moe_ep_rank, server_args, port_args, dp_rank
     ):
+        if server_args.speculative_draft_load_format is not None:
+            server_args.load_format = server_args.speculative_draft_load_format
+            logger.info(
+                f"Using draft model load_format: '{server_args.speculative_draft_load_format}'"
+            )
+
         if self.spec_algorithm.is_eagle():
             from sglang.srt.speculative.eagle_worker import EAGLEWorker
             from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
@@ -804,9 +810,6 @@ class Scheduler(
                     self.tree_cache.cache_controller.layer_done_counter
                 )
             elif self.is_hybrid:
-                assert (
-                    self.server_args.disaggregation_mode == "null"
-                ), "Hybrid mode does not support disaggregation yet"
                 self.tree_cache = SWARadixCache(
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
@@ -816,9 +819,6 @@ class Scheduler(
                     is_eagle=self.spec_algorithm.is_eagle(),
                 )
             elif self.is_hybrid_gdn:
-                assert (
-                    self.server_args.disaggregation_mode == "null"
-                ), "Hybrid GDN mode does not support disaggregation yet"
                 self.tree_cache = MambaRadixCache(
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
