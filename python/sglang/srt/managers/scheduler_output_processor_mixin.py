@@ -203,7 +203,6 @@ class SchedulerOutputProcessorMixin:
         self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
     ):
         # TODO(lsyin): try use a copy stream to share SMs with forward
-        # FIXME(lsyin): better organize this token free logic in eagle-overlap
         result.last_batch_allocate_lens_list = result.last_batch_allocate_lens.tolist()
         result.accept_lens_list = result.accept_lens.tolist()
         result.num_accepted_tokens = sum(result.accept_lens_list)
