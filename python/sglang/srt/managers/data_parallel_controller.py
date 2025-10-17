@@ -46,6 +46,7 @@ from sglang.srt.utils import (
     configure_logger,
     get_zmq_socket,
     kill_itself_when_parent_died,
+    temp_set_cuda_visible_devices,
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
@@ -138,6 +139,9 @@ class DataParallelController:
 
         # Load balance budget
         self.dp_budget = DPBudget()
+
+        # To protect changing env vars to set CUDA_VISIBLE_DEVICES.
+        self.env_lock = threading.Lock()
 
         # Launch data parallel workers
         self.scheduler_procs = []
@@ -399,21 +403,22 @@ class DataParallelController:
                     + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
                 )
                 moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
-                proc = mp.Process(
-                    target=run_scheduler_process,
-                    args=(
-                        server_args,
-                        rank_port_args,
-                        gpu_id,
-                        tp_rank,
-                        moe_ep_rank,
-                        pp_rank,
-                        dp_rank,
-                        writer,
-                    ),
-                )
-                with memory_saver_adapter.configure_subprocess():
-                    proc.start()
+                with self.env_lock, temp_set_cuda_visible_devices(gpu_id):
+                    proc = mp.Process(
+                        target=run_scheduler_process,
+                        args=(
+                            server_args,
+                            rank_port_args,
+                            gpu_id,
+                            tp_rank,
+                            moe_ep_rank,
+                            pp_rank,
+                            dp_rank,
+                            writer,
+                            ),
+                    )
+                    with memory_saver_adapter.configure_subprocess():
+                        proc.start()
                 self.scheduler_procs.append(proc)
                 scheduler_pipe_readers.append(reader)
 

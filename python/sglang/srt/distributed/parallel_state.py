@@ -279,7 +279,7 @@ class GroupCoordinator:
 
         device_id = 0 if IS_ONE_DEVICE_PER_PROCESS else local_rank
         if is_cuda_alike():
-            self.device = torch.device(f"cuda:{device_id}")
+            self.device = torch.device(f"cuda:{0}")
         elif _is_npu:
             self.device = torch.device(f"npu:{device_id}")
         else:

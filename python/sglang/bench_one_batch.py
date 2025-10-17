@@ -79,6 +79,7 @@ from sglang.srt.utils import (
     require_mlp_tp_gather,
     set_gpu_proc_affinity,
     suppress_other_loggers,
+    temp_set_cuda_visible_devices,
 )
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
@@ -168,7 +169,7 @@ def load_model(server_args, port_args, tp_rank):
     model_runner = ModelRunner(
         model_config=model_config,
         mem_fraction_static=server_args.mem_fraction_static,
-        gpu_id=tp_rank,
+        gpu_id=gpu_id,
         tp_rank=tp_rank,
         tp_size=server_args.tp_size,
         moe_ep_rank=moe_ep_rank,
@@ -355,6 +356,10 @@ def correctness_test(
     # Configure the logger
     configure_logger(server_args, prefix=f" TP{tp_rank}")
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
+
+    if is_cuda_alike():
+        # Set gpu_id to 0 for CUDA because CUDA_VISIBLE_DEVICES guarantee there's only 1 available GPU.
+        gpu_id = 0
 
     # Load the model
     model_runner, tokenizer = load_model(server_args, port_args, tp_rank)
@@ -638,17 +643,19 @@ def main(server_args, bench_args):
     else:
         workers = []
         for tp_rank in range(server_args.tp_size):
-            proc = multiprocessing.Process(
-                target=work_func,
-                args=(
-                    server_args,
-                    port_args,
-                    bench_args,
-                    tp_rank,
-                ),
-            )
-            proc.start()
-            workers.append(proc)
+            gpu_id = tp_rank
+            with temp_set_cuda_visible_devices(gpu_id):
+                proc = multiprocessing.Process(
+                    target=work_func,
+                    args=(
+                        server_args,
+                        port_args,
+                        bench_args,
+                        tp_rank,
+                    ),
+                )
+                proc.start()
+                workers.append(proc)
 
         for proc in workers:
             proc.join()

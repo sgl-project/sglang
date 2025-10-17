@@ -173,6 +173,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_int_env_var,
     get_zmq_socket,
+    is_cuda_alike,
     kill_itself_when_parent_died,
     numa_bind_to_node,
     point_to_point_pyobj,
@@ -3030,6 +3031,16 @@ def run_scheduler_process(
         if server_args.disaggregation_mode == "null":
             thread_label = "Scheduler"
             trace_set_thread_info(thread_label, tp_rank, dp_rank)
+
+    if is_cuda_alike():
+        # Set gpu_id to 0 for CUDA because CUDA_VISIBLE_DEVICES guarantee there's only 1 available GPU.
+        gpu_id = 0
+        assert torch.cuda.device_count() == 1
+
+    if is_cuda_alike():
+        # Set gpu_id to 0 for CUDA because CUDA_VISIBLE_DEVICES guarantee there's only 1 available GPU.
+        gpu_id = 0
+        assert torch.cuda.device_count() == 1
 
     # Create a scheduler and run the event loop
     try:
