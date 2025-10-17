@@ -434,7 +434,7 @@ nsys-ui layerwise_profile.qdrep
 In the Nsight Systems GUI, you'll see:
 - **NVTX ranges**: Each layer appears as a labeled range in the timeline with detailed information in the marker metadata
 - **CUDA kernels**: All GPU kernels are shown alongside the layer annotations
-- **Layer hierarchy**: The full module path (e.g., `model.layers.0.self_attn.qkv_proj`) helps identify specific layers
+- **Layer hierarchy**: The full module path (e.g., `meta-llama/Meta-Llama-3.1-8B-Instruct.model.layers.0.self_attn.qkv_proj`) helps identify specific layers. The prefix uses the full model path from `--model-path`.
 - **Tensor shapes**: Input/output dimensions and parameter shapes are included in the NVTX marker data
 
 **Benefits of layerwise NVTX profiling:**
