@@ -1,7 +1,10 @@
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    time::Duration,
+};
+
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub struct PrometheusConfig {
@@ -69,6 +72,31 @@ pub fn init_metrics() {
     describe_counter!(
         "sgl_router_processed_requests_total",
         "Total requests processed by each worker"
+    );
+
+    describe_gauge!(
+        "sgl_router_job_queue_depth",
+        "Current number of pending jobs in the queue"
+    );
+    describe_histogram!(
+        "sgl_router_job_duration_seconds",
+        "Job processing duration in seconds by job type"
+    );
+    describe_counter!(
+        "sgl_router_job_success_total",
+        "Total successful job completions by job type"
+    );
+    describe_counter!(
+        "sgl_router_job_failure_total",
+        "Total failed job completions by job type"
+    );
+    describe_counter!(
+        "sgl_router_job_queue_full_total",
+        "Total number of jobs rejected due to queue full"
+    );
+    describe_counter!(
+        "sgl_router_job_shutdown_rejected_total",
+        "Total number of jobs rejected due to shutdown"
     );
 
     describe_counter!(
@@ -595,8 +623,9 @@ impl TokenizerMetrics {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::net::TcpListener;
+
+    use super::*;
 
     #[test]
     fn test_prometheus_config_default() {
@@ -887,9 +916,13 @@ mod tests {
 
     #[test]
     fn test_concurrent_metric_updates() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::Arc;
-        use std::thread;
+        use std::{
+            sync::{
+                atomic::{AtomicBool, Ordering},
+                Arc,
+            },
+            thread,
+        };
 
         let done = Arc::new(AtomicBool::new(false));
         let mut handles = vec![];

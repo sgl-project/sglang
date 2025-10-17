@@ -678,8 +678,9 @@ class CudaGraphRunner:
         capture_hidden_mode_required_by_forward_batch = (
             forward_batch.capture_hidden_mode
         )
-        capture_hidden_mode_required_by_spec_info = getattr(
-            forward_batch.spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL
+        capture_hidden_mode_required_by_spec_info = (
+            getattr(forward_batch.spec_info, "capture_hidden_mode", None)
+            or CaptureHiddenMode.NULL
         )
         capture_hidden_mode_required_for_returning_hidden_states = (
             CaptureHiddenMode.FULL
@@ -849,7 +850,7 @@ class CudaGraphRunner:
                 )
 
         elif self.model_runner.spec_algorithm.is_ngram():
-            from sglang.srt.speculative.ngram_utils import NgramVerifyInput
+            from sglang.srt.speculative.ngram_info import NgramVerifyInput
 
             spec_info = NgramVerifyInput(
                 draft_token=None,
