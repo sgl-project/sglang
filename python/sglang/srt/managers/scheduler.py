@@ -149,6 +149,7 @@ from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
 from sglang.srt.speculative.eagle_info import EagleDraftInput
@@ -283,6 +284,7 @@ class Scheduler(
     SchedulerMetricsMixin,
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
+    SchedulerMultiplexMixin,
 ):
     """A scheduler that manages a tensor parallel GPU worker."""
 
@@ -317,6 +319,7 @@ class Scheduler(
         self.enable_lora = server_args.enable_lora
         self.max_loras_per_batch = server_args.max_loras_per_batch
         self.enable_overlap = not server_args.disable_overlap_schedule
+        self.enable_pdmux = server_args.enable_pdmux
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
         self.enable_metrics = server_args.enable_metrics
         self.enable_metrics_for_all_schedulers = (
@@ -389,6 +392,10 @@ class Scheduler(
             self.send_metrics_from_scheduler = get_zmq_socket(
                 context, zmq.PUSH, port_args.metrics_ipc_name, False
             )
+
+        # Init pdmux context
+        if self.enable_pdmux:
+            self.init_pdmux()
 
         # Init tokenizer
         self.init_tokenizer()
@@ -498,6 +505,8 @@ class Scheduler(
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
         # The current forward batch
         self.cur_batch: Optional[ScheduleBatch] = None
+        # The current split prefill batch
+        self.split_prefill_batch: Optional[ScheduleBatch] = None
         # The last forward batch
         self.last_batch: Optional[ScheduleBatch] = None
         self.forward_ct = 0
@@ -2182,7 +2191,6 @@ class Scheduler(
 
         # Run forward
         if self.is_generation:
-
             batch_or_worker_batch = batch
 
             if self.enable_overlap or self.spec_algorithm.is_none():
@@ -2239,6 +2247,9 @@ class Scheduler(
                     # The future value, usually for next batch preparation
                     # Current implementation strictly synchronizes the seq_lens
                     batch.seq_lens = batch_result.next_draft_input.new_seq_lens
+            elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
+                batch_result = self.tp_worker.forward_batch_split_prefill(batch)
+                future_indices_or_next_token_ids = batch_result.next_token_ids
             else:
                 batch_result = self.model_worker.forward_batch_generation(
                     batch_or_worker_batch
@@ -3052,7 +3063,9 @@ def run_scheduler_process(
 
         disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
         if disaggregation_mode == DisaggregationMode.NULL:
-            if server_args.pp_size > 1:
+            if scheduler.enable_pdmux:
+                scheduler.event_loop_pdmux()
+            elif server_args.pp_size > 1:
                 scheduler.event_loop_pp()
             elif scheduler.enable_overlap:
                 scheduler.event_loop_overlap()

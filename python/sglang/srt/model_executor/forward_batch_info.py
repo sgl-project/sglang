@@ -89,6 +89,7 @@ class ForwardMode(IntEnum):
             or self == ForwardMode.MIXED
             or self == ForwardMode.DRAFT_EXTEND
             or self == ForwardMode.TARGET_VERIFY
+            or self == ForwardMode.SPLIT_PREFILL
         )
 
     def is_decode(self):
