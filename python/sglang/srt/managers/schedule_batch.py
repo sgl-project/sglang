@@ -1061,38 +1061,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
         return req_pool_indices
 
-    def allocate_for_eagle_v2(self):
-        from sglang.srt.speculative.eagle_info import EagleDraftInput
-        from sglang.srt.speculative.spec_utils import assign_req_to_token_pool
-
-        bs = self.batch_size()
-
-        assert self.spec_info.is_draft_input()
-        draft_input: EagleDraftInput = self.spec_info
-
-        # FIXME(lsyin): now implementation does not enable over-allocation
-        # Now seq_lens and allocate_lens are correct
-        self.maybe_wait_verify_done()
-
-        new_allocate_lens = self.seq_lens + EagleDraftInput.ALLOC_LEN_PER_DECODE
-        num_needed_tokens = (new_allocate_lens - draft_input.allocate_lens).sum().item()
-        out_cache_loc = alloc_token_slots(self.tree_cache, num_needed_tokens)
-
-        assign_req_to_token_pool[(bs,)](
-            self.req_pool_indices,
-            self.req_to_token_pool.req_to_token,
-            draft_input.allocate_lens,
-            new_allocate_lens,
-            out_cache_loc,
-            self.req_to_token_pool.req_to_token.shape[1],
-            next_power_of_2(bs),
-        )
-        draft_input.allocate_lens = new_allocate_lens
-
-        # FIXME(lsyin): remove seq_lens_sum calculation
-        self.seq_lens_cpu = self.seq_lens.cpu()
-        self.seq_lens_sum = self.seq_lens_cpu.sum().item()
-
     def prepare_encoder_info_extend(self, input_ids: List[int], seq_lens: List[int]):
         self.encoder_lens_cpu = []
         self.encoder_cached = []
@@ -1522,8 +1490,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         bs = len(self.reqs)
 
         if self.is_v2_eagle:
-            # FIXME(lsyin): make this sync optional
-            self.allocate_for_eagle_v2()
+            # TODO(spec-v2): all v2 spec should go through this path
+            from sglang.srt.speculative.eagle_info import EagleDraftInput
+
+            draft_input: EagleDraftInput = self.spec_info
+            draft_input.prepare_for_decode(self)
 
         if not self.spec_algorithm.is_none():
             # if spec decoding is used, the decode batch is prepared inside
