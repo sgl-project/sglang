@@ -3271,7 +3271,12 @@ def json_list_type(value):
 
 
 @contextmanager
-def temp_set_cuda_visible_devices(gpu_id: int):
+def maybe_reindex_device_id(gpu_id: int):
+
+    if not is_cuda_alike():
+        yield gpu_id
+        return
+
     original_cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
     if original_cuda_visible_devices:
         cuda_visible_devices = original_cuda_visible_devices.split(",")
@@ -3280,7 +3285,11 @@ def temp_set_cuda_visible_devices(gpu_id: int):
 
     str_gpu_id = cuda_visible_devices[gpu_id] if cuda_visible_devices else str(gpu_id)
     os.environ["CUDA_VISIBLE_DEVICES"] = str_gpu_id
-    yield
+
+    logger.debug(f"Set CUDA_VISIBLE_DEVICES to {str_gpu_id}")
+
+    yield 0
+
     if original_cuda_visible_devices:
         os.environ["CUDA_VISIBLE_DEVICES"] = original_cuda_visible_devices
     else:
