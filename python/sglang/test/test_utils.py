@@ -20,8 +20,10 @@ from functools import partial, wraps
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import aiohttp
+import grpc
 import numpy as np
 import requests
 import torch
@@ -29,6 +31,7 @@ import torch.nn.functional as F
 
 from sglang.bench_serving import run_benchmark
 from sglang.global_config import global_config
+from sglang.srt.grpc import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
 from sglang.srt.utils import (
     get_bool_env_var,
     get_device,
@@ -117,6 +120,7 @@ DEFAULT_IMAGE_URL = "https://github.com/sgl-project/sglang/blob/main/test/lang/e
 DEFAULT_VIDEO_URL = "https://raw.githubusercontent.com/EvolvingLMMs-Lab/sglang/dev/onevision_local/assets/jobs.mp4"
 
 DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 600
+DEFAULT_TIMEOUT_FOR_ROUTER_LAUNCH = 600
 
 
 def is_in_ci():
@@ -685,6 +689,193 @@ def popen_launch_pd_server(
     process = subprocess.Popen(command, stdout=None, stderr=None, env=env)
 
     return process
+
+
+def popen_launch_router_with_grpc_worker(
+    model: str,
+    base_url: str,
+    router_timeout: float,
+    worker_timeout: float,
+    api_key: Optional[str] = None,
+    worker_other_args: list[str] = [],
+    router_other_args: list[str] = [],
+    env: Optional[dict] = None,
+    device: str = "auto",
+):
+    """Launch a router with a single gRPC worker for testing.
+
+    This function starts:
+    1. One gRPC worker process (on GPU)
+    2. One router process (no GPU) that connects to the worker
+
+    Args:
+        model: Model path or name
+        base_url: Base URL for the router (e.g., "http://127.0.0.1:30000")
+        router_timeout: Maximum time to wait for router to be ready (seconds)
+        worker_timeout: Maximum time to wait for worker to be ready (seconds, default: 120)
+        api_key: Optional API key
+        worker_other_args: Additional arguments for the gRPC worker
+        router_other_args: Additional arguments for the router
+        env: Environment variables
+        device: Device type ("auto", "cuda", "rocm" or "cpu")
+
+    Returns:
+        Tuple of (router_process, worker_process, worker_port)
+    """
+    # Auto-detect device if needed
+    if device == "auto":
+        device = auto_config_device()
+        print(f"Auto-configured device: {device}", flush=True)
+        worker_other_args = list(worker_other_args)
+        worker_other_args += ["--device", str(device)]
+
+    # Parse router URL using urllib for robustness
+    parsed_url = urlparse(base_url)
+    router_host = parsed_url.hostname or "127.0.0.1"
+    router_port = str(parsed_url.port) if parsed_url.port else "30000"
+
+    # Find available port for gRPC worker
+    worker_port = None
+    for port in range(30400, 30500):
+        if is_port_available(port):
+            worker_port = port
+            break
+    if worker_port is None:
+        raise RuntimeError("No available ports found for gRPC worker")
+
+    print(f"Router: {router_host}:{router_port}, gRPC Worker: 127.0.0.1:{worker_port}")
+
+    # Start gRPC worker
+    worker_command = [
+        "python3",
+        "-m",
+        "sglang.launch_server",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        str(worker_port),
+        "--model-path",
+        model,
+        "--grpc-mode",
+        *[str(x) for x in worker_other_args],
+    ]
+
+    print(f"Worker command: {' '.join(worker_command)}")
+    worker_process = subprocess.Popen(
+        worker_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env
+    )
+
+    # Wait for worker to be ready by polling its gRPC health check
+    print("Waiting for gRPC worker to be ready...")
+    worker_start_time = time.perf_counter()
+
+    worker_is_healthy = False
+    while time.perf_counter() - worker_start_time < worker_timeout:
+        worker_status = worker_process.poll()
+        if worker_status is not None:
+            # Worker crashed, get error logs
+            stdout, stderr = worker_process.communicate(timeout=5)
+            raise RuntimeError(
+                f"gRPC worker failed to start (exit code {worker_status})\n"
+                f"stdout: {stdout.decode()}\n"
+                f"stderr: {stderr.decode()}"
+            )
+
+        try:
+            # Try to connect and check health
+            channel = grpc.insecure_channel(f"127.0.0.1:{worker_port}")
+            stub = sglang_scheduler_pb2_grpc.SglangSchedulerStub(channel)
+            health_req = sglang_scheduler_pb2.HealthCheckRequest()
+            response = stub.HealthCheck(health_req, timeout=5)
+
+            if response.healthy:
+                elapsed = time.perf_counter() - worker_start_time
+                print(f"✓ gRPC worker is healthy ({elapsed:.1f}s)")
+                channel.close()
+                worker_is_healthy = True
+                break
+            channel.close()
+        except Exception:
+            pass  # Not ready yet, will retry
+
+        time.sleep(2)
+
+    # Check if we exited due to timeout
+    if not worker_is_healthy:
+        kill_process_tree(worker_process.pid)
+        raise TimeoutError(
+            f"gRPC worker failed to become healthy within {worker_timeout}s. "
+            "Check worker logs for errors."
+        )
+
+    # Start router
+    worker_url = f"grpc://127.0.0.1:{worker_port}"
+    router_command = [
+        "python3",
+        "-m",
+        "sglang_router.launch_router",
+        "--host",
+        router_host,
+        "--port",
+        router_port,
+        "--worker-urls",
+        worker_url,
+        "--model-path",
+        model,
+        *[str(x) for x in router_other_args],
+    ]
+
+    if api_key:
+        router_command += ["--api-key", api_key]
+
+    print(f"Router command: {' '.join(router_command)}")
+    router_process = subprocess.Popen(
+        router_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env
+    )
+
+    # Wait for router to be ready
+    print("Waiting for router to be ready (this may take several minutes)...")
+    start_time = time.perf_counter()
+    with requests.Session() as session:
+        while time.perf_counter() - start_time < router_timeout:
+
+            router_status = router_process.poll()
+            if router_status is not None:
+                # Router crashed
+                stdout, stderr = router_process.communicate(timeout=5)
+                kill_process_tree(worker_process.pid)
+                raise RuntimeError(
+                    f"Router failed to start (exit code {router_status})\n"
+                    f"stdout: {stdout.decode()}\n"
+                    f"stderr: {stderr.decode()}"
+                )
+
+            try:
+                headers = {
+                    "Content-Type": "application/json; charset=utf-8",
+                }
+                if api_key:
+                    headers["Authorization"] = f"Bearer {api_key}"
+
+                response = session.get(
+                    f"{base_url}/health",
+                    headers=headers
+                )
+                if response.status_code == 200:
+                    print("Router is ready!")
+                    return router_process, worker_process
+            except requests.RequestException:
+                pass
+
+            time.sleep(10)
+
+    # Timeout - cleanup
+    kill_process_tree(router_process.pid)
+    kill_process_tree(worker_process.pid)
+    raise TimeoutError(
+        f"Router failed to start within {router_timeout}s. "
+        "Check that gRPC worker is healthy and router can connect."
+    )
 
 
 def run_with_timeout(
