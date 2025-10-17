@@ -769,6 +769,10 @@ class ModelRunner:
 
         get_offloader().post_init()
 
+        # Register model for layerwise NVTX profiling if enabled
+        if self.server_args.enable_layerwise_nvtx:
+            self._register_layerwise_nvtx(self.model, self.model_config)
+
         if self.server_args.kv_cache_dtype == "fp8_e4m3":
             if self.server_args.quantization_param_path is not None:
                 if callable(getattr(self.model, "load_kv_cache_scales", None)):
@@ -867,6 +871,35 @@ class ModelRunner:
                 nnodes=self.server_args.nnodes,
                 rank=self.tp_rank,
             )
+
+    def _register_layerwise_nvtx(self, model: torch.nn.Module, model_config):
+        """
+        Register layerwise NVTX profiling annotations for the model.
+
+        Args:
+            model: The loaded model instance from loader.load_model()
+            model_config: The model configuration
+        """
+        logger.info("Registering layerwise NVTX profiling...")
+
+        # Access model properties
+        model_name = model_config.model_path
+        model_dtype = model_config.dtype
+
+        # Access runtime context
+        tp_size = self.server_args.tp_size
+        tp_rank = self.tp_rank
+
+        # TODO: Implement layerwise NVTX registration logic
+        # Example implementation:
+        # - Iterate through model layers
+        # - Add NVTX range annotations to each layer's forward method
+        # - Track layer names and execution times
+
+        logger.info(
+            f"Layerwise NVTX profiling registered for model: {model_name} "
+            f"(dtype={model_dtype}, tp_rank={tp_rank}/{tp_size})"
+        )
 
     def update_weights_from_disk(
         self,
