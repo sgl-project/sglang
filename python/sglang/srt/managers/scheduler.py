@@ -2169,7 +2169,7 @@ class Scheduler(
         return batch
 
     # placeholder for override
-    def update_cache_from_scheduler(self, schedule_batch, batch_result):
+    def update_cache_from_scheduler(self, schedule_batch: ScheduleBatch, batch_result: GenerationBatchResult):
         pass
 
     def run_batch(
