@@ -1,18 +1,27 @@
-use super::{CircuitBreaker, WorkerError, WorkerResult};
-use crate::core::CircuitState;
-use crate::core::{BasicWorkerBuilder, DPAwareWorkerBuilder};
-use crate::grpc_client::SglangSchedulerClient;
-use crate::metrics::RouterMetrics;
+use std::{
+    fmt,
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, LazyLock,
+    },
+    time::{Duration, Instant},
+};
+
 use async_trait::async_trait;
 use futures;
 use serde_json;
-use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock};
-use std::time::Duration;
-use std::time::Instant;
-use tokio::sync::{Mutex, RwLock};
-use tokio::time;
+use tokio::{
+    sync::{Mutex, RwLock},
+    time,
+};
+
+use super::{CircuitBreaker, WorkerError, WorkerResult};
+use crate::{
+    core::{BasicWorkerBuilder, CircuitState, DPAwareWorkerBuilder},
+    grpc_client::SglangSchedulerClient,
+    metrics::RouterMetrics,
+    protocols::worker_spec::WorkerInfo,
+};
 
 static WORKER_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
@@ -244,6 +253,20 @@ pub enum ConnectionMode {
         /// Optional port for gRPC endpoint (if different from URL)
         port: Option<u16>,
     },
+}
+
+impl ConnectionMode {
+    /// Check if this connection mode matches another, with special handling for gRPC
+    /// This allows matching any gRPC connection regardless of port when comparing
+    /// Grpc { port: None } as a wildcard
+    pub fn matches(&self, filter: &ConnectionMode) -> bool {
+        match (self, filter) {
+            (ConnectionMode::Http, ConnectionMode::Http) => true,
+            (ConnectionMode::Grpc { .. }, ConnectionMode::Grpc { port: None }) => true,
+            (ConnectionMode::Grpc { port: p1 }, ConnectionMode::Grpc { port: p2 }) => p1 == p2,
+            _ => false,
+        }
+    }
 }
 
 impl fmt::Display for ConnectionMode {
@@ -974,12 +997,45 @@ pub fn start_health_checker(
     HealthChecker { handle, shutdown }
 }
 
+/// Helper to convert Worker trait object to WorkerInfo struct
+pub fn worker_to_info(worker: &Arc<dyn Worker>) -> WorkerInfo {
+    let worker_type_str = match worker.worker_type() {
+        WorkerType::Regular => "regular",
+        WorkerType::Prefill { .. } => "prefill",
+        WorkerType::Decode => "decode",
+    };
+
+    let bootstrap_port = match worker.worker_type() {
+        WorkerType::Prefill { bootstrap_port } => bootstrap_port,
+        _ => None,
+    };
+
+    WorkerInfo {
+        id: worker.url().to_string(),
+        url: worker.url().to_string(),
+        model_id: worker.model_id().to_string(),
+        priority: worker.priority(),
+        cost: worker.cost(),
+        worker_type: worker_type_str.to_string(),
+        is_healthy: worker.is_healthy(),
+        load: worker.load(),
+        connection_mode: format!("{:?}", worker.connection_mode()),
+        tokenizer_path: worker.tokenizer_path().map(String::from),
+        reasoning_parser: worker.reasoning_parser().map(String::from),
+        tool_parser: worker.tool_parser().map(String::from),
+        chat_template: worker.chat_template().map(String::from),
+        bootstrap_port,
+        metadata: worker.metadata().labels.clone(),
+        job_status: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::{thread, time::Duration};
+
     use super::*;
     use crate::core::CircuitBreakerConfig;
-    use std::thread;
-    use std::time::Duration;
 
     #[test]
     fn test_worker_type_display() {
@@ -1454,8 +1510,9 @@ mod tests {
 
     #[test]
     fn test_load_counter_performance() {
-        use crate::core::BasicWorkerBuilder;
         use std::time::Instant;
+
+        use crate::core::BasicWorkerBuilder;
 
         let worker = BasicWorkerBuilder::new("http://test:8080")
             .worker_type(WorkerType::Regular)

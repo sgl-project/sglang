@@ -2,10 +2,12 @@
 //!
 //! Provides centralized registry for workers with model-based indexing
 
-use crate::core::{ConnectionMode, Worker, WorkerType};
-use dashmap::DashMap;
 use std::sync::{Arc, RwLock};
+
+use dashmap::DashMap;
 use uuid::Uuid;
+
+use crate::core::{ConnectionMode, Worker, WorkerType};
 
 /// Unique identifier for a worker
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
@@ -308,9 +310,9 @@ impl WorkerRegistry {
                     }
                 }
 
-                // Check connection_mode if specified
+                // Check connection_mode if specified (using matches for flexible gRPC matching)
                 if let Some(ref conn) = connection_mode {
-                    if w.connection_mode() != *conn {
+                    if !w.connection_mode().matches(conn) {
                         return false;
                     }
                 }
@@ -363,8 +365,10 @@ impl WorkerRegistry {
     /// Start a health checker for all workers in the registry
     /// This should be called once after the registry is populated with workers
     pub fn start_health_checker(&self, check_interval_secs: u64) -> crate::core::HealthChecker {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::Arc;
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
@@ -433,9 +437,10 @@ pub struct WorkerRegistryStats {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use crate::core::{BasicWorkerBuilder, CircuitBreakerConfig};
-    use std::collections::HashMap;
 
     #[test]
     fn test_worker_registry() {

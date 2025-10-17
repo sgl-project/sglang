@@ -384,6 +384,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 else:
                     unfinished_accept_index.append(accept_index[i])
             req.spec_verify_ct += 1
+            req.spec_accepted_tokens += (
+                sum(1 for idx in accept_index_row if idx != -1) - 1
+            )
 
         if has_finished:
             accept_length = (accept_index != -1).sum(dim=1) - 1
@@ -571,6 +574,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
 @dataclass
 class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
+    # Constant: alloc length per decode step
+    ALLOC_LEN_PER_DECODE: ClassVar[int] = None
+
     # The inputs for decode
     # shape: (b, topk)
     topk_p: torch.Tensor = None
@@ -605,9 +611,6 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     allocate_lens: Optional[torch.Tensor] = None
     new_seq_lens: Optional[torch.Tensor] = None
     verify_done: Optional[torch.cuda.Event] = None
-
-    # FIXME(lsyin): remove this hack
-    ALLOC_LEN_PER_DECODE: ClassVar[int] = None
 
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT)
