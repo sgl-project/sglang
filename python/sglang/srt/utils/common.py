@@ -2921,7 +2921,7 @@ def get_cpu_ids_by_node():
 def is_shm_available(dtype, world_size, local_size):
     return (
         cpu_has_amx_support()
-        and dtype in [torch.bfloat16, torch.float]
+        and dtype in [torch.bfloat16, torch.float16, torch.float]
         and world_size >= 1
         and world_size == local_size
     )
@@ -3441,16 +3441,3 @@ def cached_triton_kernel(key_fn=None):
         return CachedKernel(fn, key_fn)
 
     return decorator
-
-
-DEFAULT_DETERMINISTIC_INFERENCE_BACKEND_SIZE = 4096
-DEFAULT_DETERMINISTIC_INFERENCE_BACKEND_SIZE_CONFIG = {
-    "flashinfer": (
-        "SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE",
-        DEFAULT_DETERMINISTIC_INFERENCE_BACKEND_SIZE,
-    ),
-    "triton": (
-        "SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE",
-        DEFAULT_DETERMINISTIC_INFERENCE_BACKEND_SIZE,
-    ),
-}
