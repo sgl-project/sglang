@@ -509,6 +509,11 @@ class ServerArgs:
         """
         Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
         """
+
+        if self.model_path.lower() in ["none", "dummy"]:
+            # Skip for dummy models
+            return
+
         # Handle deprecated arguments.
         self._handle_deprecated_args()
 
