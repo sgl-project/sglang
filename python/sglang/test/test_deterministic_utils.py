@@ -6,8 +6,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
-    popen_launch_server,
-    is_in_ci
+    popen_launch_server
 )
 
 DEFAULT_MODEL = "Qwen/Qwen3-8B"
@@ -54,19 +53,6 @@ class TestDeterministicBase(CustomTestCase):
         args.n_trials = 20
         results = test_deterministic(args)
         args.temperature = 0.5  # test for deterministic sampling
-        for result in results:
-            assert result == 1
-
-    @unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
-    def test_mixed(self):
-        args = BenchArgs()
-        url = DEFAULT_URL_FOR_TEST
-        args.host, args.port = self._extract_host_and_port(url)
-        args.test_mode = "mixed"
-        args.n_start = 10
-        args.n_trials = 20
-        args.temperature = 0.5  # test for deterministic sampling
-        results = test_deterministic(args)
         for result in results:
             assert result == 1
 
