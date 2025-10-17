@@ -40,7 +40,7 @@ class BasePrefixCache(ABC):
         pass
 
     @abstractmethod
-    def cache_finished_req(self, req: Req, **kwargs):
+    def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs):
         pass
 
     @abstractmethod

@@ -1,0 +1,46 @@
+name: Bot Bump SGLang Version
+
+on:
+  workflow_dispatch:
+    inputs:
+      new_version:
+        description: 'New SGLang version (e.g., 0.5.3 or 0.5.3rc0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump-sglang-version:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Configure Git and branch
+        run: |
+          git config user.name "sglang-bot"
+          git config user.email "sglang-bot@users.noreply.github.com"
+          RANDOM_SUFFIX=$(echo $RANDOM | md5sum | head -c 4)
+          BRANCH_NAME="bot/bump-sglang-version-${{ github.event.inputs.new_version }}-${RANDOM_SUFFIX}"
+          git checkout -b "$BRANCH_NAME"
+          echo "BRANCH_NAME=$BRANCH_NAME" >> $GITHUB_ENV
+
+      - name: Run SGLang version bump script
+        run: |
+          python scripts/release/bump_sglang_version.py "${{ github.event.inputs.new_version }}"
+
+      - name: Commit and create PR
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_TAGGING }}
+        run: |
+          bash scripts/release/commit_and_pr.sh "SGLang" "${{ github.event.inputs.new_version }}" "$BRANCH_NAME"

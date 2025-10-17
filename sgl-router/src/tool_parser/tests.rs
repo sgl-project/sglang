@@ -1,75 +1,36 @@
 use super::*;
-use crate::tool_parser::parsers::JsonParser;
-use crate::tool_parser::partial_json::{
-    compute_diff, find_common_prefix, is_complete_json, PartialJson,
+use crate::tool_parser::{
+    parsers::JsonParser,
+    partial_json::{compute_diff, find_common_prefix, is_complete_json, PartialJson},
+    traits::ToolParser,
 };
-use crate::tool_parser::traits::ToolParser;
 
-#[test]
-fn test_parse_state_new() {
-    let state = ParseState::new();
-    assert_eq!(state.phase, ParsePhase::Searching);
-    assert_eq!(state.buffer, "");
-    assert_eq!(state.consumed, 0);
-    assert_eq!(state.bracket_depth, 0);
-    assert!(!state.in_string);
-    assert!(!state.escape_next);
+#[tokio::test]
+async fn test_tool_parser_factory() {
+    let factory = ParserFactory::new();
+
+    // Test that we can get a pooled parser
+    let pooled_parser = factory.get_pooled("gpt-4");
+    let parser = pooled_parser.lock().await;
+    assert!(parser.has_tool_markers(r#"{"name": "test", "arguments": {}}"#));
 }
 
-#[test]
-fn test_parse_state_process_char() {
-    let mut state = ParseState::new();
+#[tokio::test]
+async fn test_tool_parser_factory_model_mapping() {
+    let factory = ParserFactory::new();
 
-    state.process_char('{');
-    assert_eq!(state.bracket_depth, 1);
+    // Test model mapping
+    factory.registry().map_model("test-model", "json");
 
-    state.process_char('}');
-    assert_eq!(state.bracket_depth, 0);
-
-    state.process_char('"');
-    assert!(state.in_string);
-
-    state.process_char('"');
-    assert!(!state.in_string);
-
-    state.process_char('"');
-    state.process_char('\\');
-    assert!(state.escape_next);
-
-    state.process_char('"');
-    assert!(!state.escape_next);
-    assert!(state.in_string); // Still in string because quote was escaped
-}
-
-#[test]
-fn test_parser_registry() {
-    let registry = ParserRegistry::new();
-
-    assert!(!registry.list_mappings().is_empty());
-
-    let mappings = registry.list_mappings();
-    let has_gpt = mappings.iter().any(|(m, _)| m.starts_with("gpt"));
-    assert!(has_gpt);
-}
-
-#[test]
-fn test_parser_registry_pattern_matching() {
-    let mut registry = ParserRegistry::new_for_testing();
-
-    registry.map_model("test-model", "json");
-
-    let mappings = registry.list_mappings();
-    let has_test = mappings
-        .iter()
-        .any(|(m, p)| *m == "test-model" && *p == "json");
-    assert!(has_test);
+    // Get parser for the test model
+    let pooled_parser = factory.get_pooled("test-model");
+    let parser = pooled_parser.lock().await;
+    assert!(parser.has_tool_markers(r#"{"name": "test", "arguments": {}}"#));
 }
 
 #[test]
 fn test_tool_call_serialization() {
     let tool_call = ToolCall {
-        id: "call-123".to_string(),
-        r#type: "function".to_string(),
         function: FunctionCall {
             name: "search".to_string(),
             arguments: r#"{"query": "rust programming"}"#.to_string(),
@@ -77,13 +38,15 @@ fn test_tool_call_serialization() {
     };
 
     let json = serde_json::to_string(&tool_call).unwrap();
-    assert!(json.contains("call-123"));
     assert!(json.contains("search"));
     assert!(json.contains("rust programming"));
 
     let parsed: ToolCall = serde_json::from_str(&json).unwrap();
-    assert_eq!(parsed.id, "call-123");
     assert_eq!(parsed.function.name, "search");
+    assert_eq!(
+        parsed.function.arguments,
+        r#"{"query": "rust programming"}"#
+    );
 }
 
 #[test]
@@ -91,22 +54,22 @@ fn test_partial_json_parser() {
     let parser = PartialJson::default();
 
     let input = r#"{"name": "test", "value": 42}"#;
-    let (value, consumed) = parser.parse_value(input).unwrap();
+    let (value, consumed) = parser.parse_value(input, true).unwrap();
     assert_eq!(value["name"], "test");
     assert_eq!(value["value"], 42);
     assert_eq!(consumed, input.len());
 
     let input = r#"{"name": "test", "value": "#;
-    let (value, _consumed) = parser.parse_value(input).unwrap();
+    let (value, _consumed) = parser.parse_value(input, true).unwrap();
     assert_eq!(value["name"], "test");
     assert!(value["value"].is_null());
 
     let input = r#"{"name": "tes"#;
-    let (value, _consumed) = parser.parse_value(input).unwrap();
+    let (value, _consumed) = parser.parse_value(input, true).unwrap();
     assert_eq!(value["name"], "tes");
 
     let input = r#"[1, 2, "#;
-    let (value, _consumed) = parser.parse_value(input).unwrap();
+    let (value, _consumed) = parser.parse_value(input, true).unwrap();
     assert!(value.is_array());
     assert_eq!(value[0], 1);
     assert_eq!(value[1], 2);
@@ -120,17 +83,17 @@ fn test_partial_json_depth_limit() {
 
     // This should work (simple object)
     let input = r#"{"a": 1}"#;
-    let result = parser.parse_value(input);
+    let result = parser.parse_value(input, true);
     assert!(result.is_ok());
 
     // This should work (nested to depth 3)
     let input = r#"{"a": {"b": {"c": 1}}}"#;
-    let result = parser.parse_value(input);
+    let result = parser.parse_value(input, true);
     assert!(result.is_ok());
 
     // This should fail (nested to depth 4, exceeds limit)
     let input = r#"{"a": {"b": {"c": {"d": 1}}}}"#;
-    let result = parser.parse_value(input);
+    let result = parser.parse_value(input, true);
     assert!(result.is_err());
 }
 
@@ -165,37 +128,7 @@ fn test_compute_diff() {
     assert_eq!(compute_diff("test", "hello"), "hello");
 }
 
-#[test]
-fn test_stream_result_variants() {
-    let result = StreamResult::Incomplete;
-    matches!(result, StreamResult::Incomplete);
-
-    let result = StreamResult::ToolName {
-        index: 0,
-        name: "test".to_string(),
-    };
-    if let StreamResult::ToolName { index, name } = result {
-        assert_eq!(index, 0);
-        assert_eq!(name, "test");
-    } else {
-        panic!("Expected ToolName variant");
-    }
-
-    let tool = ToolCall {
-        id: "123".to_string(),
-        r#type: "function".to_string(),
-        function: FunctionCall {
-            name: "test".to_string(),
-            arguments: "{}".to_string(),
-        },
-    };
-    let result = StreamResult::ToolComplete(tool.clone());
-    if let StreamResult::ToolComplete(t) = result {
-        assert_eq!(t.id, "123");
-    } else {
-        panic!("Expected ToolComplete variant");
-    }
-}
+// NOTE: test_stream_result_variants removed - StreamResult enum replaced by StreamingParseResult
 
 #[test]
 fn test_partial_tool_call() {
@@ -301,23 +234,21 @@ fn test_json_parser_format_detection() {
     let parser = JsonParser::new();
 
     // Should detect valid tool call formats
-    assert!(parser.detect_format(r#"{"name": "test", "arguments": {}}"#));
-    assert!(parser.detect_format(r#"{"name": "test", "parameters": {"x": 1}}"#));
-    assert!(parser.detect_format(r#"[{"name": "test"}]"#));
+    assert!(parser.has_tool_markers(r#"{"name": "test", "arguments": {}}"#));
+    assert!(parser.has_tool_markers(r#"{"name": "test", "parameters": {"x": 1}}"#));
+    assert!(parser.has_tool_markers(r#"[{"name": "test"}]"#));
 
     // Should not detect non-tool formats
-    assert!(!parser.detect_format("plain text"));
+    assert!(!parser.has_tool_markers("plain text"));
 }
 
 #[tokio::test]
-async fn test_registry_with_json_parser() {
-    let registry = ParserRegistry::new();
-
-    // JSON parser should be registered by default
-    assert!(registry.has_parser("json"));
+async fn test_factory_with_json_parser() {
+    let factory = ParserFactory::new();
 
     // Should get JSON parser for OpenAI models
-    let parser = registry.get_parser("gpt-4-turbo").unwrap();
+    let pooled_parser = factory.get_pooled("gpt-4-turbo");
+    let parser = pooled_parser.lock().await;
 
     let input = r#"{"name": "test", "arguments": {"x": 1}}"#;
     let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
@@ -544,62 +475,6 @@ mod edge_cases {
         let (_normal_text, tools) = parser.parse_complete(input).await.unwrap();
         assert_eq!(tools.len(), 1);
         assert!(tools[0].function.arguments.contains("null"));
-    }
-
-    #[tokio::test]
-    async fn test_streaming_with_partial_chunks() {
-        let parser = JsonParser::new();
-
-        let mut state1 = ParseState::new();
-        let partial = r#"{"#;
-        let result = parser
-            .parse_incremental(partial, &mut state1)
-            .await
-            .unwrap();
-        assert!(
-            matches!(result, StreamResult::Incomplete),
-            "Should return Incomplete for just opening brace"
-        );
-
-        let mut state2 = ParseState::new();
-        let complete = r#"{"name": "get_weather", "arguments": {"location": "SF"}}"#;
-        let result = parser
-            .parse_incremental(complete, &mut state2)
-            .await
-            .unwrap();
-
-        match result {
-            StreamResult::ToolComplete(tool) => {
-                assert_eq!(tool.function.name, "get_weather");
-                let args: serde_json::Value =
-                    serde_json::from_str(&tool.function.arguments).unwrap();
-                assert_eq!(args["location"], "SF");
-            }
-            _ => panic!("Expected ToolComplete for complete JSON"),
-        }
-
-        // The PartialJson parser can complete partial JSON by filling in missing values
-        let mut state3 = ParseState::new();
-        let partial_with_name = r#"{"name": "test", "argum"#;
-        let result = parser
-            .parse_incremental(partial_with_name, &mut state3)
-            .await
-            .unwrap();
-
-        match result {
-            StreamResult::ToolComplete(tool) => {
-                assert_eq!(tool.function.name, "test");
-                // Arguments will be empty object since "argum" is incomplete
-                assert_eq!(tool.function.arguments, "{}");
-            }
-            StreamResult::ToolName { name, .. } => {
-                assert_eq!(name, "test");
-            }
-            StreamResult::Incomplete => {
-                // Also acceptable if parser decides to wait
-            }
-            _ => panic!("Unexpected result for partial JSON with name"),
-        }
     }
 
     #[tokio::test]

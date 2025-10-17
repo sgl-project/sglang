@@ -216,7 +216,7 @@ def _run_sglang_subprocess(
         del hf_model
         hf_model = None
         torch.cuda.empty_cache()
-        time.sleep(5)
+        time.sleep(3)
         torch.cuda.empty_cache()
         _curr_usage = get_gpu_memory_gb(rank)
         assert (

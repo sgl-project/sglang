@@ -31,9 +31,10 @@ class SGLangCIAnalyzer:
         self.session = requests.Session()
         self.session.headers.update(self.headers)
 
-    def get_recent_runs(self, limit: int = 100) -> List[Dict]:
+    def get_recent_runs(self, limit: int = 100, branch: str = None) -> List[Dict]:
         """Get recent CI run data"""
-        print(f"Fetching {limit} recent CI runs...")
+        branch_info = f" from branch '{branch}'" if branch else ""
+        print(f"Fetching {limit} recent CI runs{branch_info}...")
 
         all_runs = []
         page = 1
@@ -42,6 +43,8 @@ class SGLangCIAnalyzer:
         while len(all_runs) < limit:
             url = f"{self.base_url}/repos/{self.repo}/actions/runs"
             params = {"per_page": min(per_page, limit - len(all_runs)), "page": page}
+            if branch:
+                params["branch"] = branch
 
             try:
                 response = self.session.get(url, params=params)
@@ -67,15 +70,14 @@ class SGLangCIAnalyzer:
         return all_runs[:limit]
 
     def analyze_ci_failures(self, runs: List[Dict]) -> Dict:
-        """Analyze CI failure patterns"""
-        print("Analyzing CI failure data...")
+        """Analyze CI failure patterns (CUDA jobs only)"""
+        print("Analyzing CI failure data (CUDA only)...")
 
-        # SGLang specific job categories
+        # SGLang specific job categories (CUDA only)
         job_categories = {
-            "sgl-kernel": [
+            "build": [
+                "build-test",
                 "sgl-kernel-build-wheels",
-                "sgl-kernel-unit-test",
-                "sgl-kernel-mla-test",
             ],
             "unit-test": [
                 "unit-test-frontend",
@@ -87,11 +89,35 @@ class SGLangCIAnalyzer:
             "performance": [
                 "performance-test-1-gpu-part-1",
                 "performance-test-1-gpu-part-2",
+                "performance-test-1-gpu-part-3",
                 "performance-test-2-gpu",
             ],
-            "accuracy": ["accuracy-test-1-gpu", "accuracy-test-2-gpu"],
-            "deepep": ["unit-test-deepep-4-gpu", "unit-test-deepep-8-gpu"],
-            "b200": ["unit-test-backend-4-gpu-b200"],
+            "accuracy": [
+                "accuracy-test-1-gpu",
+                "accuracy-test-2-gpu",
+            ],
+            "mla-test": [
+                "sgl-kernel-mla-test",
+            ],
+            "deepep": [
+                "unit-test-deepep-4-gpu",
+                "unit-test-deepep-8-gpu",
+            ],
+            "per-commit": [
+                "per-commit-8-gpu-h20",
+            ],
+            "nightly": [
+                "nightly-test-perf-text-models",
+                "nightly-test-eval-text-models",
+            ],
+            "integration": [
+                "run-all-notebooks",
+                "vllm-dependency-test",
+                "test-disaggregation",
+            ],
+            "b200": [
+                "unit-test-backend-4-gpu-b200",
+            ],
         }
 
         stats = {
@@ -141,13 +167,26 @@ class SGLangCIAnalyzer:
                 job_name = job.get("name", "Unknown")
                 job_conclusion = job.get("conclusion", "unknown")
 
-                # Filter out non-specific CI jobs
-                if job_name not in [
-                    "check-changes",
-                    "pr-test-finish",
-                    "pr-test-h20-finish",
-                    "lint",
-                ]:
+                # Filter out non-specific CI jobs and non-CUDA jobs
+                # Skip meta jobs and AMD/NPU related jobs
+                if (
+                    job_name
+                    not in [
+                        "check-changes",
+                        "pr-test-finish",
+                        "pr-test-h20-finish",
+                        "pr-test-amd-finish",
+                        "pr-test-b200-finish",
+                        "lint",
+                        "Set up job",
+                    ]
+                    and "-amd" not in job_name.lower()
+                    and "mi300" not in job_name.lower()
+                    and "mi325" not in job_name.lower()
+                    and "gfx" not in job_name.lower()
+                    and "-npu" not in job_name.lower()
+                    and "ascend" not in job_name.lower()
+                ):
                     # Record successful jobs (update last success)
                     if job_conclusion == "success":
                         stats["job_last_success"][job_name] = {
@@ -158,7 +197,7 @@ class SGLangCIAnalyzer:
                         }
 
                     # Record failed jobs
-                    elif job_conclusion == "failure" and run_status == "failure":
+                    elif job_conclusion == "failure":
                         stats["job_failures"][job_name] += 1
 
                         # Store failure link (keep only last 3 for each job)
@@ -216,7 +255,7 @@ class SGLangCIAnalyzer:
         return pr_info
 
     def _analyze_failure_pattern(self, job: Dict, stats: Dict):
-        """Analyze failure patterns"""
+        """Analyze failure patterns (CUDA jobs only)"""
         job_name = job.get("name", "")
         steps = job.get("steps", [])
 
@@ -224,19 +263,33 @@ class SGLangCIAnalyzer:
             if step.get("conclusion") == "failure":
                 step_name = step.get("name", "")
 
-                # SGLang specific failure pattern recognition
+                # SGLang specific failure pattern recognition (CUDA only)
                 if "timeout" in step_name.lower():
                     stats["failure_patterns"]["Timeout"] += 1
-                elif "test" in step_name.lower() and "unit" in job_name.lower():
+                elif "build" in step_name.lower() or "build" in job_name.lower():
+                    stats["failure_patterns"]["Build Failure"] += 1
+                elif "install" in step_name.lower() or "dependency" in job_name.lower():
+                    stats["failure_patterns"]["Dependency Installation Failure"] += 1
+                elif "unit" in job_name.lower() or "unit-test" in job_name.lower():
                     stats["failure_patterns"]["Unit Test Failure"] += 1
-                elif "performance" in job_name.lower():
+                elif "performance" in job_name.lower() or "perf" in job_name.lower():
                     stats["failure_patterns"]["Performance Test Failure"] += 1
                 elif "accuracy" in job_name.lower():
                     stats["failure_patterns"]["Accuracy Test Failure"] += 1
-                elif "build" in step_name.lower():
-                    stats["failure_patterns"]["Build Failure"] += 1
-                elif "install" in step_name.lower():
-                    stats["failure_patterns"]["Dependency Installation Failure"] += 1
+                elif "mla" in job_name.lower():
+                    stats["failure_patterns"]["MLA Test Failure"] += 1
+                elif "deepep" in job_name.lower():
+                    stats["failure_patterns"]["DeepEP Test Failure"] += 1
+                elif "nightly" in job_name.lower():
+                    stats["failure_patterns"]["Nightly Test Failure"] += 1
+                elif "notebook" in job_name.lower():
+                    stats["failure_patterns"]["Notebook Test Failure"] += 1
+                elif "disaggregation" in job_name.lower():
+                    stats["failure_patterns"]["Disaggregation Test Failure"] += 1
+                elif "h20" in job_name.lower() or "h200" in job_name.lower():
+                    stats["failure_patterns"]["H20/H200 GPU Failure"] += 1
+                elif "b200" in job_name.lower():
+                    stats["failure_patterns"]["B200 GPU Failure"] += 1
                 elif "gpu" in job_name.lower():
                     stats["failure_patterns"]["GPU Related Failure"] += 1
                 else:
@@ -245,7 +298,7 @@ class SGLangCIAnalyzer:
     def generate_report(self, stats: Dict):
         """Generate CI analysis report"""
         print("\n" + "=" * 60)
-        print("SGLang CI Analysis Report")
+        print("SGLang CI Analysis Report (CUDA Only)")
         print("=" * 60)
 
         # Overall statistics
@@ -357,6 +410,11 @@ def main():
         default="ci_analysis.json",
         help="Output file (default: ci_analysis.json)",
     )
+    parser.add_argument(
+        "--branch",
+        default="main",
+        help="Filter runs by branch (default: 'main'). Set to empty string '' to analyze all branches.",
+    )
 
     args = parser.parse_args()
 
@@ -365,7 +423,9 @@ def main():
 
     try:
         # Get CI run data
-        runs = analyzer.get_recent_runs(args.limit)
+        # Use None for branch if empty string is provided (to scan all branches)
+        branch = args.branch if args.branch else None
+        runs = analyzer.get_recent_runs(args.limit, branch)
 
         if not runs:
             print("No CI run data found")

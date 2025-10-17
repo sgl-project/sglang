@@ -29,9 +29,69 @@ impl ConfigValidator {
         Self::validate_retry(&retry_cfg)?;
         Self::validate_circuit_breaker(&cb_cfg)?;
 
-        if config.history_backend == HistoryBackend::Oracle && config.oracle.is_none() {
+        // Validate Oracle configuration if enabled
+        if config.history_backend == HistoryBackend::Oracle {
+            if config.oracle.is_none() {
+                return Err(ConfigError::MissingRequired {
+                    field: "oracle".to_string(),
+                });
+            }
+            // Validate Oracle configuration details
+            if let Some(oracle) = &config.oracle {
+                Self::validate_oracle(oracle)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Validate Oracle configuration
+    fn validate_oracle(oracle: &OracleConfig) -> ConfigResult<()> {
+        // Validate username is not empty
+        if oracle.username.is_empty() {
             return Err(ConfigError::MissingRequired {
-                field: "oracle".to_string(),
+                field: "oracle.username".to_string(),
+            });
+        }
+
+        // Validate password is not empty
+        if oracle.password.is_empty() {
+            return Err(ConfigError::MissingRequired {
+                field: "oracle.password".to_string(),
+            });
+        }
+
+        // Validate connect_descriptor is not empty
+        if oracle.connect_descriptor.is_empty() {
+            return Err(ConfigError::MissingRequired {
+                field: "oracle_dsn or oracle_tns_alias".to_string(),
+            });
+        }
+
+        // Validate pool_min is at least 1
+        if oracle.pool_min < 1 {
+            return Err(ConfigError::InvalidValue {
+                field: "oracle.pool_min".to_string(),
+                value: oracle.pool_min.to_string(),
+                reason: "Must be at least 1".to_string(),
+            });
+        }
+
+        // Validate pool_max is greater than or equal to pool_min
+        if oracle.pool_max < oracle.pool_min {
+            return Err(ConfigError::InvalidValue {
+                field: "oracle.pool_max".to_string(),
+                value: oracle.pool_max.to_string(),
+                reason: "Must be >= oracle.pool_min".to_string(),
+            });
+        }
+
+        // Validate pool_timeout_secs is greater than 0
+        if oracle.pool_timeout_secs == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "oracle.pool_timeout_secs".to_string(),
+                value: oracle.pool_timeout_secs.to_string(),
+                reason: "Must be > 0".to_string(),
             });
         }
 
@@ -203,6 +263,24 @@ impl ConfigValidator {
                 value: config.request_timeout_secs.to_string(),
                 reason: "Must be > 0".to_string(),
             });
+        }
+
+        if config.queue_size > 0 && config.queue_timeout_secs == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "queue_timeout_secs".to_string(),
+                value: config.queue_timeout_secs.to_string(),
+                reason: "Must be > 0 when queue_size > 0".to_string(),
+            });
+        }
+
+        if let Some(tokens_per_second) = config.rate_limit_tokens_per_second {
+            if tokens_per_second <= 0 {
+                return Err(ConfigError::InvalidValue {
+                    field: "rate_limit_tokens_per_second".to_string(),
+                    value: tokens_per_second.to_string(),
+                    reason: "Must be > 0 when specified".to_string(),
+                });
+            }
         }
 
         if config.worker_startup_timeout_secs == 0 {

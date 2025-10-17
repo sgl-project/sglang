@@ -26,12 +26,12 @@ import torch
 from torch import nn
 
 from sglang.srt.configs.load_config import LoadConfig
-from sglang.srt.hf_transformers_utils import AutoConfig
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.backend.chunked_backend import ChunkedSgmvLoRABackend
 from sglang.srt.lora.backend.triton_backend import TritonLoRABackend
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.model_loader.loader import DefaultModelLoader
+from sglang.srt.utils.hf_transformers_utils import AutoConfig
 
 logger = logging.getLogger(__name__)
 
