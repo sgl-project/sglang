@@ -89,6 +89,7 @@ from torch.utils._contextlib import _DecoratorContextManager
 from typing_extensions import Literal
 
 from sglang.srt.metrics.func_timer import enable_func_timer
+from itertools import accumulate
 
 logger = logging.getLogger(__name__)
 
@@ -2587,7 +2588,7 @@ def require_mlp_tp_gather(server_args):
     """
     Check if the input of MLP is obtained by all-gather rather than all-reduce. This only happens when each MLP TP group contains multiple attention DP groups.
     """
-    if server_args.enable_dp_attention:
+    if server_args.enable_dp_attention and not get_bool_env_var("SGLANG_USE_DP_CP_AG_AFTER_DSA"):
         assert server_args.dp_size > 1, "dp_size must be greater than 1"
         if (
             server_args.moe_dense_tp_size is None
@@ -3441,3 +3442,63 @@ def cached_triton_kernel(key_fn=None):
         return CachedKernel(fn, key_fn)
 
     return decorator
+
+def prepare_input_dp_with_cp_dsa(
+        kv_len,
+        cp_rank,
+        cp_size,
+    ):  
+        """ prepare_input_dp_with_cp_dsa """
+        # just support batch = 1
+        bs_per_cp_group = 1
+        cp_input_dict = {}
+        kv_len_origin = kv_len
+        # get zigzag index
+        cp_segment_num = cp_size * 2
+        seq_per_batch = kv_len // cp_segment_num   # seq_len for each batch and segment
+        split_list = seq_per_batch.repeat_interleave(cp_segment_num).int().tolist()
+        remainder = kv_len % (cp_segment_num) 
+        if remainder > 0:
+            split_list[:remainder] = [x + 1 for x in split_list[:remainder]]
+        
+        cp_input_dict.update({"split_list": split_list})
+        seq_max_rank_len = (kv_len + cp_size - 1) // cp_size
+        max_rank_len = seq_max_rank_len.repeat_interleave(cp_size).int().tolist()
+        cp_input_dict.update({"max_rank_len": max_rank_len})
+        zigzag_index = list(range(cp_rank,
+                                  cp_rank + bs_per_cp_group * cp_segment_num,
+                                  cp_segment_num)) + \
+            list(range(cp_segment_num - cp_rank - 1,
+                       bs_per_cp_group * cp_segment_num,
+                       cp_segment_num))
+        cp_input_dict.update({"zigzag_index": zigzag_index})
+
+        per_rank_actual_token = list(split_list[i] + \
+            split_list[cp_size * 2 - i - 1] for i in range(cp_size))
+        cp_input_dict.update({"per_rank_actual_token": per_rank_actual_token})
+        reverse_split_len = [
+            element 
+            for i in range(cp_size) 
+            for element in (
+                split_list[i], 
+                split_list[cp_size * 2 - i - 1]
+            )
+        ]
+        cp_input_dict.update({"reverse_split_len": reverse_split_len})
+        # get zigzag reverse index
+        cp_reverse_index = []
+        for batch_id in range(bs_per_cp_group):
+            cp_reverse_index.extend(
+                list(range(batch_id, cp_segment_num * bs_per_cp_group, 2 * bs_per_cp_group)) +\
+                list(range((cp_segment_num - 1) * bs_per_cp_group + batch_id, 0, -2 * bs_per_cp_group))
+                )
+        cp_input_dict.update({"cp_reverse_index": cp_reverse_index})
+        prefix_sum_list = list(accumulate(split_list))
+        
+        cp_input_dict.update({"kv_len_prev": prefix_sum_list[cp_rank]})
+        cp_input_dict.update({"kv_len_next": prefix_sum_list[cp_size * 2 - cp_rank - 1]})
+        cp_input_dict.update({"actual_seq_q_prev": split_list[cp_rank]})
+        cp_input_dict.update({"actual_seq_q_next": split_list[cp_size * 2 - cp_rank - 1]})
+        cp_input_dict.update({"toatl_seq_lens": kv_len_origin})
+        logger.info(f"SGLANG_USE_DP_CP_AG_AFTER_DSA is ture, prepare_input_cp_nsa: cp_input_dict: {cp_input_dict}")
+        return cp_input_dict

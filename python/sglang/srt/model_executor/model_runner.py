@@ -255,6 +255,7 @@ class ModelRunner:
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
     ):
         # Parse args
+        logger.info(f"=====ModelRunner=====================server_args.dp_size: {server_args.dp_size}====")
         self.mem_fraction_static = mem_fraction_static
         self.device = server_args.device
         self.gpu_id = gpu_id

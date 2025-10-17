@@ -64,6 +64,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
     is_dp_attention_enabled,
+    attn_tp_all_gather_reorgan_into_tensor,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -107,7 +108,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch, 
+    PPProxyTensors, 
+    ForwardMode)
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.single_batch_overlap import SboFlags
@@ -137,6 +141,7 @@ from sglang.srt.utils import (
     log_info_on_rank0,
     make_layers,
     use_intel_amx_backend,
+    prepare_input_dp_with_cp_dsa,
 )
 
 _is_hip = is_hip()
@@ -480,25 +485,27 @@ class MoEGate(nn.Module):
                 None,  # bias
                 True,  # is_vnni
             )
-
-        # NOTE: For some unknown reason, router_gemm seems degrade accept length.
-        if (
-            _is_cuda
-            and hidden_states.shape[0] <= 16
-            and hidden_states.shape[1] == 7168
-            and (self.weight.shape[0] == 256 or self.weight.shape[0] == 384)
-            and _device_sm >= 90
-        ):
-            # router gemm output float32
-            logits = dsv3_router_gemm(
-                hidden_states, self.weight, out_dtype=torch.float32
-            )
-        elif _use_aiter_gfx95 and hidden_states.shape[0] <= 256:
-            logits = aiter_dsv3_router_gemm(
-                hidden_states, self.weight, gemm_output_zero_allocator
-            )
-        else:
+        if get_bool_env_var("SGLANG_USE_DP_CP_AG_AFTER_DSA"):
             logits = F.linear(hidden_states, self.weight, None)
+        else:
+            # NOTE: For some unknown reason, router_gemm seems degrade accept length.
+            if (
+                _is_cuda
+                and hidden_states.shape[0] <= 16
+                and hidden_states.shape[1] == 7168
+                and (self.weight.shape[0] == 256 or self.weight.shape[0] == 384)
+                and _device_sm >= 90
+            ):
+                # router gemm output float32
+                logits = dsv3_router_gemm(
+                    hidden_states, self.weight, out_dtype=torch.float32
+                )
+            elif _use_aiter_gfx95 and hidden_states.shape[0] <= 256:
+                logits = aiter_dsv3_router_gemm(
+                    hidden_states, self.weight, gemm_output_zero_allocator
+                )
+            else:
+                logits = F.linear(hidden_states, self.weight, None)
 
         return logits
 
@@ -1030,13 +1037,19 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.kv_lora_rank = kv_lora_rank
         attn_tp_rank = get_attention_tp_rank()
         attn_tp_size = get_attention_tp_size()
-
+        self.use_nsa = is_deepseek_nsa(config)
+        self.use_dp_cp_ag_after_qlora = get_bool_env_var("SGLANG_USE_DP_CP_AG_AFTER_DSA")
+        if self.use_dp_cp_ag_after_qlora and self.use_nsa:
+            attn_tp_rank = 0
+            attn_tp_size = 1
         self.num_heads = num_heads
         assert num_heads % attn_tp_size == 0
         self.num_local_heads = num_heads // attn_tp_size
         self.scaling = self.qk_head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
+        self.cp_size = get_attention_tp_size()
+        self.cp_input_dict = None
 
         # NOTE modification to rope_scaling must be done early enough, b/c e.g. Indexer needs it
         if rope_scaling:
@@ -1079,7 +1092,6 @@ class DeepseekV2AttentionMLA(nn.Module):
                 prefix=add_prefix("kv_a_proj_with_mqa", prefix),
             )
 
-        self.use_nsa = is_deepseek_nsa(config)
         if self.use_nsa:
             self.indexer = Indexer(
                 hidden_size=hidden_size,
@@ -1292,7 +1304,9 @@ class DeepseekV2AttentionMLA(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
+        cp_input_dict: Optional[Dict] = None,
     ):
+        self.cp_input_dict = cp_input_dict
         s = self.forward_prepare(
             positions=positions,
             hidden_states=hidden_states,
@@ -1596,11 +1610,33 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         q_nope_out = q_nope_out.transpose(0, 1)
 
+        if self.cp_input_dict is not None and self.use_nsa and \
+            forward_batch.forward_mode.is_extend():
+            position_id_list = list(torch.split(positions, self.cp_input_dict["split_list"], dim=-1))
+            positions = torch.cat(
+                [position_id_list[i] for i in self.cp_input_dict["zigzag_index"]], dim=-1
+            )
         if not self._fuse_rope_for_trtllm_mla(forward_batch) and (
             not _use_aiter or not _is_gfx95_supported or self.use_nsa
         ):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
+        if self.cp_input_dict is not None and self.use_nsa and \
+            forward_batch.forward_mode.is_extend():
+            # support allgather+rerrange
+            latent_cache[..., : self.kv_lora_rank] = k_nope.squeeze(1)
+            latent_cache[..., self.kv_lora_rank :] = k_pe.squeeze(1)
+            k_seq_len, k_np_pe_dim = latent_cache.shape
+            kv_all = attn_tp_all_gather_reorgan_into_tensor(latent_cache.contiguous(), 
+                                        self.cp_input_dict["toatl_seq_lens"], 
+                                        self.cp_size, 
+                                        self.cp_input_dict)
+            outputs_list = torch.split(kv_all, self.cp_input_dict["reverse_split_len"], dim=0)
+            latent_cache = torch.cat(
+                [outputs_list[i] for i in self.cp_input_dict["cp_reverse_index"]], dim=0
+            ).view(-1, k_np_pe_dim)
+            k_nope = latent_cache[..., : self.kv_lora_rank].unsqueeze(1)
+            k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1) 
         topk_indices = None
         if q_lora is not None:
             topk_indices = self.indexer(
@@ -1609,6 +1645,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 positions=positions,
                 forward_batch=forward_batch,
                 layer_id=self.layer_id,
+                cp_input_dict=self.cp_input_dict,
             )
 
         return (
@@ -2419,6 +2456,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 mlp_tp_rank, mlp_tp_size = 0, 1
             else:
                 mlp_tp_rank, mlp_tp_size = None, None
+            # mlp_tp_rank, mlp_tp_size = 0, 1
             self.mlp = DeepseekV2MLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
@@ -2459,6 +2497,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
         gemm_output_zero_allocator: BumpAllocator = None,
+        cp_input_dict: Optional[Dict] = None,
     ) -> torch.Tensor:
         quant_format = (
             "mxfp4"
@@ -2482,6 +2521,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             zero_allocator=zero_allocator,
+            cp_input_dict=cp_input_dict,
         )
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
@@ -2509,9 +2549,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             use_reduce_scatter,
             gemm_output_zero_allocator,
         )
-
-        if should_allreduce_fusion:
-            hidden_states._sglang_needs_allreduce_fusion = True
+        
+        # if should_allreduce_fusion:
+        #     hidden_states._sglang_needs_allreduce_fusion = True
 
         if not should_allreduce_fusion:
             hidden_states, residual = self.layer_communicator.postprocess_layer(
@@ -2605,6 +2645,7 @@ class DeepseekV2Model(nn.Module):
         self.vocab_size = config.vocab_size
         self.first_k_dense_replace = config.first_k_dense_replace
         self.pp_group = get_pp_group()
+        self.cp_size = get_attention_tp_size()
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -2699,6 +2740,7 @@ class DeepseekV2Model(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        cp_input_dict: Optional[Dict] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
         total_num_layers = self.end_layer - self.start_layer
         device = input_embeds.device if input_embeds is not None else input_ids.device
@@ -2733,6 +2775,11 @@ class DeepseekV2Model(nn.Module):
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
+        if cp_input_dict is not None and forward_batch.forward_mode.is_extend():
+            hidden_states_list = list(torch.split(hidden_states, cp_input_dict["split_list"], dim=0))
+            hidden_states = torch.cat(
+                [hidden_states_list[i] for i in cp_input_dict["zigzag_index"]], dim=0
+            ).view(-1, hidden_states.shape[-1])
 
         normal_start_layer = self.start_layer
         normal_end_layer = self.end_layer
@@ -2755,6 +2802,7 @@ class DeepseekV2Model(nn.Module):
                     residual,
                     zero_allocator,
                     gemm_output_zero_allocator,
+                    cp_input_dict=cp_input_dict,
                 )
 
         if normal_end_layer != self.end_layer:
@@ -2784,6 +2832,16 @@ class DeepseekV2Model(nn.Module):
                     hidden_states = self.norm(hidden_states)
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
+        if cp_input_dict is not None and forward_batch.forward_mode.is_extend():
+            # allgather + rerrange
+            bs_seq_len, hidden_size = hidden_states.shape
+            hidden_states = attn_tp_all_gather_reorgan_into_tensor(hidden_states, 
+                                                            cp_input_dict["toatl_seq_lens"], 
+                                                            self.cp_size, 
+                                                            cp_input_dict)
+            outputs_list = list(torch.split(hidden_states, cp_input_dict["reverse_split_len"], dim=0))
+            hidden_states = torch.cat([outputs_list[i] for i in cp_input_dict["cp_reverse_index"]], dim=0)
+            hidden_states = hidden_states.view(-1, hidden_size)
         return hidden_states
 
 
@@ -2815,6 +2873,9 @@ class DeepseekV2ForCausalLM(nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
         self.determine_num_fused_shared_experts()
+        self.cp_rank = get_attention_tp_rank()
+        self.cp_size = get_attention_tp_size()
+        self.use_nsa = is_deepseek_nsa(config)
         self.model = DeepseekV2Model(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
@@ -2834,6 +2895,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                 if isinstance(layer.mlp, DeepseekV2MoE)
             }
         )
+        self.use_dp_cp_ag_after_qlora = get_bool_env_var("SGLANG_USE_DP_CP_AG_AFTER_DSA")
 
     @property
     def routed_experts_weights_of_layer(self):
@@ -2884,8 +2946,19 @@ class DeepseekV2ForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+        cp_input_dict = None
+        # TODO current just support prefill batch=1 and len(input_ids) > self.cp_size * 2
+        cur_cp_seq_len = len(input_ids) // (self.cp_size * 2)
+        if (cur_cp_seq_len != 0) and self.cp_size > 1 and \
+            self.use_nsa and self.use_dp_cp_ag_after_qlora and \
+            forward_batch.forward_mode.is_extend():
+            cp_input_dict = prepare_input_dp_with_cp_dsa(torch.tensor(len(input_ids)), 
+                                                         self.cp_rank, 
+                                                         self.cp_size)
+        
         hidden_states = self.model(
-            input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
+            input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors,
+            cp_input_dict=cp_input_dict,
         )
 
         if self.pp_group.is_last_rank:
