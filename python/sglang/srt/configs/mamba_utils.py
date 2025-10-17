@@ -70,7 +70,7 @@ class Mamba2StateShape:
 
         # These are not TP-ed as they depend on A, dt_bias, D
         # - they are typically small
-        #   e.g., (h_heads, head_dim, state_size) = (128, 64, 128)
+        #   e.g., QWen3-Next: (32, 128, 128)
         temporal_state_shape = (divide(num_heads, tp_world_size), head_dim, state_size)
         return Mamba2StateShape(
             conv=conv_state_shape,
