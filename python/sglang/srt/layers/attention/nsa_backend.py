@@ -522,6 +522,7 @@ class NativeSparseAttnBackend(AttentionBackend):
             )
 
         # Do absorbed multi-latent attention (MLA path)
+        assert q_rope is not None
         kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
 
         # when store in fp8 and compute in fp8, no need to convert dtype
@@ -540,8 +541,7 @@ class NativeSparseAttnBackend(AttentionBackend):
             q_nope = q_all[:, :, : layer.v_head_dim]
             q_rope = q_all[:, :, layer.v_head_dim :]
 
-        # MLA path: topk_indices should always be provided
-        assert topk_indices is not None, "MLA path requires topk_indices from Indexer"
+        # NOTE(dark): here, we use page size = 1
 
         if NSA_FUSE_TOPK:
             page_table_1 = topk_indices
