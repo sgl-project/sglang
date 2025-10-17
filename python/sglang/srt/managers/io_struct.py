@@ -1077,6 +1077,22 @@ class InitWeightsSendGroupForRemoteInstanceReqInput(BaseReq):
 
 
 @dataclass
+class UpdateWeightsFromIPCReqInput(BaseReq):
+    # ZMQ socket paths for each device UUID
+    zmq_handles: Dict[str, str]
+    # Whether to flush cache after weight update
+    flush_cache: bool = True
+    # Optional: Update weight version along with weights
+    weight_version: Optional[str] = None
+
+
+@dataclass
+class UpdateWeightsFromIPCReqOutput(BaseReq):
+    success: bool
+    message: str
+
+
+@dataclass
 class InitWeightsSendGroupForRemoteInstanceReqOutput(BaseReq):
     success: bool
     message: str
