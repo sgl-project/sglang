@@ -168,6 +168,7 @@ class SchedulerProfilerMixin:
 
         if "CUDA_PROFILER" in activities:
             torch.cuda.cudart().cudaProfilerStart()
+            torch.autograd.profiler.emit_nvtx(record_shapes=True).__enter__()
             self.profile_in_progress = True
 
         return ProfileReqOutput(success=True, message="Succeeded")
@@ -264,6 +265,7 @@ class SchedulerProfilerMixin:
 
         if "CUDA_PROFILER" in self.profiler_activities:
             torch.cuda.cudart().cudaProfilerStop()
+            torch.autograd.profiler.emit_nvtx().__exit__(None, None, None)
 
         merge_message = self._merge_profile_traces()
 
