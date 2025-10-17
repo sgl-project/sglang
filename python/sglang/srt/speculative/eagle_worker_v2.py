@@ -84,8 +84,8 @@ class EagleDraftWorker(BaseDraftWorker):
             server_args.speculative_algorithm
         )
 
-        # Do not capture cuda graph in `super().__init__()`
-        # It will be captured later.
+        # Do not capture cuda graph in `TpModelWorker` init,
+        # will capture later with init_cuda_graphs()
         backup_disable_cuda_graph = server_args.disable_cuda_graph
         server_args.disable_cuda_graph = True
 
