@@ -53,7 +53,6 @@ from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
     get_bool_env_var,
-    get_device_memory_capacity,
     is_hip,
     log_info_on_rank0,
     require_attn_tp_gather,
@@ -274,7 +273,6 @@ class CudaGraphRunner:
             self.model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
         )
 
-        # FIXME(lsyin): leave it here for now, I don't know whether it is necessary
         self.encoder_len_fill_value = 0
         self.seq_lens_cpu = torch.full(
             (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32

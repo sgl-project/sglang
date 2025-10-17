@@ -40,7 +40,11 @@ class EAGLEDraftCudaGraphRunner:
     def __init__(self, eagle_worker: EAGLEWorker):
         # Parse args
         self.eagle_worker = eagle_worker
-        self.model_runner = model_runner = eagle_worker.model_runner
+        if not hasattr(eagle_worker, "model_runner"):
+            # V2: EagleDraftWorker
+            self.model_runner = model_runner = eagle_worker.draft_runner
+        else:
+            self.model_runner = model_runner = eagle_worker.model_runner
         self.graphs = {}
         self.output_buffers = {}
         self.enable_torch_compile = model_runner.server_args.enable_torch_compile

@@ -147,7 +147,7 @@ curl -X POST http://localhost:30000/workers \
       }'
 
 # Inspect registered workers
-curl http://localhost:30000/workers | jq
+curl http://localhost:30000/workers
 ```
 Sample response (http workers):
 ```json
@@ -194,13 +194,11 @@ Route requests to OpenAI or OpenAI-compatible endpoints:
 python3 -m sglang_router.launch_router \
   --backend openai \
   --worker-urls https://api.openai.com \
-  --api-key "$OPENAI_API_KEY"
 
 # Route to custom OpenAI-compatible endpoint (Gemini, xAI, etc.)
 python3 -m sglang_router.launch_router \
   --backend openai \
   --worker-urls http://my-openai-compatible-service:8000 \
-  --api-key "tenant-api-key"
 ```
 
 **Notes**
@@ -218,7 +216,7 @@ Add flags as needed for production deployments:
 python3 -m sglang_router.launch_server \
   --host 0.0.0.0 \
   --port 8080 \
-  --model /raid/models/meta-llama/Llama-3.1-8B-Instruct \
+  --model meta-llama/Llama-3.1-8B-Instruct \
   --tp-size 1 \
   --dp-size 8 \
   --grpc-mode
@@ -240,7 +238,7 @@ Use upstream SGLang binaries to start dedicated worker processes.
 - **Prefill worker server (gRPC mode)**:
   ```bash
   python3 -m sglang.launch_server \
-    --model /raid/models/meta-llama/Llama-3.1-8B-Instruct \
+    --model meta-llama/Llama-3.1-8B-Instruct \
     --port 20000 \
     --tp-size 1 \
     --grpc-mode
@@ -312,7 +310,7 @@ The HTTP router exposes the full OpenAI-compatible surface area (`/generate`, `/
 ### OpenAI Router
 - Proxies OpenAI-compatible chat completions and responses APIs, preserving headers and SSE streams end-to-end.
 - Supports `/v1/responses` background jobs with cancellation, deletion, and listing input items—enabling agentic, multi-turn orchestration without persisting data at remote vendor endpoints.
-- Conversation APIs (`/v1/conversations` and `/items`) interact with the configured conversation storage backend for compliant chat-history management. Conversation state lives at the router tier, so the same history can drive different models or MCP loops without leaking data to upstream vendors.
+- Conversation APIs (`/v1/conversations` and `/v1/conversations/{id}/items`) interact with the configured conversation storage backend for compliant chat-history management. Conversation state lives at the router tier, so the same history can drive different models or MCP loops without leaking data to upstream vendors.
 - Chat history, agentic multi-turn `/v1/responses`, and the native MCP client (STDIO/HTTP/SSE/Streamable transports) are designed to satisfy enterprise data-privacy requirements by keeping sensitive state within the router.
 
 ### Request Endpoints
@@ -323,10 +321,7 @@ The HTTP router exposes the full OpenAI-compatible surface area (`/generate`, `/
 | `POST /v1/completions`                                                           | OpenAI-compatible text completions.                        |
 | `POST /v1/responses`                                                             | Create background responses, returns response IDs.         |
 | `GET /v1/responses/{id}`                                                         | Retrieve stored responses.                                 |
-| `POST /v1/responses/{id}/cancel`                                                 | Cancel in-flight background jobs.                          |
-| `DELETE /v1/responses/{id}`                                                      | Delete stored response.                                    |
-| `GET /v1/responses/{id}/input`                                                   | List captured input items.                                 |
-| Conversation endpoints (`/v1/conversations`, `/v1/conversations/{id}`, `/items`) | Manage chat history.                                       |
+| Conversation endpoints (`/v1/conversations`, `/v1/conversations/{id}`, `/v1/conversations/{id}/items`) | Manage chat history.                                       |
 | `POST /v1/embeddings`                                                            | Forward embedding requests.                                |
 | `POST /v1/rerank`, `POST /rerank`                                                | Ranking APIs.                                              |
 

@@ -9,7 +9,8 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.schedule_batch import ModelWorkerBatch
+from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
+from sglang.srt.mem_cache.common import alloc_token_slots
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -72,6 +73,34 @@ def assign_draft_cache_locs_page_size_1(
 
 @dataclass
 class EagleDraftInputV2Mixin:
+    def prepare_for_decode(self: EagleDraftInput, batch: ScheduleBatch):
+        from sglang.srt.speculative.spec_utils import assign_req_to_token_pool
+
+        bs = batch.batch_size()
+
+        # TODO(lsyin): implement over-allocation
+        # Now seq_lens and allocate_lens are correct
+        batch.maybe_wait_verify_done()
+
+        new_allocate_lens = batch.seq_lens + self.ALLOC_LEN_PER_DECODE
+        num_needed_tokens = (new_allocate_lens - self.allocate_lens).sum().item()
+        out_cache_loc = alloc_token_slots(batch.tree_cache, num_needed_tokens)
+
+        assign_req_to_token_pool[(bs,)](
+            batch.req_pool_indices,
+            batch.req_to_token_pool.req_to_token,
+            self.allocate_lens,
+            new_allocate_lens,
+            out_cache_loc,
+            batch.req_to_token_pool.req_to_token.shape[1],
+            next_power_of_2(bs),
+        )
+        self.allocate_lens = new_allocate_lens
+
+        # FIXME(lsyin): make this sync optional
+        batch.seq_lens_cpu = batch.seq_lens.cpu()
+        batch.seq_lens_sum = batch.seq_lens_cpu.sum().item()
+
     def prepare_for_v2_draft(
         self: EagleDraftInput,
         req_to_token_pool: ReqToTokenPool,
@@ -114,7 +143,7 @@ class EagleDraftInputV2Mixin:
         num_draft_tokens: int,
         draft_model_runner: Any,
     ):
-        seq_lens_cpu_backup = batch.seq_lens_cpu
+        seq_lens_cpu_ = batch.seq_lens_cpu
         extend_num_tokens = len(batch.seq_lens) * num_draft_tokens
 
         batch.spec_info = self
@@ -123,8 +152,7 @@ class EagleDraftInputV2Mixin:
         batch.seq_lens_cpu = batch.seq_lens_cpu + num_draft_tokens
         batch.seq_lens_sum += extend_num_tokens
         batch.extend_seq_lens = [num_draft_tokens for _ in range(len(batch.seq_lens))]
-        batch.extend_prefix_lens = seq_lens_cpu_backup.tolist()
-        batch.extend_prefix_lens_cpu = seq_lens_cpu_backup
+        batch.extend_prefix_lens = seq_lens_cpu_.tolist()
         batch.extend_num_tokens = extend_num_tokens
         batch.capture_hidden_mode = CaptureHiddenMode.FULL
         batch.forward_mode = ForwardMode.DRAFT_EXTEND_V2

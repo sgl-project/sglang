@@ -38,7 +38,12 @@ class EAGLEDraftExtendCudaGraphRunner:
     def __init__(self, eagle_worker: EAGLEWorker):
         # Parse args
         self.eagle_worker = eagle_worker
-        self.model_runner = model_runner = eagle_worker.model_runner
+        if not hasattr(eagle_worker, "model_runner"):
+            # V2: EagleDraftWorker
+            self.model_runner = model_runner = eagle_worker.draft_runner
+        else:
+            self.model_runner = model_runner = eagle_worker.model_runner
+
         self.graphs = {}
         self.output_buffers = {}
         self.enable_torch_compile = model_runner.server_args.enable_torch_compile
@@ -285,7 +290,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             output_cache_loc_backup = forward_batch.out_cache_loc
             hidden_states_backup = forward_batch.spec_info.hidden_states
 
-            ret = self.eagle_worker.draft_model_runner.model.forward(
+            ret = self.model_runner.model.forward(
                 forward_batch.input_ids,
                 forward_batch.positions,
                 forward_batch,

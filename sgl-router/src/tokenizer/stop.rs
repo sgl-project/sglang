@@ -149,29 +149,45 @@ impl StopSequenceDecoder {
 
         // Check for partial matches: is the end of jail_buffer the start of any stop_seq?
         // This handles stop sequences split across tokens
-        let mut longest_partial = 0;
+        let buffer_len = self.jail_buffer.len();
+        let mut best_split_pos: Option<usize> = None;
+
         for stop_seq in self
             .config
             .stop_sequences
             .iter()
             .chain(&self.config.visible_stop_sequences)
         {
-            // Check suffixes of jail_buffer that match prefixes of stop_seq
-            // We check up to stop_seq.len() - 1 to avoid rechecking exact matches
-            let max_len = self.jail_buffer.len().min(stop_seq.len() - 1);
-            for len in 1..=max_len {
-                let suffix = &self.jail_buffer[self.jail_buffer.len() - len..];
-                if stop_seq.starts_with(suffix) {
-                    longest_partial = longest_partial.max(len);
+            let stop_len = stop_seq.len();
+
+            if stop_len <= 1 || buffer_len == 0 {
+                continue;
+            }
+
+            let max_len = buffer_len.min(stop_len - 1);
+
+            for len in (1..=max_len).rev() {
+                let suffix_start = buffer_len - len;
+
+                if !self.jail_buffer.is_char_boundary(suffix_start) {
+                    continue;
+                }
+
+                let suffix = &self.jail_buffer[suffix_start..];
+
+                if stop_seq.starts_with(suffix)
+                    && best_split_pos.is_none_or(|current| suffix_start < current)
+                {
+                    best_split_pos = Some(suffix_start);
+                    break;
                 }
             }
         }
 
-        if longest_partial > 0 {
+        if let Some(split_pos) = best_split_pos {
             // Hold the partial match, flush the rest
-            let split_pos = self.jail_buffer.len() - longest_partial;
-            let to_output = self.jail_buffer[..split_pos].to_string();
-            self.jail_buffer = self.jail_buffer[split_pos..].to_string();
+            // Drain [0..split_pos] as output, keep [split_pos..] in jail_buffer
+            let to_output = self.jail_buffer.drain(..split_pos).collect::<String>();
 
             if to_output.is_empty() {
                 Ok(SequenceDecoderOutput::Held)
@@ -455,6 +471,136 @@ mod tests {
                 result,
                 SequenceDecoderOutput::Text(_) | SequenceDecoderOutput::Held
             ));
+        }
+    }
+
+    #[test]
+    fn test_utf8_multibyte_character_boundaries() {
+        // This test verifies the fix for the UTF-8 boundary panic
+        // The panic occurred when trying to slice jail_buffer at a byte index
+        // that was in the middle of a multi-byte UTF-8 character (e.g., '×')
+        use crate::tokenizer::mock::MockTokenizer;
+
+        let tokenizer = Arc::new(MockTokenizer::new());
+
+        // Configure stop sequence with a multi-byte character
+        let config = StopSequenceConfig::default().with_stop_sequence(" ×");
+
+        let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
+
+        // Simulate the scenario: jail_buffer will contain " ×" (space + multiplication sign)
+        // The '×' character is UTF-8 encoded as bytes [0xC3, 0x97] (2 bytes)
+        // When checking for partial matches, we must not slice in the middle of these bytes
+
+        // This should not panic - the fix ensures we only slice at char boundaries
+        let result = decoder.process_token(1); // Will add some text to jail_buffer
+        assert!(result.is_ok());
+
+        // Even with multi-byte UTF-8 characters in the buffer, processing should work
+        let result = decoder.process_token(2);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_utf8_multibyte_delta_character() {
+        // Test for: byte index 1 is not a char boundary; it is inside 'Δ' (bytes 0..2) of `Δ`
+        // 'Δ' (U+0394 GREEK CAPITAL LETTER DELTA) is encoded as [0xCE, 0x94] (2 bytes)
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let config = StopSequenceConfig::default().with_stop_sequence("Δ");
+
+        let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
+
+        // Process tokens - should not panic when checking partial matches
+        let result = decoder.process_token(1);
+        assert!(result.is_ok());
+        let result = decoder.process_token(2);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_utf8_multibyte_degree_character() {
+        // Test for: byte index 1 is not a char boundary; it is inside '°' (bytes 0..2) of `°`
+        // '°' (U+00B0 DEGREE SIGN) is encoded as [0xC2, 0xB0] (2 bytes)
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let config = StopSequenceConfig::default().with_stop_sequence("°");
+
+        let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
+
+        // Process tokens - should not panic when checking partial matches
+        let result = decoder.process_token(1);
+        assert!(result.is_ok());
+        let result = decoder.process_token(2);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_utf8_multibyte_triangle_character() {
+        // Test for: byte index 4 is not a char boundary; it is inside '∆' (bytes 2..5) of ` (∆`
+        // '∆' (U+2206 INCREMENT) is encoded as [0xE2, 0x88, 0x86] (3 bytes)
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let config = StopSequenceConfig::default().with_stop_sequence(" (∆");
+
+        let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
+
+        // Process tokens - should not panic when checking partial matches
+        let result = decoder.process_token(1);
+        assert!(result.is_ok());
+        let result = decoder.process_token(2);
+        assert!(result.is_ok());
+        let result = decoder.process_token(3);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_utf8_multibyte_en_dash_character() {
+        // Test for: byte index 3 is not a char boundary; it is inside '–' (bytes 1..4) of ` –`
+        // '–' (U+2013 EN DASH) is encoded as [0xE2, 0x80, 0x93] (3 bytes)
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let config = StopSequenceConfig::default().with_stop_sequence(" –");
+
+        let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
+
+        // Process tokens - should not panic when checking partial matches
+        let result = decoder.process_token(1);
+        assert!(result.is_ok());
+        let result = decoder.process_token(2);
+        assert!(result.is_ok());
+        let result = decoder.process_token(3);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_utf8_multibyte_various_characters() {
+        // Comprehensive test with multiple multi-byte UTF-8 characters
+        // Tests 2-byte, 3-byte, and 4-byte UTF-8 sequences
+        let test_cases = vec![
+            ("×", "multiplication sign - 2 bytes"),
+            ("Δ", "Greek Delta - 2 bytes"),
+            ("°", "degree sign - 2 bytes"),
+            ("∆", "increment - 3 bytes"),
+            ("–", "en dash - 3 bytes"),
+            ("€", "euro sign - 3 bytes"),
+            ("中", "Chinese character - 3 bytes"),
+            ("🚀", "rocket emoji - 4 bytes"),
+            ("💡", "lightbulb emoji - 4 bytes"),
+        ];
+
+        for (stop_char, description) in test_cases {
+            let tokenizer = Arc::new(MockTokenizer::new());
+            let config = StopSequenceConfig::default().with_stop_sequence(stop_char);
+
+            let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
+
+            // Process multiple tokens - should not panic
+            for token_id in 1..=5 {
+                let result = decoder.process_token(token_id);
+                assert!(
+                    result.is_ok(),
+                    "Failed on {} with token {}",
+                    description,
+                    token_id
+                );
+            }
         }
     }
 }
