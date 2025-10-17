@@ -88,6 +88,7 @@ from torch.profiler import ProfilerActivity, profile, record_function
 from torch.utils._contextlib import _DecoratorContextManager
 from typing_extensions import Literal
 
+from sglang.srt.environ import envs
 from sglang.srt.metrics.func_timer import enable_func_timer
 
 logger = logging.getLogger(__name__)
@@ -3272,6 +3273,11 @@ def json_list_type(value):
 
 @contextmanager
 def temp_set_cuda_visible_devices(gpu_id: int):
+
+    if envs.SGLANG_ONE_GPU_PER_PROCESS.get() is False:
+        yield
+        return
+
     original_cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
     if original_cuda_visible_devices:
         cuda_visible_devices = original_cuda_visible_devices.split(",")
