@@ -845,6 +845,7 @@ class NativeSparseAttnBackend(AttentionBackend):
             )
 
         # Do absorbed multi-latent attention (MLA path)
+        assert q_rope is not None
         kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
 
         # when store in fp8 and compute in fp8, no need to convert dtype
