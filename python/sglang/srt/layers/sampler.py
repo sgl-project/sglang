@@ -27,7 +27,7 @@ if is_cuda():
 logger = logging.getLogger(__name__)
 
 SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
-RETURN_ORIGINAL_LOGPROB = get_bool_env_var("RETURN_ORIGINAL_LOGPROB")
+SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
 
 
 class Sampler(nn.Module):
@@ -92,8 +92,14 @@ class Sampler(nn.Module):
             if return_logprob:
                 logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
         else:
+            can_sample_directly_from_probs = (
+                not sampling_info.need_top_p_sampling
+                and not sampling_info.need_top_k_sampling
+                and not sampling_info.need_min_p_sampling
+            )
+
             # If requested, cache probabilities from original logits before temperature scaling.
-            if return_logprob and RETURN_ORIGINAL_LOGPROB:
+            if return_logprob and SGLANG_RETURN_ORIGINAL_LOGPROB:
                 probs_without_temp_scaling = torch.softmax(logits, dim=-1)
 
             # Post process logits
@@ -102,7 +108,14 @@ class Sampler(nn.Module):
             probs = logits
             del logits
 
-            if True:  # Keep this redundant check to simplify some internal code sync
+            if can_sample_directly_from_probs:
+                # when we don't need top-k, top-p, or min-p sampling, we can directly sample from the probs
+                batch_next_token_ids = sampling_from_probs_torch(
+                    probs,
+                    sampling_seed=sampling_info.sampling_seed,
+                    positions=positions,
+                )
+            else:
                 if get_global_server_args().sampling_backend == "flashinfer":
                     if sampling_info.need_min_p_sampling:
                         probs = top_k_renorm_prob(probs, sampling_info.top_ks)
@@ -136,7 +149,7 @@ class Sampler(nn.Module):
 
             if return_logprob:
                 # clamp to avoid -inf
-                if RETURN_ORIGINAL_LOGPROB:
+                if SGLANG_RETURN_ORIGINAL_LOGPROB:
                     logprobs = torch.log(probs_without_temp_scaling).clamp(
                         min=torch.finfo(probs_without_temp_scaling.dtype).min
                     )

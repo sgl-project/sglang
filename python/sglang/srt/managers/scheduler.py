@@ -148,7 +148,7 @@ from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
 from sglang.srt.speculative.eagle_info import EagleDraftInput
@@ -212,14 +212,13 @@ class GenerationBatchResult:
 
     # For overlap scheduling
     copy_done: Optional[torch.cuda.Event] = None
-    delay_sample_launch: bool = False
-    forward_batch: Optional[ForwardBatch] = None
+    delay_sample_func: Optional[callable] = None
     future_indices: Optional[FutureIndices] = None
 
-    # FIXME(lsyin): maybe move to <BetterPlace> ?
+    # FIXME(lsyin): maybe move to a better place?
     # sync path: forward stream -> output processor
     accept_lens: Optional[torch.Tensor] = None
-    last_batch_allocate_lens: Optional[torch.Tensor] = None
+    allocate_lens: Optional[torch.Tensor] = None
 
     # relay path: forward stream -> next step forward
     next_draft_input: Optional[EagleDraftInput] = None
@@ -247,10 +246,8 @@ class GenerationBatchResult:
         if self.accept_lens is not None:
             self.accept_lens = self.accept_lens.to("cpu", non_blocking=True)
 
-        if self.last_batch_allocate_lens is not None:
-            self.last_batch_allocate_lens = self.last_batch_allocate_lens.to(
-                "cpu", non_blocking=True
-            )
+        if self.allocate_lens is not None:
+            self.allocate_lens = self.allocate_lens.to("cpu", non_blocking=True)
 
         self.copy_done.record()
 
@@ -468,9 +465,7 @@ class Scheduler(
 
         # Hybrid memory pool
         self.is_hybrid = self.tp_worker.is_hybrid
-        self.is_hybrid_gdn = (
-            self.tp_worker.worker.model_runner.hybrid_gdn_config is not None
-        )
+        self.is_hybrid_gdn = self.tp_worker.model_runner.hybrid_gdn_config is not None
 
         if self.is_hybrid:
             self.sliding_window_size = self.tp_worker.sliding_window_size
@@ -660,6 +655,12 @@ class Scheduler(
     def launch_draft_worker(
         self, gpu_id, tp_rank, moe_ep_rank, server_args, port_args, dp_rank
     ):
+        if server_args.speculative_draft_load_format is not None:
+            server_args.load_format = server_args.speculative_draft_load_format
+            logger.info(
+                f"Using draft model load_format: '{server_args.speculative_draft_load_format}'"
+            )
+
         if self.spec_algorithm.is_eagle():
             from sglang.srt.speculative.eagle_worker import EAGLEWorker
             from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
@@ -807,9 +808,6 @@ class Scheduler(
                     self.tree_cache.cache_controller.layer_done_counter
                 )
             elif self.is_hybrid:
-                assert (
-                    self.server_args.disaggregation_mode == "null"
-                ), "Hybrid mode does not support disaggregation yet"
                 self.tree_cache = SWARadixCache(
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
@@ -819,9 +817,6 @@ class Scheduler(
                     is_eagle=self.spec_algorithm.is_eagle(),
                 )
             elif self.is_hybrid_gdn:
-                assert (
-                    self.server_args.disaggregation_mode == "null"
-                ), "Hybrid GDN mode does not support disaggregation yet"
                 self.tree_cache = MambaRadixCache(
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
@@ -1038,17 +1033,16 @@ class Scheduler(
         self.result_queue: Deque[Tuple[ScheduleBatch, GenerationBatchResult]] = deque()
 
         while True:
-            self.launch_last_batch_sample_if_needed()
-
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
 
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
 
+            batch_result = None
             if batch:
-                result = self.run_batch(batch)
-                self.result_queue.append((batch.copy(), result))
+                batch_result = self.run_batch(batch)
+                self.result_queue.append((batch.copy(), batch_result))
 
             if self.last_batch:
                 # Process the results of the last batch
@@ -1058,6 +1052,7 @@ class Scheduler(
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
 
+            self.launch_batch_sample_if_needed(batch_result)
             self.last_batch = batch
 
     @DynamicGradMode()
@@ -1882,7 +1877,7 @@ class Scheduler(
             chunked_req_to_exclude.add(self.chunked_req)
             self.tree_cache.cache_unfinished_req(self.chunked_req, chunked=True)
             # chunked request keeps its rid but will get a new req_pool_idx
-            if self.tp_worker.worker.model_runner.mambaish_config is not None:
+            if self.tp_worker.model_runner.mambaish_config is not None:
                 self.req_to_token_pool.free(
                     self.chunked_req.req_pool_idx, free_mamba_cache=False
                 )
@@ -2171,6 +2166,12 @@ class Scheduler(
         batch.prepare_for_decode()
         return batch
 
+    # placeholder for override
+    def update_cache_from_scheduler(
+        self, schedule_batch: ScheduleBatch, batch_result: GenerationBatchResult
+    ):
+        pass
+
     def run_batch(
         self, batch: ScheduleBatch
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
@@ -2209,8 +2210,6 @@ class Scheduler(
                 with self.forward_stream_ctx:
                     self.forward_stream.wait_stream(self.default_stream)
                     self.future_map.resolve_future(model_worker_batch)
-                    if batch.sampling_info.grammars is not None:
-                        model_worker_batch.delay_sample_launch = True
                     batch_result = self.model_worker.forward_batch_generation(
                         model_worker_batch
                     )
@@ -2218,7 +2217,7 @@ class Scheduler(
                     batch_result.copy_done = torch.get_device_module(
                         self.device
                     ).Event()
-                    if not model_worker_batch.delay_sample_launch:
+                    if batch_result.delay_sample_func is None:
                         self.future_map.store_to_map(future_indices, batch_result)
                         batch_result.copy_to_cpu()
                     else:
@@ -2249,6 +2248,7 @@ class Scheduler(
                     batch_or_worker_batch
                 )
                 future_indices_or_next_token_ids = batch_result.next_token_ids
+                self.update_cache_from_scheduler(batch, batch_result)
 
             # NOTE: future_indices_or_next_token_ids is used in ScheduleBatch,
             #       which can probably be replaced by future_indices later [TODO(lsyin)].
@@ -2282,29 +2282,20 @@ class Scheduler(
             ret = EmbeddingBatchResult(embeddings=embeddings)
         return ret
 
-    def launch_last_batch_sample_if_needed(
-        self,
+    def launch_batch_sample_if_needed(
+        self, batch_result: GenerationBatchResult
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
-        if len(self.result_queue) == 0:
-            return
-
-        tmp_batch, tmp_result = self.result_queue.popleft()
-
-        tmp_result: GenerationBatchResult
-        if not tmp_result.delay_sample_launch:
-            self.result_queue.appendleft((tmp_batch, tmp_result))
+        # TODO(lsyin): make the delayed sample a default behavior after
+        # unifying the forward_batch_generation interface (related to spec V2).
+        if batch_result is None or batch_result.delay_sample_func is None:
             return
 
         with self.forward_stream_ctx:
             self.forward_stream.wait_stream(self.default_stream)
-            tmp_result.next_token_ids = self.model_worker.model_runner.sample(
-                tmp_result.logits_output,
-                tmp_result.forward_batch,
-            )
-            future_indices = tmp_result.future_indices
-            self.future_map.store_to_map(future_indices, tmp_result)
-            tmp_result.copy_to_cpu()
-            self.result_queue.appendleft((tmp_batch, tmp_result))
+            _batch_result = batch_result.delay_sample_func()
+            assert _batch_result is batch_result
+            self.future_map.store_to_map(batch_result.future_indices, batch_result)
+            batch_result.copy_to_cpu()
 
     def process_batch_result(
         self,
@@ -2686,9 +2677,7 @@ class Scheduler(
         ret = vars(get_global_server_args())
         ret["last_gen_throughput"] = self.last_gen_throughput
         ret["memory_usage"] = {
-            "weight": round(
-                self.tp_worker.worker.model_runner.weight_load_mem_usage, 2
-            ),
+            "weight": round(self.tp_worker.model_runner.weight_load_mem_usage, 2),
             "kvcache": round(
                 self.token_to_kv_pool_allocator.get_kvcache().mem_usage, 2
             ),
@@ -2696,7 +2685,7 @@ class Scheduler(
         }
 
         ret["memory_usage"]["graph"] = round(
-            self.tp_worker.worker.model_runner.graph_mem_usage, 2
+            self.tp_worker.model_runner.graph_mem_usage, 2
         )
 
         if not self.spec_algorithm.is_none() and self.cum_spec_accept_count > 0:

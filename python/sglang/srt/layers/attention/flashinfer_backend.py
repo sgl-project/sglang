@@ -118,6 +118,7 @@ class FlashInferAttnBackend(AttentionBackend):
         skip_prefill: bool = False,
         kv_indptr_buf: Optional[torch.Tensor] = None,
         kv_last_page_len_buf: Optional[torch.Tensor] = None,
+        init_new_workspace: bool = False,
     ):
         super().__init__()
 
@@ -192,7 +193,14 @@ class FlashInferAttnBackend(AttentionBackend):
                 dtype=torch.uint8,
                 device=model_runner.device,
             )
-        self.workspace_buffer = global_workspace_buffer
+        if init_new_workspace:
+            self.workspace_buffer = torch.empty(
+                global_config.flashinfer_workspace_size,
+                dtype=torch.uint8,
+                device=model_runner.device,
+            )
+        else:
+            self.workspace_buffer = global_workspace_buffer
         max_bs = model_runner.req_to_token_pool.size
         if kv_indptr_buf is None:
             self.kv_indptr = [
@@ -1405,7 +1413,7 @@ class FlashInferMultiStepDraftBackend:
             (max_bs,), dtype=torch.int32, device=model_runner.device
         )
         self.attn_backends: List[FlashInferAttnBackend] = []
-        for i in range(self.speculative_num_steps):
+        for i in range(self.speculative_num_steps - 1):
             self.attn_backends.append(
                 FlashInferAttnBackend(
                     model_runner,
@@ -1493,7 +1501,7 @@ class FlashInferMultiStepDraftBackend:
             device="cuda",
         )
 
-        for i in range(self.speculative_num_steps):
+        for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_cuda_graph_state(
                 max_bs, max_num_tokens, kv_indices_buf=self.cuda_graph_kv_indices[i]
             )

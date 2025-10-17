@@ -1,13 +1,16 @@
 mod common;
 
+use std::sync::Arc;
+
 use common::mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType};
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde_json::json;
-use sglang_router_rs::config::{RouterConfig, RoutingMode};
-use sglang_router_rs::core::WorkerManager;
-use sglang_router_rs::routers::{RouterFactory, RouterTrait};
-use std::sync::Arc;
+use sglang_router_rs::{
+    config::{RouterConfig, RoutingMode},
+    core::WorkerManager,
+    routers::{RouterFactory, RouterTrait},
+};
 
 /// Test context that manages mock workers
 struct TestContext {
@@ -19,6 +22,7 @@ struct TestContext {
 impl TestContext {
     async fn new(worker_configs: Vec<MockWorkerConfig>) -> Self {
         let mut config = RouterConfig {
+            chat_template: None,
             mode: RoutingMode::Regular {
                 worker_urls: vec![],
             },
