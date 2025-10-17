@@ -33,15 +33,7 @@ class DraftBackendFactory:
 
     def create_decode_backend(self):
         if self.speculative_num_steps == 1:
-
-            class DummyAttnBackend:
-                def __init__(self):
-                    pass
-
-                def init_forward_metadata(*args, **kwargs):
-                    pass
-
-            return DummyAttnBackend()
+            return None
 
         backend_map = {
             "flashinfer": self._create_flashinfer_decode_backend,
@@ -96,7 +88,6 @@ class DraftBackendFactory:
                 FlashInferMultiStepDraftBackend,
             )
 
-            self.has_prefill_wrapper_verify = True
             return FlashInferMultiStepDraftBackend(
                 self.draft_model_runner, self.topk, self.speculative_num_steps
             )
@@ -105,7 +96,6 @@ class DraftBackendFactory:
                 FlashInferMLAMultiStepDraftBackend,
             )
 
-            self.has_prefill_wrapper_verify = True
             return FlashInferMLAMultiStepDraftBackend(
                 self.draft_model_runner, self.topk, self.speculative_num_steps
             )
@@ -149,7 +139,6 @@ class DraftBackendFactory:
             TRTLLMHAAttnMultiStepDraftBackend,
         )
 
-        self.has_prefill_wrapper_verify = True
         return TRTLLMHAAttnMultiStepDraftBackend(
             self.draft_model_runner, self.topk, self.speculative_num_steps
         )
@@ -164,7 +153,6 @@ class DraftBackendFactory:
             TRTLLMMLAMultiStepDraftBackend,
         )
 
-        self.has_prefill_wrapper_verify = True
         return TRTLLMMLAMultiStepDraftBackend(
             self.draft_model_runner, self.topk, self.speculative_num_steps
         )

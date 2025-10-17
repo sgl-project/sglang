@@ -3,31 +3,34 @@
 //! Handles all aspects of worker lifecycle including discovery, initialization,
 //! runtime management, and health monitoring.
 
-use crate::config::types::{
-    CircuitBreakerConfig as ConfigCircuitBreakerConfig, ConnectionMode as ConfigConnectionMode,
-    HealthCheckConfig, RouterConfig, RoutingMode,
-};
-use crate::core::{
-    BasicWorkerBuilder, CircuitBreakerConfig, ConnectionMode, DPAwareWorkerBuilder, HealthConfig,
-    Worker, WorkerFactory, WorkerRegistry, WorkerType,
-};
-use crate::grpc_client::SglangSchedulerClient;
-use crate::policies::PolicyRegistry;
-use crate::protocols::worker_spec::{
-    FlushCacheResult, WorkerConfigRequest, WorkerLoadInfo, WorkerLoadsResult,
-};
-use crate::server::AppContext;
+use std::{collections::HashMap, sync::Arc, time::Duration};
+
 use futures::future;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
-use std::path::Path;
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::{watch, Mutex};
-use tokio::task::JoinHandle;
+use tokio::{
+    sync::{watch, Mutex},
+    task::JoinHandle,
+};
 use tracing::{debug, error, info, warn};
+
+use crate::{
+    config::types::{
+        CircuitBreakerConfig as ConfigCircuitBreakerConfig, ConnectionMode as ConfigConnectionMode,
+        HealthCheckConfig, RouterConfig, RoutingMode,
+    },
+    core::{
+        BasicWorkerBuilder, CircuitBreakerConfig, ConnectionMode, DPAwareWorkerBuilder,
+        HealthConfig, Worker, WorkerFactory, WorkerRegistry, WorkerType,
+    },
+    grpc_client::SglangSchedulerClient,
+    policies::PolicyRegistry,
+    protocols::worker_spec::{
+        FlushCacheResult, WorkerConfigRequest, WorkerLoadInfo, WorkerLoadsResult,
+    },
+    server::AppContext,
+};
 
 static HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
     reqwest::Client::builder()
@@ -1228,8 +1231,7 @@ impl WorkerManager {
             Ok(server_info) => {
                 if let Some(model_id) = server_info.model_id {
                     if !model_id.is_empty() {
-                        let normalized = Self::normalize_model_identifier(&model_id);
-                        discovery.labels.insert("model_id".to_string(), normalized);
+                        discovery.labels.insert("model_id".to_string(), model_id);
                     }
                 }
                 if let Some(model_path) = server_info.model_path {
@@ -1309,9 +1311,9 @@ impl WorkerManager {
                         "served_model_name".to_string(),
                         model_info.served_model_name.clone(),
                     );
-                    let normalized =
-                        Self::normalize_model_identifier(&model_info.served_model_name);
-                    discovery.labels.insert("model_id".to_string(), normalized);
+                    discovery
+                        .labels
+                        .insert("model_id".to_string(), model_info.served_model_name);
                 }
                 if !model_info.weight_version.is_empty() {
                     discovery.labels.insert(
@@ -1368,15 +1370,6 @@ impl WorkerManager {
         discovery
     }
 
-    fn normalize_model_identifier(value: &str) -> String {
-        let trimmed = value.trim();
-        if trimmed.contains('/') || trimmed.contains('\\') {
-            Self::derive_model_id_from_path(trimmed)
-        } else {
-            trimmed.to_string()
-        }
-    }
-
     fn finalize_model_id(labels: &mut HashMap<String, String>) {
         let has_model_id = labels
             .get("model_id")
@@ -1386,38 +1379,17 @@ impl WorkerManager {
             return;
         }
 
-        if let Some(served_name) = labels.get("served_model_name").cloned() {
+        if let Some(served_name) = labels.get("served_model_name") {
             if !served_name.trim().is_empty() {
-                let normalized = Self::normalize_model_identifier(&served_name);
-                labels.insert("model_id".to_string(), normalized);
+                labels.insert("model_id".to_string(), served_name.clone());
                 return;
             }
         }
 
-        if let Some(model_path) = labels.get("model_path").cloned() {
+        if let Some(model_path) = labels.get("model_path") {
             if !model_path.trim().is_empty() {
-                let derived = Self::derive_model_id_from_path(&model_path);
-                if !derived.is_empty() {
-                    labels.insert("model_id".to_string(), derived);
-                }
+                labels.insert("model_id".to_string(), model_path.clone());
             }
-        }
-    }
-
-    fn derive_model_id_from_path(path: &str) -> String {
-        let trimmed = path.trim_end_matches(['/', '\\']);
-        if trimmed.is_empty() {
-            return path.to_string();
-        }
-
-        let candidate = Path::new(trimmed)
-            .file_name()
-            .and_then(|p| p.to_str())
-            .map(|s| s.to_string());
-
-        match candidate {
-            Some(name) if !name.is_empty() => name,
-            _ => trimmed.to_string(),
         }
     }
 
@@ -1835,8 +1807,9 @@ impl Drop for LoadMonitor {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::collections::HashMap;
+
+    use super::*;
 
     #[test]
     fn test_parse_server_info() {
@@ -1873,20 +1846,6 @@ mod tests {
     }
 
     #[test]
-    fn test_derive_model_id_from_path() {
-        let path = "/raid/models/meta-llama/Llama-3.1-8B-Instruct";
-        let derived = WorkerManager::derive_model_id_from_path(path);
-        assert_eq!(derived, "Llama-3.1-8B-Instruct");
-    }
-
-    #[test]
-    fn test_derive_model_id_trailing_slash() {
-        let path = "/models/foo/bar/";
-        let derived = WorkerManager::derive_model_id_from_path(path);
-        assert_eq!(derived, "bar");
-    }
-
-    #[test]
     fn test_finalize_model_id_prefers_existing() {
         let mut labels = HashMap::new();
         labels.insert("model_id".to_string(), "manual-id".to_string());
@@ -1908,12 +1867,6 @@ mod tests {
         let mut labels = HashMap::new();
         labels.insert("model_path".to_string(), "/models/alpha".to_string());
         WorkerManager::finalize_model_id(&mut labels);
-        assert_eq!(labels.get("model_id").unwrap(), "alpha");
-    }
-
-    #[test]
-    fn test_normalize_model_identifier_from_path() {
-        let normalized = WorkerManager::normalize_model_identifier("/raid/models/foo/bar-model");
-        assert_eq!(normalized, "bar-model");
+        assert_eq!(labels.get("model_id").unwrap(), "/models/alpha");
     }
 }

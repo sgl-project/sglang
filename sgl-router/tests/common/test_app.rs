@@ -1,3 +1,5 @@
+use std::sync::{Arc, OnceLock};
+
 use axum::Router;
 use reqwest::Client;
 use sglang_router_rs::{
@@ -11,7 +13,6 @@ use sglang_router_rs::{
     routers::RouterTrait,
     server::{build_app, AppContext, AppState},
 };
-use std::sync::{Arc, OnceLock};
 
 /// Create a test Axum application using the actual server's build_app function
 #[allow(dead_code)]
