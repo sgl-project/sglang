@@ -3,30 +3,34 @@
 //! Handles all aspects of worker lifecycle including discovery, initialization,
 //! runtime management, and health monitoring.
 
-use crate::config::types::{
-    CircuitBreakerConfig as ConfigCircuitBreakerConfig, ConnectionMode as ConfigConnectionMode,
-    HealthCheckConfig, RouterConfig, RoutingMode,
-};
-use crate::core::{
-    BasicWorkerBuilder, CircuitBreakerConfig, ConnectionMode, DPAwareWorkerBuilder, HealthConfig,
-    Worker, WorkerFactory, WorkerRegistry, WorkerType,
-};
-use crate::grpc_client::SglangSchedulerClient;
-use crate::policies::PolicyRegistry;
-use crate::protocols::worker_spec::{
-    FlushCacheResult, WorkerConfigRequest, WorkerLoadInfo, WorkerLoadsResult,
-};
-use crate::server::AppContext;
+use std::{collections::HashMap, sync::Arc, time::Duration};
+
 use futures::future;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::{watch, Mutex};
-use tokio::task::JoinHandle;
+use tokio::{
+    sync::{watch, Mutex},
+    task::JoinHandle,
+};
 use tracing::{debug, error, info, warn};
+
+use crate::{
+    config::types::{
+        CircuitBreakerConfig as ConfigCircuitBreakerConfig, ConnectionMode as ConfigConnectionMode,
+        HealthCheckConfig, RouterConfig, RoutingMode,
+    },
+    core::{
+        BasicWorkerBuilder, CircuitBreakerConfig, ConnectionMode, DPAwareWorkerBuilder,
+        HealthConfig, Worker, WorkerFactory, WorkerRegistry, WorkerType,
+    },
+    grpc_client::SglangSchedulerClient,
+    policies::PolicyRegistry,
+    protocols::worker_spec::{
+        FlushCacheResult, WorkerConfigRequest, WorkerLoadInfo, WorkerLoadsResult,
+    },
+    server::AppContext,
+};
 
 static HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
     reqwest::Client::builder()
@@ -1803,8 +1807,9 @@ impl Drop for LoadMonitor {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::collections::HashMap;
+
+    use super::*;
 
     #[test]
     fn test_parse_server_info() {
