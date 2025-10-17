@@ -852,15 +852,6 @@ class LoRAUpdateEngineTestSession(LoRAUpdateTestSessionBase):
             enable_lora=self.enable_lora,
             disable_radix_cache=True,
         )
-        import asyncio
-
-        def has_event_loop() -> bool:
-            try:
-                return asyncio.get_running_loop()
-            except RuntimeError:
-                return "No running event loop"
-
-        print(f"[Test Lora]: Starting SRTRunner, {has_event_loop()=}")
         self.handle.__enter__()
         return self
 
