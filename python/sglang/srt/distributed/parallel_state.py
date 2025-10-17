@@ -49,6 +49,7 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
     is_shm_available,
+    is_xpu,
     supports_custom_op,
 )
 
@@ -282,6 +283,8 @@ class GroupCoordinator:
             self.device = torch.device(f"cuda:{device_id}")
         elif _is_npu:
             self.device = torch.device(f"npu:{device_id}")
+        elif is_xpu:
+            self.device = torch.device(f"xpu:{device_id}")
         else:
             self.device = torch.device("cpu")
         self.device_module = torch.get_device_module(self.device)
@@ -687,7 +690,7 @@ class GroupCoordinator:
             )
 
     def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
-        if _is_npu or not _supports_custom_op:
+        if _is_npu or is_xpu() or not _supports_custom_op:
             self._all_gather_into_tensor(output, input)
         else:
             torch.ops.sglang.reg_all_gather_into_tensor(

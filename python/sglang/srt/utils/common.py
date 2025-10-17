@@ -1211,42 +1211,37 @@ def point_to_point_pyobj(
     dst: int = 1,
 ):
     """Send data from src to dst in group using DeviceToDevice communication."""
+    # Generic way to get current device for any accelerator ('cuda', 'xpu', 'hpu', etc)
+    device_module = torch.get_device_module()
+    current_device = torch.device(device_module.__name__.split(".")[-1])
 
     if rank == src:
         if len(data) == 0:
-            tensor_size = torch.tensor(
-                [0], dtype=torch.long, device=torch.cuda.current_device()
-            )
+            tensor_size = torch.tensor([0], dtype=torch.long, device=current_device)
             dist.send(tensor_size, dst=dst, group=group)
         else:
             serialized_data = pickle.dumps(data)
             size = len(serialized_data)
             tensor_data = torch.ByteTensor(
                 np.frombuffer(serialized_data, dtype=np.uint8)
-            ).cuda(
-                device=torch.cuda.current_device()
-            )  # Move to GPU
-            tensor_size = torch.tensor(
-                [size], dtype=torch.long, device=torch.cuda.current_device()
-            )
+            ).to(
+                device=current_device
+            )  # Move to current accelerator device
+            tensor_size = torch.tensor([size], dtype=torch.long, device=current_device)
 
             dist.send(tensor_size, dst=dst, group=group)
             dist.send(tensor_data, dst=dst, group=group)
         return data
 
     elif rank == dst:
-        tensor_size = torch.tensor(
-            [0], dtype=torch.long, device=torch.cuda.current_device()
-        )
+        tensor_size = torch.tensor([0], dtype=torch.long, device=current_device)
         dist.recv(tensor_size, src=src, group=group)
         size = tensor_size.item()
 
         if size == 0:
             return []
 
-        tensor_data = torch.empty(
-            size, dtype=torch.uint8, device=torch.cuda.current_device()
-        )
+        tensor_data = torch.empty(size, dtype=torch.uint8, device=current_device)
         dist.recv(tensor_data, src=src, group=group)
 
         serialized_data = bytes(
