@@ -16,6 +16,7 @@
 import dataclasses
 import json
 import logging
+import weakref
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -190,6 +191,12 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         self.vocab_size = vocab_size
         self.override_stop_tokens = override_stop_tokens
         self.any_whitespace = any_whitespace
+        self._finalizer = weakref.finalize(
+            self,
+            XGrammarGrammarBackend._cleanup,
+            self.cache,
+            self.grammar_compiler,
+        )
 
     def _from_context(
         self, ctx: CompiledGrammar, key_string: str, grammar_stats: GrammarStats
@@ -261,4 +268,17 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         )
 
     def reset(self):
+        super().reset()
         self.grammar_compiler.clear_cache()
+
+    @staticmethod
+    def _cleanup(cache, grammar_compiler):
+        try:
+            cache.clear()
+        except Exception:
+            pass
+
+        try:
+            grammar_compiler.clear_cache()
+        except Exception:
+            pass

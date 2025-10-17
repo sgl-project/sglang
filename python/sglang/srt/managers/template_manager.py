@@ -22,6 +22,8 @@ import json
 import logging
 import os
 import re
+import uuid
+import requests
 from typing import Optional
 
 from sglang.srt.parser.code_completion_parser import (
@@ -153,10 +155,16 @@ class TemplateManager:
             return
 
         if not os.path.exists(chat_template_arg):
-            raise RuntimeError(
-                f"Chat template {chat_template_arg} is not a built-in template name "
-                "or a valid chat template file path."
-            )
+            if chat_template_arg.startswith(("http://", "https://")):
+                template_path = f"{uuid.uuid4()}-{os.path.basename(chat_template_arg)}"
+                with open(template_path, "w") as outfile:
+                    outfile.write(requests.get(chat_template_arg).text)
+                    chat_template_arg = template_path
+            else:
+                raise RuntimeError(
+                    f"Chat template {chat_template_arg} is not a built-in template name "
+                    "or a valid chat template file path."
+                )
 
         if chat_template_arg.endswith(".jinja"):
             self._load_jinja_template(tokenizer_manager, chat_template_arg)
@@ -260,6 +268,7 @@ class TemplateManager:
                 override=True,
             )
         self._chat_template_name = template["name"]
+
 
     def _load_json_completion_template(self, template_path: str) -> None:
         """Load a JSON completion template file."""

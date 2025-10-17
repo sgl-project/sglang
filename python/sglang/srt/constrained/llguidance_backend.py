@@ -42,18 +42,58 @@ class GuidanceGrammar(BaseGrammarObject):
         super().__init__()
         self.llguidance_tokenizer = llguidance_tokenizer
         self.serialized_grammar = serialized_grammar
+        self._log_level = int(os.environ.get("LLGUIDANCE_LOG_LEVEL", "1"))
 
-        self.ll_matcher = LLMatcher(
+        self.ll_matcher = self._create_matcher()
+        self.bitmask = None
+        self._accepted_tokens: List[int] = []
+
+    def _create_matcher(self) -> LLMatcher:
+        return LLMatcher(
             self.llguidance_tokenizer,
             self.serialized_grammar,
-            log_level=int(os.environ.get("LLGUIDANCE_LOG_LEVEL", "1")),
+            log_level=self._log_level,
         )
-        self.bitmask = None
+
+    def _replay_tokens(self) -> None:
+        """Rebuild matcher state after rollback or retokenization."""
+        self.ll_matcher = self._create_matcher()
+        self.finished = False
+        for token in self._accepted_tokens:
+            if not self.ll_matcher.consume_token(token):
+                logger.warning(
+                    f"matcher error during replay: {self.ll_matcher.get_error()}"
+                )
+                self.finished = True
+                break
+        else:
+            # Only mark finished if matcher reports stop condition.
+            self.finished = self.ll_matcher.is_stopped()
+        self.current_token = (
+            self._accepted_tokens[-1] if self._accepted_tokens else None
+        )
 
     def accept_token(self, token: int):
+        if self.finished:
+            return
+
         if not self.ll_matcher.consume_token(token):
             logger.warning(f"matcher error: {self.ll_matcher.get_error()}")
             self.finished = True
+            return
+
+        self.current_token = token
+        self._accepted_tokens.append(token)
+        if self.ll_matcher.is_stopped():
+            self.finished = True
+
+    def rollback(self, k: int):
+        if k <= 0 or not self._accepted_tokens:
+            return
+        if k > len(self._accepted_tokens):
+            k = len(self._accepted_tokens)
+        del self._accepted_tokens[-k:]
+        self._replay_tokens()
 
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
         if self.ll_matcher.is_stopped():
@@ -84,10 +124,16 @@ class GuidanceGrammar(BaseGrammarObject):
         apply_token_bitmask_inplace(logits, vocab_mask)
 
     def copy(self):
-        return GuidanceGrammar(
+        copied = GuidanceGrammar(
             llguidance_tokenizer=self.llguidance_tokenizer,
             serialized_grammar=self.serialized_grammar,
         )
+        if self._accepted_tokens:
+            copied._accepted_tokens = list(self._accepted_tokens)
+            copied._replay_tokens()
+        copied.finished = self.finished
+        copied.current_token = self.current_token
+        return copied
 
     def try_jump_forward(self, tokenizer) -> Optional[Tuple[List[int], str]]:
         ff_tokens = self.ll_matcher.compute_ff_tokens()
@@ -102,7 +148,8 @@ class GuidanceGrammar(BaseGrammarObject):
     def jump_and_retokenize(
         self, old_output_ids: List[int], new_output_ids: List[int], next_state: int
     ):
-        pass
+        self._accepted_tokens = list(new_output_ids)
+        self._replay_tokens()
 
 
 class GuidanceBackend(BaseGrammarBackend):
