@@ -10,7 +10,7 @@ from typing import Any, Callable, Optional, Union
 
 import torch
 
-from sglang.srt.model_executor.compilation.compilation_config import CompilationConfig
+from sglang.srt.compilation.compilation_config import CompilationConfig
 
 logger = logging.getLogger(__name__)
 
@@ -134,7 +134,7 @@ def install_torch_compiled(
     dyn_map = dynamic_arg_dims or _infer_dynamic_arg_dims_from_annotations(unbound_fwd)
 
     if backend_factory is None:
-        from sglang.srt.model_executor.compilation.backend import SGLangBackend
+        from sglang.srt.compilation.backend import SGLangBackend
 
         backend_factory = lambda gm, ex: SGLangBackend(compile_config, graph_pool)(
             gm, ex
