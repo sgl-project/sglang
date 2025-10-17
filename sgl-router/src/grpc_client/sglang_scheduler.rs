@@ -1,15 +1,22 @@
-use std::convert::TryFrom;
-use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::task::{Context, Poll};
-use std::time::Duration;
+use std::{
+    convert::TryFrom,
+    pin::Pin,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    task::{Context, Poll},
+    time::Duration,
+};
+
 use tonic::{transport::Channel, Request, Streaming};
 use tracing::{debug, warn};
 
-use crate::protocols::spec::{
-    ChatCompletionRequest, GenerateRequest, ResponseFormat,
-    SamplingParams as GenerateSamplingParams, StringOrArray,
+use crate::protocols::{
+    chat::ChatCompletionRequest,
+    common::{ResponseFormat, StringOrArray, ToolChoice, ToolChoiceValue},
+    generate::GenerateRequest,
+    sampling_params::SamplingParams as GenerateSamplingParams,
 };
 
 // Include the generated protobuf code
@@ -125,7 +132,7 @@ impl SglangSchedulerClient {
         };
 
         let channel = Channel::from_shared(http_endpoint)?
-            .timeout(Duration::from_secs(600)) // 10 minute timeout for connection
+            .timeout(Duration::from_secs(3600)) // 1 hr timeout for connection
             .http2_keep_alive_interval(Duration::from_secs(30))
             .keep_alive_timeout(Duration::from_secs(10))
             .keep_alive_while_idle(true)
@@ -306,9 +313,7 @@ impl SglangSchedulerClient {
         // Handle skip_special_tokens: set to false if tools are present and tool_choice is not "none"
         let skip_special_tokens = if request.tools.is_some() {
             match &request.tool_choice {
-                Some(crate::protocols::spec::ToolChoice::Value(
-                    crate::protocols::spec::ToolChoiceValue::None,
-                )) => request.skip_special_tokens,
+                Some(ToolChoice::Value(ToolChoiceValue::None)) => request.skip_special_tokens,
                 Some(_) => false, // tool_choice is not "none"
                 None => false, // TODO: this assumes tool_choice defaults to "auto" when tools present
             }

@@ -1,5 +1,7 @@
 // OAuth authentication support for MCP servers
 
+use std::{net::SocketAddr, sync::Arc};
+
 use axum::{
     extract::{Query, State},
     response::Html,
@@ -8,7 +10,6 @@ use axum::{
 };
 use rmcp::transport::auth::OAuthState;
 use serde::Deserialize;
-use std::{net::SocketAddr, sync::Arc};
 use tokio::sync::{oneshot, Mutex};
 
 use crate::mcp::error::{McpError, McpResult};
