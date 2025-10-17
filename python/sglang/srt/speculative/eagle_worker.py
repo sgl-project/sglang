@@ -882,9 +882,16 @@ class EAGLEWorker(TpModelWorker):
 
         batch.spec_info.num_tokens_per_batch = self.speculative_num_steps + 1
         batch.spec_info.num_tokens_for_logprob_per_batch = 1
+        # trtllm_mla backend uses decode kernel for draft extend, so we need to pad the input if we are not using CUDA graph.
+        need_pad_input = (
+            self.draft_model_runner.server_args.decode_attention_backend == "trtllm_mla"
+            and (
+                not self.cuda_graph_runner_for_draft_extend
+                or not self.cuda_graph_runner_for_draft_extend.can_run(batch)
+            )
+        )
         batch.spec_info.prepare_extend_after_decode(
-            batch,
-            self.speculative_num_steps,
+            batch, self.speculative_num_steps, need_pad_input
         )
         batch.forward_mode = (
             ForwardMode.DRAFT_EXTEND
