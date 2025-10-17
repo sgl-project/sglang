@@ -1,9 +1,12 @@
-use super::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
-use super::worker::{
-    BasicWorker, ConnectionMode, DPAwareWorker, HealthConfig, WorkerMetadata, WorkerType,
+use std::collections::HashMap;
+
+use super::{
+    circuit_breaker::{CircuitBreaker, CircuitBreakerConfig},
+    worker::{
+        BasicWorker, ConnectionMode, DPAwareWorker, HealthConfig, WorkerMetadata, WorkerType,
+    },
 };
 use crate::grpc_client::SglangSchedulerClient;
-use std::collections::HashMap;
 
 /// Builder for creating BasicWorker instances with fluent API
 pub struct BasicWorkerBuilder {
@@ -100,6 +103,7 @@ impl BasicWorkerBuilder {
             atomic::{AtomicBool, AtomicUsize},
             Arc,
         };
+
         use tokio::sync::{Mutex, RwLock};
 
         let bootstrap_host = match url::Url::parse(&self.url) {
@@ -282,9 +286,10 @@ impl DPAwareWorkerBuilder {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use crate::core::worker::Worker;
-    use std::time::Duration;
 
     #[test]
     fn test_basic_worker_builder_minimal() {

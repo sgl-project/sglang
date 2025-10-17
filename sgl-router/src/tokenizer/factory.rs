@@ -1,13 +1,9 @@
-use super::traits;
+use std::{fs::File, io::Read, path::Path, sync::Arc};
+
 use anyhow::{Error, Result};
-use std::fs::File;
-use std::io::Read;
-use std::path::Path;
-use std::sync::Arc;
 use tracing::{debug, info};
 
-use super::huggingface::HuggingFaceTokenizer;
-use super::tiktoken::TiktokenTokenizer;
+use super::{huggingface::HuggingFaceTokenizer, tiktoken::TiktokenTokenizer, traits};
 use crate::tokenizer::hub::download_tokenizer_from_hf;
 
 /// Represents the type of tokenizer being used
@@ -379,8 +375,7 @@ pub fn get_tokenizer_info(file_path: &str) -> Result<TokenizerType> {
         Some("json") => Ok(TokenizerType::HuggingFace(file_path.to_string())),
         _ => {
             // Try auto-detection
-            use std::fs::File;
-            use std::io::Read;
+            use std::{fs::File, io::Read};
 
             let mut file = File::open(file_path)?;
             let mut buffer = vec![0u8; 512];

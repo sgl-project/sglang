@@ -3,11 +3,15 @@
 //! This module provides functionality to apply chat templates to messages,
 //! similar to HuggingFace transformers' apply_chat_template method.
 
-use anyhow::{anyhow, Result};
-use minijinja::machinery::ast::{Expr, Stmt};
-use minijinja::{context, Environment, Value};
-use serde_json;
 use std::collections::HashMap;
+
+use anyhow::{anyhow, Result};
+use minijinja::{
+    context,
+    machinery::ast::{Expr, Stmt},
+    Environment, Value,
+};
+use serde_json;
 
 /// Chat template content format
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -319,8 +323,10 @@ impl<'a> Detector<'a> {
 /// AST-based detection using minijinja's unstable machinery
 /// Single-pass detector with scope tracking
 fn detect_format_with_ast(template: &str) -> Option<ChatTemplateContentFormat> {
-    use minijinja::machinery::{parse, WhitespaceConfig};
-    use minijinja::syntax::SyntaxConfig;
+    use minijinja::{
+        machinery::{parse, WhitespaceConfig},
+        syntax::SyntaxConfig,
+    };
 
     let ast = match parse(
         template,

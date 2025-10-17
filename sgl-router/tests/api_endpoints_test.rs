@@ -1,5 +1,7 @@
 mod common;
 
+use std::sync::Arc;
+
 use axum::{
     body::Body,
     extract::Request,
@@ -8,13 +10,14 @@ use axum::{
 use common::mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType};
 use reqwest::Client;
 use serde_json::json;
-use sglang_router_rs::config::{
-    CircuitBreakerConfig, ConnectionMode, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
+use sglang_router_rs::{
+    config::{
+        CircuitBreakerConfig, ConnectionMode, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
+    },
+    core::WorkerManager,
+    routers::{RouterFactory, RouterTrait},
+    server::AppContext,
 };
-use sglang_router_rs::core::WorkerManager;
-use sglang_router_rs::routers::{RouterFactory, RouterTrait};
-use sglang_router_rs::server::AppContext;
-use std::sync::Arc;
 use tower::ServiceExt;
 
 /// Test context that manages mock workers
@@ -995,8 +998,9 @@ mod router_policy_tests {
 
 #[cfg(test)]
 mod responses_endpoint_tests {
-    use super::*;
     use reqwest::Client as HttpClient;
+
+    use super::*;
 
     #[tokio::test]
     async fn test_v1_responses_non_streaming() {

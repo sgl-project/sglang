@@ -1,9 +1,14 @@
-use crate::protocols::spec::Tool;
-use serde_json::Value;
 use std::collections::HashMap;
 
-use crate::tool_parser::errors::{ParserError, ParserResult};
-use crate::tool_parser::types::{StreamingParseResult, ToolCallItem};
+use serde_json::Value;
+
+use crate::{
+    protocols::common::Tool,
+    tool_parser::{
+        errors::{ParserError, ParserResult},
+        types::{StreamingParseResult, ToolCallItem},
+    },
+};
 
 /// Get a mapping of tool names to their indices
 pub fn get_tool_indices(tools: &[Tool]) -> HashMap<String, usize> {

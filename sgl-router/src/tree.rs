@@ -1,16 +1,12 @@
-use dashmap::mapref::entry::Entry;
-use dashmap::DashMap;
+use std::{
+    cmp::Reverse,
+    collections::{BinaryHeap, HashMap, VecDeque},
+    sync::{Arc, RwLock},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+use dashmap::{mapref::entry::Entry, DashMap};
 use tracing::info;
-
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
-use std::collections::HashMap;
-use std::collections::VecDeque;
-use std::sync::Arc;
-use std::sync::RwLock;
-
-use std::time::Duration;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 type NodeRef = Arc<Node>;
 
@@ -666,12 +662,12 @@ impl Tree {
 //  Unit tests
 #[cfg(test)]
 mod tests {
-    use rand::distr::Alphanumeric;
-    use rand::distr::SampleString;
-    use rand::rng as thread_rng;
-    use rand::Rng;
-    use std::thread;
-    use std::time::Instant;
+    use std::{thread, time::Instant};
+
+    use rand::{
+        distr::{Alphanumeric, SampleString},
+        rng as thread_rng, Rng,
+    };
 
     use super::*;
 

@@ -3,12 +3,12 @@ use std::collections::HashMap;
 use anyhow::{Error, Result};
 use tokenizers::tokenizer::Tokenizer as HfTokenizer;
 
-use super::chat_template::{
-    detect_chat_template_content_format, ChatTemplateContentFormat, ChatTemplateParams,
-    ChatTemplateProcessor,
-};
-use super::traits::{
-    Decoder, Encoder, Encoding, SpecialTokens, TokenIdType, Tokenizer as TokenizerTrait,
+use super::{
+    chat_template::{
+        detect_chat_template_content_format, ChatTemplateContentFormat, ChatTemplateParams,
+        ChatTemplateProcessor,
+    },
+    traits::{Decoder, Encoder, Encoding, SpecialTokens, TokenIdType, Tokenizer as TokenizerTrait},
 };
 
 /// HuggingFace tokenizer wrapper

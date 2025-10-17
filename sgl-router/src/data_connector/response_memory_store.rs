@@ -1,7 +1,7 @@
+use std::{collections::HashMap, sync::Arc};
+
 use async_trait::async_trait;
 use parking_lot::RwLock;
-use std::collections::HashMap;
-use std::sync::Arc;
 
 use super::responses::{ResponseChain, ResponseId, ResponseStorage, Result, StoredResponse};
 

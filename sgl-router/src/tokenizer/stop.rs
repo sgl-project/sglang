@@ -1,8 +1,11 @@
-use super::sequence::Sequence;
-use super::traits::{self, TokenIdType};
+use std::{collections::HashSet, sync::Arc};
+
 use anyhow::Result;
-use std::collections::HashSet;
-use std::sync::Arc;
+
+use super::{
+    sequence::Sequence,
+    traits::{self, TokenIdType},
+};
 
 /// Output from the sequence decoder
 #[derive(Debug, Clone, PartialEq)]

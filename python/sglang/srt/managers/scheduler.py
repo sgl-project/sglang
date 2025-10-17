@@ -163,7 +163,6 @@ from sglang.srt.tracing.trace import (
 )
 from sglang.srt.two_batch_overlap import TboDPAttentionPreparer
 from sglang.srt.utils import (
-    DEFAULT_DETERMINISTIC_INFERENCE_BACKEND_SIZE_CONFIG,
     DynamicGradMode,
     broadcast_pyobj,
     configure_gc_logger,
@@ -712,7 +711,11 @@ class Scheduler(
             self.truncation_align_size = None
             return
 
-        env_var, default_size = DEFAULT_DETERMINISTIC_INFERENCE_BACKEND_SIZE_CONFIG.get(
+        backend_sizes = {
+            "flashinfer": ("SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE", 4096),
+            "triton": ("SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE", 4096),
+        }
+        env_var, default_size = backend_sizes.get(
             self.server_args.attention_backend, (None, None)
         )
         self.truncation_align_size = (
@@ -846,7 +849,6 @@ class Scheduler(
                     disable=server_args.disable_radix_cache,
                     enable_kv_cache_events=self.enable_kv_cache_events,
                     eviction_policy=server_args.radix_eviction_policy,
-                    enable_deterministic_inference=server_args.enable_deterministic_inference,
                     is_eagle=self.spec_algorithm.is_eagle(),
                 )
 

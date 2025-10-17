@@ -309,8 +309,8 @@ class ServerArgs:
     ] = None
     max_loaded_loras: Optional[int] = None
     max_loras_per_batch: int = 8
+    lora_backend: str = "csgmv"
     lora_eviction_policy: str = DEFAULT_LORA_EVICTION_POLICY
-    lora_backend: str = "triton"
     max_lora_chunk_size: Optional[int] = 16
 
     # Kernel backend
@@ -628,6 +628,16 @@ class ServerArgs:
                     self.chunked_prefill_size = 2048
                 if self.cuda_graph_max_bs is None:
                     self.cuda_graph_max_bs = 8
+            elif is_npu() and gpu_mem < 32 * 1024:
+                # Atlas A2B4
+                # (chunked_prefill_size 32k, cuda_graph_max_bs 16 if tp < 4 else 64)
+                if self.chunked_prefill_size is None:
+                    self.chunked_prefill_size = 32768
+                if self.cuda_graph_max_bs is None:
+                    if self.tp_size < 4:
+                        self.cuda_graph_max_bs = 16
+                    else:
+                        self.cuda_graph_max_bs = 64
             elif gpu_mem < 35 * 1024:
                 # A10, 4090, 5090
                 # (chunked_prefill_size 2k, cuda_graph_max_bs 16 if tp < 4 else 80)
@@ -651,6 +661,16 @@ class ServerArgs:
                         self.cuda_graph_max_bs = 32
                     else:
                         self.cuda_graph_max_bs = 160
+            elif is_npu() and gpu_mem < 64 * 1024:
+                # Atlas A2 and Atlas A3
+                # (chunked_prefill_size 32k, cuda_graph_max_bs 64 if tp < 4 else 128)
+                if self.chunked_prefill_size is None:
+                    self.chunked_prefill_size = 32768
+                if self.cuda_graph_max_bs is None:
+                    if self.tp_size < 4:
+                        self.cuda_graph_max_bs = 64
+                    else:
+                        self.cuda_graph_max_bs = 128
             elif gpu_mem < 90 * 1024:
                 # H100, A100
                 # (chunked_prefill_size 8k, cuda_graph_max_bs 256 if tp < 4 else 512)
@@ -1389,6 +1409,13 @@ class ServerArgs:
             if self.attention_backend not in DETERMINISTIC_ATTENTION_BACKEND_CHOICES:
                 raise ValueError(
                     f"Currently only {DETERMINISTIC_ATTENTION_BACKEND_CHOICES} attention backends are supported for deterministic inference."
+                )
+
+            # Currently, only FA3 supports radix cache. Support for other backends is in progress
+            if self.attention_backend != "fa3":
+                self.disable_radix_cache = True
+                logger.warning(
+                    f"Currently radix cache is not compatible with {self.attention_backend} attention backend for deterministic inference. It will be supported in the future."
                 )
 
             # Check TP size

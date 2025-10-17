@@ -1,6 +1,8 @@
-use super::ConfigResult;
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+use serde::{Deserialize, Serialize};
+
+use super::ConfigResult;
 
 /// Main router configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
