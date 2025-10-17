@@ -42,22 +42,20 @@ class SchedulerOutputProcessorMixin:
         skip_stream_req = None
 
         if self.is_generation:
+            if result.copy_done is not None:
+                result.copy_done.synchronize()
+
             (
                 logits_output,
                 next_token_ids,
                 extend_input_len_per_req,
                 extend_logprob_start_len_per_req,
-                copy_done,
             ) = (
                 result.logits_output,
                 result.next_token_ids,
                 result.extend_input_len_per_req,
                 result.extend_logprob_start_len_per_req,
-                result.copy_done,
             )
-
-            if copy_done is not None:
-                copy_done.synchronize()
 
             # Move next_token_ids and logprobs to cpu
             next_token_ids = next_token_ids.tolist()
@@ -199,25 +197,24 @@ class SchedulerOutputProcessorMixin:
 
         self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
 
-    def hacky_process_eagle_overlap_result(
+    def _resolve_spec_overlap_token_ids(
         self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
-    ):
-        # TODO(lsyin): try use a copy stream to share SMs with forward
-        result.last_batch_allocate_lens_list = result.last_batch_allocate_lens.tolist()
-        result.accept_lens_list = result.accept_lens.tolist()
-        result.num_accepted_tokens = sum(result.accept_lens_list)
+    ) -> List[List[int]]:
+        """Resolve the padding next token ids for speculative decoding with overlap."""
+        assert result.next_token_ids.is_cpu
+        assert result.accept_lens.is_cpu
+        assert result.last_batch_allocate_lens.is_cpu
+
         next_token_ids = result.next_token_ids.tolist()
+        accept_lens = result.accept_lens.tolist()
+        result.num_accepted_tokens = sum(accept_lens)
 
         predict_tokens = []
-        num_draft_tokens = self.draft_worker.speculative_num_draft_tokens
+        stride = self.draft_worker.speculative_num_draft_tokens
         for i, req in enumerate(batch.reqs):
             predict_tokens.append(
-                next_token_ids[
-                    i * num_draft_tokens : i * num_draft_tokens
-                    + result.accept_lens_list[i]
-                ]
+                next_token_ids[i * stride : i * stride + accept_lens[i]]
             )
-            # FIXME(lsyin): move this update elsewhere
             req.spec_verify_ct += 1
 
         return predict_tokens
@@ -227,25 +224,25 @@ class SchedulerOutputProcessorMixin:
         batch: ScheduleBatch,
         result: GenerationBatchResult,
     ):
-        logits_output, next_token_ids, can_run_cuda_graph, copy_done = (
+        if result.copy_done is not None:
+            result.copy_done.synchronize()
+
+        logits_output, next_token_ids, can_run_cuda_graph = (
             result.logits_output,
             result.next_token_ids,
             result.can_run_cuda_graph,
-            result.copy_done,
         )
-        self.num_generated_tokens += len(batch.reqs)
-
-        if copy_done is not None:
-            copy_done.synchronize()
 
         if batch.spec_algorithm.is_none():
             next_token_ids = next_token_ids.tolist()
             if batch.return_logprob:
                 next_token_logprobs = logits_output.next_token_logprobs.tolist()
         elif batch.is_v2_eagle:
-            next_token_ids = self.hacky_process_eagle_overlap_result(result, batch)
+            next_token_ids = self._resolve_spec_overlap_token_ids(result, batch)
+            last_batch_allocate_lens_list = result.last_batch_allocate_lens.tolist()
+            accept_lens_list = result.accept_lens.tolist()
 
-        # FIXME(lsyin): we suppose we have already got the num_accepted_tokens in result
+        self.num_generated_tokens += len(batch.reqs)
         if not self.spec_algorithm.is_none():
             self.update_spec_metrics(batch.batch_size(), result.num_accepted_tokens)
 
@@ -270,7 +267,7 @@ class SchedulerOutputProcessorMixin:
                             self.req_to_token_pool,
                             self.token_to_kv_pool_allocator,
                             req,
-                            result.last_batch_allocate_lens_list[i],
+                            last_batch_allocate_lens_list[i],
                             None,
                         )
                     else:
@@ -295,8 +292,7 @@ class SchedulerOutputProcessorMixin:
             if batch.spec_algorithm.is_none():
                 req.output_ids.append(next_token_id)
             elif batch.is_v2_eagle:
-                # FIXME(lsyin): non-overlap spec worker will solve the output_ids in speculative decoding
-                #               !!!unify the logic here!!!
+                # Only v2 eagle's output_ids are updated here.
                 req.output_ids.extend(next_token_id)
 
             req.check_finished()
@@ -309,12 +305,12 @@ class SchedulerOutputProcessorMixin:
                         free_spec_dec_tokens_page_size_1,
                     )
 
-                    new_seq_len = batch.seq_lens_cpu[i] + result.accept_lens_list[i]
+                    new_seq_len = batch.seq_lens_cpu[i] + accept_lens_list[i]
                     free_spec_dec_tokens_page_size_1(
                         self.req_to_token_pool,
                         self.token_to_kv_pool_allocator,
                         req,
-                        result.last_batch_allocate_lens_list[i],
+                        last_batch_allocate_lens_list[i],
                         new_seq_len,
                     )
 
