@@ -164,18 +164,16 @@ def _check(cc_major):
 
 @contextmanager
 def device_context(device: torch.device):
-    if device.type == "cuda" and is_cuda():
-        with torch.cuda.device(device.index):
-            yield
-    elif device.type == "xpu" and is_xpu():
-        with torch.xpu.device(device.index):
-            yield
-    elif device.type == "npu" and is_npu():
-        with torch.npu.device(device.index):
+    if device.type == "cpu" and is_cpu():
+        with torch.device("cpu"):
             yield
     else:
-        # other vendors' devices, e.g., hpu, npu, cpu
-        yield
+        module = torch.get_device_module(device)
+        if module is not None:
+            with module.device(device.index):
+                yield
+        else:
+            raise ValueError(f"Unknown device module: {device}")
 
 
 is_ampere_with_cuda_12_3 = lambda: _check(8)
