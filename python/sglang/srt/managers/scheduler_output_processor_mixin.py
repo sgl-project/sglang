@@ -203,7 +203,7 @@ class SchedulerOutputProcessorMixin:
         """Resolve the padding next token ids for speculative decoding with overlap."""
         assert result.next_token_ids.is_cpu
         assert result.accept_lens.is_cpu
-        assert result.last_batch_allocate_lens.is_cpu
+        assert result.allocate_lens.is_cpu
 
         next_token_ids = result.next_token_ids.tolist()
         accept_lens = result.accept_lens.tolist()
@@ -239,7 +239,7 @@ class SchedulerOutputProcessorMixin:
                 next_token_logprobs = logits_output.next_token_logprobs.tolist()
         elif batch.is_v2_eagle:
             next_token_ids = self._resolve_spec_overlap_token_ids(result, batch)
-            last_batch_allocate_lens_list = result.last_batch_allocate_lens.tolist()
+            allocate_lens_list = result.allocate_lens.tolist()
             accept_lens_list = result.accept_lens.tolist()
 
         self.num_generated_tokens += len(batch.reqs)
@@ -262,7 +262,7 @@ class SchedulerOutputProcessorMixin:
                     if batch.spec_algorithm.is_eagle():
                         from sglang.srt.speculative.eagle_info import EagleDraftInput
 
-                        end_p = last_batch_allocate_lens_list[i]
+                        end_p = allocate_lens_list[i]
                         start_p = end_p - EagleDraftInput.ALLOC_LEN_PER_DECODE
                         indices_to_free = self.req_to_token_pool.req_to_token[
                             req.req_pool_idx
@@ -298,7 +298,7 @@ class SchedulerOutputProcessorMixin:
                     # 1) when not overlap (v2 impl), we free the extra tokens in the req
                     # 2) overlap eagle and the current batch is prefill. This seq will not run extra iteration.
                     start_p = batch.seq_lens_cpu[i] + accept_lens_list[i]
-                    end_p = last_batch_allocate_lens_list[i]
+                    end_p = allocate_lens_list[i]
                     indices_to_free = self.req_to_token_pool.req_to_token[
                         req.req_pool_idx
                     ][start_p:end_p]
