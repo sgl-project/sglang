@@ -1,34 +1,38 @@
-use crate::config::types::RetryConfig;
-use crate::core::{
-    is_retryable_status, ConnectionMode, RetryExecutor, Worker, WorkerRegistry, WorkerType,
-};
-use crate::metrics::RouterMetrics;
-use crate::policies::PolicyRegistry;
-use crate::protocols::chat::ChatCompletionRequest;
-use crate::protocols::common::GenerationRequest;
-use crate::protocols::completion::CompletionRequest;
-use crate::protocols::embedding::EmbeddingRequest;
-use crate::protocols::generate::GenerateRequest;
-use crate::protocols::rerank::{RerankRequest, RerankResponse, RerankResult};
-use crate::protocols::responses::{ResponsesGetParams, ResponsesRequest};
-use crate::routers::header_utils;
-use crate::routers::RouterTrait;
-use axum::body::to_bytes;
+use std::{sync::Arc, time::Instant};
+
 use axum::{
-    body::Body,
+    body::{to_bytes, Body},
     extract::Request,
     http::{
-        header::CONTENT_LENGTH, header::CONTENT_TYPE, HeaderMap, HeaderValue, Method, StatusCode,
+        header::{CONTENT_LENGTH, CONTENT_TYPE},
+        HeaderMap, HeaderValue, Method, StatusCode,
     },
     response::{IntoResponse, Response},
     Json,
 };
 use futures_util::StreamExt;
 use reqwest::Client;
-use std::sync::Arc;
-use std::time::Instant;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error};
+
+use crate::{
+    config::types::RetryConfig,
+    core::{
+        is_retryable_status, ConnectionMode, RetryExecutor, Worker, WorkerRegistry, WorkerType,
+    },
+    metrics::RouterMetrics,
+    policies::PolicyRegistry,
+    protocols::{
+        chat::ChatCompletionRequest,
+        common::GenerationRequest,
+        completion::CompletionRequest,
+        embedding::EmbeddingRequest,
+        generate::GenerateRequest,
+        rerank::{RerankRequest, RerankResponse, RerankResult},
+        responses::{ResponsesGetParams, ResponsesRequest},
+    },
+    routers::{header_utils, RouterTrait},
+};
 
 /// Regular router that uses injected load balancing policies
 #[derive(Debug)]

@@ -1,22 +1,26 @@
 //! Conversation CRUD operations and persistence
 
-use crate::data_connector::{
-    conversation_items::ListParams, conversation_items::SortOrder, Conversation, ConversationId,
-    ConversationItemId, ConversationItemStorage, ConversationStorage, NewConversation,
-    NewConversationItem, ResponseId, ResponseStorage, SharedConversationItemStorage,
-    SharedConversationStorage,
+use std::{collections::HashMap, sync::Arc};
+
+use axum::{
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    Json,
 };
-use crate::protocols::responses::{ResponseInput, ResponseInputOutputItem, ResponsesRequest};
-use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
-use axum::Json;
 use chrono::Utc;
 use serde_json::{json, Value};
-use std::collections::HashMap;
-use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use super::responses::build_stored_response;
+use crate::{
+    data_connector::{
+        conversation_items::{ListParams, SortOrder},
+        Conversation, ConversationId, ConversationItemId, ConversationItemStorage,
+        ConversationStorage, NewConversation, NewConversationItem, ResponseId, ResponseStorage,
+        SharedConversationItemStorage, SharedConversationStorage,
+    },
+    protocols::responses::{ResponseInput, ResponseInputOutputItem, ResponsesRequest},
+};
 
 /// Maximum number of properties allowed in conversation metadata
 pub(crate) const MAX_METADATA_PROPERTIES: usize = 16;
