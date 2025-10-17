@@ -174,7 +174,7 @@ class MooncakeKVManager(CommonKVManager):
             cpu_count = os.cpu_count()
             transfer_thread_pool_size = get_int_env_var(
                 "SGLANG_DISAGGREGATION_THREAD_POOL_SIZE",
-                min(max(4, int(0.75 * cpu_count) // 8), 12),
+                min(max(4, int(0.5 * cpu_count) // 8), 12),
             )
             transfer_queue_size = get_int_env_var("SGLANG_DISAGGREGATION_QUEUE_SIZE", 4)
             self.transfer_queues: List[FastQueue] = [
@@ -190,9 +190,6 @@ class MooncakeKVManager(CommonKVManager):
                 )
                 for _ in range(transfer_queue_size)
             ]
-            self.state_executors = concurrent.futures.ThreadPoolExecutor(
-                transfer_thread_pool_size // transfer_queue_size
-            )
             for queue, executor in zip(self.transfer_queues, self.executors):
                 threading.Thread(
                     target=self.transfer_worker, args=(queue, executor), daemon=True
@@ -662,7 +659,7 @@ class MooncakeKVManager(CommonKVManager):
                 item_lens=self.kv_args.state_item_lens,
                 prefill_data_indices=prefill_state_indices,
                 dst_data_indices=dst_state_indices,
-                executor=self.state_executors,
+                executor=self.executors,
             )
         else:
             return 0
@@ -1257,6 +1254,13 @@ class MooncakeKVReceiver(CommonKVReceiver):
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
     ):
+        if self.bootstrap_infos is None:
+            self.kv_mgr.record_failure(
+                self.bootstrap_room,
+                f"Could not fetch prefill parallel info from bootstrap_addr: {self.bootstrap_addr}",
+            )
+            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+
         for bootstrap_info in self.bootstrap_infos:
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             is_dummy = bootstrap_info["is_dummy"]
