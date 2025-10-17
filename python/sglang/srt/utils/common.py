@@ -2922,7 +2922,7 @@ def get_cpu_ids_by_node():
 def is_shm_available(dtype, world_size, local_size):
     return (
         cpu_has_amx_support()
-        and dtype in [torch.bfloat16, torch.float]
+        and dtype in [torch.bfloat16, torch.float16, torch.float]
         and world_size >= 1
         and world_size == local_size
     )
@@ -3272,9 +3272,9 @@ def json_list_type(value):
 
 
 @contextmanager
-def temp_set_cuda_visible_devices(gpu_id: int):
+def maybe_reindex_device_id(gpu_id: int):
 
-    if envs.SGLANG_ONE_DEVICE_PER_PROCESS.get() is False:
+    if envs.SGLANG_ONE_DEVICE_PER_PROCESS.get() is False or not is_cuda_alike():
         yield
         return
 
@@ -3286,7 +3286,11 @@ def temp_set_cuda_visible_devices(gpu_id: int):
 
     str_gpu_id = cuda_visible_devices[gpu_id] if cuda_visible_devices else str(gpu_id)
     os.environ["CUDA_VISIBLE_DEVICES"] = str_gpu_id
-    yield
+
+    logger.debug(f"Set CUDA_VISIBLE_DEVICES to {str_gpu_id}")
+
+    yield 0
+
     if original_cuda_visible_devices:
         os.environ["CUDA_VISIBLE_DEVICES"] = original_cuda_visible_devices
     else:
