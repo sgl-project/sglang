@@ -823,8 +823,53 @@ class NativeSparseAttnBackend(AttentionBackend):
         # For fa3 interface version compatibility, we put new fields into conditional keyword args
         kwargs = {}
 
-        # Do absorbed multi-latent attention
-        assert q_rope is not None
+        # Detect if this is MHA mode by checking layer parameters
+        # MHA: layer.tp_k_head_num == layer.tp_q_head_num (multi KV heads)
+        # MLA: layer.tp_k_head_num == 1 (single KV head)
+        is_mha_mode = (layer.tp_k_head_num == layer.tp_q_head_num) and (layer.tp_k_head_num > 1)
+        
+        # Check if this is MHA_CHUNKED_KV mode
+        # Two cases:
+        # 1. attn_attend_prefix_cache=True: Processing historical chunks (k, v are decompressed)
+        # 2. attn_attend_prefix_cache=False: Processing current extend (k, v are current tokens)
+        # In both cases for MHA mode, we should NOT use MLA kernels
+        if (
+            is_mha_mode
+            and k is not None 
+            and v is not None
+            and q_rope is None  # MHA format: q/k/v without separate rope
+        ):
+            # MHA_CHUNKED_KV mode: Use standard MHA path
+            # If attn_attend_prefix_cache=True: k, v are decompressed chunks
+            # If attn_attend_prefix_cache=False: k, v are current extend tokens
+            if (
+                hasattr(forward_batch, 'attn_attend_prefix_cache') 
+                and forward_batch.attn_attend_prefix_cache
+            ):
+                # Processing historical chunks: use decompressed k, v directly
+                return self._forward_standard_mha(
+                    q=q,
+                    k=k,
+                    v=v,
+                    layer=layer,
+                    forward_batch=forward_batch,
+                    metadata=metadata,
+                    is_prefix_chunk=True,
+                )
+            else:
+                # Processing current extend: use passed-in k, v (no need to read cache)
+                # Use standard FlashAttention for current tokens only
+                return self._forward_standard_mha(
+                    q=q,
+                    k=k,
+                    v=v,
+                    layer=layer,
+                    forward_batch=forward_batch,
+                    metadata=metadata,
+                    is_prefix_chunk=False,
+                )
+
+        # Do absorbed multi-latent attention (MLA path)
         kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
 
         # when store in fp8 and compute in fp8, no need to convert dtype
@@ -1152,6 +1197,62 @@ class NativeSparseAttnBackend(AttentionBackend):
             ),
             is_fp8_kvcache=NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8,
         )
+        return o
+
+    def _forward_standard_mha(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        metadata: NSAMetadata,
+        is_prefix_chunk: bool = False,
+    ) -> torch.Tensor:
+        """
+        Handle standard MHA using FlashAttention varlen kernel.
+        Used in MHA_CHUNKED_KV mode for both current tokens and historical chunks.
+        
+        Args:
+            q: Query tensor [num_q, num_heads, head_dim]
+            k: Key tensor [num_k, num_heads, head_dim]
+            v: Value tensor [num_k, num_heads, v_head_dim]
+            is_prefix_chunk: If True, processing historical chunks (non-causal);
+                           If False, processing current extend tokens (causal)
+        """
+        # Reshape for FlashAttention
+        q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+        k = k.view(-1, layer.tp_k_head_num, layer.head_dim)
+        v = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
+        
+        # Determine metadata based on mode
+        if is_prefix_chunk:
+            # Processing historical chunks
+            chunk_idx = forward_batch.prefix_chunk_idx
+            cu_seqlens_q = metadata.nsa_cu_seqlens_q if hasattr(metadata, 'nsa_cu_seqlens_q') else metadata.cu_seqlens_q
+            cu_seqlens_k = forward_batch.prefix_chunk_cu_seq_lens[chunk_idx]
+            max_seqlen_k = forward_batch.prefix_chunk_max_seq_lens[chunk_idx]
+            causal = False  # Non-causal: current queries can see all tokens in historical chunk
+        else:
+            # Processing current extend tokens
+            cu_seqlens_q = metadata.cu_seqlens_q
+            cu_seqlens_k = metadata.cu_seqlens_k
+            max_seqlen_k = metadata.max_seq_len_k
+            causal = True  # Causal: each token can only see previous tokens in current extend
+        
+        # Use varlen FlashAttention
+        o = flash_attn_varlen_func(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=metadata.max_seq_len_q,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=layer.scaling,
+            causal=causal,
+        )
+        
         return o
 
     def _forward_tilelang(
