@@ -145,9 +145,11 @@ curl -X POST http://127.0.0.1:30000/start_profile \
 
 - `output_dir` (optional): Directory where profile traces will be saved. If not specified, uses `SGLANG_TORCH_PROFILER_DIR` environment variable, or `/tmp` as the default
 - `num_steps` (optional): Number of steps to profile. If not specified, profiling continues until manually stopped with `/end_profile`
-- `start_step` (optional): Number of steps to wait before starting profiling. Useful for skipping warmup iterations
+- `start_step` (optional): Step number at which to start profiling (inclusive). Useful for skipping warmup iterations
 - `activities` (optional): List of activities to profile, e.g., `["CPU", "GPU"]`. Default is `["CPU", "GPU"]`
 - `merge_profiles` (optional): Whether to merge distributed traces. Default is `false`
+
+**Note on step ranges:** Profiling starts at `start_step` (inclusive) and continues for `num_steps` iterations. For example, with `start_step=3` and `num_steps=10`, profiling captures steps 3, 4, 5, 6, 7, 8, 9, 10, 11, and 12 (10 steps total, starting from step 3).
 
 **Advanced usage with `start_step`:**
 
