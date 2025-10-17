@@ -164,7 +164,6 @@ class RotaryEmbedding(CustomOp):
             positions = positions + offsets
         positions = positions.flatten()
         num_tokens = positions.shape[0]
-        self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
         cos_sin = self.cos_sin_cache.index_select(0, positions)
         cos, sin = cos_sin.chunk(2, dim=-1)
 
@@ -297,6 +296,7 @@ class RotaryEmbedding(CustomOp):
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # TODO: make a wrapper, and XPU will implement this kernel later.
+        self.cos_sin_cache = self.cos_sin_cache.to(query.device)
         return self.forward_native(positions, query, key, offsets)
 
 
