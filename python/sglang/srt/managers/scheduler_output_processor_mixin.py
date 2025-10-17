@@ -13,7 +13,13 @@ from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
     BatchTokenIDOutput,
 )
-from sglang.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import (
+    BaseFinishReason,
+    Req,
+    RequestStage,
+    ScheduleBatch,
+)
+from sglang.srt.tracing.trace import trace_slice
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import (
@@ -145,6 +151,14 @@ class SchedulerOutputProcessorMixin:
                             )
                             self.abort_request(AbortReq(rid=req.rid))
                         req.grammar.finished = req.finished()
+
+                    trace_slice(
+                        RequestStage.PREFILL_FORWARD,
+                        req.rid,
+                        auto_next_anon=not req.finished(),
+                        thread_finish_flag=req.finished(),
+                    )
+
                 else:
                     # being chunked reqs' prefill is not finished
                     req.is_chunked -= 1
@@ -173,6 +187,12 @@ class SchedulerOutputProcessorMixin:
                                 )
                             logprob_pt += num_input_logprobs
 
+                    trace_slice(
+                        RequestStage.PREFILL_CHUNKED_FORWARD,
+                        req.rid,
+                        auto_next_anon=True,
+                    )
+
         else:  # embedding or reward model
             embeddings = result.embeddings.tolist()
 
@@ -194,6 +214,13 @@ class SchedulerOutputProcessorMixin:
                 else:
                     # being chunked reqs' prefill is not finished
                     req.is_chunked -= 1
+
+                trace_slice(
+                    RequestStage.PREFILL_FORWARD,
+                    req.rid,
+                    auto_next_anon=not req.finished(),
+                    thread_finish_flag=req.finished(),
+                )
 
         self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
 
