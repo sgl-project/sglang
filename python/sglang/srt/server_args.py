@@ -81,7 +81,7 @@ QUANTIZATION_CHOICES = [
     "bitsandbytes",
     "gguf",
     "modelopt",
-    "modelopt_fp4",
+    "modelopt_fp8" "modelopt_fp4",
     "petit_nvfp4",
     "w8a8_int8",
     "w8a8_fp8",
@@ -902,7 +902,8 @@ class ServerArgs:
                 "fa3",
                 "aiter",
                 "triton",
-            }, "fa3, aiter, or triton is required for Llama4 model"
+                "flashinfer",
+            }, "fa3, aiter, triton, or flashinfer is required for Llama4 model"
         elif model_arch in [
             "Gemma2ForCausalLM",
             "Gemma3ForCausalLM",
