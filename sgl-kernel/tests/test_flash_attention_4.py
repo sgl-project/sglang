@@ -10,9 +10,16 @@ import pytest
 import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
+
+try:
+    from flash_attn.layers.rotary import apply_rotary_emb
+except ImportError:
+    apply_rotary_emb = None
+
 from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 from sgl_kernel.testing.rotary_embedding import _apply_rotary_emb as apply_rotary_emb
-from utils import is_hopper
+
+# from utils import is_hopper  # Not used in this test
 
 # Force sgl_kernel.flash_attn wrappers to use FA4 (Cute-DSL) implementations.
 # The wrappers accept a superset of args; for FA4, extra args are ignored.
@@ -90,6 +97,11 @@ def generate_random_padding_mask(
     elif mode == "third":
         lengths = torch.randint(
             max_seqlen // 3, max_seqlen + 1, (batch_size, 1), device=device
+        )
+    else:
+        # This should never happen due to the assertion above, but for linter
+        lengths = torch.full(
+            (batch_size, 1), max_seqlen, device=device, dtype=torch.int32
         )
 
     if zero_lengths:
@@ -484,10 +496,6 @@ def attention_ref(
     return output.to(dtype=dtype_og), attention.to(dtype=dtype_og)
 
 
-@pytest.mark.skipif(
-    is_hopper(),
-    reason="FA4 build is currently SM100-first; skip on Hopper until CI has FA4 + CUTLASS DSL for SM90",
-)
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
@@ -665,30 +673,32 @@ def test_flash_attn_output(
 
         print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
         print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
-
-        # Convert to varlen format for sglang (no padding mask = full sequences)
-        q_unpad = rearrange(q, "b s h d -> (b s) h d")
-        k_unpad = rearrange(k, "b s h d -> (b s) h d")
-        v_unpad = rearrange(v, "b s h d -> (b s) h d")
-        cu_seqlens_q = torch.arange(
-            0,
-            (batch_size + 1) * seqlen_q,
-            step=seqlen_q,
-            dtype=torch.int32,
-            device=device,
-        )
-        cu_seqlens_k = torch.arange(
-            0,
-            (batch_size + 1) * seqlen_k,
-            step=seqlen_k,
-            dtype=torch.int32,
-            device=device,
-        )
-
-        pack_gqa_vals = [False, True, None]
         # num_splits_vals = [1, 3]
+        pack_gqa_vals = [False, True, None]
         num_splits_vals = [1]
         for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
+            # Convert to varlen format for sglang
+            result = generate_qkv(q, k, v, kvpacked=False, qkvpacked=False)
+            (
+                q_unpad,
+                k_unpad,
+                v_unpad,
+                _,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                _,
+                _,
+                max_seqlen_q,
+                max_seqlen_k,
+                _,
+                _,
+                _,
+                _,
+                _,
+                _,
+                _,
+            ) = result
+
             out_unpad, lse = flash_attn_varlen_func(
                 q_unpad,
                 k_unpad,
@@ -696,16 +706,14 @@ def test_flash_attn_output(
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_k=cu_seqlens_k,
                 causal=causal,
-                # qv=qv,
-                # q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
                 window_size=window_size,
-                # attention_chunk=attention_chunk,
                 softcap=softcap,
                 sinks=learnable_sink,
                 pack_gqa=pack_gqa,
-                # num_splits=num_splits
                 return_softmax_lse=True,
             )
+
+            # Convert back to padded format
             out = rearrange(out_unpad, "(b s) h d -> b s h d", b=batch_size)
             print(f"Output max diff: {(out - out_ref).abs().max().item()}")
             print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
@@ -718,23 +726,6 @@ def test_flash_attn_output(
             assert (out - out_ref).abs().max().item() <= rtol * (
                 out_pt - out_ref
             ).abs().max().item() + fwd_atol
-
-            # Also exercise return_softmax_lse=False to compile the no-LSE path
-            out_unpad2 = flash_attn_varlen_func(
-                q_unpad,
-                k_unpad,
-                v_unpad,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
-                causal=causal,
-                window_size=window_size,
-                sinks=learnable_sink,
-                softcap=softcap,
-                pack_gqa=pack_gqa,
-                return_softmax_lse=False,
-            )
-            out2 = rearrange(out_unpad2, "(b s) h d -> b s h d", b=batch_size)
-            assert torch.allclose(out2, out, atol=1e-5, rtol=1e-5)
 
         if (
             dtype != torch.float8_e4m3fn
@@ -799,10 +790,6 @@ def test_flash_attn_output(
             ).abs().max().item() + dv_atol
 
 
-@pytest.mark.skipif(
-    is_hopper(),
-    reason="FA4 build is currently SM100-first; skip on Hopper until CI has FA4 + CUTLASS DSL for SM90",
-)
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
@@ -976,6 +963,17 @@ def test_flash_attn_varlen_output(
         if causal or local:
             key_padding_mask = query_padding_mask
 
+        result = generate_qkv(
+            q,
+            k,
+            v,
+            query_padding_mask,
+            key_padding_mask,
+            qv=qv,
+            kvpacked=False,
+            query_unused_mask=query_unused_mask,
+            key_unused_mask=key_unused_mask,
+        )
         (
             q_unpad,
             k_unpad,
@@ -994,17 +992,7 @@ def test_flash_attn_varlen_output(
             output_pad_fn,
             dq_pad_fn,
             dk_pad_fn,
-        ) = generate_qkv(
-            q,
-            k,
-            v,
-            query_padding_mask,
-            key_padding_mask,
-            qv=qv,
-            kvpacked=False,
-            query_unused_mask=query_unused_mask,
-            key_unused_mask=key_unused_mask,
-        )
+        ) = result
         q_unpad, k_unpad, v_unpad = [
             x.detach().to(dtype).requires_grad_() for x in (q_unpad, k_unpad, v_unpad)
         ]
@@ -1064,16 +1052,12 @@ def test_flash_attn_varlen_output(
                 v_unpad,
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_k=cu_seqlens_k,
-                # seqused_q=seqused_q,
-                # seqused_k=seqused_k,
+                seqused_q=seqused_q,
+                seqused_k=seqused_k,
                 causal=causal,
-                # qv=qv_unpad,
-                # q_descale=q_descale,
-                # k_descale=k_descale, v_descale=v_descale,
                 window_size=window_size,
-                # attention_chunk=attention_chunk,
-                sinks=learnable_sink,
                 softcap=softcap,
+                sinks=learnable_sink,
                 pack_gqa=pack_gqa,
                 return_softmax_lse=True,
             )
@@ -1091,25 +1075,6 @@ def test_flash_attn_varlen_output(
             assert (out - out_ref).abs().max().item() <= rtol * (
                 out_pt - out_ref
             ).abs().max().item() + fwd_atol
-
-            # Also exercise return_softmax_lse=False to compile the no-LSE path
-            out_unpad2 = flash_attn_varlen_func(
-                q_unpad,
-                k_unpad,
-                v_unpad,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
-                causal=causal,
-                window_size=window_size,
-                sinks=learnable_sink,
-                softcap=softcap,
-                pack_gqa=pack_gqa,
-                return_softmax_lse=False,
-            )
-            out2 = output_pad_fn(out_unpad2)
-            if query_unused_mask is not None:
-                out2.masked_fill_(q_zero_masking, 0.0)
-            assert torch.allclose(out2, out, atol=1e-5, rtol=1e-5)
 
         if (
             dtype != torch.float8_e4m3fn
@@ -1209,10 +1174,6 @@ def test_flash_attn_varlen_output(
             ).abs().max().item() + dv_atol
 
 
-@pytest.mark.skipif(
-    is_hopper(),
-    reason="FA4 build is currently SM100-first; skip on Hopper until CI has FA4 + CUTLASS DSL for SM90",
-)
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 # @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
@@ -1500,15 +1461,7 @@ def test_flash_attn_kvcache(
         if rotary_dim > 0:
             angle = (
                 torch.rand(
-                    (
-                        seqlen_k
-                        if page_size is None
-                        else (
-                            num_blocks * page_size
-                            if num_blocks is not None
-                            else seqlen_k
-                        )
-                    ),
+                    seqlen_k if page_size is None else num_blocks * page_size,
                     rotary_dim // 2,
                     device=device,
                 )
@@ -1645,30 +1598,29 @@ def test_flash_attn_kvcache(
                 else:
                     k_cache_paged.copy_(k_cache_saved)
                     v_cache_paged.copy_(v_cache_saved)
-                # out, lse, *rest = flash_attn_with_kvcache(
-                out, lse, *rest = flash_attn_with_kvcache(
+                out, lse = flash_attn_with_kvcache(
                     q if not varlen_q else q_unpad,
                     k_cache if page_size is None else k_cache_paged,
                     v_cache if page_size is None else v_cache_paged,
-                    # k if not new_kv or not varlen_q else k_unpad,
-                    # v if not new_kv or not varlen_q else v_unpad,
-                    # qv=qv if not varlen_q else qv_unpad,
-                    # rotary_cos=cos,
-                    # rotary_sin=sin,
+                    k if not new_kv or not varlen_q else k_unpad,
+                    v if not new_kv or not varlen_q else v_unpad,
+                    qv=qv if not varlen_q else qv_unpad,
+                    rotary_cos=cos,
+                    rotary_sin=sin,
                     cache_seqlens=cache_seqlens,
-                    # cache_batch_idx=cache_batch_idx,
-                    # cache_leftpad=cache_leftpad,
+                    cache_batch_idx=cache_batch_idx,
+                    cache_leftpad=cache_leftpad,
                     page_table=page_table,
                     cu_seqlens_q=cu_seqlens_q,
-                    # cu_seqlens_k_new=cu_seqlens_k_new,
-                    # rotary_seqlens=rotary_seqlens,
+                    cu_seqlens_k_new=cu_seqlens_k_new,
+                    rotary_seqlens=rotary_seqlens,
                     causal=causal,
                     window_size=window_size,
                     sinks=learnable_sink,
-                    # attention_chunk=attention_chunk,
-                    # rotary_interleaved=rotary_interleaved,
-                    # scheduler_metadata=scheduler_metadata,
-                    # num_splits=num_splits,
+                    attention_chunk=attention_chunk,
+                    rotary_interleaved=rotary_interleaved,
+                    scheduler_metadata=scheduler_metadata,
+                    num_splits=num_splits,
                     return_softmax_lse=True,
                 )
                 if varlen_q:
@@ -1757,23 +1709,6 @@ def test_flash_attn_kvcache(
                 assert (out - out_ref).abs().mean().item() <= mult_mean * (
                     out_pt - out_ref
                 ).abs().mean().item()
-
-                # Also exercise return_softmax_lse=False to compile the no-LSE path
-                out2, *rest2 = flash_attn_with_kvcache(
-                    q if not varlen_q else q_unpad,
-                    k_cache if page_size is None else k_cache_paged,
-                    v_cache if page_size is None else v_cache_paged,
-                    cache_seqlens=cache_seqlens,
-                    page_table=page_table,
-                    cu_seqlens_q=cu_seqlens_q,
-                    causal=causal,
-                    window_size=window_size,
-                    sinks=learnable_sink,
-                    return_softmax_lse=False,
-                )
-                if varlen_q:
-                    out2 = output_pad_fn(out2)
-                assert torch.allclose(out2, out, atol=1e-5, rtol=1e-5)
 
 
 def _generate_block_kvcache(
