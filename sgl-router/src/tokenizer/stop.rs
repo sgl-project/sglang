@@ -176,7 +176,7 @@ impl StopSequenceDecoder {
                 let suffix = &self.jail_buffer[suffix_start..];
 
                 if stop_seq.starts_with(suffix)
-                    && best_split_pos.map_or(true, |current| suffix_start < current)
+                    && best_split_pos.is_none_or(|current| suffix_start < current)
                 {
                     best_split_pos = Some(suffix_start);
                     break;
@@ -552,6 +552,24 @@ mod tests {
     }
 
     #[test]
+    fn test_utf8_multibyte_en_dash_character() {
+        // Test for: byte index 3 is not a char boundary; it is inside '–' (bytes 1..4) of ` –`
+        // '–' (U+2013 EN DASH) is encoded as [0xE2, 0x80, 0x93] (3 bytes)
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let config = StopSequenceConfig::default().with_stop_sequence(" –");
+
+        let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
+
+        // Process tokens - should not panic when checking partial matches
+        let result = decoder.process_token(1);
+        assert!(result.is_ok());
+        let result = decoder.process_token(2);
+        assert!(result.is_ok());
+        let result = decoder.process_token(3);
+        assert!(result.is_ok());
+    }
+
+    #[test]
     fn test_utf8_multibyte_various_characters() {
         // Comprehensive test with multiple multi-byte UTF-8 characters
         // Tests 2-byte, 3-byte, and 4-byte UTF-8 sequences
@@ -560,6 +578,7 @@ mod tests {
             ("Δ", "Greek Delta - 2 bytes"),
             ("°", "degree sign - 2 bytes"),
             ("∆", "increment - 3 bytes"),
+            ("–", "en dash - 3 bytes"),
             ("€", "euro sign - 3 bytes"),
             ("中", "Chinese character - 3 bytes"),
             ("🚀", "rocket emoji - 4 bytes"),
