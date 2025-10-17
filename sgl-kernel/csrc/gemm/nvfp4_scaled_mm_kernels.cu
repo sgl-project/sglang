@@ -51,7 +51,8 @@ inline uint32_t next_pow_2(uint32_t x) {
   return x + 1;
 }
 
-#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || \
+    defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
 // Config(half_t/bfloat16_t) for M <= 128
 template <typename T>
 struct KernelConfigM128 {
@@ -236,25 +237,40 @@ struct Fp4GemmSm120 {
   using ClusterShape = typename Config::ClusterShape;
   using PerSmTileShape_MNK = typename Config::PerSmTileShape_MNK;
 
-  using CollectiveEpilogue =
-      typename cutlass::epilogue::collective::CollectiveBuilder<
-          ArchTag, OperatorClass, PerSmTileShape_MNK, ClusterShape,
-          cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator,
-          ElementAccumulator, ElementC, LayoutCTag, AlignmentC, ElementD,
-          LayoutDTag, AlignmentD,
-          cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
+  using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+      ArchTag,
+      OperatorClass,
+      PerSmTileShape_MNK,
+      ClusterShape,
+      cutlass::epilogue::collective::EpilogueTileAuto,
+      ElementAccumulator,
+      ElementAccumulator,
+      ElementC,
+      LayoutCTag,
+      AlignmentC,
+      ElementD,
+      LayoutDTag,
+      AlignmentD,
+      cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
 
-  using CollectiveMainloop =
-      typename cutlass::gemm::collective::CollectiveBuilder<
-          ArchTag, OperatorClass, ElementA, LayoutATag, AlignmentA, ElementB,
-          LayoutBTag, AlignmentB, ElementAccumulator, MmaTileShape,
-          ClusterShape,
-          cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
-              sizeof(typename CollectiveEpilogue::SharedStorage))>,
-          cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
+  using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+      ArchTag,
+      OperatorClass,
+      ElementA,
+      LayoutATag,
+      AlignmentA,
+      ElementB,
+      LayoutBTag,
+      AlignmentB,
+      ElementAccumulator,
+      MmaTileShape,
+      ClusterShape,
+      cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
+          sizeof(typename CollectiveEpilogue::SharedStorage))>,
+      cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
 
-  using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
-      Shape<int, int, int, int>, CollectiveMainloop, CollectiveEpilogue, void>;
+  using GemmKernel =
+      cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, CollectiveMainloop, CollectiveEpilogue, void>;
 
   using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 };
@@ -367,30 +383,27 @@ typename Gemm::Arguments args_from_options_sm120(
   using StrideC = typename Gemm::GemmKernel::StrideC;
   using StrideD = typename Gemm::GemmKernel::StrideD;
 
-  using Sm1xxBlkScaledConfig =
-      typename Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
+  using Sm1xxBlkScaledConfig = typename Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
 
   auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, {M, K, 1});
   auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, {N, K, 1});
   auto stride_D = cutlass::make_cute_packed_stride(StrideD{}, {M, N, 1});
 
-  auto layout_SFA = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(
-      cute::make_shape(M, N, K, 1));
-  auto layout_SFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(
-      cute::make_shape(M, N, K, 1));
+  auto layout_SFA = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(cute::make_shape(M, N, K, 1));
+  auto layout_SFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(cute::make_shape(M, N, K, 1));
 
   typename Gemm::Arguments arguments{
       cutlass::gemm::GemmUniversalMode::kGemm,
       {M, N, K, 1},
-      {static_cast<ElementA const*>(A.data_ptr()), stride_A,
-       static_cast<ElementB const*>(B.data_ptr()), stride_B,
-       static_cast<ElementSFA const*>(A_sf.data_ptr()), layout_SFA,
-       static_cast<ElementSFB const*>(B_sf.data_ptr()), layout_SFB},
-      {{},
-       static_cast<ElementD const*>(D.data_ptr()),
-       stride_D,
-       static_cast<ElementD*>(D.data_ptr()),
-       stride_D}};
+      {static_cast<ElementA const*>(A.data_ptr()),
+       stride_A,
+       static_cast<ElementB const*>(B.data_ptr()),
+       stride_B,
+       static_cast<ElementSFA const*>(A_sf.data_ptr()),
+       layout_SFA,
+       static_cast<ElementSFB const*>(B_sf.data_ptr()),
+       layout_SFB},
+      {{}, static_cast<ElementD const*>(D.data_ptr()), stride_D, static_cast<ElementD*>(D.data_ptr()), stride_D}};
   auto& fusion_args = arguments.epilogue.thread;
   fusion_args.alpha_ptr = static_cast<ElementCompute const*>(alpha.data_ptr());
 
@@ -415,8 +428,7 @@ void runGemmSm120(
   auto arguments = args_from_options_sm120<Gemm>(D, A, B, A_sf, B_sf, alpha, M, N, K);
 
   size_t workspace_size = Gemm::get_workspace_size(arguments);
-  auto const workspace_options =
-      torch::TensorOptions().dtype(torch::kUInt8).device(A.device());
+  auto const workspace_options = torch::TensorOptions().dtype(torch::kUInt8).device(A.device());
   auto workspace = torch::empty(workspace_size, workspace_options);
 
   CUTLASS_CHECK(gemm.can_implement(arguments));
@@ -468,12 +480,17 @@ void cutlassFp4GemmDispatch<float>(
 }
 
 // SM120 specific dispatch functions
-void cutlass_fp4_bf16_gemm_dispatch_sm120(torch::Tensor& D, torch::Tensor const& A,
-                                          torch::Tensor const& B,
-                                          torch::Tensor const& A_sf,
-                                          torch::Tensor const& B_sf,
-                                          torch::Tensor const& alpha, int m, int n,
-                                          int k, cudaStream_t stream) {
+void cutlass_fp4_bf16_gemm_dispatch_sm120(
+    torch::Tensor& D,
+    torch::Tensor const& A,
+    torch::Tensor const& B,
+    torch::Tensor const& A_sf,
+    torch::Tensor const& B_sf,
+    torch::Tensor const& alpha,
+    int m,
+    int n,
+    int k,
+    cudaStream_t stream) {
   uint32_t const mp2 = std::max(static_cast<uint32_t>(16), next_pow_2(m));
   if (mp2 <= 256) {
     runGemmSm120<Fp4GemmSm120<sm120_fp4_config_M256, cutlass::bfloat16_t>::Gemm>(
@@ -484,12 +501,17 @@ void cutlass_fp4_bf16_gemm_dispatch_sm120(torch::Tensor& D, torch::Tensor const&
   }
 }
 
-void cutlass_fp4_f16_gemm_dispatch_sm120(torch::Tensor& D, torch::Tensor const& A,
-                                         torch::Tensor const& B,
-                                         torch::Tensor const& A_sf,
-                                         torch::Tensor const& B_sf,
-                                         torch::Tensor const& alpha, int m, int n,
-                                         int k, cudaStream_t stream) {
+void cutlass_fp4_f16_gemm_dispatch_sm120(
+    torch::Tensor& D,
+    torch::Tensor const& A,
+    torch::Tensor const& B,
+    torch::Tensor const& A_sf,
+    torch::Tensor const& B_sf,
+    torch::Tensor const& alpha,
+    int m,
+    int n,
+    int k,
+    cudaStream_t stream) {
   uint32_t const mp2 = std::max(static_cast<uint32_t>(16), next_pow_2(m));
   if (mp2 <= 256) {
     runGemmSm120<Fp4GemmSm120<sm120_fp4_config_M256, cutlass::half_t>::Gemm>(
@@ -518,7 +540,8 @@ void cutlassFp4GemmDispatch(
       "Unsupported CUTLASS version. Set VLLM_CUTLASS_SRC_DIR to "
       "a CUTLASS 3.8 source directory to enable support.");
 }
-#endif  // defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
+#endif  // defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) ||
+        // defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
 
 // Undefine macros from utils.h to redefine with custom signatures
 #undef CHECK_CONTIGUOUS
@@ -639,7 +662,7 @@ void cutlass_scaled_fp4_mm_sm100_sm120(
 
   // Check SM version and dispatch accordingly
   auto sm_version = getSMVersion();
-  
+
   if (sm_version == 120) {
     // Use SM120 specific dispatch
     if (out_dtype == at::ScalarType::Half) {

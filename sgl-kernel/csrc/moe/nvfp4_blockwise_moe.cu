@@ -201,14 +201,13 @@ void run_fp4_blockwise_scaled_group_mm_sm120(
   using ElementB = cutlass::nv_float4_t<cutlass::float_e2m1_t>;
 
   using ElementC = cutlass::bfloat16_t;
-  using ElementD = cutlass::bfloat16_t;  
+  using ElementD = cutlass::bfloat16_t;
   using ElementAccumulator = float;
   // Layout definitions
   using LayoutA = cutlass::layout::RowMajor;
   using LayoutB = cutlass::layout::ColumnMajor;
   using LayoutC = cutlass::layout::RowMajor;
-  using LayoutD = cutlass::layout::RowMajor;  
-
+  using LayoutD = cutlass::layout::RowMajor;
 
   // Alignment constraints
   static constexpr int AlignmentA = 32;
@@ -218,38 +217,48 @@ void run_fp4_blockwise_scaled_group_mm_sm120(
 
   // Architecture definitions
   using ArchTag = cutlass::arch::Sm120;
-  using OperatorClass       = cutlass::arch::OpClassBlockScaledTensorOp;  
-  using StageCountType = cutlass::gemm::collective::StageCountAuto;    
-  using ThreadBlockShape    = Shape<_128,_128,_128>;  
-                                                                              // on the tile size
+  using OperatorClass = cutlass::arch::OpClassBlockScaledTensorOp;
+  using StageCountType = cutlass::gemm::collective::StageCountAuto;
+  using ThreadBlockShape = Shape<_128, _128, _128>;
+  // on the tile size
 
   using ClusterShape = Shape<_1, _1, _1>;
 
-  using FusionOperation = cutlass::epilogue::fusion::LinearCombination<
-      ElementD, ElementAccumulator, ElementC, ElementAccumulator>;
+  using FusionOperation =
+      cutlass::epilogue::fusion::LinearCombination<ElementD, ElementAccumulator, ElementC, ElementAccumulator>;
 
-    using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
-        ArchTag, OperatorClass,
-        ThreadBlockShape, ClusterShape,
-        cutlass::epilogue::collective::EpilogueTileAuto,
-        ElementAccumulator, ElementAccumulator,
-        ElementC, LayoutC *, AlignmentC,
-        ElementD, LayoutC *, AlignmentD,
-        cutlass::epilogue::collective::EpilogueScheduleAuto,
-        FusionOperation
-    >::CollectiveOp;
+  using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+      ArchTag,
+      OperatorClass,
+      ThreadBlockShape,
+      ClusterShape,
+      cutlass::epilogue::collective::EpilogueTileAuto,
+      ElementAccumulator,
+      ElementAccumulator,
+      ElementC,
+      LayoutC*,
+      AlignmentC,
+      ElementD,
+      LayoutC*,
+      AlignmentD,
+      cutlass::epilogue::collective::EpilogueScheduleAuto,
+      FusionOperation>::CollectiveOp;
 
-    using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
-    ArchTag, OperatorClass,
-    ElementA, LayoutA *, AlignmentA,
-    ElementB, LayoutB *, AlignmentB,
-    ElementAccumulator,
-    ThreadBlockShape, ClusterShape,
-    cutlass::gemm::collective::StageCountAutoCarveout<
-    static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
-    cutlass::gemm::KernelPtrArrayTmaWarpSpecializedPingpong
-  >::CollectiveOp;
-  
+  using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+      ArchTag,
+      OperatorClass,
+      ElementA,
+      LayoutA*,
+      AlignmentA,
+      ElementB,
+      LayoutB*,
+      AlignmentB,
+      ElementAccumulator,
+      ThreadBlockShape,
+      ClusterShape,
+      cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
+          sizeof(typename CollectiveEpilogue::SharedStorage))>,
+      cutlass::gemm::KernelPtrArrayTmaWarpSpecializedPingpong>::CollectiveOp;
 
   using GemmKernel = cutlass::gemm::kernel::GemmUniversal<ProblemShape, CollectiveMainloop, CollectiveEpilogue>;
 
@@ -330,7 +339,7 @@ void run_fp4_blockwise_scaled_group_mm_sm120(
       static_cast<const ElementSFType**>(b_scales_ptrs.data_ptr()),
       reinterpret_cast<LayoutSFB*>(layout_sfb.data_ptr())};
 
-  // Epilogue Arguments 
+  // Epilogue Arguments
   typename GemmKernel::EpilogueArguments epilogue_args{
       {},  // epilogue.thread
       nullptr,
@@ -340,7 +349,7 @@ void run_fp4_blockwise_scaled_group_mm_sm120(
   auto& fusion_args = epilogue_args.thread;
   fusion_args.alpha_ptr_array = reinterpret_cast<float**>(alpha_ptrs.data_ptr());
   fusion_args.dAlpha = {_0{}, _0{}, 1};
-  fusion_args.beta = 0.0f; 
+  fusion_args.beta = 0.0f;
 
   // Gemm Arguments
   typename GemmKernel::Arguments args{
@@ -639,8 +648,8 @@ void cutlass_fp4_group_mm(
           M,
           N,
           K);
-      } else {
-        run_fp4_blockwise_scaled_group_mm_sm100<cutlass::half_t>(
+    } else {
+      run_fp4_blockwise_scaled_group_mm_sm100<cutlass::half_t>(
           output,
           a,
           b,
@@ -655,7 +664,7 @@ void cutlass_fp4_group_mm(
           M,
           N,
           K);
-      }
+    }
   } else if (sm_version == 120) {
     if (output.scalar_type() == torch::kBFloat16) {
       run_fp4_blockwise_scaled_group_mm_sm120(
@@ -674,12 +683,10 @@ void cutlass_fp4_group_mm(
           N,
           K);
     } else {
-    std::cout << "run_fp4_blockwise_scaled_group_mm_sm120 half no implementation" << std::endl;
+      std::cout << "run_fp4_blockwise_scaled_group_mm_sm120 half no implementation" << std::endl;
     }
   } else {
-    TORCH_CHECK_NOT_IMPLEMENTED(
-        false,
-        "Unsupported SM version: " + std::to_string(sm_version));
+    TORCH_CHECK_NOT_IMPLEMENTED(false, "Unsupported SM version: " + std::to_string(sm_version));
   }
 #else
   TORCH_CHECK_NOT_IMPLEMENTED(

@@ -568,7 +568,9 @@ void scaled_fp4_experts_quant_sm100a(
     torch::Tensor const& input_offset_by_experts,
     torch::Tensor const& output_scale_offset_by_experts) {
   auto sm_version = getSMVersion();
-  TORCH_CHECK(sm_version == 100 || sm_version == 103 || sm_version == 120, "fp4_quant is only supported on sm100a/sm103a/sm120a");
+  TORCH_CHECK(
+      sm_version == 100 || sm_version == 103 || sm_version == 120,
+      "fp4_quant is only supported on sm100a/sm103a/sm120a");
 
   CHECK_INPUT(output, "output must be a CUDA tensor");
   CHECK_INPUT(output_scale, "output_scale must be a CUDA tensor");
@@ -652,7 +654,9 @@ void silu_and_mul_scaled_fp4_experts_quant_sm100a(
     torch::Tensor const& mask,
     bool use_silu_and_mul) {
   auto sm_version = getSMVersion();
-  TORCH_CHECK(sm_version == 100 || sm_version == 103 || sm_version == 120, "fp4_quant is only supported on sm100a/sm103a/sm120a");
+  TORCH_CHECK(
+      sm_version == 100 || sm_version == 103 || sm_version == 120,
+      "fp4_quant is only supported on sm100a/sm103a/sm120a");
 
   CHECK_INPUT(output, "output must be a CUDA tensor");
   CHECK_INPUT(output_scale, "output_scale must be a CUDA tensor");

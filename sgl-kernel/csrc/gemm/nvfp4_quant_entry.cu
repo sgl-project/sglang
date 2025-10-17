@@ -16,10 +16,11 @@ limitations under the License.
 #include <torch/all.h>
 
 #if defined ENABLE_NVFP4 && ENABLE_NVFP4
-void scaled_fp4_quant_sm100_sm120(torch::Tensor const& output,
-                                  torch::Tensor const& input,
-                                  torch::Tensor const& output_sf,
-                                  torch::Tensor const& input_sf);
+void scaled_fp4_quant_sm100_sm120(
+    torch::Tensor const& output,
+    torch::Tensor const& input,
+    torch::Tensor const& output_sf,
+    torch::Tensor const& input_sf);
 
 void scaled_fp4_experts_quant_sm100a(
     torch::Tensor& output,

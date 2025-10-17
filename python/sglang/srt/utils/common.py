@@ -170,8 +170,10 @@ is_hopper_with_cuda_12_3 = lambda: _check(9)
 def is_blackwell():
     if not is_cuda():
         return False
-    return torch.cuda.get_device_capability()[0] == 10 or torch.cuda.get_device_capability()[0] == 12
-
+    return (
+        torch.cuda.get_device_capability()[0] == 10
+        or torch.cuda.get_device_capability()[0] == 12
+    )
 
 @lru_cache(maxsize=1)
 def is_sm100_supported(device=None) -> bool:

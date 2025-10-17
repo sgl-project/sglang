@@ -29,7 +29,6 @@ from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     cutlass_fp8_supported,
 )
-from sglang.srt.utils import is_blackwell
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import (
@@ -39,7 +38,7 @@ from sglang.srt.layers.quantization.utils import (
     requantize_with_max_scale,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.utils import get_bool_env_var, is_cuda, next_power_of_2
+from sglang.srt.utils import get_bool_env_var, is_blackwell, is_cuda, next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE

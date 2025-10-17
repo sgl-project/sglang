@@ -25,19 +25,29 @@ void cutlass_scaled_fp4_mm_sm100_sm120(
     torch::Tensor const& alpha);
 
 // SM120 specific dispatch functions
-void cutlass_fp4_bf16_gemm_dispatch_sm120(torch::Tensor& D, torch::Tensor const& A,
-                                          torch::Tensor const& B,
-                                          torch::Tensor const& A_sf,
-                                          torch::Tensor const& B_sf,
-                                          torch::Tensor const& alpha, int m, int n,
-                                          int k, cudaStream_t stream);
+void cutlass_fp4_bf16_gemm_dispatch_sm120(
+    torch::Tensor& D,
+    torch::Tensor const& A,
+    torch::Tensor const& B,
+    torch::Tensor const& A_sf,
+    torch::Tensor const& B_sf,
+    torch::Tensor const& alpha,
+    int m,
+    int n,
+    int k,
+    cudaStream_t stream);
 
-void cutlass_fp4_f16_gemm_dispatch_sm120(torch::Tensor& D, torch::Tensor const& A,
-                                         torch::Tensor const& B,
-                                         torch::Tensor const& A_sf,
-                                         torch::Tensor const& B_sf,
-                                         torch::Tensor const& alpha, int m, int n,
-                                         int k, cudaStream_t stream);
+void cutlass_fp4_f16_gemm_dispatch_sm120(
+    torch::Tensor& D,
+    torch::Tensor const& A,
+    torch::Tensor const& B,
+    torch::Tensor const& A_sf,
+    torch::Tensor const& B_sf,
+    torch::Tensor const& alpha,
+    int m,
+    int n,
+    int k,
+    cudaStream_t stream);
 #endif
 
 void cutlass_scaled_fp4_mm(
