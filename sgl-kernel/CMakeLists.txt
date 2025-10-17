@@ -60,6 +60,7 @@ FetchContent_Declare(
 )
 FetchContent_Populate(repo-deepgemm)
 
+# fmt
 FetchContent_Declare(
     repo-fmt
     GIT_REPOSITORY https://github.com/fmtlib/fmt
@@ -113,6 +114,15 @@ FetchContent_Declare(
 )
 FetchContent_Populate(repo-mscclpp)
 
+# fast-hadamard-transform
+FetchContent_Declare(
+    repo-fast-hadamard-transform
+    GIT_REPOSITORY https://github.com/sgl-project/fast-hadamard-transform.git
+    GIT_TAG 48f3c13764dc2ec662ade842a4696a90a137f1bc
+    GIT_SHALLOW OFF
+)
+FetchContent_Populate(repo-fast-hadamard-transform)
+
 # ccache option
 option(ENABLE_CCACHE "Whether to use ccache" ON)
 find_program(CCACHE_FOUND ccache)
@@ -138,6 +148,7 @@ include_directories(
     ${repo-flashinfer_SOURCE_DIR}/include
     ${repo-flashinfer_SOURCE_DIR}/csrc
     ${repo-mscclpp_SOURCE_DIR}/include
+    ${repo-fast-hadamard-transform}/csrc
 )
 
 set(SGL_KERNEL_CUDA_FLAGS
@@ -271,6 +282,8 @@ set(SOURCES
     "csrc/elementwise/topk.cu"
     "csrc/common_extension.cc"
 
+    "csrc/quantization/gguf/gguf_kernel.cu"
+
     "csrc/gemm/awq_kernel.cu"
     "csrc/gemm/bmm_fp8.cu"
     "csrc/gemm/dsv3_fused_a_gemm.cu"
@@ -306,6 +319,7 @@ set(SOURCES
     "csrc/moe/marlin_moe_wna16/ops.cu"
     "csrc/moe/moe_align_kernel.cu"
     "csrc/moe/moe_fused_gate.cu"
+    "csrc/moe/moe_sum.cu"
     "csrc/moe/moe_sum_reduce.cu"
     "csrc/moe/moe_topk_softmax_kernels.cu"
     "csrc/moe/nvfp4_blockwise_moe.cu"
@@ -320,9 +334,14 @@ set(SOURCES
     "csrc/speculative/packbit.cu"
     "csrc/speculative/speculative_sampling.cu"
 
+    "csrc/expert_specialization/es_fp8_blockwise.cu"
+
     "${repo-flashinfer_SOURCE_DIR}/csrc/norm.cu"
     "${repo-flashinfer_SOURCE_DIR}/csrc/renorm.cu"
     "${repo-flashinfer_SOURCE_DIR}/csrc/sampling.cu"
+
+    "${repo-fast-hadamard-transform_SOURCE_DIR}/csrc/fast_hadamard_transform_cuda.cu"
+    "${repo-fast-hadamard-transform_SOURCE_DIR}/csrc/fast_hadamard_transform.cpp"
 
     "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_bf16_causal_sm80.cu"
     "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_bf16_sm80.cu"

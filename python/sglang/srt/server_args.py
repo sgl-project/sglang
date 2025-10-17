@@ -13,6 +13,8 @@
 # ==============================================================================
 """The arguments of the server."""
 
+from __future__ import annotations
+
 import argparse
 import dataclasses
 import json
@@ -21,6 +23,8 @@ import os
 import random
 import tempfile
 from typing import Dict, List, Literal, Optional, Union
+
+import orjson
 
 from sglang.srt.connector import ConnectorType
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -50,6 +54,7 @@ from sglang.srt.utils.hf_transformers_utils import check_gguf_file, get_config
 from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
+
 
 # Define constants
 LOAD_FORMAT_CHOICES = [
@@ -117,6 +122,8 @@ GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 
 DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton"]
 
+DEFAULT_LORA_EVICTION_POLICY = "lru"
+
 NSA_CHOICES = ["flashmla_prefill", "flashmla_decode", "fa3", "tilelang", "aiter"]
 
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu"]
@@ -130,6 +137,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "flashinfer_cutlass",
     "flashinfer_mxfp4",
     "flashinfer_cutedsl",
+    "cutlass",
 ]
 
 
@@ -189,6 +197,7 @@ class ServerArgs:
     # HTTP server
     host: str = "127.0.0.1"
     port: int = 30000
+    grpc_mode: bool = False
     skip_server_warmup: bool = False
     warmups: Optional[str] = None
     nccl_port: Optional[int] = None
@@ -220,6 +229,8 @@ class ServerArgs:
 
     # Runtime options
     device: Optional[str] = None
+    elastic_ep_backend: Literal[None, "mooncake"] = None
+    mooncake_ib_device: Optional[str] = None
     tp_size: int = 1
     pp_size: int = 1
     pp_max_micro_batch_size: Optional[int] = None
@@ -298,7 +309,8 @@ class ServerArgs:
     ] = None
     max_loaded_loras: Optional[int] = None
     max_loras_per_batch: int = 8
-    lora_backend: str = "triton"
+    lora_backend: str = "csgmv"
+    lora_eviction_policy: str = DEFAULT_LORA_EVICTION_POLICY
     max_lora_chunk_size: Optional[int] = 16
 
     # Kernel backend
@@ -312,9 +324,11 @@ class ServerArgs:
     nsa_decode: str = "fa3"
 
     # Speculative decoding
+    enable_beta_spec: bool = False
     speculative_algorithm: Optional[str] = None
     speculative_draft_model_path: Optional[str] = None
     speculative_draft_model_revision: Optional[str] = None
+    speculative_draft_load_format: Optional[str] = None
     speculative_num_steps: Optional[int] = None
     speculative_eagle_topk: Optional[int] = None
     speculative_num_draft_tokens: Optional[int] = None
@@ -333,7 +347,7 @@ class ServerArgs:
 
     # Expert parallelism
     ep_size: int = 1
-    moe_a2a_backend: Literal["none", "deepep"] = "none"
+    moe_a2a_backend: Literal["none", "deepep", "mooncake"] = "none"
     moe_runner_backend: str = "auto"
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
     enable_flashinfer_allreduce_fusion: bool = False
@@ -357,6 +371,7 @@ class ServerArgs:
     # Mamba cache
     max_mamba_cache_size: Optional[int] = None
     mamba_ssm_dtype: str = "float32"
+    mamba_full_memory_ratio: float = 0.9
 
     # Hierarchical cache
     enable_hierarchical_cache: bool = False
@@ -416,7 +431,10 @@ class ServerArgs:
     enable_single_batch_overlap: bool = False
     tbo_token_distribution_threshold: float = 0.48
     enable_torch_compile: bool = False
+    enable_piecewise_cuda_graph: bool = False
     torch_compile_max_bs: int = 32
+    piecewise_cuda_graph_max_tokens: int = 4096
+    piecewise_cuda_graph_tokens: Optional[List[int]] = None
     torchao_config: str = ""
     enable_nan_detection: bool = False
     enable_p2p_check: bool = False
@@ -448,7 +466,6 @@ class ServerArgs:
     debug_tensor_dump_output_folder: Optional[str] = None
     debug_tensor_dump_input_file: Optional[str] = None
     debug_tensor_dump_inject: bool = False
-    debug_tensor_dump_prefill_only: bool = False
 
     # PD disaggregation: can be "null" (not disaggregated), "prefill" (prefill-only), or "decode" (decode-only)
     disaggregation_mode: Literal["null", "prefill", "decode"] = "null"
@@ -523,7 +540,7 @@ class ServerArgs:
 
         # Handle MoE configurations.
         self._handle_moe_kernel_config()
-        self._handle_deepep_moe()
+        self._handle_a2a_moe()
         self._handle_eplb_and_dispatch()
         self._handle_expert_distribution_metrics()
 
@@ -611,6 +628,16 @@ class ServerArgs:
                     self.chunked_prefill_size = 2048
                 if self.cuda_graph_max_bs is None:
                     self.cuda_graph_max_bs = 8
+            elif is_npu() and gpu_mem < 32 * 1024:
+                # Atlas A2B4
+                # (chunked_prefill_size 32k, cuda_graph_max_bs 16 if tp < 4 else 64)
+                if self.chunked_prefill_size is None:
+                    self.chunked_prefill_size = 32768
+                if self.cuda_graph_max_bs is None:
+                    if self.tp_size < 4:
+                        self.cuda_graph_max_bs = 16
+                    else:
+                        self.cuda_graph_max_bs = 64
             elif gpu_mem < 35 * 1024:
                 # A10, 4090, 5090
                 # (chunked_prefill_size 2k, cuda_graph_max_bs 16 if tp < 4 else 80)
@@ -634,6 +661,16 @@ class ServerArgs:
                         self.cuda_graph_max_bs = 32
                     else:
                         self.cuda_graph_max_bs = 160
+            elif is_npu() and gpu_mem < 64 * 1024:
+                # Atlas A2 and Atlas A3
+                # (chunked_prefill_size 32k, cuda_graph_max_bs 64 if tp < 4 else 128)
+                if self.chunked_prefill_size is None:
+                    self.chunked_prefill_size = 32768
+                if self.cuda_graph_max_bs is None:
+                    if self.tp_size < 4:
+                        self.cuda_graph_max_bs = 64
+                    else:
+                        self.cuda_graph_max_bs = 128
             elif gpu_mem < 90 * 1024:
                 # H100, A100
                 # (chunked_prefill_size 8k, cuda_graph_max_bs 256 if tp < 4 else 512)
@@ -673,6 +710,11 @@ class ServerArgs:
             self.cuda_graph_bs = self._generate_cuda_graph_batch_sizes()
         else:
             self.cuda_graph_max_bs = max(self.cuda_graph_bs)
+
+        if self.piecewise_cuda_graph_tokens is None:
+            self.piecewise_cuda_graph_tokens = (
+                self._generate_piecewise_cuda_graph_tokens()
+            )
 
         if self.mem_fraction_static is None:
             # Constant meta data (e.g., from attention backend)
@@ -752,6 +794,25 @@ class ServerArgs:
 
         return capture_bs
 
+    def _generate_piecewise_cuda_graph_tokens(self):
+        """
+        Generate the list of batch sizes for piecewise CUDA graph capture
+        based on piecewise_cuda_graph_max_tokens.
+        """
+        capture_sizes = (
+            list(range(4, 33, 4))
+            + list(range(48, 257, 16))
+            + list(range(288, 513, 32))
+            + list(range(640, 4096 + 1, 128))
+            + list(range(4352, self.piecewise_cuda_graph_max_tokens + 1, 256))
+        )
+
+        capture_sizes = [
+            s for s in capture_sizes if s <= self.piecewise_cuda_graph_max_tokens
+        ]
+
+        return capture_sizes
+
     def _handle_hpu_backends(self):
         if self.device == "hpu":
             self.attention_backend = "torch_native"
@@ -771,7 +832,32 @@ class ServerArgs:
 
         hf_config = self.get_hf_config()
         model_arch = hf_config.architectures[0]
-        if model_arch in ["GptOssForCausalLM"]:
+        if model_arch in ["DeepseekV3ForCausalLM"] and not is_deepseek_nsa(hf_config):
+            if is_cuda() and is_sm100_supported():
+                if (
+                    self.attention_backend is None
+                    and self.prefill_attention_backend is None
+                    and self.decode_attention_backend is None
+                ):
+                    self.attention_backend = "trtllm_mla"
+                    logger.info(
+                        "Use trtllm_mla as attention backend on sm100 for DeepseekV3ForCausalLM"
+                    )
+                if not self.enable_dp_attention:
+                    self.enable_flashinfer_allreduce_fusion = True
+                    logger.info(
+                        "Enable FlashInfer AllReduce Fusion on sm100 for DeepseekV3ForCausalLM"
+                    )
+                if (
+                    self.quantization == "modelopt_fp4"
+                    and self.moe_runner_backend == "auto"
+                ):
+                    self.moe_runner_backend = "flashinfer_trtllm"
+                    logger.info(
+                        "Use flashinfer_trtllm as moe runner backend on sm100 for DeepseekV3ForCausalLM"
+                    )
+
+        elif model_arch in ["GptOssForCausalLM"]:
             if (
                 self.attention_backend is None
                 and self.prefill_attention_backend is None
@@ -1028,7 +1114,7 @@ class ServerArgs:
                 "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
             )
 
-    def _handle_deepep_moe(self):
+    def _handle_a2a_moe(self):
         if self.moe_a2a_backend == "deepep":
             if self.deepep_mode == "normal":
                 logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
@@ -1036,6 +1122,12 @@ class ServerArgs:
             self.ep_size = self.tp_size
             logger.warning(
                 f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
+            )
+
+        if self.moe_a2a_backend == "mooncake":
+            self.ep_size = self.tp_size
+            logger.warning(
+                f"Mooncake MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
 
     def _handle_eplb_and_dispatch(self):
@@ -1103,11 +1195,19 @@ class ServerArgs:
                 )
             if self.max_running_requests is None:
                 self.max_running_requests = 48
-            self.disable_overlap_schedule = True
-            logger.warning(
-                "Overlap scheduler is disabled because of using "
-                "eagle speculative decoding."
-            )
+
+            if self.speculative_algorithm == "EAGLE" and self.enable_beta_spec:
+                self.disable_overlap_schedule = False
+                logger.warning(
+                    "Beta spec is enabled for eagle speculative decoding and overlap schedule is turned on."
+                )
+
+            if not self.enable_beta_spec:
+                self.disable_overlap_schedule = True
+                logger.warning(
+                    "Overlap scheduler is disabled because of using eagle3 and standalone speculative decoding."
+                )
+
             if self.enable_mixed_chunk:
                 self.enable_mixed_chunk = False
                 logger.warning(
@@ -1451,6 +1551,11 @@ class ServerArgs:
             help="The port of the HTTP server.",
         )
         parser.add_argument(
+            "--grpc-mode",
+            action="store_true",
+            help="If set, use gRPC server instead of HTTP server.",
+        )
+        parser.add_argument(
             "--skip-server-warmup",
             action="store_true",
             help="If set, skip warmup.",
@@ -1642,6 +1747,21 @@ class ServerArgs:
             type=str,
             default=ServerArgs.device,
             help="The device to use ('cuda', 'xpu', 'hpu', 'npu', 'cpu'). Defaults to auto-detection if not specified.",
+        )
+        parser.add_argument(
+            "--elastic-ep-backend",
+            type=str,
+            default=ServerArgs.elastic_ep_backend,
+            choices=["none", "mooncake"],
+            help="Specify the collective communication backend for elastic EP. Currently supports 'mooncake'.",
+        )
+        parser.add_argument(
+            "--mooncake-ib-device",
+            type=str,
+            default=ServerArgs.mooncake_ib_device,
+            help="The InfiniBand devices for Mooncake Backend transfer, accepts multiple comma-separated devices "
+            "(e.g., --mooncake-ib-device mlx5_0,mlx5_1). "
+            "Default is None, which triggers automatic device detection when Mooncake Backend is enabled.",
         )
         parser.add_argument(
             "--tensor-parallel-size",
@@ -2056,6 +2176,13 @@ class ServerArgs:
             help="If specified, it limits the maximum number of LoRA adapters loaded in CPU memory at a time. The value must be greater than or equal to `--max-loras-per-batch`.",
         )
         parser.add_argument(
+            "--lora-eviction-policy",
+            type=str,
+            default=DEFAULT_LORA_EVICTION_POLICY,
+            choices=["lru", "fifo"],
+            help="LoRA adapter eviction policy when memory pool is full. 'lru': Least Recently Used (default, better cache efficiency). 'fifo': First-In-First-Out.",
+        )
+        parser.add_argument(
             "--lora-backend",
             type=str,
             choices=LORA_BACKEND_CHOICES,
@@ -2127,6 +2254,7 @@ class ServerArgs:
         )
 
         # Speculative decoding
+        parser.add_argument("--enable-beta-spec", action="store_true")
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
@@ -2146,6 +2274,15 @@ class ServerArgs:
             help="The specific draft model version to use. It can be a branch "
             "name, a tag name, or a commit id. If unspecified, will use "
             "the default version.",
+        )
+        parser.add_argument(
+            "--speculative-draft-load-format",
+            type=str,
+            default=ServerArgs.speculative_draft_load_format,
+            choices=LOAD_FORMAT_CHOICES,
+            help="The format of the draft model weights to load. "
+            "If not specified, will use the same format as --load-format. "
+            "Use 'dummy' to initialize draft model weights with random values for profiling.",
         )
         parser.add_argument(
             "--speculative-num-steps",
@@ -2247,7 +2384,7 @@ class ServerArgs:
         parser.add_argument(
             "--moe-a2a-backend",
             type=str,
-            choices=["none", "deepep"],
+            choices=["none", "deepep", "mooncake"],
             default=ServerArgs.moe_a2a_backend,
             help="Choose the backend for MoE A2A.",
         )
@@ -2368,13 +2505,13 @@ class ServerArgs:
             choices=["float32", "bfloat16"],
             help="The data type of the SSM states in mamba cache.",
         )
-        # Args for multi-item-scoring
         parser.add_argument(
-            "--multi-item-scoring-delimiter",
-            type=int,
-            default=ServerArgs.multi_item_scoring_delimiter,
-            help="Delimiter token ID for multi-item scoring. Used to combine Query and Items into a single sequence: Query<delimiter>Item1<delimiter>Item2<delimiter>... This enables efficient batch processing of multiple items against a single query.",
+            "--mamba-full-memory-ratio",
+            type=float,
+            default=ServerArgs.mamba_full_memory_ratio,
+            help="The ratio of mamba state memory to full kv cache memory.",
         )
+
         # Hierarchical cache
         parser.add_argument(
             "--enable-hierarchical-cache",
@@ -2520,6 +2657,14 @@ class ServerArgs:
             help="Mode of offloading.",
         )
 
+        # Args for multi-item-scoring
+        parser.add_argument(
+            "--multi-item-scoring-delimiter",
+            type=int,
+            default=ServerArgs.multi_item_scoring_delimiter,
+            help="Delimiter token ID for multi-item scoring. Used to combine Query and Items into a single sequence: Query<delimiter>Item1<delimiter>Item2<delimiter>... This enables efficient batch processing of multiple items against a single query.",
+        )
+
         # Optimization/debug options
         parser.add_argument(
             "--disable-radix-cache",
@@ -2640,10 +2785,27 @@ class ServerArgs:
             help="Optimize the model with torch.compile. Experimental feature.",
         )
         parser.add_argument(
+            "--enable-piecewise-cuda-graph",
+            action="store_true",
+            help="Optimize the model with piecewise cuda graph for extend/prefill only. Experimental feature.",
+        )
+        parser.add_argument(
+            "--piecewise-cuda-graph-tokens",
+            type=json_list_type,
+            default=ServerArgs.piecewise_cuda_graph_tokens,
+            help="Set the list of tokens when using piecewise cuda graph.",
+        )
+        parser.add_argument(
             "--torch-compile-max-bs",
             type=int,
             default=ServerArgs.torch_compile_max_bs,
             help="Set the maximum batch size when using torch compile.",
+        )
+        parser.add_argument(
+            "--piecewise-cuda-graph-max-tokens",
+            type=int,
+            default=ServerArgs.piecewise_cuda_graph_max_tokens,
+            help="Set the maximum tokens when using piecewise cuda graph.",
         )
         parser.add_argument(
             "--torchao-config",
@@ -2773,11 +2935,6 @@ class ServerArgs:
             type=str,
             default=ServerArgs.debug_tensor_dump_inject,
             help="Inject the outputs from jax as the input of every layer.",
-        )
-        parser.add_argument(
-            "--debug-tensor-dump-prefill-only",
-            action="store_true",
-            help="Only dump the tensors for prefill requests (i.e. batch size > 1).",
         )
         parser.add_argument(
             "--enable-dynamic-batch-tokenizer",
@@ -2987,7 +3144,7 @@ class ServerArgs:
             self.model_path,
             trust_remote_code=self.trust_remote_code,
             revision=self.revision,
-            model_override_args=json.loads(self.json_model_override_args),
+            model_override_args=orjson.loads(self.json_model_override_args),
             **kwargs,
         )
         return hf_config
@@ -3273,6 +3430,22 @@ class ServerArgs:
         )
 
 
+# NOTE: This is a global variable to hold the server args for scheduler.
+_global_server_args: Optional[ServerArgs] = None
+
+
+def set_global_server_args_for_scheduler(server_args: ServerArgs):
+    global _global_server_args
+    _global_server_args = server_args
+
+
+def get_global_server_args() -> ServerArgs:
+    if _global_server_args is None:
+        raise ValueError("Global server args is not set yet!")
+
+    return _global_server_args
+
+
 def prepare_server_args(argv: List[str]) -> ServerArgs:
     """
     Prepare the server arguments from the command line arguments.
@@ -3307,11 +3480,12 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
     raw_args = parser.parse_args(argv)
-    server_args = ServerArgs.from_cli_args(raw_args)
-    return server_args
+
+    return ServerArgs.from_cli_args(raw_args)
 
 
 ZMQ_TCP_PORT_DELTA = 233
+DP_ATTENTION_HANDSHAKE_PORT_DELTA = 5
 
 
 @dataclasses.dataclass
@@ -3336,7 +3510,11 @@ class PortArgs:
     tokenizer_worker_ipc_name: Optional[str]
 
     @staticmethod
-    def init_new(server_args, dp_rank: Optional[int] = None) -> "PortArgs":
+    def init_new(
+        server_args: ServerArgs,
+        dp_rank: Optional[int] = None,
+        worker_ports: Optional[List[int]] = None,
+    ) -> PortArgs:
         if server_args.nccl_port is None:
             nccl_port = server_args.port + random.randint(100, 1000)
             while True:
@@ -3383,8 +3561,8 @@ class PortArgs:
                 # TokenizerManager to DataParallelController
                 scheduler_input_port = port_base + 4
             else:
-                scheduler_input_port = port_base + 4 + 1 + dp_rank
-
+                assert worker_ports is not None
+                scheduler_input_port = worker_ports[dp_rank]
             return PortArgs(
                 tokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base}",
                 scheduler_input_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port}",

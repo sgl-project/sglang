@@ -1,6 +1,7 @@
 import argparse
 import dataclasses
 import logging
+import os
 from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -83,12 +84,23 @@ class RouterArgs:
     cb_timeout_duration_secs: int = 60
     cb_window_duration_secs: int = 120
     disable_circuit_breaker: bool = False
-    # Tokenizer configuration
     model_path: Optional[str] = None
     tokenizer_path: Optional[str] = None
-    # Parser configuration
+    chat_template: Optional[str] = None
     reasoning_parser: Optional[str] = None
     tool_call_parser: Optional[str] = None
+    # Backend selection
+    backend: str = "sglang"
+    # History backend configuration
+    history_backend: str = "memory"
+    oracle_wallet_path: Optional[str] = None
+    oracle_tns_alias: Optional[str] = None
+    oracle_connect_descriptor: Optional[str] = None
+    oracle_username: Optional[str] = None
+    oracle_password: Optional[str] = None
+    oracle_pool_min: int = 1
+    oracle_pool_max: int = 16
+    oracle_pool_timeout_secs: int = 30
 
     @staticmethod
     def add_cli_args(
@@ -450,6 +462,12 @@ class RouterArgs:
             help="Explicit tokenizer path (overrides model_path tokenizer if provided)",
         )
         parser.add_argument(
+            f"--{prefix}chat-template",
+            type=str,
+            default=None,
+            help="Chat template path (optional)",
+        )
+        parser.add_argument(
             f"--{prefix}reasoning-parser",
             type=str,
             default=None,
@@ -460,6 +478,73 @@ class RouterArgs:
             type=str,
             default=None,
             help="Specify the parser for handling tool-call interactions",
+        )
+        # Backend selection
+        parser.add_argument(
+            f"--{prefix}backend",
+            type=str,
+            default=RouterArgs.backend,
+            choices=["sglang", "openai"],
+            help="Backend runtime to use (default: sglang)",
+        )
+        # History backend configuration
+        parser.add_argument(
+            f"--{prefix}history-backend",
+            type=str,
+            default=RouterArgs.history_backend,
+            choices=["memory", "none", "oracle"],
+            help="History storage backend for conversations and responses (default: memory)",
+        )
+        # Oracle configuration
+        parser.add_argument(
+            f"--{prefix}oracle-wallet-path",
+            type=str,
+            default=os.getenv("ATP_WALLET_PATH"),
+            help="Path to Oracle ATP wallet directory (env: ATP_WALLET_PATH)",
+        )
+        parser.add_argument(
+            f"--{prefix}oracle-tns-alias",
+            type=str,
+            default=os.getenv("ATP_TNS_ALIAS"),
+            help="Oracle TNS alias from tnsnames.ora (env: ATP_TNS_ALIAS).",
+        )
+        parser.add_argument(
+            f"--{prefix}oracle-connect-descriptor",
+            type=str,
+            default=os.getenv("ATP_DSN"),
+            help="Oracle connection descriptor/DSN (full connection string) (env: ATP_DSN)",
+        )
+        parser.add_argument(
+            f"--{prefix}oracle-username",
+            type=str,
+            default=os.getenv("ATP_USER"),
+            help="Oracle database username (env: ATP_USER)",
+        )
+        parser.add_argument(
+            f"--{prefix}oracle-password",
+            type=str,
+            default=os.getenv("ATP_PASSWORD"),
+            help="Oracle database password (env: ATP_PASSWORD)",
+        )
+        parser.add_argument(
+            f"--{prefix}oracle-pool-min",
+            type=int,
+            default=int(os.getenv("ATP_POOL_MIN", RouterArgs.oracle_pool_min)),
+            help="Minimum Oracle connection pool size (default: 1, env: ATP_POOL_MIN)",
+        )
+        parser.add_argument(
+            f"--{prefix}oracle-pool-max",
+            type=int,
+            default=int(os.getenv("ATP_POOL_MAX", RouterArgs.oracle_pool_max)),
+            help="Maximum Oracle connection pool size (default: 16, env: ATP_POOL_MAX)",
+        )
+        parser.add_argument(
+            f"--{prefix}oracle-pool-timeout-secs",
+            type=int,
+            default=int(
+                os.getenv("ATP_POOL_TIMEOUT_SECS", RouterArgs.oracle_pool_timeout_secs)
+            ),
+            help="Oracle connection pool timeout in seconds (default: 30, env: ATP_POOL_TIMEOUT_SECS)",
         )
 
     @classmethod
