@@ -104,14 +104,6 @@ cu130_all = [
   "sglang[cu130]"
 ]
 
-
-# The following will be deprecated in 2 weeks
-dev = ["sglang[test]", "sglang[decord]"]
-all_aarch64 = ["sglang[test]"]
-blackwell = ["sglang[test]", "sglang[decord]"]
-blackwell_aarch64 = ["sglang[test]"]
-
-
 [project.urls]
 "Homepage" = "https://github.com/sgl-project/sglang"
 "Bug Tracker" = "https://github.com/sgl-project/sglang/issues"
