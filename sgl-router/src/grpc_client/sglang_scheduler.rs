@@ -132,7 +132,6 @@ impl SglangSchedulerClient {
         };
 
         let channel = Channel::from_shared(http_endpoint)?
-            .timeout(Duration::from_secs(3600)) // 1 hr timeout for connection
             .http2_keep_alive_interval(Duration::from_secs(30))
             .keep_alive_timeout(Duration::from_secs(10))
             .keep_alive_while_idle(true)
