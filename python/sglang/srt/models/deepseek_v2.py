@@ -2972,7 +2972,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                 )
                 if weight_block_size is not None:
                     assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
-                    if _is_hip:
+                    if _is_fp8_fnuz:
                         weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
                             weight=w,
                             weight_scale=self_attn.kv_b_proj.weight_scale_inv,
