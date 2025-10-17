@@ -23,6 +23,8 @@ if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.server_args import ServerArgs
 
+import torch.nn.functional as F
+
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
@@ -270,6 +272,11 @@ def initialize_dp_attention(
         _LOCAL_ATTN_DP_SIZE = 1
 
     tp_group = get_tp_group()
+    is_use_pynccl = (
+        True
+        if get_bool_env_var("SGLANG_USE_DP_CP_AG_AFTER_DSA")
+        else SYNC_TOKEN_IDS_ACROSS_TP
+    )
     _ATTN_TP_GROUP = GroupCoordinator(
         [
             list(range(head, head + _ATTN_TP_SIZE))
@@ -277,7 +284,7 @@ def initialize_dp_attention(
         ],
         tp_group.local_rank,
         torch.distributed.get_backend(tp_group.device_group),
-        use_pynccl=SYNC_TOKEN_IDS_ACROSS_TP,
+        use_pynccl=is_use_pynccl,
         use_pymscclpp=False,
         use_custom_allreduce=False,
         use_torch_symm_mem=False,
@@ -543,3 +550,32 @@ def attn_tp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
 
 def attn_tp_all_gather(output_list: List[torch.Tensor], input: torch.Tensor):
     return get_attention_tp_group().all_gather(input, output_tensor_list=output_list)
+
+
+def attn_tp_all_gather_reorgan_into_tensor(
+    input_: torch.Tensor, total_len, attn_tp_size, cp_input_dict, stream_op
+):
+    max_len = (total_len + attn_tp_size - 1) // attn_tp_size
+    pad_size = max_len - input_.shape[0]
+    if pad_size > 0:
+        input_ = F.pad(input_, (0, 0, 0, pad_size), mode="constant", value=0)
+    input_tensor_all = torch.empty(
+        max_len * attn_tp_size,
+        input_.shape[1],
+        device=input_.device,
+        dtype=input_.dtype,
+    )
+    get_attention_tp_group().all_gather_into_tensor_async(
+        input_tensor_all, input_, stream_op
+    )
+    outputs_list_max = list(
+        torch.split(input_tensor_all, cp_input_dict["max_rank_len"], dim=0)
+    )
+    outputs = torch.cat(
+        [
+            outputs_list_max[index][:per_rank_len]
+            for index, per_rank_len in enumerate(cp_input_dict["per_rank_actual_token"])
+        ],
+        dim=0,
+    )
+    return outputs

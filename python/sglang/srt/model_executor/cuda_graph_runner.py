@@ -252,6 +252,7 @@ class CudaGraphRunner:
 
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
+        self.is_context_parallel = get_bool_env_var("SGLANG_USE_DP_CP_AG_AFTER_DSA")
 
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
 
@@ -783,7 +784,7 @@ class CudaGraphRunner:
             self.global_num_tokens_for_logprob_gpu.fill_(bs * self.num_tokens_per_bs)
         if enable_num_token_non_padded(self.model_runner.server_args):
             num_token_non_padded = forward_batch.num_token_non_padded
-            if self.require_gathered_buffer:
+            if self.require_gathered_buffer and not self.is_context_parallel:
                 tokens_per_rank = bs // self.attn_tp_size * self.num_tokens_per_bs
                 num_local_token_non_padded = torch.clamp(
                     num_token_non_padded - tokens_per_rank * self.attn_tp_rank,
