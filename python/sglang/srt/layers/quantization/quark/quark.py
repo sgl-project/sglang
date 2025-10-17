@@ -270,7 +270,9 @@ class QuarkConfig(QuantizationConfig):
             )
             return global_quant_config
 
-    def _get_scheme_from_config(self, config: dict[str, Any]) -> "QuarkScheme":
+    def _get_scheme_from_config(
+        self, config: dict[str, Any], layer_name: str
+    ) -> "QuarkScheme":
         if config.get("output_tensors") or config.get("bias"):
             raise NotImplementedError(
                 "Currently, Quark models with output_tensors "
@@ -278,14 +280,16 @@ class QuarkConfig(QuantizationConfig):
             )
         weight_config = cast(dict[str, Any], config.get("weight"))
         input_config = cast(dict[str, Any], config.get("input_tensors"))
+        online = cast(bool, config.get("online", False))
 
         if self._is_mx_fp4(weight_config, input_config):
-            return QuarkW4A4MXFP4(weight_config, input_config)
+            return QuarkW4A4MXFP4(weight_config, input_config, online, layer_name)
 
         raise NotImplementedError(
             "No quark compatible scheme was found. "
             f"Weight config: {weight_config}, "
-            f"Input config: {input_config}"
+            f"Input config: {input_config}, "
+            f"online: {online}"
         )
 
     def get_scheme(self, layer: torch.nn.Module, layer_name: str) -> "QuarkScheme":
@@ -293,7 +297,7 @@ class QuarkConfig(QuantizationConfig):
         layer_quant_config = self._find_matched_config(layer_name, layer)
 
         # Find the quant_scheme
-        scheme = self._get_scheme_from_config(layer_quant_config)
+        scheme = self._get_scheme_from_config(layer_quant_config, layer_name)
 
         # Raise error if device does not support the scheme
         # (e.g. fp8 needs ada lovelace)
