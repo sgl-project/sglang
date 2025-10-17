@@ -46,7 +46,7 @@ class PytHooks(object):
         self.debug = debug
 
     @staticmethod
-    def print_tensor(tensor_obj, prefix, tensor_list=[]):
+    def print_tensor(tensor_obj, prefix, tensor_list=None):
         """Descends iterators that contains Tensors and prints the Tensor
 
         Recursive function that descends iterator type arguments until
@@ -55,20 +55,21 @@ class PytHooks(object):
         Args:
             tensor_obj: Could be a Tensor or an iterator type that contains Tensors
             prefix: String name to assign to the Tensor
+            tensor_list: List to accumulate tensor dimensions
 
         Returns:
-            None:
+            List of tensor dimensions
 
         Raises:
             None:
         """
-        tensor_dims = []
-        tensor_ptr = None
+        if tensor_list is None:
+            tensor_list = []
+
         if isinstance(tensor_obj, list) or isinstance(tensor_obj, tuple):
             for ten in tensor_obj:
                 tensor_list = PytHooks.print_tensor(ten, prefix, tensor_list)
         elif isinstance(tensor_obj, torch.Tensor):
-            tensor_ptr = hex(id(tensor_obj))
             tensor_dims = list(tensor_obj.size())
             tensor_list.append(tensor_dims)
         return tensor_list
@@ -239,7 +240,7 @@ class PytHooks(object):
         nvtx.range_pop()
 
         if self.debug:
-            module_name = self.module_to_name_map[module_obj]
+            module_name = self.module_to_name_map.get(module_obj, "unknown")
             print(f"FWD hook module {module_name}")
             out_tensor_list = PytHooks.print_tensor(out_tensor, "Output")
 
@@ -260,15 +261,15 @@ class PytHooks(object):
         Raises:
             None
         """
-
         marker_dict = {}
-        module_name = self.module_to_name_map[module_obj]
-        module_params = module_obj.named_parameters(recurse=False)
+        module_name = self.module_to_name_map.get(module_obj, "unknown")
+
         if self.debug:
             print(f"FWD Pre hook module:{module_name}")
         marker_dict["Module"] = module_name
 
         ## Get trainable parameters like weights and bias
+        module_params = module_obj.named_parameters(recurse=False)
         for idx, (param_name, param_obj) in enumerate(module_params):
             if idx == 0:
                 marker_dict["TrainableParams"] = {}
@@ -276,7 +277,7 @@ class PytHooks(object):
             if self.debug:
                 print(f"Param {param_name} value {list(param_obj.size())}")
 
-        in_tensor_list = PytHooks.print_tensor(in_tensor, "Input", tensor_list=[])
+        in_tensor_list = PytHooks.print_tensor(in_tensor, "Input")
         if in_tensor_list:
             marker_dict["Inputs"] = in_tensor_list
             if self.debug:
@@ -307,9 +308,23 @@ class PytHooks(object):
         Raises:
             Exception if a module instance is reused
         """
+        # Module types to skip (simple operations that don't need detailed profiling)
+        skip_types = (
+            torch.nn.Identity,
+            torch.nn.Dropout,
+            torch.nn.Dropout1d,
+            torch.nn.Dropout2d,
+            torch.nn.Dropout3d,
+        )
+
         for name, module in network_model.named_modules(prefix=module_prefix):
+            # Skip certain module types to reduce profiling overhead
+            if isinstance(module, skip_types):
+                continue
+
             if self.debug:
                 print(f"Module Name:{name} addr:{hex(id(module))}")
+
             module.register_forward_pre_hook(self.module_fwd_pre_hook)
             module.register_forward_hook(self.module_fwd_hook)
             if module not in self.module_to_name_map:

@@ -168,8 +168,6 @@ class SchedulerProfilerMixin:
 
         if "CUDA_PROFILER" in activities:
             torch.cuda.cudart().cudaProfilerStart()
-            if self.server_args.enable_layerwise_nvtx:
-                torch.autograd.profiler.emit_nvtx(record_shapes=True).__enter__()
             self.profile_in_progress = True
 
         return ProfileReqOutput(success=True, message="Succeeded")
@@ -265,8 +263,6 @@ class SchedulerProfilerMixin:
             torch.cuda.memory._record_memory_history(enabled=None)
 
         if "CUDA_PROFILER" in self.profiler_activities:
-            if self.server_args.enable_layerwise_nvtx:
-                torch.autograd.profiler.emit_nvtx().__exit__(None, None, None)
             torch.cuda.cudart().cudaProfilerStop()
 
         merge_message = self._merge_profile_traces()
