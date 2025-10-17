@@ -8,17 +8,20 @@
 //! - Payload transformation for MCP tool interception
 //! - Metadata injection for MCP operations
 
-use crate::mcp::McpClientManager;
-use crate::protocols::spec::{ResponseInput, ResponseToolType, ResponsesRequest};
-use crate::routers::header_utils::apply_request_headers;
+use std::{io, sync::Arc};
+
 use axum::http::HeaderMap;
 use bytes::Bytes;
 use serde_json::{json, to_value, Value};
-use std::{io, sync::Arc};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use super::utils::event_types;
+use crate::{
+    mcp::McpClientManager,
+    protocols::responses::{ResponseInput, ResponseTool, ResponseToolType, ResponsesRequest},
+    routers::header_utils::apply_request_headers,
+};
 
 // ============================================================================
 // Configuration and State Types
@@ -127,7 +130,7 @@ impl FunctionCallInProgress {
 
 /// Build a request-scoped MCP manager from request tools, if present.
 pub(super) async fn mcp_manager_from_request_tools(
-    tools: &[crate::protocols::spec::ResponseTool],
+    tools: &[ResponseTool],
 ) -> Option<Arc<McpClientManager>> {
     let tool = tools
         .iter()
@@ -689,9 +692,13 @@ pub(super) async fn execute_tool_loop(
             if state.total_calls > 0 {
                 let server_label = original_body
                     .tools
-                    .iter()
-                    .find(|t| matches!(t.r#type, ResponseToolType::Mcp))
-                    .and_then(|t| t.server_label.as_deref())
+                    .as_ref()
+                    .and_then(|tools| {
+                        tools
+                            .iter()
+                            .find(|t| matches!(t.r#type, ResponseToolType::Mcp))
+                            .and_then(|t| t.server_label.as_deref())
+                    })
                     .unwrap_or("mcp");
 
                 // Build mcp_list_tools item
@@ -747,9 +754,13 @@ pub(super) fn build_incomplete_response(
     if let Some(output_array) = obj.get_mut("output").and_then(|v| v.as_array_mut()) {
         let server_label = original_body
             .tools
-            .iter()
-            .find(|t| matches!(t.r#type, ResponseToolType::Mcp))
-            .and_then(|t| t.server_label.as_deref())
+            .as_ref()
+            .and_then(|tools| {
+                tools
+                    .iter()
+                    .find(|t| matches!(t.r#type, ResponseToolType::Mcp))
+                    .and_then(|t| t.server_label.as_deref())
+            })
             .unwrap_or("mcp");
 
         // Find any function_call items and convert them to mcp_call (incomplete)

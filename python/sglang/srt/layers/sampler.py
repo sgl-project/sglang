@@ -27,7 +27,7 @@ if is_cuda():
 logger = logging.getLogger(__name__)
 
 SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
-RETURN_ORIGINAL_LOGPROB = get_bool_env_var("RETURN_ORIGINAL_LOGPROB")
+SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
 
 
 class Sampler(nn.Module):
@@ -91,10 +91,15 @@ class Sampler(nn.Module):
             batch_next_token_ids = torch.argmax(logits, -1)
             if return_logprob:
                 logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
-
         else:
+            can_sample_directly_from_probs = (
+                not sampling_info.need_top_p_sampling
+                and not sampling_info.need_top_k_sampling
+                and not sampling_info.need_min_p_sampling
+            )
+
             # If requested, cache probabilities from original logits before temperature scaling.
-            if return_logprob and RETURN_ORIGINAL_LOGPROB:
+            if return_logprob and SGLANG_RETURN_ORIGINAL_LOGPROB:
                 probs_without_temp_scaling = torch.softmax(logits, dim=-1)
 
             # Post process logits
@@ -103,7 +108,14 @@ class Sampler(nn.Module):
             probs = logits
             del logits
 
-            if True:  # Keep this redundant check to simplify some internal code sync
+            if can_sample_directly_from_probs:
+                # when we don't need top-k, top-p, or min-p sampling, we can directly sample from the probs
+                batch_next_token_ids = sampling_from_probs_torch(
+                    probs,
+                    sampling_seed=sampling_info.sampling_seed,
+                    positions=positions,
+                )
+            else:
                 if get_global_server_args().sampling_backend == "flashinfer":
                     if sampling_info.need_min_p_sampling:
                         probs = top_k_renorm_prob(probs, sampling_info.top_ks)
@@ -137,7 +149,7 @@ class Sampler(nn.Module):
 
             if return_logprob:
                 # clamp to avoid -inf
-                if RETURN_ORIGINAL_LOGPROB:
+                if SGLANG_RETURN_ORIGINAL_LOGPROB:
                     logprobs = torch.log(probs_without_temp_scaling).clamp(
                         min=torch.finfo(probs_without_temp_scaling.dtype).min
                     )
@@ -288,21 +300,29 @@ def multinomial_with_seed(
     """
     n, m = inputs.shape
     col_indices = torch.arange(m, device=inputs.device).unsqueeze(0)
-    step_seed = seed * 19349663 ^ positions * 73856093
+    step_seed = (seed * 19349663) ^ (positions * 73856093)
     seed_expanded = step_seed.unsqueeze(-1)
-    hashed = seed_expanded * 8589934591 ^ col_indices * 479001599
+    hashed = (seed_expanded * 8589934591) ^ (col_indices * 479001599)
     uniform_samples = (hashed % (2**24)).float() / (2**24)
-    epsilon = 1e-9
-    gumbel_noise = -torch.log(-torch.log(uniform_samples + epsilon) + epsilon)
+    epsilon = 1e-10
+    uniform_samples = uniform_samples.clamp(epsilon, 1.0 - epsilon)
+    gumbel_noise = -torch.log(-torch.log(uniform_samples))
     log_probs = torch.log(inputs + epsilon)
     perturbed_log_probs = log_probs + gumbel_noise
     return torch.argmax(perturbed_log_probs, dim=1, keepdim=True)
 
 
-def sampling_from_probs_torch(probs: torch.Tensor):
+def sampling_from_probs_torch(
+    probs: torch.Tensor,
+    sampling_seed: Optional[torch.Tensor] = None,
+    positions: Optional[torch.Tensor] = None,
+):
     """A sampling implementation with native pytorch operations, without
     top-k, top-p, or min-p filtering."""
-    sampled_index = torch.multinomial(probs, num_samples=1)
+    if sampling_seed is not None:
+        sampled_index = multinomial_with_seed(probs, sampling_seed, positions)
+    else:
+        sampled_index = torch.multinomial(probs, num_samples=1)
     batch_next_token_ids = sampled_index.view(-1).to(torch.int32)
     return batch_next_token_ids
 
