@@ -1,3 +1,4 @@
+import contextlib
 import logging
 import time
 from typing import List, Optional
@@ -5,6 +6,7 @@ from typing import List, Optional
 import torch
 from torch.cuda import Stream as CudaStream
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -115,9 +117,14 @@ class EagleDraftWorker(BaseDraftWorker):
             self.speculative_num_steps * self.topk, self.speculative_num_draft_tokens
         )
 
-        # TODO(lsyin): potential bugs with a separate plan stream
-        self.plan_stream: CudaStream = torch.get_device_module(self.device).Stream()
-        self.plan_stream_ctx = torch.cuda.stream(self.plan_stream)
+        self.tree_mask_mode = TreeMaskMode.FULL_MASK
+
+        if envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get():
+            self.plan_stream: CudaStream = torch.get_device_module(self.device).Stream()
+            self.plan_stream_ctx = torch.cuda.stream(self.plan_stream)
+        else:
+            self.plan_stream = None
+            self.plan_stream_ctx = contextlib.nullcontext()
 
     def init_token_map(self):
         # Load hot token ids
@@ -557,15 +564,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
         batch: ModelWorkerBatch,
         pre_draft_allocate_lens: torch.Tensor,
     ):
+        # Since batch.seq_lens is allocated in another stream, we need
+        # record_stream() to prevent pytorch gc and reuse the gpu memory
+        # while forward_stream is still running.
+        batch.seq_lens.record_stream(torch.cuda.current_stream())
+
         # Parse args
         verify_input: EagleVerifyInput = batch.spec_info
-        seq_lens_backup = batch.seq_lens
         bs = len(batch.seq_lens)
-
-        # Since seq_lens_backup's tensor is allocated in another stream, we
-        # need record_stream() to prevent pytorch gc and reuse the gpu memory
-        # while forward_stream is still running.
-        seq_lens_backup.record_stream(torch.cuda.current_stream())
 
         # Batch 1: Target verify
         # Prepare for target verify in a separate stream
@@ -611,17 +617,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
             accept_length,
             accept_index,
         ) = verify_input.sample(batch, logits_output)
-        new_seq_lens = seq_lens_backup + accept_length
+        new_seq_lens = batch.seq_lens + accept_length
         verify_done = torch.cuda.Event()
-
-        # Move the accepted tokens to the target KV cache locations
-        batch.seq_lens = seq_lens_backup
-        self.move_accepted_tokens_to_target_kvcache(
-            batch,
-            accept_index,
-            accept_length,
-        )
-
         verify_done.record()
 
         all_verified_id = predict[accept_index]
