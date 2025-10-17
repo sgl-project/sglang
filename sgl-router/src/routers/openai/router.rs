@@ -188,7 +188,7 @@ impl OpenAIRouter {
             let client = self.client.clone();
 
             let handle = tokio::spawn(async move {
-                let probe_url = format!("{}/v1/models/{}", url.trim_end_matches('/'), model);
+                let probe_url = format!("{}/v1/models/{}", url, model);
                 let mut req = client.get(&probe_url).timeout(Duration::from_secs(5));
 
                 if let Some(a) = auth {
@@ -454,13 +454,24 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                 }
 
                 match req.send().await {
-                    Ok(res) if res.status().is_success() => {
-                        match res.json::<Value>().await {
-                            Ok(json) => Ok(json),
-                            Err(_) => Err(()),
+                    Ok(res) => {
+                        if res.status().is_success() {
+                            match res.json::<Value>().await {
+                                Ok(json) => Ok(json),
+                                Err(e) => {
+                                    tracing::warn!("Failed to parse models response from '{}': {}", url, e);
+                                    Err(())
+                                }
+                            }
+                        } else {
+                            tracing::warn!("Getting models from '{}' failed with status: {}", url, res.status());
+                            Err(())
                         }
                     }
-                    _ => Err(()),
+                    Err(e) => {
+                        tracing::warn!("Request to get models from '{}' failed: {}", url, e);
+                        Err(())
+                    }
                 }
             });
 
@@ -680,8 +691,8 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                 .and_then(|v| v.to_str().ok())
         });
 
-        // Find endpoint for model
-        let model = model_id.or(body.model.as_deref()).unwrap_or("");
+        // Find endpoint for model (use model_id if provided, otherwise use body.model)
+        let model = model_id.unwrap_or(body.model.as_str());
         let base_url = match self.find_endpoint_for_model(model, auth).await {
             Ok(url) => url,
             Err(response) => return response,
@@ -709,7 +720,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         // Clone the body for validation and logic, but we'll build payload differently
         let mut request_body = body.clone();
         if let Some(model) = model_id {
-            request_body.model = Some(model.to_string());
+            request_body.model = model.to_string();
         }
         // Do not forward conversation field upstream; retain for local persistence only
         request_body.conversation = None;
