@@ -110,18 +110,13 @@ impl HuggingFaceTokenizer {
             None
         };
 
-        // Extract additional special tokens (ChatML tokens like <|im_start|>, <|im_end|>, etc.)
-        // These are typically in added_tokens with special: true
-        let mut additional_special_tokens = Vec::new();
-        for (token, _id) in vocab.iter() {
-            // Look for tokens that match common special token patterns
-            if token.starts_with("<|") && token.ends_with("|>") {
-                additional_special_tokens.push(token.clone());
-            } else if token.starts_with("<|") && token.ends_with(">") {
-                // Alternative patterns like <|endoftext|>
-                additional_special_tokens.push(token.clone());
-            }
-        }
+        // Extract additional special tokens using the tokenizers library API
+        let additional_special_tokens: Vec<String> = tokenizer
+            .get_added_tokens_decoder()
+            .iter()
+            .filter(|(_id, token)| token.special) // Only tokens marked as special: true
+            .map(|(_id, token)| token.content.clone())
+            .collect();
 
         SpecialTokens {
             bos_token: find_token(&["<s>", "<|startoftext|>", "<BOS>", "[CLS]"]),
