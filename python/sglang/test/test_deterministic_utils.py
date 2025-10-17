@@ -7,6 +7,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    is_in_ci
 )
 
 DEFAULT_MODEL = "Qwen/Qwen3-8B"
@@ -56,6 +57,7 @@ class TestDeterministicBase(CustomTestCase):
         for result in results:
             assert result == 1
 
+    @unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
     def test_mixed(self):
         args = BenchArgs()
         url = DEFAULT_URL_FOR_TEST
