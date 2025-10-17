@@ -1071,7 +1071,7 @@ class ServerArgs:
             )
         if self.prefill_attention_backend == "fa4":
             logger.warning(
-                f"FA4 backend only supports page size 128, changing page_size from {self.page_size} to 64."
+                f"FA4 backend only supports page size 128, changing page_size from {self.page_size} to 128."
             )
             self.page_size = 128
 
