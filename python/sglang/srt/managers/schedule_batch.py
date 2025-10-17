@@ -63,7 +63,6 @@ from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
 from sglang.srt.mem_cache.common import (
     alloc_for_decode,
     alloc_for_extend,
-    alloc_token_slots,
     evict_from_tree_cache,
 )
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
@@ -76,7 +75,6 @@ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, get_global_server_args
 from sglang.srt.utils import flatten_nested_list
-from sglang.srt.utils.common import next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig

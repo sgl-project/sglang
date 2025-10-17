@@ -22,8 +22,6 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.utils import is_cuda, is_hip
 
 if TYPE_CHECKING:
-    from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
-    from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
 
