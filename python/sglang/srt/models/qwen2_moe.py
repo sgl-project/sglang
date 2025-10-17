@@ -204,14 +204,17 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             if name not in ["correction_bias"]
         ]
 
+    def _compile(self, hidden_states, shared_output):
+            return torch.ops.sgl_kernel.fma_linear(hidden_states, self.shared_expert_gate.weight.t(), None, shared_output)
     def _forward_shared_experts(self, hidden_states: torch.Tensor):
         shared_output = None
         if self.shared_expert is not None:
             shared_output = self.shared_expert(hidden_states)
             if self.shared_expert_gate is not None:
-                shared_output = (
-                    F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_output
-                )
+                shared_output = self._compile(hidden_states, shared_output)
+                # shared_output = (
+                #     F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_output
+                # )
         return shared_output
 
     def _forward_deepep(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
