@@ -385,7 +385,10 @@ class EagleDraftWorker(BaseDraftWorker):
 
         return parent_list, top_scores_index, draft_tokens
 
-    def draft_extend(
+    def draft_extend(self):
+        pass
+
+    def _draft_extend_for_prefill(
         self,
         batch: ModelWorkerBatch,
         target_hidden_states: torch.Tensor,
@@ -429,7 +432,7 @@ class EagleDraftWorker(BaseDraftWorker):
         next_draft_input.hidden_states = logits_output.hidden_states
         return next_draft_input
 
-    def draft_extend_after_verify(
+    def _draft_extend_for_decode(
         self, batch: ModelWorkerBatch, batch_result: GenerationBatchResult
     ):
         # Batch 2: Draft extend
@@ -544,9 +547,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             assert verify_input.is_verify_input()
             model_worker_batch.spec_info = verify_input
             batch_output = self.verify(model_worker_batch, draft_input.allocate_lens)
-            self.draft_worker.draft_extend_after_verify(
-                model_worker_batch, batch_output
-            )
+            self.draft_worker._draft_extend_for_decode(model_worker_batch, batch_output)
             return batch_output
         else:
             # Target prefill
@@ -557,7 +558,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
             # Draft prefill
             model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
-            batch_output.next_draft_input = self.draft_worker.draft_extend(
+            batch_output.next_draft_input = self.draft_worker._draft_extend_for_prefill(
                 model_worker_batch,
                 batch_output.logits_output.hidden_states,
                 batch_output.next_token_ids,
