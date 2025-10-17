@@ -161,8 +161,14 @@ class ReasonerGrammarObject(BaseGrammarObject):
         return self.grammar.allocate_vocab_mask(vocab_size, batch_size, device)
 
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
-        if not self.is_in_reasoning:
-            self.grammar.fill_vocab_mask(vocab_mask, idx)
+        if self.is_in_reasoning:
+            row = vocab_mask[idx]
+            if row.dtype == torch.bool:
+                row.zero_()
+            else:
+                row.fill_(-1)
+            return
+        self.grammar.fill_vocab_mask(vocab_mask, idx)
 
     def move_vocab_mask(self, vocab_mask: torch.Tensor, device) -> torch.Tensor:
         return self.grammar.move_vocab_mask(vocab_mask, device)
