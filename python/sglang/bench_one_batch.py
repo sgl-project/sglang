@@ -61,6 +61,7 @@ import torch.distributed as dist
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed.parallel_state import destroy_distributed_environment
 from sglang.srt.entrypoints.engine import _set_envs_and_config
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
@@ -165,7 +166,7 @@ def load_model(server_args, port_args, tp_rank):
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
     moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
 
-    if is_cuda_alike():
+    if is_cuda_alike() and envs.SGLANG_ONE_DEVICE_PER_PROCESS.get():
         # Set gpu_id to 0 for CUDA because CUDA_VISIBLE_DEVICES guarantee there's only 1 available GPU.
         gpu_id = 0
     else:

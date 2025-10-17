@@ -3274,7 +3274,7 @@ def json_list_type(value):
 @contextmanager
 def temp_set_cuda_visible_devices(gpu_id: int):
 
-    if envs.SGLANG_ONE_GPU_PER_PROCESS.get() is False:
+    if envs.SGLANG_ONE_DEVICE_PER_PROCESS.get() is False:
         yield
         return
 
