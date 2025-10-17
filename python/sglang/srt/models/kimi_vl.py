@@ -43,10 +43,8 @@
 
 import copy
 import logging
-import math
-from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Iterable, List, Optional, Tuple
+from typing import Iterable, List, Optional, Tuple
 
 import torch
 from torch import nn
@@ -56,10 +54,6 @@ from sglang.srt.configs import KimiVLConfig
 from sglang.srt.configs.deepseekvl2 import DeepseekV2Config
 from sglang.srt.configs.kimi_vl import KimiVLConfig
 from sglang.srt.configs.kimi_vl_moonvit import MoonViTConfig
-from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
 from sglang.srt.layers.activation import QuickGELU
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -67,7 +61,11 @@ from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
 )
-from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
@@ -140,7 +138,7 @@ class KimiVLForConditionalGeneration(nn.Module):
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         pixel_values = (
-            torch.cat([item.pixel_values for item in items], dim=0)
+            torch.cat([item.feature for item in items], dim=0)
             .type(self.vision_tower.dtype)
             .to(self.vision_tower.device)
         )
@@ -154,8 +152,7 @@ class KimiVLForConditionalGeneration(nn.Module):
         return res
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
-        # Get all special token IDs
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens(mm_inputs.im_token_id)
+        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def forward(
@@ -169,7 +166,9 @@ class KimiVLForConditionalGeneration(nn.Module):
             input_ids=input_ids,
             forward_batch=forward_batch,
             language_model=self.language_model,
-            image_data_embedding_func=self.get_image_feature,
+            data_embedding_funcs={
+                Modality.IMAGE: self.get_image_feature,
+            },
             positions=positions,
         )
 

@@ -67,7 +67,7 @@ class TestFlashMLAAttnBackend(unittest.TestCase):
 
 class TestFlashMLAAttnLatency(unittest.TestCase):
     def test_latency(self):
-        output_throughput = run_bench_one_batch(
+        _, output_throughput, _ = run_bench_one_batch(
             DEFAULT_MODEL_NAME_FOR_TEST_MLA,
             [
                 "--attention-backend",
@@ -100,14 +100,14 @@ class TestFlashMLAMTP(CustomTestCase):
                     "1",
                     "--speculative-algorithm",
                     "EAGLE",
-                    "--speculative-draft",
+                    "--speculative-draft-model-path",
                     "lmsys/sglang-ci-dsv3-test-NextN",
                     "--speculative-num-steps",
-                    "1",
+                    "2",
                     "--speculative-eagle-topk",
                     "1",
                     "--speculative-num-draft-tokens",
-                    "2",
+                    "3",
                     "--attention-backend",
                     "flashmla",
                 ]
@@ -146,7 +146,7 @@ class TestFlashMLAMTP(CustomTestCase):
             "avg_spec_accept_length"
         ]
         print(f"{avg_spec_accept_length=}")
-        self.assertGreater(avg_spec_accept_length, 1.8)
+        self.assertGreater(avg_spec_accept_length, 2.4)
 
 
 if __name__ == "__main__":

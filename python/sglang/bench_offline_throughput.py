@@ -418,6 +418,26 @@ if __name__ == "__main__":
     ServerArgs.add_cli_args(parser)
     BenchArgs.add_cli_args(parser)
     args = parser.parse_args()
+
+    # handling ModelScope model downloads
+    if os.getenv("SGLANG_USE_MODELSCOPE", "false").lower() in ("true", "1"):
+        if os.path.exists(args.model_path):
+            print(f"Using local model path: {args.model_path}")
+        else:
+            try:
+                from modelscope import snapshot_download
+
+                print(f"Using ModelScope to download model: {args.model_path}")
+
+                # download the model and replace args.model_path
+                args.model_path = snapshot_download(
+                    args.model_path,
+                )
+                print(f"Model downloaded to: {args.model_path}")
+            except Exception as e:
+                print(f"ModelScope download failed: {str(e)}")
+                raise e
+
     server_args = ServerArgs.from_cli_args(args)
     bench_args = BenchArgs.from_cli_args(args)
 

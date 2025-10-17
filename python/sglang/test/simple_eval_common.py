@@ -91,7 +91,9 @@ class ChatCompletionSampler(SamplerBase):
         model: Optional[str] = None,
         system_message: Optional[str] = None,
         temperature: float = 0.0,
+        reasoning_effort: Optional[str] = None,
         max_tokens: int = 2048,
+        extra_body: Optional[Dict[str, Any]] = None,
     ):
         self.client = OpenAI(base_url=base_url, http_client=LargerHttpxClient())
 
@@ -102,7 +104,12 @@ class ChatCompletionSampler(SamplerBase):
         self.system_message = system_message
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.reasoning_effort = reasoning_effort
+        self.extra_body = extra_body
         self.image_format = "url"
+        print(
+            f"ChatCompletionSampler initialized with {self.system_message=} {self.temperature=} {self.max_tokens=} {self.reasoning_effort=} {self.extra_body=}"
+        )
 
     def _handle_image(
         self,
@@ -131,13 +138,15 @@ class ChatCompletionSampler(SamplerBase):
                 self._pack_message("system", self.system_message)
             ] + message_list
         trial = 0
-        while True:
+        while trial < 6:  # 126 seconds in total
             try:
                 response = self.client.chat.completions.create(
                     model=self.model,
                     messages=message_list,
                     temperature=self.temperature,
                     max_tokens=self.max_tokens,
+                    reasoning_effort=self.reasoning_effort,
+                    extra_body=self.extra_body,
                 )
                 return response.choices[0].message.content
             # NOTE: BadRequestError is triggered once for MMMU, please uncomment if you are rerunning MMMU
@@ -281,6 +290,9 @@ def aggregate_results(
     htmls = []
     convos = []
     for single_eval_result in single_eval_results:
+        # Skip None results
+        if single_eval_result is None:
+            continue
         for name, value in single_eval_result.metrics.items():
             name2values[name].append(value)
         if single_eval_result.score is not None:

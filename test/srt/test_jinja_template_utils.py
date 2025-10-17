@@ -3,9 +3,8 @@ Unit tests for Jinja chat template utils.
 """
 
 import unittest
-from unittest.mock import patch
 
-from sglang.srt.jinja_template_utils import (
+from sglang.srt.parser.jinja_template_utils import (
     detect_jinja_template_content_format,
     process_content_for_template_format,
 )
@@ -61,6 +60,86 @@ class TestTemplateContentFormatDetection(CustomTestCase):
         result = detect_jinja_template_content_format("")
         self.assertEqual(result, "string")
 
+    def test_detect_msg_content_pattern(self):
+        """Test detection of template with msg.content pattern (should be 'openai' format)."""
+        msg_content_pattern = """
+[gMASK]<sop>
+{%- for msg in messages %}
+    {%- if msg.role == 'system' %}
+<|system|>
+{{ msg.content }}
+    {%- elif msg.role == 'user' %}
+<|user|>{{ '\n' }}
+        {%- if msg.content is string %}
+{{ msg.content }}
+        {%- else %}
+            {%- for item in msg.content %}
+                {%- if item.type == 'video' or 'video' in item %}
+<|begin_of_video|><|video|><|end_of_video|>
+                {%- elif item.type == 'image' or 'image' in item %}
+<|begin_of_image|><|image|><|end_of_image|>
+                {%- elif item.type == 'text' %}
+{{ item.text }}
+                {%- endif %}
+            {%- endfor %}
+        {%- endif %}
+    {%- elif msg.role == 'assistant' %}
+        {%- if msg.metadata %}
+<|assistant|>{{ msg.metadata }}
+{{ msg.content }}
+        {%- else %}
+<|assistant|>
+{{ msg.content }}
+        {%- endif %}
+    {%- endif %}
+{%- endfor %}
+{% if add_generation_prompt %}<|assistant|>
+{% endif %}
+        """
+
+        result = detect_jinja_template_content_format(msg_content_pattern)
+        self.assertEqual(result, "openai")
+
+    def test_detect_m_content_pattern(self):
+        """Test detection of template with m.content pattern (should be 'openai' format)."""
+        msg_content_pattern = """
+[gMASK]<sop>
+{%- for m in messages %}
+    {%- if m.role == 'system' %}
+<|system|>
+{{ m.content }}
+    {%- elif m.role == 'user' %}
+<|user|>{{ '\n' }}
+        {%- if m.content is string %}
+{{ m.content }}
+        {%- else %}
+            {%- for item in m.content %}
+                {%- if item.type == 'video' or 'video' in item %}
+<|begin_of_video|><|video|><|end_of_video|>
+                {%- elif item.type == 'image' or 'image' in item %}
+<|begin_of_image|><|image|><|end_of_image|>
+                {%- elif item.type == 'text' %}
+{{ item.text }}
+                {%- endif %}
+            {%- endfor %}
+        {%- endif %}
+    {%- elif m.role == 'assistant' %}
+        {%- if m.metadata %}
+<|assistant|>{{ m.metadata }}
+{{ m.content }}
+        {%- else %}
+<|assistant|>
+{{ m.content }}
+        {%- endif %}
+    {%- endif %}
+{%- endfor %}
+{% if add_generation_prompt %}<|assistant|>
+{% endif %}
+        """
+
+        result = detect_jinja_template_content_format(msg_content_pattern)
+        self.assertEqual(result, "openai")
+
     def test_process_content_openai_format(self):
         """Test content processing for openai format."""
         msg_dict = {
@@ -76,16 +155,17 @@ class TestTemplateContentFormatDetection(CustomTestCase):
         }
 
         image_data = []
+        video_data = []
         audio_data = []
         modalities = []
 
         result = process_content_for_template_format(
-            msg_dict, "openai", image_data, audio_data, modalities
+            msg_dict, "openai", image_data, video_data, audio_data, modalities
         )
 
         # Check that image_data was extracted
         self.assertEqual(len(image_data), 1)
-        self.assertEqual(image_data[0], "http://example.com/image.jpg")
+        self.assertEqual(image_data[0].url, "http://example.com/image.jpg")
 
         # Check that content was normalized
         expected_content = [
@@ -111,11 +191,12 @@ class TestTemplateContentFormatDetection(CustomTestCase):
         }
 
         image_data = []
+        video_data = []
         audio_data = []
         modalities = []
 
         result = process_content_for_template_format(
-            msg_dict, "string", image_data, audio_data, modalities
+            msg_dict, "string", image_data, video_data, audio_data, modalities
         )
 
         # For string format, should flatten to text only
@@ -139,11 +220,12 @@ class TestTemplateContentFormatDetection(CustomTestCase):
         }
 
         image_data = []
+        video_data = []
         audio_data = []
         modalities = []
 
         result = process_content_for_template_format(
-            msg_dict, "openai", image_data, audio_data, modalities
+            msg_dict, "openai", image_data, video_data, audio_data, modalities
         )
 
         # Check that audio_data was extracted
@@ -162,11 +244,12 @@ class TestTemplateContentFormatDetection(CustomTestCase):
         msg_dict = {"role": "user", "content": "Hello world"}
 
         image_data = []
+        video_data = []
         audio_data = []
         modalities = []
 
         result = process_content_for_template_format(
-            msg_dict, "openai", image_data, audio_data, modalities
+            msg_dict, "openai", image_data, video_data, audio_data, modalities
         )
 
         # Should pass through unchanged
@@ -188,11 +271,12 @@ class TestTemplateContentFormatDetection(CustomTestCase):
         }
 
         image_data = []
+        video_data = []
         audio_data = []
         modalities = []
 
         result = process_content_for_template_format(
-            msg_dict, "openai", image_data, audio_data, modalities
+            msg_dict, "openai", image_data, video_data, audio_data, modalities
         )
 
         # Check that modalities was extracted
@@ -209,11 +293,12 @@ class TestTemplateContentFormatDetection(CustomTestCase):
         }
 
         image_data = []
+        video_data = []
         audio_data = []
         modalities = []
 
         result = process_content_for_template_format(
-            msg_dict, "string", image_data, audio_data, modalities
+            msg_dict, "string", image_data, video_data, audio_data, modalities
         )
 
         # None values should be filtered out

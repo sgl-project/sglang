@@ -1,21 +1,15 @@
-//! Comprehensive tests for PrefillDecode (PD) routing functionality
-//!
-//! This test suite covers:
-//! - Phase 1: Basic PD router creation and configuration
-//! - Phase 2: Bootstrap injection and request handling
-//! - Phase 3: Cache-aware selection (when implemented)
-//!
-//! Note: PD mode is enabled via the pd_disaggregation flag, not as a policy type.
-//! The policy type (Random, PowerOfTwo, CacheAware) determines the selection algorithm within PD mode.
-
 #[cfg(test)]
 mod test_pd_routing {
-    use rand::Rng;
     use serde_json::json;
-    use sglang_router_rs::pd_types::{EngineInfo, EngineType, PDSelectionPolicy};
-    use sglang_router_rs::router::{PolicyConfig, Router};
+    use sglang_router_rs::{
+        config::{
+            CircuitBreakerConfig, ConnectionMode, PolicyConfig, RetryConfig, RouterConfig,
+            RoutingMode,
+        },
+        core::{BasicWorkerBuilder, Worker, WorkerType},
+        routers::{http::pd_types::PDSelectionPolicy, RouterFactory},
+    };
 
-    // Test-only struct to help validate PD request parsing
     #[derive(Debug)]
     struct PDRequest {
         pub is_stream: bool,
@@ -23,14 +17,12 @@ mod test_pd_routing {
     }
 
     impl PDRequest {
-        // Extract PD-relevant info from JSON for testing
         pub fn from_json(json: &serde_json::Value) -> Self {
             let is_stream = json
                 .get("stream")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
 
-            // Detect batch size from text or input_ids
             let batch_size = if let Some(text) = json.get("text") {
                 text.as_array().map(|arr| arr.len())
             } else if let Some(input_ids) = json.get("input_ids") {
@@ -46,50 +38,53 @@ mod test_pd_routing {
         }
     }
 
-    // ========================================================================
-    // Phase 1: Basic PD Components and Router Creation
-    // ========================================================================
-
     #[test]
-    fn test_engine_info_creation() {
-        // Test EngineInfo creation for prefill servers
-        let prefill_engine = EngineInfo::new_prefill("http://prefill:8080".to_string(), Some(9000));
-        match prefill_engine.engine_type {
-            EngineType::Prefill => (),
-            _ => panic!("Expected Prefill engine type"),
-        }
-        assert_eq!(prefill_engine.url, "http://prefill:8080");
-        assert_eq!(prefill_engine.bootstrap_port, Some(9000));
-        assert_eq!(prefill_engine.get_hostname(), "prefill");
+    fn test_worker_types() {
+        use sglang_router_rs::core::{BasicWorkerBuilder, Worker, WorkerType};
 
-        // Test EngineInfo creation for decode servers
-        let decode_engine = EngineInfo::new_decode("http://decode:8080".to_string());
-        match decode_engine.engine_type {
-            EngineType::Decode => (),
-            _ => panic!("Expected Decode engine type"),
+        let prefill_worker: Box<dyn Worker> = Box::new(
+            BasicWorkerBuilder::new("http://prefill:8080")
+                .worker_type(WorkerType::Prefill {
+                    bootstrap_port: Some(9000),
+                })
+                .api_key("test_api_key")
+                .build(),
+        );
+        assert_eq!(prefill_worker.url(), "http://prefill:8080");
+        match prefill_worker.worker_type() {
+            WorkerType::Prefill { bootstrap_port } => {
+                assert_eq!(bootstrap_port, Some(9000));
+            }
+            _ => panic!("Expected Prefill worker type"),
         }
-        assert_eq!(decode_engine.url, "http://decode:8080");
-        assert_eq!(decode_engine.bootstrap_port, None);
-        assert_eq!(decode_engine.get_hostname(), "decode");
 
-        // Test API path generation
-        assert_eq!(
-            prefill_engine.api_path("/generate"),
-            "http://prefill:8080/generate"
+        let decode_worker: Box<dyn Worker> = Box::new(
+            BasicWorkerBuilder::new("http://decode:8080")
+                .worker_type(WorkerType::Decode)
+                .api_key("test_api_key")
+                .build(),
         );
-        assert_eq!(
-            prefill_engine.api_path("health"),
-            "http://prefill:8080/health"
+        assert_eq!(decode_worker.url(), "http://decode:8080");
+        match decode_worker.worker_type() {
+            WorkerType::Decode => (),
+            _ => panic!("Expected Decode worker type"),
+        }
+
+        let regular_worker: Box<dyn Worker> = Box::new(
+            BasicWorkerBuilder::new("http://regular:8080")
+                .worker_type(WorkerType::Regular)
+                .api_key("test_api_key")
+                .build(),
         );
-        assert_eq!(
-            decode_engine.api_path("/v1/chat/completions"),
-            "http://decode:8080/v1/chat/completions"
-        );
+        assert_eq!(regular_worker.url(), "http://regular:8080");
+        match regular_worker.worker_type() {
+            WorkerType::Regular => (),
+            _ => panic!("Expected Regular worker type"),
+        }
     }
 
     #[test]
     fn test_pd_selection_policies() {
-        // Test all PD selection policy variants
         // Note: These policies are only used when pd_disaggregation=true
         let policies = vec![
             PDSelectionPolicy::Random,
@@ -102,7 +97,6 @@ mod test_pd_routing {
         ];
 
         for policy in policies {
-            // Verify each policy can be created and matched
             match &policy {
                 PDSelectionPolicy::Random => {
                     assert!(matches!(policy, PDSelectionPolicy::Random));
@@ -119,69 +113,165 @@ mod test_pd_routing {
         }
     }
 
-    #[test]
-    fn test_pd_router_configuration() {
-        // Test PrefillDecodeConfig creation with various policies
-        // This config is used when pd_disaggregation=true
-        let configs = vec![
-            PolicyConfig::PrefillDecodeConfig {
-                selection_policy: PDSelectionPolicy::Random,
-                prefill_urls: vec![
-                    ("http://prefill1:8080".to_string(), Some(9000)),
-                    ("http://prefill2:8080".to_string(), None),
-                ],
-                decode_urls: vec![
-                    "http://decode1:8080".to_string(),
-                    "http://decode2:8080".to_string(),
-                ],
-                timeout_secs: 10,
-                interval_secs: 1,
-            },
-            PolicyConfig::PrefillDecodeConfig {
-                selection_policy: PDSelectionPolicy::PowerOfTwo,
-                prefill_urls: vec![("http://prefill:8080".to_string(), Some(9000))],
-                decode_urls: vec!["http://decode:8080".to_string()],
-                timeout_secs: 5,
-                interval_secs: 1,
-            },
-            PolicyConfig::PrefillDecodeConfig {
-                selection_policy: PDSelectionPolicy::CacheAware {
+    #[tokio::test]
+    async fn test_pd_router_configuration() {
+        // In the new structure, RoutingMode and PolicyConfig are separate
+        let test_cases = vec![
+            (
+                RoutingMode::PrefillDecode {
+                    prefill_urls: vec![
+                        ("http://prefill1:8080".to_string(), Some(9000)),
+                        ("http://prefill2:8080".to_string(), None),
+                    ],
+                    decode_urls: vec![
+                        "http://decode1:8080".to_string(),
+                        "http://decode2:8080".to_string(),
+                    ],
+                    prefill_policy: None,
+                    decode_policy: None,
+                },
+                PolicyConfig::Random,
+            ),
+            (
+                RoutingMode::PrefillDecode {
+                    prefill_urls: vec![("http://prefill:8080".to_string(), Some(9000))],
+                    decode_urls: vec!["http://decode:8080".to_string()],
+                    prefill_policy: None,
+                    decode_policy: None,
+                },
+                PolicyConfig::PowerOfTwo {
+                    load_check_interval_secs: 5,
+                },
+            ),
+            (
+                RoutingMode::PrefillDecode {
+                    prefill_urls: vec![
+                        ("http://p1:8080".to_string(), Some(9000)),
+                        ("http://p2:8080".to_string(), Some(9001)),
+                        ("http://p3:8080".to_string(), Some(9002)),
+                    ],
+                    decode_urls: vec!["http://d1:8080".to_string(), "http://d2:8080".to_string()],
+                    prefill_policy: None,
+                    decode_policy: None,
+                },
+                PolicyConfig::CacheAware {
                     cache_threshold: 0.7,
                     balance_abs_threshold: 20,
                     balance_rel_threshold: 1.2,
+                    eviction_interval_secs: 60,
+                    max_tree_size: 1000000,
                 },
-                prefill_urls: vec![
-                    ("http://p1:8080".to_string(), Some(9000)),
-                    ("http://p2:8080".to_string(), Some(9001)),
-                    ("http://p3:8080".to_string(), Some(9002)),
-                ],
-                decode_urls: vec!["http://d1:8080".to_string(), "http://d2:8080".to_string()],
-                timeout_secs: 10,
-                interval_secs: 2,
-            },
+            ),
         ];
 
-        for config in configs {
-            // Router creation will fail due to health checks, but config should be valid
-            let result = Router::new(vec![], config);
-            assert!(result.is_err());
-            let error_msg = result.unwrap_err();
-            // Error should be about health/timeout, not configuration
+        for (mode, policy) in test_cases {
+            let config = RouterConfig {
+                chat_template: None,
+                mode,
+                policy,
+                host: "127.0.0.1".to_string(),
+                port: 3001,
+                max_payload_size: 1024 * 1024,
+                request_timeout_secs: 60,
+                worker_startup_timeout_secs: 10,
+                worker_startup_check_interval_secs: 1,
+                dp_aware: false,
+                api_key: None,
+                discovery: None,
+                metrics: None,
+                log_dir: None,
+                log_level: None,
+                request_id_headers: None,
+                max_concurrent_requests: 64,
+                queue_size: 0,
+                queue_timeout_secs: 60,
+                cors_allowed_origins: vec![],
+                retry: RetryConfig::default(),
+                circuit_breaker: CircuitBreakerConfig::default(),
+                disable_retries: false,
+                disable_circuit_breaker: false,
+                health_check: sglang_router_rs::config::HealthCheckConfig::default(),
+                enable_igw: false,
+                rate_limit_tokens_per_second: None,
+                connection_mode: ConnectionMode::Http,
+                model_path: None,
+                tokenizer_path: None,
+                history_backend: sglang_router_rs::config::HistoryBackend::Memory,
+                oracle: None,
+                reasoning_parser: None,
+                tool_call_parser: None,
+            };
+
+            let app_context = {
+                use std::sync::{Arc, OnceLock};
+
+                use sglang_router_rs::{
+                    core::{LoadMonitor, WorkerRegistry},
+                    data_connector::{
+                        MemoryConversationItemStorage, MemoryConversationStorage,
+                        MemoryResponseStorage,
+                    },
+                    middleware::TokenBucket,
+                    policies::PolicyRegistry,
+                };
+
+                let client = reqwest::Client::new();
+
+                // Initialize rate limiter
+                let rate_limiter = Some(Arc::new(TokenBucket::new(64, 64)));
+
+                // Initialize registries
+                let worker_registry = Arc::new(WorkerRegistry::new());
+                let policy_registry = Arc::new(PolicyRegistry::new(config.policy.clone()));
+
+                // Initialize storage backends
+                let response_storage = Arc::new(MemoryResponseStorage::new());
+                let conversation_storage = Arc::new(MemoryConversationStorage::new());
+                let conversation_item_storage = Arc::new(MemoryConversationItemStorage::new());
+
+                // Initialize load monitor
+                let load_monitor = Some(Arc::new(LoadMonitor::new(
+                    worker_registry.clone(),
+                    policy_registry.clone(),
+                    client.clone(),
+                    config.worker_startup_check_interval_secs,
+                )));
+
+                // Create empty OnceLock for worker job queue
+                let worker_job_queue = Arc::new(OnceLock::new());
+
+                Arc::new(sglang_router_rs::server::AppContext::new(
+                    config,
+                    client,
+                    rate_limiter,
+                    None, // tokenizer
+                    None, // reasoning_parser_factory
+                    None, // tool_parser_factory
+                    worker_registry,
+                    policy_registry,
+                    response_storage,
+                    conversation_storage,
+                    conversation_item_storage,
+                    load_monitor,
+                    worker_job_queue,
+                ))
+            };
+            let result = RouterFactory::create_router(&app_context).await;
             assert!(
-                error_msg.contains("healthy") || error_msg.contains("timeout"),
-                "Unexpected error: {}",
-                error_msg
+                result.is_ok(),
+                "Router creation should succeed with empty worker"
+            );
+
+            let stats = app_context.worker_registry.stats();
+            assert_eq!(
+                stats.total_workers, 0,
+                "No workers should be registered without initialization"
             );
         }
     }
 
-    // ========================================================================
-    // Phase 2: Bootstrap Injection and Request Handling
-    // ========================================================================
-
     #[test]
     fn test_pd_request_from_json() {
-        // Test PDRequest parsing from single text request
         let single_json = json!({
             "text": "Hello world",
             "stream": false,
@@ -193,7 +283,6 @@ mod test_pd_routing {
         assert!(!pd_req.is_stream);
         assert_eq!(pd_req.batch_size, None);
 
-        // Test PDRequest parsing from batch text request
         let batch_json = json!({
             "text": ["Hello", "World", "Test"],
             "stream": true,
@@ -204,7 +293,6 @@ mod test_pd_routing {
         assert!(pd_req.is_stream);
         assert_eq!(pd_req.batch_size, Some(3));
 
-        // Test PDRequest parsing from input_ids request
         let ids_json = json!({
             "input_ids": [[1, 2, 3], [4, 5, 6]],
             "stream": false
@@ -214,7 +302,6 @@ mod test_pd_routing {
         assert!(!pd_req.is_stream);
         assert_eq!(pd_req.batch_size, Some(2));
 
-        // Test PDRequest parsing from chat request
         let chat_json = json!({
             "messages": [
                 {"role": "system", "content": "You are a helpful assistant"},
@@ -233,37 +320,46 @@ mod test_pd_routing {
         // Since we can't test the actual inject_bootstrap_fields function here
         // (it's private in the router module), we'll test the expected behavior
 
-        // Simulate bootstrap injection for single request
         let mut single_json = json!({
             "text": "Hello world",
             "stream": false,
             "temperature": 0.7
         });
 
-        // Simulate what inject_bootstrap_fields would do
-        let prefill_info = EngineInfo::new_prefill("http://prefill1:8080".to_string(), Some(9000));
-        single_json["bootstrap_host"] = json!(prefill_info.get_hostname());
-        single_json["bootstrap_port"] = json!(prefill_info.bootstrap_port);
+        let prefill_worker: Box<dyn Worker> = Box::new(
+            BasicWorkerBuilder::new("http://prefill1:8080")
+                .worker_type(WorkerType::Prefill {
+                    bootstrap_port: Some(9000),
+                })
+                .api_key("test_api_key")
+                .build(),
+        );
+
+        let bootstrap_port = match prefill_worker.worker_type() {
+            WorkerType::Prefill { bootstrap_port } => bootstrap_port,
+            _ => None,
+        };
+
+        single_json["bootstrap_host"] = json!(prefill_worker.bootstrap_host());
+        single_json["bootstrap_port"] = json!(bootstrap_port);
         single_json["bootstrap_room"] = json!(12345u64); // Random room ID
 
-        // Verify bootstrap fields are added correctly
         assert_eq!(single_json["bootstrap_host"], "prefill1");
-        assert_eq!(single_json["bootstrap_port"], 9000);
+        assert_eq!(single_json["bootstrap_port"], json!(Some(9000)));
         assert!(single_json["bootstrap_room"].is_u64());
         assert_eq!(single_json["temperature"], 0.7); // Original field preserved
 
-        // Simulate bootstrap injection for batch request
         let mut batch_json = json!({
             "text": ["Hello", "World", "Test"],
             "stream": true
         });
 
         let batch_size = 3;
-        batch_json["bootstrap_host"] = json!(vec![prefill_info.get_hostname(); batch_size]);
-        batch_json["bootstrap_port"] = json!(vec![prefill_info.bootstrap_port; batch_size]);
+        let hostname = prefill_worker.bootstrap_host();
+        batch_json["bootstrap_host"] = json!(vec![hostname; batch_size]);
+        batch_json["bootstrap_port"] = json!(vec![bootstrap_port; batch_size]);
         batch_json["bootstrap_room"] = json!(vec![111u64, 222u64, 333u64]);
 
-        // Verify batch bootstrap fields
         assert!(batch_json["bootstrap_host"].is_array());
         assert_eq!(
             batch_json["bootstrap_host"].as_array().unwrap().len(),
@@ -276,7 +372,6 @@ mod test_pd_routing {
 
     #[test]
     fn test_request_serialization() {
-        // Test that requests can be properly serialized and deserialized
         let request = json!({
             "text": "Test prompt",
             "stream": false,
@@ -289,13 +384,10 @@ mod test_pd_routing {
             "bootstrap_room": 12345u64
         });
 
-        // Convert to bytes (as would happen in the router)
         let bytes = serde_json::to_vec(&request).unwrap();
 
-        // Parse back from bytes
         let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
 
-        // Verify all fields are preserved
         assert_eq!(parsed["text"], "Test prompt");
         assert_eq!(parsed["stream"], false);
         assert_eq!(parsed["temperature"], 0.7);
@@ -306,32 +398,12 @@ mod test_pd_routing {
     }
 
     #[test]
-    fn test_engine_info_hostname_extraction() {
-        // Test various URL formats
-        let test_cases = vec![
-            ("http://localhost:8080", "localhost"),
-            ("http://10.0.0.1:8080", "10.0.0.1"),
-            ("https://api.example.com:443", "api.example.com"),
-            ("http://prefill-server", "prefill-server"),
-            ("http://[::1]:8080", "["),  // IPv6 edge case
-            ("prefill:8080", "prefill"), // No protocol
-        ];
-
-        for (url, expected_hostname) in test_cases {
-            let engine = EngineInfo::new_prefill(url.to_string(), None);
-            assert_eq!(engine.get_hostname(), expected_hostname);
-        }
-    }
-
-    #[test]
     fn test_pd_request_edge_cases() {
-        // Test empty request
         let empty_json = json!({});
         let pd_req = PDRequest::from_json(&empty_json);
         assert!(!pd_req.is_stream);
         assert_eq!(pd_req.batch_size, None);
 
-        // Test request with only stream field
         let stream_only = json!({
             "stream": true
         });
@@ -339,14 +411,12 @@ mod test_pd_routing {
         assert!(pd_req.is_stream);
         assert_eq!(pd_req.batch_size, None);
 
-        // Test request with empty text array
         let empty_batch = json!({
             "text": []
         });
         let pd_req = PDRequest::from_json(&empty_batch);
         assert_eq!(pd_req.batch_size, Some(0));
 
-        // Test request with non-array text (should be None)
         let non_array_text = json!({
             "text": "single string"
         });
@@ -354,29 +424,22 @@ mod test_pd_routing {
         assert_eq!(pd_req.batch_size, None);
     }
 
-    // ========================================================================
-    // Phase 2: Background Load Monitoring Tests
-    // ========================================================================
-
     #[tokio::test]
     async fn test_background_load_monitoring() {
         use std::collections::HashMap;
+
         use tokio::sync::watch;
 
-        // Create a watch channel for testing
         let (tx, rx) = watch::channel(HashMap::new());
 
-        // Simulate load updates
         let mut loads = HashMap::new();
         loads.insert("http://prefill1:8080".to_string(), 10);
         loads.insert("http://prefill2:8080".to_string(), 20);
         loads.insert("http://decode1:8080".to_string(), 5);
         loads.insert("http://decode2:8080".to_string(), 15);
 
-        // Send the loads
         tx.send(loads.clone()).unwrap();
 
-        // Verify receiver gets the update
         let received_loads = rx.borrow();
         assert_eq!(received_loads.get("http://prefill1:8080"), Some(&10));
         assert_eq!(received_loads.get("http://prefill2:8080"), Some(&20));
@@ -385,43 +448,7 @@ mod test_pd_routing {
     }
 
     #[test]
-    fn test_power_of_two_load_selection() {
-        // Test the power-of-two selection logic with different load scenarios
-
-        // Scenario 1: Clear winner for both prefill and decode
-        let _loads = vec![
-            ("prefill1", 100),
-            ("prefill2", 10), // Should be selected
-            ("decode1", 50),
-            ("decode2", 5), // Should be selected
-        ];
-
-        // In actual implementation, the lower load should be selected
-        assert!(10 < 100);
-        assert!(5 < 50);
-
-        // Scenario 2: Equal loads (should select first)
-        let _equal_loads = vec![
-            ("prefill1", 20),
-            ("prefill2", 20), // Either could be selected
-            ("decode1", 30),
-            ("decode2", 30), // Either could be selected
-        ];
-
-        // When loads are equal, <= comparison means first is selected
-        assert!(20 <= 20);
-        assert!(30 <= 30);
-
-        // Scenario 3: Missing load data (should default to usize::MAX)
-        // This tests the unwrap_or(usize::MAX) behavior
-        let missing_load = usize::MAX;
-        assert!(10 < missing_load);
-        assert!(missing_load > 0);
-    }
-
-    #[test]
     fn test_load_monitoring_configuration() {
-        // Test that load monitoring is only enabled for PowerOfTwo policy
         let policies = vec![
             (PDSelectionPolicy::Random, false),
             (PDSelectionPolicy::PowerOfTwo, true),
@@ -446,44 +473,34 @@ mod test_pd_routing {
     #[tokio::test]
     async fn test_watch_channel_behavior() {
         use std::collections::HashMap;
+
         use tokio::sync::watch;
 
-        // Test watch channel's broadcast behavior
         let (tx, rx1) = watch::channel(HashMap::new());
         let rx2 = rx1.clone();
 
-        // Initial state - empty map
         assert!(rx1.borrow().is_empty());
         assert!(rx2.borrow().is_empty());
 
-        // Update 1
         let mut loads = HashMap::new();
         loads.insert("worker1".to_string(), 10);
         tx.send(loads.clone()).unwrap();
 
-        // Both receivers see the update
         assert_eq!(rx1.borrow().get("worker1"), Some(&10));
         assert_eq!(rx2.borrow().get("worker1"), Some(&10));
 
-        // Update 2 - overwrites previous
         loads.insert("worker1".to_string(), 20);
         loads.insert("worker2".to_string(), 30);
         tx.send(loads).unwrap();
 
-        // Both receivers see the latest state
         assert_eq!(rx1.borrow().get("worker1"), Some(&20));
         assert_eq!(rx2.borrow().get("worker2"), Some(&30));
     }
-
-    // ========================================================================
-    // Tests based on bench_one_batch_server.py patterns
-    // ========================================================================
 
     #[test]
     fn test_generate_request_formats() {
         // Based on bench_one_batch_server.py request patterns
 
-        // Test 1: Batch request with input_ids (most common in benchmarks)
         let batch_request = json!({
             "input_ids": [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12]],
             "sampling_params": {
@@ -499,7 +516,6 @@ mod test_pd_routing {
         assert!(pd_req.is_stream);
         assert_eq!(pd_req.batch_size, Some(3));
 
-        // Test 2: Request with return_logprob (critical for PD)
         let logprob_request = json!({
             "input_ids": [[1, 2, 3]],
             "sampling_params": {
@@ -513,7 +529,6 @@ mod test_pd_routing {
         assert_eq!(logprob_request["return_logprob"], true);
         assert_eq!(logprob_request["stream"], false);
 
-        // Test 3: Large batch sizes from benchmark
         let batch_sizes = vec![1, 16, 64]; // From bench_one_batch_server.py
         for bs in batch_sizes {
             let request = json!({
@@ -532,7 +547,6 @@ mod test_pd_routing {
 
     #[test]
     fn test_sampling_params_handling() {
-        // Test various sampling parameters from bench_one_batch_server.py
         let sampling_params_variations = vec![
             json!({
                 "temperature": 0.0,
@@ -560,20 +574,16 @@ mod test_pd_routing {
                 "stream": false
             });
 
-            // Verify params are preserved
             assert_eq!(request["sampling_params"], params);
         }
     }
 
     #[test]
     fn test_streaming_response_parsing() {
-        // Test SSE format parsing from streaming responses
-        let sse_chunks = vec![
-            "data: {\"text\":\"Hello\",\"meta_info\":{\"completion_tokens\":1,\"finish_reason\":null}}",
+        let sse_chunks = ["data: {\"text\":\"Hello\",\"meta_info\":{\"completion_tokens\":1,\"finish_reason\":null}}",
             "data: {\"text\":\" world\",\"meta_info\":{\"completion_tokens\":2,\"finish_reason\":null}}",
             "data: {\"text\":\"!\",\"meta_info\":{\"completion_tokens\":3,\"finish_reason\":{\"type\":\"length\"}}}",
-            "data: [DONE]",
-        ];
+            "data: [DONE]"];
 
         for chunk in &sse_chunks[..3] {
             assert!(chunk.starts_with("data: "));
@@ -582,13 +592,11 @@ mod test_pd_routing {
             assert!(parsed["meta_info"]["completion_tokens"].is_u64());
         }
 
-        // Test [DONE] detection
         assert_eq!(sse_chunks[3], "data: [DONE]");
     }
 
     #[test]
     fn test_ttft_calculation() {
-        // Test Time To First Token calculation pattern
         let first_token_response = json!({
             "text": "Hello",
             "meta_info": {
@@ -604,7 +612,6 @@ mod test_pd_routing {
 
     #[test]
     fn test_throughput_metrics() {
-        // Test throughput calculation patterns from bench_one_batch_server.py
         let batch_size = 16;
         let input_len = 1024;
         let output_len = 16;
@@ -622,7 +629,6 @@ mod test_pd_routing {
 
     #[test]
     fn test_error_response_handling() {
-        // Test error response format from bench_one_batch_server.py
         let error_response = json!({
             "error": "Request has failed. Invalid input format."
         });
@@ -633,7 +639,6 @@ mod test_pd_routing {
 
     #[test]
     fn test_structured_output_request() {
-        // Test structured output format (json_schema)
         let structured_request = json!({
             "text": "What is the capital of France? Answer in JSON.",
             "sampling_params": {
@@ -652,7 +657,8 @@ mod test_pd_routing {
 
     #[test]
     fn test_bootstrap_injection_with_benchmark_requests() {
-        // Test bootstrap injection with actual benchmark request patterns
+        use sglang_router_rs::core::{BasicWorkerBuilder, Worker, WorkerType};
+
         let mut benchmark_request = json!({
             "input_ids": vec![vec![1, 2, 3, 4]; 16], // Batch size 16
             "sampling_params": {
@@ -664,16 +670,27 @@ mod test_pd_routing {
             "stream": true
         });
 
-        // Simulate bootstrap injection
-        let prefill_info = EngineInfo::new_prefill("http://prefill:8080".to_string(), Some(9000));
-        let batch_size = 16;
+        let prefill_worker: Box<dyn Worker> = Box::new(
+            BasicWorkerBuilder::new("http://prefill:8080")
+                .worker_type(WorkerType::Prefill {
+                    bootstrap_port: Some(9000),
+                })
+                .api_key("test_api_key")
+                .build(),
+        );
 
-        benchmark_request["bootstrap_host"] = json!(vec![prefill_info.get_hostname(); batch_size]);
-        benchmark_request["bootstrap_port"] = json!(vec![prefill_info.bootstrap_port; batch_size]);
+        let bootstrap_port = match prefill_worker.worker_type() {
+            WorkerType::Prefill { bootstrap_port } => bootstrap_port,
+            _ => None,
+        };
+        let batch_size = 16;
+        let hostname = prefill_worker.bootstrap_host();
+
+        benchmark_request["bootstrap_host"] = json!(vec![hostname; batch_size]);
+        benchmark_request["bootstrap_port"] = json!(vec![bootstrap_port; batch_size]);
         benchmark_request["bootstrap_room"] =
             json!((0..batch_size).map(|_| 12345u64).collect::<Vec<_>>());
 
-        // Verify bootstrap fields match batch size
         assert_eq!(
             benchmark_request["bootstrap_host"]
                 .as_array()
@@ -696,14 +713,12 @@ mod test_pd_routing {
             batch_size
         );
 
-        // Verify original fields are preserved
         assert_eq!(benchmark_request["return_logprob"], true);
         assert_eq!(benchmark_request["stream"], true);
     }
 
     #[test]
     fn test_server_info_response_format() {
-        // Test server info format expected by bench_one_batch_server.py
         let server_info = json!({
             "internal_states": [{
                 "avg_spec_accept_length": 3.5,
@@ -720,16 +735,13 @@ mod test_pd_routing {
             ]
         });
 
-        // Verify structure matches what benchmark expects
         assert!(server_info["internal_states"][0]["avg_spec_accept_length"].is_f64());
         assert!(server_info["internal_states"][0]["last_gen_throughput"].is_f64());
         assert!(server_info["prefill"].is_array());
         assert!(server_info["decode"].is_array());
     }
 
-    // ========================================================================
     // Comprehensive Endpoint Coverage Test
-    // ========================================================================
 
     #[test]
     fn test_pd_endpoints_coverage() {
@@ -758,7 +770,6 @@ mod test_pd_routing {
         assert_eq!(implemented_count, 10);
         assert_eq!(total_count, 11);
 
-        // Document the missing endpoint
         let missing: Vec<_> = implemented_endpoints
             .iter()
             .filter(|(_, _, impl_status)| !impl_status)
@@ -770,14 +781,12 @@ mod test_pd_routing {
 
     #[test]
     fn test_large_batch_bootstrap_injection() {
-        // Test bootstrap injection performance with very large batches
         // This simulates the bench_one_batch_server.py scenario
         let large_batch_sizes = vec![1024, 4096, 8192];
 
         for batch_size in large_batch_sizes {
             let start = std::time::Instant::now();
 
-            // Simulate a large batch request
             let mut large_batch_request = json!({
                 "input_ids": vec![vec![1, 2, 3, 4]; batch_size],
                 "sampling_params": {
@@ -787,21 +796,29 @@ mod test_pd_routing {
                 "stream": true
             });
 
-            // Simulate bootstrap injection
-            let prefill_info =
-                EngineInfo::new_prefill("http://prefill:8080".to_string(), Some(9000));
+            let prefill_worker: Box<dyn Worker> = Box::new(
+                BasicWorkerBuilder::new("http://prefill:8080")
+                    .worker_type(WorkerType::Prefill {
+                        bootstrap_port: Some(9000),
+                    })
+                    .api_key("test_api_key")
+                    .build(),
+            );
 
-            large_batch_request["bootstrap_host"] =
-                json!(vec![prefill_info.get_hostname(); batch_size]);
-            large_batch_request["bootstrap_port"] =
-                json!(vec![prefill_info.bootstrap_port; batch_size]);
+            let bootstrap_port = match prefill_worker.worker_type() {
+                WorkerType::Prefill { bootstrap_port } => bootstrap_port,
+                _ => None,
+            };
+            let hostname = prefill_worker.bootstrap_host();
+
+            large_batch_request["bootstrap_host"] = json!(vec![hostname; batch_size]);
+            large_batch_request["bootstrap_port"] = json!(vec![bootstrap_port; batch_size]);
             large_batch_request["bootstrap_room"] = json!((0..batch_size)
-                .map(|_| rand::thread_rng().gen::<u64>())
+                .map(|_| rand::random::<u64>())
                 .collect::<Vec<_>>());
 
             let elapsed = start.elapsed();
 
-            // Verify bootstrap fields are correctly sized
             assert_eq!(
                 large_batch_request["bootstrap_host"]
                     .as_array()
@@ -839,7 +856,6 @@ mod test_pd_routing {
 
     #[test]
     fn test_payload_size_calculation() {
-        // Test payload size estimation for bench_one_batch_server.py scenarios
         let test_cases = vec![
             (1, 1024, 16),   // Small batch
             (16, 1024, 16),  // Medium batch
@@ -877,22 +893,12 @@ mod test_pd_routing {
 
     #[test]
     fn test_policy_type_to_pd_selection_policy_mapping() {
-        // Document the mapping from PolicyType to PDSelectionPolicy
-        // This mapping happens in lib.rs when pd_disaggregation=true
-
-        // PolicyType::Random -> PDSelectionPolicy::Random
-        // PolicyType::PowerOfTwo -> PDSelectionPolicy::PowerOfTwo
-        // PolicyType::CacheAware -> PDSelectionPolicy::CacheAware { ... }
-        // PolicyType::RoundRobin -> ERROR (not supported in PD mode)
-
-        // Test that PDSelectionPolicy doesn't include RoundRobin
         let pd_policy_count = 3; // Random, PowerOfTwo, CacheAware
         assert_eq!(
             pd_policy_count, 3,
             "PDSelectionPolicy should have exactly 3 variants"
         );
 
-        // Verify that each PDSelectionPolicy variant can be created
         let _random = PDSelectionPolicy::Random;
         let _po2 = PDSelectionPolicy::PowerOfTwo;
         let _cache_aware = PDSelectionPolicy::CacheAware {

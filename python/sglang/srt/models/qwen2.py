@@ -16,7 +16,7 @@
 # Modify details for the adaptation of Qwen2 model.
 """Inference-only Qwen2 model compatible with HuggingFace weights."""
 import logging
-from typing import Any, Dict, Iterable, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -27,6 +27,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -101,11 +102,13 @@ class Qwen2Attention(nn.Module):
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
+        head_dim: Optional[int] = None,
         layer_id: int = 0,
         rope_theta: float = 1000000,
         rope_scaling: Optional[Dict[str, Any]] = None,
         max_position_embeddings: int = 32768,
         quant_config: Optional[QuantizationConfig] = None,
+        dual_chunk_attention_config: Optional[dict[str, Any]] = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -124,7 +127,10 @@ class Qwen2Attention(nn.Module):
             # the KV heads across multiple tensor parallel GPUs.
             assert tp_size % self.total_num_kv_heads == 0
         self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
-        self.head_dim = hidden_size // self.total_num_heads
+        if head_dim is not None:
+            self.head_dim = head_dim
+        else:
+            self.head_dim = hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
@@ -154,6 +160,7 @@ class Qwen2Attention(nn.Module):
             max_position=max_position_embeddings,
             base=rope_theta,
             rope_scaling=rope_scaling,
+            dual_chunk_attention_config=dual_chunk_attention_config,
         )
         self.attn = RadixAttention(
             self.num_heads,
@@ -186,21 +193,28 @@ class Qwen2DecoderLayer(nn.Module):
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
         rope_theta = getattr(config, "rope_theta", 1000000)
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
+        head_dim = getattr(config, "head_dim", None)
+        dual_chunk_attention_config = getattr(
+            config, "dual_chunk_attention_config", None
+        )
         self.self_attn = Qwen2Attention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
+            head_dim=head_dim,
             layer_id=layer_id,
             rope_theta=rope_theta,
             rope_scaling=rope_scaling,
             max_position_embeddings=max_position_embeddings,
             quant_config=quant_config,
+            dual_chunk_attention_config=dual_chunk_attention_config,
             prefix=add_prefix("self_attn", prefix),
         )
         self.mlp = Qwen2MLP(
@@ -247,6 +261,7 @@ class Qwen2Model(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         decoder_layer_type: type[nn.Module] = Qwen2DecoderLayer,
+        alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -259,6 +274,7 @@ class Qwen2Model(nn.Module):
                 config.vocab_size,
                 config.hidden_size,
                 quant_config=quant_config,
+                enable_tp=not is_dp_attention_enabled(),
                 prefix=add_prefix("embed_tokens", prefix),
             )
         else:
@@ -273,6 +289,7 @@ class Qwen2Model(nn.Module):
                 config=config,
                 quant_config=quant_config,
                 prefix=prefix,
+                alt_stream=alt_stream,
             ),
             pp_rank=self.pp_group.rank_in_group,
             pp_size=self.pp_group.world_size,
@@ -282,6 +299,9 @@ class Qwen2Model(nn.Module):
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer(return_tuple=True)
+
+        # For EAGLE3 support
+        self.layers_to_capture = []
 
     def get_input_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
         if hasattr(self.config, "scale_emb"):
@@ -311,7 +331,12 @@ class Qwen2Model(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
+        aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
+            if i in self.layers_to_capture:
+                aux_hidden_states.append(
+                    hidden_states + residual if residual is not None else hidden_states
+                )
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions,
@@ -327,8 +352,16 @@ class Qwen2Model(nn.Module):
                 }
             )
         else:
-            hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states
+            if hidden_states.shape[0] != 0:
+                if residual is None:
+                    hidden_states = self.norm(hidden_states)
+                else:
+                    hidden_states, _ = self.norm(hidden_states, residual)
+
+        if len(aux_hidden_states) == 0:
+            return hidden_states
+
+        return hidden_states, aux_hidden_states
 
     # If this function is called, it should always initialize KV cache scale
     # factors (or else raise an exception). Thus, handled exceptions should
@@ -419,6 +452,8 @@ class Qwen2ForCausalLM(nn.Module, SupportsPP):
 
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
+        # For EAGLE3 support
+        self.capture_aux_hidden_states = False
 
     def get_input_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embedding(input_ids)
@@ -443,16 +478,72 @@ class Qwen2ForCausalLM(nn.Module, SupportsPP):
             input_embeds,
             pp_proxy_tensors=pp_proxy_tensors,
         )
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
 
         if self.pp_group.is_last_rank:
             if not get_embedding:
                 return self.logits_processor(
-                    input_ids, hidden_states, self.lm_head, forward_batch
+                    input_ids,
+                    hidden_states,
+                    self.lm_head,
+                    forward_batch,
+                    aux_hidden_states,
                 )
             else:
                 return self.pooler(hidden_states, forward_batch)
         else:
             return hidden_states
+
+    @torch.no_grad()
+    def forward_split_prefill(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        split_interval: Tuple[int, int],  # [start, end) 0-based
+        input_embeds: torch.Tensor = None,
+    ):
+        start, end = split_interval
+        # embed
+        if start == 0:
+            if input_embeds is None:
+                forward_batch.hidden_states = self.model.embed_tokens(input_ids)
+            else:
+                forward_batch.hidden_states = input_embeds
+        # decoder layer
+        for i in range(start, end):
+            layer = self.model.layers[i]
+            forward_batch.hidden_states, forward_batch.residual = layer(
+                positions,
+                forward_batch.hidden_states,
+                forward_batch,
+                forward_batch.residual,
+            )
+
+        if end == self.model.config.num_hidden_layers:
+            # norm
+            hidden_states, _ = self.model.norm(
+                forward_batch.hidden_states, forward_batch.residual
+            )
+            forward_batch.hidden_states = hidden_states
+            # logits process
+            result = self.logits_processor(
+                input_ids, forward_batch.hidden_states, self.lm_head, forward_batch
+            )
+        else:
+            result = None
+
+        return result
+
+    @property
+    def start_layer(self):
+        return self.model.start_layer
+
+    @property
+    def end_layer(self):
+        return self.model.end_layer
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
@@ -494,6 +585,8 @@ class Qwen2ForCausalLM(nn.Module, SupportsPP):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+                if name not in params_dict:
+                    continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -525,6 +618,21 @@ class Qwen2ForCausalLM(nn.Module, SupportsPP):
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         self.model.load_kv_cache_scales(quantization_param_path)
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        if not self.pp_group.is_last_rank:
+            return
+
+        self.capture_aux_hidden_states = True
+        if layer_ids is None:
+            num_layers = self.config.num_hidden_layers
+            self.model.layers_to_capture = [
+                2,
+                num_layers // 2,
+                num_layers - 3,
+            ]  # Specific layers for EAGLE3 support
+        else:
+            self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
 
 EntryClass = Qwen2ForCausalLM

@@ -45,7 +45,6 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.utils import SupportsPP
 from sglang.srt.model_loader.weight_utils import (
@@ -53,6 +52,7 @@ from sglang.srt.model_loader.weight_utils import (
     kv_cache_scales_loader,
     maybe_remap_kv_scale_name,
 )
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, make_layers
 from sglang.utils import get_exception_traceback
 
@@ -92,10 +92,18 @@ class LlamaMLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
 
-    def forward(self, x, forward_batch=None):
+    def forward(
+        self,
+        x,
+        forward_batch=None,
+        use_reduce_scatter: bool = False,
+    ):
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
+        x, _ = self.down_proj(
+            x,
+            skip_all_reduce=use_reduce_scatter,
+        )
         return x
 
 
@@ -378,6 +386,10 @@ class LlamaModel(nn.Module):
                     "Self attention has no KV cache scaling " "factor attribute!"
                 )
 
+    def get_input_embeddings(self) -> nn.Embedding:
+        """Get input embeddings from the model."""
+        return self.embed_tokens
+
 
 class LlamaForCausalLM(nn.Module, SupportsPP):
     # BitandBytes specific attributes
@@ -444,6 +456,13 @@ class LlamaForCausalLM(nn.Module, SupportsPP):
                 )
                 self.lm_head.weight.copy_(emb_token_weight)
 
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=add_prefix("lm_head", prefix),
+                use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+            )
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
         self.stacked_params_mapping = [
@@ -501,33 +520,57 @@ class LlamaForCausalLM(nn.Module, SupportsPP):
         else:
             return hidden_states
 
+    @torch.no_grad()
+    def forward_split_prefill(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        split_interval: Tuple[int, int],  # [start, end) 0-based
+        input_embeds: torch.Tensor = None,
+    ) -> Optional[LogitsProcessorOutput]:
+        start, end = split_interval
+        # embed
+        if start == 0:
+            if input_embeds is None:
+                forward_batch.hidden_states = self.model.embed_tokens(input_ids)
+            else:
+                forward_batch.hidden_states = input_embeds
+        # decoder layer
+        for i in range(start, end):
+            layer = self.model.layers[i]
+            forward_batch.hidden_states, forward_batch.residual = layer(
+                positions,
+                forward_batch.hidden_states,
+                forward_batch,
+                forward_batch.residual,
+            )
+
+        if end == self.model.config.num_hidden_layers:
+            # norm
+            hidden_states, _ = self.model.norm(
+                forward_batch.hidden_states, forward_batch.residual
+            )
+            forward_batch.hidden_states = hidden_states
+            # logits process
+            result = self.logits_processor(
+                input_ids, forward_batch.hidden_states, self.lm_head, forward_batch
+            )
+        else:
+            result = None
+
+        return result
+
+    @property
+    def start_layer(self):
+        return self.model.start_layer
+
+    @property
+    def end_layer(self):
+        return self.model.end_layer
+
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
-
-    def get_hidden_dim(self, module_name):
-        # return input_dim, output_dim
-        if module_name in ["q_proj", "o_proj", "qkv_proj"]:
-            return self.config.hidden_size, self.config.hidden_size
-        elif module_name in ["kv_proj"]:
-            return self.config.hidden_size, self.config.hidden_size // (
-                self.config.num_attention_heads // self.config.num_key_value_heads
-            )
-        elif module_name == "gate_up_proj":
-            return self.config.hidden_size, self.config.intermediate_size
-        elif module_name == "down_proj":
-            return self.config.intermediate_size, self.config.hidden_size
-        else:
-            raise NotImplementedError()
-
-    def get_module_name(self, name):
-        params_mapping = {
-            "q_proj": "qkv_proj",
-            "k_proj": "qkv_proj",
-            "v_proj": "qkv_proj",
-            "gate_proj": "gate_up_proj",
-            "up_proj": "gate_up_proj",
-        }
-        return params_mapping.get(name, name)
 
     def get_module_name_from_weight_name(self, name):
         for param_name, weight_name, shard_id, num_shard in self.stacked_params_mapping:
@@ -587,6 +630,8 @@ class LlamaForCausalLM(nn.Module, SupportsPP):
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
+                    continue
+                if name not in params_dict:
                     continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
@@ -710,13 +755,19 @@ class LlamaForCausalLM(nn.Module, SupportsPP):
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         self.model.load_kv_cache_scales(quantization_param_path)
 
-    def set_eagle3_layers_to_capture(self):
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
         if not self.pp_group.is_last_rank:
             return
 
-        self.capture_aux_hidden_states = True
-        num_layers = self.config.num_hidden_layers
-        self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]
+        if layer_ids is None:
+            self.capture_aux_hidden_states = True
+            num_layers = self.config.num_hidden_layers
+            self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]
+        else:
+            self.capture_aux_hidden_states = True
+            # we plus 1 here because in sglang, for the ith layer, it takes the output
+            # of the (i-1)th layer as aux hidden state
+            self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
 
 class Phi3ForCausalLM(LlamaForCausalLM):

@@ -4,6 +4,7 @@ import unittest
 import requests
 import torch
 
+from sglang.srt.server_args import set_global_server_args_for_scheduler
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -16,17 +17,15 @@ from sglang.test.test_utils import (
 def check_quant_method(model_path: str, use_marlin_kernel: bool):
     from sglang.srt.configs.device_config import DeviceConfig
     from sglang.srt.configs.load_config import LoadConfig
-    from sglang.srt.configs.model_config import AttentionArch, ModelConfig
+    from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.distributed import (
-        get_tp_group,
         init_distributed_environment,
         initialize_model_parallel,
-        set_custom_all_reduce,
     )
     from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
-    from sglang.srt.layers.quantization import get_dynamic_override
+    from sglang.srt.layers.quantization.utils import get_dynamic_override
     from sglang.srt.model_loader import get_model
-    from sglang.srt.server_args import PortArgs, ServerArgs
+    from sglang.srt.server_args import ServerArgs
 
     try:
         init_distributed_environment(
@@ -43,6 +42,7 @@ def check_quant_method(model_path: str, use_marlin_kernel: bool):
         pass
 
     server_args = ServerArgs(model_path=model_path, dtype=torch.float16)
+    set_global_server_args_for_scheduler(server_args)
     model_config = ModelConfig.from_server_args(server_args)
 
     load_config = LoadConfig()
@@ -51,12 +51,11 @@ def check_quant_method(model_path: str, use_marlin_kernel: bool):
         model_config=model_config, load_config=load_config, device_config=device_config
     )
 
-    from vllm.model_executor.layers.quantization.gptq import GPTQLinearMethod
-    from vllm.model_executor.layers.quantization.gptq_marlin import (
+    from sglang.srt.layers.linear import UnquantizedLinearMethod
+    from sglang.srt.layers.quantization.gptq import (
+        GPTQLinearMethod,
         GPTQMarlinLinearMethod,
     )
-
-    from sglang.srt.layers.linear import UnquantizedLinearMethod
 
     linear_method_cls = (
         GPTQMarlinLinearMethod if use_marlin_kernel else (GPTQLinearMethod)
@@ -162,7 +161,7 @@ class TestGPTQModelDynamicWithMarlin(CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--dtype", "float16"],
+            other_args=["--dtype", "bfloat16"],
         )
 
     @classmethod
