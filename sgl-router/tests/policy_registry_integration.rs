@@ -1,12 +1,11 @@
 //! Integration tests for PolicyRegistry with RouterManager
 
-use sglang_router_rs::config::PolicyConfig;
-use sglang_router_rs::core::WorkerRegistry;
-use sglang_router_rs::policies::PolicyRegistry;
-use sglang_router_rs::protocols::worker_spec::WorkerConfigRequest;
-use sglang_router_rs::routers::router_manager::RouterManager;
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
+
+use sglang_router_rs::{
+    config::PolicyConfig, core::WorkerRegistry, policies::PolicyRegistry,
+    protocols::worker_spec::WorkerConfigRequest, routers::router_manager::RouterManager,
+};
 
 #[tokio::test]
 async fn test_policy_registry_with_router_manager() {
@@ -95,8 +94,7 @@ async fn test_policy_registry_with_router_manager() {
 
 #[test]
 fn test_policy_registry_cleanup() {
-    use sglang_router_rs::config::PolicyConfig;
-    use sglang_router_rs::policies::PolicyRegistry;
+    use sglang_router_rs::{config::PolicyConfig, policies::PolicyRegistry};
 
     let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
 
@@ -123,8 +121,7 @@ fn test_policy_registry_cleanup() {
 
 #[test]
 fn test_policy_registry_multiple_models() {
-    use sglang_router_rs::config::PolicyConfig;
-    use sglang_router_rs::policies::PolicyRegistry;
+    use sglang_router_rs::{config::PolicyConfig, policies::PolicyRegistry};
 
     let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
 
