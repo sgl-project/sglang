@@ -55,6 +55,7 @@ from sglang.srt.utils import (
 from sglang.srt.utils.hf_transformers_utils import check_gguf_file, get_config
 from sglang.utils import is_in_ci
 
+from sglang.srt.utils import get_bool_env_var
 logger = logging.getLogger(__name__)
 
 
@@ -1016,8 +1017,17 @@ class ServerArgs:
 
             if not is_npu():
                 self.enable_dp_attention = True
-                self.dp_size = self.tp_size
-                logger.warning("DP attention is enabled for DeepSeek NSA.")
+                is_context_parallel = get_bool_env_var("SGLANG_USE_DP_CP_AG_AFTER_DSA")
+                if is_context_parallel:
+                    self.dp_size = 1
+                    self.moe_dense_tp_size = 1
+                    assert (
+                        self.tp_size == 8
+                    ), "Current context parallel only support Single machine(tp_size == 8)"
+
+                    logger.warning("Start context parallel opt for deeeseekv3.2-DSA, Setting dp_size == 1 and moe_dense_tp_size == 1.")
+                else:
+                    self.dp_size = self.tp_size
 
                 self.page_size = 64
                 logger.warning("Setting page size to 64 for DeepSeek NSA.")
@@ -1163,7 +1173,7 @@ class ServerArgs:
 
     def _handle_data_parallelism(self):
         if self.dp_size == 1:
-            self.enable_dp_attention = False
+            # self.enable_dp_attention = False
             self.enable_dp_lm_head = False
 
         if self.enable_dp_attention:
