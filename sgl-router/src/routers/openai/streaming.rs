@@ -7,11 +7,8 @@
 //! - MCP tool execution loops within streaming responses
 //! - Event transformation and output index remapping
 
-use crate::data_connector::{
-    SharedConversationItemStorage, SharedConversationStorage, SharedResponseStorage,
-};
-use crate::protocols::responses::{ResponseToolType, ResponsesRequest};
-use crate::routers::header_utils::{apply_request_headers, preserve_response_headers};
+use std::{borrow::Cow, io, sync::Arc};
+
 use axum::{
     body::Body,
     http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode},
@@ -20,20 +17,28 @@ use axum::{
 use bytes::Bytes;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
-use std::{borrow::Cow, io, sync::Arc};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::warn;
 
 // Import from sibling modules
 use super::conversations::persist_conversation_items;
-use super::mcp::{
-    build_resume_payload, execute_streaming_tool_calls, inject_mcp_metadata_streaming,
-    mcp_manager_from_request_tools, prepare_mcp_payload_for_streaming, send_mcp_list_tools_events,
-    McpLoopConfig, ToolLoopState,
+use super::{
+    mcp::{
+        build_resume_payload, execute_streaming_tool_calls, inject_mcp_metadata_streaming,
+        mcp_manager_from_request_tools, prepare_mcp_payload_for_streaming,
+        send_mcp_list_tools_events, McpLoopConfig, ToolLoopState,
+    },
+    responses::{mask_tools_as_mcp, patch_streaming_response_json, rewrite_streaming_block},
+    utils::{event_types, FunctionCallInProgress, OutputIndexMapper, StreamAction},
 };
-use super::responses::{mask_tools_as_mcp, patch_streaming_response_json, rewrite_streaming_block};
-use super::utils::{event_types, FunctionCallInProgress, OutputIndexMapper, StreamAction};
+use crate::{
+    data_connector::{
+        SharedConversationItemStorage, SharedConversationStorage, SharedResponseStorage,
+    },
+    protocols::responses::{ResponseToolType, ResponsesRequest},
+    routers::header_utils::{apply_request_headers, preserve_response_headers},
+};
 
 // ============================================================================
 // Streaming Response Accumulator

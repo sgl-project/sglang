@@ -1,5 +1,13 @@
 //! Comprehensive integration tests for OpenAI backend functionality
 
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
+
 use axum::{
     body::Body,
     extract::Request,
@@ -26,13 +34,10 @@ use sglang_router_rs::{
     },
     routers::{openai::OpenAIRouter, RouterTrait},
 };
-use std::collections::HashMap;
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc,
+use tokio::{
+    net::TcpListener,
+    time::{sleep, Duration},
 };
-use tokio::net::TcpListener;
-use tokio::time::{sleep, Duration};
 use tower::ServiceExt;
 
 mod common;
@@ -962,8 +967,7 @@ fn oracle_config_validation_accepts_wallet_alias() {
 /// Test that RouterManager delegates /v1/models to OpenAI router in single-router mode
 #[tokio::test]
 async fn test_router_manager_delegates_models_to_openai_router() {
-    use sglang_router_rs::routers::router_manager::RouterManager;
-    use sglang_router_rs::server::ServerConfig;
+    use sglang_router_rs::{routers::router_manager::RouterManager, server::ServerConfig};
 
     // Start a mock OpenAI server
     let mock_server = MockOpenAIServer::new().await;
