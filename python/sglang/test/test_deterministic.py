@@ -176,6 +176,7 @@ def send_single(
     else:
         return ret["text"]
 
+
 def send_prefix(args, batch_size: int, prompts: List[str]):
     requests.post(f"http://{args.host}:{args.port}/flush_cache")
 

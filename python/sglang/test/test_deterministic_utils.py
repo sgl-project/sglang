@@ -6,7 +6,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
-    popen_launch_server
+    popen_launch_server,
 )
 
 DEFAULT_MODEL = "Qwen/Qwen3-8B"
