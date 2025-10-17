@@ -1,14 +1,18 @@
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use serde_json::{from_str, to_string, to_value, to_vec};
 use std::time::Instant;
 
-use sglang_router_rs::core::{BasicWorker, BasicWorkerBuilder, Worker, WorkerType};
-use sglang_router_rs::protocols::chat::{ChatCompletionRequest, ChatMessage, UserMessageContent};
-use sglang_router_rs::protocols::common::StringOrArray;
-use sglang_router_rs::protocols::completion::CompletionRequest;
-use sglang_router_rs::protocols::generate::GenerateRequest;
-use sglang_router_rs::protocols::sampling_params::SamplingParams;
-use sglang_router_rs::routers::http::pd_types::{generate_room_id, RequestWithBootstrap};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use serde_json::{from_str, to_string, to_value, to_vec};
+use sglang_router_rs::{
+    core::{BasicWorker, BasicWorkerBuilder, Worker, WorkerType},
+    protocols::{
+        chat::{ChatCompletionRequest, ChatMessage, UserMessageContent},
+        common::StringOrArray,
+        completion::CompletionRequest,
+        generate::GenerateRequest,
+        sampling_params::SamplingParams,
+    },
+    routers::http::pd_types::{generate_room_id, RequestWithBootstrap},
+};
 
 fn create_test_worker() -> BasicWorker {
     BasicWorkerBuilder::new("http://test-server:8000")

@@ -3,28 +3,28 @@
 //! This module defines the core pipeline abstraction and individual processing stages
 //! that transform a RequestContext through its lifecycle.
 
+use std::{
+    sync::Arc,
+    time::{Instant, SystemTime, UNIX_EPOCH},
+};
+
 use async_trait::async_trait;
 use axum::response::{IntoResponse, Response};
-use tracing::{debug, error, warn};
-
-use super::context::*;
-use super::processing;
-use super::streaming;
-use super::utils;
-use crate::core::{ConnectionMode, Worker, WorkerRegistry, WorkerType};
-use crate::grpc_client::proto;
-use crate::policies::PolicyRegistry;
-use crate::protocols::chat::ChatCompletionRequest;
-use crate::protocols::common::InputIds;
-use crate::protocols::generate::GenerateRequest;
-use crate::reasoning_parser::ParserFactory as ReasoningParserFactory;
-use crate::tokenizer::traits::Tokenizer;
-use crate::tool_parser::ParserFactory as ToolParserFactory;
 use proto::DisaggregatedParams;
 use rand::Rng;
-use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use tracing::{debug, error, warn};
 use uuid::Uuid;
+
+use super::{context::*, processing, streaming, utils};
+use crate::{
+    core::{ConnectionMode, Worker, WorkerRegistry, WorkerType},
+    grpc_client::proto,
+    policies::PolicyRegistry,
+    protocols::{chat::ChatCompletionRequest, common::InputIds, generate::GenerateRequest},
+    reasoning_parser::ParserFactory as ReasoningParserFactory,
+    tokenizer::traits::Tokenizer,
+    tool_parser::ParserFactory as ToolParserFactory,
+};
 
 // ============================================================================
 // Pipeline Trait

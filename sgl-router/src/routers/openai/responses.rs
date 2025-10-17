@@ -1,12 +1,15 @@
 //! Response storage, patching, and extraction utilities
 
-use crate::data_connector::{ResponseId, StoredResponse};
-use crate::protocols::responses::{ResponseInput, ResponseToolType, ResponsesRequest};
-use serde_json::{json, Value};
 use std::collections::HashMap;
+
+use serde_json::{json, Value};
 use tracing::warn;
 
 use super::utils::event_types;
+use crate::{
+    data_connector::{ResponseId, StoredResponse},
+    protocols::responses::{ResponseInput, ResponseToolType, ResponsesRequest},
+};
 
 // ============================================================================
 // Response Storage Operations
