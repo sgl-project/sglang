@@ -267,8 +267,8 @@ def flash_attn_varlen_func(
     v,
     cu_seqlens_q,
     cu_seqlens_k,
-    max_seqlen_q,
-    max_seqlen_k,
+    max_seqlen_q=None,
+    max_seqlen_k=None,
     seqused_q=None,
     seqused_k=None,
     softmax_scale=None,
@@ -298,31 +298,27 @@ def flash_attn_varlen_func(
             q,
             k,
             v,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            # max_seqlen_q,
-            # max_seqlen_k,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
             seqused_q=seqused_q,
             seqused_k=seqused_k,
             softmax_scale=softmax_scale,
             causal=causal,
-            # qv=qv,
-            # q_descale=q_descale,
-            # k_descale=k_descale,
-            # v_descale=v_descale,
             window_size=window_size,
             softcap=softcap,
-            # num_splits=num_splits,
             pack_gqa=pack_gqa,
-            # sm_margin=sm_margin,
-            return_softmax_lse=return_softmax_lse,
             learnable_sink=sinks,
+            return_softmax_lse=return_softmax_lse,
         )
 
     if not is_fa3_supported():
         raise NotImplementedError(
             "flash_attn at sgl-kernel is only supported on sm90 and above"
         )
+
+    # FA3 requires max_seqlen_q and max_seqlen_k
+    if max_seqlen_q is None or max_seqlen_k is None:
+        raise ValueError("max_seqlen_q and max_seqlen_k are required for FA3")
 
     if softmax_scale is None:
         softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (
