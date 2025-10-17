@@ -1,13 +1,16 @@
-use clap::{ArgAction, Parser, ValueEnum};
-use sglang_router_rs::config::{
-    CircuitBreakerConfig, ConfigError, ConfigResult, ConnectionMode, DiscoveryConfig,
-    HealthCheckConfig, HistoryBackend, MetricsConfig, OracleConfig, PolicyConfig, RetryConfig,
-    RouterConfig, RoutingMode,
-};
-use sglang_router_rs::metrics::PrometheusConfig;
-use sglang_router_rs::server::{self, ServerConfig};
-use sglang_router_rs::service_discovery::ServiceDiscoveryConfig;
 use std::collections::HashMap;
+
+use clap::{ArgAction, Parser, ValueEnum};
+use sglang_router_rs::{
+    config::{
+        CircuitBreakerConfig, ConfigError, ConfigResult, ConnectionMode, DiscoveryConfig,
+        HealthCheckConfig, HistoryBackend, MetricsConfig, OracleConfig, PolicyConfig, RetryConfig,
+        RouterConfig, RoutingMode,
+    },
+    metrics::PrometheusConfig,
+    server::{self, ServerConfig},
+    service_discovery::ServiceDiscoveryConfig,
+};
 
 fn parse_prefill_args() -> Vec<(String, Option<u16>)> {
     let args: Vec<String> = std::env::args().collect();
