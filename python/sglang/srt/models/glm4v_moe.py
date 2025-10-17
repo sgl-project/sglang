@@ -41,7 +41,6 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
         vision_utils.update_vit_attn_dummy_heads_config(self.config)
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
-        self.determine_num_fused_shared_experts("Glm4MoeForCausalLM")
         self.num_fused_shared_experts = (
             0
             if get_global_server_args().disable_shared_experts_fusion
