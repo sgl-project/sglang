@@ -1,6 +1,8 @@
-use super::ConfigResult;
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+use serde::{Deserialize, Serialize};
+
+use super::ConfigResult;
 
 /// Main router configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,6 +69,8 @@ pub struct RouterConfig {
     pub model_path: Option<String>,
     /// Explicit tokenizer path (overrides model_path tokenizer if provided)
     pub tokenizer_path: Option<String>,
+    /// Chat template path (optional)
+    pub chat_template: Option<String>,
     /// History backend configuration (memory or none, default: memory)
     #[serde(default = "default_history_backend")]
     pub history_backend: HistoryBackend,
@@ -450,6 +454,7 @@ impl Default for RouterConfig {
             connection_mode: ConnectionMode::Http,
             model_path: None,
             tokenizer_path: None,
+            chat_template: None,
             history_backend: default_history_backend(),
             oracle: None,
             reasoning_parser: None,
@@ -994,6 +999,7 @@ mod tests {
             connection_mode: ConnectionMode::Http,
             model_path: None,
             tokenizer_path: None,
+            chat_template: None,
             history_backend: default_history_backend(),
             oracle: None,
             reasoning_parser: None,
@@ -1061,6 +1067,7 @@ mod tests {
             connection_mode: ConnectionMode::Http,
             model_path: None,
             tokenizer_path: None,
+            chat_template: None,
             history_backend: default_history_backend(),
             oracle: None,
             reasoning_parser: None,
@@ -1124,6 +1131,7 @@ mod tests {
             connection_mode: ConnectionMode::Http,
             model_path: None,
             tokenizer_path: None,
+            chat_template: None,
             history_backend: default_history_backend(),
             oracle: None,
             reasoning_parser: None,

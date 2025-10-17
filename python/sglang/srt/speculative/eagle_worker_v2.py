@@ -1,9 +1,11 @@
+import contextlib
 import logging
 from typing import List, Optional
 
 import torch
 from torch.cuda import Stream as CudaStream
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, Req
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -12,15 +14,14 @@ from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.build_eagle_tree import TreeMaskMode
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_info_v2 import (
     assign_extend_cache_locs,
-    build_tree_kernel_efficient_tmp,
     fill_accepted_out_cache_loc,
     fill_new_verified_id,
     select_top_k_tokens_tmp,
 )
+from sglang.srt.speculative.eagle_utils import TreeMaskMode, build_tree_kernel_efficient
 from sglang.srt.speculative.eagle_worker import EAGLEWorker
 from sglang.srt.utils.common import fast_topk, next_power_of_2
 
@@ -51,9 +52,13 @@ class EAGLEWorkerV2(EAGLEWorker):
             self.speculative_num_steps * self.topk, self.speculative_num_draft_tokens
         )
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
-        self.plan_stream: CudaStream = torch.get_device_module(self.device).Stream()
-        # TODO(lsyin): potential bugs with a separate plan stream
-        self.plan_stream_ctx = torch.cuda.stream(self.plan_stream)
+
+        if envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get():
+            self.plan_stream: CudaStream = torch.get_device_module(self.device).Stream()
+            self.plan_stream_ctx = torch.cuda.stream(self.plan_stream)
+        else:
+            self.plan_stream = None
+            self.plan_stream_ctx = contextlib.nullcontext()
 
     def forward_batch_generation(self, model_worker_batch: ModelWorkerBatch):
         if model_worker_batch.forward_mode.is_decode():
@@ -98,7 +103,10 @@ class EAGLEWorkerV2(EAGLEWorker):
                 forward_batch,
             )
         else:
-            self.draft_attn_backend.init_forward_metadata(forward_batch)
+            if self.speculative_num_steps > 1:
+                # Skip attention backend init for 1-step draft,
+                # `draft_forward` only does sample in this case.
+                self.draft_attn_backend.init_forward_metadata(forward_batch)
             parent_list, top_scores_index, draft_tokens = self.draft_forward(
                 forward_batch
             )
@@ -116,7 +124,7 @@ class EAGLEWorkerV2(EAGLEWorker):
             retrive_next_token,
             retrive_next_sibling,
             draft_tokens,
-        ) = build_tree_kernel_efficient_tmp(
+        ) = build_tree_kernel_efficient(
             draft_input.verified_id,
             parent_list,
             top_scores_index,
@@ -230,9 +238,13 @@ class EAGLEWorkerV2(EAGLEWorker):
         batch: ModelWorkerBatch,
         pre_draft_allocate_lens: torch.Tensor,
     ):
+        # Since batch.seq_lens is allocated in another stream, we need
+        # record_stream() to prevent pytorch gc and reuse the gpu memory
+        # while forward_stream is still running.
+        batch.seq_lens.record_stream(torch.cuda.current_stream())
+
         # Parse args
         verify_input: EagleVerifyInput = batch.spec_info
-        seq_lens_backup = batch.seq_lens
         bs = len(batch.seq_lens)
 
         # Batch 1: Target verify
@@ -278,17 +290,8 @@ class EAGLEWorkerV2(EAGLEWorker):
             accept_length,
             accept_index,
         ) = verify_input.sample(batch, logits_output)
-        new_seq_lens = seq_lens_backup + accept_length
+        new_seq_lens = batch.seq_lens + accept_length
         verify_done = torch.cuda.Event()
-
-        # Move the accepted tokens to the target KV cache locations
-        batch.seq_lens = seq_lens_backup
-        self.move_accepted_tokens_to_target_kvcache(
-            batch,
-            accept_index,
-            accept_length,
-        )
-
         verify_done.record()
 
         all_verified_id = predict[accept_index]
@@ -338,11 +341,6 @@ class EAGLEWorkerV2(EAGLEWorker):
         probs = torch.softmax(draft_logits_output.next_token_logits, dim=-1)
         ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
         ret_hidden_states = draft_logits_output.hidden_states
-
-        # Since seq_lens_backup's tensor is allocated in another stream, we
-        # need record_stream() to prevent pytorch gc and reuse the gpu memory
-        # while forward_stream is still running.
-        seq_lens_backup.record_stream(torch.cuda.current_stream())
 
         # Construct the return values
         next_draft_input = EagleDraftInput(
