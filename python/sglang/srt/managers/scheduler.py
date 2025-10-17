@@ -2168,6 +2168,10 @@ class Scheduler(
         batch.prepare_for_decode()
         return batch
 
+    # placeholder for override
+    def update_cache_from_scheduler(self, schedule_batch, batch_result):
+        pass
+
     def run_batch(
         self, batch: ScheduleBatch
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
@@ -2244,6 +2248,7 @@ class Scheduler(
                     batch_or_worker_batch
                 )
                 future_indices_or_next_token_ids = batch_result.next_token_ids
+                self.update_cache_from_scheduler(batch, batch_result)
 
             # NOTE: future_indices_or_next_token_ids is used in ScheduleBatch,
             #       which can probably be replaced by future_indices later [TODO(lsyin)].
