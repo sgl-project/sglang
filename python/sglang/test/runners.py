@@ -496,7 +496,7 @@ class SRTRunner:
         attention_backend: Optional[str] = None,
         prefill_attention_backend: Optional[str] = None,
         decode_attention_backend: Optional[str] = None,
-        lora_backend: str = "triton",
+        lora_backend: str = "csgmv",
         disable_cuda_graph: bool = False,
         disable_radix_cache: bool = False,
         chunked_prefill_size: Optional[int] = None,
@@ -519,6 +519,7 @@ class SRTRunner:
         lora_target_modules: Optional[List[str]] = None,
         enable_lora: Optional[bool] = None,
         max_loaded_loras: Optional[int] = None,
+        lora_eviction_policy: str = "lru",
     ):
         self.model_type = model_type
         self.is_generation = model_type == "generation"
@@ -565,6 +566,7 @@ class SRTRunner:
             lora_target_modules=lora_target_modules,
             enable_lora=enable_lora,
             max_loaded_loras=max_loaded_loras,
+            lora_eviction_policy=lora_eviction_policy,
             **spec_kwargs,
         )
 

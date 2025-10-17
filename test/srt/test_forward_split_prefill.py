@@ -8,6 +8,7 @@ python3 test_forward_split_prefill.py
 """
 
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -90,17 +91,23 @@ class TestForwardSplitPrefill(CustomTestCase):
                 origin_input_ids=list(input_ids[i]),
                 sampling_params=sampling_params,
             )
-            req.prefix_indices = []
             req.fill_ids = req.origin_input_ids
             req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
             req.logprob_start_len = len(req.origin_input_ids) - 1
             reqs.append(req)
 
+        # Create dummy tree_cache for tests (no prefix caching, just allocation)
+        dummy_tree_cache = SimpleNamespace(
+            page_size=1,
+            device=self.model_runner.device,
+            token_to_kv_pool_allocator=self.model_runner.token_to_kv_pool_allocator,
+        )
+
         batch = ScheduleBatch.init_new(
             reqs=reqs,
             req_to_token_pool=self.model_runner.req_to_token_pool,
             token_to_kv_pool_allocator=self.model_runner.token_to_kv_pool_allocator,
-            tree_cache=None,
+            tree_cache=dummy_tree_cache,
             model_config=self.model_config,
             enable_overlap=False,
             spec_algorithm=SpeculativeAlgorithm.NONE,

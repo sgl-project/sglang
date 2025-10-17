@@ -1,14 +1,15 @@
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::protocols::spec::Tool;
-
-use crate::tool_parser::{
-    errors::{ToolParserError, ToolParserResult},
-    parsers::helpers,
-    partial_json::PartialJson,
-    traits::ToolParser,
-    types::{FunctionCall, StreamingParseResult, ToolCall},
+use crate::{
+    protocols::common::Tool,
+    tool_parser::{
+        errors::{ParserError, ParserResult},
+        parsers::helpers,
+        partial_json::PartialJson,
+        traits::ToolParser,
+        types::{FunctionCall, StreamingParseResult, ToolCall},
+    },
 };
 
 /// Mistral format parser for tool calls
@@ -111,9 +112,9 @@ impl MistralParser {
     }
 
     /// Parse tool calls from a JSON array
-    fn parse_json_array(&self, json_str: &str) -> ToolParserResult<Vec<ToolCall>> {
+    fn parse_json_array(&self, json_str: &str) -> ParserResult<Vec<ToolCall>> {
         let value: Value = serde_json::from_str(json_str)
-            .map_err(|e| ToolParserError::ParsingFailed(e.to_string()))?;
+            .map_err(|e| ParserError::ParsingFailed(e.to_string()))?;
 
         let mut tools = Vec::new();
 
@@ -134,7 +135,7 @@ impl MistralParser {
     }
 
     /// Parse a single JSON object into a ToolCall
-    fn parse_single_object(&self, obj: &Value) -> ToolParserResult<Option<ToolCall>> {
+    fn parse_single_object(&self, obj: &Value) -> ParserResult<Option<ToolCall>> {
         let name = obj.get("name").and_then(|v| v.as_str());
 
         if let Some(name) = name {
@@ -144,7 +145,7 @@ impl MistralParser {
 
             // Convert arguments to JSON string
             let arguments = serde_json::to_string(args)
-                .map_err(|e| ToolParserError::ParsingFailed(e.to_string()))?;
+                .map_err(|e| ParserError::ParsingFailed(e.to_string()))?;
 
             Ok(Some(ToolCall {
                 function: FunctionCall {
@@ -156,11 +157,6 @@ impl MistralParser {
             Ok(None)
         }
     }
-
-    /// Check if text contains Mistral tool markers
-    fn has_tool_markers(&self, text: &str) -> bool {
-        text.contains("[TOOL_CALLS]")
-    }
 }
 
 impl Default for MistralParser {
@@ -171,7 +167,7 @@ impl Default for MistralParser {
 
 #[async_trait]
 impl ToolParser for MistralParser {
-    async fn parse_complete(&self, text: &str) -> ToolParserResult<(String, Vec<ToolCall>)> {
+    async fn parse_complete(&self, text: &str) -> ParserResult<(String, Vec<ToolCall>)> {
         // Check if text contains Mistral format
         if !self.has_tool_markers(text) {
             return Ok((text.to_string(), vec![]));
@@ -204,7 +200,7 @@ impl ToolParser for MistralParser {
         &mut self,
         chunk: &str,
         tools: &[Tool],
-    ) -> ToolParserResult<StreamingParseResult> {
+    ) -> ParserResult<StreamingParseResult> {
         // Append new text to buffer
         self.buffer.push_str(chunk);
         let current_text = &self.buffer.clone();
@@ -254,11 +250,21 @@ impl ToolParser for MistralParser {
         )
     }
 
-    fn detect_format(&self, text: &str) -> bool {
-        self.has_tool_markers(text)
+    fn has_tool_markers(&self, text: &str) -> bool {
+        text.contains("[TOOL_CALLS]")
     }
 
     fn get_unstreamed_tool_args(&self) -> Option<Vec<crate::tool_parser::types::ToolCallItem>> {
         helpers::get_unstreamed_args(&self.prev_tool_call_arr, &self.streamed_args_for_tool)
+    }
+
+    fn reset(&mut self) {
+        helpers::reset_parser_state(
+            &mut self.buffer,
+            &mut self.prev_tool_call_arr,
+            &mut self.current_tool_id,
+            &mut self.current_tool_name_sent,
+            &mut self.streamed_args_for_tool,
+        );
     }
 }
