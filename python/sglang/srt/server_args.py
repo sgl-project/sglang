@@ -903,8 +903,7 @@ class ServerArgs:
                 "fa3",
                 "aiter",
                 "triton",
-                "flashinfer",
-            }, "fa3, aiter, triton, or flashinfer is required for Llama4 model"
+            }, "fa3, aiter, or triton is required for Llama4 model"
         elif model_arch in [
             "Gemma2ForCausalLM",
             "Gemma3ForCausalLM",
