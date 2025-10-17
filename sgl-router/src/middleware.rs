@@ -1,12 +1,19 @@
+use std::{
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
+};
+
 use axum::{
-    body::Body, extract::Request, extract::State, http::header, http::HeaderValue,
-    http::StatusCode, middleware::Next, response::IntoResponse, response::Response,
+    body::Body,
+    extract::{Request, State},
+    http::{header, HeaderValue, StatusCode},
+    middleware::Next,
+    response::{IntoResponse, Response},
 };
 use rand::Rng;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
-use std::time::Instant;
 use subtle::ConstantTimeEq;
 use tokio::sync::{mpsc, oneshot};
 use tower::{Layer, Service};
@@ -14,9 +21,7 @@ use tower_http::trace::{MakeSpan, OnRequest, OnResponse, TraceLayer};
 use tracing::{debug, error, field::Empty, info, info_span, warn, Span};
 
 pub use crate::core::token_bucket::TokenBucket;
-
-use crate::metrics::RouterMetrics;
-use crate::server::AppState;
+use crate::{metrics::RouterMetrics, server::AppState};
 
 #[derive(Clone)]
 pub struct AuthConfig {
@@ -69,6 +74,8 @@ fn generate_request_id(path: &str) -> String {
         "cmpl-"
     } else if path.contains("/generate") {
         "gnt-"
+    } else if path.contains("/responses") {
+        "resp-"
     } else {
         "req-"
     };
