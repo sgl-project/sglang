@@ -1,10 +1,13 @@
 cmake_minimum_required(VERSION 3.26 FATAL_ERROR)
 project(sgl-kernel LANGUAGES CXX CUDA)
 
+# utils
+include(${CMAKE_CURRENT_LIST_DIR}/cmake/utils.cmake)
+include(FetchContent)
+
 # CMake
 cmake_policy(SET CMP0169 OLD)
 cmake_policy(SET CMP0177 NEW)
-include(${CMAKE_CURRENT_LIST_DIR}/cmake/utils.cmake)
 set(CMAKE_COLOR_DIAGNOSTICS ON)
 set(CMAKE_VERBOSE_MAKEFILE ON CACHE BOOL "ON")
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
@@ -37,11 +40,9 @@ endif()
 
 # Torch
 find_package(Torch REQUIRED)
-# clean Torch Flag
 clear_cuda_arches(CMAKE_FLAG)
 
-include(FetchContent)
-
+# Third Party
 # cutlass
 FetchContent_Declare(
     repo-cutlass
@@ -60,15 +61,6 @@ FetchContent_Declare(
 )
 FetchContent_Populate(repo-deepgemm)
 
-# flash_mla
-FetchContent_Declare(
-    repo-flashmla
-    GIT_REPOSITORY https://github.com/sgl-project/FlashMLA
-    GIT_TAG sgl
-    GIT_SHALLOW OFF
-)
-FetchContent_Populate(repo-flashmla)
-
 # fmt
 FetchContent_Declare(
     repo-fmt
@@ -78,7 +70,7 @@ FetchContent_Declare(
 )
 FetchContent_Populate(repo-fmt)
 
-# Triton
+# Triton kernel
 FetchContent_Declare(
     repo-triton
     GIT_REPOSITORY "https://github.com/triton-lang/triton"
@@ -152,15 +144,6 @@ endif()
 include_directories(
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/csrc
-    ${repo-cutlass_SOURCE_DIR}/include
-    ${repo-cutlass_SOURCE_DIR}/tools/util/include
-    ${repo-flashinfer_SOURCE_DIR}/include
-    ${repo-flashinfer_SOURCE_DIR}/csrc
-    ${repo-mscclpp_SOURCE_DIR}/include
-    ${repo-flashmla_SOURCE_DIR}/csrc
-    ${repo-flashmla_SOURCE_DIR}/csrc/sm90
-    ${repo-flashmla_SOURCE_DIR}/cutlass/include
-    ${repo-flashmla_SOURCE_DIR}/cutlass/tools/utils/include
 )
 
 set(SGL_KERNEL_CUDA_FLAGS
@@ -352,17 +335,6 @@ set(SOURCES
     "${repo-flashinfer_SOURCE_DIR}/csrc/renorm.cu"
     "${repo-flashinfer_SOURCE_DIR}/csrc/sampling.cu"
 
-    "${repo-flashmla_SOURCE_DIR}/csrc/python_api.cpp"
-    "${repo-flashmla_SOURCE_DIR}/csrc/smxx/get_mla_metadata.cu"
-    "${repo-flashmla_SOURCE_DIR}/csrc/smxx/mla_combine.cu"
-    "${repo-flashmla_SOURCE_DIR}/csrc/sm90/decode/dense/splitkv_mla.cu"
-    "${repo-flashmla_SOURCE_DIR}/csrc/sm90/decode/sparse_fp8/splitkv_mla.cu"
-    "${repo-flashmla_SOURCE_DIR}/csrc/sm90/prefill/sparse/fwd.cu"
-    "${repo-flashmla_SOURCE_DIR}/csrc/sm100/decode/sparse_fp8/splitkv_mla.cu"
-    "${repo-flashmla_SOURCE_DIR}/csrc/sm100/prefill/dense/fmha_cutlass_fwd_sm100.cu"
-    "${repo-flashmla_SOURCE_DIR}/csrc/sm100/prefill/dense/fmha_cutlass_bwd_sm100.cu"
-    "${repo-flashmla_SOURCE_DIR}/csrc/sm100/prefill/sparse/fwd.cu"
-
     "${repo-fast-hadamard-transform_SOURCE_DIR}/csrc/fast_hadamard_transform_cuda.cu"
     "${repo-fast-hadamard-transform_SOURCE_DIR}/csrc/fast_hadamard_transform.cpp"
 
@@ -373,6 +345,7 @@ set(SOURCES
     "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/flash_sparse_api.cpp"
 )
 
+# =========================== Common SM90 Build ============================= #
 # Build SM90 library with fast math optimization (same namespace, different directory)
 Python_add_library(common_ops_sm90_build MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
 
@@ -383,7 +356,11 @@ target_compile_options(common_ops_sm90_build PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS} -use_fast_math>
 )
 target_include_directories(common_ops_sm90_build PRIVATE
-    ${PROJECT_SOURCE_DIR}/csrc
+    ${repo-cutlass_SOURCE_DIR}/include
+    ${repo-cutlass_SOURCE_DIR}/tools/util/include
+    ${repo-flashinfer_SOURCE_DIR}/include
+    ${repo-flashinfer_SOURCE_DIR}/csrc
+    ${repo-mscclpp_SOURCE_DIR}/include
     ${repo-cutlass_SOURCE_DIR}/examples/77_blackwell_fmha
     ${repo-cutlass_SOURCE_DIR}/examples/common
     ${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src
@@ -394,6 +371,7 @@ set_target_properties(common_ops_sm90_build PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/sm90"
 )
 
+# =========================== Common SM100+ Build ============================= #
 # Build SM100+ library with precise math (same namespace, different directory)
 Python_add_library(common_ops_sm100_build MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
 
@@ -404,7 +382,11 @@ target_compile_options(common_ops_sm100_build PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>
 )
 target_include_directories(common_ops_sm100_build PRIVATE
-    ${PROJECT_SOURCE_DIR}/csrc
+    ${repo-cutlass_SOURCE_DIR}/include
+    ${repo-cutlass_SOURCE_DIR}/tools/util/include
+    ${repo-flashinfer_SOURCE_DIR}/include
+    ${repo-flashinfer_SOURCE_DIR}/csrc
+    ${repo-mscclpp_SOURCE_DIR}/include
     ${repo-cutlass_SOURCE_DIR}/examples/77_blackwell_fmha
     ${repo-cutlass_SOURCE_DIR}/examples/common
     ${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src
@@ -431,7 +413,7 @@ else()
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -D_GLIBCXX_USE_CXX11_ABI=1")
 endif()
 
-# mscclpp
+# mscclpp option
 set(MSCCLPP_USE_CUDA ON)
 set(MSCCLPP_BYPASS_GPU_CHECK ON)
 set(MSCCLPP_BUILD_TESTS OFF)
@@ -442,7 +424,7 @@ add_subdirectory(
 target_link_libraries(common_ops_sm90_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
 target_link_libraries(common_ops_sm100_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
 
-# flash attention
+# sparse flash attention
 target_compile_definitions(common_ops_sm90_build PRIVATE
     FLASHATTENTION_DISABLE_BACKWARD
     FLASHATTENTION_DISABLE_DROPOUT
@@ -529,6 +511,8 @@ if (SGL_KERNEL_ENABLE_FA3)
 
     target_compile_options(flash_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${SGL_FLASH_KERNEL_CUDA_FLAGS}>)
     target_include_directories(flash_ops PRIVATE
+        ${repo-cutlass_SOURCE_DIR}/include
+        ${repo-cutlass_SOURCE_DIR}/tools/util/include
         ${repo-flash-attention_SOURCE_DIR}/hopper
     )
     target_link_libraries(flash_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda)
@@ -558,6 +542,8 @@ target_compile_options(spatial_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERN
 target_link_libraries(spatial_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda)
 install(TARGETS spatial_ops LIBRARY DESTINATION sgl_kernel)
 
+# ============================ Extra Install ============================= #
+include(${CMAKE_CURRENT_LIST_DIR}/cmake/flashmla.cmake)
 
 # ============================ DeepGEMM (JIT) ============================= #
 # Create a separate library for DeepGEMM's Python API.

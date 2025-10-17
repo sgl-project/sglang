@@ -2,6 +2,17 @@ from typing import Optional, Tuple
 
 import torch
 
+try:
+    from . import flashmla_ops  # triggers TORCH extension registration
+except Exception as _e:
+    _flashmla_import_error = _e
+else:
+    _flashmla_import_error = None
+
+_IMPORT_ERROR = ImportError(
+    "Failed to load sgl_kernel.flashmla_ops extension. Ensure CUDA Driver >= 12.4"
+)
+
 
 def get_mla_metadata(
     cache_seqlens: torch.Tensor,
