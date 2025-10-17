@@ -308,9 +308,9 @@ impl WorkerRegistry {
                     }
                 }
 
-                // Check connection_mode if specified
+                // Check connection_mode if specified (using matches for flexible gRPC matching)
                 if let Some(ref conn) = connection_mode {
-                    if w.connection_mode() != *conn {
+                    if !w.connection_mode().matches(conn) {
                         return false;
                     }
                 }

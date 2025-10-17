@@ -3,10 +3,12 @@
 use crate::config::types::RetryConfig;
 use crate::core::{ConnectionMode, WorkerRegistry, WorkerType};
 use crate::policies::PolicyRegistry;
-use crate::protocols::spec::{
-    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest,
-    ResponsesGetParams, ResponsesRequest,
-};
+use crate::protocols::chat::ChatCompletionRequest;
+use crate::protocols::completion::CompletionRequest;
+use crate::protocols::embedding::EmbeddingRequest;
+use crate::protocols::generate::GenerateRequest;
+use crate::protocols::rerank::RerankRequest;
+use crate::protocols::responses::{ResponsesGetParams, ResponsesRequest};
 use crate::reasoning_parser::ParserFactory as ReasoningParserFactory;
 use crate::routers::RouterTrait;
 use crate::server::AppContext;
