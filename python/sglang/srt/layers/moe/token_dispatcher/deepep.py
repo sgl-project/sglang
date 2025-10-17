@@ -534,7 +534,6 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             hidden_states,
             input_global_scale,
             topk_idx,
-            use_fp8=not get_moe_runner_backend().is_cutlass(),
         )
         return (
             hidden_states,
@@ -590,7 +589,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 topk_idx,
                 self.num_max_dispatch_tokens_per_rank,
                 self.num_experts,
-                use_fp8=use_fp8,
+                use_fp8=not get_moe_runner_backend().is_cutlass(),
                 **(dict(use_nvfp4=True) if use_nvfp4 else dict()),
                 **(
                     dict(x_global_scale=input_global_scale)
