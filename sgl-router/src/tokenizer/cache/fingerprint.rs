@@ -3,9 +3,12 @@
 //! Creates a unique fingerprint of a tokenizer's configuration to detect
 //! when the tokenizer has changed and the cache needs to be cleared.
 
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+};
+
 use super::super::traits::Tokenizer;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 
 /// A fingerprint of a tokenizer's configuration
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

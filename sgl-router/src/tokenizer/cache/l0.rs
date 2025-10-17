@@ -5,10 +5,14 @@
 //!
 //! Expected hit rate: 60-90% for workloads with repeated system prompts
 
-use super::super::traits::Encoding;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
+
 use dashmap::DashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+
+use super::super::traits::Encoding;
 
 /// L0 cache implementation using DashMap for lock-free reads
 pub struct L0Cache {

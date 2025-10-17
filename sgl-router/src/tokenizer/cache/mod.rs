@@ -18,14 +18,15 @@ mod fingerprint;
 mod l0;
 mod l1;
 
+use std::sync::Arc;
+
+use anyhow::Result;
 pub use fingerprint::TokenizerFingerprint;
 pub use l0::{CacheStats, L0Cache};
 pub use l1::{L1Cache, L1CacheStats};
+use rayon::prelude::*;
 
 use super::traits::{Decoder, Encoder, Encoding, SpecialTokens, TokenIdType, Tokenizer};
-use anyhow::Result;
-use rayon::prelude::*;
-use std::sync::Arc;
 
 /// Configuration for the tokenizer cache
 #[derive(Debug, Clone)]
@@ -157,6 +158,14 @@ impl CachedTokenizer {
 
 impl Encoder for CachedTokenizer {
     fn encode(&self, input: &str) -> Result<Encoding> {
+        // Collect special tokens once if L1 is enabled (avoid redundant allocation)
+        let special_tokens: Option<Vec<&str>> = self.l1.as_ref().map(|_| {
+            self.special_token_strings
+                .iter()
+                .map(|s| s.as_str())
+                .collect()
+        });
+
         // L0 cache lookup (exact match)
         if let Some(l0) = &self.l0 {
             if let Some(cached) = l0.get(input) {
@@ -166,15 +175,9 @@ impl Encoder for CachedTokenizer {
 
         // L1 cache lookup (prefix match at special token boundaries)
         if let Some(l1) = &self.l1 {
-            let special_tokens: Vec<&str> = self
-                .special_token_strings
-                .iter()
-                .map(|s| s.as_str())
-                .collect();
+            let tokens = special_tokens.as_ref().unwrap();
 
-            if let Some((prefix_tokens, prefix_len)) =
-                l1.longest_prefix_match(input, &special_tokens)
-            {
+            if let Some((prefix_tokens, prefix_len)) = l1.longest_prefix_match(input, tokens) {
                 // We have a prefix match - tokenize the suffix
                 let suffix = &input[prefix_len..];
                 if !suffix.is_empty() {
@@ -208,12 +211,8 @@ impl Encoder for CachedTokenizer {
         // Cache in L1 at special token boundaries
         // Re-tokenizes prefixes for correctness (optimized for high prefix reuse)
         if let Some(l1) = &self.l1 {
-            let special_tokens: Vec<&str> = self
-                .special_token_strings
-                .iter()
-                .map(|s| s.as_str())
-                .collect();
-            let _ = l1.insert_at_boundaries(input, self.inner.as_ref(), &special_tokens);
+            let tokens = special_tokens.as_ref().unwrap();
+            let _ = l1.insert_at_boundaries(input, self.inner.as_ref(), tokens);
             // Ignore errors in cache insertion - cache is best-effort
         }
 

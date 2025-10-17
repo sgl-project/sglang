@@ -19,12 +19,18 @@
 //! Cache points: After each "<|im_end|>" (atomic tokens, guaranteed safe)
 //! Result: tokenize(prefix) + tokenize(suffix) == tokenize(prefix + suffix)
 
-use super::super::traits::TokenIdType;
+use std::{
+    mem::size_of,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+};
+
 use blake3;
 use dashmap::DashMap;
-use std::mem::size_of;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+
+use super::super::traits::TokenIdType;
 
 /// Hash type for cache keys
 type Blake3Hash = [u8; 32];
