@@ -23,13 +23,14 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.layers.parameter import (
     BasevLLMParameter,
-    BlockQuantScaleParameter,
+    #BlockQuantScaleParameter,
     PackedColumnParameter,
     PackedvLLMParameter,
     PerTensorScaleParameter,
     RowvLLMParameter,
     _ColumnvLLMParameter,
 )
+from vllm.model_executor.parameter import BlockQuantScaleParameter 
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.utils import pad_or_narrow_weight
 from sglang.srt.utils import is_cpu, is_npu, set_weight_attrs
@@ -956,7 +957,8 @@ class QKVParallelLinear(ColumnParallelLinear):
         shard_size = self._get_shard_size_mapping(loaded_shard_id)
 
         if isinstance(param, BlockQuantScaleParameter):
-            weight_block_size = self.quant_method.quant_config.weight_block_size
+            assert hasattr(self, "weight_block_size")
+            weight_block_size = self.weight_block_size
             block_n, _ = weight_block_size[0], weight_block_size[1]
             shard_offset = (shard_offset + block_n - 1) // block_n
             shard_size = (shard_size + block_n - 1) // block_n
