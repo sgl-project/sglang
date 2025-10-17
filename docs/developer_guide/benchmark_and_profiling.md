@@ -341,6 +341,108 @@ Additionally, if you want to locate the SGLang Python source code through the cu
        # some critical code
    ```
 
+### Layer-wise NVTX Profiling with Nsight Systems
+
+SGLang provides built-in layerwise NVTX annotations that can be combined with the CUDA Profiler for detailed per-layer profiling in Nsight Systems. This is particularly useful for identifying performance bottlenecks at the layer level.
+
+#### Using `--enable-layerwise-nvtx` with Nsight Systems and `/start_profile`
+
+The `--enable-layerwise-nvtx` flag automatically adds NVTX markers to every layer in your model. This is particularly powerful when combined with Nsight Systems profiling to see detailed per-layer performance.
+
+**Method 1: Using `/start_profile` with CUDA_PROFILER (for programmatic control)**
+
+This method allows you to control exactly when profiling starts/stops via HTTP API while Nsight Systems is running.
+
+1. Launch the server with layerwise NVTX enabled under Nsight Systems:
+
+   ```bash
+   # Terminal 1: Start server with nsys and capture-range option
+   nsys profile --trace-fork-before-exec=true \
+     --cuda-graph-trace=node \
+     --capture-range=cudaProfilerApi \
+     --capture-range-end=stop \
+     -o layerwise_profile.qdrep \
+     python -m sglang.launch_server \
+       --model-path meta-llama/Llama-3.1-8B-Instruct \
+       --enable-layerwise-nvtx \
+       --disable-cuda-graph
+   ```
+
+   Note: NVTX markers are not emitted for kernel launches captured by CUDA graphs. Use `--disable-cuda-graph` to ensure all layerwise NVTX markers are emitted in the trace.
+
+2. In another terminal, control profiling via `/start_profile` with `CUDA_PROFILER` activity:
+
+   ```bash
+   # Terminal 2: Wait for server to be ready, then start CUDA profiling
+   # Wait 3 steps for warmup, then profile for 10 steps
+   curl -X POST http://127.0.0.1:30000/start_profile \
+     -H "Content-Type: application/json" \
+     -d '{
+       "start_step": 3,
+       "num_steps": 10,
+       "activities": ["CUDA_PROFILER"]
+     }'
+   ```
+
+3. Send requests to generate load:
+
+   ```bash
+   # Terminal 3: Generate workload
+   python -m sglang.bench_serving --backend sglang --num-prompts 100
+   ```
+
+4. Profiling will automatically stop after 10 steps (due to `num_steps: 10`). If you hadn't specified `num_steps`, you would need to manually stop it:
+
+   ```bash
+   # Terminal 2: Only needed if num_steps was not specified
+   curl -X POST http://127.0.0.1:30000/end_profile
+   ```
+
+The `--capture-range=cudaProfilerApi` option tells Nsight Systems to only capture data between `cudaProfilerStart()` and `cudaProfilerStop()` calls (triggered by `/start_profile` and `/end_profile`), reducing overhead and file size. The `start_step` parameter skips the first 3 steps to avoid capturing warmup overhead.
+
+**Method 2: Simpler approach without `/start_profile` API**
+
+For simpler use cases where you don't need fine-grained control over profiling start/stop, you can profile with Nsight Systems capturing the entire workload:
+
+```bash
+# Terminal 1: Start server with layerwise NVTX
+# Note: --disable-cuda-graph ensures all NVTX markers are emitted
+python -m sglang.launch_server \
+  --model-path meta-llama/Llama-3.1-8B-Instruct \
+  --enable-layerwise-nvtx \
+  --disable-cuda-graph
+
+# Terminal 2: Profile the benchmarking client
+nsys profile --trace-fork-before-exec=true \
+  --cuda-graph-trace=node \
+  -o layerwise_profile.qdrep \
+  python -m sglang.bench_serving --backend sglang --num-prompts 10
+```
+
+This approach profiles the entire client execution, including all server interactions. The layerwise NVTX markers will be visible in the Nsight Systems timeline.
+
+**Viewing the profiling results:**
+
+Open the generated `.qdrep` file with Nsight Systems:
+
+```bash
+nsys-ui layerwise_profile.qdrep
+```
+
+In the Nsight Systems GUI, you'll see:
+- **NVTX ranges**: Each layer appears as a labeled range in the timeline with detailed information in the marker metadata
+- **CUDA kernels**: All GPU kernels are shown alongside the layer annotations
+- **Layer hierarchy**: The full module path (e.g., `model.layers.0.self_attn.qkv_proj`) helps identify specific layers
+- **Tensor shapes**: Input/output dimensions and parameter shapes are included in the NVTX marker data
+
+**Benefits of layerwise NVTX profiling:**
+
+- **Granular visibility**: See exactly which layers are taking the most time
+- **Memory tracking**: Identify layers with large memory allocations
+- **Bottleneck identification**: Quickly locate inefficient operations
+- **Communication overhead**: In multi-GPU setups, see per-layer communication costs
+- **Development debugging**: Validate that model architecture changes have the expected performance impact
+
 ## Other tips
 
 1. You can benchmark a model using dummy weights by only providing the config.json file. This allows for quick testing of model variants without training. To do so, add `--load-format dummy` to the above commands and then you only need a correct `config.json` under the checkpoint folder.
