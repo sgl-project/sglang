@@ -143,7 +143,7 @@ class Engine(EngineBase):
         )
 
         if server_args.enable_trace:
-            process_tracing_init(server_args.oltp_traces_endpoint, server_name="sglang")
+            process_tracing_init(server_args.oltp_traces_endpoint, "sglang")
             if server_args.disaggregation_mode == "null":
                 thread_label = "Tokenizer"
                 trace_set_thread_info(thread_label)
@@ -819,6 +819,7 @@ def _launch_subprocesses(
                     )
                     with memory_saver_adapter.configure_subprocess():
                         proc.start()
+
                 scheduler_procs.append(proc)
                 scheduler_pipe_readers.append(reader)
     else:
