@@ -186,9 +186,8 @@ impl StopSequenceDecoder {
 
         if let Some(split_pos) = best_split_pos {
             // Hold the partial match, flush the rest
-            let remainder = self.jail_buffer.split_off(split_pos);
-            let to_output = std::mem::take(&mut self.jail_buffer);
-            self.jail_buffer = remainder;
+            // Drain [0..split_pos] as output, keep [split_pos..] in jail_buffer
+            let to_output = self.jail_buffer.drain(..split_pos).collect::<String>();
 
             if to_output.is_empty() {
                 Ok(SequenceDecoderOutput::Held)
@@ -485,8 +484,7 @@ mod tests {
         let tokenizer = Arc::new(MockTokenizer::new());
 
         // Configure stop sequence with a multi-byte character
-        let config = StopSequenceConfig::default()
-            .with_stop_sequence(" ×");
+        let config = StopSequenceConfig::default().with_stop_sequence(" ×");
 
         let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
 
@@ -508,8 +506,7 @@ mod tests {
         // Test for: byte index 1 is not a char boundary; it is inside 'Δ' (bytes 0..2) of `Δ`
         // 'Δ' (U+0394 GREEK CAPITAL LETTER DELTA) is encoded as [0xCE, 0x94] (2 bytes)
         let tokenizer = Arc::new(MockTokenizer::new());
-        let config = StopSequenceConfig::default()
-            .with_stop_sequence("Δ");
+        let config = StopSequenceConfig::default().with_stop_sequence("Δ");
 
         let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
 
@@ -525,8 +522,7 @@ mod tests {
         // Test for: byte index 1 is not a char boundary; it is inside '°' (bytes 0..2) of `°`
         // '°' (U+00B0 DEGREE SIGN) is encoded as [0xC2, 0xB0] (2 bytes)
         let tokenizer = Arc::new(MockTokenizer::new());
-        let config = StopSequenceConfig::default()
-            .with_stop_sequence("°");
+        let config = StopSequenceConfig::default().with_stop_sequence("°");
 
         let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
 
@@ -542,8 +538,7 @@ mod tests {
         // Test for: byte index 4 is not a char boundary; it is inside '∆' (bytes 2..5) of ` (∆`
         // '∆' (U+2206 INCREMENT) is encoded as [0xE2, 0x88, 0x86] (3 bytes)
         let tokenizer = Arc::new(MockTokenizer::new());
-        let config = StopSequenceConfig::default()
-            .with_stop_sequence(" (∆");
+        let config = StopSequenceConfig::default().with_stop_sequence(" (∆");
 
         let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
 
@@ -573,15 +568,19 @@ mod tests {
 
         for (stop_char, description) in test_cases {
             let tokenizer = Arc::new(MockTokenizer::new());
-            let config = StopSequenceConfig::default()
-                .with_stop_sequence(stop_char);
+            let config = StopSequenceConfig::default().with_stop_sequence(stop_char);
 
             let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
 
             // Process multiple tokens - should not panic
             for token_id in 1..=5 {
                 let result = decoder.process_token(token_id);
-                assert!(result.is_ok(), "Failed on {} with token {}", description, token_id);
+                assert!(
+                    result.is_ok(),
+                    "Failed on {} with token {}",
+                    description,
+                    token_id
+                );
             }
         }
     }
