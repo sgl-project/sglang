@@ -235,6 +235,7 @@ class ServerArgs:
     swa_full_tokens_ratio: float = 0.8
     disable_hybrid_swa_memory: bool = False
     radix_eviction_policy: str = "lru"
+    use_mem_cache_v2: bool = False
 
     # Runtime options
     device: Optional[str] = None
@@ -2643,6 +2644,13 @@ class ServerArgs:
             type=int,
             default=ServerArgs.moe_dense_tp_size,
             help="TP size for MoE dense MLP layers. This flag is useful when, with large TP size, there are errors caused by weights in MLP layers having dimension smaller than the min dimension GEMM supports.",
+        )
+
+        # Mem Cache V2
+        parser.add_argument(
+            "--use-mem-cache-v2",
+            action="store_true",
+            help="Use mem cache v2",
         )
 
         # Mamba Cache
