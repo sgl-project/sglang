@@ -20,8 +20,7 @@ from eval_utils import EvalArgs
 from sglang.test.test_utils import add_common_sglang_args_and_parse
 
 
-def main(args):
-
+def main(args: EvalArgs):
     # Set OpenAI API key and base URL environment variables.
     # lmms-eval's openai_compatible model uses these env vars.
     api_key = "sk-123456"
@@ -59,6 +58,7 @@ def main(args):
         log_suffix,
         "--output_path",
         str(args.output_path),
+        f"--limit={args.num_samples}",
     ]
 
     print("\nRunning lmms_eval command:")

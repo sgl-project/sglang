@@ -7,11 +7,15 @@ import dataclasses
 @dataclasses.dataclass
 class EvalArgs:
     seed: int = 42
+
+    dataset_path: str = "lmms-lab/Video-MME"
     split: str = "lvb_val.json"
+
     result_filename: str = "./val_sglang.json"
     output_path: str = "."
-    dataset_path: str = "lmms-lab/Video-MME"
+
     concurrency: int = 1
+    num_samples: int = 30
     max_new_tokens: int = 30
     max_num_frames: int = 64
     batch_size: int = 1
@@ -21,6 +25,7 @@ class EvalArgs:
         parser.add_argument(
             "--result-filename", type=str, default=EvalArgs.result_filename
         )
+        parser.add_argument("--num_samples", type=int, default=EvalArgs.num_samples)
         parser.add_argument("--output-path", type=str, default=EvalArgs.output_path)
 
         parser.add_argument("--dataset-path", type=str, default=EvalArgs.dataset_path)
