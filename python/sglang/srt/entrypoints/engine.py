@@ -518,13 +518,6 @@ class Engine(EngineBase):
             lora_path=lora_path,
             pinned=pinned,
         )
-        import asyncio
-
-        def has_event_loop() -> bool:
-            try:
-                return asyncio.get_running_loop()
-            except RuntimeError:
-                return "No running event loop"
 
         return self.loop.run_until_complete(
             self.tokenizer_manager.load_lora_adapter(obj, None)
