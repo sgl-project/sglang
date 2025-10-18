@@ -188,11 +188,13 @@ class TestModelOptModelLoader(CustomTestCase):
             loader, "_load_modelopt_base_model", return_value=self.mock_base_model
         ):
             # Simulate missing modelopt by making import fail
+            original_import = __import__
+
             def mock_import(name, *args, **kwargs):
                 if name.startswith("modelopt"):
                     raise ImportError("No module named 'modelopt'")
                 # Return default import behavior for other modules
-                return __import__(name, *args, **kwargs)
+                return original_import(name, *args, **kwargs)
 
             with patch("builtins.__import__", side_effect=mock_import):
                 # Expect ImportError to be raised and logged
