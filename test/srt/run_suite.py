@@ -66,10 +66,10 @@ suites = {
         TestFile("rl/test_update_weights_from_disk.py", 114),
         TestFile("rl/test_update_weights_from_tensor.py", 48),
         TestFile("test_abort.py", 51),
+        TestFile("test_build_eagle_tree.py", 8),
         TestFile("test_chunked_prefill.py", 313),
         TestFile("test_create_kvindices.py", 2),
-        TestFile("test_deterministic.py", 300),
-        TestFile("test_build_eagle_tree.py", 8),
+        TestFile("test_deterministic.py", 320),
         TestFile("test_eagle_infer_a.py", 370),
         TestFile("test_eagle_infer_b.py", 700),
         TestFile("test_eagle_infer_beta.py", 300),
@@ -131,8 +131,7 @@ suites = {
         TestFile("test_triton_sliding_window.py", 250),
         TestFile("test_utils_update_weights.py", 48),
         TestFile("test_vision_chunked_prefill.py", 175),
-        TestFile("test_vision_openai_server_a.py", 724),
-        TestFile("test_vision_openai_server_b.py", 446),
+        TestFile("test_vision_openai_server_a.py", 608),
         TestFile("test_vlm_input_format.py", 300),
     ],
     "per-commit-2-gpu": [
@@ -159,11 +158,16 @@ suites = {
         TestFile("test_multi_instance_release_memory_occupation.py", 64),
         TestFile("test_pp_single_node.py", 481),
     ],
-    "per-commit-8-gpu": [
+    "per-commit-8-gpu-h200": [
         TestFile("lora/test_lora_llama4.py", 400),
         TestFile("test_deepseek_v3_basic.py", 275),
         TestFile("test_deepseek_v3_mtp.py", 275),
         TestFile("test_disaggregation_hybrid_attention.py", 200),
+    ],
+    "per-commit-8-gpu-h20": [
+        TestFile("quant/test_w4a8_deepseek_v3.py", 371),
+        TestFile("test_disaggregation_different_tp.py", 600),
+        TestFile("test_disaggregation_pp.py", 140),
     ],
     "per-commit-4-gpu-b200": [
         # TestFile("test_gpt_oss_4gpu.py", 600),
@@ -173,16 +177,11 @@ suites = {
         TestFile("ep/test_deepep_small.py", 531),
         TestFile("ep/test_mooncake_ep_small.py", 450),
     ],
-    "per-commit-8-gpu-deepep": [
+    "per-commit-8-gpu-h200-deepep": [
         TestFile("ep/test_deepep_large.py", 338),
     ],
-    "per-commit-8-gpu-deepseek-v32": [
+    "per-commit-8-gpu-h200-deepseek-v32": [
         TestFile("test_deepseek_v32_basic.py", 275),
-    ],
-    "per-commit-8-gpu-h20": [
-        TestFile("test_disaggregation_different_tp.py", 600),
-        TestFile("test_disaggregation_pp.py", 140),
-        TestFile("quant/test_w4a8_deepseek_v3.py", 371),
     ],
     "vllm_dependency_test": [
         TestFile("quant/test_awq.py", 163),
