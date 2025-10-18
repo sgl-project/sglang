@@ -379,7 +379,7 @@ class TokenizerCommunicatorMixin:
         self.auto_create_handle_loop()
         assert (
             self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
-        ), "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
+        ), "dp_size must be 1 or dp attention must be enabled for destroy parameter update group"
 
         results = await self.destroy_weights_update_group_communicator(obj)
         return _Communicator.merge_results(results)
