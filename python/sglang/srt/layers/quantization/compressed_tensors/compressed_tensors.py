@@ -135,7 +135,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         if isinstance(layer, LinearBase):
             if CompressedTensorsConfig.DeepSeekFP8Config is not None:
                 return Fp8LinearMethod(CompressedTensorsConfig.DeepSeekFP8Config)
-            if "MOE_AMX_WEIGHT_PATH" in os.environ:
+            if "KT_MOE_AMX_WEIGHT_PATH" in os.environ:
                 return UnquantizedLinearMethod()
             scheme = self.get_scheme(layer=layer, layer_name=prefix)
             if scheme is None:

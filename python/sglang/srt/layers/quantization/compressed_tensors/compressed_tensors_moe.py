@@ -121,7 +121,7 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
             )
         layer_number = int(match.group(1))
 
-        if os.environ.get("MOE_AMX_WEIGHT_PATH") is not None:
+        if os.environ.get("KT_MOE_AMX_WEIGHT_PATH") is not None:
             return CompressedTensorsWNA16AMXEPMoEMethod(quant_config, layer_number)
 
         weight_quant = quant_config.target_scheme_map["Linear"].get("weights")
@@ -744,7 +744,7 @@ class CompressedTensorsWNA16AMXMoEMethod(CompressedTensorsMoEMethod):
         layer_idx,
         num_gpu_experts,
         cpuinfer,
-        subpool_count,
+        threadpool_count,
         amx_weight_path,
         chunked_prefill_size,
     ):
@@ -763,7 +763,7 @@ class CompressedTensorsWNA16AMXMoEMethod(CompressedTensorsMoEMethod):
         self.amx_weight_path = amx_weight_path
         self.chunked_prefill_size = chunked_prefill_size
         self.cpuinfer = cpuinfer
-        self.subpool_count = subpool_count
+        self.threadpool_count = threadpool_count
         self.amx_wrapper = None
 
     def create_weights(
@@ -790,7 +790,7 @@ class CompressedTensorsWNA16AMXMoEMethod(CompressedTensorsMoEMethod):
             moe_intermediate_size=self.moe_intermediate_size,
             num_gpu_experts=self.num_gpu_experts,
             cpuinfer_threads=self.cpuinfer,
-            subpool_count=self.subpool_count,
+            threadpool_count=self.threadpool_count,
             amx_weight_path=self.amx_weight_path,
             chunked_prefill_size=self.chunked_prefill_size,
         )
@@ -885,24 +885,20 @@ def override_config(
     cls,
     num_gpu_experts,
     cpuinfer,
-    subpool_count,
+    threadpool_count,
     amx_weight_path,
     amx_method,
     chunked_prefill_size,
-    enable_defer,
-    cpu_embed,
 ):
     """Override MOE configuration via environment variables."""
     # Mapping of config parameters to environment variable names
     config_map = {
-        "MOE_NUM_GPU_EXPERTS": num_gpu_experts,
-        "MOE_CPUINFER": cpuinfer,
-        "SUBPOOL_COUNT": subpool_count,
-        "MOE_AMX_WEIGHT_PATH": amx_weight_path,
-        "AMX_METHOD": amx_method,
-        "CPU_EMBED": cpu_embed,
-        "MOE_CHUNKED_PREFILL_SIZE": chunked_prefill_size,
-        "MOE_ENABLE_DEFER": enable_defer,
+        "KT_MOE_NUM_GPU_EXPERTS": num_gpu_experts,
+        "KT_MOE_CPUINFER": cpuinfer,
+        "KT_THREADPOOL_COUNT": threadpool_count,
+        "KT_MOE_AMX_WEIGHT_PATH": amx_weight_path,
+        "KT_AMX_METHOD": amx_method,
+        "KT_MOE_CHUNKED_PREFILL_SIZE": chunked_prefill_size,
     }
 
     # Set environment variables, converting values to strings
@@ -921,27 +917,25 @@ class CompressedTensorsWNA16AMXEPMoEMethod(CompressedTensorsMoEMethod):
         self.tp_rank = get_tensor_model_parallel_rank()
 
         if (
-            "MOE_NUM_GPU_EXPERTS" not in os.environ
-            or "MOE_CPUINFER" not in os.environ
-            or "MOE_AMX_WEIGHT_PATH" not in os.environ
+            "KT_MOE_NUM_GPU_EXPERTS" not in os.environ
+            or "KT_MOE_CPUINFER" not in os.environ
+            or "KT_MOE_AMX_WEIGHT_PATH" not in os.environ
         ):
             raise RuntimeError(
-                "the following arguments are required: --amx-weight-path, --cpuinfer, --num-gpu-experts"
+                "the following arguments are required: --kt-amx-weight-path, --kt-cpuinfer, --kt-num-gpu-experts"
             )
-        self.num_gpu_experts = int(os.environ.get("MOE_NUM_GPU_EXPERTS"))
-        cpuinfer = int(os.environ.get("MOE_CPUINFER"))
-        subpool_count = int(os.environ.get("SUBPOOL_COUNT"))
-        amx_weight_path = os.environ.get("MOE_AMX_WEIGHT_PATH")
-        chunked_prefill_size = int(os.environ.get("MOE_CHUNKED_PREFILL_SIZE"))
-        self.enable_defer = (
-            os.environ.get("MOE_ENABLE_DEFER", "False").lower() == "true"
-        )
+        self.num_gpu_experts = int(os.environ.get("KT_MOE_NUM_GPU_EXPERTS"))
+        cpuinfer = int(os.environ.get("KT_MOE_CPUINFER"))
+        threadpool_count = int(os.environ.get("KT_THREADPOOL_COUNT"))
+        amx_weight_path = os.environ.get("KT_MOE_AMX_WEIGHT_PATH")
+        chunked_prefill_size = int(os.environ.get("KT_MOE_CHUNKED_PREFILL_SIZE"))
+
         self.AMX_method = CompressedTensorsWNA16AMXMoEMethod(
             quant_config,
             layer_idx,
             self.num_gpu_experts,
             cpuinfer,
-            subpool_count,
+            threadpool_count,
             amx_weight_path,
             chunked_prefill_size,
         )

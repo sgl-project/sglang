@@ -2864,7 +2864,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
-        if os.environ.get("MOE_AMX_WEIGHT_PATH") is not None:
+        if os.environ.get("KT_MOE_AMX_WEIGHT_PATH") is not None:
             CompressedTensorsConfig.DeepSeekFP8Config = Fp8Config(
                 True, "dynamic", None, [128, 128]
             )
