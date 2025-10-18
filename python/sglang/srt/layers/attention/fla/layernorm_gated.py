@@ -12,6 +12,8 @@ import triton
 import triton.language as tl
 from einops import rearrange
 
+from sglang.srt.utils import device_context
+
 
 def rms_norm_ref(
     x,
@@ -157,7 +159,7 @@ def _layer_norm_fwd(
     # heuristics for number of warps
     num_warps = min(max(BLOCK_N // 256, 1), 8)
     grid = (M, ngroups)
-    with torch.get_device_module(x.device).device(x.device.index):
+    with device_context(x.device):
         _layer_norm_fwd_1pass_kernel[grid](
             x,
             out,
