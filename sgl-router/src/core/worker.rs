@@ -10,10 +10,7 @@ use std::{
 use async_trait::async_trait;
 use futures;
 use serde_json;
-use tokio::{
-    sync::RwLock,
-    time,
-};
+use tokio::{sync::RwLock, time};
 
 use super::{CircuitBreaker, WorkerError, WorkerResult};
 use crate::{

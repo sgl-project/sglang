@@ -145,9 +145,7 @@ impl BasicWorkerBuilder {
             bootstrap_port,
         };
 
-        let grpc_client = Arc::new(RwLock::new(
-            self.grpc_client.map(|client| Arc::new(client)),
-        ));
+        let grpc_client = Arc::new(RwLock::new(self.grpc_client.map(Arc::new)));
 
         BasicWorker {
             metadata,
