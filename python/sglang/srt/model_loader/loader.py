@@ -1812,22 +1812,7 @@ class ModelOptModelLoader(DefaultModelLoader):
                 )
 
                 # Export model if path provided (even when restoring from checkpoint)
-                if export_path:
-                    try:
-                        # Get the original model path from the model config
-                        original_model_path = getattr(
-                            self, "_original_model_path", None
-                        )
-                        self._export_modelopt_checkpoint(
-                            model, export_path, original_model_path
-                        )
-                        rank0_log(
-                            f"Quantized model exported to HuggingFace format at {export_path}"
-                        )
-                    except Exception as e:
-                        rank0_log(
-                            f"Warning: Failed to export quantized model to {export_path}: {e}"
-                        )
+                self._maybe_export_modelopt(model, export_path)
                 return
             except Exception as e:
                 logger.warning(
@@ -1875,23 +1860,27 @@ class ModelOptModelLoader(DefaultModelLoader):
                     )
 
             # Export model if path provided
-            if export_path:
-                try:
-                    # Get the original model path from the model config
-                    original_model_path = getattr(self, "_original_model_path", None)
-                    self._export_modelopt_checkpoint(
-                        model, export_path, original_model_path
-                    )
-                    rank0_log(
-                        f"Quantized model exported to HuggingFace format at {export_path}"
-                    )
-                except Exception as e:
-                    rank0_log(
-                        f"Warning: Failed to export quantized model to {export_path}: {e}"
-                    )
+            self._maybe_export_modelopt(model, export_path)
 
         except Exception as e:
             raise Exception(f"Failed to set up ModelOpt quantization: {e}") from e
+
+    def _maybe_export_modelopt(self, model, export_path: str | None) -> None:
+        """Export model to HuggingFace format if export_path is provided."""
+        if export_path:
+            try:
+                # Get the original model path from the model config
+                original_model_path = getattr(self, "_original_model_path", None)
+                self._export_modelopt_checkpoint(
+                    model, export_path, original_model_path
+                )
+                rank0_log(
+                    f"Quantized model exported to HuggingFace format at {export_path}"
+                )
+            except Exception as e:
+                rank0_log(
+                    f"Warning: Failed to export quantized model to {export_path}: {e}"
+                )
 
     def _export_modelopt_checkpoint(
         self,
