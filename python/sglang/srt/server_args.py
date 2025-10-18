@@ -309,8 +309,8 @@ class ServerArgs:
     ] = None
     max_loaded_loras: Optional[int] = None
     max_loras_per_batch: int = 8
-    lora_backend: str = "csgmv"
     lora_eviction_policy: str = DEFAULT_LORA_EVICTION_POLICY
+    lora_backend: str = "triton"
     max_lora_chunk_size: Optional[int] = 16
 
     # Kernel backend
@@ -509,6 +509,11 @@ class ServerArgs:
         """
         Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
         """
+
+        if self.model_path.lower() in ["none", "dummy"]:
+            # Skip for dummy models
+            return
+
         # Handle deprecated arguments.
         self._handle_deprecated_args()
 

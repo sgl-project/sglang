@@ -17,7 +17,6 @@ repos:
       - id: check-shebang-scripts-are-executable
       - id: detect-private-key
       - id: debug-statements
-      - id: no-commit-to-branch
   - repo: https://github.com/PyCQA/isort
     rev: 5.13.2
     hooks:
@@ -27,9 +26,9 @@ repos:
     rev: v0.11.7
     hooks:
       - id: ruff
-        args: [--select=F401, --fixable=F401]
-        files: ^(benchmark/|docs/|examples/)
-        exclude: \.ipynb$|^python/sglang/srt/grpc/.*_pb2\.py$|^python/sglang/srt/grpc/.*_pb2_grpc\.py$|^python/sglang/srt/grpc/.*_pb2\.pyi$|^python/sglang/srt/grpc/.*_pb2_grpc\.pyi$
+        args: [--select=F401,F821, --fixable=F401]
+        files: ^(benchmark/|docs/|examples/|python/sglang/)
+        exclude: __init__\.py$|\.ipynb$|^python/sglang/srt/grpc/.*_pb2\.py$|^python/sglang/srt/grpc/.*_pb2_grpc\.py$|^python/sglang/srt/grpc/.*_pb2\.pyi$|^python/sglang/srt/grpc/.*_pb2_grpc\.pyi$
   - repo: https://github.com/psf/black
     rev: 24.10.0
     hooks:
