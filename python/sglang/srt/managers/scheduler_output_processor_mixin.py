@@ -175,7 +175,12 @@ class SchedulerOutputProcessorMixin:
                             logprob_pt += num_input_logprobs
 
         else:  # embedding or reward model
-            embeddings = result.embeddings.tolist()
+            embeddings = result.embeddings
+
+            if isinstance(embeddings, torch.Tensor):
+                embeddings = embeddings.tolist()
+            else:
+                embeddings = [tensor.tolist() for tensor in embeddings]
 
             # Check finish conditions
             for i, req in enumerate(batch.reqs):

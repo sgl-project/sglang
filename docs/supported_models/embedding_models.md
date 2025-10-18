@@ -75,6 +75,45 @@ response = requests.post(url + "/v1/embeddings", json=payload).json()
 print("Embeddings:", [x.get("embedding") for x in response.get("data", [])])
 ```
 
+## Matryoshka Embedding Example
+
+[Matryoshka Embeddings](https://sbert.net/examples/sentence_transformer/training/matryoshka/README.html#matryoshka-embeddings) or [Matryoshka Representation Learning (MRL)](https://arxiv.org/abs/2205.13147) is a technique used in training embedding models. It allows user to trade off between performance and cost.
+
+### 1. Launch a Matryoshka‑capable model
+
+If the model config already includes `matryoshka_dimensions` or `is_matryoshka` then no override is needed. Otherwise, you can use `--json-model-override-args` as below:
+
+```shell
+python3 -m sglang.launch_server \
+    --model-path Qwen/Qwen3-Embedding-0.6B \
+    --is-embedding \
+    --host 0.0.0.0 \
+    --port 30000 \
+    --json-model-override-args '{"matryoshka_dimensions": [128, 256, 512, 1024, 1536]}'
+```
+
+1. Setting `"is_matryoshka": true` allows truncating to any dimension. Otherwise, the server will validate that the specified dimension in the request is one of `matryoshka_dimensions`.
+2. Omitting `dimensions` in a request returns the full vector.
+
+### 2. Make requests with different output dimensions
+
+```python
+import requests
+
+url = "http://127.0.0.1:30000"
+
+# Request a truncated (Matryoshka) embedding by specifying a supported dimension.
+payload = {
+    "model": "Qwen/Qwen3-Embedding-0.6B",
+    "input": "Explain diffusion models simply.",
+    "dimensions": 512  # change to 128 / 1024 / omit for full size
+}
+
+response = requests.post(url + "/v1/embeddings", json=payload).json()
+print("Embedding:", response["data"][0]["embedding"])
+```
+
+
 ## Supported Models
 
 | Model Family                               | Example Model                          | Chat Template | Description                                                                 |
