@@ -107,6 +107,9 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
+    is_in_piecewise_cuda_graph,
+)
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.single_batch_overlap import SboFlags
@@ -308,7 +311,8 @@ def _handle_attention_backend(
     ) and attn.flashinfer_mla_disable_ragged
 
     if (
-        not disable_ragged
+        not is_in_piecewise_cuda_graph()
+        and not disable_ragged
         and _is_extend_without_speculative(forward_batch)
         and (
             (
@@ -373,7 +377,8 @@ def handle_attention_nsa(attn, forward_batch):
 
 def handle_attention_triton(attn, forward_batch):
     if (
-        _is_extend_without_speculative(forward_batch)
+        not is_in_piecewise_cuda_graph()
+        and _is_extend_without_speculative(forward_batch)
         and sum(forward_batch.extend_prefix_lens_cpu) == 0
     ):
         return AttnForwardMethod.MHA
@@ -1785,18 +1790,26 @@ class DeepseekV2AttentionMLA(nn.Module):
             )
             attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
         else:
-            attn_bmm_output = torch.empty(
-                (attn_output.shape[0], self.num_local_heads * self.v_head_dim),
-                dtype=attn_output.dtype,
-                device=attn_output.device,
-            )
-            torch.bmm(
-                attn_output.transpose(0, 1),
-                self.w_vc,
-                out=attn_bmm_output.view(
-                    -1, self.num_local_heads, self.v_head_dim
-                ).transpose(0, 1),
-            )
+            if is_in_piecewise_cuda_graph():
+                # torch dynamo requires out= op was called where output tensor was non-contiguous
+                attn_bmm_output = (
+                    torch.bmm(attn_output.transpose(0, 1), self.w_vc)
+                    .transpose(0, 1)
+                    .flatten(1, 2)
+                )
+            else:
+                attn_bmm_output = torch.empty(
+                    (attn_output.shape[0], self.num_local_heads * self.v_head_dim),
+                    dtype=attn_output.dtype,
+                    device=attn_output.device,
+                )
+                torch.bmm(
+                    attn_output.transpose(0, 1),
+                    self.w_vc,
+                    out=attn_bmm_output.view(
+                        -1, self.num_local_heads, self.v_head_dim
+                    ).transpose(0, 1),
+                )
         output, _ = self.o_proj(attn_bmm_output)
 
         return output

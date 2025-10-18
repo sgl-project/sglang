@@ -1,6 +1,5 @@
 from abc import ABC, abstractmethod
 from enum import IntEnum, auto
-from functools import lru_cache
 from typing import List, Tuple
 
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
@@ -28,7 +27,6 @@ class SpeculativeAlgorithm(IntEnum):
     def is_ngram(self):
         return self == SpeculativeAlgorithm.NGRAM
 
-    @lru_cache(maxsize=None)
     @staticmethod
     def from_string(name: str):
         name_map = {
