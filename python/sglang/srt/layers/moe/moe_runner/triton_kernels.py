@@ -169,6 +169,10 @@ def fused_experts_none_to_triton_kernels(
     quant_info: TritonKernelsQuantInfo,
     runner_config: MoeRunnerConfig,
 ) -> "StandardCombineInput":
+    # TODO: add per-expert return support once Triton kernels honor no_combine.
+    if runner_config.no_combine:
+        return None
+
     from sglang.srt.layers.moe.fused_moe_triton.triton_kernels_moe import (
         triton_kernel_moe_forward,
         triton_kernel_moe_with_bias_forward,
