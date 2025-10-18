@@ -28,7 +28,6 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt import single_batch_overlap
 from sglang.srt.configs.model_config import (
     get_nsa_index_head_dim,
     get_nsa_index_n_heads,
