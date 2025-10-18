@@ -480,8 +480,24 @@ def set_inductor_config(config, runtime_shape):
 class EagerAdapter(CompilerInterface):
     name = "eager"
 
-    def compile(self, graph: fx.GraphModule, example_inputs: list[Any], compiler_config: dict[str, Any], runtime_shape: Optional[int] = None, key: Optional[str] = None) -> tuple[Optional[Callable], Optional[Any]]:
+    def compile(
+        self,
+        graph: fx.GraphModule,
+        example_inputs: list[Any],
+        compiler_config: dict[str, Any],
+        runtime_shape: Optional[int] = None,
+        key: Optional[str] = None,
+        num_graphs: int = 1,
+    ) -> tuple[Optional[Callable], Optional[Any]]:
         return graph, None
 
-    def load(self, handle: Any, graph: fx.GraphModule, example_inputs: list[Any], graph_index: int, runtime_shape: Optional[int] = None) -> Callable:
+    def load(
+        self,
+        handle: Any,
+        graph: fx.GraphModule,
+        example_inputs: list[Any],
+        graph_index: int,
+        runtime_shape: Optional[int] = None,
+        num_graphs: int = 1,
+    ) -> Callable:
         raise NotImplementedError("eager compilation is not supported")
