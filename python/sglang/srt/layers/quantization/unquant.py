@@ -141,19 +141,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         self.use_triton_kernels = use_triton_kernels
         self.with_bias = False
 
-        self.triton_kernel_moe_forward = None
-        self.triton_kernel_moe_with_bias_forward = None
-        if torch.cuda.is_available() and has_triton_kernels:
-            from sglang.srt.layers.moe.fused_moe_triton.triton_kernels_moe import (
-                triton_kernel_moe_forward as _tk_forward,
-            )
-            from sglang.srt.layers.moe.fused_moe_triton.triton_kernels_moe import (
-                triton_kernel_moe_with_bias_forward as _tk_with_bias_forward,
-            )
-
-            self.triton_kernel_moe_forward = _tk_forward
-            self.triton_kernel_moe_with_bias_forward = _tk_with_bias_forward
-
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -234,7 +221,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+        backend = get_moe_runner_backend()
+        if backend.is_auto():
+            backend = (
+                MoeRunnerBackend.TRITON_KERNEL
+                if self.use_triton_kernels
+                else MoeRunnerBackend.TRITON
+            )
+        self.runner = MoeRunner(backend, moe_runner_config)
 
     def apply(
         self,
@@ -260,68 +254,56 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
 
         moe_runner_config = self.moe_runner_config
 
-        if self.use_triton_kernels:
-            if self.with_bias:
-                assert self.triton_kernel_moe_with_bias_forward is not None
-                output = self.triton_kernel_moe_with_bias_forward(
-                    hidden_states=x,
-                    w1=layer.w13_weight,
-                    w2=layer.w2_weight,
-                    b1=layer.w13_weight_bias,
-                    b2=layer.w2_weight_bias,
-                    topk_output=topk_output,
-                    moe_runner_config=moe_runner_config,
-                    w1_pcg=None,
-                    w2_pcg=None,
-                )
-            else:
-                assert self.triton_kernel_moe_forward is not None
-                output = self.triton_kernel_moe_forward(
-                    hidden_states=x,
-                    w1=layer.w13_weight,
-                    w2=layer.w2_weight,
-                    topk_output=topk_output,
-                    moe_runner_config=moe_runner_config,
-                )
+        if _use_aiter:
+            assert not moe_runner_config.no_combine, "unsupported"
+            topk_weights, topk_ids, _ = topk_output
+            if moe_runner_config.apply_router_weight_on_input:
+                assert (
+                    topk_weights.dim() == 2
+                ), "`topk_weights` should be in shape (num_tokens, topk)"
+                _, topk = topk_weights.shape
+                assert (
+                    topk == 1
+                ), "Only support topk=1 when `apply_router_weight_on_input` is True"
+                x = x * topk_weights.to(x.dtype)
+                topk_weights = torch.ones_like(
+                    topk_weights, dtype=torch.float32
+                )  # topk_weights must be FP32 (float32)
+            output = fused_moe(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                topk_weights,
+                topk_ids,
+                activation=(
+                    ActivationType.Silu
+                    if moe_runner_config.activation == "silu"
+                    else ActivationType.Gelu
+                ),
+            )
             return StandardCombineInput(hidden_states=output)
-        else:
-            if _use_aiter:
-                assert not moe_runner_config.no_combine, "unsupported"
-                topk_weights, topk_ids, _ = topk_output
-                if moe_runner_config.apply_router_weight_on_input:
-                    assert (
-                        topk_weights.dim() == 2
-                    ), "`topk_weights` should be in shape (num_tokens, topk)"
-                    _, topk = topk_weights.shape
-                    assert (
-                        topk == 1
-                    ), "Only support topk=1 when `apply_router_weight_on_input` is True"
-                    x = x * topk_weights.to(x.dtype)
-                    topk_weights = torch.ones_like(
-                        topk_weights, dtype=torch.float32
-                    )  # topk_weights must be FP32 (float32)
-                output = fused_moe(
-                    x,
-                    layer.w13_weight,
-                    layer.w2_weight,
-                    topk_weights,
-                    topk_ids,
-                    activation=(
-                        ActivationType.Silu
-                        if moe_runner_config.activation == "silu"
-                        else ActivationType.Gelu
-                    ),
-                )
-                return StandardCombineInput(hidden_states=output)
-            else:
 
-                quant_info = TritonMoeQuantInfo(
-                    w13_weight=layer.w13_weight,
-                    w2_weight=layer.w2_weight,
-                    b13=getattr(layer, "w13_weight_bias", None),
-                    b2=getattr(layer, "w2_weight_bias", None),
-                )
-                return self.runner.run(dispatch_output, quant_info)
+        backend = self.runner.runner_backend
+        if backend.is_triton_kernel():
+            from sglang.srt.layers.moe.moe_runner.triton_kernels import (
+                TritonKernelsQuantInfo,
+            )
+
+            quant_info = TritonKernelsQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                w13_bias=getattr(layer, "w13_weight_bias", None),
+                w2_bias=getattr(layer, "w2_weight_bias", None),
+            )
+        else:
+            quant_info = TritonMoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                b13=getattr(layer, "w13_weight_bias", None),
+                b2=getattr(layer, "w2_weight_bias", None),
+            )
+
+        return self.runner.run(dispatch_output, quant_info)
 
     def forward_cpu(
         self,

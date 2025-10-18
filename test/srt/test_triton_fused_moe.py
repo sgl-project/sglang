@@ -5,11 +5,10 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.moe.fused_moe_triton.triton_kernels_moe import (
-    triton_kernel_moe_forward,
-)
-from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
-from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner.triton_kernels import TritonKernelsQuantInfo
+from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
+from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -99,20 +98,54 @@ class TestFusedMOE(CustomTestCase):
             renormalize=False,
             use_grouped_topk=False,
         )
-        topk_op.use_triton_kernels = True
+        topk_op.topk_config.output_format = TopKOutputFormat.TRITON_KERNEL
         triton_topk_output = topk_op.forward_cuda(
             hidden_states=a,
             router_logits=score,
         )
 
-        moe_runner_config = MoeRunnerConfig(
-            inplace=False,
-        )
-        triton_output = triton_kernel_moe_forward(
-            a, w1_tri, w2_tri, triton_topk_output, moe_runner_config
-        )
+        quant_info = TritonKernelsQuantInfo(w13_weight=w1_tri, w2_weight=w2_tri)
+
+        fused_config = MoeRunnerConfig(inplace=False)
+        runner_fused = MoeRunner(MoeRunnerBackend.TRITON_KERNEL, fused_config)
+        fused_output = runner_fused.run(
+            StandardDispatchOutput(hidden_states=a, topk_output=triton_topk_output),
+            quant_info,
+        ).hidden_states
+
         torch_output = self.torch_naive_moe(a, w1, w2, score, topk)
-        torch.testing.assert_close(triton_output, torch_output, rtol=rtol, atol=atol)
+        torch.testing.assert_close(fused_output, torch_output, rtol=rtol, atol=atol)
+
+        fused_scaled_config = MoeRunnerConfig(
+            inplace=False,
+            routed_scaling_factor=0.5,
+        )
+        runner_fused_scaled = MoeRunner(
+            MoeRunnerBackend.TRITON_KERNEL, fused_scaled_config
+        )
+        fused_scaled_output = runner_fused_scaled.run(
+            StandardDispatchOutput(hidden_states=a, topk_output=triton_topk_output),
+            quant_info,
+        ).hidden_states
+        torch.testing.assert_close(
+            fused_scaled_output, 0.5 * fused_output, rtol=rtol, atol=atol
+        )
+
+        # TODO: Triton-kernel kernels currently emit combined activations even when
+        # no_combine is requested. Re-enable this check once the kernel supports
+        # per-expert outputs.
+        # no_combine_config = MoeRunnerConfig(inplace=False, no_combine=True)
+        # runner_no_combine = MoeRunner(
+        #     MoeRunnerBackend.TRITON_KERNEL, no_combine_config
+        # )
+        # no_combine_output = runner_no_combine.run(
+        #     StandardDispatchOutput(hidden_states=a, topk_output=triton_topk_output),
+        #     quant_info,
+        # ).hidden_states
+        # self.assertEqual(
+        #     no_combine_output.shape,
+        #     (a.shape[0], topk, w2.shape[1]),
+        # )
 
     def test_various_configurations(self):
         m_values = [1, 32, 64, 256]
