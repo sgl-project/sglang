@@ -93,7 +93,7 @@ class TestOpenAIServer(CustomTestCase):
             num_choices = 1
 
         response = client.completions.create(
-            model=self.model,
+            model="unknown",
             prompt=prompt_arg,
             temperature=0,
             max_tokens=32,
@@ -147,7 +147,7 @@ class TestOpenAIServer(CustomTestCase):
             num_choices = 1
 
         generator = client.completions.create(
-            model=self.model,
+            model="unknown",
             prompt=prompt_arg,
             temperature=0,
             max_tokens=32,
@@ -201,7 +201,7 @@ class TestOpenAIServer(CustomTestCase):
     def run_chat_completion(self, logprobs, parallel_sample_num):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
         response = client.chat.completions.create(
-            model=self.model,
+            model="unknown",
             messages=[
                 {"role": "system", "content": "You are a helpful AI assistant"},
                 {
@@ -239,7 +239,7 @@ class TestOpenAIServer(CustomTestCase):
     def run_chat_completion_stream(self, logprobs, parallel_sample_num=1):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
         generator = client.chat.completions.create(
-            model=self.model,
+            model="unknown",
             messages=[
                 {"role": "system", "content": "You are a helpful AI assistant"},
                 {"role": "user", "content": "What is the capital of France?"},
@@ -315,7 +315,6 @@ class TestOpenAIServer(CustomTestCase):
                 finish_reason_counts[index] == 1
             ), f"Expected 1 finish_reason chunk for index {index}, got {finish_reason_counts[index]}"
 
-    @unittest.skip("Completions API not fully supported by gRPC router - prompt deserialization issue")
     def test_completion(self):
         for echo in [False, True]:
             for logprobs in [None, 5]:
@@ -330,7 +329,6 @@ class TestOpenAIServer(CustomTestCase):
                                 token_input,
                             )
 
-    @unittest.skip("Completions API not fully supported by gRPC router - prompt deserialization issue")
     def test_completion_stream(self):
         for echo in [False, True]:
             for logprobs in [None, 5]:
@@ -366,7 +364,7 @@ class TestOpenAIServer(CustomTestCase):
         )
 
         response = client.chat.completions.create(
-            model=self.model,
+            model="unknown",
             messages=[
                 {"role": "system", "content": "You are a helpful AI assistant"},
                 {"role": "user", "content": "Introduce the capital of France."},
@@ -389,7 +387,7 @@ class TestOpenAIServer(CustomTestCase):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
 
         response = client.chat.completions.create(
-            model=self.model,
+            model="unknown",
             messages=[
                 {"role": "system", "content": "You are a helpful AI assistant"},
                 {"role": "user", "content": "Introduce the capital of France."},
@@ -405,7 +403,7 @@ class TestOpenAIServer(CustomTestCase):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
 
         response = client.chat.completions.create(
-            model="meta-llama/Llama-3.1-8B-Instruct",
+            model="unknown",
             messages=[
                 {"role": "system", "content": "You are a helpful AI assistant"},
                 {
@@ -432,14 +430,12 @@ The SmartHome Mini is a compact smart home assistant available in black or white
             .message.content.strip()
             .startswith('"name": "SmartHome Mini",')
         )
-    @unittest.skip("/models API not fully supported by gRPC router - model list issue")
     def test_model_list(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
         models = list(client.models.list())
         assert len(models) == 1
         assert isinstance(getattr(models[0], "max_model_len", None), int)
 
-    @unittest.skip("/models API not fully supported by gRPC router - model list issue")
     def test_retrieve_model(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
 
