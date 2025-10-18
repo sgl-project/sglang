@@ -186,7 +186,7 @@ class DeepEPMoE(FusedMoE):
         dispatch_output = self.dispatch(
             hidden_states, topk_idx, topk_weights, forward_batch
         )
-        hidden_states = self.moe_impl(dispatch_output)
+        hidden_states = self.run_moe_core(dispatch_output)
         hidden_states = self.combine(
             hidden_states,
             dispatch_output.topk_idx,
@@ -216,12 +216,15 @@ class DeepEPMoE(FusedMoE):
             ),
         )
 
-    def moe_impl(
+    def run_moe_core(
         self,
         dispatch_output: DispatchOutput,
         down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = None,
     ):
         from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
+
+        if self.has_refactored_flag:
+            return super().run_moe_core(dispatch_output)
 
         if _use_aiter:
             assert DispatchOutputChecker.format_is_deepep(dispatch_output)

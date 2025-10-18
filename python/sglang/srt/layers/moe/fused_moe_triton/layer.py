@@ -22,6 +22,8 @@ from sglang.srt.layers.moe import (
     get_moe_runner_backend,
     should_use_flashinfer_trtllm_moe,
 )
+from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
+from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
 from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardDispatcher,
     StandardDispatchOutput,
@@ -75,7 +77,7 @@ def _get_tile_tokens_dim(num_tokens, top_k, num_experts):
     return tile_tokens_dim
 
 
-def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig):
+def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
     a2a_backend = get_moe_a2a_backend()
     if a2a_backend.is_none():
         return StandardDispatcher(moe_runner_config)
@@ -823,15 +825,14 @@ class FusedMoE(torch.nn.Module):
             hidden_states=hidden_states, topk_output=topk_output
         )
 
-        # TODO: consider using symmetric memory
-        combine_input = self.quant_method.apply(
-            layer=self,
+        combine_input = self.run_moe_core(
             dispatch_output=dispatch_output,
             **kwargs,
         )
 
         final_hidden_states = self.dispatcher.combine(combine_input)
 
+        # TODO: should we add some conditions here?
         final_hidden_states = final_hidden_states[
             ..., :origin_hidden_states_dim
         ].contiguous()
@@ -840,6 +841,14 @@ class FusedMoE(torch.nn.Module):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states
+
+    def run_moe_core(self, dispatch_output: DispatchOutput, **kwargs) -> CombineInput:
+        # TODO: consider using symmetric memory
+        return self.quant_method.apply(
+            layer=self,
+            dispatch_output=dispatch_output,
+            **kwargs,
+        )
 
     @classmethod
     def make_expert_params_mapping(

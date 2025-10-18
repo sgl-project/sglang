@@ -255,7 +255,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 )
 
     def op_experts(self, state):
-        state.hidden_states_experts_output = self.experts.moe_impl(
+        state.hidden_states_experts_output = self.experts.run_moe_core(
             dispatch_output=state.dispatch_output,
         )
 
