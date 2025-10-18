@@ -449,7 +449,7 @@ class DataParallelController:
         else:
             assert (
                 req.bootstrap_room is not None
-            ), "req.bootstrap_room should not be None. If you send requests directly to prefill or decode instances, please send to the router instead."
+            ), "req.bootstrap_room should not be None. Do not send requests directly to prefill or decode instances, but send to the router instead."
             self.workers[req.bootstrap_room % len(self.workers)].send_pyobj(req)
 
     def shortest_queue_scheduler(self, req):
