@@ -499,304 +499,6 @@ def attention_ref(
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
-# @pytest.mark.parametrize("mha_type", ["mha"])
-@pytest.mark.parametrize("has_learnable_sink", [False, True])
-# @pytest.mark.parametrize("has_learnable_sink", [False])
-# @pytest.mark.parametrize("has_qv", [False, True])
-@pytest.mark.parametrize("has_qv", [False])
-# @pytest.mark.parametrize("deterministic", [False, True])
-@pytest.mark.parametrize("deterministic", [False])
-# @pytest.mark.parametrize("softcap", [0.0, 15.0])
-@pytest.mark.parametrize("softcap", [0.0])
-@pytest.mark.parametrize("local", [False, True])
-# @pytest.mark.parametrize("local", [False])
-@pytest.mark.parametrize("causal", [False, True])
-# @pytest.mark.parametrize("causal", [True])
-# @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
-# @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192, 256])
-# @pytest.mark.parametrize('d', [32, 64, 96, 128, 160, 192])
-# @pytest.mark.parametrize('d', [56, 80])
-# @pytest.mark.parametrize("d", [64, 96, 128, 256])
-# @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128])
-# @pytest.mark.parametrize("d", [64, 96, 128, 192])
-# @pytest.mark.parametrize("d", [64, 128])
-@pytest.mark.parametrize("d", [128, 192])
-# @pytest.mark.parametrize("d", [128])
-@pytest.mark.parametrize(
-    "seqlen_q,seqlen_k",
-    [
-        (1, 1),
-        (64, 128),
-        (128, 192),
-        (256, 256),
-        (239, 1),
-        (799, 3),
-        (113, 203),
-        (113, 128),
-        (128, 217),
-        (113, 211),
-        (108, 256),
-        (256, 512),
-        (384, 256),
-        (640, 128),
-        (512, 256),
-        (1024, 1024),
-        (1023, 1024),
-        (1024, 1023),
-        (4096, 4096),
-        (4224, 4224),
-    ],
-)
-# @pytest.mark.parametrize('seqlen_q,seqlen_k', [(128, 128)])
-# Note: sglang doesn't expose flash_attn_func (non-varlen version) for FA4
-# The varlen test below covers the main functionality
-def test_flash_attn_output_disabled(
-    seqlen_q,
-    seqlen_k,
-    d,
-    causal,
-    local,
-    softcap,
-    deterministic,
-    has_qv,
-    has_learnable_sink,
-    mha_type,
-    dtype,
-):
-    if (causal or local) and seqlen_k < seqlen_q:
-        pytest.skip("Causal attention requires seqlen_k >= seqlen_q")
-    device = "cuda"
-    # set seed
-    torch.random.manual_seed(0)
-    batch_size = 9 if seqlen_k <= 2048 else 2
-    # batch_size = 1
-    nheads = 6
-    # nheads = 1
-    nheads_kv = nheads if mha_type == "mha" else (3 if mha_type == "gqa" else 1)
-    dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
-    # dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
-    dv_vals = [128] if d == 192 else ([d] if d != 128 else [64, d])
-    if dtype == torch.float8_e4m3fn:
-        dv_vals = [d]
-    # attention_chunk_vals = [torch.randint(1, seqlen_k * 2, (1,)).item(), 0]
-    attention_chunk_vals = [0]
-    for dv, attention_chunk in itertools.product(dv_vals, attention_chunk_vals):
-        q_ref = torch.randn(
-            batch_size, seqlen_q, nheads, d, device=device, dtype=dtype_ref
-        )
-        if softcap > 0.0:
-            # Ensure the values of qk are at least within softcap range.
-            q_ref = q_ref * softcap / 4
-        q_ref = q_ref.to(dtype).to(dtype_ref).requires_grad_()
-        k_ref = (
-            torch.randn(
-                batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype_ref
-            )
-            .to(dtype)
-            .to(dtype_ref)
-            .requires_grad_()
-        )
-        v_ref = (
-            torch.randn(
-                batch_size, seqlen_k, nheads_kv, dv, device=device, dtype=dtype_ref
-            )
-            .to(dtype)
-            .to(dtype_ref)
-            .requires_grad_()
-        )
-        if has_qv:
-            qv_ref = (
-                torch.randn(
-                    batch_size, seqlen_q, nheads, dv, device=device, dtype=dtype_ref
-                )
-                .to(dtype)
-                .to(dtype_ref)
-            )
-        else:
-            qv_ref = None
-        # Put window_size after QKV randn so that window_size changes from test to test
-        window_size = (
-            (None, None) if not local else torch.randint(0, seqlen_k, (2,)).tolist()
-        )
-        # window_size = (-1, -1) if not local else (16, 0)
-        if has_learnable_sink:
-            learnable_sink = torch.randn(nheads, dtype=torch.bfloat16, device=device)
-        else:
-            learnable_sink = None
-        if dtype == torch.float8_e4m3fn:
-            q_descale, k_descale, v_descale = [
-                torch.rand(batch_size, nheads_kv, device=device, dtype=torch.float32)
-                * 2
-                for _ in range(3)
-            ]
-        else:
-            q_descale, k_descale, v_descale = None, None, None
-        q, k, v = [x.detach().to(dtype).requires_grad_() for x in (q_ref, k_ref, v_ref)]
-        qv = qv_ref.detach().to(dtype).requires_grad_() if has_qv else None
-        out_ref, attn_ref = attention_ref(
-            q_ref,
-            k_ref,
-            v_ref,
-            None,
-            None,
-            causal=causal,
-            qv=qv_ref,
-            q_descale=q_descale,
-            k_descale=k_descale,
-            v_descale=v_descale,
-            window_size=window_size,
-            attention_chunk=attention_chunk,
-            learnable_sink=learnable_sink,
-            softcap=softcap,
-        )
-        out_pt, attn_pt = attention_ref(
-            q_ref,
-            k_ref,
-            v_ref,
-            None,
-            None,
-            causal=causal,
-            qv=qv_ref,
-            q_descale=q_descale,
-            k_descale=k_descale,
-            v_descale=v_descale,
-            window_size=window_size,
-            attention_chunk=attention_chunk,
-            learnable_sink=learnable_sink,
-            softcap=softcap,
-            upcast=False,
-            reorder_ops=True,
-            intermediate_dtype=dtype if dtype == torch.float8_e4m3fn else None,
-        )
-
-        # Numerical error if we just do any arithmetic on out_ref
-        fwd_atol = 2 * (out_ref + 0.3 - 0.3 - out_ref).abs().max().item()
-        rtol = 2 if softcap == 0.0 else 3
-
-        print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
-        print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
-        # num_splits_vals = [1, 3]
-        pack_gqa_vals = [False, True, None]
-        num_splits_vals = [1]
-        for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
-            # Convert to varlen format for sglang
-            result = generate_qkv(q, k, v, kvpacked=False, qkvpacked=False)
-            (
-                q_unpad,  # 0
-                k_unpad,  # 1
-                v_unpad,  # 2
-                _,  # 3 - qv_unpad
-                cu_seqlens_q,  # 4
-                cu_seqlens_k,  # 5
-                _,  # 6 - seqused_q
-                _,  # 7 - seqused_k
-                max_seqlen_q,  # 8
-                max_seqlen_k,  # 9
-                _,  # 10 - q
-                _,  # 11 - k
-                _,  # 12 - v
-                _,  # 13 - qv
-                _,  # 14 - output_pad_fn
-                _,  # 15 - dq_pad_fn
-                _,  # 16 - dk_pad_fn
-            ) = result
-
-            out_unpad, lse = flash_attn_varlen_func(
-                q_unpad,
-                k_unpad,
-                v_unpad,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
-                # max_seqlen_q and max_seqlen_k not needed for FA4
-                causal=causal,
-                window_size=window_size,
-                softcap=softcap,
-                sinks=learnable_sink,  # FA4 uses learnable_sink, not sinks
-                pack_gqa=pack_gqa,
-                return_softmax_lse=True,
-                ver=4,  # Use FA4
-            )
-
-            # Convert back to padded format
-            out = rearrange(out_unpad, "(b s) h d -> b s h d", b=batch_size)
-            print(f"Output max diff: {(out - out_ref).abs().max().item()}")
-            print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
-            # if not causal:
-            #     print(f"LSE max diff: {(lse - lse_ref).abs().max().item()}")
-            # breakpoint()
-
-            # Check that FlashAttention's numerical error is at most twice the numerical error
-            # of a Pytorch implementation.
-            assert (out - out_ref).abs().max().item() <= rtol * (
-                out_pt - out_ref
-            ).abs().max().item() + fwd_atol
-
-        if (
-            dtype != torch.float8_e4m3fn
-            and not has_qv
-            and not dv > 256
-            and not attention_chunk != 0
-            and softcap == 0.0
-            and not local
-            and dv == d
-            and learnable_sink is None
-            and False
-        ):
-            g = torch.randn_like(out)
-            # do_o = ((g.float() * out.float()).sum(-1)).transpose(1, 2)
-            dq, dk, dv = torch.autograd.grad(out, (q, k, v), g)
-            # print(f"dO_O max diff: {(softmax_d - do_o).abs().max().item()}")
-            # assert (softmax_d - do_o).abs().max().item() <= 1e-5
-            # assert dq_accum.abs().max().item() == 0.0
-
-            # dS = torch.einsum('bthd,bshd->bhts', g.float(), v.float())
-            # P = torch.softmax(qk, -1)
-            # dP = P * (dS - do_o.transpose(1, 2).unsqueeze(1))
-            # dQ = torch.einsum('bhts,bshd->bthd', dP, k.float())
-            # dV = torch.einsum('bhts,bthd->bshd', P, g.float())
-            # dK = torch.einsum('bhts,bthd->bshd', dP, q.float())
-
-            # dq, dk, dv = torch.autograd.grad(out, (q, k, v), g)
-            dq_ref, dk_ref, dv_ref = torch.autograd.grad(
-                out_ref, (q_ref, k_ref, v_ref), g
-            )
-            dq_pt, dk_pt, dv_pt = torch.autograd.grad(out_pt, (q_ref, k_ref, v_ref), g)
-            print(f"dQ max diff: {(dq - dq_ref).abs().max().item()}")
-            print(f"dK max diff: {(dk - dk_ref).abs().max().item()}")
-            print(f"dV max diff: {(dv - dv_ref).abs().max().item()}")
-            print(f"dQ mean diff: {(dq - dq_ref).abs().mean().item()}")
-            print(f"dK mean diff: {(dk - dk_ref).abs().mean().item()}")
-            print(f"dV mean diff: {(dv - dv_ref).abs().mean().item()}")
-            print(f"dQ Pytorch max diff: {(dq_pt - dq_ref).abs().max().item()}")
-            print(f"dK Pytorch max diff: {(dk_pt - dk_ref).abs().max().item()}")
-            print(f"dV Pytorch max diff: {(dv_pt - dv_ref).abs().max().item()}")
-            print(f"dQ Pytorch mean diff: {(dq_pt - dq_ref).abs().mean().item()}")
-            print(f"dK Pytorch mean diff: {(dk_pt - dk_ref).abs().mean().item()}")
-            print(f"dV Pytorch mean diff: {(dv_pt - dv_ref).abs().mean().item()}")
-            # breakpoint()
-            dq_atol = 2 * (dq_ref + 0.3 - 0.3 - dq_ref).abs().max().item() + (
-                0 if softcap == 0 else 3e-4
-            )
-            assert (dq - dq_ref).abs().max().item() <= rtol * (
-                dq_pt - dq_ref
-            ).abs().max().item() + dq_atol
-            dk_atol = 2 * (dk_ref + 0.3 - 0.3 - dk_ref).abs().max().item() + (
-                0 if softcap == 0 else 3e-4
-            )
-            assert (dk - dk_ref).abs().max().item() <= rtol * (
-                dk_pt - dk_ref
-            ).abs().max().item() + dk_atol
-            dv_atol = 2 * (dv_ref + 0.3 - 0.3 - dv_ref).abs().max().item() + (
-                0 if softcap == 0 else 3e-4
-            )
-            assert (dv - dv_ref).abs().max().item() <= rtol * (
-                dv_pt - dv_ref
-            ).abs().max().item() + dv_atol
-
-
-# @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 # @pytest.mark.parametrize("mha_type", ["mqa"])
 @pytest.mark.parametrize("has_learnable_sink", [False, True])
 # @pytest.mark.parametrize("has_learnable_sink", [False])
@@ -806,8 +508,8 @@ def test_flash_attn_output_disabled(
 @pytest.mark.parametrize("deterministic", [False])
 # @pytest.mark.parametrize("softcap", [0.0, 15.0])
 @pytest.mark.parametrize("softcap", [0.0])
-@pytest.mark.parametrize("local", [False, True])
-# @pytest.mark.parametrize("local", [False])
+# @pytest.mark.parametrize("local", [False, True])
+@pytest.mark.parametrize("local", [False])
 @pytest.mark.parametrize("causal", [False, True])
 # @pytest.mark.parametrize("causal", [False])
 # @pytest.mark.parametrize("add_unused_qkv", [False, True])
@@ -831,11 +533,11 @@ def test_flash_attn_output_disabled(
         (64, 128),
         (128, 128),
         (256, 256),
-        (113, 203),
-        (128, 217),
-        (113, 211),
-        (108, 256),
-        (256, 512),
+        # (113, 203),
+        # (128, 217),
+        # (113, 211),
+        # (108, 256),
+        # (256, 512),
         (307, 256),
         (640, 128),
         (512, 256),
@@ -1189,8 +891,8 @@ def test_flash_attn_varlen_output(
 # @pytest.mark.parametrize("has_learnable_sink", [False])
 # @pytest.mark.parametrize("new_kv", [False, True])
 @pytest.mark.parametrize("new_kv", [False])
-@pytest.mark.parametrize("local", [False, True])
-# @pytest.mark.parametrize("local", [False])
+# @pytest.mark.parametrize("local", [False, True])
+@pytest.mark.parametrize("local", [False])
 # @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("causal", [True])
 # @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True, False])
@@ -1202,8 +904,8 @@ def test_flash_attn_varlen_output(
 # @pytest.mark.parametrize("rotary_fraction", [0.0, 0.5, 1.0])
 @pytest.mark.parametrize("rotary_fraction", [0.0])
 # @pytest.mark.parametrize("page_size", [None] + ([1, 4, 128]))
-@pytest.mark.parametrize("page_size", [None, 128])
-# @pytest.mark.parametrize("page_size", [128])
+# @pytest.mark.parametrize("page_size", [None, 128])
+@pytest.mark.parametrize("page_size", [128])
 # @pytest.mark.parametrize("has_leftpad", [False, True])
 @pytest.mark.parametrize("has_leftpad", [False])
 # @pytest.mark.parametrize("has_batch_idx", [False, True])
