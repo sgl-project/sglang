@@ -88,12 +88,9 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
     get_device_sm,
-    get_int_env_var,
     is_cpu,
     is_cuda,
-    is_flashinfer_available,
     is_hip,
-    is_non_idle_and_non_empty,
     log_info_on_rank0,
     make_layers,
 )
