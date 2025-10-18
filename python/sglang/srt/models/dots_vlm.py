@@ -23,7 +23,6 @@ import torch
 from torch import nn
 
 from sglang.srt.configs.dots_vlm import DotsVLMConfig
-from sglang.srt.distributed import parallel_state
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,

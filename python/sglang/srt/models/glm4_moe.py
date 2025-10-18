@@ -44,10 +44,8 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
-    ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
-    ReplicatedLinear,
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -78,16 +76,12 @@ from sglang.srt.utils import (
     BumpAllocator,
     LazyValue,
     add_prefix,
-    bind_or_assign,
     cpu_has_amx_support,
     get_bool_env_var,
     get_device_sm,
-    get_int_env_var,
     is_cpu,
     is_cuda,
-    is_flashinfer_available,
     is_hip,
-    is_non_idle_and_non_empty,
     log_info_on_rank0,
     use_intel_amx_backend,
 )
@@ -467,7 +461,7 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
 
         self.top_k = config.num_experts_per_tok
 
-        if get_moe_a2a_backend().is_deepep():
+        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
             # TODO: we will support tp < ep in the future
             self.ep_size = get_moe_expert_parallel_world_size()
             self.num_experts = (
@@ -496,7 +490,9 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
                 return_recv_hook=True,
             )
 
-        self._enable_deepep_moe = get_moe_a2a_backend().is_deepep()
+        self._enable_a2a_moe = (
+            get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake()
+        )
 
     def forward_normal_dual_stream(
         self,

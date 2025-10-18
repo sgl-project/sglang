@@ -39,10 +39,12 @@ import torch
 import torch.distributed
 from torch.distributed import Backend, ProcessGroup
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import (
     direct_register_custom_op,
     get_bool_env_var,
     get_int_env_var,
+    get_local_ip_auto,
     is_cpu,
     is_cuda_alike,
     is_hip,
@@ -54,8 +56,6 @@ from sglang.srt.utils import (
 _is_npu = is_npu()
 _is_cpu = is_cpu()
 _supports_custom_op = supports_custom_op()
-
-IS_ONE_DEVICE_PER_PROCESS = get_bool_env_var("SGLANG_ONE_DEVICE_PER_PROCESS")
 
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
@@ -258,11 +258,14 @@ class GroupCoordinator:
             device_group = torch.distributed.new_group(
                 ranks, backend=torch_distributed_backend
             )
-            # a group with `gloo` backend, to allow direct coordination between
-            # processes through the CPU.
-            cpu_group = torch.distributed.new_group(
-                ranks, backend="gloo", timeout=gloo_timeout
-            )
+            # a cpu_group to allow direct coordination between processes through
+            # the CPU. The backend is chosen based on `torch_distributed_backend`
+            if "mooncake" in torch_distributed_backend:
+                cpu_group = torch.distributed.new_group(ranks, backend="mooncake-cpu")
+            else:
+                cpu_group = torch.distributed.new_group(
+                    ranks, backend="gloo", timeout=gloo_timeout
+                )
             if self.rank in ranks:
                 self.ranks = ranks
                 self.world_size = len(ranks)
@@ -273,11 +276,13 @@ class GroupCoordinator:
         assert self.cpu_group is not None
         assert self.device_group is not None
 
-        device_id = 0 if IS_ONE_DEVICE_PER_PROCESS else local_rank
         if is_cuda_alike():
+            device_id = (
+                0 if envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.get() else local_rank
+            )
             self.device = torch.device(f"cuda:{device_id}")
         elif _is_npu:
-            self.device = torch.device(f"npu:{device_id}")
+            self.device = torch.device(f"npu:{local_rank}")
         else:
             self.device = torch.device("cpu")
         self.device_module = torch.get_device_module(self.device)
@@ -1410,6 +1415,17 @@ def init_distributed_environment(
         distributed_init_method,
         backend,
     )
+    if "mooncake" in backend:
+        try:
+            from mooncake import ep as mooncake_ep
+        except ImportError as e:
+            raise ImportError(
+                "Please install mooncake by following the instructions at "
+                "https://github.com/kvcache-ai/Mooncake/blob/main/doc/en/build.md "  # noqa: E501
+                "to run SGLang with Mooncake Backend."
+            ) from e
+        mooncake_ep.set_host_ip(get_local_ip_auto())
+
     if not torch.distributed.is_initialized():
         assert distributed_init_method is not None, (
             "distributed_init_method must be provided when initializing "
