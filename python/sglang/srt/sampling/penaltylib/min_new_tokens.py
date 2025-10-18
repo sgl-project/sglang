@@ -1,3 +1,6 @@
+import weakref
+from typing import Optional
+
 import torch
 
 from sglang.srt.sampling.penaltylib.orchestrator import (
@@ -10,10 +13,6 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
     """
     Min new tokens penalizer penalizes tokens based on the length of the output.
     """
-
-    def __init__(self, orchestrator: BatchedPenalizerOrchestrator):
-        self.orchestrator = orchestrator
-        self._is_prepared = False
 
     def _is_required(self) -> bool:
         return any(
@@ -92,3 +91,9 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
         self.len_output_tokens = torch.cat(
             [self.len_output_tokens, their.len_output_tokens], dim=0
         )
+
+    # Explicit resource cleanup to aid GC and free CUDA memory promptly
+    def _teardown(self) -> None:
+        for name in ("min_new_tokens", "stop_token_penalties", "len_output_tokens"):
+            if hasattr(self, name):
+                delattr(self, name)
