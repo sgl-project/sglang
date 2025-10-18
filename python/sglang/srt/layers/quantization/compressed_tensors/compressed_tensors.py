@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import suppress
 from typing import Any, Dict, List, Literal, NamedTuple, Optional, Tuple, cast
 
@@ -24,6 +25,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.compressed_tensors import WNA16_SUPPORTED_BITS
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa: E501
     CompressedTensorsMoEMethod,
 )
@@ -38,6 +40,7 @@ from sglang.srt.layers.quantization.compressed_tensors.utils import (
     is_activation_quantization_format,
     should_ignore_layer,
 )
+from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
 try:
@@ -76,6 +79,7 @@ class DeviceCapability(NamedTuple):
 
 
 class CompressedTensorsConfig(QuantizationConfig):
+    DeepSeekFP8Config = None
 
     def __init__(
         self,
@@ -129,6 +133,10 @@ class CompressedTensorsConfig(QuantizationConfig):
         ):
             return UnquantizedLinearMethod()
         if isinstance(layer, LinearBase):
+            if CompressedTensorsConfig.DeepSeekFP8Config is not None:
+                return Fp8LinearMethod(CompressedTensorsConfig.DeepSeekFP8Config)
+            if "KT_MOE_AMX_WEIGHT_PATH" in os.environ:
+                return UnquantizedLinearMethod()
             scheme = self.get_scheme(layer=layer, layer_name=prefix)
             if scheme is None:
                 return UnquantizedLinearMethod()
@@ -137,7 +145,8 @@ class CompressedTensorsConfig(QuantizationConfig):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, FusedMoE):
-            return CompressedTensorsMoEMethod.get_moe_method(self)
+            # Ktransformers use CompressedTensorsWNA16AMXMOEMethod if AMX weights are provided
+            return CompressedTensorsMoEMethod.get_moe_method(self, layer, prefix)
         return None
 
     @classmethod

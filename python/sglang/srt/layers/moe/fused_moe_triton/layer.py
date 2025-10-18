@@ -123,7 +123,6 @@ class FusedMoE(torch.nn.Module):
         with_bias=False,
     ):
         super().__init__()
-
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
 
@@ -215,6 +214,8 @@ class FusedMoE(torch.nn.Module):
                 if not use_weight_loader_fused
                 else self.weight_loader_fused
             ),
+            intermediate_size_full=intermediate_size,
+            top_k=top_k,
             with_bias=with_bias,
         )
 
@@ -527,6 +528,11 @@ class FusedMoE(torch.nn.Module):
             if expert_id == -1:
                 return
 
+        if hasattr(self.quant_method, "num_gpu_experts"):
+            if self.quant_method.num_gpu_experts != -1:
+                if expert_id >= self.quant_method.num_gpu_experts:
+                    return
+
         self._weight_loader_impl(
             param=param,
             loaded_weight=loaded_weight,
@@ -553,7 +559,12 @@ class FusedMoE(torch.nn.Module):
             loaded_weight.t().contiguous()
             if (
                 self.quant_method.__class__.__name__
-                == "CompressedTensorsWNA16MoEMethod"
+                in [
+                    "CompressedTensorsWNA16MarlinMoEMethod",
+                    "CompressedTensorsWNA16MoEMethod",
+                    "CompressedTensorsWNA16AMXMoEMethod",
+                    "CompressedTensorsWNA16AMXEPMoEMethod",
+                ]
             )
             else loaded_weight
         )
@@ -822,12 +833,12 @@ class FusedMoE(torch.nn.Module):
         )
 
         # TODO: consider using symmetric memory
+
         combine_input = self.quant_method.apply(
             layer=self,
             dispatch_output=dispatch_output,
             **kwargs,
         )
-
         final_hidden_states = self.dispatcher.combine(combine_input)
 
         final_hidden_states = final_hidden_states[
