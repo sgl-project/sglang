@@ -114,20 +114,7 @@ class ModelOptFp8Config(QuantizationConfig):
     @classmethod
     def override_quantization_method(cls, hf_quant_config, user_quant):
         """Override quantization method based on the model's config."""
-        if hf_quant_config is None:
-            return None
-
-        # Check if this is a ModelOpt config
-        quant_algo = hf_quant_config.get("quant_algo", "").upper()
-
-        # If user specified generic "modelopt", auto-detect the specific method
-        if user_quant == "modelopt":
-            if "FP8" in quant_algo:
-                return "modelopt_fp8"
-            elif "NVFP4" in quant_algo or "FP4" in quant_algo:
-                return "modelopt_fp4"
-
-        return None
+        return cls._modelopt_override_quantization_method(hf_quant_config, user_quant)
 
     @classmethod
     def get_name(cls) -> str:
@@ -548,20 +535,7 @@ class ModelOptFp4Config(QuantizationConfig):
     @classmethod
     def override_quantization_method(cls, hf_quant_config, user_quant):
         """Override quantization method based on the model's config."""
-        if hf_quant_config is None:
-            return None
-
-        # Check if this is a ModelOpt config
-        quant_algo = hf_quant_config.get("quant_algo", "").upper()
-
-        # If user specified generic "modelopt", auto-detect the specific method
-        if user_quant == "modelopt":
-            if "FP8" in quant_algo:
-                return "modelopt_fp8"
-            elif "NVFP4" in quant_algo or "FP4" in quant_algo:
-                return "modelopt_fp4"
-
-        return None
+        return cls._modelopt_override_quantization_method(hf_quant_config, user_quant)
 
     @classmethod
     def get_name(cls) -> str:
