@@ -44,6 +44,7 @@ from sglang.srt.utils import (
     is_remote_url,
     is_sm90_supported,
     is_sm100_supported,
+    is_sm120_supported,
     is_triton_kernels_available,
     is_valid_ipv6_address,
     json_list_type,
@@ -1413,18 +1414,16 @@ class ServerArgs:
             # Check attention backend
             if self.attention_backend is None:
                 # User didn't specify attention backend, fallback based on GPU architecture
-                if is_sm100_supported():
+                if is_sm100_supported() or is_sm120_supported():
+                    # Blackwell and newer architectures
                     self.attention_backend = "flashinfer"
-                    logger.warning(
-                        f"Attention backend not specified. Falling back to 'flashinfer' for deterministic inference on Blackwell (SM100). "
-                        f"You can explicitly set --attention-backend to one of {DETERMINISTIC_ATTENTION_BACKEND_CHOICES}."
-                    )
                 else:
+                    # Hopper (SM90) and older architectures
                     self.attention_backend = "fa3"
-                    logger.warning(
-                        f"Attention backend not specified. Falling back to 'fa3' for deterministic inference. "
-                        f"You can explicitly set --attention-backend to one of {DETERMINISTIC_ATTENTION_BACKEND_CHOICES}."
-                    )
+                logger.warning(
+                    f"Attention backend not specified. Falling back to '{self.attention_backend}' for deterministic inference. "
+                    f"You can explicitly set --attention-backend to one of {DETERMINISTIC_ATTENTION_BACKEND_CHOICES}."
+                )
             elif self.attention_backend not in DETERMINISTIC_ATTENTION_BACKEND_CHOICES:
                 # User explicitly specified an incompatible attention backend
                 raise ValueError(
