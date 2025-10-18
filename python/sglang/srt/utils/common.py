@@ -88,6 +88,7 @@ from torch.profiler import ProfilerActivity, profile, record_function
 from torch.utils._contextlib import _DecoratorContextManager
 from typing_extensions import Literal
 
+from sglang.srt.environ import envs
 from sglang.srt.metrics.func_timer import enable_func_timer
 
 logger = logging.getLogger(__name__)
@@ -3273,7 +3274,7 @@ def json_list_type(value):
 @contextmanager
 def maybe_reindex_device_id(gpu_id: int):
 
-    if not is_cuda_alike():
+    if envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.get() is False or not is_cuda_alike():
         yield gpu_id
         return
 
