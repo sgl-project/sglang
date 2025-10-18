@@ -1,14 +1,18 @@
-use std::collections::{BTreeMap, HashMap};
-use std::sync::RwLock;
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::RwLock,
+};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
-use super::conversation_items::{
-    make_item_id, ConversationItem, ConversationItemId, ConversationItemStorage, ListParams,
-    Result, SortOrder,
+use super::{
+    conversation_items::{
+        make_item_id, ConversationItem, ConversationItemId, ConversationItemStorage, ListParams,
+        Result, SortOrder,
+    },
+    conversations::ConversationId,
 };
-use super::conversations::ConversationId;
 
 #[derive(Default)]
 pub struct MemoryConversationItemStorage {
@@ -142,12 +146,57 @@ impl ConversationItemStorage for MemoryConversationItemStorage {
 
         Ok(results)
     }
+
+    async fn get_item(&self, item_id: &ConversationItemId) -> Result<Option<ConversationItem>> {
+        let items = self.items.read().unwrap();
+        Ok(items.get(item_id).cloned())
+    }
+
+    async fn is_item_linked(
+        &self,
+        conversation_id: &ConversationId,
+        item_id: &ConversationItemId,
+    ) -> Result<bool> {
+        let rev = self.rev_index.read().unwrap();
+        if let Some(conv_idx) = rev.get(conversation_id) {
+            Ok(conv_idx.contains_key(&item_id.0))
+        } else {
+            Ok(false)
+        }
+    }
+
+    async fn delete_item(
+        &self,
+        conversation_id: &ConversationId,
+        item_id: &ConversationItemId,
+    ) -> Result<()> {
+        // Get the key from rev_index and remove the entry at the same time
+        let key_to_remove = {
+            let mut rev = self.rev_index.write().unwrap();
+            if let Some(conv_idx) = rev.get_mut(conversation_id) {
+                conv_idx.remove(&item_id.0)
+            } else {
+                None
+            }
+        };
+
+        // If the item was in rev_index, remove it from links as well
+        if let Some(key) = key_to_remove {
+            let mut links = self.links.write().unwrap();
+            if let Some(conv_links) = links.get_mut(conversation_id) {
+                conv_links.remove(&key);
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use chrono::{TimeZone, Utc};
+
+    use super::*;
 
     fn make_item(
         item_type: &str,

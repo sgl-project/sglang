@@ -1,10 +1,13 @@
+use std::{
+    fmt::{Display, Formatter},
+    sync::Arc,
+};
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::fmt::{Display, Formatter};
-use std::sync::Arc;
 
 use super::conversations::ConversationId;
 
@@ -94,15 +97,32 @@ pub trait ConversationItemStorage: Send + Sync + 'static {
         conversation_id: &ConversationId,
         params: ListParams,
     ) -> Result<Vec<ConversationItem>>;
+
+    /// Get a single item by ID
+    async fn get_item(&self, item_id: &ConversationItemId) -> Result<Option<ConversationItem>>;
+
+    /// Check if an item is linked to a conversation
+    async fn is_item_linked(
+        &self,
+        conversation_id: &ConversationId,
+        item_id: &ConversationItemId,
+    ) -> Result<bool>;
+
+    /// Delete an item link from a conversation (does not delete the item itself)
+    async fn delete_item(
+        &self,
+        conversation_id: &ConversationId,
+        item_id: &ConversationItemId,
+    ) -> Result<()>;
 }
 
 pub type SharedConversationItemStorage = Arc<dyn ConversationItemStorage>;
 
 /// Helper to build id prefix based on item_type
 pub fn make_item_id(item_type: &str) -> ConversationItemId {
-    // Generate a 24-byte random hex string (48 hex chars), consistent with conversation id style
+    // Generate exactly 50 hex characters (25 bytes) for the part after the underscore
     let mut rng = rand::rng();
-    let mut bytes = [0u8; 24];
+    let mut bytes = [0u8; 25];
     rng.fill_bytes(&mut bytes);
     let hex_string: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
 
