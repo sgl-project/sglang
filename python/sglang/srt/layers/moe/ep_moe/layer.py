@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import torch
 
+from sglang.srt import single_batch_overlap
 from sglang.srt.layers.moe import (
     get_deepep_mode,
     get_moe_a2a_backend,
@@ -167,18 +168,20 @@ class DeepEPMoE(FusedMoE):
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
         forward_batch: ForwardBatch,
+        forward_shared_experts=None,
+        alt_stream=None,
     ):
-        dispatch_output = self.dispatch(
-            hidden_states, topk_idx, topk_weights, forward_batch
+        # We have to call SBO inside MoE to be compatible with hooks used in offloading
+        return single_batch_overlap.execute_sbo(
+            hidden_states=hidden_states,
+            topk_idx=topk_idx,
+            topk_weights=topk_weights,
+            forward_batch=forward_batch,
+            # SBO args
+            experts=self,
+            forward_shared_experts=forward_shared_experts,
+            alt_stream=alt_stream,
         )
-        hidden_states = self.moe_impl(dispatch_output)
-        hidden_states = self.combine(
-            hidden_states,
-            dispatch_output.topk_idx,
-            dispatch_output.topk_weights,
-            forward_batch,
-        )
-        return hidden_states
 
     def dispatch(
         self,

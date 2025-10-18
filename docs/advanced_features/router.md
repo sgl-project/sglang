@@ -81,7 +81,7 @@ Comprehensive example:
 python3 -m sglang_router.launch_server \
   --host 0.0.0.0 \
   --port 8080 \
-  --model /raid/models/meta-llama/Llama-3.1-8B-Instruct \
+  --model meta-llama/Llama-3.1-8B-Instruct \
   --tp-size 1 \
   --dp-size 8 \
   --grpc-mode \
@@ -91,7 +91,7 @@ python3 -m sglang_router.launch_server \
   --router-health-success-threshold 2 \
   --router-health-check-timeout-secs 6000 \
   --router-health-check-interval-secs 60 \
-  --router-model-path /raid/models/meta-llama/Llama-3.1-8B-Instruct \
+  --router-model-path meta-llama/Llama-3.1-8B-Instruct \
   --router-policy round_robin \
   --router-log-level debug
 ```
@@ -117,7 +117,7 @@ Use SRT gRPC workers to unlock the highest throughput and access native reasonin
 ```bash
 # Workers expose gRPC endpoints
 python -m sglang.launch_server \
-  --model /raid/models/meta-llama/Llama-3.1-8B-Instruct \
+  --model meta-llama/Llama-3.1-8B-Instruct \
   --grpc-mode \
   --port 20000
 
@@ -152,7 +152,6 @@ Proxy OpenAI-compatible endpoints (OpenAI, xAI, etc.) while keeping history and 
 python -m sglang_router.launch_router \
   --backend openai \
   --worker-urls https://api.openai.com \
-  --api-key "$OPENAI_API_KEY" \
   --history-backend memory
 ```
 
@@ -171,7 +170,7 @@ curl -X POST http://localhost:30000/workers \
   -d '{"url":"grpc://0.0.0.0:31000","worker_type":"regular"}'
 
 # Inspect registry
-curl http://localhost:30000/workers | jq
+curl http://localhost:30000/workers
 
 # Remove a worker
 curl -X DELETE http://localhost:30000/workers/grpc://0.0.0.0:31000
@@ -278,8 +277,18 @@ PD deployments can specify `--prefill-selector` and `--decode-selector` plus the
 | `oracle` | Oracle Autonomous Database-backed storage (pooled connections). | `--history-backend oracle` |
 
 Oracle configuration (choose DSN *or* TNS alias):
+Install the Oracle Instant Client and set `LD_LIBRARY_PATH` accordingly.
+Choose **one** connection method:
 ```bash
-export ATP_DSN="tcps://host:port/service"  # or use ATP_TNS_ALIAS + ATP_WALLET_PATH
+# Option 1: Full connection descriptor
+export ATP_DSN="(description=(address=(protocol=tcps)(port=1522)(host=adb.region.oraclecloud.com))(connect_data=(service_name=service_name)))"
+
+# Option 2: TNS alias (requires wallet)
+export ATP_TNS_ALIAS="sglroutertestatp_high"
+export ATP_WALLET_PATH="/path/to/wallet"
+```
+Provide database credentials and optional pool sizing:
+```bash
 export ATP_USER="admin"
 export ATP_PASSWORD="secret"
 export ATP_POOL_MIN=4
@@ -320,7 +329,6 @@ Use CLI flags to select parsers:
 | `POST`                | `/v1/completions`                        | OpenAI-compatible text completions.            |
 | `POST`                | `/v1/responses`                          | Create background responses (agentic loops).   |
 | `GET`                 | `/v1/responses/{id}`                     | Retrieve stored responses.                     |
-| `GET`                 | `/v1/responses/{id}/input`               | List captured input items.                     |
 | `POST`                | `/v1/embeddings`                         | Forward embedding requests.                    |
 | `POST`                | `/v1/rerank`                             | Ranking endpoint (`/rerank` synonym).          |
 | `POST`                | `/v1/conversations`                      | Create conversation metadata.                  |
