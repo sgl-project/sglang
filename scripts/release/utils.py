@@ -92,7 +92,15 @@ def replace_in_file(file_path: Path, old_version: str, new_version: str) -> bool
         return False
 
     content = file_path.read_text()
-    new_content = content.replace(old_version, new_version)
+
+    # For TOML files, use regex to match version field regardless of current value
+    if file_path.suffix == ".toml":
+        # Match: version = "X.Y.Z..." (with optional quotes and whitespace)
+        pattern = r'(version\s*=\s*["\'])([^"\']+)(["\'])'
+        new_content = re.sub(pattern, rf"\g<1>{new_version}\g<3>", content)
+    else:
+        # For non-TOML files, use simple string replacement
+        new_content = content.replace(old_version, new_version)
 
     if content == new_content:
         print(f"No changes needed in {file_path}")
@@ -150,3 +158,26 @@ def bump_version(
     print()
     print(f"Successfully updated {updated_count} file(s)")
     print(f"Version bumped from {old_version} to {new_version}")
+
+    # Validate that all files now contain the new version
+    print("\nValidating version updates...")
+    failed_files = []
+    for file_rel in files_to_update:
+        file_abs = repo_root / file_rel
+        if not file_abs.exists():
+            continue  # Skip non-existent files (already warned above)
+
+        content = file_abs.read_text()
+        if new_version not in content:
+            failed_files.append(file_rel)
+            print(f"✗ {file_rel} does not contain version {new_version}")
+        else:
+            print(f"✓ {file_rel} validated")
+
+    if failed_files:
+        print(f"\nError: {len(failed_files)} file(s) were not updated correctly:")
+        for file_rel in failed_files:
+            print(f"  - {file_rel}")
+        sys.exit(1)
+
+    print("\nAll files validated successfully!")
