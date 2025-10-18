@@ -57,6 +57,9 @@ class Operation:
     data: Optional[Any]
     # If the operation is expected to fail, this is the error message to expect
     expected_error: Optional[str] = None
+    # Because the logic for implicitly evicting LoRA adapters can be complicated, we explicitly
+    # pass in LoRA adapters that should be implicitly evicted here
+    expected_implicit_evictions: Optional[set[str]] = None
 
 
 @dataclass
@@ -141,20 +144,20 @@ BASIC_TESTS = [
                 data=create_batch_data(
                     "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16"
                 ),
-                expected_error="not loaded",
             ),
             Operation(
                 type=OperationType.FORWARD,
                 data=create_batch_data("pbevan11/llama-3.1-8b-ocr-correction"),
-                expected_error="not loaded",
             ),
             Operation(
                 type=OperationType.LOAD,
                 data="Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
+                expected_error="already loaded",
             ),
             Operation(
                 type=OperationType.LOAD,
                 data="pbevan11/llama-3.1-8b-ocr-correction",
+                expected_error="already loaded",
             ),
             Operation(
                 type=OperationType.FORWARD,
@@ -173,7 +176,6 @@ BASIC_TESTS = [
             Operation(
                 type=OperationType.FORWARD,
                 data=create_batch_data("philschmid/code-llama-3-1-8b-text-to-sql-lora"),
-                expected_error="not loaded",
             ),
             Operation(
                 type=OperationType.FORWARD,
@@ -197,12 +199,10 @@ BASIC_TESTS = [
                 data=create_batch_data(
                     "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16"
                 ),
-                expected_error="not loaded",
             ),
             Operation(
                 type=OperationType.FORWARD,
                 data=create_batch_data("pbevan11/llama-3.1-8b-ocr-correction"),
-                expected_error="not loaded",
             ),
             Operation(
                 type=OperationType.FORWARD,
@@ -268,7 +268,6 @@ BASIC_TESTS = [
             Operation(
                 type=OperationType.FORWARD,
                 data=create_batch_data("philschmid/code-llama-3-1-8b-text-to-sql-lora"),
-                expected_error="not loaded",
             ),
             Operation(
                 type=OperationType.FORWARD,
@@ -294,12 +293,10 @@ BASIC_TESTS = [
                 data=create_batch_data(
                     "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16"
                 ),
-                expected_error="not loaded",
             ),
             Operation(
                 type=OperationType.FORWARD,
                 data=create_batch_data("pbevan11/llama-3.1-8b-ocr-correction"),
-                expected_error="not loaded",
             ),
             Operation(
                 type=OperationType.FORWARD,
@@ -308,14 +305,17 @@ BASIC_TESTS = [
             Operation(
                 type=OperationType.LOAD,
                 data="philschmid/code-llama-3-1-8b-text-to-sql-lora",
+                expected_error="already loaded",
             ),
             Operation(
                 type=OperationType.LOAD,
                 data="Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
+                expected_error="already loaded",
             ),
             Operation(
                 type=OperationType.LOAD,
                 data="pbevan11/llama-3.1-8b-ocr-correction",
+                expected_error="already loaded",
             ),
             Operation(
                 type=OperationType.FORWARD,
@@ -363,7 +363,7 @@ TARGET_MODULE_TESTS = [
                 data=create_batch_data(
                     "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16"
                 ),
-                expected_error="not loaded",
+                expected_error="never been loaded",
             ),
             Operation(
                 type=OperationType.LOAD,
@@ -403,7 +403,7 @@ TARGET_MODULE_TESTS = [
                 data=create_batch_data(
                     "algoprog/fact-generation-llama-3.1-8b-instruct-lora"
                 ),
-                expected_error="not loaded",
+                expected_error="never been loaded",
             ),
             Operation(
                 type=OperationType.LOAD,
@@ -443,7 +443,7 @@ TARGET_MODULE_TESTS = [
                 data=create_batch_data(
                     "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16"
                 ),
-                expected_error="not loaded",
+                expected_error="never been loaded",
             ),
             Operation(
                 type=OperationType.LOAD,
@@ -484,12 +484,12 @@ MAX_LORA_RANK_TESTS = [
             Operation(
                 type=OperationType.FORWARD,
                 data=create_batch_data("philschmid/code-llama-3-1-8b-text-to-sql-lora"),
-                expected_error="not loaded",
+                expected_error="never been loaded",
             ),
             Operation(
                 type=OperationType.FORWARD,
                 data=create_batch_data("pbevan11/llama-3.1-8b-ocr-correction"),
-                expected_error="not loaded",
+                expected_error="never been loaded",
             ),
             Operation(
                 type=OperationType.LOAD,
@@ -515,7 +515,7 @@ MAX_LORA_RANK_TESTS = [
                 data=create_batch_data(
                     "philschmid/code-llama-3-1-8b-text-to-sql-lora",
                 ),
-                expected_error="not loaded",
+                expected_error="never been loaded",
             ),
             Operation(
                 type=OperationType.FORWARD,
@@ -552,7 +552,7 @@ MAX_LORA_RANK_TESTS = [
             Operation(
                 type=OperationType.FORWARD,
                 data=create_batch_data("philschmid/code-llama-3-1-8b-text-to-sql-lora"),
-                expected_error="not loaded",
+                expected_error="never been loaded",
             ),
             Operation(
                 type=OperationType.LOAD,
@@ -579,7 +579,7 @@ MAX_LORA_RANK_TESTS = [
 ]
 MAX_LOADED_LORAS_TESTS = [
     TestCase(
-        description="Test max_loaded_loras limit",
+        description="Test max_loaded_loras limit as well as implicit eviction and reloading",
         base="meta-llama/Llama-3.1-8B-Instruct",
         max_loras_per_batch=2,
         max_loaded_loras=2,
@@ -597,7 +597,50 @@ MAX_LOADED_LORAS_TESTS = [
             Operation(
                 type=OperationType.LOAD,
                 data="pbevan11/llama-3.1-8b-ocr-correction",
-                expected_error="Maximum number of loaded LoRA adapters",
+                expected_implicit_evictions={
+                    "philschmid/code-llama-3-1-8b-text-to-sql-lora"
+                },
+            ),
+            # Implicitly load "philschmid/code-llama-3-1-8b-text-to-sql-lora"
+            Operation(
+                type=OperationType.FORWARD,
+                data=create_batch_data(
+                    [
+                        "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
+                        "philschmid/code-llama-3-1-8b-text-to-sql-lora",
+                    ]
+                ),
+                expected_implicit_evictions={"pbevan11/llama-3.1-8b-ocr-correction"},
+            ),
+            Operation(
+                type=OperationType.UNLOAD,
+                data="philschmid/code-llama-3-1-8b-text-to-sql-lora",
+            ),
+            Operation(
+                type=OperationType.FORWARD,
+                data=create_batch_data(
+                    [
+                        "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
+                    ]
+                ),
+            ),
+            Operation(
+                type=OperationType.LOAD,
+                data="philschmid/code-llama-3-1-8b-text-to-sql-lora",
+            ),
+            # Implicitly load "pbevan11/llama-3.1-8b-ocr-correction" and make sure that "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16"
+            # isn't implicitly unloaded even though it is LRU because it is needed for this forward pass
+            Operation(
+                type=OperationType.FORWARD,
+                data=create_batch_data(
+                    [
+                        "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
+                        "pbevan11/llama-3.1-8b-ocr-correction",
+                    ]
+                ),
+                expected_implicit_evictions={
+                    "philschmid/code-llama-3-1-8b-text-to-sql-lora"
+                },
             ),
             Operation(
                 type=OperationType.UNLOAD,
@@ -605,7 +648,92 @@ MAX_LOADED_LORAS_TESTS = [
             ),
             Operation(
                 type=OperationType.LOAD,
+                data="algoprog/fact-generation-llama-3.1-8b-instruct-lora",
+            ),
+            Operation(
+                type=OperationType.FORWARD,
+                data=create_batch_data(
+                    [
+                        "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
+                        "philschmid/code-llama-3-1-8b-text-to-sql-lora",
+                    ]
+                ),
+                expected_implicit_evictions={
+                    "pbevan11/llama-3.1-8b-ocr-correction",
+                    "algoprog/fact-generation-llama-3.1-8b-instruct-lora",
+                },
+            ),
+        ],
+    ),
+    TestCase(
+        description="Test implicit eviction and reloading with pinned LoRA adapters",
+        base="meta-llama/Llama-3.1-8B-Instruct",
+        max_loras_per_batch=2,
+        max_loaded_loras=2,
+        all_adapters=[
+            "philschmid/code-llama-3-1-8b-text-to-sql-lora",
+            "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
+            "pbevan11/llama-3.1-8b-ocr-correction",
+        ],
+        initial_adapters=[
+            {
+                "lora_name": "philschmid/code-llama-3-1-8b-text-to-sql-lora",
+                "lora_path": "philschmid/code-llama-3-1-8b-text-to-sql-lora",
+                "pinned": True,
+            }
+        ],
+        op_sequence=[
+            Operation(
+                type=OperationType.LOAD,
+                data="Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
+            ),
+            Operation(
+                type=OperationType.LOAD,
                 data="pbevan11/llama-3.1-8b-ocr-correction",
+                expected_implicit_evictions={
+                    "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16"
+                },
+            ),
+            # Implicitly load "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16"
+            Operation(
+                type=OperationType.FORWARD,
+                data=create_batch_data(
+                    [
+                        "philschmid/code-llama-3-1-8b-text-to-sql-lora",
+                        "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
+                    ]
+                ),
+                expected_implicit_evictions={"pbevan11/llama-3.1-8b-ocr-correction"},
+            ),
+            Operation(
+                type=OperationType.LOAD,
+                data={
+                    "lora_name": "pbevan11/llama-3.1-8b-ocr-correction",
+                    "lora_path": "pbevan11/llama-3.1-8b-ocr-correction",
+                    "pinned": True,
+                },
+                expected_error="not allowed to pin all slots",
+            ),
+            Operation(
+                type=OperationType.UNLOAD,
+                data="philschmid/code-llama-3-1-8b-text-to-sql-lora",
+            ),
+            Operation(
+                type=OperationType.LOAD,
+                data={
+                    "lora_name": "pbevan11/llama-3.1-8b-ocr-correction",
+                    "lora_path": "pbevan11/llama-3.1-8b-ocr-correction",
+                    "pinned": True,
+                },
+            ),
+            Operation(
+                type=OperationType.FORWARD,
+                data=create_batch_data(
+                    [
+                        "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
+                        "pbevan11/llama-3.1-8b-ocr-correction",
+                    ]
+                ),
             ),
         ],
     ),
@@ -804,6 +932,7 @@ class LoRAUpdateTestSessionBase:
         lora_name: str,
         lora_path: Optional[str] = None,
         expected_error: Optional[str] = None,
+        expected_implicit_evictions: Optional[set[str]] = None,
     ):
         """
         Load a LoRA adapter by name and path.
@@ -822,6 +951,7 @@ class LoRAUpdateTestSessionBase:
         lora_paths: List[str],
         max_new_tokens: int = 32,
         expected_error: Optional[str] = None,
+        expected_implicit_evictions: Optional[set[str]] = None,
     ):
         """
         Perform a batch forward pass with the current set of loaded LoRA adapters.
@@ -868,6 +998,7 @@ class LoRAUpdateEngineTestSession(LoRAUpdateTestSessionBase):
         lora_path: Optional[str] = None,
         expected_error: Optional[str] = None,
         pinned: bool = False,
+        expected_implicit_evictions: Optional[set[str]] = None,
     ):
         """
         Load a LoRA adapter by name and path.
@@ -892,6 +1023,9 @@ class LoRAUpdateEngineTestSession(LoRAUpdateTestSessionBase):
             print(f"Received error as expected: {response.error_message}")
         else:
             self.expected_adapters.add(lora_name)
+            if expected_implicit_evictions is not None:
+                self.expected_adapters -= expected_implicit_evictions
+
             self.testcase.assertTrue(
                 response.success,
                 f"Failed to load LoRA adapter {lora_name}: {response.error_message}",
@@ -932,6 +1066,7 @@ class LoRAUpdateEngineTestSession(LoRAUpdateTestSessionBase):
         lora_paths: List[str],
         max_new_tokens: int = 32,
         expected_error: Optional[str] = None,
+        expected_implicit_evictions: Optional[set[str]] = None,
     ):
         """
         Perform a batch forward pass with the current set of loaded LoRA adapters.
@@ -962,6 +1097,13 @@ class LoRAUpdateEngineTestSession(LoRAUpdateTestSessionBase):
         )
         output = response.output_strs
         print(f"output_strs: {output}")
+
+        self.expected_adapters.update(
+            [lora_path for lora_path in lora_paths if lora_path is not None]
+        )
+
+        if expected_implicit_evictions is not None:
+            self.expected_adapters -= expected_implicit_evictions
 
         return output
 
@@ -1025,6 +1167,7 @@ class LoRAUpdateServerTestSession(LoRAUpdateTestSessionBase):
         lora_path: Optional[str] = None,
         expected_error: Optional[str] = None,
         pinned: bool = False,
+        expected_implicit_evictions: Optional[set[str]] = None,
     ):
         """
         Load a LoRA adapter by name and path.
@@ -1050,6 +1193,9 @@ class LoRAUpdateServerTestSession(LoRAUpdateTestSessionBase):
             print(f"Received error as expected: {response.text}")
         else:
             self.expected_adapters.add(lora_name)
+            if expected_implicit_evictions is not None:
+                self.expected_adapters -= expected_implicit_evictions
+
             self.testcase.assertTrue(
                 response.ok, f"Failed to load LoRA adapter {lora_name}: {response.text}"
             )
@@ -1071,6 +1217,7 @@ class LoRAUpdateServerTestSession(LoRAUpdateTestSessionBase):
             DEFAULT_URL_FOR_TEST + "/unload_lora_adapter",
             json={"lora_name": lora_name},
         )
+
         self.testcase.assertTrue(
             response.ok, f"Failed to unload LoRA adapter {lora_name}: {response.text}"
         )
@@ -1089,6 +1236,7 @@ class LoRAUpdateServerTestSession(LoRAUpdateTestSessionBase):
         lora_paths: List[str],
         max_new_tokens: int = 32,
         expected_error: Optional[str] = None,
+        expected_implicit_evictions: Optional[set[str]] = None,
     ):
         """
         Perform a batch forward pass with the current set of loaded LoRA adapters.
@@ -1130,6 +1278,14 @@ class LoRAUpdateServerTestSession(LoRAUpdateTestSessionBase):
                 f"Expected {len(prompts)} outputs, but got {len(output)}",
             )
             print(f"output_strs: {output}")
+
+            self.expected_adapters.update(
+                [lora_path for lora_path in lora_paths if lora_path is not None]
+            )
+
+            if expected_implicit_evictions is not None:
+                self.expected_adapters -= expected_implicit_evictions
+
             return output
 
 
@@ -1191,6 +1347,7 @@ class TestLoRADynamicUpdate(CustomTestCase):
                 op_type = op.type
                 data = op.data
                 expected_error = op.expected_error
+                expected_implicit_evictions = op.expected_implicit_evictions
                 print("-" * 100)
                 print(
                     f"Running operation: {op_type} --- data: {data} --- mode: {mode} ---"
@@ -1207,6 +1364,7 @@ class TestLoRADynamicUpdate(CustomTestCase):
 
                     result = session.load_lora_adapter(
                         expected_error=expected_error,
+                        expected_implicit_evictions=expected_implicit_evictions,
                         **adapter_info,
                     )
                 elif op_type == OperationType.UNLOAD:
@@ -1220,6 +1378,7 @@ class TestLoRADynamicUpdate(CustomTestCase):
                         lora_paths=list(adapters),
                         max_new_tokens=max_new_tokens,
                         expected_error=expected_error,
+                        expected_implicit_evictions=expected_implicit_evictions,
                     )
                     if not expected_error:
                         forward_outputs.append(result)

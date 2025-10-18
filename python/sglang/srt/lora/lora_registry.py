@@ -14,6 +14,7 @@
 
 
 import asyncio
+from collections import OrderedDict
 from dataclasses import dataclass, field, fields
 from typing import Dict, List, Optional, Union
 from uuid import uuid4
@@ -71,8 +72,11 @@ class LoRARegistry:
         # Please note that the counter increment/decrement operations are not synchronized through this
         # lock, as they are designed to be non-blocking and can be performed concurrently.
         self._registry_lock = RWLock()
-        # A dictionary to hold LoRARef objects, mapping from LoRA name to LoRARef.
-        self._registry: Dict[str, LoRARef] = {}
+        # An ordered dictionary to hold LoRARef objects, mapping from LoRA name to LoRARef.
+        # The LoRARefs are stored in LRU order, such that LoRA adapters that have been
+        # most recently used are stored at the end. Note that lookups count for accesses.
+        # Ties are broken arbitrarily.
+        self._registry: OrderedDict[str, LoRARef] = OrderedDict()
         # Counters for ongoing requests, mapping from LoRA ID to ConcurrentCounter.
         self._counters: Dict[str, ConcurrentCounter] = {}
 
@@ -124,29 +128,30 @@ class LoRARegistry:
                     f"The following requested LoRA adapters are not loaded: {name}\n"
                     f"Loaded adapters: {self._registry.keys()}."
                 )
+            self._registry.move_to_end(name)
             return lora_ref.lora_id
 
-        async with self._registry_lock.reader_lock:
-            if isinstance(lora_name, str):
+        if isinstance(lora_name, str):
+            async with self._registry_lock.writer_lock:
                 lora_id = _lookup(lora_name)
-                await self._counters[lora_id].increment(notify_all=False)
-                return lora_id
-            elif isinstance(lora_name, list):
+
+            await self._counters[lora_id].increment(notify_all=False)
+            return lora_id
+        elif isinstance(lora_name, list):
+            async with self._registry_lock.writer_lock:
                 lora_ids = [_lookup(name) for name in lora_name]
 
-                # Increment the counters only after all IDs are looked up.
-                await asyncio.gather(
-                    *[
-                        self._counters[id].increment(notify_all=False)
-                        for id in lora_ids
-                        if id is not None
-                    ]
-                )
-                return lora_ids
-            else:
-                raise TypeError(
-                    "lora_name must be either a string or a list of strings."
-                )
+            # Increment the counters only after all IDs are looked up.
+            await asyncio.gather(
+                *[
+                    self._counters[id].increment(notify_all=False)
+                    for id in lora_ids
+                    if id is not None
+                ]
+            )
+            return lora_ids
+        else:
+            raise TypeError("lora_name must be either a string or a list of strings.")
 
     async def release(self, lora_id: Union[str, List[str]]):
         """
@@ -185,6 +190,37 @@ class LoRARegistry:
         # Wait until no requests are using this LoRA adapter.
         await self._counters[lora_id].wait_for_zero()
         del self._counters[lora_id]
+
+    async def get_unregistered_loras(self, lora_name: set[str]):
+        """
+        Returns all LoRA adapters in lora_name that are not found in self._registry.
+        """
+        async with self._registry_lock.writer_lock:
+            unregistered_loras = []
+
+            for name in lora_name:
+                if name in self._registry:
+                    # This counts as a lookup, so we want to update the cache
+                    self._registry.move_to_end(name)
+                else:
+                    unregistered_loras.append(name)
+
+            return unregistered_loras
+
+    async def lru_lora_name(self, exclude_pinned=False):
+        """
+        Returns the least recently used LoRA adapter.
+        If exclude_pinned is True, then return the LRU LoRA adapter that isn't pinned.
+        """
+        async with self._registry_lock.reader_lock:
+            if not exclude_pinned:
+                return next(iter(self._registry), None)
+
+            for lora_name, lora_ref in self._registry.items():
+                if not lora_ref.pinned:
+                    return lora_name
+            else:
+                return None
 
     def _register_adapter(self, lora_ref: LoRARef):
         """
