@@ -9,9 +9,9 @@ from unittest.mock import patch
 import torch
 import torch.fx as fx
 
+import sglang.srt.compilation.weak_ref_tensor_jit  # noqa: F401
 from sglang.srt.compilation.compilation_config import CompilationConfig
 from sglang.srt.compilation.compilation_counter import compilation_counter
-import sglang.srt.compilation.weak_ref_tensor_jit
 
 logger = logging.getLogger(__name__)
 
