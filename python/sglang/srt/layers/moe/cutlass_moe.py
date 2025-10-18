@@ -1,7 +1,10 @@
 """CUTLASS based Fused MoE kernels."""
 
+from typing import Optional
+
 import torch
 
+from sglang.srt.layers.activation import apply_glu_activation_for_moe, get_activation
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams
 from sglang.srt.utils import is_cuda
 
@@ -40,6 +43,10 @@ def cutlass_fused_experts_fp8(
     problem_sizes1: torch.Tensor,
     problem_sizes2: torch.Tensor,
     use_fp8_blockscale: bool = True,
+    *,
+    activation: str = "silu",
+    gemm1_alpha: Optional[float] = None,
+    gemm1_limit: Optional[float] = None
 ) -> torch.Tensor:
     """Performs Fused MoE computation using CUTLASS-like kernels with FP8 weights and activations.
 
@@ -175,7 +182,11 @@ def cutlass_fused_experts_fp8(
     )
 
     intermediate = torch.empty((m * topk, n), device=device, dtype=out_dtype)
-    silu_and_mul(c1, intermediate)
+    apply_glu_activation_for_moe(
+        c1,
+        intermediate,
+        get_activation(activation, alpha=gemm1_alpha, limit=gemm1_limit),
+    )
 
     intemediate_q, a2_scale = sglang_per_token_group_quant_fp8(intermediate, 128)
 
@@ -223,6 +234,10 @@ def cutlass_moe_fp4(
     topk_ids: torch.Tensor,
     params: CutlassMoEParams,
     apply_router_weight_on_input: bool = False,
+    *,
+    activation: str = "silu",
+    gemm1_alpha: Optional[float] = None,
+    gemm1_limit: Optional[float] = None
 ):
     """
     MoE implementation for FP4 Inputs
@@ -336,7 +351,11 @@ def cutlass_moe_fp4(
     intermediate = torch.empty(
         (m_a * num_topk, w1_fp4.shape[1] // 2), device=device, dtype=out_dtype
     )
-    silu_and_mul(c1, intermediate)
+    apply_glu_activation_for_moe(
+        c1,
+        intermediate,
+        get_activation(activation, alpha=gemm1_alpha, limit=gemm1_limit),
+    )
 
     int_fp4, int_blockscale = scaled_fp4_experts_quant(
         intermediate,
