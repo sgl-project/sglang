@@ -43,13 +43,7 @@ from sglang.srt.utils import (
 )
 
 if is_flashinfer_available():
-    from flashinfer import (
-        RoutingMethodType,
-        fp4_quantize,
-        reorder_rows_for_gated_act_gemm,
-        shuffle_matrix_a,
-        shuffle_matrix_sf_a,
-    )
+    from flashinfer import RoutingMethodType, fp4_quantize
 
 _is_hip = is_hip()
 _is_cpu_amx_available = cpu_has_amx_support()
