@@ -656,7 +656,7 @@ class Glm4MoeDecoderLayer(DeepseekV2DecoderLayer):
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
-            allow_reduce_scatter=True,
+            allow_reduce_scatter=False,
         )
 
     def forward(
