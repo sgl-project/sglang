@@ -1412,10 +1412,10 @@ class ServerArgs:
 
             # Check attention backend
             if self.attention_backend is None:
-                # User didn't specify attention backend, fallback to fa3
-                self.attention_backend = "fa3"
+                # User didn't specify attention backend, fallback to flashinfer
+                self.attention_backend = "flashinfer"
                 logger.warning(
-                    f"Attention backend not specified. Falling back to 'fa3' for deterministic inference. "
+                    f"Attention backend not specified. Falling back to 'flashinfer' for deterministic inference. "
                     f"You can explicitly set --attention-backend to one of {DETERMINISTIC_ATTENTION_BACKEND_CHOICES}."
                 )
             elif self.attention_backend not in DETERMINISTIC_ATTENTION_BACKEND_CHOICES:
