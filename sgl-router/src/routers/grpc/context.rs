@@ -4,21 +4,22 @@
 //! eliminating deep parameter passing chains and providing a single source of truth
 //! for request state.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use axum::http::HeaderMap;
 use serde_json::Value;
 
-use crate::core::Worker;
-use crate::grpc_client::{proto, SglangSchedulerClient};
-use crate::protocols::spec::{
-    ChatCompletionRequest, ChatCompletionResponse, GenerateRequest, GenerateResponse,
+use crate::{
+    core::Worker,
+    grpc_client::{proto, SglangSchedulerClient},
+    protocols::{
+        chat::{ChatCompletionRequest, ChatCompletionResponse},
+        generate::{GenerateRequest, GenerateResponse},
+    },
+    reasoning_parser::ParserFactory as ReasoningParserFactory,
+    tokenizer::{stop::StopSequenceDecoder, traits::Tokenizer},
+    tool_parser::ParserFactory as ToolParserFactory,
 };
-use crate::reasoning_parser::ReasoningParserFactory;
-use crate::tokenizer::stop::StopSequenceDecoder;
-use crate::tokenizer::traits::Tokenizer;
-use crate::tool_parser::ToolParserFactory;
 
 // ============================================================================
 // Core Context Types
@@ -371,16 +372,17 @@ impl ClientSelection {
 // Execution and Response Types
 // ============================================================================
 
-use tonic::codec::Streaming;
+use crate::grpc_client::sglang_scheduler::AbortOnDropStream;
 
 /// Result of request execution (streams from workers)
+/// Uses AbortOnDropStream to automatically abort on cancellation
 pub enum ExecutionResult {
     Single {
-        stream: Streaming<proto::GenerateResponse>,
+        stream: AbortOnDropStream,
     },
     Dual {
-        prefill: Streaming<proto::GenerateResponse>,
-        decode: Box<Streaming<proto::GenerateResponse>>,
+        prefill: AbortOnDropStream,
+        decode: Box<AbortOnDropStream>,
     },
 }
 

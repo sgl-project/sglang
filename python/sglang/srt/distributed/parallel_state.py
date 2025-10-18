@@ -39,10 +39,12 @@ import torch
 import torch.distributed
 from torch.distributed import Backend, ProcessGroup
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import (
     direct_register_custom_op,
     get_bool_env_var,
     get_int_env_var,
+    get_local_ip_auto,
     is_cpu,
     is_cuda_alike,
     is_hip,
@@ -54,8 +56,6 @@ from sglang.srt.utils import (
 _is_npu = is_npu()
 _is_cpu = is_cpu()
 _supports_custom_op = supports_custom_op()
-
-IS_ONE_DEVICE_PER_PROCESS = get_bool_env_var("SGLANG_ONE_DEVICE_PER_PROCESS")
 
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
@@ -239,6 +239,8 @@ class GroupCoordinator:
         use_npu_communicator: bool,
         use_message_queue_broadcaster: bool = False,
         group_name: Optional[str] = None,
+        torch_compile: Optional[bool] = None,
+        gloo_timeout: timedelta = timedelta(seconds=120 * 60),
     ):
         # Set group info
         group_name = group_name or "anonymous"
@@ -256,9 +258,14 @@ class GroupCoordinator:
             device_group = torch.distributed.new_group(
                 ranks, backend=torch_distributed_backend
             )
-            # a group with `gloo` backend, to allow direct coordination between
-            # processes through the CPU.
-            cpu_group = torch.distributed.new_group(ranks, backend="gloo")
+            # a cpu_group to allow direct coordination between processes through
+            # the CPU. The backend is chosen based on `torch_distributed_backend`
+            if "mooncake" in torch_distributed_backend:
+                cpu_group = torch.distributed.new_group(ranks, backend="mooncake-cpu")
+            else:
+                cpu_group = torch.distributed.new_group(
+                    ranks, backend="gloo", timeout=gloo_timeout
+                )
             if self.rank in ranks:
                 self.ranks = ranks
                 self.world_size = len(ranks)
@@ -269,11 +276,13 @@ class GroupCoordinator:
         assert self.cpu_group is not None
         assert self.device_group is not None
 
-        device_id = 0 if IS_ONE_DEVICE_PER_PROCESS else local_rank
         if is_cuda_alike():
+            device_id = (
+                0 if envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.get() else local_rank
+            )
             self.device = torch.device(f"cuda:{device_id}")
         elif _is_npu:
-            self.device = torch.device(f"npu:{device_id}")
+            self.device = torch.device(f"npu:{local_rank}")
         else:
             self.device = torch.device("cpu")
         self.device_module = torch.get_device_module(self.device)
@@ -326,10 +335,17 @@ class GroupCoordinator:
         self.qr_comm: Optional[QuickAllReduce] = None
         if use_custom_allreduce and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
+            if torch_compile is not None and torch_compile:
+                # For piecewise CUDA graph, the requirement for custom allreduce is larger to
+                # avoid illegal cuda memory access.
+                ca_max_size = 256 * 1024 * 1024
+            else:
+                ca_max_size = 8 * 1024 * 1024
             try:
                 self.ca_comm = CustomAllreduce(
                     group=self.cpu_group,
                     device=self.device,
+                    max_size=ca_max_size,
                 )
             except Exception as e:
                 logger.warning(
@@ -603,8 +619,11 @@ class GroupCoordinator:
 
     def _all_reduce_in_place(self, input_: torch.Tensor) -> None:
         pynccl_comm = self.pynccl_comm
+        symm_mem_comm = self.symm_mem_comm
         if pynccl_comm is not None and not pynccl_comm.disabled:
             pynccl_comm.all_reduce(input_)
+        elif symm_mem_comm is not None and not symm_mem_comm.disabled:
+            symm_mem_comm.all_reduce(input_)
         else:
             torch.distributed.all_reduce(input_, group=self.device_group)
 
@@ -1260,6 +1279,7 @@ def init_model_parallel_group(
     group_name: Optional[str] = None,
     use_mscclpp_allreduce: Optional[bool] = None,
     use_symm_mem_allreduce: Optional[bool] = None,
+    torch_compile: Optional[bool] = None,
 ) -> GroupCoordinator:
     if use_custom_allreduce is None:
         use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
@@ -1280,6 +1300,7 @@ def init_model_parallel_group(
         use_npu_communicator=True,
         use_message_queue_broadcaster=use_message_queue_broadcaster,
         group_name=group_name,
+        torch_compile=torch_compile,
     )
 
 
@@ -1394,6 +1415,17 @@ def init_distributed_environment(
         distributed_init_method,
         backend,
     )
+    if "mooncake" in backend:
+        try:
+            from mooncake import ep as mooncake_ep
+        except ImportError as e:
+            raise ImportError(
+                "Please install mooncake by following the instructions at "
+                "https://github.com/kvcache-ai/Mooncake/blob/main/doc/en/build.md "  # noqa: E501
+                "to run SGLang with Mooncake Backend."
+            ) from e
+        mooncake_ep.set_host_ip(get_local_ip_auto())
+
     if not torch.distributed.is_initialized():
         assert distributed_init_method is not None, (
             "distributed_init_method must be provided when initializing "
@@ -1439,6 +1471,7 @@ def initialize_model_parallel(
     pipeline_model_parallel_size: int = 1,
     backend: Optional[str] = None,
     duplicate_tp_group: bool = False,
+    torch_compile: Optional[bool] = None,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -1494,6 +1527,7 @@ def initialize_model_parallel(
             "SGLANG_USE_MESSAGE_QUEUE_BROADCASTER", "true"
         ),
         group_name="tp",
+        torch_compile=torch_compile,
     )
 
     if duplicate_tp_group:
@@ -1509,6 +1543,7 @@ def initialize_model_parallel(
                 "SGLANG_USE_MESSAGE_QUEUE_BROADCASTER", "true"
             ),
             group_name="pdmux_prefill_tp",
+            torch_compile=torch_compile,
         )
         _TP.pynccl_comm.disabled = False
         _PDMUX_PREFILL_TP_GROUP.pynccl_comm.disabled = False
@@ -1518,7 +1553,6 @@ def initialize_model_parallel(
 
     global _MOE_EP
     assert _MOE_EP is None, "expert model parallel group is already initialized"
-
     if moe_ep_size == tensor_model_parallel_size:
         _MOE_EP = _TP
     else:
@@ -1539,7 +1573,6 @@ def initialize_model_parallel(
 
     global _MOE_TP
     assert _MOE_TP is None, "expert model parallel group is already initialized"
-
     if moe_tp_size == tensor_model_parallel_size:
         _MOE_TP = _TP
     else:

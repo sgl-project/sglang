@@ -2,13 +2,14 @@ use async_trait::async_trait;
 use regex::Regex;
 use serde_json::Value;
 
-use crate::protocols::spec::Tool;
-
-use crate::tool_parser::{
-    errors::{ToolParserError, ToolParserResult},
-    parsers::helpers,
-    traits::ToolParser,
-    types::{FunctionCall, StreamingParseResult, ToolCall, ToolCallItem},
+use crate::{
+    protocols::common::Tool,
+    tool_parser::{
+        errors::{ParserError, ParserResult},
+        parsers::helpers,
+        traits::ToolParser,
+        types::{FunctionCall, StreamingParseResult, ToolCall, ToolCallItem},
+    },
 };
 
 /// DeepSeek V3 format parser for tool calls
@@ -78,15 +79,15 @@ impl DeepSeekParser {
     }
 
     /// Parse a single tool call block - throws error if parsing fails
-    fn parse_tool_call(&self, block: &str) -> ToolParserResult<ToolCall> {
+    fn parse_tool_call(&self, block: &str) -> ParserResult<ToolCall> {
         let captures = self.func_detail_extractor.captures(block).ok_or_else(|| {
-            ToolParserError::ParsingFailed("Failed to match tool call pattern".to_string())
+            ParserError::ParsingFailed("Failed to match tool call pattern".to_string())
         })?;
 
         // Get function type (should be "function")
         let func_type = captures.get(1).map_or("", |m| m.as_str());
         if func_type != "function" {
-            return Err(ToolParserError::ParsingFailed(format!(
+            return Err(ParserError::ParsingFailed(format!(
                 "Invalid function type: {}",
                 func_type
             )));
@@ -95,7 +96,7 @@ impl DeepSeekParser {
         // Get function name
         let func_name = captures.get(2).map_or("", |m| m.as_str()).trim();
         if func_name.is_empty() {
-            return Err(ToolParserError::ParsingFailed(
+            return Err(ParserError::ParsingFailed(
                 "Empty function name".to_string(),
             ));
         }
@@ -105,7 +106,7 @@ impl DeepSeekParser {
 
         // Parse JSON arguments
         let value = serde_json::from_str::<Value>(json_args)
-            .map_err(|e| ToolParserError::ParsingFailed(format!("Invalid JSON: {}", e)))?;
+            .map_err(|e| ParserError::ParsingFailed(format!("Invalid JSON: {}", e)))?;
 
         // Create arguments object
         let args = if value.is_object() {
@@ -115,8 +116,8 @@ impl DeepSeekParser {
             serde_json::json!({ "value": value })
         };
 
-        let arguments = serde_json::to_string(&args)
-            .map_err(|e| ToolParserError::ParsingFailed(e.to_string()))?;
+        let arguments =
+            serde_json::to_string(&args).map_err(|e| ParserError::ParsingFailed(e.to_string()))?;
 
         Ok(ToolCall {
             function: FunctionCall {
@@ -135,7 +136,7 @@ impl Default for DeepSeekParser {
 
 #[async_trait]
 impl ToolParser for DeepSeekParser {
-    async fn parse_complete(&self, text: &str) -> ToolParserResult<(String, Vec<ToolCall>)> {
+    async fn parse_complete(&self, text: &str) -> ParserResult<(String, Vec<ToolCall>)> {
         if !self.has_tool_markers(text) {
             return Ok((text.to_string(), vec![]));
         }
@@ -168,7 +169,7 @@ impl ToolParser for DeepSeekParser {
         &mut self,
         chunk: &str,
         tools: &[Tool],
-    ) -> ToolParserResult<StreamingParseResult> {
+    ) -> ParserResult<StreamingParseResult> {
         self.buffer.push_str(chunk);
         let current_text = &self.buffer.clone();
 
@@ -313,5 +314,13 @@ impl ToolParser for DeepSeekParser {
 
     fn get_unstreamed_tool_args(&self) -> Option<Vec<ToolCallItem>> {
         helpers::get_unstreamed_args(&self.prev_tool_call_arr, &self.streamed_args_for_tool)
+    }
+
+    fn reset(&mut self) {
+        self.buffer.clear();
+        self.prev_tool_call_arr.clear();
+        self.current_tool_id = -1;
+        self.current_tool_name_sent = false;
+        self.streamed_args_for_tool.clear();
     }
 }

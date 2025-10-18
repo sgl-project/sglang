@@ -54,7 +54,9 @@ jobs:
         run: |
           source "$HOME/.cargo/env"
           cd sgl-router/
-          cargo fmt -- --check
+          rustup component add --toolchain nightly-x86_64-unknown-linux-gnu rustfmt
+          rustup toolchain install nightly --profile minimal
+          cargo +nightly fmt -- --check
 
       - name: Run Rust tests
         timeout-minutes: 20
@@ -107,7 +109,7 @@ jobs:
 
       - name: Install SGLang dependencies
         run: |
-          sudo bash scripts/ci/ci_install_dependency.sh
+          sudo --preserve-env=PATH bash scripts/ci/ci_install_dependency.sh
 
       - name: Build python binding
         run: |
