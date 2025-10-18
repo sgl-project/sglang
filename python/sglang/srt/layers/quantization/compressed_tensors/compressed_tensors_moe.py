@@ -2,16 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
-import ctypes
 import enum
-import glob
 import logging
 import os
 import re
 from enum import Enum
-from typing import TYPE_CHECKING, Dict, List, Optional
-
-from safetensors import safe_open
+from typing import TYPE_CHECKING, List
 
 try:
     from sgl_kernel import fused_marlin_moe
@@ -46,10 +42,7 @@ from sglang.srt.layers.quantization.utils import (
 from sglang.srt.utils import (
     get_bool_env_var,
     get_compiler_backend,
-    is_cpu,
-    is_cuda,
     is_hip,
-    is_npu,
     set_weight_attrs,
 )
 
@@ -72,7 +65,7 @@ if _use_aiter:
     from sglang.srt.layers.moe.rocm_moe_utils import rocm_fused_experts_tkw1
 
 try:
-    import vllm
+    import vllm  # noqa: F401
 
     VLLM_AVAILABLE = True
 except ImportError:

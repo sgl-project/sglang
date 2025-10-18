@@ -5,7 +5,6 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.layers.attention import vision_utils
-from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
