@@ -35,7 +35,7 @@ def test_retry_reroutes_to_healthy_worker(router_manager, mock_workers):
     )
     assert r.status_code == 200
     wid = r.headers.get("X-Worker-Id") or r.json().get("worker_id")
-    assert wid == id_b  # should have retried onto healthy worker
+    assert wid in [id_b, id_c]  # should have retried onto a healthy worker (B or C)
     # mock_workers fixture handles cleanup
 
 

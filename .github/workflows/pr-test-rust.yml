@@ -9,15 +9,20 @@ on:
     branches: [ main ]
     paths:
       - "sgl-router/**"
+    types: [synchronize, labeled]
   workflow_dispatch:
 
 concurrency:
   group: pr-test-rust-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: "true"
+
 jobs:
   unit-test-rust:
-    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -27,10 +32,17 @@ jobs:
         run: |
           bash scripts/ci/ci_install_rust.sh
 
+      - name: Configure sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+        with:
+          version: "v0.10.0"
+
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: sgl-router
+          cache-all-crates: true
+          cache-on-failure: true
 
       - name: Run lint
         run: |
@@ -42,7 +54,9 @@ jobs:
         run: |
           source "$HOME/.cargo/env"
           cd sgl-router/
-          cargo fmt -- --check
+          rustup component add --toolchain nightly-x86_64-unknown-linux-gnu rustfmt
+          rustup toolchain install nightly --profile minimal
+          cargo +nightly fmt -- --check
 
       - name: Run Rust tests
         timeout-minutes: 20
@@ -65,9 +79,13 @@ jobs:
           # Run quick benchmarks to ensure they work using Python script
           python3 scripts/run_benchmarks.py --quick
 
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats
+
   pytest-rust:
-    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
-    runs-on: BM.A10.4
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
+    runs-on: 4-gpu-a10
     timeout-minutes: 25
     steps:
       - name: Checkout code
@@ -77,13 +95,26 @@ jobs:
         run: |
           bash scripts/ci/ci_install_rust.sh
 
+      - name: Configure sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+        with:
+          version: "v0.10.0"
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sgl-router
+          cache-all-crates: true
+          cache-on-failure: true
+
       - name: Install SGLang dependencies
         run: |
-          sudo bash scripts/ci/ci_install_dependency.sh
+          sudo --preserve-env=PATH bash scripts/ci/ci_install_dependency.sh
 
       - name: Build python binding
         run: |
           source "$HOME/.cargo/env"
+          export RUSTC_WRAPPER=sccache
           cd sgl-router
           pip install setuptools-rust wheel build
           python3 -m build

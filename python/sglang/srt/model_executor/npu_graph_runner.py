@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Optional, Union
 
 import torch
 
+from sglang.srt.configs.model_config import is_deepseek_nsa
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 
 logger = logging.getLogger(__name__)
@@ -73,11 +74,16 @@ class NPUGraphRunner(CudaGraphRunner):
             self.positions[: self.raw_num_token].copy_(forward_batch.positions)
 
         # Replay
-        seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (self.bs - self.raw_bs)
-        thread = threading.Thread(target=self._update_inputs, args=(seq_lens,))
-        thread.start()
-        self.graphs[self.bs].replay()
-        thread.join()
+        if not is_deepseek_nsa(self.model_runner.model_config.hf_config):
+            seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (
+                self.bs - self.raw_bs
+            )
+            thread = threading.Thread(target=self._update_inputs, args=(seq_lens,))
+            thread.start()
+            self.graphs[self.bs].replay()
+            thread.join()
+        else:
+            self.graphs[self.bs].replay()
 
         output = self.output_buffers[self.bs]
         if isinstance(output, LogitsProcessorOutput):

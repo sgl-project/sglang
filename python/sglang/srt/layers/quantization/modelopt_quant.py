@@ -39,7 +39,7 @@ from sglang.srt.layers.quantization.utils import (
     requantize_with_max_scale,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.utils import is_cuda, next_power_of_2
+from sglang.srt.utils import get_bool_env_var, is_cuda, next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -47,6 +47,7 @@ if TYPE_CHECKING:
         CombineInput,
         StandardDispatchOutput,
     )
+    from sglang.srt.single_batch_overlap import DownGemmOverlapArgs
 
 if is_cuda():
     from sgl_kernel import scaled_fp4_quant
@@ -73,6 +74,17 @@ except ImportError:
 
 # Initialize logger for the module
 logger = logging.getLogger(__name__)
+
+CUTEDSL_MOE_SCALAR_INPUT_SCALE = get_bool_env_var(
+    "SGLANG_CUTEDSL_MOE_SCALAR_INPUT_SCALE", "true"
+)
+USE_CUTLASS_BACKEND_FOR_FP4_GEMM = get_bool_env_var(
+    "SGLANG_USE_CUTLASS_BACKEND_FOR_FP4_GEMM"
+)
+# TODO make it true by default when the DeepEP PR is merged
+CUTEDSL_MOE_NVFP4_DISPATCH = get_bool_env_var(
+    "SGLANG_CUTEDSL_MOE_NVFP4_DISPATCH", "false"
+)
 
 # Supported activation schemes for the current configuration
 ACTIVATION_SCHEMES = ["static"]
@@ -101,7 +113,7 @@ class ModelOptFp8Config(QuantizationConfig):
 
     @classmethod
     def get_name(cls) -> str:
-        return "modelopt"
+        return "modelopt_fp8"
 
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
@@ -847,6 +859,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             w_scale_interleaved,
             layer.alpha,
             output_dtype,
+            **(dict(backend="cutlass") if USE_CUTLASS_BACKEND_FOR_FP4_GEMM else dict()),
         )
         if bias is not None:
             out = out + bias
@@ -999,12 +1012,14 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             data=torch.empty(layer.num_experts, 2, dtype=torch.float32),
             weight_loader=weight_loader,
         )
+        w13_input_scale._sglang_require_global_experts = True
         layer.register_parameter("w13_input_scale", w13_input_scale)
 
         w2_input_scale = PerTensorScaleParameter(
             data=torch.empty(layer.num_experts, dtype=torch.float32),
             weight_loader=weight_loader,
         )
+        w2_input_scale._sglang_require_global_experts = True
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def swizzle_blockscale(self, scale: torch.Tensor):
@@ -1044,16 +1059,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         intermediate_size,
         num_experts,
     ):
-        from flashinfer import (
-            RoutingMethodType,
-            e2m1_and_ufp8sf_scale_to_float,
-            fp4_quantize,
-            next_positive_power_of_2,
-            nvfp4_block_scale_interleave,
-            reorder_rows_for_gated_act_gemm,
-            shuffle_matrix_a,
-            shuffle_matrix_sf_a,
-        )
+        from flashinfer import nvfp4_block_scale_interleave
         from flashinfer.fused_moe.core import (
             _maybe_get_cached_w2_permute_indices,
             _maybe_get_cached_w3_w1_permute_indices,
@@ -1187,6 +1193,37 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         if self.enable_flashinfer_cutlass_moe or self.enable_flashinfer_trtllm_moe:
             w13_input_scale = layer.w13_input_scale.max().to(torch.float32)
             w2_input_scale = layer.w2_input_scale.max().to(torch.float32)
+        elif self.enable_flashinfer_cutedsl_moe:
+            # All-expert-one-input-scale is mathematically different from default per-expert-input-scale
+            # Thus we allow users to switch the flag to do thorough testing
+            if CUTEDSL_MOE_SCALAR_INPUT_SCALE:
+                w13_input_scale = (
+                    layer.w13_input_scale.max()
+                    .to(torch.float32)
+                    .repeat(layer.w13_input_scale.shape[0])
+                )
+            else:
+                w13_input_scale = layer.w13_input_scale.max(dim=1).values.to(
+                    torch.float32
+                )
+
+            w2_input_scale = layer.w2_input_scale
+
+            def _slice_scale(w):
+                assert w.shape == (layer.num_experts,)
+                assert layer.moe_ep_size * layer.num_local_experts == layer.num_experts
+                return w[
+                    layer.moe_ep_rank
+                    * layer.num_local_experts : (layer.moe_ep_rank + 1)
+                    * layer.num_local_experts
+                ]
+
+            w13_input_scale = _slice_scale(w13_input_scale)
+            w2_input_scale = _slice_scale(w2_input_scale)
+
+            if CUTEDSL_MOE_NVFP4_DISPATCH:
+                assert torch.all(w13_input_scale == w13_input_scale[0])
+                w13_input_scale = w13_input_scale[0]
         else:
             w13_input_scale = layer.w13_input_scale.max(dim=1).values.to(torch.float32)
             w2_input_scale = layer.w2_input_scale
@@ -1310,6 +1347,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         self,
         layer: FusedMoE,
         dispatch_output: StandardDispatchOutput,
+        forward_shared_experts=None,
+        alt_stream=None,
     ) -> CombineInput:
 
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
@@ -1381,9 +1420,19 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             )[0]
             if should_use_flashinfer_cutlass_moe_fp4_allgather():
                 output, global_output = get_local_dp_buffer(), output
+
+                if forward_shared_experts is not None:
+                    alt_stream.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(alt_stream):
+                        forward_shared_experts()
+
                 get_tp_group().reduce_scatterv(
                     global_output, output=output, sizes=get_dp_global_num_tokens()
                 )
+
+                if forward_shared_experts is not None:
+                    torch.cuda.current_stream().wait_stream(alt_stream)
+
             return StandardCombineInput(hidden_states=output)
 
         from sglang.srt.layers.moe.cutlass_moe import cutlass_moe_fp4
@@ -1413,6 +1462,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         x: torch.Tensor,
         masked_m: torch.Tensor,
         moe_runner_config: MoeRunnerConfig,
+        down_gemm_overlap_args: Optional["DownGemmOverlapArgs"],
     ) -> torch.Tensor:
         assert (
             moe_runner_config.activation == "silu"
@@ -1429,7 +1479,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         out = flashinfer_cutedsl_moe_masked(
             hidden_states=x,
-            input_global_scale=layer.w13_input_scale_quant,
+            input_global_scale=(
+                None if CUTEDSL_MOE_NVFP4_DISPATCH else layer.w13_input_scale_quant
+            ),
             w1=layer.w13_weight,
             w1_blockscale=layer.w13_blockscale_swizzled,
             w1_alpha=layer.g1_alphas,
@@ -1438,5 +1490,14 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w2_blockscale=layer.w2_blockscale_swizzled,
             w2_alpha=layer.g2_alphas,
             masked_m=masked_m,
+            **(
+                dict(
+                    down_sm_count=down_gemm_overlap_args.num_sms,
+                    down_signals=down_gemm_overlap_args.signal,
+                    down_start_event=down_gemm_overlap_args.start_event,
+                )
+                if down_gemm_overlap_args is not None
+                else {}
+            ),
         )
         return out

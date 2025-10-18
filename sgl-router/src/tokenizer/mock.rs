@@ -1,8 +1,10 @@
 //! Mock tokenizer implementation for testing
 
-use super::traits::{Decoder, Encoder, Encoding, SpecialTokens, Tokenizer as TokenizerTrait};
-use anyhow::Result;
 use std::collections::HashMap;
+
+use anyhow::Result;
+
+use super::traits::{Decoder, Encoder, Encoding, SpecialTokens, Tokenizer as TokenizerTrait};
 
 /// Mock tokenizer for testing purposes
 pub struct MockTokenizer {
@@ -108,5 +110,9 @@ impl TokenizerTrait for MockTokenizer {
 
     fn id_to_token(&self, id: u32) -> Option<String> {
         self.reverse_vocab.get(&id).cloned()
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }

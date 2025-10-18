@@ -1,3 +1,5 @@
+use std::{borrow::Cow, collections::HashMap, time::Duration};
+
 use backoff::ExponentialBackoffBuilder;
 use dashmap::DashMap;
 use rmcp::{
@@ -13,7 +15,6 @@ use rmcp::{
     RoleClient, ServiceExt,
 };
 use serde::{Deserialize, Serialize};
-use std::{borrow::Cow, collections::HashMap, time::Duration};
 
 use crate::mcp::{
     config::{McpConfig, McpServerConfig, McpTransport},
@@ -288,8 +289,6 @@ impl McpClientManager {
         }
     }
 
-    // ===== Helpers =====
-
     fn client_for(&self, server_name: &str) -> McpResult<&RunningService<RoleClient, ()>> {
         self.clients
             .get(server_name)
@@ -316,8 +315,6 @@ impl McpClientManager {
             .map(|e| e.value().clone())
             .ok_or_else(|| McpError::ResourceNotFound(uri.to_string()))
     }
-
-    // ===== Tool Methods =====
 
     /// Call a tool by name
     pub async fn call_tool(
@@ -380,8 +377,6 @@ impl McpClientManager {
         self.clients.keys().cloned().collect()
     }
 
-    // ===== Prompt Methods =====
-
     /// Get a prompt by name with arguments
     pub async fn get_prompt(
         &self,
@@ -438,8 +433,6 @@ impl McpClientManager {
             }
         })
     }
-
-    // ===== Resource Methods =====
 
     /// Read a resource by URI
     pub async fn read_resource(&self, uri: &str) -> McpResult<ReadResourceResult> {

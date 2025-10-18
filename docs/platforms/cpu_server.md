@@ -63,7 +63,7 @@ is required to enable SGLang service with CPU engine.
 conda create -n sgl-cpu python=3.12 -y
 conda activate sgl-cpu
 
-# Optional: Set PyTorch CPU as primary pip install channel to avoid installing CUDA version
+# Set PyTorch CPU as primary pip install channel to avoid installing the larger CUDA-enabled version and prevent potential runtime issues.
 pip config set global.index-url https://download.pytorch.org/whl/cpu
 pip config set global.extra-index-url https://pypi.org/simple
 
@@ -81,14 +81,17 @@ git clone https://github.com/sgl-project/sglang.git
 cd sglang
 git checkout <YOUR-DESIRED-VERSION>
 
+# Use dedicated toml file
+cd python
+cp pyproject_cpu.toml pyproject.toml
 # Install SGLang dependent libs, and build SGLang main package
 pip install --upgrade pip setuptools
 conda install -y libsqlite==3.48.0 gperftools tbb libnuma numactl
-pip install -e "python[all_cpu]"
+pip install .
 pip install torch==2.7.1 torchvision==0.22.1 triton==3.3.1 --force-reinstall
 
 # Build the CPU backend kernels
-cd sgl-kernel
+cd ../sgl-kernel
 cp pyproject_cpu.toml pyproject.toml
 pip install .
 
