@@ -1,6 +1,8 @@
-use super::traits::{TokenIdType, Tokenizer as TokenizerTrait};
-use anyhow::Result;
 use std::sync::Arc;
+
+use anyhow::Result;
+
+use super::traits::{TokenIdType, Tokenizer as TokenizerTrait};
 
 /// Maintains state for an ongoing sequence of tokens and their decoded text
 /// This provides a cleaner abstraction for managing token sequences
