@@ -175,6 +175,15 @@ def is_blackwell():
 
 
 @lru_cache(maxsize=1)
+def is_sm120_supported(device=None) -> bool:
+    if not is_cuda_alike():
+        return False
+    return (torch.cuda.get_device_capability(device)[0] == 12) and (
+        torch.version.cuda >= "12.8"
+    )
+
+
+@lru_cache(maxsize=1)
 def is_sm100_supported(device=None) -> bool:
     if not is_cuda_alike():
         return False
