@@ -103,8 +103,8 @@ impl OpenAIRouter {
     /// Maximum number of conversation items to attach as input when a conversation is provided
     const MAX_CONVERSATION_HISTORY_ITEMS: usize = 100;
 
-    /// Model discovery cache TTL (10 minutes)
-    const MODEL_CACHE_TTL_SECS: u64 = 600;
+    /// Model discovery cache TTL (1 hour)
+    const MODEL_CACHE_TTL_SECS: u64 = 3600;
 
     /// Create a new OpenAI router
     pub async fn new(
@@ -582,6 +582,11 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                 "sampling_seed",
             ] {
                 obj.remove(key);
+            }
+
+            // Remove logprobs if false (Gemini don't accept it)
+            if obj.get("logprobs").and_then(|v| v.as_bool()) == Some(false) {
+                obj.remove("logprobs");
             }
         }
 

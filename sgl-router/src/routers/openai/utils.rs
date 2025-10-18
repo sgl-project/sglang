@@ -115,6 +115,7 @@ pub enum ApiProvider {
     Anthropic,
     Xai,
     OpenAi,
+    Gemini,
     Generic,
 }
 
@@ -127,6 +128,8 @@ impl ApiProvider {
             ApiProvider::Xai
         } else if url.contains("openai.com") {
             ApiProvider::OpenAi
+        } else if url.contains("googleapis.com") {
+            ApiProvider::Gemini
         } else {
             ApiProvider::Generic
         }
@@ -154,7 +157,7 @@ pub fn apply_provider_headers(
                 }
             }
         }
-        ApiProvider::Xai | ApiProvider::OpenAi | ApiProvider::Generic => {
+        ApiProvider::Gemini | ApiProvider::Xai | ApiProvider::OpenAi | ApiProvider::Generic => {
             // Standard OpenAI-compatible: use Authorization header as-is
             if let Some(auth) = auth_header {
                 req = req.header("Authorization", auth);
