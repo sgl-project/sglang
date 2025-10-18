@@ -40,7 +40,7 @@ from sglang.srt.layers.quantization.compressed_tensors.utils import (
     is_activation_quantization_format,
     should_ignore_layer,
 )
-from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod, Fp8MoEMethod
+from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
 try:
