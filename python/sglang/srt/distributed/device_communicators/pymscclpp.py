@@ -4,7 +4,7 @@ import math
 import os
 from contextlib import contextmanager
 from enum import IntEnum
-from typing import Any, Callable, List, Optional, TypeVar, Union
+from typing import Optional, Union
 
 import torch
 import torch.distributed as dist
@@ -24,7 +24,7 @@ if _is_hip:
     mscclpp_is_available = False
 if _is_cuda:
     try:
-        import sgl_kernel
+        import sgl_kernel  # noqa: F401
 
         mscclpp_is_available = True
     except:

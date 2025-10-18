@@ -9,6 +9,7 @@ from sglang.srt.layers.dp_attention import DpPaddingMode, set_dp_buffer_len
 from sglang.srt.model_executor.cuda_graph_runner import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
     CudaGraphRunner,
+    DeepEPCudaGraphRunnerAdapter,
     get_batch_sizes_to_capture,
     get_global_graph_memory_pool,
     model_capture_mode,
@@ -61,6 +62,7 @@ class EAGLEDraftCudaGraphRunner:
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
         )
+        self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
         server_args = model_runner.server_args
 
         # Batch sizes to capture
@@ -264,6 +266,8 @@ class EAGLEDraftCudaGraphRunner:
             forward_batch.spec_info.hidden_states = hidden_states_backup
             return ret
 
+        self.deepep_adapter.capture(is_extend_in_batch=False)
+
         for _ in range(2):
             torch.cuda.synchronize()
             self.model_runner.tp_group.barrier()
@@ -285,6 +289,8 @@ class EAGLEDraftCudaGraphRunner:
 
     def replay(self, forward_batch: ForwardBatch):
         assert forward_batch.out_cache_loc is not None
+        self.deepep_adapter.replay()
+
         raw_bs = forward_batch.batch_size
         raw_num_token = raw_bs * self.num_tokens_per_bs
 

@@ -14,6 +14,7 @@ from sglang.srt.managers.io_struct import (
     BatchTokenIDOutput,
 )
 from sglang.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
+from sglang.srt.utils.common import ceil_div
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import (
@@ -258,22 +259,22 @@ class SchedulerOutputProcessorMixin:
 
             if self.enable_overlap and req.finished():
                 indices_to_free = None
-                if self.page_size == 1:
-                    if batch.spec_algorithm.is_eagle():
-                        from sglang.srt.speculative.eagle_info import EagleDraftInput
+                if batch.spec_algorithm.is_eagle():
+                    from sglang.srt.speculative.eagle_info import EagleDraftInput
 
-                        end_p = allocate_lens_list[i]
-                        start_p = end_p - EagleDraftInput.ALLOC_LEN_PER_DECODE
-                        indices_to_free = self.req_to_token_pool.req_to_token[
-                            req.req_pool_idx
-                        ][start_p:end_p]
-                    else:
+                    end_p = allocate_lens_list[i]
+                    start_p = end_p - EagleDraftInput.ALLOC_LEN_PER_DECODE
+                    if self.page_size > 1:
+                        start_p = ceil_div(start_p, self.page_size) * self.page_size
+
+                    indices_to_free = self.req_to_token_pool.req_to_token[
+                        req.req_pool_idx
+                    ][start_p:end_p]
+
+                else:
+                    if self.page_size == 1:
                         # Free the one extra delayed token
                         indices_to_free = batch.out_cache_loc[i : i + 1]
-                else:
-                    if batch.spec_algorithm.is_eagle():
-                        # TODO(spec-v2): support eagle with page_size > 1
-                        raise NotImplementedError()
                     else:
                         if (
                             len(req.origin_input_ids) + len(req.output_ids) - 1
@@ -299,6 +300,10 @@ class SchedulerOutputProcessorMixin:
                     # 2) overlap eagle and the current batch is prefill. This seq will not run extra iteration.
                     start_p = batch.seq_lens_cpu[i] + accept_lens_list[i]
                     end_p = allocate_lens_list[i]
+
+                    if self.page_size > 1:
+                        start_p = ceil_div(start_p, self.page_size) * self.page_size
+
                     indices_to_free = self.req_to_token_pool.req_to_token[
                         req.req_pool_idx
                     ][start_p:end_p]
