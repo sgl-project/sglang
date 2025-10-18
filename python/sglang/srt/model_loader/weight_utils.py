@@ -50,19 +50,36 @@ logger = logging.getLogger(__name__)
 temp_dir = tempfile.gettempdir()
 
 
-def enable_hf_transfer():
-    """automatically activates hf_transfer"""
-    if "HF_HUB_ENABLE_HF_TRANSFER" not in os.environ:
+def maybe_enable_hf_transfer():
+    """
+    Attempts to enable faster Hugging Face model file downloads using the `hf_transfer` backend.
+
+    - If the environment variable `HF_HUB_ENABLE_HF_TRANSFER` is set to "1", or is not set at all,
+      try to import the `hf_transfer` package and enable Hugging Face's transfer acceleration.
+    - On recent versions of `huggingface_hub`, Xet is enabled by default for supported models if available.
+
+    To ensure maximum download speed, it is recommended to install `hf_transfer` (`pip install hf_transfer`)
+    and set the `HF_HUB_ENABLE_HF_TRANSFER=1` environment variable.
+    """
+    if (
+        os.environ.get("HF_HUB_ENABLE_HF_TRANSFER") == "1"
+        or "HF_HUB_ENABLE_HF_TRANSFER" not in os.environ
+    ):
         try:
             # enable hf hub transfer if available
             import hf_transfer  # type: ignore # noqa
 
             huggingface_hub.constants.HF_HUB_ENABLE_HF_TRANSFER = True
         except ImportError:
-            pass
+            logger.warning(
+                "Skipping usage of hf_transfer because it was not found in your environment. "
+                "For faster downloads on high throughput network, install via `pip install hf_transfer` "
+                "and set `HF_HUB_ENABLE_HF_TRANSFER=1` in your environment. "
+                "Using hf_xet as the download method."
+            )
 
 
-enable_hf_transfer()
+maybe_enable_hf_transfer()
 
 
 class DisabledTqdm(tqdm):
