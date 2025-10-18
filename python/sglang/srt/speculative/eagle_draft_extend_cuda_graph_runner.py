@@ -9,6 +9,7 @@ from sglang.srt.layers.dp_attention import DpPaddingMode, set_dp_buffer_len
 from sglang.srt.model_executor.cuda_graph_runner import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
     CudaGraphRunner,
+    DeepEPCudaGraphRunnerAdapter,
     LogitsProcessorOutput,
     get_batch_sizes_to_capture,
     get_global_graph_memory_pool,
@@ -61,6 +62,7 @@ class EAGLEDraftExtendCudaGraphRunner:
         )
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
         self.padded_static_len = -1
+        self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
 
         # Attention backend
         self.num_tokens_per_bs = self.speculative_num_steps + 1
@@ -243,6 +245,8 @@ class EAGLEDraftExtendCudaGraphRunner:
         )
         spec_info.positions = None
 
+        self.deepep_adapter.capture(is_extend_in_batch=True)
+
         # Forward batch
         forward_batch = ForwardBatch(
             forward_mode=ForwardMode.DRAFT_EXTEND,
@@ -318,6 +322,8 @@ class EAGLEDraftExtendCudaGraphRunner:
 
     def replay(self, forward_batch: ForwardBatch):
         assert forward_batch.out_cache_loc is not None
+        self.deepep_adapter.replay()
+
         # batch_size and num_seqs can be different in case there are finished examples
         # in the batch, which will not be counted as num_seqs
         raw_bs = forward_batch.batch_size
