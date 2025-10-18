@@ -6,7 +6,9 @@ import torch
 try:
     from sgl_kernel import flash_ops
 except:
-    raise ImportError("Can not import sgl_kernel. Please check your installation.")
+    raise ImportError(
+        "Can not import FA3 in sgl_kernel. Please check your installation."
+    )
 
 try:
     from ._fa4_interface import flash_attn_varlen_func as flash_attn_varlen_func_v4
@@ -161,10 +163,7 @@ def flash_attn_with_kvcache(
             k is None and v is None
         ), "FA4 does not support updating KV cache in-place."
         assert (
-            rotary_cos is None
-            and rotary_sin is None
-            and rotary_interleaved is None
-            and rotary_seqlens is None
+            rotary_cos is None and rotary_sin is None and rotary_seqlens is None
         ), "FA4 does not support rotary embedding."
         assert (
             cache_batch_idx is None and cache_leftpad is None

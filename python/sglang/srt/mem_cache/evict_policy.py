@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, List, Tuple, Union
+from typing import TYPE_CHECKING, Tuple, Union
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.radix_cache import TreeNode

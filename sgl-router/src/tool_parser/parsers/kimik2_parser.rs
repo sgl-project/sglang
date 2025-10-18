@@ -2,13 +2,14 @@ use async_trait::async_trait;
 use regex::Regex;
 use serde_json::Value;
 
-use crate::protocols::spec::Tool;
-
-use crate::tool_parser::{
-    errors::ToolParserResult,
-    parsers::helpers,
-    traits::ToolParser,
-    types::{FunctionCall, StreamingParseResult, ToolCall, ToolCallItem},
+use crate::{
+    protocols::common::Tool,
+    tool_parser::{
+        errors::ParserResult,
+        parsers::helpers,
+        traits::ToolParser,
+        types::{FunctionCall, StreamingParseResult, ToolCall, ToolCallItem},
+    },
 };
 
 /// Kimi K2 format parser for tool calls
@@ -82,11 +83,6 @@ impl KimiK2Parser {
         }
     }
 
-    /// Check if text contains Kimi K2 tool markers
-    fn has_tool_markers(&self, text: &str) -> bool {
-        text.contains("<|tool_calls_section_begin|>")
-    }
-
     /// Parse function ID to extract name and index
     fn parse_function_id(&self, id: &str) -> Option<(String, usize)> {
         if let Some(captures) = self.tool_call_id_regex.captures(id) {
@@ -107,7 +103,7 @@ impl Default for KimiK2Parser {
 
 #[async_trait]
 impl ToolParser for KimiK2Parser {
-    async fn parse_complete(&self, text: &str) -> ToolParserResult<(String, Vec<ToolCall>)> {
+    async fn parse_complete(&self, text: &str) -> ParserResult<(String, Vec<ToolCall>)> {
         if !self.has_tool_markers(text) {
             return Ok((text.to_string(), vec![]));
         }
@@ -129,7 +125,7 @@ impl ToolParser for KimiK2Parser {
                 // Parse function ID
                 if let Some((func_name, _index)) = self.parse_function_id(function_id) {
                     // Try to parse JSON arguments
-                    match serde_json::from_str::<serde_json::Value>(function_args) {
+                    match serde_json::from_str::<Value>(function_args) {
                         Ok(_) => {
                             tools.push(ToolCall {
                                 function: FunctionCall {
@@ -166,7 +162,7 @@ impl ToolParser for KimiK2Parser {
         &mut self,
         chunk: &str,
         tools: &[Tool],
-    ) -> ToolParserResult<StreamingParseResult> {
+    ) -> ParserResult<StreamingParseResult> {
         self.buffer.push_str(chunk);
         let current_text = &self.buffer.clone();
 
@@ -331,11 +327,20 @@ impl ToolParser for KimiK2Parser {
         })
     }
 
-    fn detect_format(&self, text: &str) -> bool {
-        self.has_tool_markers(text) || text.contains("<|tool_call_begin|>")
+    fn has_tool_markers(&self, text: &str) -> bool {
+        text.contains("<|tool_calls_section_begin|>")
     }
 
     fn get_unstreamed_tool_args(&self) -> Option<Vec<ToolCallItem>> {
         helpers::get_unstreamed_args(&self.prev_tool_call_arr, &self.streamed_args_for_tool)
+    }
+
+    fn reset(&mut self) {
+        self.buffer.clear();
+        self.prev_tool_call_arr.clear();
+        self.current_tool_id = -1;
+        self.current_tool_name_sent = false;
+        self.streamed_args_for_tool.clear();
+        self.last_arguments.clear();
     }
 }

@@ -7,7 +7,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.server_args import (
+    ServerArgs,
+    get_global_server_args,
+    set_global_server_args_for_scheduler,
+)
 
 
 class LMHeadStub(nn.Module):
@@ -32,8 +36,9 @@ class TestLMHeadFP32(unittest.TestCase):
             raise unittest.SkipTest("needs CUDA GPU")
 
     def _make_logprocessor(self, vocab_size, enable_fp32):
-        global_server_args_dict["enable_dp_lm_head"] = False
-        global_server_args_dict["enable_fp32_lm_head"] = enable_fp32
+        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+        get_global_server_args().enable_dp_lm_head = False
+        get_global_server_args().enable_fp32_lm_head = enable_fp32
         cfg = SimpleNamespace(vocab_size=vocab_size, final_logit_softcapping=None)
         return LogitsProcessor(cfg, skip_all_gather=True, logit_scale=None)
 

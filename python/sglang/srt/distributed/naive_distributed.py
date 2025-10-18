@@ -1,5 +1,4 @@
 import base64
-import os
 import pickle
 import time
 from pathlib import Path

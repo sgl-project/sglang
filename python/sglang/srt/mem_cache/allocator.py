@@ -274,10 +274,15 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_to_swa_index_mapping[free_index] = 0
 
     def backup_state(self):
-        raise NotImplementedError
+        return [
+            self.full_attn_allocator.backup_state(),
+            self.swa_attn_allocator.backup_state(),
+        ]
 
     def restore_state(self, state):
-        raise NotImplementedError
+        assert len(state) == 2
+        self.full_attn_allocator.restore_state(state[0])
+        self.swa_attn_allocator.restore_state(state[1])
 
     def clear(self):
         self.swa_attn_allocator.clear()

@@ -2,6 +2,7 @@ import json as json_lib
 import logging
 import math
 import os
+import re
 from collections.abc import Iterable
 from typing import List, Optional, Set, Tuple
 
@@ -30,9 +31,9 @@ from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
     MultimodalInputs,
-    global_server_args_dict,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_cpu
 
 _is_cpu = is_cpu()
@@ -422,6 +423,11 @@ class Llama4ForConditionalGeneration(nn.Module):
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
 
+    # Pattern to match language model layers only (skip vision_model and multi_modal_projector)
+    lora_pattern = re.compile(
+        r"^language_model\.model\.layers\.(\d+)\.(?:self_attn|mlp)\.(?:qkv_proj|o_proj|down_proj|gate_up_proj)"
+    )
+
     def __init__(
         self,
         config: Llama4Config,
@@ -442,7 +448,7 @@ class Llama4ForConditionalGeneration(nn.Module):
             )
 
         self.has_vision = (
-            self.has_vision_weights and global_server_args_dict["enable_multimodal"]
+            self.has_vision_weights and get_global_server_args().enable_multimodal
         )
 
         if self.has_vision:
@@ -554,6 +560,10 @@ class Llama4ForConditionalGeneration(nn.Module):
         projected_vision_flat = self.multi_modal_projector(vision_flat)
 
         return projected_vision_flat
+
+    def should_apply_lora(self, module_name: str) -> bool:
+        """Skip vision model and multi_modal_projector for LoRA."""
+        return bool(self.lora_pattern.match(module_name))
 
     def forward(
         self,
@@ -700,7 +710,7 @@ class Llama4ForConditionalGeneration(nn.Module):
         """Handle scale parameter remapping. Returns True if handled."""
         if "scale" in name and "expert" not in name:
             remapped_name = maybe_remap_kv_scale_name(name, params_dict)
-            return remapped_name is not None and remapped_name != name
+            return remapped_name != name
         return False
 
     def _handle_stacked_params(

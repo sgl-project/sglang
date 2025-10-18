@@ -3,9 +3,9 @@
 //! This module provides a unified abstraction for routing policies that work
 //! across both regular and prefill-decode (PD) routing modes.
 
+use std::{fmt::Debug, sync::Arc};
+
 use crate::core::Worker;
-use std::fmt::Debug;
-use std::sync::Arc;
 
 mod cache_aware;
 mod factory;

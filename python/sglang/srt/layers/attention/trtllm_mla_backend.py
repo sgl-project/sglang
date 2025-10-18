@@ -20,8 +20,8 @@ from sglang.srt.layers.attention.utils import (
     create_flashmla_kv_indices_triton,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_cuda, is_flashinfer_available
 
 if is_flashinfer_available():
@@ -123,9 +123,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self.forward_prefill_metadata: Optional[TRTLLMMLAPrefillMetadata] = None
         self.forward_decode_metadata: Union[TRTLLMMLADecodeMetadata, None] = None
 
-        self.disable_chunked_prefix_cache = global_server_args_dict[
-            "disable_chunked_prefix_cache"
-        ]
+        self.disable_chunked_prefix_cache = (
+            get_global_server_args().disable_chunked_prefix_cache
+        )
 
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
 
@@ -735,7 +735,7 @@ class TRTLLMMLAMultiStepDraftBackend(FlashInferMLAMultiStepDraftBackend):
     ):
         super().__init__(model_runner, topk, speculative_num_steps)
 
-        for i in range(self.speculative_num_steps):
+        for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i] = TRTLLMMLABackend(
                 model_runner,
                 skip_prefill=True,

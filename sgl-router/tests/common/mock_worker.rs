@@ -1,20 +1,25 @@
 // Mock worker for testing - these functions are used by integration tests
 #![allow(dead_code)]
 
+use std::{
+    collections::{HashMap, HashSet},
+    convert::Infallible,
+    sync::{Arc, Mutex, OnceLock},
+    time::{SystemTime, UNIX_EPOCH},
+};
+
 use axum::{
     extract::{Json, Path, State},
     http::StatusCode,
-    response::sse::{Event, KeepAlive},
-    response::{IntoResponse, Response, Sse},
+    response::{
+        sse::{Event, KeepAlive},
+        IntoResponse, Response, Sse,
+    },
     routing::{get, post},
     Router,
 };
 use futures_util::stream::{self, StreamExt};
 use serde_json::json;
-use std::collections::{HashMap, HashSet};
-use std::convert::Infallible;
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
