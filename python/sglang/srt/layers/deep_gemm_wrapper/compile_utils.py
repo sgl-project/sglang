@@ -8,9 +8,7 @@ import torch
 from tqdm import tqdm
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.quantization.deep_gemm_wrapper.configurer import (
-    ENABLE_JIT_DEEPGEMM,
-)
+from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import ceil_div, get_bool_env_var
 
