@@ -191,14 +191,14 @@ class PiecewiseCudaGraphRunner:
             with set_compiled(True):
                 self.warmup_and_capture()
 
-        # Capture
-        try:
-            with model_capture_mode():
-                self.capture()
-        except RuntimeError as e:
-            raise Exception(
-                f"Capture cuda graph failed: {e}\n{PIECEWISE_CUDA_GRAPH_CAPTURE_FAILED_MSG}"
-            )
+            # Capture - keep patch_model context active during capture
+            try:
+                with model_capture_mode():
+                    self.capture()
+            except RuntimeError as e:
+                raise Exception(
+                    f"Capture cuda graph failed: {e}\n{PIECEWISE_CUDA_GRAPH_CAPTURE_FAILED_MSG}"
+                )
 
         self.raw_num_tokens = 0
 

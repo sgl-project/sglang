@@ -36,17 +36,25 @@ class CustomOp(nn.Module):
             return
 
         self._original_forward_method = self._forward_method
+        
+        # For RMSNorm and RotaryEmbedding, keep using sgl-kernel implementations
+        # instead of falling back to forward_native, to avoid performance degradation
+        op_name = self.__class__.__name__
+        if any(name in op_name for name in ["RMSNorm", "RotaryEmbedding", "Llama3RotaryEmbedding"]):
+            # Keep the original forward method (forward_cuda with sgl-kernel)
+            # Don't switch to forward_native
+            pass
         # NOTE: Temporarily workaround MoE
         # The performance of torch.compile on this layer is not always good when bs > 1,
         # so we decide to only use torch.compile when bs=1
-        if "FusedMoE" in self.__class__.__name__:
+        elif "FusedMoE" in op_name:
             if num_tokens == 1:
                 from sglang.srt.layers.moe.fused_moe_native import (
                     fused_moe_forward_native,
                 )
 
                 self._forward_method = fused_moe_forward_native
-        elif "TopK" in self.__class__.__name__:
+        elif "TopK" in op_name:
             if num_tokens == 1:
                 self._forward_method = self.forward_native
         else:
