@@ -568,6 +568,7 @@ mod tests {
             configured_reasoning_parser: None,
             configured_tool_parser: None,
             worker_job_queue: Arc::new(std::sync::OnceLock::new()),
+            workflow_engine: Arc::new(std::sync::OnceLock::new()),
         })
     }
 

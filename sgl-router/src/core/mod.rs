@@ -4,6 +4,7 @@
 //! - Worker trait and implementations
 //! - Error types
 //! - Circuit breaker for reliability
+//! - Workflow engine for multi-step operations
 //! - Common utilities
 
 pub mod circuit_breaker;
@@ -15,6 +16,7 @@ pub mod worker;
 pub mod worker_builder;
 pub mod worker_manager;
 pub mod worker_registry;
+pub mod workflow;
 
 pub use circuit_breaker::{
     CircuitBreaker, CircuitBreakerConfig, CircuitBreakerStats, CircuitState,
