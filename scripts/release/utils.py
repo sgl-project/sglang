@@ -96,8 +96,9 @@ def replace_in_file(file_path: Path, old_version: str, new_version: str) -> bool
     # For TOML files, use regex to match version field regardless of current value
     if file_path.suffix == ".toml":
         # Match: version = "X.Y.Z..." (with optional quotes and whitespace)
-        pattern = r'(version\s*=\s*["\'])([^"\']+)(["\'])'
-        new_content = re.sub(pattern, rf"\g<1>{new_version}\g<3>", content)
+        # Captures quotes (or lack thereof) to preserve original quoting style
+        pattern = r'(version\s*=\s*)(["\']?)([^"\'\n]+)(["\']?)'
+        new_content = re.sub(pattern, rf"\g<1>\g<2>{new_version}\g<4>", content)
     else:
         # For non-TOML files, use simple string replacement
         new_content = content.replace(old_version, new_version)
@@ -165,14 +166,27 @@ def bump_version(
     for file_rel in files_to_update:
         file_abs = repo_root / file_rel
         if not file_abs.exists():
-            continue  # Skip non-existent files (already warned above)
+            print(f"Warning: File {file_rel} does not exist, skipping validation.")
+            continue
 
         content = file_abs.read_text()
-        if new_version not in content:
-            failed_files.append(file_rel)
-            print(f"✗ {file_rel} does not contain version {new_version}")
+
+        # For TOML files, use regex to specifically check the version field
+        if file_abs.suffix == ".toml":
+            # Match version field with optional quotes
+            pattern = r'version\s*=\s*["\']?' + re.escape(new_version) + r'["\']?'
+            if not re.search(pattern, content):
+                failed_files.append(file_rel)
+                print(f"✗ {file_rel} does not contain version {new_version}")
+            else:
+                print(f"✓ {file_rel} validated")
         else:
-            print(f"✓ {file_rel} validated")
+            # For non-TOML files, use simple string search
+            if new_version not in content:
+                failed_files.append(file_rel)
+                print(f"✗ {file_rel} does not contain version {new_version}")
+            else:
+                print(f"✓ {file_rel} validated")
 
     if failed_files:
         print(f"\nError: {len(failed_files)} file(s) were not updated correctly:")
