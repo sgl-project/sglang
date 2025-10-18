@@ -87,6 +87,11 @@ class RouterArgs:
     model_path: Optional[str] = None
     tokenizer_path: Optional[str] = None
     chat_template: Optional[str] = None
+    # Tokenizer cache configuration
+    tokenizer_cache_enable_l0: bool = False
+    tokenizer_cache_l0_max_entries: int = 10000
+    tokenizer_cache_enable_l1: bool = False
+    tokenizer_cache_l1_max_memory: int = 50 * 1024 * 1024  # 50MB
     reasoning_parser: Optional[str] = None
     tool_call_parser: Optional[str] = None
     # Backend selection
@@ -466,6 +471,30 @@ class RouterArgs:
             type=str,
             default=None,
             help="Chat template path (optional)",
+        )
+        parser.add_argument(
+            f"--{prefix}tokenizer-cache-enable-l0",
+            action="store_true",
+            default=RouterArgs.tokenizer_cache_enable_l0,
+            help="Enable L0 (whole-string exact match) tokenizer cache (default: False)",
+        )
+        parser.add_argument(
+            f"--{prefix}tokenizer-cache-l0-max-entries",
+            type=int,
+            default=RouterArgs.tokenizer_cache_l0_max_entries,
+            help="Maximum number of entries in L0 tokenizer cache (default: 10000)",
+        )
+        parser.add_argument(
+            f"--{prefix}tokenizer-cache-enable-l1",
+            action="store_true",
+            default=RouterArgs.tokenizer_cache_enable_l1,
+            help="Enable L1 (prefix matching) tokenizer cache (default: False)",
+        )
+        parser.add_argument(
+            f"--{prefix}tokenizer-cache-l1-max-memory",
+            type=int,
+            default=RouterArgs.tokenizer_cache_l1_max_memory,
+            help="Maximum memory for L1 tokenizer cache in bytes (default: 50MB)",
         )
         parser.add_argument(
             f"--{prefix}reasoning-parser",

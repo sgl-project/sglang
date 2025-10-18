@@ -69,6 +69,7 @@ impl TestContext {
             oracle: None,
             reasoning_parser: None,
             tool_call_parser: None,
+            tokenizer_cache: sglang_router_rs::config::TokenizerCacheConfig::default(),
         };
 
         Self::new_with_config(config, worker_configs).await
@@ -1406,6 +1407,7 @@ mod error_tests {
             oracle: None,
             reasoning_parser: None,
             tool_call_parser: None,
+            tokenizer_cache: sglang_router_rs::config::TokenizerCacheConfig::default(),
         };
 
         let ctx = TestContext::new_with_config(
@@ -1735,6 +1737,7 @@ mod pd_mode_tests {
             oracle: None,
             reasoning_parser: None,
             tool_call_parser: None,
+            tokenizer_cache: sglang_router_rs::config::TokenizerCacheConfig::default(),
         };
 
         // Create app context
@@ -1898,6 +1901,7 @@ mod request_id_tests {
             oracle: None,
             reasoning_parser: None,
             tool_call_parser: None,
+            tokenizer_cache: sglang_router_rs::config::TokenizerCacheConfig::default(),
         };
 
         let ctx = TestContext::new_with_config(

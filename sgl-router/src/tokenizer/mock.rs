@@ -34,6 +34,12 @@ impl MockTokenizer {
             (".", 6),
             ("<eos>", 999),
             ("<bos>", 1000),
+            ("<|im_start|>", 1001),
+            ("<|im_end|>", 1002),
+            ("<|eot_id|>", 1003),
+            ("system", 7),
+            ("user", 8),
+            ("assistant", 9),
         ];
 
         for (token, id) in tokens {
@@ -62,7 +68,8 @@ impl MockTokenizer {
 
 impl Encoder for MockTokenizer {
     fn encode(&self, input: &str) -> Result<Encoding> {
-        // Simple word-based tokenization for testing
+        // Simple word-based tokenization using the vocab
+        // Split by whitespace and look up each word (decoder adds spaces back)
         let tokens: Vec<u32> = input
             .split_whitespace()
             .filter_map(|word| self.vocab.get(word).copied())
