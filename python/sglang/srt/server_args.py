@@ -309,8 +309,8 @@ class ServerArgs:
     ] = None
     max_loaded_loras: Optional[int] = None
     max_loras_per_batch: int = 8
-    lora_backend: str = "csgmv"
     lora_eviction_policy: str = DEFAULT_LORA_EVICTION_POLICY
+    lora_backend: str = "triton"
     max_lora_chunk_size: Optional[int] = 16
 
     # Kernel backend
@@ -509,6 +509,11 @@ class ServerArgs:
         """
         Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
         """
+
+        if self.model_path.lower() in ["none", "dummy"]:
+            # Skip for dummy models
+            return
+
         # Handle deprecated arguments.
         self._handle_deprecated_args()
 
@@ -1409,6 +1414,13 @@ class ServerArgs:
             if self.attention_backend not in DETERMINISTIC_ATTENTION_BACKEND_CHOICES:
                 raise ValueError(
                     f"Currently only {DETERMINISTIC_ATTENTION_BACKEND_CHOICES} attention backends are supported for deterministic inference."
+                )
+
+            # Currently, only FA3 supports radix cache. Support for other backends is in progress
+            if self.attention_backend != "fa3":
+                self.disable_radix_cache = True
+                logger.warning(
+                    f"Currently radix cache is not compatible with {self.attention_backend} attention backend for deterministic inference. It will be supported in the future."
                 )
 
             # Check TP size

@@ -1,3 +1,24 @@
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, OnceLock,
+    },
+    time::Duration,
+};
+
+use axum::{
+    extract::{Path, Query, Request, State},
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    routing::{delete, get, post},
+    serve, Json, Router,
+};
+use reqwest::Client;
+use serde::Deserialize;
+use serde_json::{json, Value};
+use tokio::{net::TcpListener, signal, spawn};
+use tracing::{error, info, warn, Level};
+
 use crate::{
     config::{ConnectionMode, HistoryBackend, RouterConfig, RoutingMode},
     core::{
@@ -30,24 +51,6 @@ use crate::{
     tokenizer::{factory as tokenizer_factory, traits::Tokenizer},
     tool_parser::ParserFactory as ToolParserFactory,
 };
-use axum::{
-    extract::{Path, Query, Request, State},
-    http::StatusCode,
-    response::{IntoResponse, Response},
-    routing::{delete, get, post},
-    serve, Json, Router,
-};
-use reqwest::Client;
-use serde::Deserialize;
-use serde_json::{json, Value};
-use std::sync::OnceLock;
-use std::{
-    sync::atomic::{AtomicBool, Ordering},
-    sync::Arc,
-    time::Duration,
-};
-use tokio::{net::TcpListener, signal, spawn};
-use tracing::{error, info, warn, Level};
 
 //
 

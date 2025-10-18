@@ -117,9 +117,10 @@ impl<T> std::ops::DerefMut for ValidatedJson<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use serde::{Deserialize, Serialize};
     use validator::Validate;
+
+    use super::*;
 
     #[derive(Debug, Deserialize, Serialize, Validate)]
     struct TestRequest {
