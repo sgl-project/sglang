@@ -219,7 +219,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         """Initialize metadata for CUDA graph capture."""
 
         # Delegate to parent for non-decode modes.
-        if not forward_mode.is_decode_or_idle() and not forward_mode.is_target_verify():
+        if (
+            not forward_mode.is_decode_or_idle()
+            and not forward_mode.is_target_verify()
+            and not forward_mode.is_draft_extend()
+        ):
             return super().init_forward_metadata_capture_cuda_graph(
                 bs,
                 num_tokens,
@@ -275,7 +279,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     ):
         """Replay CUDA graph with new inputs."""
         # Delegate to parent for non-decode modes.
-        if not forward_mode.is_decode_or_idle() and not forward_mode.is_target_verify():
+        if (
+            not forward_mode.is_decode_or_idle()
+            and not forward_mode.is_target_verify()
+            and not forward_mode.is_draft_extend()
+        ):
             return super().init_forward_metadata_replay_cuda_graph(
                 bs,
                 req_pool_indices,
@@ -344,6 +352,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         elif (
             forward_batch.forward_mode.is_decode_or_idle()
             or forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend()
         ):
             bs = forward_batch.batch_size
 
@@ -571,11 +580,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         cos_sin_cache: Optional[torch.Tensor] = None,
         is_neox: Optional[bool] = False,
     ) -> torch.Tensor:
-        if forward_batch.forward_mode.is_draft_extend():
-            return super().forward_extend(
-                q, k, v, layer, forward_batch, save_kv_cache, q_rope, k_rope
-            )
-
         # TODO refactor to avoid code duplication
         merge_query = q_rope is not None
         if (
@@ -627,7 +631,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         v = v.view(-1, layer.tp_k_head_num, layer.v_head_dim)
 
-        if forward_batch.forward_mode.is_target_verify():
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend()
+        ):
             metadata = (
                 getattr(forward_batch, "decode_trtllm_mla_metadata", None)
                 or self.forward_decode_metadata
@@ -648,12 +655,17 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             )
 
             bmm1_scale = q_scale * k_scale * layer.scaling
-
-            seq_lens = (
-                forward_batch.seq_lens.to(torch.int32)
-                + forward_batch.spec_info.draft_token_num
-            )
-            max_seq_len = metadata.max_seq_len + forward_batch.spec_info.draft_token_num
+            if forward_batch.forward_mode.is_target_verify():
+                seq_lens = (
+                    forward_batch.seq_lens.to(torch.int32)
+                    + forward_batch.spec_info.draft_token_num
+                )
+                max_seq_len = (
+                    metadata.max_seq_len + forward_batch.spec_info.draft_token_num
+                )
+            else:
+                seq_lens = forward_batch.seq_lens.to(torch.int32)
+                max_seq_len = metadata.max_seq_len
 
             # TODO may use `mla_rope_quantize_fp8` fusion
             q = q.to(self.data_type)
