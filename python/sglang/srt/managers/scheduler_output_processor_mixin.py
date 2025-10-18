@@ -695,6 +695,7 @@ class SchedulerOutputProcessorMixin:
         spec_verify_ct = []
         spec_accepted_tokens = []
         output_hidden_states = None
+        request_cache_hit_rates = []
 
         if return_logprob:
             input_token_logprobs_val = []
@@ -788,6 +789,14 @@ class SchedulerOutputProcessorMixin:
                 prompt_tokens.append(len(req.origin_input_ids))
                 completion_tokens.append(len(req.output_ids))
                 cached_tokens.append(req.cached_tokens)
+
+                # Calculate per-request cache hit rate.
+                cache_hit_rate = (
+                    cached_tokens[-1] / prompt_tokens[-1]
+                    if prompt_tokens[-1] > 0
+                    else 0.0
+                )
+                request_cache_hit_rates.append(cache_hit_rate)
 
                 if not self.spec_algorithm.is_none():
                     spec_verify_ct.append(req.spec_verify_ct)
@@ -910,6 +919,7 @@ class SchedulerOutputProcessorMixin:
                     rids=rids,
                     placeholder_tokens_idx=None,
                     placeholder_tokens_val=None,
+                    cache_hit_rate=request_cache_hit_rates,
                 )
             )
 
@@ -920,6 +930,8 @@ class SchedulerOutputProcessorMixin:
         embeddings = []
         prompt_tokens = []
         cached_tokens = []
+        request_cache_hit_rates = []
+
         for req in reqs:
             if req.finished():
                 rids.append(req.rid)
@@ -927,6 +939,13 @@ class SchedulerOutputProcessorMixin:
                 embeddings.append(req.embedding)
                 prompt_tokens.append(len(req.origin_input_ids))
                 cached_tokens.append(req.cached_tokens)
+
+                # Calculate per-request cache hit rate.
+                total_tokens = prompt_tokens[-1]
+                cache_hit_rate = (
+                    cached_tokens[-1] / total_tokens if total_tokens > 0 else 0.0
+                )
+                request_cache_hit_rates.append(cache_hit_rate)
         self.send_to_detokenizer.send_pyobj(
             BatchEmbeddingOutput(
                 finished_reasons,
@@ -936,5 +955,6 @@ class SchedulerOutputProcessorMixin:
                 rids=rids,
                 placeholder_tokens_idx=None,
                 placeholder_tokens_val=None,
+                cache_hit_rate=request_cache_hit_rates,
             )
         )
