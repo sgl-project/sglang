@@ -805,7 +805,13 @@ class TritonAttnBackend(AttentionBackend):
         if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
             causal = False
 
-        if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
+        # For ENCODER_ONLY models, disable sliding window since they don't use KV cache
+        # and the window_kv_indptr is not properly initialized for encoder models
+        if (
+            layer.sliding_window_size is not None
+            and layer.sliding_window_size > -1
+            and layer.attn_type != AttentionType.ENCODER_ONLY
+        ):
             sliding_window_size = (
                 layer.sliding_window_size
             )  # Needed for sliding window mask
