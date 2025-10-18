@@ -227,13 +227,10 @@ def get_quant_config(
                 else:
                     return quant_cls.from_config(config)
         elif model_config.quantization == "modelopt_fp8":
-            if config["producer"]["name"] == "modelopt_fp8":
-                return quant_cls.from_config(config)
-            else:
-                raise ValueError(
-                    f"Unsupported quantization config"
-                    f" found for {model_config.quantization} in {f}."
-                )
+            # Accept both legacy and current ModelOpt hf_quant_config.json formats.
+            # Some checkpoints set producer.name to "modelopt" even for FP8.
+            # Delegate parsing/validation to the quantization config class.
+            return quant_cls.from_config(config)
         elif model_config.quantization == "w8a8_int8":
             config["packed_modules_mapping"] = packed_modules_mapping
 
