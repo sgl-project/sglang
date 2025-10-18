@@ -1411,9 +1411,18 @@ class ServerArgs:
             )
 
             # Check attention backend
-            if self.attention_backend not in DETERMINISTIC_ATTENTION_BACKEND_CHOICES:
+            if self.attention_backend is None:
+                # User didn't specify attention backend, fallback to fa3
+                self.attention_backend = "fa3"
+                logger.warning(
+                    f"Attention backend not specified. Falling back to 'fa3' for deterministic inference. "
+                    f"You can explicitly set --attention-backend to one of {DETERMINISTIC_ATTENTION_BACKEND_CHOICES}."
+                )
+            elif self.attention_backend not in DETERMINISTIC_ATTENTION_BACKEND_CHOICES:
+                # User explicitly specified an incompatible attention backend
                 raise ValueError(
-                    f"Currently only {DETERMINISTIC_ATTENTION_BACKEND_CHOICES} attention backends are supported for deterministic inference."
+                    f"Currently only {DETERMINISTIC_ATTENTION_BACKEND_CHOICES} attention backends are supported for deterministic inference, "
+                    f"but you explicitly specified '{self.attention_backend}'."
                 )
 
             # Currently, only FA3 supports radix cache. Support for other backends is in progress
