@@ -116,10 +116,14 @@ NVIDIA Model Optimizer (ModelOpt) provides advanced quantization techniques opti
 
 ##### Installation
 
-First, install ModelOpt:
+First, install ModelOpt. You can either install it directly or as an optional SGLang dependency:
 
 ```bash
+# Option 1: Install ModelOpt directly
 pip install nvidia-modelopt
+
+# Option 2: Install SGLang with ModelOpt support (recommended)
+pip install sglang[modelopt]
 ```
 
 ##### Quantization and Export Workflow
