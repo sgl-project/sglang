@@ -94,6 +94,11 @@ mod test_pd_routing {
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
             },
+            PDSelectionPolicy::Bucket {
+                balance_abs_threshold: 32,
+                balance_rel_threshold: 1.1,
+                bucket_adjust_interval_secs: 5,
+            },
         ];
 
         for policy in policies {
@@ -108,6 +113,9 @@ mod test_pd_routing {
                     cache_threshold, ..
                 } => {
                     assert!(*cache_threshold >= 0.0 && *cache_threshold <= 1.0);
+                }
+                PDSelectionPolicy::Bucket{ balance_rel_threshold, .. } => {
+                    assert!(*balance_rel_threshold >= 1.0);
                 }
             }
         }
@@ -160,6 +168,23 @@ mod test_pd_routing {
                     balance_rel_threshold: 1.2,
                     eviction_interval_secs: 60,
                     max_tree_size: 1000000,
+                },
+            ),
+            (
+                RoutingMode::PrefillDecode {
+                    prefill_urls: vec![
+                        ("http://p1:8080".to_string(), Some(9000)),
+                        ("http://p2:8080".to_string(), Some(9001)),
+                        ("http://p3:8080".to_string(), Some(9002)),
+                    ],
+                    decode_urls: vec!["http://d1:8080".to_string(), "http://d2:8080".to_string()],
+                    prefill_policy: None,
+                    decode_policy: None,
+                },
+                PolicyConfig::Bucket {
+                    balance_abs_threshold: 20,
+                    balance_rel_threshold: 1.2,
+                    bucket_adjust_interval_secs: 5,
                 },
             ),
         ];
