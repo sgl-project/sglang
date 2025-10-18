@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 """Cutlass W4A8 MoE kernel."""
-import logging
 from typing import Optional
 
 import torch
