@@ -1,32 +1,39 @@
-use crate::config::types::RetryConfig;
-use crate::core::{
-    is_retryable_status, ConnectionMode, RetryExecutor, Worker, WorkerRegistry, WorkerType,
-};
-use crate::metrics::RouterMetrics;
-use crate::policies::PolicyRegistry;
-use crate::protocols::spec::{
-    ChatCompletionRequest, ClassifyRequest, CompletionRequest, EmbeddingRequest, GenerateRequest,
-    GenerationRequest, RerankRequest, RerankResponse, RerankResult, ResponsesGetParams,
-    ResponsesRequest,
-};
-use crate::routers::header_utils;
-use crate::routers::RouterTrait;
-use axum::body::to_bytes;
+use std::{sync::Arc, time::Instant};
+
 use axum::{
-    body::Body,
+    body::{to_bytes, Body},
     extract::Request,
     http::{
-        header::CONTENT_LENGTH, header::CONTENT_TYPE, HeaderMap, HeaderValue, Method, StatusCode,
+        header::{CONTENT_LENGTH, CONTENT_TYPE},
+        HeaderMap, HeaderValue, Method, StatusCode,
     },
     response::{IntoResponse, Response},
     Json,
 };
 use futures_util::StreamExt;
 use reqwest::Client;
-use std::sync::Arc;
-use std::time::Instant;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error};
+
+use crate::{
+    config::types::RetryConfig,
+    core::{
+        is_retryable_status, ConnectionMode, RetryExecutor, Worker, WorkerRegistry, WorkerType,
+    },
+    metrics::RouterMetrics,
+    policies::PolicyRegistry,
+    protocols::{
+        chat::ChatCompletionRequest,
+        common::GenerationRequest,
+        completion::CompletionRequest,
+        embedding::EmbeddingRequest,
+        classify::ClassifyRequest,
+        generate::GenerateRequest,
+        rerank::{RerankRequest, RerankResponse, RerankResult},
+        responses::{ResponsesGetParams, ResponsesRequest},
+    },
+    routers::{header_utils, RouterTrait},
+};
 
 /// Regular router that uses injected load balancing policies
 #[derive(Debug)]
@@ -629,7 +636,7 @@ impl Router {
         let rerank_results = serde_json::from_slice::<Vec<RerankResult>>(&body_bytes)?;
         let mut rerank_response =
             RerankResponse::new(rerank_results, req.model.clone(), req.rid.clone());
-        rerank_response.sort_by_score();
+        // Sorting is handled by Python worker (serving_rerank.py)
         if let Some(top_k) = req.top_k {
             rerank_response.apply_top_k(top_k);
         }
@@ -773,9 +780,6 @@ impl RouterTrait for Router {
         body: &RerankRequest,
         model_id: Option<&str>,
     ) -> Response {
-        if let Err(e) = body.validate() {
-            return (StatusCode::BAD_REQUEST, e).into_response();
-        }
         let response = self
             .route_typed_request(headers, body, "/v1/rerank", model_id)
             .await;

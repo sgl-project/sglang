@@ -1,5 +1,7 @@
 //! Router implementations
 
+use std::fmt::Debug;
+
 use async_trait::async_trait;
 use axum::{
     body::Body,
@@ -7,13 +9,17 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use std::fmt::Debug;
-
-use crate::protocols::spec::{
-    ChatCompletionRequest, ClassifyRequest, CompletionRequest, EmbeddingRequest, GenerateRequest,
-    RerankRequest, ResponsesGetParams, ResponsesRequest,
-};
 use serde_json::Value;
+
+use crate::protocols::{
+    chat::ChatCompletionRequest,
+    completion::CompletionRequest,
+    embedding::EmbeddingRequest,
+    classify::ClassifyRequest,
+    generate::GenerateRequest,
+    rerank::RerankRequest,
+    responses::{ResponsesGetParams, ResponsesRequest},
+};
 
 pub mod factory;
 pub mod grpc;
@@ -23,7 +29,6 @@ pub mod openai; // New refactored OpenAI router module
 pub mod router_manager;
 
 pub use factory::RouterFactory;
-
 // Re-export HTTP routers for convenience
 pub use http::{pd_router, pd_types, router};
 

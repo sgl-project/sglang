@@ -44,6 +44,7 @@ from sglang.srt.utils import (
     is_remote_url,
     is_sm90_supported,
     is_sm100_supported,
+    is_sm120_supported,
     is_triton_kernels_available,
     is_valid_ipv6_address,
     json_list_type,
@@ -252,7 +253,6 @@ class ServerArgs:
     log_requests: bool = False
     log_requests_level: int = 2
     crash_dump_folder: Optional[str] = None
-    crash_on_nan: bool = False
     show_time_cost: bool = False
     enable_metrics: bool = False
     enable_metrics_for_all_schedulers: bool = False
@@ -371,7 +371,7 @@ class ServerArgs:
     # Mamba cache
     max_mamba_cache_size: Optional[int] = None
     mamba_ssm_dtype: str = "float32"
-    mamba_full_memory_ratio: float = 0.2
+    mamba_full_memory_ratio: float = 0.9
 
     # Hierarchical cache
     enable_hierarchical_cache: bool = False
@@ -435,6 +435,7 @@ class ServerArgs:
     torch_compile_max_bs: int = 32
     piecewise_cuda_graph_max_tokens: int = 4096
     piecewise_cuda_graph_tokens: Optional[List[int]] = None
+    piecewise_cuda_graph_compiler: str = "eager"
     torchao_config: str = ""
     enable_nan_detection: bool = False
     enable_p2p_check: bool = False
@@ -509,6 +510,11 @@ class ServerArgs:
         """
         Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
         """
+
+        if self.model_path.lower() in ["none", "dummy"]:
+            # Skip for dummy models
+            return
+
         # Handle deprecated arguments.
         self._handle_deprecated_args()
 
@@ -628,6 +634,16 @@ class ServerArgs:
                     self.chunked_prefill_size = 2048
                 if self.cuda_graph_max_bs is None:
                     self.cuda_graph_max_bs = 8
+            elif is_npu() and gpu_mem < 32 * 1024:
+                # Atlas A2B4
+                # (chunked_prefill_size 32k, cuda_graph_max_bs 16 if tp < 4 else 64)
+                if self.chunked_prefill_size is None:
+                    self.chunked_prefill_size = 32768
+                if self.cuda_graph_max_bs is None:
+                    if self.tp_size < 4:
+                        self.cuda_graph_max_bs = 16
+                    else:
+                        self.cuda_graph_max_bs = 64
             elif gpu_mem < 35 * 1024:
                 # A10, 4090, 5090
                 # (chunked_prefill_size 2k, cuda_graph_max_bs 16 if tp < 4 else 80)
@@ -651,6 +667,16 @@ class ServerArgs:
                         self.cuda_graph_max_bs = 32
                     else:
                         self.cuda_graph_max_bs = 160
+            elif is_npu() and gpu_mem < 64 * 1024:
+                # Atlas A2 and Atlas A3
+                # (chunked_prefill_size 32k, cuda_graph_max_bs 64 if tp < 4 else 128)
+                if self.chunked_prefill_size is None:
+                    self.chunked_prefill_size = 32768
+                if self.cuda_graph_max_bs is None:
+                    if self.tp_size < 4:
+                        self.cuda_graph_max_bs = 64
+                    else:
+                        self.cuda_graph_max_bs = 128
             elif gpu_mem < 90 * 1024:
                 # H100, A100
                 # (chunked_prefill_size 8k, cuda_graph_max_bs 256 if tp < 4 else 512)
@@ -1386,9 +1412,30 @@ class ServerArgs:
             )
 
             # Check attention backend
-            if self.attention_backend not in DETERMINISTIC_ATTENTION_BACKEND_CHOICES:
+            if self.attention_backend is None:
+                # User didn't specify attention backend, fallback based on GPU architecture
+                if is_sm100_supported() or is_sm120_supported():
+                    # Blackwell and newer architectures
+                    self.attention_backend = "flashinfer"
+                else:
+                    # Hopper (SM90) and older architectures
+                    self.attention_backend = "fa3"
+                logger.warning(
+                    f"Attention backend not specified. Falling back to '{self.attention_backend}' for deterministic inference. "
+                    f"You can explicitly set --attention-backend to one of {DETERMINISTIC_ATTENTION_BACKEND_CHOICES}."
+                )
+            elif self.attention_backend not in DETERMINISTIC_ATTENTION_BACKEND_CHOICES:
+                # User explicitly specified an incompatible attention backend
                 raise ValueError(
-                    f"Currently only {DETERMINISTIC_ATTENTION_BACKEND_CHOICES} attention backends are supported for deterministic inference."
+                    f"Currently only {DETERMINISTIC_ATTENTION_BACKEND_CHOICES} attention backends are supported for deterministic inference, "
+                    f"but you explicitly specified '{self.attention_backend}'."
+                )
+
+            # Currently, only FA3 supports radix cache. Support for other backends is in progress
+            if self.attention_backend != "fa3":
+                self.disable_radix_cache = True
+                logger.warning(
+                    f"Currently radix cache is not compatible with {self.attention_backend} attention backend for deterministic inference. It will be supported in the future."
                 )
 
             # Check TP size
@@ -1850,12 +1897,6 @@ class ServerArgs:
             type=str,
             default=ServerArgs.crash_dump_folder,
             help="Folder path to dump requests from the last 5 min before a crash (if any). If not specified, crash dumping is disabled.",
-        )
-        parser.add_argument(
-            "--crash-on-nan",
-            type=str,
-            default=ServerArgs.crash_on_nan,
-            help="Crash the server on nan logprobs.",
         )
         parser.add_argument(
             "--show-time-cost",
@@ -2484,13 +2525,7 @@ class ServerArgs:
             default=ServerArgs.mamba_full_memory_ratio,
             help="The ratio of mamba state memory to full kv cache memory.",
         )
-        # Args for multi-item-scoring
-        parser.add_argument(
-            "--multi-item-scoring-delimiter",
-            type=int,
-            default=ServerArgs.multi_item_scoring_delimiter,
-            help="Delimiter token ID for multi-item scoring. Used to combine Query and Items into a single sequence: Query<delimiter>Item1<delimiter>Item2<delimiter>... This enables efficient batch processing of multiple items against a single query.",
-        )
+
         # Hierarchical cache
         parser.add_argument(
             "--enable-hierarchical-cache",
@@ -2636,6 +2671,14 @@ class ServerArgs:
             help="Mode of offloading.",
         )
 
+        # Args for multi-item-scoring
+        parser.add_argument(
+            "--multi-item-scoring-delimiter",
+            type=int,
+            default=ServerArgs.multi_item_scoring_delimiter,
+            help="Delimiter token ID for multi-item scoring. Used to combine Query and Items into a single sequence: Query<delimiter>Item1<delimiter>Item2<delimiter>... This enables efficient batch processing of multiple items against a single query.",
+        )
+
         # Optimization/debug options
         parser.add_argument(
             "--disable-radix-cache",
@@ -2765,6 +2808,13 @@ class ServerArgs:
             type=json_list_type,
             default=ServerArgs.piecewise_cuda_graph_tokens,
             help="Set the list of tokens when using piecewise cuda graph.",
+        )
+        parser.add_argument(
+            "--piecewise-cuda-graph-compiler",
+            type=str,
+            default=ServerArgs.piecewise_cuda_graph_compiler,
+            help="Set the compiler for piecewise cuda graph. Choices are: eager, inductor.",
+            choices=["eager", "inductor"],
         )
         parser.add_argument(
             "--torch-compile-max-bs",

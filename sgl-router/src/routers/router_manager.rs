@@ -4,14 +4,8 @@
 //! - Single Router Mode (enable_igw=false): Router owns workers directly
 //! - Multi-Router Mode (enable_igw=true): RouterManager coordinates everything
 
-use crate::config::{ConnectionMode, RoutingMode};
-use crate::core::{WorkerRegistry, WorkerType};
-use crate::protocols::spec::{
-    ChatCompletionRequest, ClassifyRequest, CompletionRequest, EmbeddingRequest, GenerateRequest,
-    RerankRequest, ResponsesGetParams, ResponsesRequest,
-};
-use crate::routers::RouterTrait;
-use crate::server::{AppContext, ServerConfig};
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use axum::{
     body::Body,
@@ -21,8 +15,23 @@ use axum::{
 };
 use dashmap::DashMap;
 use serde_json::Value;
-use std::sync::Arc;
 use tracing::{debug, info, warn};
+
+use crate::{
+    config::{ConnectionMode, RoutingMode},
+    core::{WorkerRegistry, WorkerType},
+    protocols::{
+        chat::ChatCompletionRequest,
+        completion::CompletionRequest,
+        embedding::EmbeddingRequest,
+        classify::ClassifyRequest,
+        generate::GenerateRequest,
+        rerank::RerankRequest,
+        responses::{ResponsesGetParams, ResponsesRequest},
+    },
+    routers::RouterTrait,
+    server::{AppContext, ServerConfig},
+};
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct RouterId(String);

@@ -1,17 +1,10 @@
 //! OpenAI router - main coordinator that delegates to specialized modules
 
-use crate::config::CircuitBreakerConfig;
-use crate::core::{CircuitBreaker, CircuitBreakerConfig as CoreCircuitBreakerConfig};
-use crate::data_connector::{
-    conversation_items::ListParams, conversation_items::SortOrder, ConversationId, ResponseId,
-    SharedConversationItemStorage, SharedConversationStorage, SharedResponseStorage,
+use std::{
+    any::Any,
+    sync::{atomic::AtomicBool, Arc},
 };
-use crate::protocols::spec::{
-    ChatCompletionRequest, ClassifyRequest, CompletionRequest, EmbeddingRequest, GenerateRequest,
-    RerankRequest, ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponsesGetParams,
-    ResponsesRequest,
-};
-use crate::routers::header_utils::apply_request_headers;
+
 use axum::{
     body::Body,
     extract::Request,
@@ -21,10 +14,6 @@ use axum::{
 };
 use futures_util::StreamExt;
 use serde_json::{json, to_value, Value};
-use std::{
-    any::Any,
-    sync::{atomic::AtomicBool, Arc},
-};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::warn;
@@ -35,12 +24,36 @@ use super::conversations::{
     get_conversation, get_conversation_item, list_conversation_items, persist_conversation_items,
     update_conversation,
 };
-use super::mcp::{
-    execute_tool_loop, mcp_manager_from_request_tools, prepare_mcp_payload_for_streaming,
-    McpLoopConfig,
+use super::{
+    mcp::{
+        execute_tool_loop, mcp_manager_from_request_tools, prepare_mcp_payload_for_streaming,
+        McpLoopConfig,
+    },
+    responses::{mask_tools_as_mcp, patch_streaming_response_json},
+    streaming::handle_streaming_response,
 };
-use super::responses::{mask_tools_as_mcp, patch_streaming_response_json};
-use super::streaming::handle_streaming_response;
+use crate::{
+    config::CircuitBreakerConfig,
+    core::{CircuitBreaker, CircuitBreakerConfig as CoreCircuitBreakerConfig},
+    data_connector::{
+        conversation_items::{ListParams, SortOrder},
+        ConversationId, ResponseId, SharedConversationItemStorage, SharedConversationStorage,
+        SharedResponseStorage,
+    },
+    protocols::{
+        chat::ChatCompletionRequest,
+        completion::CompletionRequest,
+        embedding::EmbeddingRequest,
+        classify::ClassifyRequest,
+        generate::GenerateRequest,
+        rerank::RerankRequest,
+        responses::{
+            ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponsesGetParams,
+            ResponsesRequest,
+        },
+    },
+    routers::header_utils::apply_request_headers,
+};
 
 // ============================================================================
 // OpenAIRouter Struct

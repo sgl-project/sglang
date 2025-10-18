@@ -1,17 +1,7 @@
 // PD (Prefill-Decode) gRPC Router Implementation
 
-use crate::config::types::RetryConfig;
-use crate::core::{ConnectionMode, WorkerRegistry, WorkerType};
-use crate::policies::PolicyRegistry;
-use crate::protocols::spec::{
-    ChatCompletionRequest, ClassifyRequest, CompletionRequest, EmbeddingRequest, GenerateRequest,
-    RerankRequest, ResponsesGetParams, ResponsesRequest,
-};
-use crate::reasoning_parser::ParserFactory as ReasoningParserFactory;
-use crate::routers::RouterTrait;
-use crate::server::AppContext;
-use crate::tokenizer::traits::Tokenizer;
-use crate::tool_parser::ParserFactory as ToolParserFactory;
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use axum::{
     body::Body,
@@ -19,12 +9,28 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use std::sync::Arc;
-
 use tracing::debug;
 
-use super::context::SharedComponents;
-use super::pipeline::RequestPipeline;
+use super::{context::SharedComponents, pipeline::RequestPipeline};
+use crate::{
+    config::types::RetryConfig,
+    core::{ConnectionMode, WorkerRegistry, WorkerType},
+    policies::PolicyRegistry,
+    protocols::{
+        chat::ChatCompletionRequest,
+        completion::CompletionRequest,
+        embedding::EmbeddingRequest,
+        classify::ClassifyRequest,
+        generate::GenerateRequest,
+        rerank::RerankRequest,
+        responses::{ResponsesGetParams, ResponsesRequest},
+    },
+    reasoning_parser::ParserFactory as ReasoningParserFactory,
+    routers::RouterTrait,
+    server::AppContext,
+    tokenizer::traits::Tokenizer,
+    tool_parser::ParserFactory as ToolParserFactory,
+};
 
 /// gRPC PD (Prefill-Decode) router implementation for SGLang
 #[derive(Clone)]
