@@ -67,7 +67,7 @@ if _is_hip:
             raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
     else:
         try:
-            import vllm._C
+            import vllm._C  # noqa: F401
         except ImportError:
             raise ImportError("vllm is required when SGLANG_USE_AITER is set to False")
 

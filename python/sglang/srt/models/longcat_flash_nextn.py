@@ -32,14 +32,10 @@
 
 import concurrent.futures
 import logging
-import os
-from enum import IntEnum, auto
-from typing import Any, Dict, Iterable, Optional, Tuple, Union
+from typing import Iterable, Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 from torch import nn
-from tqdm import tqdm
 
 from sglang.srt.configs import LongcatFlashConfig
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -75,7 +71,6 @@ from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.srt.models.longcat_flash import LongcatFlashForCausalLM, LongcatFlashMLP
 from sglang.srt.utils import (
     BumpAllocator,
-    LazyValue,
     add_prefix,
     bind_or_assign,
     cpu_has_amx_support,
@@ -97,13 +92,7 @@ _is_cpu = is_cpu()
 _device_sm = get_device_sm()
 
 if _is_cuda:
-    from sgl_kernel import (
-        awq_dequantize,
-        bmm_fp8,
-        dsv3_fused_a_gemm,
-        dsv3_router_gemm,
-        merge_state_v2,
-    )
+    from sgl_kernel import awq_dequantize
 elif _is_cpu and _is_cpu_amx_available:
     pass
 elif _is_hip:
