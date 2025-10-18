@@ -1403,6 +1403,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 inner_state = self.mla_preprocess.forward(
                     positions, hidden_states, forward_batch, zero_allocator
                 )
+                inner_state = (*inner_state, None)  # add a position for topk_indices
         elif attn_forward_method == AttnForwardMethod.NPU_MLA_SPARSE:
             inner_state = self.forward_npu_sparse_prepare(
                 positions, hidden_states, forward_batch, zero_allocator
