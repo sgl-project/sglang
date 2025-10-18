@@ -69,7 +69,7 @@ suites = {
         TestFile("test_build_eagle_tree.py", 8),
         TestFile("test_chunked_prefill.py", 313),
         TestFile("test_create_kvindices.py", 2),
-        TestFile("test_deterministic.py", 300),
+        TestFile("test_deterministic.py", 320),
         TestFile("test_eagle_infer_a.py", 370),
         TestFile("test_eagle_infer_b.py", 700),
         TestFile("test_eagle_infer_beta.py", 300),

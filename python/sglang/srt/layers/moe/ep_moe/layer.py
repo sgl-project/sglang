@@ -9,6 +9,7 @@ import triton.language as tl
 
 from sglang.srt import single_batch_overlap
 from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
+from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe import (
     get_deepep_mode,
     get_moe_a2a_backend,
@@ -22,7 +23,6 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     tma_align_input_scale,
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import FlashInferFusedMoE, FusedMoE
-from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_kernel import (
