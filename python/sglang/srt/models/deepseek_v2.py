@@ -28,7 +28,6 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt import single_batch_overlap
 from sglang.srt.configs.model_config import (
     get_nsa_index_head_dim,
     get_nsa_index_n_heads,
@@ -48,6 +47,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
+from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.amx_utils import PackWeightMethod
 from sglang.srt.layers.attention.npu_ops.mla_preprocess import (
@@ -82,7 +82,6 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
-from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_kernel import (
     is_fp8_fnuz,
@@ -183,10 +182,9 @@ elif _is_hip:
         awq_dequantize_triton as awq_dequantize,
     )
 elif _is_npu:
-    import custom_ops
-    import sgl_kernel_npu
-    import torch_npu
-
+    import custom_ops  # noqa: F401
+    import sgl_kernel_npu  # noqa: F401
+    import torch_npu  # noqa: F401
     from sglang.srt.layers.quantization.awq_triton import (
         awq_dequantize_decomposition as awq_dequantize,
     )
@@ -199,6 +197,15 @@ _is_cublas_ge_129 = is_nvidia_cublas_cu12_version_ge_12_9()
 
 
 logger = logging.getLogger(__name__)
+
+
+def enable_nextn_moe_bf16_cast_to_fp8(quant_config):
+    return (
+        quant_config is not None
+        and quant_config.get_name() == "modelopt_fp4"
+        and get_moe_a2a_backend().is_deepep()
+    )
+
 
 FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
     "fa3",
@@ -530,6 +537,7 @@ class DeepseekV2MoE(nn.Module):
         self.config = config
         self.layer_id = layer_id
         self.alt_stream = alt_stream
+        self.is_nextn = is_nextn
 
         if self.tp_size > config.n_routed_experts:
             raise ValueError(
@@ -659,6 +667,7 @@ class DeepseekV2MoE(nn.Module):
         self._enable_a2a_moe = (
             get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake()
         )
+        self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
 
     def get_moe_weights(self):
         return [
@@ -750,9 +759,10 @@ class DeepseekV2MoE(nn.Module):
             return self.forward_cpu(hidden_states, should_allreduce_fusion)
 
         if hidden_states.shape[0] > 0:
-            shared_output = self._forward_shared_experts(
-                hidden_states, gemm_output_zero_allocator
-            )
+            if not self._fuse_shared_experts_inside_sbo:
+                shared_output = self._forward_shared_experts(
+                    hidden_states, gemm_output_zero_allocator
+                )
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
             topk_output = self.topk(hidden_states, router_logits)
@@ -760,7 +770,27 @@ class DeepseekV2MoE(nn.Module):
             shared_output = None
             topk_output = self.topk.empty_topk_output(hidden_states.device)
 
-        final_hidden_states = self.experts(hidden_states, topk_output)
+        if self._fuse_shared_experts_inside_sbo:
+            shared_output = None
+
+            def _forward_shared_experts_and_put_results():
+                nonlocal shared_output
+                shared_output = self._forward_shared_experts(
+                    hidden_states, gemm_output_zero_allocator
+                )
+
+        final_hidden_states = self.experts(
+            hidden_states,
+            topk_output,
+            **(
+                dict(
+                    forward_shared_experts=_forward_shared_experts_and_put_results,
+                    alt_stream=self.alt_stream,
+                )
+                if self._fuse_shared_experts_inside_sbo
+                else {}
+            ),
+        )
         if not _is_cuda and not _use_aiter:
             # fused in biased_grouped_topk so we can skip here
             final_hidden_states *= self.routed_scaling_factor
@@ -844,7 +874,7 @@ class DeepseekV2MoE(nn.Module):
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
-            if not SboFlags.fuse_shared_experts_inside_sbo():
+            if not self._fuse_shared_experts_inside_sbo:
                 shared_output = self._forward_shared_experts(hidden_states)
             topk_weights, topk_idx, _ = self.topk(
                 hidden_states,
@@ -859,18 +889,27 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states.device
             )
 
-        final_hidden_states, sbo_shared_output = single_batch_overlap.execute_sbo(
+        if self._fuse_shared_experts_inside_sbo:
+            shared_output = None
+
+            def _forward_shared_experts_and_put_results():
+                nonlocal shared_output
+                shared_output = self._forward_shared_experts(hidden_states)
+
+        final_hidden_states = self.experts(
             hidden_states=hidden_states,
             topk_idx=topk_idx,
             topk_weights=topk_weights,
             forward_batch=forward_batch,
-            # SBO args
-            forward_shared_experts=lambda: self._forward_shared_experts(hidden_states),
-            experts=self.experts,
-            alt_stream=self.alt_stream,
+            **(
+                dict(
+                    forward_shared_experts=_forward_shared_experts_and_put_results,
+                    alt_stream=self.alt_stream,
+                )
+                if self._fuse_shared_experts_inside_sbo
+                else {}
+            ),
         )
-        if sbo_shared_output is not None:
-            shared_output = sbo_shared_output
 
         if shared_output is not None:
             x = shared_output
@@ -2363,6 +2402,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         config: PretrainedConfig,
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
+        moe_quant_config: Optional[QuantizationConfig] = None,
         is_nextn: bool = False,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
@@ -2412,7 +2452,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         if self.is_layer_sparse:
             self.mlp = DeepseekV2MoE(
                 config=config,
-                quant_config=quant_config,
+                quant_config=moe_quant_config or quant_config,
                 prefix=add_prefix("mlp", prefix),
                 layer_id=self.layer_id,
                 alt_stream=alt_stream,
@@ -3091,6 +3131,9 @@ class DeepseekV2ForCausalLM(nn.Module):
         ):
             self._weight_requant_ue8m0(is_nextn)
 
+        if is_nextn and enable_nextn_moe_bf16_cast_to_fp8(self.quant_config):
+            self._transform_scale_nextn_moe_ue8m0()
+
     def _weight_requant_ue8m0(self, is_nextn=False):
         weight_block_size = self.quant_config.weight_block_size
 
@@ -3156,6 +3199,28 @@ class DeepseekV2ForCausalLM(nn.Module):
                         module.weight, module.weight_scale_inv, weight_block_size
                     )
 
+    # TODO avoid code dup (currently combine from weight_requant_ue8m0 and transform_scale_ue8m0)
+    def _transform_scale_nextn_moe_ue8m0(self):
+        layer = self.model.decoder
+
+        shared_experts = getattr(layer.mlp, "shared_experts", None)
+        if shared_experts is not None:
+            for module in [
+                shared_experts.gate_up_proj,
+                shared_experts.down_proj,
+            ]:
+                transform_scale_ue8m0_inplace(
+                    module.weight_scale_inv, mn=module.weight.shape[-2]
+                )
+
+        experts = layer.mlp.experts
+        if isinstance(experts, DeepEPMoE):
+            for w in [
+                experts.w13_weight_fp8,
+                experts.w2_weight_fp8,
+            ]:
+                transform_scale_ue8m0_inplace(w[1], mn=w[0].shape[-2])
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
 
         if is_nextn:
@@ -3170,6 +3235,11 @@ class DeepseekV2ForCausalLM(nn.Module):
                 )
             else:
                 raise ValueError("num_nextn_predict_layers is not in the config")
+
+        if is_nextn and enable_nextn_moe_bf16_cast_to_fp8(self.quant_config):
+            weights = self._quant_nextn_moe_to_fp8_ue8m0(
+                weights, nextn_layer_id=nextn_layer_id
+            )
 
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -3399,6 +3469,38 @@ class DeepseekV2ForCausalLM(nn.Module):
                 future.result()
 
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
+
+    # TODO avoid code dup
+    def _quant_nextn_moe_to_fp8_ue8m0(self, weights, nextn_layer_id: int):
+        weights_dict = dict(weights)
+
+        # temporarily only support DeepSeek V3/R1
+        weight_block_size = [128, 128]
+
+        for layer_id in [nextn_layer_id]:
+            for expert_sub_name in [
+                "shared_experts",
+                *[
+                    f"experts.{expert_id}"
+                    for expert_id in range(self.config.n_routed_experts)
+                ],
+            ]:
+                for stem in [
+                    "gate_proj",
+                    "up_proj",
+                    "down_proj",
+                ]:
+                    partial_name = (
+                        f"model.layers.{layer_id}.mlp.{expert_sub_name}.{stem}"
+                    )
+                    original_weight = weights_dict[f"{partial_name}.weight"]
+                    out_w, out_s = quant_weight_ue8m0(
+                        original_weight, weight_block_size=weight_block_size
+                    )
+                    weights_dict[f"{partial_name}.weight"] = out_w
+                    weights_dict[f"{partial_name}.weight_scale_inv"] = out_s
+
+        return list(weights_dict.items())
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

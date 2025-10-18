@@ -142,6 +142,7 @@ class Envs:
 
     # Model Parallel
     SGLANG_USE_MESSAGE_QUEUE_BROADCASTER = EnvBool(True)
+    SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS = EnvBool(False)
 
     # Constrained Decoding
     SGLANG_DISABLE_OUTLINES_DISK_CACHE = EnvBool(True)
