@@ -41,10 +41,11 @@ pub(super) async fn create_conversation(
                 return (
                     StatusCode::BAD_REQUEST,
                     Json(json!({
-                        "error": format!(
-                            "metadata cannot have more than {} properties",
-                            MAX_METADATA_PROPERTIES
-                        )
+                        "error":
+                            format!(
+                                "metadata cannot have more than {} properties",
+                                MAX_METADATA_PROPERTIES
+                            )
                     })),
                 )
                     .into_response();
@@ -70,7 +71,9 @@ pub(super) async fn create_conversation(
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("Failed to create conversation: {}", e)})),
+            Json(json!({
+                "error": format!("Failed to create conversation: {}", e)
+            })),
         )
             .into_response(),
     }
@@ -97,7 +100,9 @@ pub(super) async fn get_conversation(
             .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("Failed to get conversation: {}", e)})),
+            Json(json!({
+                "error": format!("Failed to get conversation: {}", e)
+            })),
         )
             .into_response(),
     }
@@ -126,7 +131,9 @@ pub(super) async fn update_conversation(
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("Failed to get conversation: {}", e)})),
+                Json(json!({
+                    "error": format!("Failed to get conversation: {}", e)
+                })),
             )
                 .into_response();
         }
@@ -174,10 +181,11 @@ pub(super) async fn update_conversation(
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({
-                "error": format!(
-                    "metadata cannot have more than {} properties",
-                    MAX_METADATA_PROPERTIES
-                )
+                "error":
+                    format!(
+                        "metadata cannot have more than {} properties",
+                        MAX_METADATA_PROPERTIES
+                    )
             })),
         )
             .into_response();
@@ -204,7 +212,9 @@ pub(super) async fn update_conversation(
             .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("Failed to update conversation: {}", e)})),
+            Json(json!({
+                "error": format!("Failed to update conversation: {}", e)
+            })),
         )
             .into_response(),
     }
@@ -232,7 +242,9 @@ pub(super) async fn delete_conversation(
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("Failed to get conversation: {}", e)})),
+                Json(json!({
+                    "error": format!("Failed to get conversation: {}", e)
+                })),
             )
                 .into_response();
         }
@@ -256,7 +268,9 @@ pub(super) async fn delete_conversation(
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("Failed to delete conversation: {}", e)})),
+            Json(json!({
+                "error": format!("Failed to delete conversation: {}", e)
+            })),
         )
             .into_response(),
     }
@@ -286,7 +300,9 @@ pub(super) async fn list_conversation_items(
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("Failed to get conversation: {}", e)})),
+                Json(json!({
+                    "error": format!("Failed to get conversation: {}", e)
+                })),
             )
                 .into_response();
         }
@@ -346,7 +362,7 @@ pub(super) async fn list_conversation_items(
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("Failed to list items: {}", e)})),
+            Json(json!({ "error": format!("Failed to list items: {}", e) })),
         )
             .into_response(),
     }
@@ -417,7 +433,9 @@ pub(super) async fn create_conversation_items(
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("Failed to get conversation: {}", e)})),
+                Json(json!({
+                    "error": format!("Failed to get conversation: {}", e)
+                })),
             )
                 .into_response();
         }
@@ -476,14 +494,18 @@ pub(super) async fn create_conversation_items(
                 Ok(None) => {
                     return (
                         StatusCode::NOT_FOUND,
-                        Json(json!({"error": format!("Referenced item '{}' not found", ref_id)})),
+                        Json(json!({
+                            "error": format!("Referenced item '{}' not found", ref_id)
+                        })),
                     )
                         .into_response();
                 }
                 Err(e) => {
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"error": format!("Failed to get referenced item: {}", e)})),
+                        Json(json!({
+                            "error": format!("Failed to get referenced item: {}", e)
+                        })),
                     )
                         .into_response();
                 }
@@ -517,7 +539,9 @@ pub(super) async fn create_conversation_items(
                 Err(e) => {
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"error": format!("Failed to check item link: {}", e)})),
+                        Json(json!({
+                            "error": format!("Failed to check item link: {}", e)
+                        })),
                     )
                         .into_response();
                 }
@@ -553,7 +577,7 @@ pub(super) async fn create_conversation_items(
                         Err(e) => {
                             return (
                                 StatusCode::BAD_REQUEST,
-                                Json(json!({"error": format!("Invalid item: {}", e)})),
+                                Json(json!({ "error": format!("Invalid item: {}", e) })),
                             )
                                 .into_response();
                         }
@@ -570,7 +594,7 @@ pub(super) async fn create_conversation_items(
                         Err(e) => {
                             return (
                                 StatusCode::INTERNAL_SERVER_ERROR,
-                                Json(json!({"error": format!("Failed to create item: {}", e)})),
+                                Json(json!({ "error": format!("Failed to create item: {}", e) })),
                             )
                                 .into_response();
                         }
@@ -579,7 +603,9 @@ pub(super) async fn create_conversation_items(
                 Err(e) => {
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"error": format!("Failed to check item existence: {}", e)})),
+                        Json(json!({
+                            "error": format!("Failed to check item existence: {}", e)
+                        })),
                     )
                         .into_response();
                 }
@@ -593,7 +619,7 @@ pub(super) async fn create_conversation_items(
                 Err(e) => {
                     return (
                         StatusCode::BAD_REQUEST,
-                        Json(json!({"error": format!("Invalid item: {}", e)})),
+                        Json(json!({ "error": format!("Invalid item: {}", e) })),
                     )
                         .into_response();
                 }
@@ -610,7 +636,7 @@ pub(super) async fn create_conversation_items(
                 Err(e) => {
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"error": format!("Failed to create item: {}", e)})),
+                        Json(json!({ "error": format!("Failed to create item: {}", e) })),
                     )
                         .into_response();
                 }
@@ -678,7 +704,9 @@ pub(super) async fn get_conversation_item(
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("Failed to get conversation: {}", e)})),
+                Json(json!({
+                    "error": format!("Failed to get conversation: {}", e)
+                })),
             )
                 .into_response();
         }
@@ -693,7 +721,9 @@ pub(super) async fn get_conversation_item(
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("Failed to check item link: {}", e)})),
+                Json(json!({
+                    "error": format!("Failed to check item link: {}", e)
+                })),
             )
                 .into_response();
         }
@@ -721,7 +751,7 @@ pub(super) async fn get_conversation_item(
             .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("Failed to get item: {}", e)})),
+            Json(json!({ "error": format!("Failed to get item: {}", e) })),
         )
             .into_response(),
     }
@@ -753,7 +783,9 @@ pub(super) async fn delete_conversation_item(
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("Failed to get conversation: {}", e)})),
+                Json(json!({
+                    "error": format!("Failed to get conversation: {}", e)
+                })),
             )
                 .into_response();
         }
@@ -773,7 +805,7 @@ pub(super) async fn delete_conversation_item(
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("Failed to delete item: {}", e)})),
+            Json(json!({ "error": format!("Failed to delete item: {}", e) })),
         )
             .into_response(),
     }

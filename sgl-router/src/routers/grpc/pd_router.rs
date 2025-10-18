@@ -18,6 +18,7 @@ use crate::{
     policies::PolicyRegistry,
     protocols::{
         chat::ChatCompletionRequest,
+        classify::ClassifyRequest,
         completion::CompletionRequest,
         embedding::EmbeddingRequest,
         generate::GenerateRequest,
@@ -251,6 +252,15 @@ impl RouterTrait for GrpcPDRouter {
     }
 
     async fn cancel_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
+        (StatusCode::NOT_IMPLEMENTED).into_response()
+    }
+
+    async fn route_classify(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _body: &ClassifyRequest,
+        _model_id: Option<&str>,
+    ) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
     }
 

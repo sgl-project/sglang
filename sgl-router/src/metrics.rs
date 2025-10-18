@@ -480,6 +480,26 @@ impl RouterMetrics {
         gauge!("sgl_router_embeddings_queue_size").set(size as f64);
     }
 
+    pub fn record_classify_request() {
+        counter!("sgl_router_classify_total").increment(1);
+    }
+
+    pub fn record_classify_duration(duration: Duration) {
+        histogram!("sgl_router_classify_duration_seconds").record(duration.as_secs_f64());
+    }
+
+    pub fn record_classify_error(error_type: &str) {
+        counter!(
+            "sgl_router_classify_errors_total",
+            "error_type" => error_type.to_string()
+        )
+        .increment(1);
+    }
+
+    pub fn set_classify_queue_size(size: usize) {
+        gauge!("sgl_router_classify_queue_size").set(size as f64);
+    }
+
     pub fn set_running_requests(worker: &str, count: usize) {
         gauge!("sgl_router_running_requests",
             "worker" => worker.to_string()

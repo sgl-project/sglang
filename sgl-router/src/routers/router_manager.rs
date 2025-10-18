@@ -22,6 +22,7 @@ use crate::{
     core::{WorkerRegistry, WorkerType},
     protocols::{
         chat::ChatCompletionRequest,
+        classify::ClassifyRequest,
         completion::CompletionRequest,
         embedding::EmbeddingRequest,
         generate::GenerateRequest,
@@ -329,10 +330,7 @@ impl RouterTrait for RouterManager {
         } else {
             (
                 StatusCode::OK,
-                serde_json::json!({
-                    "models": models
-                })
-                .to_string(),
+                serde_json::json!({ "models": models }).to_string(),
             )
                 .into_response()
         }
@@ -512,6 +510,25 @@ impl RouterTrait for RouterManager {
             (
                 StatusCode::NOT_FOUND,
                 "No router available for rerank request",
+            )
+                .into_response()
+        }
+    }
+
+    async fn route_classify(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ClassifyRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        let router = self.select_router_for_request(headers, Some(&body.model));
+
+        if let Some(router) = router {
+            router.route_classify(headers, body, model_id).await
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                format!("Model '{}' not found or no router available", body.model),
             )
                 .into_response()
         }
