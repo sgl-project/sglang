@@ -251,11 +251,27 @@ def get_generation_config(
     **kwargs,
 ):
     try:
-        return GenerationConfig.from_pretrained(
+        cfg = GenerationConfig.from_pretrained(
             model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
         )
     except OSError as e:
         return None
+
+    explicit_keys = set()
+    json_path = os.path.join(model, "generation_config.json")
+    if os.path.exists(json_path):
+        try:
+            with open(json_path, "r") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    explicit_keys = set(data.keys())
+        except Exception as e:
+            logger.warning(
+                f"Failed to read generation_config.json for explicit keys: {e}"
+            )
+
+    cfg._explicit_keys = explicit_keys
+    return cfg
 
 
 # Qwen-1M related
