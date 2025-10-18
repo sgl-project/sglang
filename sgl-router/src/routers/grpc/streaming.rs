@@ -390,41 +390,152 @@ impl StreamingProcessor {
                 Some(Complete(complete)) => {
                     let index = complete.index;
 
-                    // Flush any remaining text for this index's stop_decoder
-                    if let Some(decoder) = stop_decoders.get_mut(&index) {
-                        if let SequenceDecoderOutput::Text(text) = decoder.flush() {
-                            if !text.is_empty() {
-                                let stream_buffer = stream_buffers.entry(index).or_default();
-                                stream_buffer.push_str(&text);
+                    // Ensure we have a stop decoder for this index
+                    let stop_decoder = stop_decoders.entry(index).or_insert_with(|| {
+                        let (ref stop, ref stop_token_ids, skip_special_tokens, no_stop_trim) =
+                            stop_params;
+                        utils::create_stop_decoder(
+                            &self.tokenizer,
+                            stop.as_ref(),
+                            stop_token_ids.as_ref(),
+                            skip_special_tokens,
+                            no_stop_trim,
+                        )
+                    });
 
-                                let content_chunk = ChatCompletionStreamResponse {
-                                    id: request_id.clone(),
-                                    object: "chat.completion.chunk".to_string(),
+                    // Process any remaining tokens included in the completion message
+                    let (mut chunk_text, _) =
+                        Self::process_chunk_tokens(stop_decoder, &complete.output_ids);
+                    if let SequenceDecoderOutput::Text(flush_text) = stop_decoder.flush() {
+                        if !flush_text.is_empty() {
+                            chunk_text.push_str(&flush_text);
+                        }
+                    }
+
+                    if !chunk_text.is_empty() {
+                        let choice_logprobs =
+                            if let Some(ref proto_logprobs) = complete.output_logprobs {
+                                match utils::convert_proto_to_openai_logprobs(
+                                    proto_logprobs,
+                                    &self.tokenizer,
+                                ) {
+                                    Ok(logprobs) => Some(logprobs),
+                                    Err(e) => {
+                                        warn!("Failed to process completion logprobs: {}", e);
+                                        None
+                                    }
+                                }
+                            } else {
+                                None
+                            };
+
+                        let stream_buffer = stream_buffers.entry(index).or_default();
+
+                        // Emit initial role chunk if this is the first output for the index
+                        if is_firsts.get(&index).copied().unwrap_or(true) {
+                            let first_chunk = ChatCompletionStreamResponse {
+                                id: request_id.clone(),
+                                object: "chat.completion.chunk".to_string(),
+                                created,
+                                model: model.clone(),
+                                system_fingerprint: system_fingerprint.map(|s| s.to_string()),
+                                choices: vec![ChatStreamChoice {
+                                    index,
+                                    delta: ChatMessageDelta {
+                                        role: Some("assistant".to_string()),
+                                        content: None,
+                                        tool_calls: None,
+                                        reasoning_content: None,
+                                    },
+                                    logprobs: None,
+                                    finish_reason: None,
+                                    matched_stop: None,
+                                }],
+                                usage: None,
+                            };
+                            Self::format_sse_chunk_into(&mut sse_buffer, &first_chunk);
+                            tx.send(Ok(Bytes::from(sse_buffer.clone())))
+                                .map_err(|_| "Failed to send first chunk".to_string())?;
+                            is_firsts.insert(index, false);
+                        }
+
+                        // Accumulate and process delta text
+                        let mut delta = chunk_text;
+                        stream_buffer.push_str(&delta);
+
+                        let in_reasoning = if separate_reasoning && reasoning_parser_available {
+                            let (normal_text, reasoning_chunk, in_reasoning) = self
+                                .process_reasoning_stream(
+                                    &delta,
+                                    index,
+                                    &mut reasoning_parsers,
+                                    request_id,
+                                    model,
                                     created,
-                                    model: model.clone(),
-                                    system_fingerprint: system_fingerprint.map(|s| s.to_string()),
-                                    choices: vec![ChatStreamChoice {
-                                        index,
-                                        delta: ChatMessageDelta {
-                                            role: Some("assistant".to_string()),
-                                            content: Some(text),
-                                            tool_calls: None,
-                                            reasoning_content: None,
-                                        },
-                                        logprobs: None,
-                                        finish_reason: None,
-                                        matched_stop: None,
-                                    }],
-                                    usage: None,
-                                };
-
-                                let sse_chunk =
-                                    serde_json::to_string(&content_chunk).map_err(|e| {
-                                        format!("Failed to serialize content chunk: {}", e)
-                                    })?;
-                                tx.send(Ok(Bytes::from(format!("data: {}\n\n", sse_chunk))))
-                                    .map_err(|_| "Failed to send flushed content".to_string())?;
+                                    system_fingerprint,
+                                )
+                                .await;
+                            if let Some(chunk) = reasoning_chunk {
+                                Self::format_sse_chunk_into(&mut sse_buffer, &chunk);
+                                tx.send(Ok(Bytes::from(sse_buffer.clone())))
+                                    .map_err(|_| "Failed to send reasoning chunk".to_string())?;
                             }
+                            delta = normal_text;
+                            in_reasoning
+                        } else {
+                            false
+                        };
+
+                        let mut delta_consumed_by_tools = false;
+                        let tool_choice_enabled =
+                            !matches!(tool_choice, Some(ToolChoice::Value(ToolChoiceValue::None)));
+
+                        if !in_reasoning
+                            && tool_choice_enabled
+                            && tools.is_some()
+                            && tool_parser_available
+                        {
+                            let tool_chunks = self
+                                .process_tool_calls_stream(
+                                    &delta,
+                                    index,
+                                    &mut tool_parsers,
+                                    &mut has_tool_calls,
+                                    tools.as_ref().unwrap(),
+                                    request_id,
+                                    model,
+                                    created,
+                                    system_fingerprint,
+                                    history_tool_calls_count,
+                                )
+                                .await;
+
+                            let has_tool_output = !tool_chunks.is_empty();
+                            for chunk in tool_chunks {
+                                Self::format_sse_chunk_into(&mut sse_buffer, &chunk);
+                                tx.send(Ok(Bytes::from(sse_buffer.clone())))
+                                    .map_err(|_| "Failed to send tool call chunk".to_string())?;
+                            }
+
+                            if has_tool_output {
+                                delta_consumed_by_tools = true;
+                            }
+                        }
+
+                        if !in_reasoning && !delta_consumed_by_tools && !delta.is_empty() {
+                            let content_chunk = Self::create_content_chunk(
+                                delta,
+                                index,
+                                request_id,
+                                model,
+                                created,
+                                system_fingerprint,
+                                choice_logprobs,
+                            );
+                            Self::format_sse_chunk_into(&mut sse_buffer, &content_chunk);
+                            tx.send(Ok(Bytes::from(sse_buffer.clone()))).map_err(|_| {
+                                "Failed to send completion content chunk".to_string()
+                            })?;
                         }
                     }
 
