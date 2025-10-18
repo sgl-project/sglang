@@ -983,7 +983,7 @@ class MaybeTboDeepEPDispatcher:
     def _execute(self, name, tbo_subbatch_index: Optional[int] = None, **kwargs):
         return getattr(self._inners[tbo_subbatch_index or 0], name)(**kwargs)
 
-    def dispatch(self, hidden_states, **kwargs) -> DispatchOutput:
+    def dispatch(self, **kwargs) -> DispatchOutput:
         return self._execute("dispatch", **kwargs)
 
     def dispatch_a(self, **kwargs):
