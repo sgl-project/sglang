@@ -168,6 +168,17 @@ class DeepEPMoE(FusedMoE):
         topk_weights: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
+
+        if (
+            _use_aiter
+            or _is_npu
+            or self.use_w4afp8
+            or get_moe_runner_backend().is_flashinfer_cutedsl()
+        ):
+            pass
+        else:
+            super().forward(hidden_states, topk_idx, topk_weights, forward_batch)
+
         dispatch_output = self.dispatch(
             hidden_states, topk_idx, topk_weights, forward_batch
         )

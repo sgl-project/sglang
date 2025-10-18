@@ -3,15 +3,18 @@ from __future__ import annotations
 
 import inspect
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type
 
 import torch
 from torch import nn
 
+from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
+from sglang.srt.layers.moe.utils import get_moe_runner_backend
+
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
+    from sglang.srt.layers.moe.utils import MoeRunnerBackend
 
 
 class QuantizeMethodBase(ABC):
@@ -96,11 +99,30 @@ class FusedMoEMethodBase(QuantizeMethodBase):
     ):
         raise NotImplementedError
 
-    @abstractmethod
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
-    ):
-        raise NotImplementedError
+    ) -> None:
+        self.moe_runner_config = moe_runner_config
+        moe_runner_backend = get_moe_runner_backend()
+        if moe_runner_backend.is_auto():
+            moe_runner_backend = self.get_default_runner_backend(layer)
+        else:
+            # TODO(cwan): add assertion here
+            assert moe_runner_backend in self.get_supported_runner_backends()
+
+        if moe_runner_backend.is_deep_gemm() or moe_runner_backend.is_triton():
+            self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
+
+    @classmethod
+    @abstractmethod
+    def get_supported_runner_backends(cls) -> List[MoeRunnerBackend]:
+        """List of supported runner backends."""
+        raise NotImplementedError()
+
+    @abstractmethod
+    def get_default_runner_backend(self, layer: torch.nn.Module) -> MoeRunnerBackend:
+        """Get the default runner backend."""
+        raise NotImplementedError()
 
     @abstractmethod
     def apply(
