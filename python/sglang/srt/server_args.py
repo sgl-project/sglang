@@ -90,6 +90,7 @@ QUANTIZATION_CHOICES = [
     "qoq",
     "w4afp8",
     "mxfp4",
+    "w4a8_machete",
 ]
 
 ATTENTION_BACKEND_CHOICES = [
