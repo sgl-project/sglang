@@ -23,7 +23,7 @@ import heapq
 import time
 from collections import defaultdict
 from functools import lru_cache, partial
-from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Iterator, List, Optional, Tuple, Union
 
 import torch
 
