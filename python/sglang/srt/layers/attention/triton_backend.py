@@ -880,7 +880,17 @@ class TritonAttnBackend(AttentionBackend):
             # Compute window start positions (absolute position of first key in window)
             # window_start_pos = seq_len - window_len
             window_kv_lens = prefix_kv_indptr[1 : bs + 1] - prefix_kv_indptr[:bs]
-            window_start_pos = forward_batch.extend_prefix_lens[:bs] - window_kv_lens
+            # Handle TARGET_VERIFY mode where extend_prefix_lens might not be set
+            if forward_batch.extend_prefix_lens is not None:
+                window_start_pos = forward_batch.extend_prefix_lens[:bs] - window_kv_lens
+            else:
+                # Infer from spec_info: prefix_len = seq_len - draft_token_num
+                if (forward_batch.spec_info is not None and 
+                    hasattr(forward_batch.spec_info, 'draft_token_num')):
+                    extend_prefix_lens = forward_batch.seq_lens[:bs] - forward_batch.spec_info.draft_token_num
+                    window_start_pos = extend_prefix_lens - window_kv_lens
+                else:
+                    window_start_pos = None
         else:
             sliding_window_size = -1
             prefix_kv_indptr = self.forward_metadata.kv_indptr
@@ -890,12 +900,41 @@ class TritonAttnBackend(AttentionBackend):
         # Build unified kv_indices using fused Triton kernel
         extend_kv_indices = forward_batch.out_cache_loc
 
+        # Handle cases where extend_seq_lens or extend_start_loc might not be set
+        # In speculative decoding, we can infer these from spec_info or compute them
+        if forward_batch.extend_seq_lens is None:
+            # TARGET_VERIFY mode: infer extend_seq_lens from spec_info
+            if (forward_batch.spec_info is not None and 
+                hasattr(forward_batch.spec_info, 'draft_token_num')):
+                draft_token_num = forward_batch.spec_info.draft_token_num
+                extend_seq_lens = torch.full(
+                    (bs,), draft_token_num, dtype=torch.int32, device=self.device
+                )
+            else:
+                raise RuntimeError(
+                    "extend_seq_lens is None but cannot infer from spec_info. "
+                    "This should not happen in TARGET_VERIFY mode."
+                )
+        else:
+            extend_seq_lens = forward_batch.extend_seq_lens
+        
+        # Check extend_start_loc separately - it might be None even when extend_seq_lens is set
+        if forward_batch.extend_start_loc is None:
+            # Compute extend_start_loc from extend_seq_lens
+            # extend_start_loc[i] = sum(extend_seq_lens[0:i])
+            extend_start_loc = torch.cat([
+                torch.zeros(1, dtype=torch.int32, device=self.device),
+                torch.cumsum(extend_seq_lens[:-1], dim=0)
+            ])
+        else:
+            extend_start_loc = forward_batch.extend_start_loc
+
         unified_kv_indptr, unified_kv_indices, prefix_lens = (
             self.build_unified_kv_indices(
                 prefix_kv_indptr,
                 prefix_kv_indices,
-                forward_batch.extend_start_loc,
-                forward_batch.extend_seq_lens,
+                extend_start_loc,
+                extend_seq_lens,
                 extend_kv_indices,
                 bs,
             )
@@ -915,6 +954,8 @@ class TritonAttnBackend(AttentionBackend):
             unified_kv_indices,
             prefix_lens,
             self.forward_metadata.max_extend_len,
+            custom_mask=self.forward_metadata.custom_mask,
+            mask_indptr=self.forward_metadata.mask_indptr,
             sm_scale=layer.scaling,
             logit_cap=logits_soft_cap,
             is_causal=causal,
