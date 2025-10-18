@@ -761,6 +761,37 @@ class EmbeddingObject(BaseModel):
     object: str = "embedding"
 
 
+ClassifyInput = Union[str, List[str], List[int]]
+
+
+class ClassifyRequest(BaseModel):
+    # OpenAI-compatible classification request
+    model: str = DEFAULT_MODEL_NAME
+    input: ClassifyInput
+    user: Optional[str] = None
+
+    # The request id.
+    rid: Optional[Union[List[str], str]] = None
+    # Priority for the request
+    priority: Optional[int] = None
+
+
+class ClassifyData(BaseModel):
+    index: int
+    label: str
+    probs: List[float]
+    num_classes: int
+
+
+class ClassifyResponse(BaseModel):
+    id: str
+    object: str = "list"
+    created: int
+    model: str
+    data: List[ClassifyData]
+    usage: UsageInfo
+
+
 class EmbeddingResponse(BaseModel):
     data: List[EmbeddingObject]
     model: str
@@ -844,6 +875,7 @@ OpenAIServingRequest = Union[
     ChatCompletionRequest,
     CompletionRequest,
     EmbeddingRequest,
+    ClassifyRequest,
     ScoringRequest,
     V1RerankReqInput,
     TokenizeRequest,
