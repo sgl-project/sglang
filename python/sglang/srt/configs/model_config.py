@@ -557,16 +557,9 @@ class ModelConfig:
     def _is_already_quantized(self) -> bool:
         """Check if the model is already quantized based on config files."""
         # Check for HuggingFace quantization config
-        if is_remote_url(self.model_path):
-            try:
-                from huggingface_hub import HfApi
+        from sglang.srt.utils import has_hf_quant_config
 
-                hf_api = HfApi()
-                return hf_api.file_exists(self.model_path, "hf_quant_config.json")
-            except Exception:
-                return False
-        else:
-            return os.path.exists(os.path.join(self.model_path, "hf_quant_config.json"))
+        return has_hf_quant_config(self.model_path)
 
     def _get_modelopt_quant_type(self) -> str:
         """Extract ModelOpt quantization type from unified quantization flag."""
