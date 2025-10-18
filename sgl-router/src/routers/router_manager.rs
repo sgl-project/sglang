@@ -22,9 +22,9 @@ use crate::{
     core::{WorkerRegistry, WorkerType},
     protocols::{
         chat::ChatCompletionRequest,
+        classify::ClassifyRequest,
         completion::CompletionRequest,
         embedding::EmbeddingRequest,
-        classify::ClassifyRequest,
         generate::GenerateRequest,
         rerank::RerankRequest,
         responses::{ResponsesGetParams, ResponsesRequest},

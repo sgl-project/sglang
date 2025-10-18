@@ -13,9 +13,9 @@ use serde_json::Value;
 
 use crate::protocols::{
     chat::ChatCompletionRequest,
+    classify::ClassifyRequest,
     completion::CompletionRequest,
     embedding::EmbeddingRequest,
-    classify::ClassifyRequest,
     generate::GenerateRequest,
     rerank::RerankRequest,
     responses::{ResponsesGetParams, ResponsesRequest},

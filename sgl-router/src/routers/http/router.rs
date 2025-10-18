@@ -24,10 +24,10 @@ use crate::{
     policies::PolicyRegistry,
     protocols::{
         chat::ChatCompletionRequest,
+        classify::ClassifyRequest,
         common::GenerationRequest,
         completion::CompletionRequest,
         embedding::EmbeddingRequest,
-        classify::ClassifyRequest,
         generate::GenerateRequest,
         rerank::{RerankRequest, RerankResponse, RerankResult},
         responses::{ResponsesGetParams, ResponsesRequest},

@@ -2,10 +2,10 @@
 // This module provides a structured approach to handling different API protocols
 
 pub mod chat;
+pub mod classify;
 pub mod common;
 pub mod completion;
 pub mod embedding;
-pub mod classify;
 pub mod generate;
 pub mod rerank;
 pub mod responses;
