@@ -131,9 +131,6 @@ class GrpcRequestManager:
 
         # State Management (from TokenizerManager)
         self.rid_to_state: Dict[str, GrpcReqState] = {}
-        self.rid_to_state_lock = (
-            asyncio.Lock()
-        )  # Protect dictionary from race conditions
         self.asyncio_tasks: set = set()
         self.gracefully_exit = False
         self.no_create_loop = False
@@ -311,8 +308,7 @@ class GrpcRequestManager:
             state.session_id = obj.session_params.session_id
             state.is_session_request = True
 
-        async with self.rid_to_state_lock:
-            self.rid_to_state[request_id] = state
+        self.rid_to_state[request_id] = state
         self.record_request_for_crash_dump(obj)
 
         try:
@@ -344,13 +340,12 @@ class GrpcRequestManager:
 
         finally:
             # Always clean up request state when exiting
-            await self._cleanup_request_state(request_id)
+            self._cleanup_request_state(request_id)
 
-    async def _cleanup_request_state(self, request_id: str):
+    def _cleanup_request_state(self, request_id: str):
         """Clean up local request state (does not notify scheduler)."""
-        async with self.rid_to_state_lock:
-            if request_id in self.rid_to_state:
-                del self.rid_to_state[request_id]
+        if request_id in self.rid_to_state:
+            del self.rid_to_state[request_id]
 
     async def embedding_request(
         self,
@@ -379,8 +374,7 @@ class GrpcRequestManager:
         )
 
         # Register state
-        async with self.rid_to_state_lock:
-            self.rid_to_state[request_id] = state
+        self.rid_to_state[request_id] = state
 
         # Create future for result
         future = asyncio.Future()
@@ -389,8 +383,7 @@ class GrpcRequestManager:
         try:
             await self._send_to_scheduler(obj)
         except Exception as e:
-            async with self.rid_to_state_lock:
-                del self.rid_to_state[request_id]
+            del self.rid_to_state[request_id]
             future.set_exception(e)
             return future
 
@@ -404,9 +397,8 @@ class GrpcRequestManager:
                 future.set_exception(e)
             finally:
                 # Clean up
-                async with self.rid_to_state_lock:
-                    if request_id in self.rid_to_state:
-                        del self.rid_to_state[request_id]
+                if request_id in self.rid_to_state:
+                    del self.rid_to_state[request_id]
 
         asyncio.create_task(wait_for_result())
         return future
@@ -422,12 +414,11 @@ class GrpcRequestManager:
             return False
 
         # Mark state as finished immediately to stop processing scheduler outputs
-        async with self.rid_to_state_lock:
-            state = self.rid_to_state.get(request_id)
-            if state:
-                state.finished = True
-                state.stream_finished = True
-                logger.debug(f"Marked request {request_id} as aborted locally")
+        state = self.rid_to_state.get(request_id)
+        if state:
+            state.finished = True
+            state.stream_finished = True
+            logger.debug(f"Marked request {request_id} as aborted locally")
 
         # Send abort to scheduler - the scheduler will send AbortReq back
         # which will be handled by _handle_abort_req
@@ -548,11 +539,10 @@ class GrpcRequestManager:
 
         # Process each request in the batch
         for i, rid in enumerate(batch_out.rids):
-            # Acquire lock to safely check and retrieve state
-            async with self.rid_to_state_lock:
-                if rid not in self.rid_to_state:
-                    continue
-                state = self.rid_to_state[rid]
+            if rid not in self.rid_to_state:
+                continue
+
+            state = self.rid_to_state[rid]
 
             # Skip if already aborted/finished locally (client cancelled)
             if state.finished:
@@ -666,9 +656,8 @@ class GrpcRequestManager:
                 # Remove from tracking after a delay
                 async def cleanup(request_id):
                     await asyncio.sleep(5.0)
-                    async with self.rid_to_state_lock:
-                        if request_id in self.rid_to_state:
-                            del self.rid_to_state[request_id]
+                    if request_id in self.rid_to_state:
+                        del self.rid_to_state[request_id]
 
                 cleanup_tasks.append(asyncio.create_task(cleanup(rid)))
 
@@ -679,11 +668,10 @@ class GrpcRequestManager:
     async def _handle_embedding_output(self, batch_out: BatchEmbeddingOutput):
         """Handle batch embedding output from scheduler."""
         for i, rid in enumerate(batch_out.rids):
-            # Acquire lock to safely check and retrieve state
-            async with self.rid_to_state_lock:
-                if rid not in self.rid_to_state:
-                    continue
-                state = self.rid_to_state[rid]
+            if rid not in self.rid_to_state:
+                continue
+
+            state = self.rid_to_state[rid]
 
             # Create result
             result = {
@@ -709,12 +697,11 @@ class GrpcRequestManager:
         """Handle health check output from scheduler."""
         rid = health_out.rid
 
-        # Acquire lock to safely check and retrieve state
-        async with self.rid_to_state_lock:
-            if rid not in self.rid_to_state:
-                logger.warning(f"Health check output for unknown request: {rid}")
-                return
-            state = self.rid_to_state[rid]
+        if rid not in self.rid_to_state:
+            logger.warning(f"Health check output for unknown request: {rid}")
+            return
+
+        state = self.rid_to_state[rid]
 
         # Create health check result
         result = {
@@ -750,13 +737,13 @@ class GrpcRequestManager:
             return
 
         # Check if request still exists
-        async with self.rid_to_state_lock:
-            if recv_obj.rid not in self.rid_to_state:
-                logger.debug(
-                    f"Abort request for {recv_obj.rid} not in local state (may have already finished or not started yet)"
-                )
-                return
-            state = self.rid_to_state[recv_obj.rid]
+        if recv_obj.rid not in self.rid_to_state:
+            logger.debug(
+                f"Abort request for {recv_obj.rid} not in local state (may have already finished or not started yet)"
+            )
+            return
+
+        state = self.rid_to_state[recv_obj.rid]
 
         # Mark as finished
         state.finished = True
