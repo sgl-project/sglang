@@ -35,7 +35,6 @@ from sglang.srt.managers.io_struct import (
     BatchStrOutput,
     BatchTokenIDOutput,
     MultiTokenizerRegisterReq,
-    MultiTokenizerWrapper,
 )
 from sglang.srt.managers.tokenizer_communicator_mixin import _Communicator
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -359,17 +358,18 @@ def _handle_output_by_index(output, i):
     return new_output
 
 
+def get_worker_ids_from_req_rids(rids):
+    if isinstance(rids, list):
+        worker_ids = [int(rid.split("_")[0]) for rid in rids]
+    elif isinstance(rids, str):
+        worker_ids = [int(rids.split("_")[0])]
+    else:
+        worker_ids = []
+    return worker_ids
+
+
 class MultiHttpWorkerDetokenizerMixin:
     """Mixin class for DetokenizerManager"""
-
-    def get_worker_ids_from_req_rids(self, rids):
-        if isinstance(rids, list):
-            worker_ids = [int(rid.split("_")[0]) for rid in rids]
-        elif isinstance(rids, str):
-            worker_ids = [int(rids.split("_")[0])]
-        else:
-            worker_ids = []
-        return worker_ids
 
     def maybe_clear_socket_mapping(self):
         if hasattr(self, "socket_mapping"):
@@ -385,7 +385,7 @@ class MultiHttpWorkerDetokenizerMixin:
                 continue
             # Extract worker_id from rid
             if isinstance(recv_obj.rids, list):
-                worker_ids = self.get_worker_ids_from_req_rids(recv_obj.rids)
+                worker_ids = get_worker_ids_from_req_rids(recv_obj.rids)
             else:
                 raise RuntimeError(
                     f"for tokenizer_worker_num > 1, recv_obj.rids must be a list"
@@ -450,25 +450,25 @@ class MultiTokenizerRouter:
 
     async def _distribute_result_to_workers(self, recv_obj):
         """Distribute result to corresponding workers based on rid"""
-        if isinstance(recv_obj, MultiTokenizerWrapper):
-            worker_ids = [recv_obj.worker_id]
-            recv_obj = recv_obj.obj
-        else:
-            worker_ids = self.get_worker_ids_from_req_rids(recv_obj.rids)
+        if hasattr(recv_obj, "rids"):
+            rids = recv_obj.rids
+        elif hasattr(recv_obj, "rid"):
+            rids = recv_obj.rid
+        if rids is not None:
+            worker_ids = get_worker_ids_from_req_rids(rids)
+            if len(worker_ids) == 0:
+                logger.error(f"Cannot find worker_id from rids {rids}")
+                return
 
-        if len(worker_ids) == 0:
-            logger.error(f"Cannot find worker_id from rids {recv_obj.rids}")
-            return
-
-        # Distribute result to each worker
-        for i, worker_id in enumerate(worker_ids):
-            if isinstance(recv_obj, MultiTokenizerRegisterReq):
-                self.socket_mapping.register_ipc_mapping(
-                    recv_obj, worker_id, is_tokenizer=True
-                )
-            else:
-                new_recv_obj = _handle_output_by_index(recv_obj, i)
-                self.socket_mapping.send_output(worker_id, new_recv_obj)
+            # Distribute result to each worker
+            for i, worker_id in enumerate(worker_ids):
+                if isinstance(recv_obj, MultiTokenizerRegisterReq):
+                    self.socket_mapping.register_ipc_mapping(
+                        recv_obj, worker_id, is_tokenizer=True
+                    )
+                else:
+                    new_recv_obj = _handle_output_by_index(recv_obj, i)
+                    self.socket_mapping.send_output(worker_id, new_recv_obj)
 
 
 class TokenizerWorker(TokenizerManager):
