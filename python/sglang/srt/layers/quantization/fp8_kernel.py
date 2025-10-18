@@ -23,7 +23,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.quantization import deep_gemm_wrapper
+from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.utils import (
     align,
     direct_register_custom_op,

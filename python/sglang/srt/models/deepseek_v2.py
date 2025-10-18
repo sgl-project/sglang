@@ -26,10 +26,8 @@ from typing import Any, Dict, Iterable, Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 from torch import nn
-from tqdm import tqdm, trange
 from transformers import PretrainedConfig
 
-from sglang.srt import single_batch_overlap
 from sglang.srt.configs.model_config import (
     get_nsa_index_head_dim,
     get_nsa_index_n_heads,
@@ -49,6 +47,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
+from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.amx_utils import PackWeightMethod
 from sglang.srt.layers.attention.npu_ops.mla_preprocess import (
@@ -83,7 +82,6 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
-from sglang.srt.layers.quantization import Fp8Config, deep_gemm_wrapper
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_kernel import (
     is_fp8_fnuz,
@@ -873,7 +871,7 @@ class DeepseekV2MoE(nn.Module):
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
-            if not SboFlags.fuse_shared_experts_inside_sbo():
+            if not self._fuse_shared_experts_inside_sbo:
                 shared_output = self._forward_shared_experts(hidden_states)
             topk_weights, topk_idx, _ = self.topk(
                 hidden_states,
@@ -888,18 +886,27 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states.device
             )
 
-        final_hidden_states, sbo_shared_output = single_batch_overlap.execute_sbo(
+        if self._fuse_shared_experts_inside_sbo:
+            shared_output = None
+
+            def _forward_shared_experts_and_put_results():
+                nonlocal shared_output
+                shared_output = self._forward_shared_experts(hidden_states)
+
+        final_hidden_states = self.experts(
             hidden_states=hidden_states,
             topk_idx=topk_idx,
             topk_weights=topk_weights,
             forward_batch=forward_batch,
-            # SBO args
-            forward_shared_experts=lambda: self._forward_shared_experts(hidden_states),
-            experts=self.experts,
-            alt_stream=self.alt_stream,
+            **(
+                dict(
+                    forward_shared_experts=_forward_shared_experts_and_put_results,
+                    alt_stream=self.alt_stream,
+                )
+                if self._fuse_shared_experts_inside_sbo
+                else {}
+            ),
         )
-        if sbo_shared_output is not None:
-            shared_output = sbo_shared_output
 
         if shared_output is not None:
             x = shared_output
