@@ -3,15 +3,21 @@
 //! Provides non-blocking worker management by queuing operations and processing
 //! them asynchronously in background worker tasks.
 
-use crate::core::WorkerManager;
-use crate::protocols::worker_spec::{JobStatus, WorkerConfigRequest};
-use crate::server::AppContext;
+use std::{
+    sync::{Arc, Weak},
+    time::{Duration, SystemTime},
+};
+
 use dashmap::DashMap;
 use metrics::{counter, gauge, histogram};
-use std::sync::{Arc, Weak};
-use std::time::{Duration, SystemTime};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
+
+use crate::{
+    core::WorkerManager,
+    protocols::worker_spec::{JobStatus, WorkerConfigRequest},
+    server::AppContext,
+};
 
 /// Job types for control plane operations
 #[derive(Debug, Clone)]

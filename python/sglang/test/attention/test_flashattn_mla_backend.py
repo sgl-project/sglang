@@ -4,7 +4,6 @@ import torch
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
-from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
