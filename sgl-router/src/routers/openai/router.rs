@@ -33,7 +33,7 @@ use super::{
     },
     responses::{mask_tools_as_mcp, patch_streaming_response_json},
     streaming::handle_streaming_response,
-    utils::{apply_provider_headers, probe_endpoint_for_model},
+    utils::{apply_provider_headers, extract_auth_header, probe_endpoint_for_model},
 };
 use crate::{
     config::CircuitBreakerConfig,
@@ -103,8 +103,8 @@ impl OpenAIRouter {
     /// Maximum number of conversation items to attach as input when a conversation is provided
     const MAX_CONVERSATION_HISTORY_ITEMS: usize = 100;
 
-    /// Model discovery cache TTL (1 hour)
-    const MODEL_CACHE_TTL_SECS: u64 = 3600;
+    /// Model discovery cache TTL (10 minutes)
+    const MODEL_CACHE_TTL_SECS: u64 = 600;
 
     /// Create a new OpenAI router
     pub async fn new(
@@ -190,13 +190,16 @@ impl OpenAIRouter {
 
         // Probe all endpoints in parallel
         let mut handles = vec![];
-        for url in &self.worker_urls {
-            let url = url.clone();
-            let model = model_id.to_string();
-            let auth = auth_header.map(|s| s.to_string());
-            let client = self.client.clone();
+        let model = model_id.to_string();
+        let auth = auth_header.map(|s| s.to_string());
 
-            let handle = tokio::spawn(probe_endpoint_for_model(client, url, model, auth));
+        for url in &self.worker_urls {
+            let handle = tokio::spawn(probe_endpoint_for_model(
+                self.client.clone(),
+                url.clone(),
+                model.clone(),
+                auth.clone(),
+            ));
             handles.push(handle);
         }
 
@@ -397,7 +400,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         let mut errors = Vec::new();
         for handle in handles {
             match handle.await {
-                Ok(Ok(())) => continue,
+                Ok(Ok(())) => (),
                 Ok(Err(e)) => errors.push(e),
                 Err(e) => errors.push(format!("Task join error: {}", e)),
             }
@@ -534,11 +537,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         }
 
         // Extract auth header
-        let auth = headers.and_then(|h| {
-            h.get("authorization")
-                .or_else(|| h.get("Authorization"))
-                .and_then(|v| v.to_str().ok())
-        });
+        let auth = extract_auth_header(headers);
 
         // Find endpoint for model
         let base_url = match self
@@ -688,11 +687,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         model_id: Option<&str>,
     ) -> Response {
         // Extract auth header
-        let auth = headers.and_then(|h| {
-            h.get("authorization")
-                .or_else(|| h.get("Authorization"))
-                .and_then(|v| v.to_str().ok())
-        });
+        let auth = extract_auth_header(headers);
 
         // Find endpoint for model (use model_id if provided, otherwise use body.model)
         let model = model_id.unwrap_or(body.model.as_str());

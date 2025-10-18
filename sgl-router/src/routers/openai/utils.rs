@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use axum::http::HeaderValue;
+use axum::http::{HeaderMap, HeaderValue};
 
 // ============================================================================
 // SSE Event Type Constants
@@ -99,6 +99,16 @@ impl OutputIndexMapper {
 // Provider Detection and Header Handling
 // ============================================================================
 
+/// Extract authorization header from request headers
+/// Checks both "authorization" and "Authorization" (case variations)
+pub fn extract_auth_header(headers: Option<&HeaderMap>) -> Option<&str> {
+    headers.and_then(|h| {
+        h.get("authorization")
+            .or_else(|| h.get("Authorization"))
+            .and_then(|v| v.to_str().ok())
+    })
+}
+
 /// API provider types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApiProvider {
@@ -186,10 +196,24 @@ pub async fn probe_endpoint_for_model(
                 );
                 Ok(url)
             } else {
+                debug!(
+                    url = %url,
+                    model = %model,
+                    status = %status,
+                    "Model not found on endpoint (unsuccessful status)"
+                );
                 Err(())
             }
         }
-        Err(_) => Err(()),
+        Err(e) => {
+            debug!(
+                url = %url,
+                model = %model,
+                error = %e,
+                "Probe request to endpoint failed"
+            );
+            Err(())
+        }
     }
 }
 
