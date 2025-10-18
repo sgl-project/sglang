@@ -488,37 +488,42 @@ class ModelConfig:
             if not is_local:
                 import huggingface_hub
 
-                try:
-                    from huggingface_hub import HfApi, hf_hub_download
-
-                    hf_api = HfApi()
-                    # Retry HF API call up to 3 times
-                    file_exists = retry(
-                        lambda: hf_api.file_exists(
-                            self.model_path, "hf_quant_config.json"
-                        ),
-                        max_retry=2,
-                        initial_delay=1.0,
-                        max_delay=5.0,
-                    )
-                    if file_exists:
-                        # Download and parse the quantization config for remote models
-                        quant_config_file = hf_hub_download(
-                            repo_id=self.model_path,
-                            filename="hf_quant_config.json",
-                            revision=self.revision,
-                        )
-                        with open(quant_config_file) as f:
-                            quant_config_dict = json.load(f)
-                        quant_cfg = self._parse_modelopt_quant_config(quant_config_dict)
-                except huggingface_hub.errors.OfflineModeIsEnabled:
+                # Skip HF check if offline mode is enabled
+                if huggingface_hub.constants.HF_HUB_OFFLINE:
                     logger.warning(
                         "Offline mode is enabled, skipping hf_quant_config.json check"
                     )
-                except Exception as e:
-                    logger.warning(
-                        f"Failed to check hf_quant_config.json: {self.model_path} {e}"
-                    )
+                    pass
+                else:
+                    try:
+                        from huggingface_hub import HfApi, hf_hub_download
+
+                        hf_api = HfApi()
+                        # Retry HF API call up to 3 times
+                        file_exists = retry(
+                            lambda: hf_api.file_exists(
+                                self.model_path, "hf_quant_config.json"
+                            ),
+                            max_retry=2,
+                            initial_delay=1.0,
+                            max_delay=5.0,
+                        )
+                        if file_exists:
+                            # Download and parse the quantization config for remote models
+                            quant_config_file = hf_hub_download(
+                                repo_id=self.model_path,
+                                filename="hf_quant_config.json",
+                                revision=self.revision,
+                            )
+                            with open(quant_config_file) as f:
+                                quant_config_dict = json.load(f)
+                            quant_cfg = self._parse_modelopt_quant_config(
+                                quant_config_dict
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            f"Failed to check hf_quant_config.json: {self.model_path} {e}"
+                        )
             elif os.path.exists(os.path.join(self.model_path, "hf_quant_config.json")):
                 quant_config_file = os.path.join(
                     self.model_path, "hf_quant_config.json"
