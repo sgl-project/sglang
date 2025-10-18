@@ -1,25 +1,23 @@
 import logging
 from functools import lru_cache
 from typing import Iterable, Optional, Tuple
+
 import torch.nn as nn
 from transformers.models.glm4v_moe.configuration_glm4v_moe import Glm4vMoeConfig
 
-from sglang.srt.distributed import (
-    get_moe_expert_parallel_world_size,
-    get_tensor_model_parallel_world_size,
-)
+from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.glm4_moe import Glm4MoeModel
 from sglang.srt.models.glm4v import Glm4vForConditionalGeneration, Glm4vVisionModel
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, is_cuda, log_info_on_rank0
+from sglang.srt.utils import add_prefix, is_cuda
 from sglang.srt.utils.hf_transformers_utils import get_processor
-from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
 _is_cuda = is_cuda()
 
