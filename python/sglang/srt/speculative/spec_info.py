@@ -28,7 +28,6 @@ class SpeculativeAlgorithm(IntEnum):
     def is_ngram(self):
         return self == SpeculativeAlgorithm.NGRAM
 
-    @lru_cache(maxsize=None)
     @staticmethod
     def from_string(name: str):
         name_map = {

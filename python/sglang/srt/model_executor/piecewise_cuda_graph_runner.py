@@ -55,22 +55,20 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
-# Detect whether the current forward pass is in capture mode
-is_capture_mode = False
+_in_piecewise_cuda_graph = False
 
-
-def get_is_capture_mode():
-    return is_capture_mode
+def is_in_piecewise_cuda_graph():
+    return _in_piecewise_cuda_graph
 
 
 @contextmanager
-def model_capture_mode():
-    global is_capture_mode
-    is_capture_mode = True
+def enable_piecewise_cuda_graph():
+    global _in_piecewise_cuda_graph
+    _in_piecewise_cuda_graph = True
 
     yield
 
-    is_capture_mode = False
+    _in_piecewise_cuda_graph = False
 
 
 @contextmanager
@@ -124,6 +122,13 @@ def set_global_graph_memory_pool(val):
     global global_graph_memory_pool
     global_graph_memory_pool = val
 
+def set_torch_compile_config():
+    import torch._dynamo.config
+
+    # Resolve torch._dynamo.exc.FailOnRecompileLimitHit
+    torch._dynamo.config.accumulated_cache_size_limit = 1024
+    if hasattr(torch._dynamo.config, "cache_size_limit"):
+        torch._dynamo.config.cache_size_limit = 1024
 
 class PiecewiseCudaGraphRunner:
     """A PiecewiseCudaGraphRunner runs the forward pass of a model with cuda graph and torch.compile."""
@@ -141,6 +146,8 @@ class PiecewiseCudaGraphRunner:
 
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
+
+        set_torch_compile_config()
 
         assert (
             self.model_runner.server_args.piecewise_cuda_graph_tokens is not None
@@ -184,28 +191,28 @@ class PiecewiseCudaGraphRunner:
         # Set graph pool id globally to be able to use symmetric memory
         set_graph_pool_id(get_global_graph_memory_pool())
 
-        with patch_model(
-            self.model_runner.model.model, self.compile_config.compiler
-        ) as patched_model:
-            install_torch_compiled(
-                patched_model,
-                fullgraph=True,
-                dynamic_arg_dims=None,
-                compile_config=self.compile_config,
-                graph_pool=get_global_graph_memory_pool(),
-            )
-
-            with set_compiled(True):
-                self.warmup_and_capture()
-
-            # Capture
-            try:
-                with model_capture_mode():
-                    self.capture()
-            except RuntimeError as e:
-                raise Exception(
-                    f"Capture cuda graph failed: {e}\n{PIECEWISE_CUDA_GRAPH_CAPTURE_FAILED_MSG}"
+        with enable_piecewise_cuda_graph():
+            with patch_model(
+                self.model_runner.model.model, self.compile_config.compiler
+            ) as patched_model:
+                install_torch_compiled(
+                    patched_model,
+                    fullgraph=True,
+                    dynamic_arg_dims=None,
+                    compile_config=self.compile_config,
+                    graph_pool=get_global_graph_memory_pool(),
                 )
+
+                with set_compiled(True):
+                    self.warmup_and_capture()
+
+                # Capture
+                try:
+                    self.capture()
+                except RuntimeError as e:
+                    raise Exception(
+                        f"Capture cuda graph failed: {e}\n{PIECEWISE_CUDA_GRAPH_CAPTURE_FAILED_MSG}"
+                    )
 
         self.raw_num_tokens = 0
 
@@ -247,6 +254,9 @@ class PiecewiseCudaGraphRunner:
                 global_forward_mode=ForwardMode.EXTEND,
                 lora_ids=None,
             )
+        
+        # Attention backend
+        self.model_runner.attn_backend.init_forward_metadata(forward_batch)
 
         with set_forward_context(forward_batch, self.attention_layers):
             _ = self.model_runner.model.forward(
@@ -471,29 +481,30 @@ class PiecewiseCudaGraphRunner:
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
         static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
         # Replay
-        with set_forward_context(static_forward_batch, self.attention_layers):
-            with set_compiled(True):
-                output = self.model_runner.model.forward(
-                    static_forward_batch.input_ids,
-                    static_forward_batch.positions,
-                    static_forward_batch,
-                    **kwargs,
-                )
-            if isinstance(output, LogitsProcessorOutput):
-                return LogitsProcessorOutput(
-                    next_token_logits=output.next_token_logits[: self.raw_num_tokens],
-                    hidden_states=(
-                        output.hidden_states[: self.raw_num_tokens]
-                        if output.hidden_states is not None
-                        else None
-                    ),
-                )
-            else:
-                assert isinstance(output, PPProxyTensors)
-                # TODO(Yuwei): support PP Support
-                raise NotImplementedError(
-                    "PPProxyTensors is not supported in PiecewiseCudaGraphRunner yet."
-                )
+        with enable_piecewise_cuda_graph():
+            with set_forward_context(static_forward_batch, self.attention_layers):
+                with set_compiled(True):
+                    output = self.model_runner.model.forward(
+                        static_forward_batch.input_ids,
+                        static_forward_batch.positions,
+                        static_forward_batch,
+                        **kwargs,
+                    )
+                if isinstance(output, LogitsProcessorOutput):
+                    return LogitsProcessorOutput(
+                        next_token_logits=output.next_token_logits[: self.raw_num_tokens],
+                        hidden_states=(
+                            output.hidden_states[: self.raw_num_tokens]
+                            if output.hidden_states is not None
+                            else None
+                        ),
+                    )
+                else:
+                    assert isinstance(output, PPProxyTensors)
+                    # TODO(Yuwei): support PP Support
+                    raise NotImplementedError(
+                        "PPProxyTensors is not supported in PiecewiseCudaGraphRunner yet."
+                    )
 
     def get_spec_info(self, num_tokens: int):
         spec_info = None

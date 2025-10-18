@@ -131,7 +131,6 @@ def install_torch_compiled(
     fullgraph: bool = True,
     graph_pool: Any = None,
 ):
-    print(f"module.__class__: {module.__class__}")
     unbound_fwd = module.__class__.forward
     if not callable(unbound_fwd):
         raise TypeError("module.__class__.forward must be callable")
