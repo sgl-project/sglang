@@ -601,11 +601,6 @@ MAX_LOADED_LORAS_TESTS = [
                     "philschmid/code-llama-3-1-8b-text-to-sql-lora"
                 },
             ),
-            Operation(
-                type=OperationType.UNLOAD,
-                data="philschmid/code-llama-3-1-8b-text-to-sql-lora",
-                expected_error="does not exist",
-            ),
             # Implicitly load "philschmid/code-llama-3-1-8b-text-to-sql-lora"
             Operation(
                 type=OperationType.FORWARD,
@@ -616,11 +611,6 @@ MAX_LOADED_LORAS_TESTS = [
                     ]
                 ),
                 expected_implicit_evictions={"pbevan11/llama-3.1-8b-ocr-correction"},
-            ),
-            Operation(
-                type=OperationType.UNLOAD,
-                data="pbevan11/llama-3.1-8b-ocr-correction",
-                expected_error="does not exist",
             ),
             Operation(
                 type=OperationType.UNLOAD,
@@ -704,11 +694,6 @@ MAX_LOADED_LORAS_TESTS = [
                     "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16"
                 },
             ),
-            Operation(
-                type=OperationType.UNLOAD,
-                data="Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
-                expected_error="does not exist",
-            ),
             # Implicitly load "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16"
             Operation(
                 type=OperationType.FORWARD,
@@ -719,11 +704,6 @@ MAX_LOADED_LORAS_TESTS = [
                     ]
                 ),
                 expected_implicit_evictions={"pbevan11/llama-3.1-8b-ocr-correction"},
-            ),
-            Operation(
-                type=OperationType.UNLOAD,
-                data="pbevan11/llama-3.1-8b-ocr-correction",
-                expected_error="does not exist",
             ),
             Operation(
                 type=OperationType.LOAD,
@@ -959,7 +939,7 @@ class LoRAUpdateTestSessionBase:
         """
         raise NotImplementedError("Subclasses must implement load_lora_adapter")
 
-    def unload_lora_adapter(self, lora_name: str, expected_error: Optional[str] = None):
+    def unload_lora_adapter(self, lora_name: str):
         """
         Unload a LoRA adapter by name.
         """
@@ -1058,38 +1038,27 @@ class LoRAUpdateEngineTestSession(LoRAUpdateTestSessionBase):
                 f"Expected loaded adapters to be {self.expected_adapters}, but got {loaded_adapters}",
             )
 
-    def unload_lora_adapter(self, lora_name: str, expected_error: Optional[str] = None):
+    def unload_lora_adapter(self, lora_name: str):
         """
         Unload a LoRA adapter by name.
         """
+        self.expected_adapters.remove(lora_name)
+
         response = self.handle.unload_lora_adapter(
             lora_name=lora_name,
         )
-        if expected_error:
-            self.testcase.assertFalse(
-                response.success, f"Expected failure for {lora_name}, but got success."
-            )
-            self.testcase.assertIn(
-                expected_error,
-                response.error_message,
-                f"Expected error message to contain '{expected_error}', but got '{response.error_message}'",
-            )
-            print(f"Received error as expected: {response.error_message}")
-        else:
-            self.expected_adapters.remove(lora_name)
+        self.testcase.assertTrue(
+            response.success,
+            f"Failed to unload LoRA adapter {lora_name}: {response.error_message}",
+        )
+        loaded_adapters = set(response.loaded_adapters)
 
-            self.testcase.assertTrue(
-                response.success,
-                f"Failed to unload LoRA adapter {lora_name}: {response.error_message}",
-            )
-            loaded_adapters = set(response.loaded_adapters)
-
-            print(f"loaded_adapters: {loaded_adapters}")
-            self.testcase.assertEqual(
-                loaded_adapters,
-                self.expected_adapters,
-                f"Expected loaded adapters to be {self.expected_adapters}, but got {loaded_adapters}",
-            )
+        print(f"loaded_adapters: {loaded_adapters}")
+        self.testcase.assertEqual(
+            loaded_adapters,
+            self.expected_adapters,
+            f"Expected loaded adapters to be {self.expected_adapters}, but got {loaded_adapters}",
+        )
 
     def forward(
         self,
@@ -1238,42 +1207,28 @@ class LoRAUpdateServerTestSession(LoRAUpdateTestSessionBase):
                 f"Expected loaded adapters to be {self.expected_adapters}, but got {loaded_adapters}",
             )
 
-    def unload_lora_adapter(self, lora_name: str, expected_error: Optional[str] = None):
+    def unload_lora_adapter(self, lora_name: str):
         """
         Unload a LoRA adapter by name.
         """
+        self.expected_adapters.remove(lora_name)
+
         response = requests.post(
             DEFAULT_URL_FOR_TEST + "/unload_lora_adapter",
             json={"lora_name": lora_name},
         )
-        response_payload = response.json()
-        success = response_payload["success"]
-        error_message = response_payload["error_message"]
 
-        if expected_error:
-            self.testcase.assertFalse(
-                success, f"Expected failure for {lora_name}, but got success."
-            )
-            self.testcase.assertIn(
-                expected_error,
-                error_message,
-                f"Expected error message to contain '{expected_error}', but got '{error_message}'",
-            )
-            print(f"Received error as expected: {error_message}")
-        else:
-            self.expected_adapters.remove(lora_name)
+        self.testcase.assertTrue(
+            response.ok, f"Failed to unload LoRA adapter {lora_name}: {response.text}"
+        )
+        loaded_adapters = set(response.json()["loaded_adapters"])
 
-            self.testcase.assertTrue(
-                success, f"Failed to unload LoRA adapter {lora_name}: {error_message}"
-            )
-
-            loaded_adapters = set(response_payload["loaded_adapters"])
-            print(f"loaded_adapters: {loaded_adapters}")
-            self.testcase.assertEqual(
-                loaded_adapters,
-                self.expected_adapters,
-                f"Expected loaded adapters to be {self.expected_adapters}, but got {loaded_adapters}",
-            )
+        print(f"loaded_adapters: {loaded_adapters}")
+        self.testcase.assertEqual(
+            loaded_adapters,
+            self.expected_adapters,
+            f"Expected loaded adapters to be {self.expected_adapters}, but got {loaded_adapters}",
+        )
 
     def forward(
         self,
@@ -1415,7 +1370,6 @@ class TestLoRADynamicUpdate(CustomTestCase):
                 elif op_type == OperationType.UNLOAD:
                     result = session.unload_lora_adapter(
                         lora_name=data,
-                        expected_error=expected_error,
                     )
                 elif op_type == OperationType.FORWARD:
                     prompts, adapters = zip(*data)

@@ -514,15 +514,20 @@ class TokenizerCommunicatorMixin:
                                 f"LoRA registry is: {self.lora_registry._registry}"
                             )
 
-                        logger.warning(
+                        logger.info(
                             f"Unloading least recently used LoRA adapter '{lru_lora_name}' "
                             f"(current number of adapters: {self.lora_registry.num_registered_loras}, "
                             f"max allowed: {self.server_args.max_loaded_loras})"
                         )
 
-                        await self._unload_lora_adapter_locked(
+                        unload_result = await self._unload_lora_adapter_locked(
                             UnloadLoRAAdapterReqInput(lora_name=lru_lora_name)
                         )
+                        if not unload_result.success:
+                            raise ValueError(
+                                f"Error while unloading LRU LoRA adapter '{lru_lora_name}': "
+                                f"{unload_result.error_message}"
+                            )
                         del result.loaded_adapters[lru_lora_name]
 
                 return result

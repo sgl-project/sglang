@@ -436,13 +436,20 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
                     logger.info(f"Reloading evicted adapter: {lora_path}")
                     new_lora_ref = self.lora_ref_cache[lora_path]
-                    await self.load_lora_adapter(
+                    load_result = await self.load_lora_adapter(
                         LoadLoRAAdapterReqInput(
                             lora_name=new_lora_ref.lora_name,
                             lora_path=new_lora_ref.lora_path,
                             pinned=new_lora_ref.pinned,
                         )
                     )
+                    if (
+                        not load_result.success
+                        and "already exists" not in load_result.error_message
+                    ):
+                        raise ValueError(
+                            f"Failed to implicitly load LoRA adapter {lora_path}: {load_result.error_message}"
+                        )
 
                 # Look up the LoRA ID from the registry and start tracking ongoing LoRA requests.
                 obj.lora_id = await self.lora_registry.acquire(obj.lora_path)
