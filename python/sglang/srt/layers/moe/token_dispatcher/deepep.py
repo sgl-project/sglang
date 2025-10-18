@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
     BaseDispatcherConfig,
@@ -20,7 +21,6 @@ from sglang.srt.layers.moe.utils import (
     get_moe_runner_backend,
     is_tbo_enabled,
 )
-from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.utils import (
     get_bool_env_var,
     get_int_env_var,
