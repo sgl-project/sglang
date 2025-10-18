@@ -53,3 +53,9 @@ def create_fused_set_kv_buffer_arg(
         v_scale=layer.v_scale,
         cache_loc=forward_batch.out_cache_loc,
     )
+
+
+def permute_inv(perm: torch.Tensor) -> torch.Tensor:
+    inv_perm = torch.empty_like(perm)
+    inv_perm[perm] = torch.arange(perm.numel(), device=perm.device, dtype=perm.dtype)
+    return inv_perm
