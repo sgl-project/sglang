@@ -246,6 +246,7 @@ class CommonKVReceiver(BaseKVReceiver):
                     f"Could not fetch prefill parallel info from bootstrap_addr: {self.bootstrap_addr}",
                 )
                 self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                self.bootstrap_infos = None
                 return
             else:
                 logger.debug(
