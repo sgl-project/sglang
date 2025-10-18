@@ -145,12 +145,13 @@ class PiecewiseCudaGraphRunner:
         assert (
             self.model_runner.server_args.piecewise_cuda_graph_tokens is not None
         ), "piecewise_cuda_graph_tokens is not set"
-        assert (
-            self.model_runner.server_args.piecewise_cuda_graph_compiler in ["eager", "inductor"]
-        ), "By now, only eager and inductor are supported for piecewise cuda graph compiler."
+        assert self.model_runner.server_args.piecewise_cuda_graph_compiler in [
+            "eager",
+            "inductor",
+        ], "By now, only eager and inductor are supported for piecewise cuda graph compiler."
         self.compile_config = CompilationConfig(
             self.model_runner.server_args.piecewise_cuda_graph_tokens,
-            self.model_runner.server_args.piecewise_cuda_graph_compiler
+            self.model_runner.server_args.piecewise_cuda_graph_compiler,
         )
 
         # Batch sizes to capture
@@ -184,7 +185,9 @@ class PiecewiseCudaGraphRunner:
         # Set graph pool id globally to be able to use symmetric memory
         set_graph_pool_id(get_global_graph_memory_pool())
 
-        with patch_model(self.model_runner.model.model, self.compile_config.compiler) as patched_model:
+        with patch_model(
+            self.model_runner.model.model, self.compile_config.compiler
+        ) as patched_model:
             install_torch_compiled(
                 patched_model,
                 fullgraph=True,

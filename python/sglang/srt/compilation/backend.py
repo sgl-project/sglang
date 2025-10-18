@@ -17,7 +17,7 @@ from torch._dispatch.python import enable_python_dispatcher
 
 from sglang.srt.compilation.compilation_config import CompilationConfig
 from sglang.srt.compilation.compilation_counter import compilation_counter
-from sglang.srt.compilation.compiler_interface import InductorAdaptor, EagerAdapter
+from sglang.srt.compilation.compiler_interface import EagerAdapter, InductorAdaptor
 from sglang.srt.compilation.cuda_piecewise_backend import CUDAPiecewiseBackend
 from sglang.srt.compilation.pass_manager import PostGradPassManager
 
