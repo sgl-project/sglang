@@ -13,6 +13,7 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutputFormat,
 )
 from sglang.srt.layers.moe.utils import DeepEPMode
+from sglang.srt.layers.dp_attention import get_is_extend_in_batch
 from sglang.srt.utils import get_int_env_var
 
 try:
@@ -335,21 +336,20 @@ class MooncakeEPDispatcher(BaseDispatcher):
         input_global_scale: Optional[torch.Tensor],
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
-        forward_batch: ForwardBatch,
     ):
         self._update_stage(_Stage.INITIAL, _Stage.AFTER_DISPATCH_A)
-        inner_state = self._get_impl(forward_batch).dispatch_a(
+        inner_state = self._get_impl().dispatch_a(
             hidden_states=hidden_states,
             topk_idx=topk_idx,
             topk_weights=topk_weights,
         )
-        self._dispatch_intermediate_state = forward_batch, inner_state
+        self._dispatch_intermediate_state = inner_state
 
     def dispatch_b(self):
         self._update_stage(_Stage.AFTER_DISPATCH_A, _Stage.AFTER_DISPATCH_B)
-        forward_batch, inner_state = self._dispatch_intermediate_state
+        inner_state = self._dispatch_intermediate_state
         del self._dispatch_intermediate_state
-        return self._get_impl(forward_batch).dispatch_b(*inner_state)
+        return self._get_impl().dispatch_b(*inner_state)
 
     def combine(self, *args, **kwargs) -> Tuple:
         self.combine_a(*args, **kwargs)
@@ -361,27 +361,25 @@ class MooncakeEPDispatcher(BaseDispatcher):
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
-        forward_batch: ForwardBatch,
         overlap_args: Optional = None,
     ):
         self._update_stage(_Stage.AFTER_DISPATCH_B, _Stage.AFTER_COMBINE_A)
-        inner_state = self._get_impl(forward_batch).combine_a(
+        inner_state = self._get_impl().combine_a(
             hidden_states=hidden_states,
             topk_idx=topk_idx,
             topk_weights=topk_weights,
         )
-        self._combine_intermediate_state = forward_batch, inner_state
+        self._combine_intermediate_state = inner_state
 
     def combine_b(self):
         self._update_stage(_Stage.AFTER_COMBINE_A, _Stage.INITIAL)
-        forward_batch, inner_state = self._combine_intermediate_state
+        inner_state = self._combine_intermediate_state
         del self._combine_intermediate_state
-        return self._get_impl(forward_batch).combine_b(*inner_state)
+        return self._get_impl().combine_b(*inner_state)
 
-    def _get_impl(self, forward_batch: ForwardBatch) -> _MooncakeEPDispatcherImpl:
-        resolved_deepep_mode = self.deepep_mode.resolve(
-            forward_batch.is_extend_in_batch
-        )
+    def _get_impl(self) -> _MooncakeEPDispatcherImpl:
+        is_extend_in_batch = get_is_extend_in_batch()
+        resolved_deepep_mode = self.deepep_mode.resolve(is_extend_in_batch)
         if resolved_deepep_mode == DeepEPMode.NORMAL:
             raise NotImplementedError
         elif resolved_deepep_mode == DeepEPMode.LOW_LATENCY:

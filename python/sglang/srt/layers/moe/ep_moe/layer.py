@@ -177,21 +177,19 @@ class DeepEPMoE(FusedMoE):
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
-        forward_batch: ForwardBatch,
     ):
 
         if self.has_refactored_flag:
             return super().forward(hidden_states, topk_idx, topk_weights, forward_batch)
 
         dispatch_output = self.dispatch(
-            hidden_states, topk_idx, topk_weights, forward_batch
+            hidden_states, topk_idx, topk_weights
         )
         hidden_states = self.run_moe_core(dispatch_output)
         hidden_states = self.combine(
             hidden_states,
             dispatch_output.topk_idx,
             dispatch_output.topk_weights,
-            forward_batch,
         )
         return hidden_states
 
@@ -200,13 +198,11 @@ class DeepEPMoE(FusedMoE):
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
-        forward_batch: ForwardBatch,
     ):
         return self.dispatcher.dispatch(
             hidden_states=hidden_states,
             topk_idx=topk_idx,
             topk_weights=topk_weights,
-            forward_batch=forward_batch,
             input_global_scale=(
                 self.w13_input_scale_quant
                 if isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
@@ -251,14 +247,12 @@ class DeepEPMoE(FusedMoE):
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
-        forward_batch: ForwardBatch,
         overlap_args: Optional[Dict[str, Any]] = None,
     ):
         return self.dispatcher.combine(
             hidden_states=hidden_states,
             topk_idx=topk_idx,
             topk_weights=topk_weights,
-            forward_batch=forward_batch,
             overlap_args=overlap_args,
         )
 
