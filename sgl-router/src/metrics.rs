@@ -1,7 +1,10 @@
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    time::Duration,
+};
+
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub struct PrometheusConfig {
@@ -620,8 +623,9 @@ impl TokenizerMetrics {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::net::TcpListener;
+
+    use super::*;
 
     #[test]
     fn test_prometheus_config_default() {
@@ -912,9 +916,13 @@ mod tests {
 
     #[test]
     fn test_concurrent_metric_updates() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::Arc;
-        use std::thread;
+        use std::{
+            sync::{
+                atomic::{AtomicBool, Ordering},
+                Arc,
+            },
+            thread,
+        };
 
         let done = Arc::new(AtomicBool::new(false));
         let mut handles = vec![];

@@ -1,23 +1,24 @@
-use crate::core::WorkerManager;
-use crate::protocols::worker_spec::WorkerConfigRequest;
-use crate::server::AppContext;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use futures::{StreamExt, TryStreamExt};
 use k8s_openapi::api::core::v1::Pod;
 use kube::{
     api::Api,
-    runtime::watcher::{watcher, Config},
-    runtime::WatchStreamExt,
+    runtime::{
+        watcher::{watcher, Config},
+        WatchStreamExt,
+    },
     Client,
 };
-use std::collections::{HashMap, HashSet};
-
 use rustls;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
-use tokio::task;
-use tokio::time;
+use tokio::{task, time};
 use tracing::{debug, error, info, warn};
+
+use crate::{core::WorkerManager, protocols::worker_spec::WorkerConfigRequest, server::AppContext};
 
 #[derive(Debug, Clone)]
 pub struct ServiceDiscoveryConfig {
@@ -452,10 +453,12 @@ async fn handle_pod_deletion(
 
 #[cfg(test)]
 mod tests {
+    use k8s_openapi::{
+        api::core::v1::{Pod, PodCondition, PodSpec, PodStatus},
+        apimachinery::pkg::apis::meta::v1::{ObjectMeta, Time},
+    };
+
     use super::*;
-    use k8s_openapi::api::core::v1::{Pod, PodCondition, PodSpec, PodStatus};
-    use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-    use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 
     fn create_k8s_pod(
         name: Option<&str>,
@@ -535,8 +538,7 @@ mod tests {
     }
 
     async fn create_test_app_context() -> Arc<AppContext> {
-        use crate::config::RouterConfig;
-        use crate::middleware::TokenBucket;
+        use crate::{config::RouterConfig, middleware::TokenBucket};
 
         let router_config = RouterConfig {
             worker_startup_timeout_secs: 1,
