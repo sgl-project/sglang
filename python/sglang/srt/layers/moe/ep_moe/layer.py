@@ -104,6 +104,7 @@ class DeepEPMoE(FusedMoE):
             self.use_fp8_w8a8 = False
             self.use_block_quant = False
         else:
+            self.use_w4afp8 = False
             self.use_fp8_w8a8 = False
             self.use_block_quant = False
 
@@ -228,6 +229,8 @@ class DeepEPMoE(FusedMoE):
                 return self.forward_flashinfer_cutedsl(
                     dispatch_output, down_gemm_overlap_args=down_gemm_overlap_args
                 )
+            elif self.use_w4afp8:
+                return self.forward_cutlass_w4afp8_masked(dispatch_output)
             assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8
             return self.forward_deepgemm_masked(dispatch_output)
         else:
@@ -536,6 +539,17 @@ class DeepEPMoE(FusedMoE):
         )
 
         return down_output
+
+    def forward_cutlass_w4afp8_masked(
+        self,
+        dispatch_output: DeepEPNormalOutput,
+    ):
+        assert self.moe_runner_config.activation == "silu"
+        assert isinstance(self.quant_method, W4AFp8MoEMethod)
+        return self.quant_method.apply_deepep_ll(
+            layer=self,
+            dispatch_output=dispatch_output,
+        )
 
     def forward_npu(
         self,
