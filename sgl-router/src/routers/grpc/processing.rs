@@ -3,28 +3,30 @@
 //! This module contains response processing functions that are shared between
 //! the regular router and PD router, eliminating ~1,200 lines of exact duplicates.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
+use proto::generate_complete::MatchedStop;
 use serde_json::Value;
 use tracing::error;
 
-use crate::grpc_client::proto;
-use crate::protocols::chat::{
-    ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse,
+use super::{
+    context::{DispatchMetadata, ExecutionResult},
+    utils,
 };
-use crate::protocols::common::{
-    FunctionCallResponse, ToolCall, ToolChoice, ToolChoiceValue, Usage,
+use crate::{
+    grpc_client::proto,
+    protocols::{
+        chat::{ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse},
+        common::{FunctionCallResponse, ToolCall, ToolChoice, ToolChoiceValue, Usage},
+        generate::{GenerateMetaInfo, GenerateRequest, GenerateResponse},
+    },
+    reasoning_parser::ParserFactory as ReasoningParserFactory,
+    tokenizer::{
+        stop::{SequenceDecoderOutput, StopSequenceDecoder},
+        traits::Tokenizer,
+    },
+    tool_parser::ParserFactory as ToolParserFactory,
 };
-use crate::protocols::generate::{GenerateMetaInfo, GenerateRequest, GenerateResponse};
-use crate::reasoning_parser::ParserFactory as ReasoningParserFactory;
-use crate::tokenizer::stop::{SequenceDecoderOutput, StopSequenceDecoder};
-use crate::tokenizer::traits::Tokenizer;
-use crate::tool_parser::ParserFactory as ToolParserFactory;
-use proto::generate_complete::MatchedStop;
-use std::time::Instant;
-
-use super::context::{DispatchMetadata, ExecutionResult};
-use super::utils;
 
 // ============================================================================
 // Response Processor - Main Entry Point

@@ -1,3 +1,5 @@
+use std::sync::OnceLock;
+
 /// Pythonic format parser for tool calls
 ///
 /// Handles Python function call syntax within square brackets:
@@ -10,18 +12,20 @@
 use async_trait::async_trait;
 use num_traits::ToPrimitive;
 use regex::Regex;
-use rustpython_parser::ast::{Constant, Expr, Mod, UnaryOp};
-use rustpython_parser::{parse, Mode};
+use rustpython_parser::{
+    ast::{Constant, Expr, Mod, UnaryOp},
+    parse, Mode,
+};
 use serde_json::{Map, Number, Value};
-use std::sync::OnceLock;
 
-use crate::protocols::common::Tool;
-
-use crate::tool_parser::{
-    errors::{ParserError, ParserResult},
-    parsers::helpers,
-    traits::ToolParser,
-    types::{FunctionCall, StreamingParseResult, ToolCall, ToolCallItem},
+use crate::{
+    protocols::common::Tool,
+    tool_parser::{
+        errors::{ParserError, ParserResult},
+        parsers::helpers,
+        traits::ToolParser,
+        types::{FunctionCall, StreamingParseResult, ToolCall, ToolCallItem},
+    },
 };
 
 static PYTHONIC_BLOCK_REGEX: OnceLock<Regex> = OnceLock::new();
