@@ -32,7 +32,10 @@ from sglang.global_config import global_config
 from sglang.srt.utils import (
     get_bool_env_var,
     get_device,
+    is_cuda,
     is_port_available,
+    is_rocm,
+    is_xpu,
     kill_process_tree,
     retry,
 )
@@ -1837,3 +1840,34 @@ def intel_amx_benchmark(extra_args=None, min_throughput=None):
         return wrapper
 
     return decorator
+
+
+def get_gpu_rank():
+    if is_xpu():
+        gpu_rank = torch.xpu.device_count()
+    elif is_cuda():
+        gpu_rank = torch.cuda.device_count()
+    elif is_rocm():
+        gpu_rank = torch.rocm.device_count()
+    return gpu_rank
+
+
+def empty_gpu_cache():
+    if is_xpu():
+        torch.xpu.empty_cache()
+    elif is_cuda():
+        torch.cuda.empty_cache()
+
+
+def get_gpu_memory_gb():
+    if is_cuda():
+        return torch.cuda.device_memory_used() / 1024**3
+    elif is_xpu():
+        return torch.xpu.device_memory_used() / 1024**3
+
+
+def get_gpu_capability():
+    if is_cuda():
+        return torch.cuda.get_device_capability()
+    elif is_xpu():
+        return torch.xpu.get_device_capability()

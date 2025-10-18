@@ -10,10 +10,13 @@ from sglang.srt.layers.moe.topk import TopKConfig, select_experts
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
 from sglang.srt.utils import is_hip
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, empty_gpu_cache, get_gpu_capability
 
 _is_hip = is_hip()
 _is_fp8_fnuz = is_fp8_fnuz()
+
+device_type = getattr(torch.accelerator.current_accelerator(), "type", "cpu")
+torch.set_default_device(device_type)
 
 
 class TestFusedMOE(CustomTestCase):
@@ -21,8 +24,8 @@ class TestFusedMOE(CustomTestCase):
     TOP_KS = [2, 6]
 
     @staticmethod
-    def create_random_cuda_tensor(shape, dtype, mean=0, std=0.01):
-        """Create a random CUDA tensor
+    def create_random_gpu_tensor(shape, dtype, mean=0, std=0.01):
+        """Create a random Torch(device) tensor
 
         Args:
             shape: Tensor shape
@@ -31,9 +34,9 @@ class TestFusedMOE(CustomTestCase):
             std: Standard deviation
 
         Returns:
-            torch.Tensor: Randomly initialized CUDA tensor
+            torch.Tensor: Randomly initialized Torch(device) tensor
         """
-        return torch.empty(shape, dtype=dtype, device="cuda").normal_(mean, std)
+        return torch.empty(shape, dtype=dtype, device=device_type).normal_(mean, std)
 
     def get_tolerance(self, dtype):
         """Get tolerance values for different data types
@@ -103,20 +106,20 @@ class TestFusedMOE(CustomTestCase):
 
         if use_fp8_w8a8:
             # AssertionError: fp8e4nv data type is not supported on CUDA arch < 89
-            capability = torch.cuda.get_device_capability()
+            capability = get_gpu_capability()
             if not _is_hip and not (capability[0] >= 9 or capability == (8, 9)):
                 return
 
-            a = self.create_random_cuda_tensor((m, k), dtype)
-            w1 = self.create_random_cuda_tensor((e, 2 * n, k), dtype)
-            w2 = self.create_random_cuda_tensor((e, k, n), dtype)
+            a = self.create_random_gpu_tensor((m, k), dtype)
+            w1 = self.create_random_gpu_tensor((e, 2 * n, k), dtype)
+            w2 = self.create_random_gpu_tensor((e, k, n), dtype)
             w1 = w1.to(torch.float8_e4m3fn)
             w2 = w2.to(torch.float8_e4m3fn)
-            score = self.create_random_cuda_tensor((m, e), dtype)
-            w1_scale = self.create_random_cuda_tensor(e, torch.float32)
-            w2_scale = self.create_random_cuda_tensor(e, torch.float32)
-            a1_scale = self.create_random_cuda_tensor(1, torch.float32)
-            a2_scale = self.create_random_cuda_tensor(1, torch.float32)
+            score = self.create_random_gpu_tensor((m, e), dtype)
+            w1_scale = self.create_random_gpu_tensor(e, torch.float32)
+            w2_scale = self.create_random_gpu_tensor(e, torch.float32)
+            a1_scale = self.create_random_gpu_tensor(1, torch.float32)
+            a2_scale = self.create_random_gpu_tensor(1, torch.float32)
 
             # Handle HIP case: normalize float8 weights so fused kernel doesn't break
             # on ROCm.
@@ -166,10 +169,10 @@ class TestFusedMOE(CustomTestCase):
                 sglang_output, torch_output, rtol=rtol, atol=atol
             )
         else:
-            a = self.create_random_cuda_tensor((m, k), dtype)
-            w1 = self.create_random_cuda_tensor((e, 2 * n, k), dtype)
-            w2 = self.create_random_cuda_tensor((e, k, n), dtype)
-            score = self.create_random_cuda_tensor((m, e), dtype)
+            a = self.create_random_gpu_tensor((m, k), dtype)
+            w1 = self.create_random_gpu_tensor((e, 2 * n, k), dtype)
+            w2 = self.create_random_gpu_tensor((e, k, n), dtype)
+            score = self.create_random_gpu_tensor((m, e), dtype)
 
             topk_output = select_experts(
                 hidden_states=a,
@@ -228,7 +231,7 @@ class TestFusedMOE(CustomTestCase):
                                                 dtype,
                                                 use_fp8_w8a8=use_fp8_w8a8,
                                             )
-                                            torch.cuda.empty_cache()
+                                            empty_gpu_cache()
                                         pbar.update(1)
 
 

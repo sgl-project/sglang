@@ -19,6 +19,9 @@ from sglang.srt.parser.conversation import generate_chat_conv
 
 TEST_IMAGE_URL = "https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true"
 
+device_type = getattr(torch.accelerator.current_accelerator(), "type", "cpu")
+torch.set_default_device(device_type)
+
 
 class VLMInputTestBase:
     model_path = None
@@ -31,7 +34,7 @@ class VLMInputTestBase:
         assert cls.model_path is not None, "Set model_path in subclass"
         assert cls.chat_template is not None, "Set chat_template in subclass"
         cls.image_url = TEST_IMAGE_URL
-        cls.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        cls.device = torch.device(device_type)
         response = requests.get(cls.image_url)
         cls.main_image = Image.open(BytesIO(response.content))
         cls.processor = AutoProcessor.from_pretrained(
