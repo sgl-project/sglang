@@ -1323,11 +1323,15 @@ def parse_image_resolution(image_resolution: str) -> Tuple[int, int]:
 
 def create_mm_data_row(text_prompt, images: list, images_base64, output_len, processor):
     try:
-        content_items = [
-            {"type": "image", "image": {"url": image_base64}}
-            for image_base64 in images_base64
-        ]
-        content_items.append({"type": "text", "text": text_prompt})
+        if type(processor).__name__ == "Phi4MMProcessor":
+            # <|endoftext10|> is the image token used in the phi-4-multimodal model.
+            content_items = text_prompt.replace("image 1", "|endoftext10|")
+        else:
+            content_items = [
+                {"type": "image", "image": {"url": image_base64}}
+                for image_base64 in images_base64
+            ]
+            content_items.append({"type": "text", "text": text_prompt})
         prompt_str = processor.apply_chat_template(
             [{"role": "user", "content": content_items}],
             add_generation_prompt=True,
@@ -1368,7 +1372,7 @@ def create_mm_data_row(text_prompt, images: list, images_base64, output_len, pro
     vision_prompt_len = prompt_len - text_prompt_len
 
     return DatasetRow(
-        prompt=text_prompt,
+        prompt=prompt_str,
         prompt_len=prompt_len,
         output_len=output_len,
         text_prompt_len=text_prompt_len,
