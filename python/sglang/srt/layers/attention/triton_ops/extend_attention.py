@@ -52,6 +52,7 @@ def _fwd_kernel(
     mask_ptr,
     mask_indptr,
     sink_ptr,
+    window_kv_offset_ptr,
     sm_scale,
     kv_group_num,
     stride_qbs,
@@ -68,6 +69,7 @@ def _fwd_kernel(
     stride_buf_vh,
     SLIDING_WINDOW_SIZE: tl.constexpr,
     logit_cap: tl.constexpr,
+    xai_temperature_len: tl.constexpr,
     Lq: tl.constexpr,
     Lv: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
@@ -95,6 +97,11 @@ def _fwd_kernel(
     if USE_CUSTOM_MASK:
         cur_seq_mask_start_idx = tl.load(mask_indptr + cur_seq)
 
+    # For SWA, we should only load the mask in the sliding window
+    window_kv_offset = 0
+    if USE_CUSTOM_MASK and SLIDING_WINDOW_SIZE > 0:
+        window_kv_offset = tl.load(window_kv_offset_ptr + cur_seq)
+
     offs_d = tl.arange(0, BLOCK_DMODEL)
     offs_dv = tl.arange(0, BLOCK_DV)
     offs_m = tl.arange(0, BLOCK_M)
@@ -102,6 +109,15 @@ def _fwd_kernel(
 
     mask_d = offs_d < Lq
     mask_dv = offs_dv < Lv
+
+    if xai_temperature_len > 0:
+        offs_qidx = cur_seq_len_prefix + cur_block_m * BLOCK_M + offs_m
+        xai_temperature_scale = 1.0 / tl.log2(float(xai_temperature_len))
+        xai_temperature_reg = tl.where(
+            offs_qidx > xai_temperature_len,
+            tl.log2(offs_qidx.to(tl.float32)) * xai_temperature_scale,
+            1.0,
+        )
 
     offs_q = (
         (cur_seq_extend_start_idx + cur_block_m * BLOCK_M + offs_m[:, None])
@@ -139,7 +155,9 @@ def _fwd_kernel(
             custom_mask = tl.load(
                 mask_ptr
                 + cur_seq_mask_start_idx
-                + (cur_block_m * BLOCK_M + offs_m[:, None]) * cur_seq_len
+                + (cur_block_m * BLOCK_M + offs_m[:, None])
+                * (cur_seq_len + window_kv_offset)
+                + window_kv_offset
                 + start_n
                 + offs_n[None, :],
                 mask=(mask_m[:, None] & mask_n[None, :]),
@@ -195,6 +213,9 @@ def _fwd_kernel(
             if logit_cap > 0:
                 qk = logit_cap * tanh(qk / logit_cap)
 
+            if xai_temperature_len > 0:
+                qk *= xai_temperature_reg[:, None]
+
             qk = tl.where(final_mask, qk, float("-inf"))
 
             row_max = tl.max(qk, 1)
@@ -236,7 +257,9 @@ def _fwd_kernel(
             custom_mask = tl.load(
                 mask_ptr
                 + cur_seq_mask_start_idx
-                + (cur_block_m * BLOCK_M + offs_m[:, None]) * cur_seq_len
+                + (cur_block_m * BLOCK_M + offs_m[:, None])
+                * (cur_seq_len + window_kv_offset)
+                + window_kv_offset
                 + cur_seq_len_prefix
                 + start_n
                 + offs_n[None, :],
@@ -295,6 +318,9 @@ def _fwd_kernel(
 
             if logit_cap > 0:
                 qk = logit_cap * tanh(qk / logit_cap)
+
+            if xai_temperature_len > 0:
+                qk *= xai_temperature_reg[:, None]
 
             qk = tl.where(final_mask, qk, float("-inf"))
 
@@ -362,6 +388,8 @@ def extend_attention_fwd(
     skip_prefix_custom_mask=True,
     sliding_window_size=-1,
     sinks=None,
+    window_kv_offsets=None,
+    xai_temperature_len=-1,
 ):
     """
     q_extend, k_extend, v_extend, o_extend: contiguous tensors
@@ -449,6 +477,7 @@ def extend_attention_fwd(
         custom_mask,
         mask_indptr,
         sinks,
+        window_kv_offsets,
         sm_scale,
         kv_group_num,
         q_extend.stride(0),
@@ -465,6 +494,7 @@ def extend_attention_fwd(
         v_buffer.stride(1),
         SLIDING_WINDOW_SIZE=sliding_window_size,
         logit_cap=logit_cap,
+        xai_temperature_len=xai_temperature_len,
         BLOCK_DMODEL=BLOCK_DMODEL,
         BLOCK_DPE=BLOCK_DPE,
         BLOCK_DV=BLOCK_DV,

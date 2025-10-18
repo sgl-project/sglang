@@ -15,7 +15,6 @@ echo "ARCH:  $ARCH"
 if [ ${ARCH} = "aarch64" ]; then
    LIBCUDA_ARCH="sbsa"
    BUILDER_NAME="pytorch/manylinuxaarch64-builder"
-   CMAKE_BUILD_PARALLEL_LEVEL=16
 else
    LIBCUDA_ARCH=${ARCH}
    BUILDER_NAME="pytorch/manylinux2_28-builder"
@@ -40,6 +39,7 @@ docker run --rm \
    export CMAKE_VERSION_MAJOR=3.31
    export CMAKE_VERSION_MINOR=1
    # Setting these flags to reduce OOM chance only on ARM
+   export CMAKE_BUILD_PARALLEL_LEVEL=$(( $(nproc)/3 < 48 ? $(nproc)/3 : 48 ))
    if [ \"${ARCH}\" = \"aarch64\" ]; then
       export CUDA_NVCC_FLAGS=\"-Xcudafe --threads=2\"
       export MAKEFLAGS='-j2'
@@ -63,7 +63,7 @@ docker run --rm \
    ln -sv /usr/lib64/libibverbs.so.1 /usr/lib64/libibverbs.so && \
    ${PYTHON_ROOT_PATH}/bin/${TORCH_INSTALL} && \
    ${PYTHON_ROOT_PATH}/bin/pip install --no-cache-dir ninja setuptools==75.0.0 wheel==0.41.0 numpy uv scikit-build-core && \
-   export TORCH_CUDA_ARCH_LIST='7.5 8.0 8.9 9.0+PTX' && \
+   export TORCH_CUDA_ARCH_LIST='8.0 8.9 9.0+PTX' && \
    export CUDA_VERSION=${CUDA_VERSION} && \
    mkdir -p /usr/lib/${ARCH}-linux-gnu/ && \
    ln -s /usr/local/cuda-${CUDA_VERSION}/targets/${LIBCUDA_ARCH}-linux/lib/stubs/libcuda.so /usr/lib/${ARCH}-linux-gnu/libcuda.so && \

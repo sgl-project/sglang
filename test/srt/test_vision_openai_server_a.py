@@ -8,64 +8,34 @@ import unittest
 
 from test_vision_openai_server_common import *
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.test_utils import (
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    DEFAULT_URL_FOR_TEST,
-    CustomTestCase,
-    popen_launch_server,
-)
+
+class TestLlavaServer(ImageOpenAITestMixin):
+    model = "lmms-lab/llava-onevision-qwen2-0.5b-ov"
 
 
-class TestQwen2VLServer(TestOpenAIVisionServer):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = "Qwen/Qwen2-VL-7B-Instruct"
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            api_key=cls.api_key,
-            other_args=[
-                "--mem-fraction-static",
-                "0.35",
-                "--cuda-graph-max-bs",
-                "4",
-            ],
-        )
-        cls.base_url += "/v1"
-
-    def test_video_chat_completion(self):
-        self._test_video_chat_completion()
+class TestQwen25VLServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
+    model = "Qwen/Qwen2.5-VL-7B-Instruct"
+    extra_args = [
+        "--cuda-graph-max-bs=4",
+    ]
 
 
-class TestQwen2_5_VLServer(TestOpenAIVisionServer):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = "Qwen/Qwen2.5-VL-7B-Instruct"
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            api_key=cls.api_key,
-            other_args=[
-                "--mem-fraction-static",
-                "0.35",
-                "--cuda-graph-max-bs",
-                "4",
-            ],
-        )
-        cls.base_url += "/v1"
-
-    def test_video_chat_completion(self):
-        self._test_video_chat_completion()
+class TestQwen3VLServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
+    model = "Qwen/Qwen3-VL-30B-A3B-Instruct"
+    extra_args = ["--cuda-graph-max-bs=4"]
 
 
-class TestVLMContextLengthIssue(CustomTestCase):
+class TestQwen3OmniServer(OmniOpenAITestMixin):
+    model = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
+    extra_args = [  # workaround to fit into H100
+        "--mem-fraction-static=0.90",
+        "--disable-cuda-graph",
+        "--disable-fast-image-processor",
+        "--grammar-backend=none",
+    ]
+
+
+class TestQwen2VLContextLengthServer(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = "Qwen/Qwen2-VL-7B-Instruct"
@@ -79,7 +49,6 @@ class TestVLMContextLengthIssue(CustomTestCase):
             other_args=[
                 "--context-length",
                 "300",
-                "--mem-fraction-static=0.75",
                 "--cuda-graph-max-bs",
                 "4",
             ],
@@ -122,112 +91,68 @@ class TestVLMContextLengthIssue(CustomTestCase):
         )
 
 
-# Note(Xinyuan): mllama is not stable for now, skip for CI
-# class TestMllamaServer(TestOpenAIVisionServer):
-#     @classmethod
-#     def setUpClass(cls):
-#         cls.model = "meta-llama/Llama-3.2-11B-Vision-Instruct"
-#         cls.base_url = DEFAULT_URL_FOR_TEST
-#         cls.api_key = "sk-123456"
-#         cls.process = popen_launch_server(
-#             cls.model,
-#             cls.base_url,
-#             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-#             api_key=cls.api_key,
-#         )
-#         cls.base_url += "/v1"
-
-#     def test_video_chat_completion(self):
-#         pass
+# flaky
+# class TestMllamaServer(ImageOpenAITestMixin):
+#     model = "meta-llama/Llama-3.2-11B-Vision-Instruct"
 
 
-class TestMinicpmvServer(TestOpenAIVisionServer):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = "openbmb/MiniCPM-V-2_6"
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--trust-remote-code",
-                "--mem-fraction-static",
-                "0.35",
-                "--cuda-graph-max-bs",
-                "4",
-            ],
-        )
-        cls.base_url += "/v1"
+class TestInternVL25Server(ImageOpenAITestMixin):
+    model = "OpenGVLab/InternVL2_5-2B"
+    extra_args = [
+        "--cuda-graph-max-bs=4",
+    ]
 
 
-class TestInternVL2_5Server(TestOpenAIVisionServer):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = "OpenGVLab/InternVL2_5-2B"
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--trust-remote-code",
-                "--cuda-graph-max-bs",
-                "4",
-            ],
-        )
-        cls.base_url += "/v1"
+class TestMiniCPMV4Server(ImageOpenAITestMixin):
+    model = "openbmb/MiniCPM-V-4"
+    extra_args = [
+        "--cuda-graph-max-bs=4",
+    ]
 
 
-class TestMinicpmoServer(TestOpenAIVisionServer):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = "openbmb/MiniCPM-o-2_6"
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--trust-remote-code",
-                "--mem-fraction-static",
-                "0.65",
-                "--cuda-graph-max-bs",
-                "4",
-            ],
-        )
-        cls.base_url += "/v1"
-
-    def test_audio_chat_completion(self):
-        self._test_audio_speech_completion()
-        self._test_audio_ambient_completion()
+class TestMiniCPMo26Server(ImageOpenAITestMixin, AudioOpenAITestMixin):
+    model = "openbmb/MiniCPM-o-2_6"
+    extra_args = [
+        "--cuda-graph-max-bs=4",
+    ]
 
 
-class TestMimoVLServer(TestOpenAIVisionServer):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = "XiaomiMiMo/MiMo-VL-7B-RL"
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            api_key=cls.api_key,
-            other_args=[
-                "--trust-remote-code",
-                "--mem-fraction-static",
-                "0.6",
-                "--cuda-graph-max-bs",
-                "4",
-            ],
-        )
-        cls.base_url += "/v1"
+class TestGemma3itServer(ImageOpenAITestMixin):
+    model = "google/gemma-3-4b-it"
+    extra_args = [
+        "--cuda-graph-max-bs=4",
+    ]
+
+
+class TestKimiVLServer(ImageOpenAITestMixin):
+    model = "moonshotai/Kimi-VL-A3B-Instruct"
+    extra_args = [
+        "--context-length=8192",
+        "--dtype=bfloat16",
+    ]
+
+    def test_video_images_chat_completion(self):
+        # model context length exceeded
+        pass
+
+
+class TestGLM41VServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
+    model = "zai-org/GLM-4.1V-9B-Thinking"
+    extra_args = [
+        "--reasoning-parser=glm45",
+    ]
+
+
+class TestQwen2AudioServer(AudioOpenAITestMixin):
+    model = "Qwen/Qwen2-Audio-7B-Instruct"
 
 
 if __name__ == "__main__":
-    del TestOpenAIVisionServer
+    del (
+        TestOpenAIMLLMServerBase,
+        ImageOpenAITestMixin,
+        VideoOpenAITestMixin,
+        AudioOpenAITestMixin,
+        OmniOpenAITestMixin,
+    )
     unittest.main()

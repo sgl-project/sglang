@@ -31,13 +31,13 @@ from sglang.srt.layers.communicator import enable_moe_dense_fully_dp
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2MLP as Ernie4MLP
@@ -92,7 +92,7 @@ class Ernie4Moe(nn.Module):
             correction_bias=self.gate.e_score_correction_bias,
         )
 
-        self.experts = get_moe_impl_class()(
+        self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.moe_num_experts,
             top_k=config.moe_k,
             hidden_size=config.hidden_size,
@@ -361,7 +361,7 @@ class Ernie4_5_ForCausalLM(nn.Module):
 
 class Ernie4_5_MoeForCausalLM(Ernie4_5_ForCausalLM):
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        expert_params_mapping = get_moe_impl_class().make_expert_params_mapping(
+        expert_params_mapping = FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",

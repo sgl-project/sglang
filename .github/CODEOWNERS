@@ -1,21 +1,32 @@
 .github @merrymercy @zhyncs
 /docker @zhyncs @HaiShaw @ByronHsu
+/docker/Dockerfile.npu @ping1jing2
 /python/pyproject.toml @merrymercy @zhyncs
 /python/sglang/* @merrymercy @Ying1123 @zhyncs @hnyls2002
 /python/sglang/srt/constrained @hnyls2002
 /python/sglang/srt/disaggregation @ByronHsu @hnyls2002
 /python/sglang/srt/disaggregation/mooncake @ShangmingCai
+/python/sglang/srt/disaggregation/ascend @ping1jing2
 /python/sglang/srt/distributed @yizhang2077 @merrymercy
-/python/sglang/srt/entrypoints @ispobock @CatherineSue @slin1237 @merrymercy
+/python/sglang/srt/entrypoints @ispobock @CatherineSue @slin1237 @merrymercy @JustinTong0323
 /python/sglang/srt/eplb @fzyzcjy
-/python/sglang/srt/function_call @CatherineSue
+/python/sglang/srt/function_call @CatherineSue @JustinTong0323
 /python/sglang/srt/layers @merrymercy @Ying1123 @zhyncs @ispobock @HaiShaw @ch-wan @BBuf @kushanam @Edwardf0t1
-/python/sglang/srt/lora @Ying1123 @Fridge003
+/python/sglang/srt/layers/attention/ascend_backend.py @ping1jing2
+/python/sglang/srt/lora @Ying1123 @Fridge003 @lifuhuang
 /python/sglang/srt/managers @merrymercy @Ying1123 @hnyls2002 @xiezhq-hermann
 /python/sglang/srt/mem_cache @merrymercy @Ying1123 @hnyls2002 @xiezhq-hermann
+/python/sglang/srt/mem_cache/allocator_ascend.py @ping1jing2
 /python/sglang/srt/model_executor @merrymercy @Ying1123 @hnyls2002 @zhyncs @ispobock
+/python/sglang/srt/model_executor/npu_graph_runner.py @ping1jing2
 /python/sglang/srt/multimodal @mickqian @JustinTong0323
-/python/sglang/srt/speculative @Ying1123 @merrymercy @rkooo567 @kssteven418
-/sgl-kernel @zhyncs @ispobock @HandH1998 @BBuf @yizhang2077 @merrymercy @FlamingoPg @HaiShaw
-/sgl-router @slin1237 @ByronHsu
+/python/sglang/srt/speculative @Ying1123 @merrymercy @kssteven418
+/sgl-kernel @zhyncs @ispobock @BBuf @yizhang2077 @merrymercy @FlamingoPg @HaiShaw
+/sgl-router @slin1237 @ByronHsu @CatherineSue
+/sgl-router/src/protocols @CatherineSue @key4ng
+/sgl-router/src/proto @CatherineSue
+/sgl-router/src/routers/http/openai_router.rs @key4ng
+/sgl-router/src/data_connector @key4ng
+/sgl-router/src/mcp @key4ng
 /test/srt/test_modelopt* @Edwardf0t1
+/test/srt/ascend @ping1jing2

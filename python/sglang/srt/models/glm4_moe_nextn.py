@@ -12,7 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Inference-only GLM-4.5 NextN Speculative Decoding."""
+"""Inference-only GLM-4.5, GLM-4.6 NextN Speculative Decoding."""
 import logging
 from typing import Iterable, Optional, Tuple
 
@@ -22,6 +22,7 @@ from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -29,9 +30,9 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.glm4_moe import Glm4MoeDecoderLayer, Glm4MoeForCausalLM
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import BumpAllocator, add_prefix
 
 logger = logging.getLogger(__name__)
@@ -47,7 +48,7 @@ class Glm4MoeModelNextN(nn.Module):
         super().__init__()
         if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
             logger.warning(
-                "Overriding Glm4MoeForCausalLMNextN quant config for modelopt_fp4 GLM-4.5 model."
+                "Overriding Glm4MoeForCausalLMNextN quant config for modelopt_fp4 GLM-4.5 / GLM-4.6 model."
             )
             quant_config = None
 
@@ -56,7 +57,7 @@ class Glm4MoeModelNextN(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
-            enable_tp=not global_server_args_dict["enable_dp_attention"],
+            enable_tp=not is_dp_attention_enabled(),
             prefix=add_prefix("embed_tokens", prefix),
         )
 
@@ -144,7 +145,7 @@ class Glm4MoeForCausalLMNextN(Glm4MoeForCausalLM):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("model.shared_head.head", prefix),
-            use_attn_tp_group=global_server_args_dict["enable_dp_lm_head"],
+            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
 

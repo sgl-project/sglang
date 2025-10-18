@@ -24,7 +24,6 @@ from torch import nn
 from transformers import MixtralConfig
 
 from sglang.srt.distributed import (
-    get_moe_expert_parallel_world_size,
     get_pp_group,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
@@ -36,7 +35,6 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe.ep_moe.layer import EPMoE
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -47,7 +45,6 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix, make_layers
@@ -95,8 +92,7 @@ class MixtralMoE(nn.Module):
             renormalize=True,
         )
 
-        MoEImpl = EPMoE if get_moe_expert_parallel_world_size() > 1 else FusedMoE
-        self.experts = MoEImpl(
+        self.experts = FusedMoE(
             num_experts=num_experts,
             top_k=top_k,
             layer_id=layer_id,
@@ -104,7 +100,6 @@ class MixtralMoE(nn.Module):
             intermediate_size=intermediate_size,
             params_dtype=params_dtype,
             quant_config=quant_config,
-            tp_size=tp_size,
             prefix=add_prefix("experts", prefix),
         )
 

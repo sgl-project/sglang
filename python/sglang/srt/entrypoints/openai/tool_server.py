@@ -5,15 +5,16 @@ from abc import ABC, abstractmethod
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from typing import Any
 
-logger = logging.getLogger(__name__)
 try:
     from mcp import ClientSession
     from mcp.client.sse import sse_client
     from mcp.types import ListToolsResult
-except ImportError:
-    logger.warning("Ignoring mcp import error")
+except ImportError as e:
+    ClientSession = sse_client = ListToolsResult = e
 
 from openai_harmony import ToolDescription, ToolNamespaceConfig
+
+logger = logging.getLogger(__name__)
 
 
 async def list_server_and_tools(server_url: str):

@@ -14,9 +14,7 @@ from transformers import (
 )
 from transformers.models.auto.modeling_auto import AutoModel
 
-from sglang.srt.hf_transformers_utils import get_processor
-from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
+from sglang.srt.layers.linear import RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
@@ -38,6 +36,7 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models.gemma3n_audio import Gemma3nAudioEncoder
 from sglang.srt.models.gemma3n_causal import Gemma3nRMSNorm, Gemma3nTextModel
 from sglang.srt.utils import add_prefix
+from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
 
@@ -499,25 +498,18 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
     def should_apply_lora(self, module_name: str) -> bool:
         return bool(self.lora_pattern.match(module_name))
 
-    def get_hidden_dim(self, module_name):
+    def get_hidden_dim(self, module_name, layer_idx):
         # return input_dim, output_dim
-        # TODO: the special handling of qkv will be addressed in #8940.
         if module_name == "qkv_proj":
             return (
                 self.config.hidden_size,
-                None,  # qkv_proj is only used in LoRA A
+                self.config.head_dim
+                * (
+                    self.config.num_attention_heads
+                    + self.config.num_key_value_heads * 2
+                ),
             )
-        elif module_name == "kv_proj":
-            return (
-                None,  # kv_proj is only used in LoRA B
-                self.config.head_dim * self.config.num_key_value_heads,
-            )
-        elif module_name == "q_proj":
-            return (
-                None,  # q_proj is only used in LoRA B
-                self.config.head_dim * self.config.num_attention_heads,
-            )
-        elif module_name in ["o_proj"]:
+        elif module_name == "o_proj":
             return (
                 self.config.head_dim * self.config.num_attention_heads,
                 self.config.hidden_size,
@@ -527,7 +519,7 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
                 "Currently SGLang requires uniform intermediate size for all layers. "
                 "Please file an issue if you need support for non-uniform intermediate sizes."
             )
-            return self.config.hidden_size, self.config.intermediate_size[0]
+            return self.config.hidden_size, self.config.intermediate_size[0] * 2
         elif module_name == "down_proj":
             assert len(set(self.config.intermediate_size)) == 1, (
                 "Currently SGLang requires uniform intermediate size for all layers. "

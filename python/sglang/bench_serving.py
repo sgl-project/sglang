@@ -12,6 +12,7 @@ python3 -m sglang.bench_serving --backend sglang --dataset-name random --num-pro
 
 import argparse
 import asyncio
+import io
 import json
 import os
 import pickle
@@ -33,6 +34,7 @@ import numpy as np
 import requests
 from tqdm.asyncio import tqdm
 from transformers import (
+    AutoProcessor,
     AutoTokenizer,
     PreTrainedTokenizer,
     PreTrainedTokenizerBase,
@@ -71,8 +73,9 @@ class RequestFuncInput:
     output_len: int
     model: str
     lora_name: str
-    image_data: str
+    image_data: Optional[List[str]]
     extra_request_body: Dict[str, Any]
+    timestamp: Optional[float] = None
 
 
 @dataclass
@@ -102,10 +105,13 @@ def remove_suffix(text: str, suffix: str) -> str:
 
 
 def get_auth_headers() -> Dict[str, str]:
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if api_key:
-        return {"Authorization": f"Bearer {api_key}"}
+    openai_api_key = os.environ.get("OPENAI_API_KEY")
+    if openai_api_key:
+        return {"Authorization": f"Bearer {openai_api_key}"}
     else:
+        api_key = os.environ.get("API_KEY")
+        if api_key:
+            return {"Authorization": f"{api_key}"}
         return {}
 
 
@@ -202,6 +208,15 @@ async def async_request_openai_completions(
             "ignore_eos": not args.disable_ignore_eos,
             **request_func_input.extra_request_body,
         }
+
+        # hack to accommodate different LoRA conventions between SGLang and vLLM.
+        if request_func_input.lora_name:
+            payload["model"] = request_func_input.lora_name
+            payload["lora_path"] = request_func_input.lora_name
+
+        if request_func_input.image_data:
+            payload.update({"image_data": request_func_input.image_data})
+
         headers = get_auth_headers()
 
         output = RequestFuncOutput.init_new(request_func_input)
@@ -289,16 +304,19 @@ async def async_request_openai_chat_completions(
     ), "OpenAI Chat Completions API URL must end with 'chat/completions'."
 
     if request_func_input.image_data:
+        # Build multi-image content: a list of image_url entries followed by the text
+        content_items = [
+            {
+                "type": "image_url",
+                "image_url": {"url": img_url},
+            }
+            for img_url in request_func_input.image_data
+        ]
+        content_items.append({"type": "text", "text": request_func_input.prompt})
         messages = [
             {
                 "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": request_func_input.image_data},
-                    },
-                    {"type": "text", "text": request_func_input.prompt},
-                ],
+                "content": content_items,
             },
         ]
     else:
@@ -309,10 +327,17 @@ async def async_request_openai_chat_completions(
             "model": request_func_input.model,
             "messages": messages,
             "temperature": 0.0,
-            "max_tokens": request_func_input.output_len,
+            "max_completion_tokens": request_func_input.output_len,
             "stream": not args.disable_stream,
+            "ignore_eos": not args.disable_ignore_eos,
             **request_func_input.extra_request_body,
         }
+
+        # hack to accommodate different LoRA conventions between SGLang and vLLM.
+        if request_func_input.lora_name:
+            payload["model"] = request_func_input.lora_name
+            payload["lora_path"] = request_func_input.lora_name
+
         headers = get_auth_headers()
 
         output = RequestFuncOutput.init_new(request_func_input)
@@ -497,7 +522,7 @@ async def async_request_sglang_generate(
             **request_func_input.extra_request_body,
         }
 
-        # Add image data if available
+        # Add image data if available (list of image urls/base64)
         if request_func_input.image_data:
             payload["image_data"] = request_func_input.image_data
 
@@ -597,6 +622,48 @@ async def async_request_profile(api_url: str) -> RequestFuncOutput:
     return output
 
 
+def _build_profile_urls(
+    profile_prefill_url: Optional[List[str]],
+    profile_decode_url: Optional[List[str]],
+) -> List[Tuple[str, str]]:
+    """Build profile URLs list from prefill/decode URL arguments.
+
+    Returns:
+        List of (worker_type, url) tuples. e.g., [("Prefill-0", "http://..."), ("Decode-0", "http://...")]
+    """
+    profile_urls = []
+    if profile_prefill_url:
+        for idx, url in enumerate(profile_prefill_url):
+            profile_urls.append((f"Prefill-{idx}", url))
+    if profile_decode_url:
+        for idx, url in enumerate(profile_decode_url):
+            profile_urls.append((f"Decode-{idx}", url))
+    return profile_urls
+
+
+async def _call_profile_pd(profile_urls: List[Tuple[str, str]], mode: str) -> None:
+    """Call profile endpoint (start/stop) on PD separated workers.
+
+    Args:
+        profile_urls: List of (worker_type, url) tuples
+        mode: "start" or "stop"
+    """
+    endpoint = "/start_profile" if mode == "start" else "/stop_profile"
+    action = "Starting" if mode == "start" else "Stopping"
+    action_past = "started" if mode == "start" else "stopped"
+
+    print(f"{action} profiler...")
+
+    for worker_type, url in profile_urls:
+        profile_output = await async_request_profile(api_url=url + endpoint)
+        if profile_output.success:
+            print(f"Profiler {action_past} for {worker_type} worker at {url}")
+        else:
+            print(
+                f"Failed to {mode} profiler for {worker_type} worker at {url}: {profile_output.error}"
+            )
+
+
 def get_model(pretrained_model_name_or_path: str) -> str:
     if os.getenv("SGLANG_USE_MODELSCOPE", "false").lower() == "true":
         import huggingface_hub.constants
@@ -622,7 +689,7 @@ def get_tokenizer(
     if pretrained_model_name_or_path.endswith(
         ".json"
     ) or pretrained_model_name_or_path.endswith(".model"):
-        from sglang.srt.hf_transformers_utils import get_tokenizer
+        from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
         return get_tokenizer(pretrained_model_name_or_path)
 
@@ -635,7 +702,30 @@ def get_tokenizer(
     )
 
 
-def get_dataset(args, tokenizer):
+def get_processor(
+    pretrained_model_name_or_path: str,
+) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
+    assert (
+        pretrained_model_name_or_path is not None
+        and pretrained_model_name_or_path != ""
+    )
+    if pretrained_model_name_or_path.endswith(
+        ".json"
+    ) or pretrained_model_name_or_path.endswith(".model"):
+        from sglang.srt.utils.hf_transformers_utils import get_processor
+
+        return get_processor(pretrained_model_name_or_path)
+
+    if pretrained_model_name_or_path is not None and not os.path.exists(
+        pretrained_model_name_or_path
+    ):
+        pretrained_model_name_or_path = get_model(pretrained_model_name_or_path)
+    return AutoProcessor.from_pretrained(
+        pretrained_model_name_or_path, trust_remote_code=True
+    )
+
+
+def get_dataset(args, tokenizer, model_id=None):
     tokenize_prompt = getattr(args, "tokenize_prompt", False)
     if args.dataset_name == "sharegpt":
         assert not tokenize_prompt
@@ -659,6 +749,19 @@ def get_dataset(args, tokenizer):
             random_sample=args.dataset_name == "random",
             return_text=not tokenize_prompt,
         )
+    elif args.dataset_name == "image":
+        processor = get_processor(model_id)
+        input_requests = sample_image_requests(
+            num_requests=args.num_prompts,
+            image_count=args.image_count,
+            input_len=args.random_input_len,
+            output_len=args.random_output_len,
+            range_ratio=args.random_range_ratio,
+            processor=processor,
+            image_content=args.image_content,
+            image_format=args.image_format,
+            image_resolution=args.image_resolution,
+        )
     elif args.dataset_name == "generated-shared-prefix":
         assert not tokenize_prompt
         input_requests = sample_generated_shared_prefix_requests(
@@ -671,14 +774,31 @@ def get_dataset(args, tokenizer):
             args=args,
         )
     elif args.dataset_name == "mmmu":
-        assert not tokenize_prompt
+        processor = get_processor(model_id)
         input_requests = sample_mmmu_requests(
             num_requests=args.num_prompts,
-            tokenizer=tokenizer,
+            processor=processor,
             fixed_output_len=args.random_output_len,
-            apply_chat_template=args.apply_chat_template,
             random_sample=True,
         )
+    elif args.dataset_name == "mooncake":
+        # For mooncake, we don't generate the prompts here.
+        # We just load the raw trace data. The async generator will handle the rest.
+        if not args.dataset_path:
+            local_path = os.path.join("/tmp", args.mooncake_workload + "_trace.jsonl")
+        else:
+            local_path = args.dataset_path
+
+        if not os.path.exists(local_path):
+            download_and_cache_file(
+                MOONCAKE_DATASET_URL[args.mooncake_workload], local_path
+            )
+
+        with open(local_path, "r") as f:
+            all_requests_data = [json.loads(line) for line in f if line.strip()]
+
+        # Limit the number of requests based on --num-prompts
+        input_requests = all_requests_data[: args.num_prompts]
     else:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
     return input_requests
@@ -703,6 +823,8 @@ ASYNC_REQUEST_FUNCS = {
 class BenchmarkMetrics:
     completed: int
     total_input: int
+    total_input_text: int
+    total_input_vision: int
     total_output: int
     total_output_retokenized: int
     request_throughput: float
@@ -733,6 +855,12 @@ class BenchmarkMetrics:
 
 
 SHAREGPT_URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
+MOONCAKE_DATASET_URL = {
+    "mooncake": "https://raw.githubusercontent.com/kvcache-ai/Mooncake/main/FAST25-release/arxiv-trace/mooncake_trace.jsonl",
+    "conversation": "https://raw.githubusercontent.com/kvcache-ai/Mooncake/main/FAST25-release/traces/conversation_trace.jsonl",
+    "synthetic": "https://raw.githubusercontent.com/kvcache-ai/Mooncake/main/FAST25-release/traces/synthetic_trace.jsonl",
+    "toolagent": "https://raw.githubusercontent.com/kvcache-ai/Mooncake/main/FAST25-release/traces/toolagent_trace.jsonl",
+}
 
 
 def download_and_cache_file(url: str, filename: Optional[str] = None):
@@ -790,14 +918,95 @@ class DatasetRow:
     prompt: str
     prompt_len: int
     output_len: int
-    image_data: Optional[str] = None
+    text_prompt_len: Optional[int] = None
+    vision_prompt_len: Optional[int] = None
+    image_data: Optional[List[str]] = None
+    timestamp: Optional[float] = None
+
+    def __post_init__(self):
+        if self.text_prompt_len is None:
+            self.text_prompt_len = self.prompt_len
+        if self.vision_prompt_len is None:
+            self.vision_prompt_len = 0
+
+
+async def get_mooncake_request_over_time(
+    input_requests: List[Dict],
+    tokenizer: PreTrainedTokenizerBase,
+    slowdown_factor: float,
+    num_rounds: int,
+) -> AsyncGenerator[DatasetRow, None]:
+    """
+    An async generator that yields requests based on the timestamps in the Mooncake trace file,
+    with support for multi-round sessions.
+    """
+    if not input_requests:
+        return
+
+    input_requests.sort(key=lambda r: r["timestamp"])
+
+    start_time = time.perf_counter()
+    trace_start_time_ms = input_requests[0]["timestamp"]
+
+    for record in input_requests:
+        # Calculate when this entire session should start
+        relative_arrival_time_s = (record["timestamp"] - trace_start_time_ms) / 1000.0
+        target_arrival_time_s = relative_arrival_time_s * slowdown_factor
+
+        current_elapsed_time_s = time.perf_counter() - start_time
+        sleep_duration_s = target_arrival_time_s - current_elapsed_time_s
+        if sleep_duration_s > 0:
+            await asyncio.sleep(sleep_duration_s)
+
+        # Once the session starts, generate all rounds for it as a burst
+        # This simulates a user engaging in a multi-turn conversation
+
+        # Base user query constructed from hash_ids
+        user_query_base = ""
+        hash_ids = record.get("hash_ids", [])
+        for hash_id in hash_ids:
+            user_query_base += f"{hash_id}" + " ".join(
+                ["hi"] * 128
+            )  # Shorter for multi-round
+        user_query_base += "Tell me a story based on this context."
+
+        output_len_per_round = record.get("output_length", 256)
+        chat_history = []
+
+        for i in range(num_rounds):
+            # Add user query for the current round
+            chat_history.append(
+                {"role": "user", "content": f"Round {i + 1}: {user_query_base}"}
+            )
+
+            # Form the full prompt from history
+            try:
+                full_prompt_text = tokenizer.apply_chat_template(
+                    chat_history, tokenize=False, add_generation_prompt=True
+                )
+            except Exception:
+                full_prompt_text = "\n".join(
+                    [f"{msg['role']}: {msg['content']}" for msg in chat_history]
+                )
+
+            prompt_len = len(tokenizer.encode(full_prompt_text))
+
+            yield DatasetRow(
+                prompt=full_prompt_text,
+                prompt_len=prompt_len,
+                output_len=output_len_per_round,
+            )
+
+            # Add a placeholder assistant response for the next round's context
+            # We use a placeholder because we don't know the real response
+            placeholder_response = " ".join(["story"] * output_len_per_round)
+            chat_history.append({"role": "assistant", "content": placeholder_response})
 
 
 def sample_mmmu_requests(
     num_requests: int,
-    tokenizer: PreTrainedTokenizerBase,
+    processor: AutoProcessor | AutoTokenizer,
     fixed_output_len: Optional[int] = None,
-    apply_chat_template: bool = True,
     random_sample: bool = True,
 ) -> List[DatasetRow]:
     """
@@ -805,9 +1014,7 @@ def sample_mmmu_requests(
 
     Args:
         num_requests: Number of requests to sample.
-        tokenizer: Tokenizer to use for token counting.
         fixed_output_len: If provided, use this fixed output length for all requests.
-        apply_chat_template: Whether to apply the chat template to the prompt.
         random_sample: Whether to randomly sample or take the first N.
 
     Returns:
@@ -864,11 +1071,11 @@ def sample_mmmu_requests(
                     if image.mode == "RGBA":
                         image = image.convert("RGB")
 
-                    # Encode image to base64
+                    # Encode image to base64 (save as PNG to support palette/alpha modes)
                     buffered = io.BytesIO()
-                    image.save(buffered, format="JPEG")
+                    image.save(buffered, format="PNG")
                     img_str = pybase64.b64encode(buffered.getvalue()).decode("utf-8")
-                    image_data = f"data:image/jpeg;base64,{img_str}"
+                    image_data = f"data:image/png;base64,{img_str}"
                 else:
                     continue
 
@@ -876,46 +1083,12 @@ def sample_mmmu_requests(
                 question = example.get("question")
 
                 # Construct the prompt
-                prompt = f"Question: {question}\n\nAnswer: "
-                if apply_chat_template:
-                    try:
-                        prompt = tokenizer.apply_chat_template(
-                            [
-                                {
-                                    "role": "user",
-                                    "content": [
-                                        {
-                                            "type": "image_url",
-                                            "image_url": {"url": image_data},
-                                        },
-                                        {"type": "text", "text": prompt},
-                                    ],
-                                }
-                            ],
-                            add_generation_prompt=True,
-                            tokenize=False,
-                        )
-                    except Exception as e:
-                        # Note (Xinyuan): This is a workaround for an issue where some tokenizers do not support content as a list. (e.g. InternVL)
-                        print(
-                            f"Error applying chat template: {e}, fallback to <image> tag"
-                        )
-                        prompt = f"<image>{prompt}"
-
-                # Calculate token lengths for text only (without image data)
-                prompt_token_ids = tokenizer.encode(prompt)
-                prompt_len = len(prompt_token_ids)
-
+                text_prompt = f"Question: {question}\n\nAnswer: "
                 output_len = fixed_output_len if fixed_output_len is not None else 256
-
-                filtered_dataset.append(
-                    DatasetRow(
-                        prompt=prompt,
-                        prompt_len=prompt_len,
-                        output_len=output_len,
-                        image_data=image_data,
-                    )
+                data_row = create_mm_data_row(
+                    text_prompt, [image], [image_data], output_len, processor
                 )
+                filtered_dataset.append(data_row)
 
         except Exception as e:
             print(f"Error processing example {i}: {e}")
@@ -983,7 +1156,8 @@ def sample_sharegpt_requests(
                 add_generation_prompt=True,
                 tokenize=False,
             )
-            prompt = prompt.replace(tokenizer.bos_token, "")
+            if tokenizer.bos_token:
+                prompt = prompt.replace(tokenizer.bos_token, "")
 
         prompt_token_ids = tokenizer.encode(prompt)
         completion = dataset[i][1]
@@ -1002,7 +1176,11 @@ def sample_sharegpt_requests(
             continue
 
         filtered_dataset.append(
-            DatasetRow(prompt=prompt, prompt_len=prompt_len, output_len=output_len)
+            DatasetRow(
+                prompt=prompt,
+                prompt_len=prompt_len,
+                output_len=output_len,
+            )
         )
 
     print(f"#Input tokens: {np.sum([x.prompt_len for x in filtered_dataset])}")
@@ -1113,6 +1291,186 @@ def sample_random_requests(
     return input_requests
 
 
+def parse_image_resolution(image_resolution: str) -> Tuple[int, int]:
+    """Parse image resolution into (width, height).
+
+    Supports presets '1080p', '720p', '360p' and custom 'heightxwidth' format
+    (e.g., '1080x1920' means height=1080, width=1920).
+    """
+    resolution_to_size = {
+        "4k": (3840, 2160),
+        "1080p": (1920, 1080),
+        "720p": (1280, 720),
+        "360p": (640, 360),
+    }
+    if image_resolution in resolution_to_size:
+        return resolution_to_size[image_resolution]
+
+    res = image_resolution.strip().lower()
+    if "x" in res:
+        parts = res.split("x")
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+            height = int(parts[0])
+            width = int(parts[1])
+            if height > 0 and width > 0:
+                return (width, height)
+
+    raise ValueError(
+        f"Unsupported image resolution: {image_resolution}. "
+        "Choose from 4k, 1080p, 720p, 360p, or provide custom 'heightxwidth' (e.g., 1080x1920)."
+    )
+
+
+def create_mm_data_row(text_prompt, images: list, images_base64, output_len, processor):
+    try:
+        content_items = [
+            {"type": "image", "image": {"url": image_base64}}
+            for image_base64 in images_base64
+        ]
+        content_items.append({"type": "text", "text": text_prompt})
+        prompt_str = processor.apply_chat_template(
+            [{"role": "user", "content": content_items}],
+            add_generation_prompt=True,
+            tokenize=False,
+        )
+    except Exception as e:
+        # Note (Xinyuan): This is a workaround for an issue where some tokenizers do not support content as a list. (e.g. InternVL)
+        print(f"Error applying chat template: {e}, fallback to <image> tag")
+        # Some tokenizers do not support list content; fall back to a placeholder in the text
+        prompt_str = f"<image>{text_prompt}"
+
+    # Calculate total tokens (text + vision)
+    prompt_len = processor(
+        text=[prompt_str],
+        images=images,
+        padding=False,
+        return_tensors="pt",
+    )["input_ids"].numel()
+
+    # Calculate text-only tokens
+    try:
+        # Create text-only version of the prompt
+        text_only_prompt = processor.apply_chat_template(
+            [{"role": "user", "content": text_prompt}],
+            add_generation_prompt=True,
+            tokenize=False,
+        )
+        text_prompt_len = processor(
+            text=[text_only_prompt],
+            padding=False,
+            return_tensors="pt",
+        )["input_ids"].numel()
+    except Exception:
+        # Fallback: just tokenize the text prompt directly
+        text_prompt_len = len(processor.tokenizer.encode(text_prompt))
+
+    # Vision tokens = total tokens - text tokens
+    vision_prompt_len = prompt_len - text_prompt_len
+
+    return DatasetRow(
+        prompt=text_prompt,
+        prompt_len=prompt_len,
+        output_len=output_len,
+        text_prompt_len=text_prompt_len,
+        vision_prompt_len=vision_prompt_len,
+        image_data=images_base64,
+    )
+
+
+def sample_image_requests(
+    num_requests: int,
+    image_count: int,
+    input_len: int,
+    output_len: int,
+    range_ratio: float,
+    processor: AutoProcessor,
+    image_content: str,
+    image_format: str,
+    image_resolution: str,
+) -> List[DatasetRow]:
+    """Generate requests with images.
+
+    - Each request includes ``image_count`` images.
+    - Supported resolutions: 4k (3840x2160), 1080p (1920x1080), 720p (1280x720), 360p (640x360),
+      or custom 'heightxwidth' (e.g., 1080x1920).
+    - Text lengths follow the 'random' dataset sampling rule. ``prompt_len``
+      only counts text tokens and excludes image data.
+    """
+    try:
+        import pybase64
+        from PIL import Image
+    except ImportError as e:
+        raise ImportError(
+            "Please install Pillow to generate random images: pip install pillow"
+        ) from e
+
+    # Parse resolution (supports presets and 'heightxwidth')
+    width, height = parse_image_resolution(image_resolution)
+
+    # Check for potentially problematic combinations and warn user
+    if width * height >= 1920 * 1080 and image_count * num_requests >= 100:
+        warnings.warn(
+            f"High resolution ({width}x{height}) with {image_count * num_requests} total images "
+            f"may take a long time. Consider reducing resolution or image count.",
+            UserWarning,
+            stacklevel=2,
+        )
+
+    # Sample text lengths
+    input_lens = np.random.randint(
+        max(int(input_len * range_ratio), 1), input_len + 1, size=num_requests
+    )
+    output_lens = np.random.randint(
+        int(output_len * range_ratio), output_len + 1, size=num_requests
+    )
+
+    def _gen_random_image_data_uri(
+        width: int = width, height: int = height
+    ) -> (Image, str, int):
+        if image_content == "blank":
+            # Generate blank white image
+            arr = np.full((height, width, 3), 255, dtype=np.uint8)
+        else:
+            # Generate random colored image
+            arr = (np.random.rand(height, width, 3) * 255).astype(np.uint8)
+        img = Image.fromarray(arr)
+        buf = io.BytesIO()
+        img.save(buf, format=image_format, quality=85)
+        encoded = pybase64.b64encode(buf.getvalue()).decode("utf-8")
+        image_data = f"data:image/{image_format};base64,{encoded}"
+        image_bytes = len(image_data.encode("utf-8"))
+        return img, image_data, image_bytes
+
+    dataset: List[DatasetRow] = []
+    total_image_bytes = 0
+    for i in range(num_requests):
+        # Generate text prompt
+        text_prompt = gen_prompt(processor.tokenizer, int(input_lens[i]))
+
+        # Generate image list
+        images, images_base64, images_bytes = zip(
+            *[_gen_random_image_data_uri() for _ in range(image_count)]
+        )
+        total_image_bytes += sum(list(images_bytes))
+
+        data_row = create_mm_data_row(
+            text_prompt,
+            list(images),
+            list(images_base64),
+            int(output_lens[i]),
+            processor,
+        )
+
+        dataset.append(data_row)
+
+    print(f"#Input tokens: {np.sum([x.prompt_len for x in dataset])}")
+    print(f"#Output tokens: {np.sum([x.output_len for x in dataset])}")
+    print(
+        f"\nCreated {len(dataset)} {image_content} {image_format} images with average {total_image_bytes // num_requests} bytes per request"
+    )
+    return dataset
+
+
 def gen_prompt(tokenizer, token_num):
     """Generate a random prompt of specified token length using tokenizer vocabulary."""
     all_available_tokens = list(tokenizer.get_vocab().values())
@@ -1181,7 +1539,9 @@ def sample_generated_shared_prefix_requests(
 
             input_requests.append(
                 DatasetRow(
-                    prompt=full_prompt, prompt_len=prompt_len, output_len=output_len
+                    prompt=full_prompt,
+                    prompt_len=prompt_len,
+                    output_len=output_len,
                 )
             )
             total_input_tokens += prompt_len
@@ -1216,19 +1576,41 @@ def sample_generated_shared_prefix_requests(
 async def get_request(
     input_requests: List[DatasetRow],
     request_rate: float,
+    use_trace_timestamps: bool = False,
+    slowdown_factor: float = 1.0,
 ) -> AsyncGenerator[DatasetRow, None]:
-    input_requests = iter(input_requests)
-    for request in input_requests:
-        yield request
+    if use_trace_timestamps:
+        print(
+            f"Using trace timestamps for request generation with slowdown factor {slowdown_factor}."
+        )
+        # Sort requests by timestamp for correct replay
+        input_requests.sort(key=lambda r: r.timestamp)
 
-        if request_rate == float("inf"):
-            # If the request rate is infinity, then we don't need to wait.
-            continue
+        start_time = time.perf_counter()
+        trace_start_time_ms = input_requests[0].timestamp if input_requests else 0
 
-        # Sample the request interval from the exponential distribution.
-        interval = np.random.exponential(1.0 / request_rate)
-        # The next request will be sent after the interval.
-        await asyncio.sleep(interval)
+        for request in input_requests:
+            trace_time_s = (request.timestamp - trace_start_time_ms) / 1000.0
+            target_arrival_time = start_time + (trace_time_s * slowdown_factor)
+
+            sleep_duration = target_arrival_time - time.perf_counter()
+            if sleep_duration > 0:
+                await asyncio.sleep(sleep_duration)
+
+            yield request
+    else:
+        input_requests_iter = iter(input_requests)
+        for request in input_requests_iter:
+            yield request
+
+            if request_rate == float("inf"):
+                # If the request rate is infinity, then we don't need to wait.
+                continue
+
+            # Sample the request interval from the exponential distribution.
+            interval = np.random.exponential(1.0 / request_rate)
+            # The next request will be sent after the interval.
+            await asyncio.sleep(interval)
 
 
 def calculate_metrics(
@@ -1241,6 +1623,8 @@ def calculate_metrics(
     output_lens: List[int] = []
     retokenized_output_lens: List[int] = []
     total_input = 0
+    total_input_text = 0
+    total_input_vision = 0
     completed = 0
     itls: List[float] = []
     tpots: List[float] = []
@@ -1255,6 +1639,8 @@ def calculate_metrics(
             )
             retokenized_output_lens.append(retokenized_output_len)
             total_input += input_requests[i].prompt_len
+            total_input_text += input_requests[i].text_prompt_len
+            total_input_vision += input_requests[i].vision_prompt_len
             if output_len > 1:
                 tpots.append((outputs[i].latency - outputs[i].ttft) / (output_len - 1))
             itls += outputs[i].itl
@@ -1276,6 +1662,8 @@ def calculate_metrics(
     metrics = BenchmarkMetrics(
         completed=completed,
         total_input=total_input,
+        total_input_text=total_input_text,
+        total_input_vision=total_input_vision,
         total_output=sum(output_lens),
         total_output_retokenized=sum(retokenized_output_lens),
         request_throughput=completed / dur_s,
@@ -1326,6 +1714,11 @@ async def benchmark(
     pd_separated: bool = False,
     flush_cache: bool = False,
     warmup_requests: int = 1,
+    use_trace_timestamps: bool = False,
+    mooncake_slowdown_factor=1.0,
+    mooncake_num_rounds=1,
+    profile_prefill_url: Optional[List[str]] = None,
+    profile_decode_url: Optional[List[str]] = None,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -1345,8 +1738,32 @@ async def benchmark(
     # Warmup
     print(f"Starting warmup with {warmup_requests} sequences...")
 
-    # Use the first request for all warmup iterations
-    test_request = input_requests[0]
+    # Handle the data structure difference for the warmup request
+    if args.dataset_name == "mooncake":
+        # For mooncake, input_requests is a list of dicts.
+        # We need to build a temporary DatasetRow for the warmup phase.
+        warmup_record = input_requests[0]
+
+        # Build prompt from hash_ids, just like in the async generator
+        hash_ids = warmup_record.get("hash_ids", [])
+        prompt_text = ""
+        for hash_id in hash_ids:
+            prompt_text += f"{hash_id}" + " ".join(["hi"] * 512)
+        prompt_text += "Can you tell me a detailed story in 1000 words?"
+
+        output_len = warmup_record.get("output_length", 32)
+        prompt_len = len(tokenizer.encode(prompt_text))
+
+        # Create a temporary DatasetRow object for warmup
+        test_request = DatasetRow(
+            prompt=prompt_text,
+            prompt_len=prompt_len,
+            output_len=output_len,
+            image_data=None,  # Mooncake doesn't have image data
+        )
+    else:
+        # For all other datasets, input_requests is a list of DatasetRow objects
+        test_request = input_requests[0]
 
     if lora_names is not None and len(lora_names) != 0:
         lora_name = lora_names[0]
@@ -1391,21 +1808,49 @@ async def benchmark(
 
     time.sleep(1.0)
 
+    # Build profile URLs for PD separated mode (do this once at the beginning)
+    pd_profile_urls = []
+    if profile and pd_separated:
+        pd_profile_urls = _build_profile_urls(profile_prefill_url, profile_decode_url)
+        if not pd_profile_urls:
+            print(
+                "Warning: PD separated mode requires --profile-prefill-url or --profile-decode-url"
+            )
+            print("Skipping profiler start. Please specify worker URLs for profiling.")
+
     # Start profiler
     if profile:
-        print("Starting profiler...")
-        profile_output = await async_request_profile(
-            api_url=base_url + "/start_profile"
-        )
-        if profile_output.success:
-            print("Profiler started")
-
-    pbar = None if disable_tqdm else tqdm(total=len(input_requests))
+        if pd_separated:
+            if pd_profile_urls:
+                await _call_profile_pd(pd_profile_urls, "start")
+        else:
+            print("Starting profiler...")
+            profile_output = await async_request_profile(
+                api_url=base_url + "/start_profile"
+            )
+            if profile_output.success:
+                print("Profiler started")
 
     # Run all requests
     benchmark_start_time = time.perf_counter()
     tasks: List[asyncio.Task] = []
-    async for request in get_request(input_requests, request_rate):
+    pbar_total = len(input_requests)
+    if (
+        backend == "sglang" and args.dataset_name == "mooncake"
+    ):  # Assuming mooncake is mainly for sglang or similar backends
+        print("Using time-based Mooncake request scheduler, ignoring --request-rate.")
+        request_generator = get_mooncake_request_over_time(
+            input_requests, tokenizer, mooncake_slowdown_factor, mooncake_num_rounds
+        )
+        print(
+            f"Starting Mooncake trace replay. Sessions: {len(input_requests)}, Rounds per session: {mooncake_num_rounds}. Slowdown factor: {mooncake_slowdown_factor}"
+        )
+        pbar_total *= args.mooncake_num_rounds
+    else:
+        request_generator = get_request(input_requests, request_rate)
+
+    pbar = None if disable_tqdm else tqdm(total=pbar_total)
+    async for request in request_generator:
         if lora_names is not None and len(lora_names) != 0:
             idx = random.randint(0, len(lora_names) - 1)
             lora_name = lora_names[idx]
@@ -1421,6 +1866,7 @@ async def benchmark(
             lora_name=lora_name,
             image_data=request.image_data,
             extra_request_body=extra_request_body,
+            timestamp=request.timestamp,
         )
 
         tasks.append(
@@ -1432,23 +1878,37 @@ async def benchmark(
 
     # Stop profiler
     if profile:
-        print("Stopping profiler...")
-        profile_output = await async_request_profile(api_url=base_url + "/stop_profile")
-        if profile_output.success:
-            print("Profiler stopped")
+        if pd_separated:
+            if pd_profile_urls:
+                await _call_profile_pd(pd_profile_urls, "stop")
+        else:
+            print("Stopping profiler...")
+            profile_output = await async_request_profile(
+                api_url=base_url + "/stop_profile"
+            )
+            if profile_output.success:
+                print("Profiler stopped")
 
     if pbar is not None:
         pbar.close()
 
     if "sglang" in backend:
-        server_info = requests.get(base_url + "/get_server_info")
+        server_info = requests.get(
+            base_url + "/get_server_info", headers=get_auth_headers()
+        )
         if server_info.status_code == 200:
             server_info_json = server_info.json()
             if "decode" in server_info_json:
                 server_info_json = server_info_json["decode"][0]
-            accept_length = server_info_json["internal_states"][0].get(
-                "avg_spec_accept_length", None
-            )
+            if (
+                "internal_states" in server_info_json
+                and server_info_json["internal_states"]
+            ):
+                accept_length = server_info_json["internal_states"][0].get(
+                    "avg_spec_accept_length", None
+                )
+            else:
+                accept_length = None
         else:
             accept_length = None
     else:
@@ -1466,7 +1926,11 @@ async def benchmark(
 
     print("\n{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
     print("{:<40} {:<10}".format("Backend:", backend))
-    print("{:<40} {:<10}".format("Traffic request rate:", request_rate))
+    print(
+        "{:<40} {:<10}".format(
+            "Traffic request rate:", "trace" if use_trace_timestamps else request_rate
+        )
+    )
     print(
         "{:<40} {:<10}".format(
             "Max request concurrency:",
@@ -1476,6 +1940,10 @@ async def benchmark(
     print("{:<40} {:<10}".format("Successful requests:", metrics.completed))
     print("{:<40} {:<10.2f}".format("Benchmark duration (s):", benchmark_duration))
     print("{:<40} {:<10}".format("Total input tokens:", metrics.total_input))
+    print("{:<40} {:<10}".format("Total input text tokens:", metrics.total_input_text))
+    print(
+        "{:<40} {:<10}".format("Total input vision tokens:", metrics.total_input_vision)
+    )
     print("{:<40} {:<10}".format("Total generated tokens:", metrics.total_output))
     print(
         "{:<40} {:<10}".format(
@@ -1535,7 +2003,7 @@ async def benchmark(
             # Arguments
             "backend": args.backend,
             "dataset_name": args.dataset_name,
-            "request_rate": request_rate,
+            "request_rate": "trace" if use_trace_timestamps else request_rate,
             "max_concurrency": max_concurrency,
             "sharegpt_output_len": args.sharegpt_output_len,
             "random_input_len": args.random_input_len,
@@ -1545,6 +2013,8 @@ async def benchmark(
             "duration": benchmark_duration,
             "completed": metrics.completed,
             "total_input_tokens": metrics.total_input,
+            "total_input_text_tokens": metrics.total_input_text,
+            "total_input_vision_tokens": metrics.total_input_vision,
             "total_output_tokens": metrics.total_output,
             "total_output_tokens_retokenized": metrics.total_output_retokenized,
             "request_throughput": metrics.request_throughput,
@@ -1579,10 +2049,18 @@ async def benchmark(
         output_file_name = args.output_file
     else:
         now = datetime.now().strftime("%m%d")
-        if args.dataset_name.startswith("random"):
+        if args.dataset_name == "image":
+            output_file_name = (
+                f"{args.backend}_{now}_{args.num_prompts}_{args.random_input_len}_"
+                f"{args.random_output_len}_{args.image_count}imgs_"
+                f"{args.image_resolution}.jsonl"
+            )
+        elif args.dataset_name.startswith("random"):
             output_file_name = f"{args.backend}_{now}_{args.num_prompts}_{args.random_input_len}_{args.random_output_len}.jsonl"
         else:
-            output_file_name = f"{args.backend}_{now}_{args.num_prompts}_sharegpt.jsonl"
+            output_file_name = (
+                f"{args.backend}_{now}_{args.num_prompts}_{args.dataset_name}.jsonl"
+            )
 
     result_details = {
         "input_lens": [output.prompt_len for output in outputs],
@@ -1636,6 +2114,17 @@ def run_benchmark(args_: argparse.Namespace):
 
     if not hasattr(args, "tokenize_prompt"):
         args.tokenize_prompt = False
+
+    if not hasattr(args, "use_trace_timestamps"):
+        args.use_trace_timestamps = False
+    if not hasattr(args, "mooncake_slowdown_factor"):
+        args.mooncake_slowdown_factor = 1.0
+
+    if not hasattr(args, "mooncake_slowdown_factor"):
+        args.mooncake_slowdown_factor = 1.0
+
+    if not hasattr(args, "mooncake_num_rounds"):
+        args.mooncake_num_rounds = 1
 
     print(f"benchmark_args={args}")
 
@@ -1740,6 +2229,12 @@ def run_benchmark(args_: argparse.Namespace):
             "Because when the tokenizer counts the output tokens, if there is gibberish, it might count incorrectly.\n"
         )
 
+    if args.dataset_name in ["image", "mmmu"]:
+        args.apply_chat_template = True
+        assert (
+            not args.tokenize_prompt
+        ), "`--tokenize-prompt` not compatible with image dataset"
+
     print(f"{args}\n")
 
     # Read dataset
@@ -1747,7 +2242,7 @@ def run_benchmark(args_: argparse.Namespace):
     model_id = args.model
     tokenizer_id = args.tokenizer if args.tokenizer is not None else args.model
     tokenizer = get_tokenizer(tokenizer_id)
-    input_requests = get_dataset(args, tokenizer)
+    input_requests = get_dataset(args, tokenizer, model_id)
 
     # compatible with SimpleNamespace
     if not hasattr(args, "flush_cache"):
@@ -1770,6 +2265,11 @@ def run_benchmark(args_: argparse.Namespace):
             pd_separated=args.pd_separated,
             flush_cache=args.flush_cache,
             warmup_requests=args.warmup_requests,
+            use_trace_timestamps=args.use_trace_timestamps,
+            mooncake_slowdown_factor=args.mooncake_slowdown_factor,
+            mooncake_num_rounds=args.mooncake_num_rounds,
+            profile_prefill_url=getattr(args, "profile_prefill_url", None),
+            profile_decode_url=getattr(args, "profile_decode_url", None),
         )
     )
 
@@ -1819,7 +2319,15 @@ if __name__ == "__main__":
         "--dataset-name",
         type=str,
         default="sharegpt",
-        choices=["sharegpt", "random", "random-ids", "generated-shared-prefix", "mmmu"],
+        choices=[
+            "sharegpt",
+            "random",
+            "random-ids",
+            "generated-shared-prefix",
+            "mmmu",
+            "image",
+            "mooncake",
+        ],
         help="Name of the dataset to benchmark on.",
     )
     parser.add_argument(
@@ -1857,20 +2365,48 @@ if __name__ == "__main__":
         "--random-input-len",
         type=int,
         default=1024,
-        help="Number of input tokens per request, used only for random dataset.",
+        help="Number of input tokens per request, used only for random and image dataset.",
     )
     parser.add_argument(
         "--random-output-len",
         default=1024,
         type=int,
-        help="Number of output tokens per request, used only for random dataset.",
+        help="Number of output tokens per request, used only for random and image dataset.",
     )
     parser.add_argument(
         "--random-range-ratio",
         type=float,
         default=0.0,
         help="Range of sampled ratio of input/output length, "
-        "used only for random dataset.",
+        "used only for random and image dataset.",
+    )
+    # image dataset args
+    parser.add_argument(
+        "--image-count",
+        type=int,
+        default=1,
+        help="Number of images per request (only available with the image dataset)",
+    )
+    parser.add_argument(
+        "--image-resolution",
+        type=str,
+        default="1080p",
+        help=(
+            "Resolution of images for image dataset. "
+            "Supports presets 4k/1080p/720p/360p or custom 'heightxwidth' (e.g., 1080x1920)."
+        ),
+    )
+    parser.add_argument(
+        "--image-format",
+        type=str,
+        default="jpeg",
+        help=("Format of images for image dataset. " "Supports jpeg and png."),
+    )
+    parser.add_argument(
+        "--image-content",
+        type=str,
+        default="random",
+        help=("Content for images for image dataset. " "Supports random and blank."),
     )
     parser.add_argument(
         "--request-rate",
@@ -1878,6 +2414,11 @@ if __name__ == "__main__":
         default=float("inf"),
         help="Number of requests per second. If this is inf, then all the requests are sent at time 0. "
         "Otherwise, we use Poisson process to synthesize the request arrival times. Default is inf.",
+    )
+    parser.add_argument(
+        "--use-trace-timestamps",
+        action="store_true",
+        help="Use timestamps from the trace file for request scheduling. Only valid for 'mooncake' dataset.",
     )
     parser.add_argument(
         "--max-concurrency",
@@ -1954,6 +2495,30 @@ if __name__ == "__main__":
         action="store_true",
         help="Benchmark PD disaggregation server",
     )
+
+    # Create a mutually exclusive group for profiling URLs
+    # In PD separated mode, prefill and decode workers must be profiled separately
+    profile_url_group = parser.add_mutually_exclusive_group()
+    profile_url_group.add_argument(
+        "--profile-prefill-url",
+        type=str,
+        nargs="*",
+        default=None,
+        help="URL(s) of the prefill worker(s) for profiling in PD separated mode. "
+        "Can specify multiple URLs: --profile-prefill-url http://localhost:30000 http://localhost:30001. "
+        "NOTE: Cannot be used together with --profile-decode-url. "
+        "In PD separated mode, prefill and decode workers must be profiled separately.",
+    )
+    profile_url_group.add_argument(
+        "--profile-decode-url",
+        type=str,
+        nargs="*",
+        default=None,
+        help="URL(s) of the decode worker(s) for profiling in PD separated mode. "
+        "Can specify multiple URLs: --profile-decode-url http://localhost:30010 http://localhost:30011. "
+        "NOTE: Cannot be used together with --profile-prefill-url. "
+        "In PD separated mode, prefill and decode workers must be profiled separately.",
+    )
     parser.add_argument(
         "--flush-cache",
         action="store_true",
@@ -2001,6 +2566,34 @@ if __name__ == "__main__":
         type=int,
         default=256,
         help="Target length in tokens for outputs in generated-shared-prefix dataset",
+    )
+    mooncake_group = parser.add_argument_group("mooncake dataset arguments")
+    mooncake_group.add_argument(
+        "--mooncake-slowdown-factor",
+        type=float,
+        default=1.0,
+        help="Slowdown factor for replaying the mooncake trace. "
+        "A value of 2.0 means the replay is twice as slow. "
+        "NOTE: --request-rate is IGNORED in mooncake mode.",
+    )
+    mooncake_group.add_argument(
+        "--mooncake-num-rounds",
+        type=int,
+        default=1,
+        help="Number of conversation rounds for each session in the mooncake dataset. "
+        "A value > 1 will enable true multi-turn session benchmarking.",
+    )
+    mooncake_group.add_argument(
+        "--mooncake-workload",
+        type=str,
+        default="conversation",
+        choices=[
+            "mooncake",
+            "conversation",
+            "synthetic",
+            "toolagent",
+        ],
+        help="Underlying workload for the mooncake dataset.",
     )
     args = parser.parse_args()
     run_benchmark(args)

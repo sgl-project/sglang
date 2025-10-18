@@ -1,6 +1,5 @@
 # Adapted from qwen2.py
 import logging
-from functools import partial
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
@@ -24,15 +23,25 @@ from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    maybe_remap_kv_scale_name,
+)
 from sglang.srt.models.qwen2 import Qwen2MLP as Qwen3MLP
 from sglang.srt.models.qwen2 import Qwen2Model
-from sglang.srt.utils import add_prefix, is_cuda
+from sglang.srt.utils import (
+    add_prefix,
+    get_cmo_stream,
+    is_cuda,
+    is_npu,
+    wait_cmo_stream,
+)
 
 Qwen3Config = None
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
+_is_npu = is_npu()
 
 
 class Qwen3Attention(nn.Module):
@@ -232,9 +241,18 @@ class Qwen3DecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
+            hidden_states,
+            residual,
+            forward_batch,
+            cache=(
+                [self.mlp.gate_up_proj.weight, self.mlp.down_proj.weight]
+                if _is_npu
+                else None
+            ),
         )
         hidden_states = self.mlp(hidden_states)
+        if _is_npu and get_cmo_stream():
+            wait_cmo_stream()
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
         )
@@ -327,8 +345,8 @@ class Qwen3ForCausalLM(nn.Module):
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
 
-    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.model.get_input_embeddings(input_ids)
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.model.get_input_embeddings()
 
     @torch.no_grad()
     def forward(
@@ -458,7 +476,10 @@ class Qwen3ForCausalLM(nn.Module):
                     continue
             if name.startswith("model.vision_tower") and name not in params_dict:
                 continue
-
+            if "scale" in name:
+                name = maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue

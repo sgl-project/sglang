@@ -8,27 +8,20 @@ from transformers.models.glm4v_moe.configuration_glm4v_moe import Glm4vMoeConfig
 
 from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
-    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
-    parallel_state,
-    tensor_model_parallel_all_reduce,
 )
-from sglang.srt.hf_transformers_utils import get_processor
-from sglang.srt.layers.dp_attention import (
-    get_attention_tp_rank,
-    get_attention_tp_size,
-    get_local_attention_dp_size,
-)
+from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
+from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.glm4_moe import Glm4MoeModel
 from sglang.srt.models.glm4v import Glm4vForConditionalGeneration, Glm4vVisionModel
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, is_cuda, log_info_on_rank0
+from sglang.srt.utils.hf_transformers_utils import get_processor
 
 _is_cuda = is_cuda()
 
@@ -48,13 +41,13 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
 
         config.moe_layer_freq = 1
         self.config = config
+        vision_utils.update_vit_attn_dummy_heads_config(self.config)
         self.tp_size = get_tensor_model_parallel_world_size()
-        self.dp_size = get_local_attention_dp_size()
         self.quant_config = quant_config
         self.determine_num_fused_shared_experts("Glm4MoeForCausalLM")
         self.num_fused_shared_experts = (
             0
-            if global_server_args_dict["disable_shared_experts_fusion"]
+            if get_global_server_args().disable_shared_experts_fusion
             else config.n_shared_experts
         )
 
@@ -75,17 +68,20 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=global_server_args_dict["enable_dp_lm_head"],
+            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
         self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
 
+        # For EAGLE3 support
+        self.capture_aux_hidden_states = False
+
     def determine_num_fused_shared_experts(
         self, architecture: str = "Glm4MoeForCausalLM"
     ):
         self.num_fused_shared_experts = 0
-        if global_server_args_dict["disable_shared_experts_fusion"]:
+        if get_global_server_args().disable_shared_experts_fusion:
             return
 
         # Only Deepseek V3/R1 can use shared experts fusion optimization now.
@@ -101,7 +97,7 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
             disable_reason = "Deepseek and GLM-4.5 can not use shared experts fusion optimization under expert parallelism."
 
         if disable_reason is not None:
-            global_server_args_dict["disable_shared_experts_fusion"] = True
+            get_global_server_args().disable_shared_experts_fusion = True
             self.num_fused_shared_experts = 0
             log_info_on_rank0(
                 logger,
@@ -232,7 +228,7 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
 
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
-        expert_params_mapping = get_moe_impl_class().make_expert_params_mapping(
+        expert_params_mapping = FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
@@ -394,6 +390,10 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
                         )
+                        if "visual" in name:
+                            loaded_weight = vision_utils.pad_vit_attn_dummy_heads(
+                                self.config, name, loaded_weight
+                            )
                         weight_loader(param, loaded_weight)
 
 

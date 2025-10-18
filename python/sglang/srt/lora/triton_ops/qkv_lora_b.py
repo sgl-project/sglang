@@ -119,7 +119,7 @@ def _qkv_lora_b_kernel(
     output_ptr = (output + seg_start * output_stride_0 + n_start * output_stride_1) + (
         s_offset[:, None] * output_stride_0 + n_offset[None, :] * output_stride_1
     )
-    output_mask = (s_offset[:, None] < seg_len) and (n_offset[None, :] < n_size)
+    output_mask = (s_offset[:, None] < seg_len) & (n_offset[None, :] < n_size)
     partial_sum += tl.load(output_ptr, mask=output_mask)
     tl.store(output_ptr, partial_sum, mask=output_mask)
 
