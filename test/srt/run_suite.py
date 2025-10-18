@@ -53,6 +53,11 @@ suites = {
         TestFile("openai_server/features/test_reasoning_content.py", 89),
         TestFile("openai_server/function_call/test_openai_function_calling.py", 60),
         TestFile("openai_server/function_call/test_tool_choice.py", 226),
+        TestFile(
+            "openai_server/function_call/test_openai_function_calling_grpc_router.py",
+            720,
+        ),
+        TestFile("openai_server/function_call/test_tool_choice_grpc_router.py", 720),
         TestFile("openai_server/validation/test_large_max_new_tokens.py", 41),
         TestFile("openai_server/validation/test_matched_stop.py", 60),
         TestFile("openai_server/validation/test_openai_server_ignore_eos.py", 85),
