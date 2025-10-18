@@ -435,6 +435,7 @@ class ServerArgs:
     torch_compile_max_bs: int = 32
     piecewise_cuda_graph_max_tokens: int = 4096
     piecewise_cuda_graph_tokens: Optional[List[int]] = None
+    piecewise_cuda_graph_compiler: str = "eager"
     torchao_config: str = ""
     enable_nan_detection: bool = False
     enable_p2p_check: bool = False
@@ -2799,6 +2800,13 @@ class ServerArgs:
             type=json_list_type,
             default=ServerArgs.piecewise_cuda_graph_tokens,
             help="Set the list of tokens when using piecewise cuda graph.",
+        )
+        parser.add_argument(
+            "--piecewise-cuda-graph-compiler",
+            type=str,
+            default=ServerArgs.piecewise_cuda_graph_compiler,
+            help="Set the compiler for piecewise cuda graph. Choices are: eager, inductor.",
+            choices=["eager", "inductor"],
         )
         parser.add_argument(
             "--torch-compile-max-bs",

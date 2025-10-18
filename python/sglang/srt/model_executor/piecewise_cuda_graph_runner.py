@@ -103,9 +103,10 @@ def _to_torch(model: torch.nn.Module, reverse: bool, num_tokens: int):
 
 
 @contextmanager
-def patch_model(model: torch.nn.Module):
+def patch_model(model: torch.nn.Module, compiler: str):
     try:
-        _to_torch(model, reverse=False, num_tokens=16)
+        if compiler != "eager":
+            _to_torch(model, reverse=False, num_tokens=16)
         yield model
     finally:
         _to_torch(model, reverse=True, num_tokens=16)
@@ -144,8 +145,12 @@ class PiecewiseCudaGraphRunner:
         assert (
             self.model_runner.server_args.piecewise_cuda_graph_tokens is not None
         ), "piecewise_cuda_graph_tokens is not set"
+        assert (
+            self.model_runner.server_args.piecewise_cuda_graph_compiler in ["eager", "inductor"]
+        ), "By now, only eager and inductor are supported for piecewise cuda graph compiler."
         self.compile_config = CompilationConfig(
-            self.model_runner.server_args.piecewise_cuda_graph_tokens
+            self.model_runner.server_args.piecewise_cuda_graph_tokens,
+            self.model_runner.server_args.piecewise_cuda_graph_compiler
         )
 
         # Batch sizes to capture
@@ -179,7 +184,7 @@ class PiecewiseCudaGraphRunner:
         # Set graph pool id globally to be able to use symmetric memory
         set_graph_pool_id(get_global_graph_memory_pool())
 
-        with patch_model(self.model_runner.model.model) as patched_model:
+        with patch_model(self.model_runner.model.model, self.compile_config.compiler) as patched_model:
             install_torch_compiled(
                 patched_model,
                 fullgraph=True,
@@ -191,14 +196,14 @@ class PiecewiseCudaGraphRunner:
             with set_compiled(True):
                 self.warmup_and_capture()
 
-        # Capture
-        try:
-            with model_capture_mode():
-                self.capture()
-        except RuntimeError as e:
-            raise Exception(
-                f"Capture cuda graph failed: {e}\n{PIECEWISE_CUDA_GRAPH_CAPTURE_FAILED_MSG}"
-            )
+            # Capture
+            try:
+                with model_capture_mode():
+                    self.capture()
+            except RuntimeError as e:
+                raise Exception(
+                    f"Capture cuda graph failed: {e}\n{PIECEWISE_CUDA_GRAPH_CAPTURE_FAILED_MSG}"
+                )
 
         self.raw_num_tokens = 0
 
