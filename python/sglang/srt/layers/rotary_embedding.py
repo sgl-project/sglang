@@ -1164,7 +1164,7 @@ def triton_mrope(
     rotary_dim: int,
     mrope_interleaved: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Qwen2VL mrope kernel.
+    """The mrope triton kernel.
 
     Args:
         q: [num_tokens, num_heads * head_size]
@@ -1177,7 +1177,13 @@ def triton_mrope(
         head_size: int
     """
     n_row, n_q_head_head_dim = q.shape
+    assert (
+        n_q_head_head_dim % head_size == 0
+    ), f"q shape {n_q_head_head_dim} must be divisible by head_size {head_size}"
     n_q_head = n_q_head_head_dim // head_size
+    assert (
+        k.shape[1] % head_size == 0
+    ), f"k shape {k.shape[1]} must be divisible by head_size {head_size}"
     n_kv_head = k.shape[1] // head_size
     pad_hd = triton.next_power_of_2(head_size)
     pad_n_q_head = triton.next_power_of_2(n_q_head)

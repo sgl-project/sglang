@@ -227,8 +227,6 @@ if __name__ == "__main__":
             num_heads = total_num_heads // tp_size
             num_kv_heads = max(1, total_num_kv_heads // tp_size)
             head_dim = config.hidden_size // total_num_heads
-            q_size = num_heads * head_dim
-            kv_size = num_kv_heads * head_dim
             is_neox_style = True
             rope_theta = config.rope_theta
             max_position = config.max_position_embeddings
