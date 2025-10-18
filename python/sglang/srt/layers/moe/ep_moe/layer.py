@@ -16,7 +16,6 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe.ep_moe.kernels import (
     ep_gather,
     ep_scatter,
-    silu_and_mul_masked_post_quant_fwd,
     tma_align_input_scale,
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import FlashInferFusedMoE, FusedMoE
