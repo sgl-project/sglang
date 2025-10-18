@@ -26,6 +26,9 @@ from sgl_kernel.testing.rotary_embedding import _apply_rotary_emb as apply_rotar
 flash_attn_varlen_func = partial(flash_attn_varlen_func, ver=4)
 flash_attn_with_kvcache = partial(flash_attn_with_kvcache, ver=4)
 
+# Skip this test on Hopper machine
+skip_condition = torch.cuda.get_device_capability() < (10, 0)
+
 
 def unpad_input(hidden_states, attention_mask, unused_mask=None):
     """
@@ -496,6 +499,9 @@ def attention_ref(
     return output.to(dtype=dtype_og), attention.to(dtype=dtype_og)
 
 
+@pytest.mark.skipif(
+    skip_condition, reason="FA4 Requires compute capability of 10 or above."
+)
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
@@ -882,6 +888,9 @@ def test_flash_attn_varlen_output(
             ).abs().max().item() + dv_atol
 
 
+@pytest.mark.skipif(
+    skip_condition, reason="FA4 Requires compute capability of 10 or above."
+)
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 # @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
