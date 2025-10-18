@@ -968,7 +968,7 @@ class ServerArgs:
                     logger.warning("Setting KV cache dtype to fp8.")
 
                 if self.kv_cache_dtype == "fp8_e4m3":
-                    self.nsa_prefill = "flashmla_decode"
+                    # self.nsa_prefill = "flashmla_prefill"
                     self.nsa_decode = "flashmla_decode"
                     logger.warning(
                         "Setting NSA backend to flashmla_decode for FP8 KV Cache."

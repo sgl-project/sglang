@@ -252,4 +252,16 @@ if __name__ == "__main__":
             ref_ref_dequant, actual_actual_dequant, atol=0.2, rtol=0.2
         )
 
+        # test dequant_k_cache_paged
+        page_table_1 = torch.arange(
+            num_blocks * block_size, dtype=torch.int32, device="cuda"
+        )
+        actual_dequant_paged = dequant_k_cache.dequantize_k_cache_paged(
+            actual_quant, page_table_1
+        ).reshape(actual_actual_dequant.shape)
+        print(f"{torch.mean(actual_actual_dequant - actual_dequant_paged)=}")
+        torch.testing.assert_close(
+            ref_ref_dequant, actual_dequant_paged, atol=0.2, rtol=0.2
+        )
+
     print("Passed")
