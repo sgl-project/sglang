@@ -131,6 +131,9 @@ class GrpcRequestManager:
 
         # State Management (from TokenizerManager)
         self.rid_to_state: Dict[str, GrpcReqState] = {}
+        self.rid_to_state_lock = (
+            asyncio.Lock()
+        )  # Protect dictionary from race conditions
         self.asyncio_tasks: set = set()
         self.gracefully_exit = False
         self.no_create_loop = False
@@ -308,7 +311,8 @@ class GrpcRequestManager:
             state.session_id = obj.session_params.session_id
             state.is_session_request = True
 
-        self.rid_to_state[request_id] = state
+        async with self.rid_to_state_lock:
+            self.rid_to_state[request_id] = state
         self.record_request_for_crash_dump(obj)
 
         try:
@@ -340,12 +344,13 @@ class GrpcRequestManager:
 
         finally:
             # Always clean up request state when exiting
-            self._cleanup_request_state(request_id)
+            await self._cleanup_request_state(request_id)
 
-    def _cleanup_request_state(self, request_id: str):
+    async def _cleanup_request_state(self, request_id: str):
         """Clean up local request state (does not notify scheduler)."""
-        if request_id in self.rid_to_state:
-            del self.rid_to_state[request_id]
+        async with self.rid_to_state_lock:
+            if request_id in self.rid_to_state:
+                del self.rid_to_state[request_id]
 
     async def embedding_request(
         self,
@@ -374,7 +379,8 @@ class GrpcRequestManager:
         )
 
         # Register state
-        self.rid_to_state[request_id] = state
+        async with self.rid_to_state_lock:
+            self.rid_to_state[request_id] = state
 
         # Create future for result
         future = asyncio.Future()
@@ -383,7 +389,8 @@ class GrpcRequestManager:
         try:
             await self._send_to_scheduler(obj)
         except Exception as e:
-            del self.rid_to_state[request_id]
+            async with self.rid_to_state_lock:
+                del self.rid_to_state[request_id]
             future.set_exception(e)
             return future
 
@@ -397,8 +404,9 @@ class GrpcRequestManager:
                 future.set_exception(e)
             finally:
                 # Clean up
-                if request_id in self.rid_to_state:
-                    del self.rid_to_state[request_id]
+                async with self.rid_to_state_lock:
+                    if request_id in self.rid_to_state:
+                        del self.rid_to_state[request_id]
 
         asyncio.create_task(wait_for_result())
         return future
@@ -414,11 +422,12 @@ class GrpcRequestManager:
             return False
 
         # Mark state as finished immediately to stop processing scheduler outputs
-        state = self.rid_to_state.get(request_id)
-        if state:
-            state.finished = True
-            state.stream_finished = True
-            logger.debug(f"Marked request {request_id} as aborted locally")
+        async with self.rid_to_state_lock:
+            state = self.rid_to_state.get(request_id)
+            if state:
+                state.finished = True
+                state.stream_finished = True
+                logger.debug(f"Marked request {request_id} as aborted locally")
 
         # Send abort to scheduler - the scheduler will send AbortReq back
         # which will be handled by _handle_abort_req
@@ -443,10 +452,11 @@ class GrpcRequestManager:
                 recv_obj = await self.recv_from_scheduler.recv_pyobj()
                 self.last_receive_tstamp = time.time()
 
-                # Check for pause
-                async with self.is_pause_cond:
-                    while self.is_pause:
-                        await self.is_pause_cond.wait()
+                # Check for pause (optimized: check flag before acquiring lock)
+                if self.is_pause:
+                    async with self.is_pause_cond:
+                        while self.is_pause:
+                            await self.is_pause_cond.wait()
 
                 # Handle different output types
                 if isinstance(recv_obj, BatchTokenIDOutput):
@@ -531,12 +541,18 @@ class GrpcRequestManager:
 
     async def _handle_batch_output(self, batch_out: BatchTokenIDOutput):
         """Handle batch generation output from scheduler."""
+        # Collect all queue.put() tasks for parallel execution
+        put_tasks = []
+        cleanup_tasks = []
+        now = time.time()
+
         # Process each request in the batch
         for i, rid in enumerate(batch_out.rids):
-            if rid not in self.rid_to_state:
-                continue
-
-            state = self.rid_to_state[rid]
+            # Acquire lock to safely check and retrieve state
+            async with self.rid_to_state_lock:
+                if rid not in self.rid_to_state:
+                    continue
+                state = self.rid_to_state[rid]
 
             # Skip if already aborted/finished locally (client cancelled)
             if state.finished:
@@ -544,7 +560,6 @@ class GrpcRequestManager:
                 continue
 
             # Update metrics
-            now = time.time()
             if state.first_token_time == 0.0:
                 state.first_token_time = now
             state.last_time = now
@@ -638,7 +653,8 @@ class GrpcRequestManager:
             if output_data["token_ids"]:
                 state.output_ids.extend(output_data["token_ids"])
 
-            await state.out_queue.put(output_data)
+            # Add queue.put() to parallel task list
+            put_tasks.append(state.out_queue.put(output_data))
 
             # Handle completion
             if output_data["finished"]:
@@ -648,20 +664,26 @@ class GrpcRequestManager:
                 state.event.set()
 
                 # Remove from tracking after a delay
-                async def cleanup():
+                async def cleanup(request_id):
                     await asyncio.sleep(5.0)
-                    if rid in self.rid_to_state:
-                        del self.rid_to_state[rid]
+                    async with self.rid_to_state_lock:
+                        if request_id in self.rid_to_state:
+                            del self.rid_to_state[request_id]
 
-                asyncio.create_task(cleanup())
+                cleanup_tasks.append(asyncio.create_task(cleanup(rid)))
+
+        # Execute all queue.put() operations in parallel
+        if put_tasks:
+            await asyncio.gather(*put_tasks, return_exceptions=True)
 
     async def _handle_embedding_output(self, batch_out: BatchEmbeddingOutput):
         """Handle batch embedding output from scheduler."""
         for i, rid in enumerate(batch_out.rids):
-            if rid not in self.rid_to_state:
-                continue
-
-            state = self.rid_to_state[rid]
+            # Acquire lock to safely check and retrieve state
+            async with self.rid_to_state_lock:
+                if rid not in self.rid_to_state:
+                    continue
+                state = self.rid_to_state[rid]
 
             # Create result
             result = {
@@ -687,11 +709,12 @@ class GrpcRequestManager:
         """Handle health check output from scheduler."""
         rid = health_out.rid
 
-        if rid not in self.rid_to_state:
-            logger.warning(f"Health check output for unknown request: {rid}")
-            return
-
-        state = self.rid_to_state[rid]
+        # Acquire lock to safely check and retrieve state
+        async with self.rid_to_state_lock:
+            if rid not in self.rid_to_state:
+                logger.warning(f"Health check output for unknown request: {rid}")
+                return
+            state = self.rid_to_state[rid]
 
         # Create health check result
         result = {
@@ -727,13 +750,13 @@ class GrpcRequestManager:
             return
 
         # Check if request still exists
-        if recv_obj.rid not in self.rid_to_state:
-            logger.debug(
-                f"Abort request for {recv_obj.rid} not in local state (may have already finished or not started yet)"
-            )
-            return
-
-        state = self.rid_to_state[recv_obj.rid]
+        async with self.rid_to_state_lock:
+            if recv_obj.rid not in self.rid_to_state:
+                logger.debug(
+                    f"Abort request for {recv_obj.rid} not in local state (may have already finished or not started yet)"
+                )
+                return
+            state = self.rid_to_state[recv_obj.rid]
 
         # Mark as finished
         state.finished = True

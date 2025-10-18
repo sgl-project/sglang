@@ -388,14 +388,14 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             if self.request_manager.last_receive_tstamp > tic:
                 task.cancel()
                 # Clean up health check state
-                self.request_manager._cleanup_request_state(rid)
+                await self.request_manager._cleanup_request_state(rid)
                 return sglang_scheduler_pb2.HealthCheckResponse(
                     healthy=True, message="Health check passed"
                 )
 
         # Timeout - server not responding
         task.cancel()
-        self.request_manager._cleanup_request_state(rid)
+        await self.request_manager._cleanup_request_state(rid)
         logger.warning(f"Health check timeout after {HEALTH_CHECK_TIMEOUT}s")
         return sglang_scheduler_pb2.HealthCheckResponse(
             healthy=False, message=f"Health check timeout after {HEALTH_CHECK_TIMEOUT}s"
