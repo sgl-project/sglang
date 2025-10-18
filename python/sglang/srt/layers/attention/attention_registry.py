@@ -34,7 +34,9 @@ def create_flashinfer_backend(runner):
                 or not runner.plan_stream_for_flashinfer
             ):
                 runner.plan_stream_for_flashinfer = torch.cuda.Stream()
-        return FlashInferAttnBackend(runner)
+        return FlashInferAttnBackend(
+            runner, init_new_workspace=runner.init_new_workspace
+        )
     else:
         from sglang.srt.layers.attention.flashinfer_mla_backend import (
             FlashInferMLAAttnBackend,

@@ -42,8 +42,7 @@ pub async fn get_grpc_client_from_worker(
         .map_err(|e| internal_error_message(format!("Failed to get gRPC client: {}", e)))?
         .ok_or_else(|| internal_error_static("Selected worker is not configured for gRPC"))?;
 
-    let client = client_arc.lock().await.clone();
-    Ok(client)
+    Ok((*client_arc).clone())
 }
 
 /// Process tool call arguments in messages

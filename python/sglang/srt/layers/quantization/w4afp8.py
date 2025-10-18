@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
-from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
-from sglang.srt.layers.linear import LinearBase, UnquantizedLinearMethod
+from sglang.srt.layers.linear import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
@@ -21,7 +20,7 @@ from sglang.srt.utils import set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe import MoeRunnerConfig
-    from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, EPMoE
+    from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
         DeepEPNormalOutput,
