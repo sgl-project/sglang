@@ -779,7 +779,7 @@ class GrpcRequestManager:
     async def _send_to_scheduler(self, obj):
         """Send an object to the scheduler via ZMQ."""
         try:
-            self.send_to_scheduler.send_pyobj(obj)
+            await self.send_to_scheduler.send_pyobj(obj)
         except Exception as e:
             logger.error(f"Failed to send to scheduler: {e}")
             raise
