@@ -1412,12 +1412,19 @@ class ServerArgs:
 
             # Check attention backend
             if self.attention_backend is None:
-                # User didn't specify attention backend, fallback to flashinfer
-                self.attention_backend = "flashinfer"
-                logger.warning(
-                    f"Attention backend not specified. Falling back to 'flashinfer' for deterministic inference. "
-                    f"You can explicitly set --attention-backend to one of {DETERMINISTIC_ATTENTION_BACKEND_CHOICES}."
-                )
+                # User didn't specify attention backend, fallback based on GPU architecture
+                if is_sm100_supported():
+                    self.attention_backend = "flashinfer"
+                    logger.warning(
+                        f"Attention backend not specified. Falling back to 'flashinfer' for deterministic inference on Blackwell (SM100). "
+                        f"You can explicitly set --attention-backend to one of {DETERMINISTIC_ATTENTION_BACKEND_CHOICES}."
+                    )
+                else:
+                    self.attention_backend = "fa3"
+                    logger.warning(
+                        f"Attention backend not specified. Falling back to 'fa3' for deterministic inference. "
+                        f"You can explicitly set --attention-backend to one of {DETERMINISTIC_ATTENTION_BACKEND_CHOICES}."
+                    )
             elif self.attention_backend not in DETERMINISTIC_ATTENTION_BACKEND_CHOICES:
                 # User explicitly specified an incompatible attention backend
                 raise ValueError(
