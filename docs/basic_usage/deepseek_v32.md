@@ -36,6 +36,7 @@ git submodule update --init --recursive
 pip install -v .
 
 # Install fast_hadamard_transform
+# To be removed after integration into sgl-kernel
 git clone https://github.com/Dao-AILab/fast-hadamard-transform.git
 cd fast-hadamard-transform
 pip install .
@@ -53,7 +54,22 @@ python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8 --ep
 ```
 
 ### Configuration Tips
-- **DP Attention**: For DeepSeek V3.2 model, the kernels are customized for the use case of `dp_size=8`.
+- **DP Attention**: For DeepSeek V3.2 model, the kernels are customized for the use case of `dp_size=8`. So
+- **Choices of Attention Kernels**: The attention backend is set to `nsa` attention backend for DeepSeek V3.2 model. In this backend, different kernels for sparse prefilling/decoding are implemented, which can be specified by `--nsa-prefill` and `--nsa-decode` arguments.
+- **FP8/BF16 KV Cache**:
+- Maybe some environmental variables
+
+
+### Multi-token Prediction
+SGLang implements Multi-Token Prediction (MTP) for DeepSeek V3.2 based on [EAGLE speculative decoding](https://docs.sglang.ai/advanced_features/speculative_decoding.html#EAGLE-Decoding). With this optimization, the decoding speed can be improved significantly on small batch sizes.
+
+Example usage:
+```bash
+python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8 --speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --cuda-graph-max-bs 32 --max-running-requests 32
+```
+- The best configuration for `--speculative-num-steps`, `--speculative-eagle-topk` and `--speculative-num-draft-tokens` can be searched with [bench_speculative.py](https://github.com/sgl-project/sglang/blob/main/scripts/playground/bench_speculative.py) script for given batch size. The minimum configuration is `--speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2`, which can achieve speedup for larger batch sizes.
+- To enable MTP for large batch sizes (>32), the `--cuda-graph-max-bs` and `--max-running-requests` arguments should be changed to a larger value that matches the batch sizes.
+
 
 
 ## Benchmarking Results
@@ -63,7 +79,6 @@ python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8 --ep
 ```bash
 python3 benchmark/gsm8k/bench_sglang.py --num-shots 8 --num-questions 1319 --parallel 1319
 ```
-
 
 ### Accuracy Test with `gpqa-diamond`
 
