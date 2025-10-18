@@ -70,12 +70,12 @@ from sglang.srt.layers.quantization.utils import (
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
+    is_blackwell_supported,
     is_cpu,
     is_cuda,
     is_hip,
     is_npu,
     is_sm90_supported,
-    is_sm100_supported,
     log_info_on_rank0,
     next_power_of_2,
     print_warning_once,
@@ -529,7 +529,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             get_bool_env_var("SGLANG_CUTLASS_MOE")
             and self.cutlass_fp8_supported
             and self.block_quant
-            and (is_sm100_supported() or is_sm90_supported())
+            and (is_blackwell_supported() or is_sm90_supported())
         )
 
     def create_weights(

@@ -132,13 +132,13 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_cpu_ids_by_node,
     init_custom_process_group,
+    is_blackwell_supported,
     is_fa3_default_architecture,
     is_flashinfer_available,
     is_hip,
     is_hopper_with_cuda_12_3,
     is_no_spec_infer_or_topk_one,
     is_npu,
-    is_sm100_supported,
     log_info_on_rank0,
     monkey_patch_p2p_access_check,
     monkey_patch_vllm_gguf_config,
@@ -559,7 +559,7 @@ class ModelRunner:
                 # MLA architecture
                 if is_hopper_with_cuda_12_3():
                     server_args.attention_backend = "fa3"
-                elif is_sm100_supported():
+                elif is_blackwell_supported():
                     server_args.attention_backend = "flashinfer"
                 elif _is_hip:
                     head_num = self.model_config.get_num_kv_heads(self.tp_size)
@@ -643,7 +643,7 @@ class ModelRunner:
                     )
                 else:
                     server_args.decode_attention_backend = (
-                        "flashinfer" if is_sm100_supported() else "triton"
+                        "flashinfer" if is_blackwell_supported() else "triton"
                     )
             elif server_args.decode_attention_backend == "fa3":
                 server_args.hicache_io_backend = "direct"
