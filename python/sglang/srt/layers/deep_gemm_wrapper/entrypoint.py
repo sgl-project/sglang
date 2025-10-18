@@ -4,8 +4,8 @@ from typing import Tuple
 
 import torch
 
-from sglang.srt.layers.quantization.deep_gemm_wrapper import compile_utils
-from sglang.srt.layers.quantization.deep_gemm_wrapper.configurer import (  # noqa: F401
+from sglang.srt.layers.deep_gemm_wrapper import compile_utils
+from sglang.srt.layers.deep_gemm_wrapper.configurer import (  # noqa: F401
     DEEPGEMM_BLACKWELL,
     DEEPGEMM_SCALE_UE8M0,
     ENABLE_JIT_DEEPGEMM,
