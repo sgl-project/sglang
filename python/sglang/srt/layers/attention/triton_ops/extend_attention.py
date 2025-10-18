@@ -118,10 +118,12 @@ def build_unified_kv_indices(
 
     # Create unified_kv_indptr avoiding direct assignment (for CUDA graph compatibility)
     unified_lens = prefix_lens + extend_seq_lens[:bs]
-    unified_kv_indptr = torch.cat([
-        torch.zeros(1, dtype=torch.int32, device=device),
-        torch.cumsum(unified_lens, dim=0)
-    ])
+    unified_kv_indptr = torch.cat(
+        [
+            torch.zeros(1, dtype=torch.int32, device=device),
+            torch.cumsum(unified_lens, dim=0),
+        ]
+    )
 
     max_unified_len = len(prefix_kv_indices) + len(extend_kv_indices)
 
@@ -713,7 +715,7 @@ def _fwd_kernel_unified(
     cur_window_start = 0
     if SLIDING_WINDOW_SIZE > 0:
         cur_window_start = tl.load(window_start_pos + cur_seq)
-    
+
     # Load custom mask start index if using custom mask (for speculative decoding)
     if USE_CUSTOM_MASK:
         cur_seq_mask_start_idx = tl.load(mask_indptr + cur_seq)
@@ -942,7 +944,7 @@ def extend_attention_fwd_unified(
         prefix_lens: Prefix length for each sequence [batch_size]
         max_len_extend: Maximum extend length
         custom_mask: Custom attention mask (for speculative decoding tree attention)
-        mask_indptr: Mask offsets [batch_size + 1] 
+        mask_indptr: Mask offsets [batch_size + 1]
         sm_scale: Softmax scale
         logit_cap: Logit capping value
         is_causal: Whether to apply causal mask

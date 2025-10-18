@@ -573,9 +573,7 @@ class TestTritonAttention(CustomTestCase):
             for B, H_Q, H_KV, D, D_V in configs:
                 self._test_grouped_decode_attention_once(B, S, H_Q, H_KV, D, D_V)
 
-    def _test_extend_attention_unified_vs_regular_once(
-        self, B, N_CTX, H_Q, H_KV, D
-    ):
+    def _test_extend_attention_unified_vs_regular_once(self, B, N_CTX, H_Q, H_KV, D):
         """Test that unified kernel produces same results as 2-stage kernel."""
         dtype = torch.bfloat16
 

@@ -882,12 +882,18 @@ class TritonAttnBackend(AttentionBackend):
             window_kv_lens = prefix_kv_indptr[1 : bs + 1] - prefix_kv_indptr[:bs]
             # Handle TARGET_VERIFY mode where extend_prefix_lens might not be set
             if forward_batch.extend_prefix_lens is not None:
-                window_start_pos = forward_batch.extend_prefix_lens[:bs] - window_kv_lens
+                window_start_pos = (
+                    forward_batch.extend_prefix_lens[:bs] - window_kv_lens
+                )
             else:
                 # Infer from spec_info: prefix_len = seq_len - draft_token_num
-                if (forward_batch.spec_info is not None and 
-                    hasattr(forward_batch.spec_info, 'draft_token_num')):
-                    extend_prefix_lens = forward_batch.seq_lens[:bs] - forward_batch.spec_info.draft_token_num
+                if forward_batch.spec_info is not None and hasattr(
+                    forward_batch.spec_info, "draft_token_num"
+                ):
+                    extend_prefix_lens = (
+                        forward_batch.seq_lens[:bs]
+                        - forward_batch.spec_info.draft_token_num
+                    )
                     window_start_pos = extend_prefix_lens - window_kv_lens
                 else:
                     window_start_pos = None
@@ -904,8 +910,9 @@ class TritonAttnBackend(AttentionBackend):
         # In speculative decoding, we can infer these from spec_info or compute them
         if forward_batch.extend_seq_lens is None:
             # TARGET_VERIFY mode: infer extend_seq_lens from spec_info
-            if (forward_batch.spec_info is not None and 
-                hasattr(forward_batch.spec_info, 'draft_token_num')):
+            if forward_batch.spec_info is not None and hasattr(
+                forward_batch.spec_info, "draft_token_num"
+            ):
                 draft_token_num = forward_batch.spec_info.draft_token_num
                 extend_seq_lens = torch.full(
                     (bs,), draft_token_num, dtype=torch.int32, device=self.device
@@ -917,15 +924,17 @@ class TritonAttnBackend(AttentionBackend):
                 )
         else:
             extend_seq_lens = forward_batch.extend_seq_lens
-        
+
         # Check extend_start_loc separately - it might be None even when extend_seq_lens is set
         if forward_batch.extend_start_loc is None:
             # Compute extend_start_loc from extend_seq_lens
             # extend_start_loc[i] = sum(extend_seq_lens[0:i])
-            extend_start_loc = torch.cat([
-                torch.zeros(1, dtype=torch.int32, device=self.device),
-                torch.cumsum(extend_seq_lens[:-1], dim=0)
-            ])
+            extend_start_loc = torch.cat(
+                [
+                    torch.zeros(1, dtype=torch.int32, device=self.device),
+                    torch.cumsum(extend_seq_lens[:-1], dim=0),
+                ]
+            )
         else:
             extend_start_loc = forward_batch.extend_start_loc
 
