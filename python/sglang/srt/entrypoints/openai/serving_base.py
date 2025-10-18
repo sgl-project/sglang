@@ -4,7 +4,7 @@ import json
 import logging
 import uuid
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, Optional, Union
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 
 import orjson
 from fastapi import HTTPException, Request
@@ -34,6 +34,52 @@ class OpenAIServingBase(ABC):
             and self.tokenizer_manager.server_args.tokenizer_metrics_allowed_custom_labels
             else None
         )
+
+    def _parse_model_parameter(self, model: str) -> Tuple[str, Optional[str]]:
+        """Parse 'base-model:adapter-name' syntax to extract LoRA adapter.
+
+        Returns (base_model, adapter_name) or (model, None) if no colon present.
+        """
+        if ":" not in model:
+            return model, None
+
+        # Split on first colon only to handle model paths with multiple colons
+        parts = model.split(":", 1)
+        base_model = parts[0].strip()
+        adapter_name = parts[1].strip() or None
+
+        return base_model, adapter_name
+
+    def _resolve_lora_path(
+        self,
+        request_model: str,
+        explicit_lora_path: Optional[Union[str, List[Optional[str]]]],
+    ) -> Optional[Union[str, List[Optional[str]]]]:
+        """Resolve LoRA adapter with priority: model parameter > explicit lora_path.
+
+        Returns adapter name or None. Supports both single values and lists (batches).
+        """
+        _, adapter_from_model = self._parse_model_parameter(request_model)
+
+        # Model parameter adapter takes precedence
+        if adapter_from_model is not None:
+            return adapter_from_model
+
+        # Fall back to explicit lora_path
+        return explicit_lora_path
+
+    def _validate_lora_enabled(self, adapter_name: str) -> None:
+        """Check that LoRA is enabled before attempting to use an adapter.
+
+        Raises ValueError with actionable guidance if --enable-lora flag is missing.
+        Adapter existence is validated later by TokenizerManager.lora_registry.
+        """
+        if not self.tokenizer_manager.server_args.enable_lora:
+            raise ValueError(
+                f"LoRA adapter '{adapter_name}' was requested, but LoRA is not enabled. "
+                "Please launch the server with --enable-lora flag and preload adapters "
+                "using --lora-paths or /load_lora_adapter endpoint."
+            )
 
     async def handle_request(
         self, request: OpenAIServingRequest, raw_request: Request
