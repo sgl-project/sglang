@@ -327,7 +327,12 @@ pub fn process_chat_messages(
             tokenizer
                 .as_any()
                 .downcast_ref::<CachedTokenizer>()
-                .and_then(|cached| cached.inner().as_any().downcast_ref::<HuggingFaceTokenizer>())
+                .and_then(|cached| {
+                    cached
+                        .inner()
+                        .as_any()
+                        .downcast_ref::<HuggingFaceTokenizer>()
+                })
         });
 
     let formatted_text = if let Some(hf_tokenizer) = hf_tokenizer {
