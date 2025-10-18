@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import sys
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Literal, Optional, TypeAlias
 
@@ -35,18 +34,18 @@ _is_hip = is_hip()
 
 if _is_hip:
     try:
-        from aiter import (
+        from aiter import (  # noqa: F401
             flash_attn_varlen_func,
             mha_batch_prefill_func,
             paged_attention_ragged,
         )
-        from aiter.mla import mla_decode_fwd, mla_prefill_fwd
+        from aiter.mla import mla_decode_fwd, mla_prefill_fwd  # noqa: F401
     except ImportError:
         print(
             "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
         )
 else:
-    from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+    from sgl_kernel.flash_attn import flash_attn_with_kvcache
 
 
 @dataclass(frozen=True)
