@@ -154,6 +154,11 @@ impl CachedTokenizer {
     pub fn fingerprint(&self) -> &TokenizerFingerprint {
         &self.fingerprint
     }
+
+    /// Get a reference to the inner (wrapped) tokenizer
+    pub fn inner(&self) -> &Arc<dyn Tokenizer> {
+        &self.inner
+    }
 }
 
 impl Encoder for CachedTokenizer {
