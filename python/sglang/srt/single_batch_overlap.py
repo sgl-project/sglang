@@ -3,10 +3,9 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import torch
 
+from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe import get_moe_runner_backend
 from sglang.srt.layers.moe.utils import is_sbo_enabled
-from sglang.srt.layers.quantization import deep_gemm_wrapper
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import get_int_env_var
 
@@ -43,7 +42,7 @@ class CombineOverlapArgs:
     wait_event: torch.cuda.Event
     num_sms: int
     signal: Optional[torch.Tensor] = None
-    threshold: int = -1
+    threshold: int = 0
 
 
 @dataclass
@@ -62,8 +61,6 @@ def execute_sbo(
     forward_batch: ForwardBatch,
     alt_stream: Optional = None,
 ):
-    shared_output = None
-
     dispatch_output = experts.dispatch(
         hidden_states, topk_idx, topk_weights, forward_batch
     )
@@ -83,7 +80,7 @@ def execute_sbo(
         with deep_gemm_wrapper.configure_deep_gemm_num_sms(
             meta_overlap_args["compute_num_sms"]
         ):
-            shared_output = forward_shared_experts()
+            forward_shared_experts()
 
     hidden_states = experts.combine(
         hidden_states,
@@ -93,7 +90,7 @@ def execute_sbo(
         overlap_args=combine_overlap_args,
     )
 
-    return hidden_states, shared_output
+    return hidden_states
 
 
 def _compute_overlap_args(dispatch_output, alt_stream):

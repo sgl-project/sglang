@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
 import torch.nn.functional as F
@@ -17,15 +17,15 @@ if is_cuda():
     except ImportError as e:
         deep_gemm = e
 
-from sglang.srt.layers.attention.nsa.utils import NSA_DUAL_STREAM, NSA_USE_REAL_INDEXER
+from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers.attention.nsa.utils import NSA_DUAL_STREAM
 from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.layers.linear import ReplicatedLinear
-from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.server_args import get_global_server_args
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
@@ -162,49 +162,13 @@ class Indexer(CustomOp):
             base=rope_theta,  # type: ignore
             rope_scaling=rope_scaling,
             is_neox_style=False,
-            device=global_server_args_dict["device"],
+            device=get_global_server_args().device,
         )
         self.block_size = block_size
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
 
-    def _forward_fake(
-        self,
-        x: torch.Tensor,
-        q_lora: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        layer_id: int,
-    ):
-        bs = x.shape[0]
-        assert self.index_topk == 2048
-        ans = torch.arange(0, self.index_topk, dtype=torch.int32, device=x.device)[
-            None, ...
-        ].repeat(bs, 1)
-        if forward_batch.forward_mode.is_extend():
-            assert (
-                forward_batch.extend_seq_lens_cpu is not None
-                and forward_batch.seq_lens_cpu is not None
-            )
-            which = 0
-            for i, (kv_len, qo_len) in enumerate(
-                zip(
-                    forward_batch.seq_lens_cpu.tolist(),
-                    forward_batch.extend_seq_lens_cpu,
-                    strict=True,
-                )
-            ):
-                for j in range(kv_len - qo_len, kv_len):
-                    ans[which, j + 1 :] = -1
-                    which += 1
-            assert which == ans.shape[0]
-        else:
-            assert forward_batch.seq_lens_cpu is not None
-            for i, seq_len in enumerate(forward_batch.seq_lens_cpu.tolist()):
-                ans[i, seq_len:] = -1
-
-        return ans
-
+    @torch.compile(dynamic=True)
     def _get_logits_head_gate(self, x: torch.Tensor, q_scale: torch.Tensor):
         weights, _ = self.weights_proj(x)
         weights = weights * self.n_heads**-0.5
@@ -403,7 +367,7 @@ class Indexer(CustomOp):
 
         return topk_result
 
-    def forward_indexer_bs_1(
+    def forward_indexer(
         self,
         q_fp8: torch.Tensor,
         weights: torch.Tensor,
@@ -484,20 +448,9 @@ class Indexer(CustomOp):
             q_len_start = q_len_end
 
         topk_indices = torch.cat(topk_indices_list, dim=0)
-
         return topk_indices
 
-    def forward_indexer(
-        self,
-        q_fp8: torch.Tensor,
-        weights: torch.Tensor,
-        forward_batch: ForwardBatch,
-        topk: int,
-        layer_id: int,
-    ) -> Optional[torch.Tensor]:
-        return self.forward_indexer_bs_1(q_fp8, weights, forward_batch, topk, layer_id)
-
-    def _forward(
+    def forward_cuda(
         self,
         x: torch.Tensor,
         q_lora: torch.Tensor,
@@ -528,9 +481,6 @@ class Indexer(CustomOp):
         # skip NSA if attention backend choose to skip this batch
         if metadata is None:
             return None
-
-        if not NSA_USE_REAL_INDEXER:  # temporary
-            return self._forward_fake(x, q_lora, positions, forward_batch, layer_id)
 
         query, key = self._get_q_k_bf16(q_lora, x, positions, enable_dual_stream)
 
@@ -587,18 +537,7 @@ class Indexer(CustomOp):
                 topk=self.index_topk,
                 layer_id=layer_id,
             )
-
         return topk_result
-
-    def forward_cuda(
-        self,
-        x: torch.Tensor,
-        q_lora: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        layer_id: int,
-    ) -> Optional[torch.Tensor]:
-        return self._forward(x, q_lora, positions, forward_batch, layer_id)
 
     def forward_npu(
         self,
@@ -608,7 +547,7 @@ class Indexer(CustomOp):
         forward_batch: ForwardBatch,
         layer_id: int,
     ) -> torch.Tensor:
-        import custom_ops
+        import custom_ops  # noqa: F401
         import torch_npu
 
         from sglang.srt.layers.dp_attention import (
