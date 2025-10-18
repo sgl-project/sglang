@@ -57,6 +57,7 @@ if TYPE_CHECKING:
 
 _in_piecewise_cuda_graph = False
 
+
 def is_in_piecewise_cuda_graph():
     return _in_piecewise_cuda_graph
 
@@ -122,6 +123,7 @@ def set_global_graph_memory_pool(val):
     global global_graph_memory_pool
     global_graph_memory_pool = val
 
+
 def set_torch_compile_config():
     import torch._dynamo.config
 
@@ -129,6 +131,7 @@ def set_torch_compile_config():
     torch._dynamo.config.accumulated_cache_size_limit = 1024
     if hasattr(torch._dynamo.config, "cache_size_limit"):
         torch._dynamo.config.cache_size_limit = 1024
+
 
 class PiecewiseCudaGraphRunner:
     """A PiecewiseCudaGraphRunner runs the forward pass of a model with cuda graph and torch.compile."""
@@ -254,7 +257,7 @@ class PiecewiseCudaGraphRunner:
                 global_forward_mode=ForwardMode.EXTEND,
                 lora_ids=None,
             )
-        
+
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
 
@@ -492,7 +495,9 @@ class PiecewiseCudaGraphRunner:
                     )
                 if isinstance(output, LogitsProcessorOutput):
                     return LogitsProcessorOutput(
-                        next_token_logits=output.next_token_logits[: self.raw_num_tokens],
+                        next_token_logits=output.next_token_logits[
+                            : self.raw_num_tokens
+                        ],
                         hidden_states=(
                             output.hidden_states[: self.raw_num_tokens]
                             if output.hidden_states is not None

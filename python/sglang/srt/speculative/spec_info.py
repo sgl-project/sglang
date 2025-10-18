@@ -1,6 +1,5 @@
 from abc import ABC, abstractmethod
 from enum import IntEnum, auto
-from functools import lru_cache
 from typing import List, Tuple
 
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
