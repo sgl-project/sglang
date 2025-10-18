@@ -11,11 +11,14 @@ from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_moe_tensor_parallel_rank,
     get_moe_tensor_parallel_world_size,
+    get_tp_group,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.layers.moe import (
     MoeRunnerConfig,
+    get_deepep_mode,
+    get_moe_a2a_backend,
     get_moe_runner_backend,
     should_use_flashinfer_trtllm_moe,
 )
@@ -32,6 +35,7 @@ from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
+from sglang.srt.two_batch_overlap import MaybeTboDeepEPDispatcher
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -69,6 +73,27 @@ def _get_tile_tokens_dim(num_tokens, top_k, num_experts):
     # Cap to 8-64 tokens per CTA tile as it's the range supported by the kernel.
     tile_tokens_dim = min(max(tile_tokens_dim, 8), 64)
     return tile_tokens_dim
+
+
+def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig):
+    a2a_backend = get_moe_a2a_backend()
+    if a2a_backend.is_none():
+        return StandardDispatcher(moe_runner_config)
+    elif a2a_backend.is_deepep():
+        return MaybeTboDeepEPDispatcher(
+            group=get_tp_group().device_group,
+            router_topk=moe_runner_config.top_k,
+            permute_fusion=True,
+            num_experts=moe_runner_config.num_experts,
+            num_local_experts=moe_runner_config.num_local_experts,
+            hidden_size=moe_runner_config.hidden_size,
+            params_dtype=moe_runner_config.params_dtype,
+            deepep_mode=get_deepep_mode(),
+            async_finish=True,
+            return_recv_hook=True,
+        )
+    else:
+        raise NotImplementedError(f"Unsupported a2a backend: {a2a_backend}")
 
 
 class FusedMoeWeightScaleSupported(Enum):
@@ -132,8 +157,6 @@ class FusedMoE(torch.nn.Module):
         self.hidden_size = hidden_size
         self.num_experts = num_experts
         self.num_fused_shared_experts = num_fused_shared_experts
-        self.expert_map_cpu = None
-        self.expert_map_gpu = None
 
         enable_flashinfer_cutlass_moe = get_moe_runner_backend().is_flashinfer_cutlass()
 
@@ -148,19 +171,6 @@ class FusedMoE(torch.nn.Module):
         self.moe_tp_rank = get_moe_tensor_parallel_rank()
         assert num_experts % self.moe_ep_size == 0
         self.num_local_experts = num_experts // self.moe_ep_size
-
-        if self.moe_ep_size > 1:
-            # TODO(ch-wan): support shared experts fusion
-            # Create a tensor of size num_experts filled with -1
-            self.expert_map_cpu = torch.full(
-                (self.num_experts,), -1, dtype=torch.int32, device="cpu"
-            )
-            # Create a expert map for the local experts
-            self.expert_map_cpu[
-                self.moe_ep_rank
-                * self.num_local_experts : (self.moe_ep_rank + 1)
-                * self.num_local_experts
-            ] = torch.arange(0, self.num_local_experts, dtype=torch.int32, device="cpu")
 
         assert intermediate_size % self.moe_tp_size == 0
         self.intermediate_size_per_partition = intermediate_size // self.moe_tp_size
@@ -219,7 +229,7 @@ class FusedMoE(torch.nn.Module):
         )
 
         self.quant_method.create_moe_runner(self, self.moe_runner_config)
-        self.dispatcher = StandardDispatcher()
+        self.dispatcher = create_moe_dispatcher(self.moe_runner_config)
 
         self.should_fuse_routed_scaling_factor_in_topk = isinstance(
             self.quant_method, ModelOptNvFp4FusedMoEMethod
@@ -453,9 +463,14 @@ class FusedMoE(torch.nn.Module):
             expert_data.copy_(loaded_weight)
 
     def _map_global_expert_id_to_local_expert_id(self, expert_id: int) -> int:
-        if self.expert_map_cpu is None:
+        if self.moe_ep_size > 1:
+            start_idx = self.moe_ep_rank * self.num_local_experts
+            end_idx = (self.moe_ep_rank + 1) * self.num_local_experts
+            if expert_id < start_idx or expert_id >= end_idx:
+                return -1
+            return expert_id - start_idx
+        else:
             return expert_id
-        return self.expert_map_cpu[expert_id].item()
 
     def weight_loader(
         self,
@@ -803,19 +818,6 @@ class FusedMoE(torch.nn.Module):
     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput, **kwargs):
         origin_hidden_states_dim = hidden_states.shape[-1]
         assert self.quant_method is not None
-
-        if self.moe_ep_size > 1 and not self.enable_flashinfer_cutlass_moe:
-            if self.expert_map_cpu is not None and self.expert_map_gpu is None:
-                # If we are in EP mode, we need to move the expert map to GPU.
-                self.expert_map_gpu = self.expert_map_cpu.to(device="cuda")
-
-        if self.expert_map_gpu is not None:
-            if TopKOutputChecker.format_is_standard(topk_output):
-                topk_output = topk_output._replace(
-                    topk_ids=self.expert_map_gpu[topk_output.topk_ids]
-                )
-            elif TopKOutputChecker.format_is_triton_kernel(topk_output):
-                raise NotImplementedError()
 
         dispatch_output = self.dispatcher.dispatch(
             hidden_states=hidden_states, topk_output=topk_output

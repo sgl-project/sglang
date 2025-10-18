@@ -93,6 +93,17 @@ class DeepEPMoE(FusedMoE):
             routed_scaling_factor=routed_scaling_factor,
         )
 
+        if (
+            _use_aiter
+            or _is_npu
+            or isinstance(quant_config, W4AFp8Config)
+            or get_moe_runner_backend().is_flashinfer_cutedsl()
+        ):
+            self.has_refactored_flag = False
+        else:
+            self.has_refactored_flag = True
+            return
+
         if isinstance(quant_config, Fp8Config):
             self.use_block_quant = getattr(self.quant_method, "block_quant", False)
             self.use_fp8_w8a8 = True
@@ -112,7 +123,7 @@ class DeepEPMoE(FusedMoE):
         from sglang.srt.distributed.parallel_state import get_tp_group
         from sglang.srt.two_batch_overlap import MaybeTboDeepEPDispatcher
 
-        self.deepep_dispatcher = MaybeTboDeepEPDispatcher(
+        self.dispatcher = MaybeTboDeepEPDispatcher(
             group=get_tp_group().device_group,
             router_topk=self.top_k,
             permute_fusion=True,
@@ -168,6 +179,10 @@ class DeepEPMoE(FusedMoE):
         topk_weights: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
+
+        if self.has_refactored_flag:
+            return super().forward(hidden_states, topk_idx, topk_weights, forward_batch)
+
         dispatch_output = self.dispatch(
             hidden_states, topk_idx, topk_weights, forward_batch
         )
@@ -187,7 +202,7 @@ class DeepEPMoE(FusedMoE):
         topk_weights: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        return self.deepep_dispatcher.dispatch(
+        return self.dispatcher.dispatch(
             hidden_states=hidden_states,
             topk_idx=topk_idx,
             topk_weights=topk_weights,
@@ -218,15 +233,11 @@ class DeepEPMoE(FusedMoE):
         if DispatchOutputChecker.format_is_deepep_normal(dispatch_output):
             if self.use_w4afp8:
                 return self.forward_cutlass_w4afp8(dispatch_output)
-            assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8
-            return self.forward_deepgemm_contiguous(dispatch_output)
         elif DispatchOutputChecker.format_is_deepep_ll(dispatch_output):
             if get_moe_runner_backend().is_flashinfer_cutedsl():
                 return self.forward_flashinfer_cutedsl(
                     dispatch_output, down_gemm_overlap_args=down_gemm_overlap_args
                 )
-            assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8
-            return self.forward_deepgemm_masked(dispatch_output)
         else:
             raise ValueError(
                 f"Dispatch output format {dispatch_output.format} is not supported"
@@ -240,7 +251,7 @@ class DeepEPMoE(FusedMoE):
         forward_batch: ForwardBatch,
         overlap_args: Optional[Dict[str, Any]] = None,
     ):
-        return self.deepep_dispatcher.combine(
+        return self.dispatcher.combine(
             hidden_states=hidden_states,
             topk_idx=topk_idx,
             topk_weights=topk_weights,

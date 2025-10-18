@@ -33,6 +33,8 @@ class TestPureDP(CustomTestCase):
                 "4",
                 "--moe-a2a-backend",
                 "deepep",
+                "--deepep-mode",
+                "normal",
                 "--cuda-graph-max-bs",
                 "128",
                 "--max-running-requests",
