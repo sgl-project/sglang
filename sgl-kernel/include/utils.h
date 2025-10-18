@@ -80,19 +80,6 @@ limitations under the License.
 #define _DISPATCH_CASE_FP8_E5M2(c_type, ...)
 #endif  // FLASHINFER_ENABLE_FP8_E5M2
 
-#define DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(pytorch_dtype, c_type, ...)                 \
-  [&]() -> bool {                                                                        \
-    switch (pytorch_dtype) {                                                             \
-      _DISPATCH_CASE_F16(c_type, __VA_ARGS__)                                            \
-      _DISPATCH_CASE_BF16(c_type, __VA_ARGS__)                                           \
-      default:                                                                           \
-        std::ostringstream oss;                                                          \
-        oss << __PRETTY_FUNCTION__ << " failed to dispatch data type " << pytorch_dtype; \
-        TORCH_CHECK(false, oss.str());                                                   \
-        return false;                                                                    \
-    }                                                                                    \
-  }()
-
 #define DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(pytorch_dtype, c_type, ...)                      \
   [&]() -> bool {                                                                            \
     switch (pytorch_dtype) {                                                                 \
@@ -215,6 +202,20 @@ inline bool is_float8_tensor(const at::Tensor& tensor) {
   return tensor.scalar_type() == at::ScalarType::Float8_e4m3fn || tensor.scalar_type() == at::ScalarType::Float8_e5m2;
 }
 #endif  // USE_ROCM
+
+// USE_ROCM or USE_CUDA
+#define DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(pytorch_dtype, c_type, ...)                 \
+  [&]() -> bool {                                                                        \
+    switch (pytorch_dtype) {                                                             \
+      _DISPATCH_CASE_F16(c_type, __VA_ARGS__)                                            \
+      _DISPATCH_CASE_BF16(c_type, __VA_ARGS__)                                           \
+      default:                                                                           \
+        std::ostringstream oss;                                                          \
+        oss << __PRETTY_FUNCTION__ << " failed to dispatch data type " << pytorch_dtype; \
+        TORCH_CHECK(false, oss.str());                                                   \
+        return false;                                                                    \
+    }                                                                                    \
+  }()
 
 struct cuda_error : public std::runtime_error {
   /**

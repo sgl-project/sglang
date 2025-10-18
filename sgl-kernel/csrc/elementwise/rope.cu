@@ -15,9 +15,16 @@
  */
 
 #include "pos_enc.cuh"
+#ifdef USE_ROCM
+#include "pytorch_extension_utils_rocm.h"
+#include "utils.h"
+
+using namespace sgl_hip;
+#else
 #include "pytorch_extension_utils.h"
 
 using namespace flashinfer;
+#endif
 
 void apply_rope_pos_ids_cos_sin_cache(
     at::Tensor q,
@@ -90,9 +97,14 @@ void apply_rope_pos_ids_cos_sin_cache(
 
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(q.scalar_type(), c_type, [&] {
-    // TODO temporarily only use `BatchQKApplyRotaryPosIdsCosSinCacheEnhanced` when save_kv_cache
-    // to avoid changing original code path; but this branch is feature-complete and should switch to this later
+  // TODO temporarily only use `BatchQKApplyRotaryPosIdsCosSinCacheEnhanced` when save_kv_cache
+  // to avoid changing original code path; but this branch is feature-complete and should switch to this later
+#ifdef USE_ROCM
+    if (true) {  // BatchQKApplyRotaryPosIdsCosSinCache is not implemented in ROCm yet, and
+                 // BatchQKApplyRotaryPosIdsCosSinCacheEnhanced seems not lost much performance
+#else
     if (save_kv_cache) {
+#endif
       cudaError_t status = BatchQKApplyRotaryPosIdsCosSinCacheEnhanced(
           static_cast<c_type*>(q.data_ptr()),
           static_cast<c_type*>(k.data_ptr()),
@@ -132,6 +144,7 @@ void apply_rope_pos_ids_cos_sin_cache(
           "BatchQKApplyRotaryPosIdsCosSinCacheEnhanced failed with error code " +
               std::string(cudaGetErrorString(status)));
     } else {
+#ifndef USE_ROCM
       TORCH_CHECK(!enable_pdl);
       cudaError_t status = BatchQKApplyRotaryPosIdsCosSinCache(
           static_cast<c_type*>(q.data_ptr()),
@@ -158,6 +171,7 @@ void apply_rope_pos_ids_cos_sin_cache(
       TORCH_CHECK(
           status == cudaSuccess,
           "BatchQKApplyRotaryPosIdsCosSinCache failed with error code " + std::string(cudaGetErrorString(status)));
+#endif
     }
     return true;
   });
