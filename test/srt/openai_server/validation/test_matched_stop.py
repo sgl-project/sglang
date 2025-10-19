@@ -20,23 +20,8 @@ The story should span multiple events, challenges, and character developments ov
 """
 
 
-class TestMatchedStop(CustomTestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=300,
-            other_args=["--max-running-requests", "10"],
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-    def run_completions_generation(
+class MatchedStopMixin:
+    def _run_completions_generation(
         self,
         prompt=MANY_NEW_TOKENS_PROMPT,
         max_tokens=1,
@@ -71,7 +56,7 @@ class TestMatchedStop(CustomTestCase):
         )
         assert response_completions.json()["choices"][0]["matched_stop"] == matched_stop
 
-    def run_chat_completions_generation(
+    def _run_chat_completions_generation(
         self,
         prompt=MANY_NEW_TOKENS_PROMPT,
         max_tokens=1,
@@ -108,22 +93,22 @@ class TestMatchedStop(CustomTestCase):
         assert response_chat.json()["choices"][0]["matched_stop"] == matched_stop
 
     def test_finish_stop_str(self):
-        self.run_completions_generation(
+        self._run_completions_generation(
             max_tokens=1000, stop="\n", finish_reason="stop", matched_stop="\n"
         )
-        self.run_chat_completions_generation(
+        self._run_chat_completions_generation(
             max_tokens=1000, stop="\n", finish_reason="stop", matched_stop="\n"
         )
 
     def test_finish_stop_regex_str(self):
         STOP_REGEX_STR = r"and|or"
-        self.run_completions_generation(
+        self._run_completions_generation(
             max_tokens=1000,
             stop_regex=STOP_REGEX_STR,
             finish_reason="stop",
             matched_stop=STOP_REGEX_STR,
         )
-        self.run_chat_completions_generation(
+        self._run_chat_completions_generation(
             max_tokens=1000,
             stop_regex=STOP_REGEX_STR,
             finish_reason="stop",
@@ -132,7 +117,7 @@ class TestMatchedStop(CustomTestCase):
 
         # Match a complete sentence
         STOP_REGEX_STR_SENTENCE = r"[.!?]\s*$"
-        self.run_chat_completions_generation(
+        self._run_chat_completions_generation(
             max_tokens=1000,
             stop_regex=STOP_REGEX_STR_SENTENCE,
             finish_reason="stop",
@@ -147,13 +132,13 @@ class TestMatchedStop(CustomTestCase):
         What is 2 + 2?<|eot_id|><|start_header_id|>assistant<|end_header_id|>
         """
         eos_token_id = 128009
-        self.run_completions_generation(
+        self._run_completions_generation(
             prompt=llama_format_prompt,
             max_tokens=1000,
             finish_reason="stop",
             matched_stop=eos_token_id,
         )
-        self.run_chat_completions_generation(
+        self._run_chat_completions_generation(
             prompt="What is 2 + 2?",
             max_tokens=1000,
             finish_reason="stop",
@@ -161,12 +146,29 @@ class TestMatchedStop(CustomTestCase):
         )
 
     def test_finish_length(self):
-        self.run_completions_generation(
+        self._run_completions_generation(
             max_tokens=5, finish_reason="length", matched_stop=None
         )
-        self.run_chat_completions_generation(
+        self._run_chat_completions_generation(
             max_tokens=5, finish_reason="length", matched_stop=None
         )
+
+
+class TestMatchedStop(CustomTestCase, MatchedStopMixin):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=300,
+            other_args=["--max-running-requests", "10"],
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
 
 
 class TestRegexPatternMaxLength(unittest.TestCase):
