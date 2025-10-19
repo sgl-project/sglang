@@ -16,9 +16,11 @@ from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    DEFAULT_TIMEOUT_FOR_ROUTER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    popen_launch_router_with_grpc_worker,
 )
 
 
@@ -849,6 +851,46 @@ class TestToolChoiceMistral(TestToolChoiceLlama32):
 #         )
 #         cls.base_url += "/v1"
 #         cls.tokenizer = get_tokenizer(cls.model)
+
+
+class TestToolChoiceLlama32GRPCRouter(TestToolChoiceLlama32):
+    """Inherits all 14 tests from parent, changes architecture to router+gRPC"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.flaky_tests = {
+            "test_multi_tool_scenario_auto",
+            "test_multi_tool_scenario_required",
+        }
+
+        cls.model = "meta-llama/Llama-3.2-1B-Instruct"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+
+        # Router + gRPC worker setup (different from parent)
+        cls.router_process, cls.worker_process = (
+            popen_launch_router_with_grpc_worker(
+                cls.model,
+                cls.base_url,
+                router_timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                worker_timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                api_key=cls.api_key,
+                worker_other_args=[
+                    "--tool-call-parser", 
+                    "llama3"
+                ],
+                router_other_args=[],
+            )
+        )
+        cls.base_url += "/v1"
+        cls.tokenizer = get_tokenizer(cls.model)
+
+    @classmethod
+    def tearDownClass(cls):
+        # Must override because parent expects cls.process
+        # But gRPC setup creates cls.router_process and cls.worker_process
+        kill_process_tree(cls.router_process.pid)
+        kill_process_tree(cls.worker_process.pid)
 
 
 if __name__ == "__main__":
