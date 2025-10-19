@@ -88,6 +88,7 @@ from torch.profiler import ProfilerActivity, profile, record_function
 from torch.utils._contextlib import _DecoratorContextManager
 from typing_extensions import Literal
 
+from sglang.srt.environ import envs
 from sglang.srt.metrics.func_timer import enable_func_timer
 
 logger = logging.getLogger(__name__)
@@ -174,6 +175,15 @@ def is_blackwell():
 
 
 @lru_cache(maxsize=1)
+def is_sm120_supported(device=None) -> bool:
+    if not is_cuda_alike():
+        return False
+    return (torch.cuda.get_device_capability(device)[0] == 12) and (
+        torch.version.cuda >= "12.8"
+    )
+
+
+@lru_cache(maxsize=1)
 def is_sm100_supported(device=None) -> bool:
     if not is_cuda_alike():
         return False
@@ -228,7 +238,7 @@ def support_triton(backend: str) -> bool:
 
 
 try:
-    import sgl_kernel
+    import sgl_kernel  # noqa: F401
 
     is_intel_amx_backend_available = hasattr(
         torch.ops.sgl_kernel, "convert_weight_packed"
@@ -1556,7 +1566,7 @@ def get_hpu_memory_capacity():
 
 def get_npu_memory_capacity():
     try:
-        import torch_npu
+        import torch_npu  # noqa: F401
 
         return torch.npu.mem_get_info()[1] // 1024 // 1024  # unit: MB
     except ImportError as e:
@@ -1743,7 +1753,7 @@ def get_device(device_id: Optional[int] = None) -> str:
 
     if is_habana_available():
         try:
-            import habana_frameworks.torch.hpu
+            import habana_frameworks.torch.hpu  # noqa: F401
 
             if torch.hpu.is_available():
                 if device_id == None:
@@ -1773,7 +1783,7 @@ def get_device_count() -> int:
 
     if is_habana_available():
         try:
-            import habana_frameworks.torch.hpu
+            import habana_frameworks.torch.hpu  # noqa: F401
 
             if torch.hpu.is_available():
                 return torch.hpu.device_count()
@@ -2921,7 +2931,7 @@ def get_cpu_ids_by_node():
 def is_shm_available(dtype, world_size, local_size):
     return (
         cpu_has_amx_support()
-        and dtype in [torch.bfloat16, torch.float]
+        and dtype in [torch.bfloat16, torch.float16, torch.float]
         and world_size >= 1
         and world_size == local_size
     )
@@ -3271,7 +3281,12 @@ def json_list_type(value):
 
 
 @contextmanager
-def temp_set_cuda_visible_devices(gpu_id: int):
+def maybe_reindex_device_id(gpu_id: int):
+
+    if envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.get() is False or not is_cuda_alike():
+        yield gpu_id
+        return
+
     original_cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
     if original_cuda_visible_devices:
         cuda_visible_devices = original_cuda_visible_devices.split(",")
@@ -3280,7 +3295,11 @@ def temp_set_cuda_visible_devices(gpu_id: int):
 
     str_gpu_id = cuda_visible_devices[gpu_id] if cuda_visible_devices else str(gpu_id)
     os.environ["CUDA_VISIBLE_DEVICES"] = str_gpu_id
-    yield
+
+    logger.debug(f"Set CUDA_VISIBLE_DEVICES to {str_gpu_id}")
+
+    yield 0
+
     if original_cuda_visible_devices:
         os.environ["CUDA_VISIBLE_DEVICES"] = original_cuda_visible_devices
     else:
@@ -3443,14 +3462,59 @@ def cached_triton_kernel(key_fn=None):
     return decorator
 
 
-DEFAULT_DETERMINISTIC_INFERENCE_BACKEND_SIZE = 4096
-DEFAULT_DETERMINISTIC_INFERENCE_BACKEND_SIZE_CONFIG = {
-    "flashinfer": (
-        "SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE",
-        DEFAULT_DETERMINISTIC_INFERENCE_BACKEND_SIZE,
-    ),
-    "triton": (
-        "SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE",
-        DEFAULT_DETERMINISTIC_INFERENCE_BACKEND_SIZE,
-    ),
-}
+def reserve_rope_cache_for_long_sequences(
+    model, server_args, model_config, req_to_token_pool=None, logger=None
+):
+    """Pre-expand RoPE cache for long sequences and speculative decoding."""
+    from sglang.srt.environ import envs
+
+    if logger is None:
+        import logging
+
+        logger = logging.getLogger(__name__)
+
+    SAFETY_FACTOR = envs.SGLANG_SPEC_EXPANSION_SAFETY_FACTOR.value
+    MARGIN = envs.SGLANG_ROPE_CACHE_SAFETY_MARGIN.value
+    ALIGN = envs.SGLANG_ROPE_CACHE_ALIGN.value
+
+    # 1) Estimate base context upper bound
+    base_ctx = (
+        getattr(server_args, "context_length", None)
+        or getattr(model_config, "context_len", None)
+        or getattr(model_config, "max_model_len", None)
+        or getattr(model_config.hf_text_config, "max_position_embeddings", None)
+        or 2048
+    )
+
+    # 2) Runtime input capacity (including extra_len from req_to_token_pool)
+    inferred_cap = getattr(req_to_token_pool, "max_context_len", None) or base_ctx
+
+    # 3) Speculative decoding expansion
+    steps = int(getattr(server_args, "speculative_num_steps", 0) or 0)
+    draft = int(getattr(server_args, "speculative_num_draft_tokens", 0) or 0)
+    reserve = inferred_cap + steps * draft * SAFETY_FACTOR + MARGIN
+
+    # 4) Align to reduce reallocation frequency
+    reserve = (reserve + ALIGN - 1) // ALIGN * ALIGN
+
+    logger.info(
+        f"RoPE cache reserve={reserve} (base={base_ctx}, cap={inferred_cap}, steps={steps}, draft={draft}, k={SAFETY_FACTOR}, margin={MARGIN})"
+    )
+
+    # Recursively expand all RoPE layers
+    def reserve_rope_cache_recursive(module):
+        for child in module.children():
+            if hasattr(child, "_ensure_cos_sin_cache_length") and hasattr(
+                child, "cos_sin_cache"
+            ):
+                old_len = child.cos_sin_cache.shape[0]
+                child._ensure_cos_sin_cache_length(reserve - 1)
+                new_len = child.cos_sin_cache.shape[0]
+                if new_len > old_len:
+                    logger.info(
+                        f"Expanded RoPE cache from {old_len} to {new_len} positions"
+                    )
+            else:
+                reserve_rope_cache_recursive(child)
+
+    reserve_rope_cache_recursive(model)

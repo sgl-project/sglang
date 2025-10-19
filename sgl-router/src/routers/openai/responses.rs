@@ -1,12 +1,15 @@
 //! Response storage, patching, and extraction utilities
 
-use crate::data_connector::{ResponseId, StoredResponse};
-use crate::protocols::spec::{ResponseInput, ResponseToolType, ResponsesRequest};
-use serde_json::{json, Value};
 use std::collections::HashMap;
+
+use serde_json::{json, Value};
 use tracing::warn;
 
 use super::utils::event_types;
+use crate::{
+    data_connector::{ResponseId, StoredResponse},
+    protocols::responses::{ResponseInput, ResponseToolType, ResponsesRequest},
+};
 
 // ============================================================================
 // Response Storage Operations
@@ -153,7 +156,7 @@ pub(super) fn patch_streaming_response_json(
 
         // Attach conversation id for client response if present (final aggregated JSON)
         if let Some(conv_id) = original_body.conversation.clone() {
-            obj.insert("conversation".to_string(), json!({"id": conv_id}));
+            obj.insert("conversation".to_string(), json!({ "id": conv_id }));
         }
     }
 }
@@ -231,7 +234,7 @@ pub(super) fn rewrite_streaming_block(
 
         // Attach conversation id into streaming event response content with ordering
         if let Some(conv_id) = original_body.conversation.clone() {
-            response_obj.insert("conversation".to_string(), json!({"id": conv_id}));
+            response_obj.insert("conversation".to_string(), json!({ "id": conv_id }));
             changed = true;
         }
     }
