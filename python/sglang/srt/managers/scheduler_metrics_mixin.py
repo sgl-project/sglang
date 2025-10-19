@@ -75,7 +75,7 @@ class SchedulerMetricsMixin:
         self.spec_num_total_accepted_tokens += num_accepted_tokens
         self.spec_num_total_forward_ct += bs
         # Here the num_generated_tokens should exclude the bonus token.
-        self.num_generated_tokens += num_accepted_tokens - 1
+        self.num_generated_tokens += num_accepted_tokens - bs
 
     def log_prefill_stats(
         self: Scheduler,
