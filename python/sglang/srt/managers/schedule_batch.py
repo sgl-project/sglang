@@ -761,6 +761,9 @@ class Req:
         return False
 
     def _check_token_based_finish(self, new_accepted_tokens: List[int]) -> bool:
+        if not self.sampling_params.ignore_eos:
+            return False
+
         # Check stop token ids
         matched_eos = False
 
@@ -775,7 +778,9 @@ class Req:
                     matched_eos |= token_id in self.tokenizer.additional_stop_token_ids
             if matched_eos:
                 self.finished_reason = FINISH_MATCHED_TOKEN(matched=token_id)
-                return
+                return True
+
+        return False
 
     def _check_str_based_finish(self):
         if (
@@ -789,7 +794,7 @@ class Req:
                 for stop_str in self.sampling_params.stop_strs:
                     if stop_str in tail_str or stop_str in self.decoded_text:
                         self.finished_reason = FINISH_MATCHED_STR(matched=stop_str)
-                        return
+                        return True
 
             # Check stop regex
             if len(self.sampling_params.stop_regex_strs) > 0:
@@ -798,7 +803,9 @@ class Req:
                         self.finished_reason = FINISHED_MATCHED_REGEX(
                             matched=stop_regex_str
                         )
-                        return
+                        return True
+
+        return False
 
     def _check_vocab_boundary_finish(self, new_accepted_tokens: List[int] = None):
         for token_id in new_accepted_tokens:
@@ -810,7 +817,9 @@ class Req:
                 if self.eos_token_ids:
                     self.output_ids[-1] = next(iter(self.eos_token_ids))
                 self.finished_reason = FINISH_MATCHED_STR(matched="NaN happened")
-                return
+                return True
+
+        return False
 
     def check_finished(self, new_accepted_len: int = 1):
         if self.finished():
@@ -834,9 +843,9 @@ class Req:
                 return
 
         new_accepted_tokens = self.output_ids[-new_accepted_len:]
-        if not self.sampling_params.ignore_eos:
-            if self._check_token_based_finish(new_accepted_tokens):
-                return
+
+        if self._check_token_based_finish(new_accepted_tokens):
+            return
 
         if self._check_vocab_boundary_finish(new_accepted_tokens):
             return
