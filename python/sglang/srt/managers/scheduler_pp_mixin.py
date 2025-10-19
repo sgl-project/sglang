@@ -686,3 +686,71 @@ class SchedulerPPMixin:
                 self.check_tree_cache()
                 self.new_token_ratio = self.init_new_token_ratio
                 self.maybe_sleep_on_idle()
+
+
+
+# Keep this function for xai's PP implementation
+def point_to_point_pyobj(
+    data: List[Any],
+    rank: int,
+    group: Optional[torch.distributed.ProcessGroup] = None,
+    src: int = 0,
+    dst: int = 1,
+    async_send: bool = False,
+):
+    """Send data from src to dst in group."""
+    if async_send:
+        send_func = dist.isend
+    else:
+        send_func = dist.send
+    if rank == src:
+        p2p_works = []
+        if len(data) == 0:
+            tensor_size = torch.tensor(
+                [0],
+                dtype=torch.long,
+            )
+            work = send_func(tensor_size, dst, group=group)
+            if async_send:
+                p2p_works.append(P2PWork(work, tensor_size))
+        else:
+            serialized_data = pickle.dumps(data)
+            size = len(serialized_data)
+            tensor_data = torch.ByteTensor(
+                np.frombuffer(serialized_data, dtype=np.uint8)
+            )
+            tensor_size = torch.tensor([size], dtype=torch.long)
+
+            work = send_func(tensor_size, dst, group=group)
+            if async_send:
+                p2p_works.append(P2PWork(work, tensor_size))
+            work = send_func(tensor_data, dst, group=group)
+            if async_send:
+                p2p_works.append(P2PWork(work, tensor_data))
+        return p2p_works
+
+    elif rank == dst:
+        tensor_size = torch.tensor(
+            [0],
+            dtype=torch.long,
+        )
+        work = dist.irecv(tensor_size, src=src, group=group)
+        work.wait()
+        size = tensor_size.item()
+
+        if size == 0:
+            return []
+
+        tensor_data = torch.empty(
+            size,
+            dtype=torch.uint8,
+        )
+        work = dist.irecv(tensor_data, src=src, group=group)
+        work.wait()
+
+        serialized_data = bytes(tensor_data.cpu().numpy())
+        data = pickle.loads(serialized_data)
+        return data
+
+    # Other ranks in pp_group do nothing
+    return []
