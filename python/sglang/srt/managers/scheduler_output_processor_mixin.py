@@ -244,7 +244,9 @@ class SchedulerOutputProcessorMixin:
             accept_lens_list = result.accept_lens.tolist()
 
         self.num_generated_tokens += len(batch.reqs)
-        if not self.spec_algorithm.is_none():
+        if batch.is_v2_eagle:
+            self.update_spec_metrics_v2(batch.batch_size(), result.num_accepted_tokens)
+        elif not batch.spec_algorithm.is_none():
             self.update_spec_metrics(batch.batch_size(), result.num_accepted_tokens)
 
         self.token_to_kv_pool_allocator.free_group_begin()
