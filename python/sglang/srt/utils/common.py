@@ -88,6 +88,7 @@ from torch.profiler import ProfilerActivity, profile, record_function
 from torch.utils._contextlib import _DecoratorContextManager
 from typing_extensions import Literal
 
+from sglang.srt.environ import envs
 from sglang.srt.metrics.func_timer import enable_func_timer
 
 logger = logging.getLogger(__name__)
@@ -174,6 +175,15 @@ def is_blackwell():
 
 
 @lru_cache(maxsize=1)
+def is_sm120_supported(device=None) -> bool:
+    if not is_cuda_alike():
+        return False
+    return (torch.cuda.get_device_capability(device)[0] == 12) and (
+        torch.version.cuda >= "12.8"
+    )
+
+
+@lru_cache(maxsize=1)
 def is_sm100_supported(device=None) -> bool:
     if not is_cuda_alike():
         return False
@@ -228,7 +238,7 @@ def support_triton(backend: str) -> bool:
 
 
 try:
-    import sgl_kernel
+    import sgl_kernel  # noqa: F401
 
     is_intel_amx_backend_available = hasattr(
         torch.ops.sgl_kernel, "convert_weight_packed"
@@ -1556,7 +1566,7 @@ def get_hpu_memory_capacity():
 
 def get_npu_memory_capacity():
     try:
-        import torch_npu
+        import torch_npu  # noqa: F401
 
         return torch.npu.mem_get_info()[1] // 1024 // 1024  # unit: MB
     except ImportError as e:
@@ -1743,7 +1753,7 @@ def get_device(device_id: Optional[int] = None) -> str:
 
     if is_habana_available():
         try:
-            import habana_frameworks.torch.hpu
+            import habana_frameworks.torch.hpu  # noqa: F401
 
             if torch.hpu.is_available():
                 if device_id == None:
@@ -1773,7 +1783,7 @@ def get_device_count() -> int:
 
     if is_habana_available():
         try:
-            import habana_frameworks.torch.hpu
+            import habana_frameworks.torch.hpu  # noqa: F401
 
             if torch.hpu.is_available():
                 return torch.hpu.device_count()
@@ -2344,6 +2354,8 @@ def retry(
         try:
             return fn()
         except Exception as e:
+            traceback.print_exc()
+
             if try_index >= max_retry:
                 raise Exception(f"retry() exceed maximum number of retries.")
 
@@ -2357,7 +2369,6 @@ def retry(
             logger.warning(
                 f"retry() failed once ({try_index}th try, maximum {max_retry} retries). Will delay {delay:.2f}s and retry. Error: {e}"
             )
-            traceback.print_exc()
 
             time.sleep(delay)
 
@@ -3271,7 +3282,12 @@ def json_list_type(value):
 
 
 @contextmanager
-def temp_set_cuda_visible_devices(gpu_id: int):
+def maybe_reindex_device_id(gpu_id: int):
+
+    if envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.get() is False or not is_cuda_alike():
+        yield gpu_id
+        return
+
     original_cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
     if original_cuda_visible_devices:
         cuda_visible_devices = original_cuda_visible_devices.split(",")
@@ -3280,7 +3296,11 @@ def temp_set_cuda_visible_devices(gpu_id: int):
 
     str_gpu_id = cuda_visible_devices[gpu_id] if cuda_visible_devices else str(gpu_id)
     os.environ["CUDA_VISIBLE_DEVICES"] = str_gpu_id
-    yield
+
+    logger.debug(f"Set CUDA_VISIBLE_DEVICES to {str_gpu_id}")
+
+    yield 0
+
     if original_cuda_visible_devices:
         os.environ["CUDA_VISIBLE_DEVICES"] = original_cuda_visible_devices
     else:
