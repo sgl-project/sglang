@@ -854,14 +854,19 @@ class ServerArgs:
                     logger.info(
                         "Enable FlashInfer AllReduce Fusion on sm100 for DeepseekV3ForCausalLM"
                     )
-                if (
-                    self.quantization == "modelopt_fp4" or self.quantization == "fp8"
-                    and self.moe_runner_backend == "auto"
-                ):
+                if self.moe_runner_backend == "auto":
                     self.moe_runner_backend = "flashinfer_trtllm"
                     logger.info(
                         "Use flashinfer_trtllm as MoE runner backend on sm100 for DeepseekV3ForCausalLM"
                     )
+                    if self.quantization is None:
+                        # Default DeepSeek V3/R1 native FP8 when not explicitly set,
+                        # Because we need this condition for an assertion in
+                        # flashinfer_trtllm MoE runner backend.
+                        self.quantization = "fp8"
+                        logger.info(
+                            "Quantization not specified, default to fp8 for DeepSeek on sm100"
+                        )
 
         elif model_arch in ["GptOssForCausalLM"]:
             if (

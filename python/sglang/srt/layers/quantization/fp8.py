@@ -33,6 +33,7 @@ from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
+from sglang.srt.layers.moe.utils import get_moe_runner_backend
 from sglang.srt.layers.parameter import (
     BlockQuantScaleParameter,
     ModelWeightParameter,
@@ -58,7 +59,6 @@ from sglang.srt.layers.quantization.fp8_utils import (
     input_to_float8,
     normalize_e4m3fn_to_e4m3fnuz,
 )
-from sglang.srt.layers.moe.utils import get_moe_runner_backend
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import (
@@ -1138,10 +1138,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             (num_experts,), hidden_size, device=device, dtype=torch.int64
         )
         self.c_strides1 = torch.full(
-            (num_experts,), 2 * intermediate_size_per_partition, device=device, dtype=torch.int64
+            (num_experts,),
+            2 * intermediate_size_per_partition,
+            device=device,
+            dtype=torch.int64,
         )
         self.ab_strides2 = torch.full(
-            (num_experts,), intermediate_size_per_partition, device=device, dtype=torch.int64
+            (num_experts,),
+            intermediate_size_per_partition,
+            device=device,
+            dtype=torch.int64,
         )
         self.c_strides2 = torch.full(
             (num_experts,), hidden_size, device=device, dtype=torch.int64
