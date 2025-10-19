@@ -31,8 +31,6 @@ if TYPE_CHECKING:
         StandardDispatchOutput,
     )
 
-has_triton_kernels = importlib.util.find_spec("triton_kernels") is not None
-
 
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_hip = is_hip()
