@@ -5,6 +5,8 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval
 from sglang.test.kit_matched_stop import MatchedStopMixin
 from sglang.test.test_utils import (
+    DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
+    DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -20,11 +22,11 @@ class TestEagleServerBase(CustomTestCase, MatchedStopMixin):
     spec_draft_tokens = 6
     page_size = 1
     other_launch_args = []
+    model = DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST
+    draft_model = DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST
 
     @classmethod
     def setUpClass(cls):
-        cls.model = "meta-llama/Llama-2-7b-chat-hf"
-        cls.draft_model = "lmzheng/sglang-EAGLE-llama2-chat-7B"
         cls.base_url = DEFAULT_URL_FOR_TEST
         launch_args = [
             "--enable-beta-spec",
