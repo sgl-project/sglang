@@ -54,6 +54,7 @@ class TestFusedMOE(CustomTestCase):
         w2,
         score,
         topk,
+        return_per_expert: bool = False,
     ):
         B, D = a.shape
         a = a.view(B, -1, D).repeat(1, topk, 1).reshape(-1, D)
@@ -77,9 +78,14 @@ class TestFusedMOE(CustomTestCase):
                     a[mask] @ w1_compute[i].transpose(0, 1)
                 ) @ w2_compute[i].transpose(0, 1)
 
-        return (
-            out.view(B, -1, w2.shape[1]) * topk_weight.view(B, -1, 1).to(out.dtype)
-        ).sum(dim=1)
+        weighted = out.view(B, -1, w2.shape[1]) * topk_weight.view(B, -1, 1).to(
+            out.dtype
+        )
+
+        if return_per_expert:
+            return weighted
+
+        return weighted.sum(dim=1)
 
     def _test_case(self, m, n, k, e, topk, dtype):
         rtol, atol = self.get_tolerance(dtype)
@@ -106,46 +112,53 @@ class TestFusedMOE(CustomTestCase):
 
         quant_info = TritonKernelsQuantInfo(w13_weight=w1_tri, w2_weight=w2_tri)
 
+        dispatch_output = StandardDispatchOutput(
+            hidden_states=a, topk_output=triton_topk_output
+        )
+
+        torch_per_expert = self.torch_naive_moe(
+            a, w1, w2, score, topk, return_per_expert=True
+        )
+        torch_combined = torch_per_expert.sum(dim=1)
+
+        def run_runner(config, fused):
+            runner = MoeRunner(MoeRunnerBackend.TRITON_KERNEL, config)
+            if not fused:
+                runner.fused_func = None
+            result = runner.run(dispatch_output, quant_info)
+            return result.hidden_states
+
+        # Case 1: fused path, combined output (no_combine=False)
         fused_config = MoeRunnerConfig(inplace=False)
-        runner_fused = MoeRunner(MoeRunnerBackend.TRITON_KERNEL, fused_config)
-        fused_output = runner_fused.run(
-            StandardDispatchOutput(hidden_states=a, topk_output=triton_topk_output),
-            quant_info,
-        ).hidden_states
+        fused_output = run_runner(fused_config, fused=True)
+        torch.testing.assert_close(fused_output, torch_combined, rtol=rtol, atol=atol)
 
-        torch_output = self.torch_naive_moe(a, w1, w2, score, topk)
-        torch.testing.assert_close(fused_output, torch_output, rtol=rtol, atol=atol)
-
-        fused_scaled_config = MoeRunnerConfig(
-            inplace=False,
-            routed_scaling_factor=0.5,
+        # Case 2: fused path, per-expert output (no_combine=True)
+        fused_no_combine_config = MoeRunnerConfig(
+            inplace=False, no_combine=True, top_k=topk
         )
-        runner_fused_scaled = MoeRunner(
-            MoeRunnerBackend.TRITON_KERNEL, fused_scaled_config
-        )
-        fused_scaled_output = runner_fused_scaled.run(
-            StandardDispatchOutput(hidden_states=a, topk_output=triton_topk_output),
-            quant_info,
-        ).hidden_states
+        fused_no_combine_output = run_runner(fused_no_combine_config, fused=True)
         torch.testing.assert_close(
-            fused_scaled_output, 0.5 * fused_output, rtol=rtol, atol=atol
+            fused_no_combine_output, torch_per_expert, rtol=rtol, atol=atol
         )
 
-        # TODO: Triton-kernel kernels currently emit combined activations even when
-        # no_combine is requested. Re-enable this check once the kernel supports
-        # per-expert outputs.
-        # no_combine_config = MoeRunnerConfig(inplace=False, no_combine=True)
-        # runner_no_combine = MoeRunner(
-        #     MoeRunnerBackend.TRITON_KERNEL, no_combine_config
-        # )
-        # no_combine_output = runner_no_combine.run(
-        #     StandardDispatchOutput(hidden_states=a, topk_output=triton_topk_output),
-        #     quant_info,
-        # ).hidden_states
-        # self.assertEqual(
-        #     no_combine_output.shape,
-        #     (a.shape[0], topk, w2.shape[1]),
-        # )
+        # Case 3: non-fused path, combined output (no_combine=False)
+        non_fused_config = MoeRunnerConfig(inplace=False)
+        non_fused_output = run_runner(non_fused_config, fused=False)
+        torch.testing.assert_close(
+            non_fused_output, torch_combined, rtol=rtol, atol=atol
+        )
+
+        # Case 4: non-fused path, per-expert output (no_combine=True)
+        non_fused_no_combine_config = MoeRunnerConfig(
+            inplace=False, no_combine=True, top_k=topk
+        )
+        non_fused_no_combine_output = run_runner(
+            non_fused_no_combine_config, fused=False
+        )
+        torch.testing.assert_close(
+            non_fused_no_combine_output, torch_per_expert, rtol=rtol, atol=atol
+        )
 
     def test_various_configurations(self):
         m_values = [1, 32, 64, 256]

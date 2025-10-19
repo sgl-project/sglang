@@ -106,7 +106,7 @@ class TritonKernelsRunnerCore(MoeRunnerCore):
         common_kwargs = dict(
             routing_data=runner_input.routing_data,
             gather_indx=runner_input.gather_indx,
-            scatter_indx=runner_input.scatter_indx,
+            scatter_indx=None if self.config.no_combine else runner_input.scatter_indx,
             inplace=False,
             activation=self.config.activation,
             apply_router_weight_on_input=self.config.apply_router_weight_on_input,
@@ -149,7 +149,16 @@ class TritonKernelsRunnerCore(MoeRunnerCore):
 
         running_state["routing_data"] = runner_input.routing_data
         running_state["gather_indx"] = runner_input.gather_indx
-        running_state["scatter_indx"] = runner_input.scatter_indx
+        running_state["scatter_indx"] = (
+            None if self.config.no_combine else runner_input.scatter_indx
+        )
+
+        if self.config.no_combine:
+            tokens = runner_input.hidden_states.shape[0]
+            hidden = runner_input.hidden_states.shape[-1]
+            total_rows = output.shape[0]
+            top_k = total_rows // tokens
+            output = output.view(tokens, top_k, hidden)
 
         return TritonKernelsRunnerOutput(hidden_states=output)
 
@@ -169,10 +178,6 @@ def fused_experts_none_to_triton_kernels(
     quant_info: TritonKernelsQuantInfo,
     runner_config: MoeRunnerConfig,
 ) -> "StandardCombineInput":
-    # TODO: add per-expert return support once Triton kernels honor no_combine.
-    if runner_config.no_combine:
-        return None
-
     from sglang.srt.layers.moe.fused_moe_triton.triton_kernels_moe import (
         triton_kernel_moe_forward,
         triton_kernel_moe_with_bias_forward,
@@ -188,6 +193,9 @@ def fused_experts_none_to_triton_kernels(
     ), "Triton-kernel runner expects TritonKernelTopKOutput"
 
     has_bias = quant_info.w13_bias is not None or quant_info.w2_bias is not None
+
+    if runner_config.no_combine:
+        topk_output = topk_output._replace(scatter_indx=None)
 
     if has_bias:
         assert (
@@ -232,18 +240,26 @@ def fused_experts_none_to_triton_kernels(
             block_shape=quant_info.block_shape,
         )
 
+    if runner_config.no_combine:
+        tokens = hidden_states.shape[0]
+        hidden = hidden_states.shape[-1]
+        top_k = runner_config.top_k
+        assert (
+            top_k is not None
+        ), "runner_config.top_k must be set when no_combine=True for Triton kernels"
+        output = output.view(tokens, top_k, hidden)
+
     if (
         runner_config.routed_scaling_factor is not None
         and runner_config.routed_scaling_factor != 1.0
-        and not runner_config.no_combine
     ):
         output = output * runner_config.routed_scaling_factor
 
     return StandardCombineInput(hidden_states=output)
 
 
-@register_pre_permute("triton_kernel", "triton_kernel")
-def pre_permute_triton_kernel_to_triton_kernels(
+@register_pre_permute("standard", "triton_kernel")
+def pre_permute_standard_to_triton_kernels(
     dispatch_output: "StandardDispatchOutput",
     quant_info: TritonKernelsQuantInfo,
     runner_config: MoeRunnerConfig,
@@ -262,7 +278,7 @@ def pre_permute_triton_kernel_to_triton_kernels(
 
     running_state["routing_data"] = routing_data
     running_state["gather_indx"] = gather_indx
-    running_state["scatter_indx"] = scatter_indx
+    running_state["scatter_indx"] = None if runner_config.no_combine else scatter_indx
 
     return TritonKernelsRunnerInput(
         hidden_states=hidden_states,
