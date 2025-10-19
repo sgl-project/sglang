@@ -26,6 +26,7 @@ use crate::{
         generate::GenerateFinishReason,
     },
     tokenizer::{
+        cache::CachedTokenizer,
         chat_template::{ChatTemplateContentFormat, ChatTemplateParams},
         traits::Tokenizer,
         HuggingFaceTokenizer,
@@ -317,9 +318,24 @@ pub fn process_chat_messages(
     tokenizer: &dyn Tokenizer,
 ) -> Result<ProcessedMessages, String> {
     // Use the tokenizer's chat template - we require HuggingFace tokenizer for gRPC
-    let formatted_text = if let Some(hf_tokenizer) =
-        tokenizer.as_any().downcast_ref::<HuggingFaceTokenizer>()
-    {
+    // First try direct downcast, then try via CachedTokenizer wrapper
+    let hf_tokenizer = tokenizer
+        .as_any()
+        .downcast_ref::<HuggingFaceTokenizer>()
+        .or_else(|| {
+            // If direct downcast fails, try to get inner tokenizer from CachedTokenizer
+            tokenizer
+                .as_any()
+                .downcast_ref::<CachedTokenizer>()
+                .and_then(|cached| {
+                    cached
+                        .inner()
+                        .as_any()
+                        .downcast_ref::<HuggingFaceTokenizer>()
+                })
+        });
+
+    let formatted_text = if let Some(hf_tokenizer) = hf_tokenizer {
         // Get content format and transform messages accordingly
         let content_format = hf_tokenizer.chat_template_content_format();
         let mut transformed_messages = process_content_format(&request.messages, content_format)?;
