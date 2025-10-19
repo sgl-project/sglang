@@ -163,7 +163,7 @@ def send_one_prompt(args):
 
     latency = ret["meta_info"]["e2e_latency"]
 
-    if "spec_verify_ct" in ret["meta_info"]:
+    if "spec_verify_ct" in ret["meta_info"] and ret["meta_info"]["spec_verify_ct"] > 0:
         acc_length = (
             ret["meta_info"]["completion_tokens"] / ret["meta_info"]["spec_verify_ct"]
         )
