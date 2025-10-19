@@ -346,6 +346,19 @@ impl StepExecutor for CreateWorkerStep {
             final_labels.insert(key.clone(), value.clone());
         }
 
+        // Derive model_id if not already set
+        if !final_labels.contains_key("model_id") {
+            let derived_model_id = final_labels
+                .get("served_model_name")
+                .or_else(|| final_labels.get("model_path"))
+                .cloned();
+
+            if let Some(model_id) = derived_model_id {
+                info!("Derived model_id from metadata: {}", model_id);
+                final_labels.insert("model_id".to_string(), model_id);
+            }
+        }
+
         info!(
             "Creating worker {} with {} discovered + {} config = {} final labels",
             config.url,
