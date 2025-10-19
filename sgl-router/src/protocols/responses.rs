@@ -8,8 +8,8 @@ use serde_json::Value;
 
 // Import shared types from common module
 use super::common::{
-    default_true, ChatLogProbs, GenerationRequest, PromptTokenUsageInfo, StringOrArray, ToolChoice,
-    UsageInfo,
+    default_true, ChatLogProbs, Function, GenerationRequest, PromptTokenUsageInfo, StringOrArray,
+    ToolChoice, UsageInfo,
 };
 
 // ============================================================================
@@ -33,6 +33,15 @@ pub struct ResponseTool {
     pub require_approval: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_tools: Option<Vec<String>>,
+    // Function-specific fields (used when type == "function")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
 }
 
 impl Default for ResponseTool {
@@ -45,7 +54,40 @@ impl Default for ResponseTool {
             server_description: None,
             require_approval: None,
             allowed_tools: None,
+            name: None,
+            description: None,
+            parameters: None,
+            strict: None,
         }
+    }
+}
+
+impl ResponseTool {
+    /// Convert ResponseTool to standard Tool format (for chat completions)
+    /// Only applicable when r#type is Function
+    pub fn to_standard_tool(&self) -> Option<super::common::Tool> {
+        if !matches!(self.r#type, ResponseToolType::Function) {
+            return None;
+        }
+
+        let name = self.name.as_ref()?.clone();
+        let parameters = self.parameters.clone().unwrap_or_else(|| {
+            serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            })
+        });
+
+        Some(super::common::Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name,
+                description: self.description.clone(),
+                parameters,
+                strict: self.strict,
+            },
+        })
     }
 }
 
@@ -55,6 +97,7 @@ pub enum ResponseToolType {
     WebSearchPreview,
     CodeInterpreter,
     Mcp,
+    Function,
 }
 
 // ============================================================================
@@ -95,29 +138,59 @@ pub enum ReasoningSummary {
 // ============================================================================
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(tag = "type")]
-#[serde(rename_all = "snake_case")]
+#[serde(untagged)]
 pub enum ResponseInputOutputItem {
-    #[serde(rename = "message")]
-    Message {
+    // Input message format (used by OpenAI SDK) - must come first for untagged matching
+    // Matches: {"role": "user", "content": "text"} or {"role": "user", "content": [...]}
+    // No required 'id' or 'type' fields
+    InputMessage {
+        role: String,
+        content: MessageContent,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(rename = "type")]
+        message_type: Option<String>,
+    },
+    // Function call output format (for SDK) - output can be object or string
+    // Matches: {"type": "function_call_output", "call_id": "...", "output": {...}}
+    FunctionCallOutput {
+        #[serde(rename = "type")]
+        output_type: String,
+        call_id: String,
+        output: Value,
+    },
+    // Full output message format with required id and type tag
+    // Matches: {"type": "message", "id": "msg_xxx", "role": "user", "content": [...], "status": "..."}
+    OutputMessage {
+        #[serde(rename = "type")]
+        message_type: String,
         id: String,
         role: String,
         content: Vec<ResponseContentPart>,
         #[serde(skip_serializing_if = "Option::is_none")]
         status: Option<String>,
     },
-    #[serde(rename = "reasoning")]
+    // Reasoning format with optional content (SDK may send null or missing content)
+    // Matches: {"type": "reasoning", "id": "...", "summary": []}
     Reasoning {
+        #[serde(rename = "type")]
+        reasoning_type: String,
         id: String,
-        #[serde(skip_serializing_if = "Vec::is_empty")]
         summary: Vec<String>,
-        content: Vec<ResponseReasoningContent>,
+        #[serde(default)]
+        #[serde(skip_serializing_if = "Option::is_none")]
+        content: Option<Vec<ResponseReasoningContent>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         status: Option<String>,
     },
-    #[serde(rename = "function_tool_call")]
-    FunctionToolCall {
+    // Function call format - handles both "function_call" and "function_tool_call" types
+    // Matches: {"type": "function_call", "id": "fc_...", "call_id": "call_...", "name": "...", "arguments": "...", "status": "..."}
+    // Or: {"type": "function_tool_call", "id": "...", "name": "...", "arguments": "...", "output": "...", "status": "..."}
+    FunctionCall {
+        #[serde(rename = "type")]
+        function_type: String,
         id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        call_id: Option<String>,
         name: String,
         arguments: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -125,6 +198,14 @@ pub enum ResponseInputOutputItem {
         #[serde(skip_serializing_if = "Option::is_none")]
         status: Option<String>,
     },
+}
+
+/// Content can be either a string or an array of content parts
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum MessageContent {
+    Text(String),
+    Parts(Vec<ResponseContentPart>),
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -596,7 +677,29 @@ impl GenerationRequest for ResponsesRequest {
             ResponseInput::Items(items) => items
                 .iter()
                 .filter_map(|item| match item {
-                    ResponseInputOutputItem::Message { content, .. } => {
+                    // Handle simple input message format (from SDK)
+                    ResponseInputOutputItem::InputMessage { content, .. } => {
+                        match content {
+                            MessageContent::Text(text) => Some(text.clone()),
+                            MessageContent::Parts(parts) => {
+                                let texts: Vec<String> = parts
+                                    .iter()
+                                    .filter_map(|part| match part {
+                                        ResponseContentPart::OutputText { text, .. } => Some(text.clone()),
+                                        ResponseContentPart::InputText { text } => Some(text.clone()),
+                                        ResponseContentPart::Unknown => None,
+                                    })
+                                    .collect();
+                                if texts.is_empty() {
+                                    None
+                                } else {
+                                    Some(texts.join(" "))
+                                }
+                            }
+                        }
+                    }
+                    // Handle full output message format
+                    ResponseInputOutputItem::OutputMessage { content, .. } => {
                         let texts: Vec<String> = content
                             .iter()
                             .filter_map(|part| match part {
@@ -612,20 +715,29 @@ impl GenerationRequest for ResponsesRequest {
                         }
                     }
                     ResponseInputOutputItem::Reasoning { content, .. } => {
-                        let texts: Vec<String> = content
-                            .iter()
-                            .map(|part| match part {
-                                ResponseReasoningContent::ReasoningText { text } => text.clone(),
-                            })
-                            .collect();
-                        if texts.is_empty() {
-                            None
+                        // Content is optional for SDK reasoning items
+                        if let Some(content_vec) = content {
+                            let texts: Vec<String> = content_vec
+                                .iter()
+                                .map(|part| match part {
+                                    ResponseReasoningContent::ReasoningText { text } => text.clone(),
+                                })
+                                .collect();
+                            if texts.is_empty() {
+                                None
+                            } else {
+                                Some(texts.join(" "))
+                            }
                         } else {
-                            Some(texts.join(" "))
+                            None
                         }
                     }
-                    ResponseInputOutputItem::FunctionToolCall { arguments, .. } => {
+                    ResponseInputOutputItem::FunctionCall { arguments, .. } => {
                         Some(arguments.clone())
+                    }
+                    ResponseInputOutputItem::FunctionCallOutput { .. } => {
+                        // Function call outputs don't contribute to routing text
+                        None
                     }
                 })
                 .collect::<Vec<String>>()

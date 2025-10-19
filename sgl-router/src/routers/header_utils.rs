@@ -74,6 +74,7 @@ pub fn apply_request_headers(
         // - We already handled (authorization)
         // - Are hop-by-hop headers (connection, transfer-encoding)
         // - Should not be forwarded (host)
+        // - Don't forward compression headers(openai python sdk automatically adds this header)
         let should_skip = key_str == "authorization" || // Already handled above
             key_str == "host" ||
             key_str == "connection" ||
@@ -82,6 +83,7 @@ pub fn apply_request_headers(
             key_str == "te" ||
             key_str == "trailers" ||
             key_str == "upgrade" ||
+            key_str == "accept-encoding" ||
             (skip_content_headers && (key_str == "content-type" || key_str == "content-length"));
 
         if !should_skip {

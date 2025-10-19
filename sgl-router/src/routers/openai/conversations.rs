@@ -19,7 +19,7 @@ use crate::{
         ConversationStorage, NewConversation, NewConversationItem, ResponseId, ResponseStorage,
         SharedConversationItemStorage, SharedConversationStorage,
     },
-    protocols::responses::{ResponseInput, ResponseInputOutputItem, ResponsesRequest},
+    protocols::responses::{MessageContent, ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponsesRequest},
 };
 
 /// Maximum number of properties allowed in conversation metadata
@@ -1064,7 +1064,34 @@ async fn persist_items_with_storages(
             ResponseInput::Items(items_array) => {
                 for input_item in items_array {
                     match input_item {
-                        ResponseInputOutputItem::Message {
+                        // Handle simple input message format
+                        ResponseInputOutputItem::InputMessage {
+                            role,
+                            content,
+                            ..
+                        } => {
+                            // Convert content to Parts format for storage
+                            let content_parts = match content {
+                                MessageContent::Text(text) => {
+                                    vec![ResponseContentPart::InputText { text: text.clone() }]
+                                }
+                                MessageContent::Parts(parts) => parts.clone(),
+                            };
+                            let content_v = serde_json::to_value(&content_parts)
+                                .map_err(|e| format!("Failed to serialize content: {}", e))?;
+                            let new_item = NewConversationItem {
+                                id: None,
+                                response_id: response_id_opt.clone(),
+                                item_type: "message".to_string(),
+                                role: Some(role.clone()),
+                                content: content_v,
+                                status: Some("completed".to_string()),
+                            };
+                            create_and_link_item(&item_storage, conv_id_opt.as_ref(), new_item)
+                                .await?;
+                        }
+                        // Handle full output message format
+                        ResponseInputOutputItem::OutputMessage {
                             role,
                             content,
                             status,
