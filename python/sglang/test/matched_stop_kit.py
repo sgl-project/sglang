@@ -1,6 +1,6 @@
 import json
 
-from fastapi import requests
+import requests
 
 MANY_NEW_TOKENS_PROMPT = """
 Please write an extremely detailed and vivid fantasy story, set in a world full of intricate magic systems, political intrigue, and complex characters.
