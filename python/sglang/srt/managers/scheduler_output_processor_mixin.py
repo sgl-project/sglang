@@ -737,6 +737,8 @@ class SchedulerOutputProcessorMixin:
                     # because of the one additional delayed token. This "continue" prevented the dummy output.
                     continue
                 req.finished_output = True
+                if req.finished_len is None:
+                    req.finished_len = len(req.output_ids)
                 should_output = True
             else:
                 if req.stream:
@@ -779,17 +781,20 @@ class SchedulerOutputProcessorMixin:
                 else:
                     decode_ids_list.append(decode_ids[req.send_decode_id_offset :])
 
+                # Exclude the tokens after stop condition
+                output_ids_ = req.output_ids_through_stop
+
                 req.send_decode_id_offset = len(decode_ids)
                 read_offsets.append(read_offset)
-                output_ids.append(req.output_ids[send_token_offset:])
-                req.send_token_offset = len(req.output_ids)
+                output_ids.append(output_ids_[send_token_offset:])
+                req.send_token_offset = len(output_ids_)
                 skip_special_tokens.append(req.sampling_params.skip_special_tokens)
                 spaces_between_special_tokens.append(
                     req.sampling_params.spaces_between_special_tokens
                 )
                 no_stop_trim.append(req.sampling_params.no_stop_trim)
                 prompt_tokens.append(len(req.origin_input_ids))
-                completion_tokens.append(len(req.output_ids))
+                completion_tokens.append(len(output_ids_))
                 cached_tokens.append(req.cached_tokens)
 
                 if not self.spec_algorithm.is_none():
