@@ -1,10 +1,13 @@
+use std::{
+    fmt::{Display, Formatter},
+    sync::Arc,
+};
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value};
-use std::fmt::{Display, Formatter};
-use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
 pub struct ConversationId(pub String);
