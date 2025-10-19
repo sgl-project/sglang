@@ -67,14 +67,12 @@ class TritonKernelsQuantInfo(MoeQuantInfo):
     w2_weight: torch.Tensor
     w13_bias: Optional[torch.Tensor] = None
     w2_bias: Optional[torch.Tensor] = None
-    w13_precision_config: Optional["PrecisionConfig"] = None
-    w2_precision_config: Optional["PrecisionConfig"] = None
+    w13_precision_config: Optional[PrecisionConfig] = None
+    w2_precision_config: Optional[PrecisionConfig] = None
     w13_scale: Optional[torch.Tensor] = None
     w2_scale: Optional[torch.Tensor] = None
     a1_scale: Optional[torch.Tensor] = None
     a2_scale: Optional[torch.Tensor] = None
-    w13_zero_point: Optional[torch.Tensor] = None
-    w2_zero_point: Optional[torch.Tensor] = None
     block_shape: Optional[Sequence[int]] = None
     use_fp8_w8a8: bool = False
     per_channel_quant: bool = False
@@ -253,7 +251,7 @@ def fused_experts_none_to_triton_kernels(
         runner_config.routed_scaling_factor is not None
         and runner_config.routed_scaling_factor != 1.0
     ):
-        output = output * runner_config.routed_scaling_factor
+        output.mul_(runner_config.routed_scaling_factor)
 
     return StandardCombineInput(hidden_states=output)
 
@@ -304,6 +302,6 @@ def post_permute_triton_kernels_to_standard(
         and runner_config.routed_scaling_factor != 1.0
         and not runner_config.no_combine
     ):
-        hidden_states = hidden_states * runner_config.routed_scaling_factor
+        hidden_states.mul_(runner_config.routed_scaling_factor)
 
     return StandardCombineInput(hidden_states=hidden_states)
