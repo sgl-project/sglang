@@ -32,6 +32,70 @@ if _is_cuda:
 _is_hip = is_hip()
 
 
+def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
+    """
+    Get block sizes and configuration for extend attention kernels.
+
+    Args:
+        Lq: Query head dimension
+        Lv: Value head dimension
+
+    Returns:
+        tuple: (BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV, BLOCK_M, BLOCK_N, num_warps)
+    """
+    # Determine BLOCK_DMODEL and BLOCK_DPE based on head dimension
+    if Lq == 576:
+        BLOCK_DMODEL = 512
+        BLOCK_DPE = 64
+    elif Lq == 288:
+        BLOCK_DMODEL = 256
+        BLOCK_DPE = 32
+    elif Lq == 192:
+        BLOCK_DMODEL = 128
+        BLOCK_DPE = 64
+    else:
+        BLOCK_DMODEL = triton.next_power_of_2(Lq)
+        BLOCK_DPE = 0
+
+    BLOCK_DV = triton.next_power_of_2(Lv)
+
+    # Determine BLOCK_M, BLOCK_N, and num_warps based on hardware
+    if _is_hip:
+        BLOCK_M, BLOCK_N = (64, 64)
+        num_warps = 4
+    else:
+        if _is_cuda and CUDA_CAPABILITY[0] >= 9:
+            # Hopper architecture (H100, etc.)
+            if Lq <= 256:
+                BLOCK_M, BLOCK_N = (128, 64)
+            else:
+                BLOCK_M, BLOCK_N = (32, 64)
+        elif _is_cuda and CUDA_CAPABILITY[0] >= 8:
+            # Ampere architecture (A100, etc.)
+            # sm86/sm89 has a much smaller shared memory size (100K) than sm80 (160K)
+            if CUDA_CAPABILITY[1] == 9 or CUDA_CAPABILITY[1] == 6:
+                if Lq <= 128:
+                    BLOCK_M, BLOCK_N = (64, 128)
+                elif Lq <= 256:
+                    BLOCK_M, BLOCK_N = (64, 64)
+                else:
+                    BLOCK_M, BLOCK_N = (32, 32)
+            else:
+                if Lq <= 128:
+                    BLOCK_M, BLOCK_N = (128, 128)
+                elif Lq <= 256:
+                    BLOCK_M, BLOCK_N = (64, 64)
+                else:
+                    BLOCK_M, BLOCK_N = (32, 64)
+        else:
+            # Older architectures
+            BLOCK_M, BLOCK_N = (64, 64) if Lq <= 128 else (32, 32)
+
+        num_warps = 4 if Lq <= 64 else 8
+
+    return BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV, BLOCK_M, BLOCK_N, num_warps
+
+
 @triton.jit
 def tanh(x):
     # Tanh is just a scaled sigmoid
@@ -508,50 +572,10 @@ def extend_attention_fwd(
         v_extend.shape[-1],
     )
 
-    if Lq == 576:
-        BLOCK_DMODEL = 512
-        BLOCK_DPE = 64
-    elif Lq == 288:
-        BLOCK_DMODEL = 256
-        BLOCK_DPE = 32
-    elif Lq == 192:
-        BLOCK_DMODEL = 128
-        BLOCK_DPE = 64
-    else:
-        BLOCK_DMODEL = triton.next_power_of_2(Lq)
-        BLOCK_DPE = 0
-    BLOCK_DV = triton.next_power_of_2(Lv)
-
-    if _is_hip:
-        BLOCK_M, BLOCK_N = (64, 64)
-        num_warps = 4
-
-    else:
-        if _is_cuda and CUDA_CAPABILITY[0] >= 9:
-            if Lq <= 256:
-                BLOCK_M, BLOCK_N = (128, 64)
-            else:
-                BLOCK_M, BLOCK_N = (32, 64)
-        elif _is_cuda and CUDA_CAPABILITY[0] >= 8:
-            # sm86/sm89 has a much smaller shared memory size (100K) than sm80 (160K)
-            if CUDA_CAPABILITY[1] == 9 or CUDA_CAPABILITY[1] == 6:
-                if Lq <= 128:
-                    BLOCK_M, BLOCK_N = (64, 128)
-                elif Lq <= 256:
-                    BLOCK_M, BLOCK_N = (64, 64)
-                else:
-                    BLOCK_M, BLOCK_N = (32, 32)
-            else:
-                if Lq <= 128:
-                    BLOCK_M, BLOCK_N = (128, 128)
-                elif Lq <= 256:
-                    BLOCK_M, BLOCK_N = (64, 64)
-                else:
-                    BLOCK_M, BLOCK_N = (32, 64)
-        else:
-            BLOCK_M, BLOCK_N = (64, 64) if Lq <= 128 else (32, 32)
-
-        num_warps = 4 if Lk <= 64 else 8
+    # Get block sizes and configuration
+    BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV, BLOCK_M, BLOCK_N, num_warps = (
+        _get_block_sizes_for_extend_attention(Lq, Lv)
+    )
 
     sm_scale = sm_scale or 1.0 / (Lq**0.5)
     batch_size, head_num = qo_indptr.shape[0] - 1, q_extend.shape[1]
@@ -954,48 +978,10 @@ def extend_attention_fwd_unified(
     """
     Lq, Lv = q.shape[-1], v_buffer.shape[-1]
 
-    if Lq == 576:
-        BLOCK_DMODEL = 512
-        BLOCK_DPE = 64
-    elif Lq == 288:
-        BLOCK_DMODEL = 256
-        BLOCK_DPE = 32
-    elif Lq == 192:
-        BLOCK_DMODEL = 128
-        BLOCK_DPE = 64
-    else:
-        BLOCK_DMODEL = triton.next_power_of_2(Lq)
-        BLOCK_DPE = 0
-    BLOCK_DV = triton.next_power_of_2(Lv)
-
-    if _is_hip:
-        BLOCK_M, BLOCK_N = (64, 64)
-        num_warps = 4
-    else:
-        if _is_cuda and CUDA_CAPABILITY[0] >= 9:
-            if Lq <= 256:
-                BLOCK_M, BLOCK_N = (128, 64)
-            else:
-                BLOCK_M, BLOCK_N = (32, 64)
-        elif _is_cuda and CUDA_CAPABILITY[0] >= 8:
-            if CUDA_CAPABILITY[1] == 9 or CUDA_CAPABILITY[1] == 6:
-                if Lq <= 128:
-                    BLOCK_M, BLOCK_N = (64, 128)
-                elif Lq <= 256:
-                    BLOCK_M, BLOCK_N = (64, 64)
-                else:
-                    BLOCK_M, BLOCK_N = (32, 32)
-            else:
-                if Lq <= 128:
-                    BLOCK_M, BLOCK_N = (128, 128)
-                elif Lq <= 256:
-                    BLOCK_M, BLOCK_N = (64, 64)
-                else:
-                    BLOCK_M, BLOCK_N = (32, 64)
-        else:
-            BLOCK_M, BLOCK_N = (64, 64) if Lq <= 128 else (32, 32)
-
-        num_warps = 4 if Lq <= 64 else 8
+    # Get block sizes and configuration
+    BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV, BLOCK_M, BLOCK_N, num_warps = (
+        _get_block_sizes_for_extend_attention(Lq, Lv)
+    )
 
     sm_scale = sm_scale or 1.0 / (Lq**0.5)
     batch_size, head_num = qo_indptr.shape[0] - 1, q.shape[1]
