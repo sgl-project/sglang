@@ -43,8 +43,10 @@ class MatchedStopMixin:
 
         assert (
             response_completions.json()["choices"][0]["finish_reason"] == finish_reason
-        )
-        assert response_completions.json()["choices"][0]["matched_stop"] == matched_stop
+        ), f"Expected finish_reason: {finish_reason}, but got: {response_completions.json()['choices'][0]['finish_reason']}"
+        assert (
+            response_completions.json()["choices"][0]["matched_stop"] == matched_stop
+        ), f"Expected matched_stop: {matched_stop}, but got: {response_completions.json()['choices'][0]['matched_stop']}"
 
     def _run_chat_completions_generation(
         self,
@@ -79,8 +81,12 @@ class MatchedStopMixin:
         print(json.dumps(response_chat.json()))
         print("=" * 100)
 
-        assert response_chat.json()["choices"][0]["finish_reason"] == finish_reason
-        assert response_chat.json()["choices"][0]["matched_stop"] == matched_stop
+        assert (
+            response_chat.json()["choices"][0]["finish_reason"] == finish_reason
+        ), f"Expected finish_reason: {finish_reason}, but got: {response_chat.json()['choices'][0]['finish_reason']}"
+        assert (
+            response_chat.json()["choices"][0]["matched_stop"] == matched_stop
+        ), f"Expected matched_stop: {matched_stop}, but got: {response_chat.json()['choices'][0]['matched_stop']}"
 
     def test_finish_stop_str(self):
         self._run_completions_generation(
