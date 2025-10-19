@@ -116,12 +116,14 @@ def build_unified_kv_indices(
 
     prefix_lens = prefix_kv_indptr[1 : bs + 1] - prefix_kv_indptr[:bs]
 
-    unified_kv_indptr = torch.empty(bs + 1, dtype=torch.int32, device=device)
-    unified_kv_indptr[0] = 0
-    unified_kv_indptr[1:] = prefix_lens + extend_seq_lens[:bs]
-
-    # Compute cumsum in-place
-    torch.cumsum(unified_kv_indptr[1:], dim=0, out=unified_kv_indptr[1:])
+    # Create unified_kv_indptr avoiding direct assignment (for CUDA graph compatibility)
+    unified_lens = prefix_lens + extend_seq_lens[:bs]
+    unified_kv_indptr = torch.cat(
+        [
+            torch.zeros(1, dtype=torch.int32, device=device),
+            torch.cumsum(unified_lens, dim=0),
+        ]
+    )
 
     max_unified_len = len(prefix_kv_indices) + len(extend_kv_indices)
 
@@ -664,6 +666,8 @@ def _fwd_kernel_unified(
     kv_indptr,
     kv_indices,
     prefix_lens,
+    mask_ptr,
+    mask_indptr,
     sink_ptr,
     window_start_pos,
     sm_scale,
@@ -687,6 +691,7 @@ def _fwd_kernel_unified(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
+    USE_CUSTOM_MASK: tl.constexpr,
     HAS_SINK: tl.constexpr,
 ):
     """
@@ -710,6 +715,10 @@ def _fwd_kernel_unified(
     cur_window_start = 0
     if SLIDING_WINDOW_SIZE > 0:
         cur_window_start = tl.load(window_start_pos + cur_seq)
+
+    # Load custom mask start index if using custom mask (for speculative decoding)
+    if USE_CUSTOM_MASK:
+        cur_seq_mask_start_idx = tl.load(mask_indptr + cur_seq)
 
     offs_d = tl.arange(0, BLOCK_DMODEL)
     offs_dv = tl.arange(0, BLOCK_DV)
@@ -758,8 +767,21 @@ def _fwd_kernel_unified(
         # Compute mask
         final_mask = mask_m[:, None] & mask_n[None, :]
 
+        # Apply custom mask if provided
+        if USE_CUSTOM_MASK:
+            custom_mask = tl.load(
+                mask_ptr
+                + cur_seq_mask_start_idx
+                + (cur_block_m * BLOCK_M + offs_m[:, None]) * cur_seq_kv_len
+                + start_n
+                + offs_n[None, :],
+                mask=(mask_m[:, None] & mask_n[None, :]),
+                other=0,
+            )
+            final_mask &= custom_mask
+
         # Apply causal mask for extend part
-        if IS_CAUSAL:
+        if IS_CAUSAL and not USE_CUSTOM_MASK:
             # Determine if current KV block is in extend region
             # Only apply causal mask when both Q and K are in extend region
             q_idx = cur_block_m * BLOCK_M + offs_m[:, None]
@@ -794,7 +816,9 @@ def _fwd_kernel_unified(
             final_mask &= window_mask
 
         # Check if we can skip this tile
-        SKIP_TILE = tl.max(tl.max(final_mask.to(tl.int32), axis=1), axis=0) == 0
+        SKIP_TILE = False
+        if USE_CUSTOM_MASK or SLIDING_WINDOW_SIZE > 0:
+            SKIP_TILE = tl.max(tl.max(final_mask.to(tl.int32), axis=1), axis=0) == 0
 
         if not SKIP_TILE:
             # Load KV indices
@@ -894,6 +918,8 @@ def extend_attention_fwd_unified(
     kv_indices,
     prefix_lens,
     max_len_extend,
+    custom_mask=None,
+    mask_indptr=None,
     sm_scale=None,
     logit_cap=0.0,
     is_causal=True,
@@ -915,6 +941,8 @@ def extend_attention_fwd_unified(
         kv_indices: Unified KV indices (both prefix and extend)
         prefix_lens: Prefix length for each sequence [batch_size]
         max_len_extend: Maximum extend length
+        custom_mask: Custom attention mask (for speculative decoding tree attention)
+        mask_indptr: Mask offsets [batch_size + 1]
         sm_scale: Softmax scale
         logit_cap: Logit capping value
         is_causal: Whether to apply causal mask
@@ -973,6 +1001,7 @@ def extend_attention_fwd_unified(
     batch_size, head_num = qo_indptr.shape[0] - 1, q.shape[1]
     kv_group_num = q.shape[1] // k_buffer.shape[1]
 
+    USE_CUSTOM_MASK = custom_mask is not None
     HAS_SINK = sinks is not None
 
     # For sliding window attention, window_start_pos tracks the absolute position
@@ -997,6 +1026,8 @@ def extend_attention_fwd_unified(
         kv_indptr,
         kv_indices,
         prefix_lens,
+        custom_mask,
+        mask_indptr,
         sinks,
         window_start_pos,
         sm_scale,
@@ -1020,6 +1051,7 @@ def extend_attention_fwd_unified(
         Lq=Lq,
         Lv=Lv,
         IS_CAUSAL=is_causal,
+        USE_CUSTOM_MASK=USE_CUSTOM_MASK,
         HAS_SINK=HAS_SINK,
         num_warps=num_warps,
         num_stages=num_stages,
