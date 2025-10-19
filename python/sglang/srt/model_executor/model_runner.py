@@ -908,18 +908,6 @@ class ModelRunner:
             logger,
         )
 
-        # Handle the case where some ranks do not finish loading.
-        try:
-            dist.monitored_barrier(
-                group=get_tp_group().cpu_group,
-                timeout=datetime.timedelta(seconds=UNBALANCED_MODEL_LOADING_TIMEOUT_S),
-                wait_all_ranks=True,
-            )
-        except RuntimeError:
-            raise ValueError(
-                f"TP rank {self.tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
-            ) from None
-
         if self.server_args.elastic_ep_backend == "mooncake":
             # Mooncake does not support `monitored_barrier`
             dist.barrier(group=get_tp_group().cpu_group)
