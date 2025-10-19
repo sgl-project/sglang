@@ -143,7 +143,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
 
         self.triton_kernel_moe_forward = None
         self.triton_kernel_moe_with_bias_forward = None
-        if torch.cuda.is_available() and has_triton_kernels:
+        if torch.cuda.is_available() and use_triton_kernels:
             from sglang.srt.layers.moe.fused_moe_triton.triton_kernels_moe import (
                 triton_kernel_moe_forward as _tk_forward,
             )
