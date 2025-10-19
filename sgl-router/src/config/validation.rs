@@ -42,6 +42,9 @@ impl ConfigValidator {
             }
         }
 
+        // Validate tokenizer cache configuration
+        Self::validate_tokenizer_cache(&config.tokenizer_cache)?;
+
         Ok(())
     }
 
@@ -443,6 +446,29 @@ impl ConfigValidator {
                 reason: "Must be > 0".to_string(),
             });
         }
+        Ok(())
+    }
+
+    /// Validate tokenizer cache configuration
+    fn validate_tokenizer_cache(cache: &TokenizerCacheConfig) -> ConfigResult<()> {
+        // Validate L0 max entries when L0 is enabled
+        if cache.enable_l0 && cache.l0_max_entries == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "tokenizer_cache.l0_max_entries".to_string(),
+                value: cache.l0_max_entries.to_string(),
+                reason: "Must be > 0 when L0 cache is enabled".to_string(),
+            });
+        }
+
+        // Validate L1 max memory when L1 is enabled
+        if cache.enable_l1 && cache.l1_max_memory == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "tokenizer_cache.l1_max_memory".to_string(),
+                value: cache.l1_max_memory.to_string(),
+                reason: "Must be > 0 when L1 cache is enabled".to_string(),
+            });
+        }
+
         Ok(())
     }
 

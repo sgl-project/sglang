@@ -4,7 +4,6 @@
 
 from typing import List, Optional, Union
 
-import numpy as np
 import torch
 import triton
 import triton.language as tl

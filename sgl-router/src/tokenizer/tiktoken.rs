@@ -1,8 +1,9 @@
+use anyhow::{Error, Result};
+use tiktoken_rs::{cl100k_base, p50k_base, p50k_edit, r50k_base, CoreBPE};
+
 use super::traits::{
     Decoder, Encoder, Encoding, SpecialTokens, TokenIdType, Tokenizer as TokenizerTrait,
 };
-use anyhow::{Error, Result};
-use tiktoken_rs::{cl100k_base, p50k_base, p50k_edit, r50k_base, CoreBPE};
 
 /// Tiktoken tokenizer wrapper for OpenAI GPT models
 pub struct TiktokenTokenizer {

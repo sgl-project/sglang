@@ -2,8 +2,10 @@
 // This parser starts with in_reasoning=true, assuming all text is reasoning
 // until an end token is encountered.
 
-use crate::reasoning_parser::parsers::BaseReasoningParser;
-use crate::reasoning_parser::traits::{ParseError, ParserConfig, ParserResult, ReasoningParser};
+use crate::reasoning_parser::{
+    parsers::BaseReasoningParser,
+    traits::{ParseError, ParserConfig, ParserResult, ReasoningParser},
+};
 
 /// DeepSeek-R1 reasoning parser.
 ///

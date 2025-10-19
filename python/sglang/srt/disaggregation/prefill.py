@@ -20,7 +20,6 @@ Life cycle of a request in the prefill server
 from __future__ import annotations
 
 import logging
-import threading
 import time
 from collections import deque
 from http import HTTPStatus
@@ -54,7 +53,7 @@ from sglang.srt.mem_cache.memory_pool import (
     NSATokenToKVPool,
     SWAKVPool,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.utils import (
     DynamicGradMode,
     broadcast_pyobj,

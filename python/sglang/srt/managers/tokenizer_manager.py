@@ -16,7 +16,6 @@
 import asyncio
 import copy
 import dataclasses
-import json
 import logging
 import math
 import os
@@ -268,7 +267,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             )
 
         # Request states
-        self.no_create_loop = False
+        self._chosen_loop = None
         self.rid_to_state: Dict[str, ReqState] = {}
         self.asyncio_tasks = set()
 
@@ -587,9 +586,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             )
 
         if self.mm_processor and obj.contains_mm_input():
-            if not isinstance(obj.image_data, list) and obj.image_data:
+            if obj.image_data is not None and not isinstance(obj.image_data, list):
                 obj.image_data = [obj.image_data]
-            if not isinstance(obj.audio_data, list) and obj.audio_data:
+            if obj.audio_data is not None and not isinstance(obj.audio_data, list):
                 obj.audio_data = [obj.audio_data]
             mm_inputs: Dict = await self.mm_processor.process_mm_data_async(
                 image_data=obj.image_data,
@@ -760,6 +759,14 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         """Handle batch tokenization for text inputs only."""
         logger.debug(f"Starting batch tokenization for {batch_size} text requests")
 
+        # If batch does not have text nothing to tokenize
+        # so lets construct the return object
+        if not self._batch_has_text(batch_size, obj):
+            # All requests already have input_ids, no need to tokenize
+            return [await self._tokenize_one_request(obj[i]) for i in range(batch_size)]
+
+        self._validate_batch_tokenization_constraints(batch_size, obj)
+
         # Collect requests and texts
         requests = [obj[i] for i in range(batch_size)]
         texts = [req.text for req in requests]
@@ -808,6 +815,30 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 raise ValueError(
                     "Batch tokenization is not needed for input_embeds. Do not set `enable_tokenizer_batch_encode`."
                 )
+
+    def _batch_has_text(
+        self, batch_size: int, obj: Union[GenerateReqInput, EmbeddingReqInput]
+    ) -> bool:
+        """Check if any request in the batch contains text input."""
+        for i in range(batch_size):
+            if obj[i].text:
+                return True
+            elif self.is_generation and obj[i].contains_mm_input():
+                return True
+
+        return False
+
+    def _should_use_batch_tokenization(self, batch_size, requests) -> bool:
+        """Return True if we should run the tokenizer in batch mode.
+
+        Current policy:
+        - Respect explicit server flag `enable_tokenizer_batch_encode`.
+        - Or, if no request has text or multimodal input (all use pre-tokenized input_ids or input_embeds), batch the requests without tokenization.
+        """
+        return batch_size > 0 and (
+            self.server_args.enable_tokenizer_batch_encode
+            or not self._batch_has_text(batch_size, requests)
+        )
 
     def _send_one_request(
         self,
@@ -943,13 +974,8 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         generators = []
         rids = []
         if getattr(obj, "parallel_sample_num", 1) == 1:
-            if self.server_args.enable_tokenizer_batch_encode:
-                # Validate batch tokenization constraints
-                self._validate_batch_tokenization_constraints(batch_size, obj)
-
+            if self._should_use_batch_tokenization(batch_size, obj):
                 tokenized_objs = await self._batch_tokenize_and_process(batch_size, obj)
-
-                # Send as a single batched request
                 self._send_batch_request(obj, tokenized_objs, created_time)
 
                 # Set up generators for each request in the batch
@@ -1144,11 +1170,14 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         return background_tasks
 
     def auto_create_handle_loop(self):
-        if self.no_create_loop:
+        if self._chosen_loop is not None:
+            assert (
+                asyncio.get_event_loop() == self._chosen_loop
+            ), f"Please ensure only one event loop is ever used with SGLang. Previous loop: {self._chosen_loop}, current loop: {asyncio.get_event_loop()}"
             return
 
-        self.no_create_loop = True
         loop = asyncio.get_event_loop()
+        self._chosen_loop = loop
         self.asyncio_tasks.add(
             loop.create_task(print_exception_wrapper(self.handle_loop))
         )

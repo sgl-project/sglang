@@ -1,12 +1,15 @@
 //! Power-of-two choices load balancing policy
 
-use super::{get_healthy_worker_indices, LoadBalancingPolicy};
-use crate::core::Worker;
-use crate::metrics::RouterMetrics;
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
+};
+
 use rand::Rng;
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
 use tracing::info;
+
+use super::{get_healthy_worker_indices, LoadBalancingPolicy};
+use crate::{core::Worker, metrics::RouterMetrics};
 
 /// Power-of-two choices policy
 ///

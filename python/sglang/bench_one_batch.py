@@ -75,6 +75,7 @@ from sglang.srt.utils import (
     is_cuda_alike,
     is_xpu,
     kill_process_tree,
+    maybe_reindex_device_id,
     require_mlp_sync,
     require_mlp_tp_gather,
     set_gpu_proc_affinity,
@@ -159,7 +160,7 @@ class BenchArgs:
         )
 
 
-def load_model(server_args, port_args, tp_rank):
+def load_model(server_args, port_args, gpu_id, tp_rank):
     suppress_other_loggers()
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
     moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
@@ -168,7 +169,7 @@ def load_model(server_args, port_args, tp_rank):
     model_runner = ModelRunner(
         model_config=model_config,
         mem_fraction_static=server_args.mem_fraction_static,
-        gpu_id=tp_rank,
+        gpu_id=gpu_id,
         tp_rank=tp_rank,
         tp_size=server_args.tp_size,
         moe_ep_rank=moe_ep_rank,
@@ -319,6 +320,7 @@ def _maybe_prepare_mlp_sync_batch(batch: ScheduleBatch, model_runner):
             speculative_num_draft_tokens=None,
             require_mlp_tp_gather=require_mlp_tp_gather(model_runner.server_args),
             disable_overlap_schedule=model_runner.server_args.disable_overlap_schedule,
+            offload_tags=set(),
         )
 
 
@@ -350,6 +352,7 @@ def correctness_test(
     server_args,
     port_args,
     bench_args,
+    gpu_id,
     tp_rank,
 ):
     # Configure the logger
@@ -357,7 +360,7 @@ def correctness_test(
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
 
     # Load the model
-    model_runner, tokenizer = load_model(server_args, port_args, tp_rank)
+    model_runner, tokenizer = load_model(server_args, port_args, gpu_id, tp_rank)
 
     # Prepare inputs
     custom_prompts = _read_prompts_from_file(bench_args.prompt_filename, rank_print)
@@ -517,6 +520,7 @@ def latency_test(
     server_args,
     port_args,
     bench_args,
+    gpu_id,
     tp_rank,
 ):
     initialize_moe_config(server_args)
@@ -532,7 +536,7 @@ def latency_test(
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
 
     # Load the model
-    model_runner, tokenizer = load_model(server_args, port_args, tp_rank)
+    model_runner, tokenizer = load_model(server_args, port_args, gpu_id, tp_rank)
 
     # Prepare inputs for warm up
     reqs = prepare_synthetic_inputs_for_latency_test(
@@ -634,21 +638,23 @@ def main(server_args, bench_args):
     port_args = PortArgs.init_new(server_args)
 
     if server_args.tp_size == 1:
-        work_func(server_args, port_args, bench_args, 0)
+        work_func(server_args, port_args, bench_args, 0, 0)
     else:
         workers = []
         for tp_rank in range(server_args.tp_size):
-            proc = multiprocessing.Process(
-                target=work_func,
-                args=(
-                    server_args,
-                    port_args,
-                    bench_args,
-                    tp_rank,
-                ),
-            )
-            proc.start()
-            workers.append(proc)
+            with maybe_reindex_device_id(tp_rank) as gpu_id:
+                proc = multiprocessing.Process(
+                    target=work_func,
+                    args=(
+                        server_args,
+                        port_args,
+                        bench_args,
+                        gpu_id,
+                        tp_rank,
+                    ),
+                )
+                proc.start()
+                workers.append(proc)
 
         for proc in workers:
             proc.join()

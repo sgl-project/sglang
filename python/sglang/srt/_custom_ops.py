@@ -15,7 +15,7 @@ if not is_hpu():
     # ROCm does not use vllm custom allreduce
     if use_vllm_custom_allreduce and not is_hip():
         try:
-            import vllm._C
+            import vllm._C  # noqa: F401
         except ImportError as e:
             logger.warning("Failed to import from vllm._C with %r", e)
     else:

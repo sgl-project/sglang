@@ -1,12 +1,9 @@
 import logging
-from typing import List, Optional
 
 import torch
 import triton
 
-from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
-from sglang.srt.utils import ceil_div, dispose_tensor, is_cuda
-from sglang.utils import is_in_ci
+from sglang.srt.utils import ceil_div, is_cuda
 
 logger = logging.getLogger(__name__)
 

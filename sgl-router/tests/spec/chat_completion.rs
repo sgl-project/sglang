@@ -1,9 +1,12 @@
 use serde_json::json;
-use sglang_router_rs::protocols::spec::{
-    ChatCompletionRequest, ChatMessage, Function, FunctionCall, FunctionChoice, StreamOptions,
-    Tool, ToolChoice, ToolChoiceValue, ToolReference, UserMessageContent,
+use sglang_router_rs::protocols::{
+    chat::{ChatCompletionRequest, ChatMessage, UserMessageContent},
+    common::{
+        Function, FunctionCall, FunctionChoice, StreamOptions, Tool, ToolChoice, ToolChoiceValue,
+        ToolReference,
+    },
+    validated::Normalizable,
 };
-use sglang_router_rs::protocols::validated::Normalizable;
 use validator::Validate;
 
 // Deprecated fields normalization tests

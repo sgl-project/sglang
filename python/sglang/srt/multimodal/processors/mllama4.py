@@ -1,13 +1,5 @@
 from typing import List, Union
 
-import torch
-from transformers.image_utils import SizeDict
-from transformers.models.llama4.image_processing_llama4_fast import (
-    find_supported_resolutions,
-    get_best_fit,
-)
-
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.models.mllama4 import Llama4ForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,

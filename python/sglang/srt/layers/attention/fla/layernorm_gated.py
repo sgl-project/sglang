@@ -5,7 +5,6 @@
 # This backward pass is faster for dimensions up to 8k, but after that it's much slower due to register spilling.
 # The models we train have hidden dim up to 8k anyway (e.g. Llama 70B), so this is fine.
 
-import math
 
 import torch
 import torch.nn.functional as F

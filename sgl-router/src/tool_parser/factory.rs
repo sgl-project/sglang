@@ -1,14 +1,19 @@
 // Factory and pool for creating model-specific tool parsers with pooling support.
 
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
+};
+
 use tokio::sync::Mutex;
 
-use crate::tool_parser::parsers::{
-    DeepSeekParser, Glm4MoeParser, GptOssHarmonyParser, GptOssParser, JsonParser, KimiK2Parser,
-    LlamaParser, MistralParser, PassthroughParser, PythonicParser, QwenParser, Step3Parser,
+use crate::tool_parser::{
+    parsers::{
+        DeepSeekParser, Glm4MoeParser, GptOssHarmonyParser, GptOssParser, JsonParser, KimiK2Parser,
+        LlamaParser, MistralParser, PassthroughParser, PythonicParser, QwenParser, Step3Parser,
+    },
+    traits::ToolParser,
 };
-use crate::tool_parser::traits::ToolParser;
 
 /// Type alias for pooled parser instances.
 pub type PooledParser = Arc<Mutex<Box<dyn ToolParser>>>;

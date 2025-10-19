@@ -92,7 +92,7 @@ class AscendPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         )
 
         if num_new_pages_item < 200:
-            import sgl_kernel_npu
+            import sgl_kernel_npu  # noqa: F401
 
             torch.ops.npu.alloc_extend(
                 prefix_lens,

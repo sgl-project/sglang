@@ -2,8 +2,9 @@
 //!
 //! Defines the request/response structures for worker management endpoints
 
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+use serde::{Deserialize, Serialize};
 
 /// Worker configuration for API requests
 #[derive(Debug, Clone, Deserialize, Serialize)]

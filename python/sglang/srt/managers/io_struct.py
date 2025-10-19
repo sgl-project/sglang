@@ -879,6 +879,8 @@ class BatchMultimodalDecodeReq(BaseBatchReq):
     placeholder_tokens_idx: List[Optional[List[int]]]
     placeholder_tokens_val: List[Optional[List[int]]]
 
+    return_bytes: List[bool]
+
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
 

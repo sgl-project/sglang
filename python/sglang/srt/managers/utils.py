@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 import logging
-import multiprocessing as mp
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Optional
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import Req

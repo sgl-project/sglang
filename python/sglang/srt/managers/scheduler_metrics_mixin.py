@@ -3,13 +3,10 @@ from __future__ import annotations
 import logging
 import time
 from collections import defaultdict
-from typing import TYPE_CHECKING, Dict, List, Optional, Union
-
-import torch
+from typing import TYPE_CHECKING, List, Optional
 
 from sglang.srt.disaggregation.kv_events import EventPublisherFactory, KVEventBatch
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
 from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.managers.scheduler import Req, ScheduleBatch
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
@@ -138,6 +135,7 @@ class SchedulerMetricsMixin:
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             f += f"#prealloc-req: {len(self.disagg_prefill_bootstrap_queue.queue)}, "
             f += f"#inflight-req: {len(self.disagg_prefill_inflight_queue)}, "
+            f += f"input throughput (token/s): {self.last_input_throughput:.2f}, "
 
         logger.info(f)
 
