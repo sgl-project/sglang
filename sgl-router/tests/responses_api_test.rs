@@ -1617,7 +1617,7 @@ async fn test_conversation_items_max_limit() {
             "content": [{"type": "input_text", "text": format!("Message {}", i)}]
         }));
     }
-    let create_items = serde_json::json!({"items": items});
+    let create_items = serde_json::json!({ "items": items });
 
     let items_resp = router
         .create_conversation_items(None, conv_id, &create_items)
