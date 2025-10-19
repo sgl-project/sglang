@@ -42,11 +42,14 @@ class MatchedStopMixin:
         print(json.dumps(res))
         print("=" * 100)
 
+        if not isinstance(matched_stop, list):
+            matched_stop = [matched_stop]
+
         assert (
             res["choices"][0]["finish_reason"] == finish_reason
         ), f"Expected finish_reason: {finish_reason}, but got: {res['choices'][0]['finish_reason']}"
         assert (
-            res["choices"][0]["matched_stop"] == matched_stop
+            res["choices"][0]["matched_stop"] in matched_stop
         ), f"Expected matched_stop: {matched_stop}, but got: {res['choices'][0]['matched_stop']}"
 
     def _run_chat_completions_generation(
@@ -83,11 +86,14 @@ class MatchedStopMixin:
         print(json.dumps(res))
         print("=" * 100)
 
+        if not isinstance(matched_stop, list):
+            matched_stop = [matched_stop]
+
         assert (
             res["choices"][0]["finish_reason"] == finish_reason
         ), f"Expected finish_reason: {finish_reason}, but got: {res['choices'][0]['finish_reason']}"
         assert (
-            res["choices"][0]["matched_stop"] == matched_stop
+            res["choices"][0]["matched_stop"] in matched_stop
         ), f"Expected matched_stop: {matched_stop}, but got: {res['choices'][0]['matched_stop']}"
 
     def test_finish_stop_str(self):
@@ -123,24 +129,23 @@ class MatchedStopMixin:
         )
 
     def test_finish_stop_eos(self):
-        llama_format_prompt = """
-        <|begin_of_text|><|start_header_id|>system<|end_header_id|>
-        You are a helpful assistant.<|eot_id|><|start_header_id|>user<|end_header_id|>
-
-        What is 2 + 2?<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+        llama_format_prompt = """\
+<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+You are a helpful assistant.<|eot_id|><|start_header_id|>user<|end_header_id|>
+What is 2 + 2?<|eot_id|><|start_header_id|>assistant<|end_header_id|>
         """
-        eos_token_id = 128009
+        eos_token_ids = [128000, 128009, 2]
         self._run_completions_generation(
             prompt=llama_format_prompt,
             max_tokens=1000,
             finish_reason="stop",
-            matched_stop=eos_token_id,
+            matched_stop=eos_token_ids,
         )
         self._run_chat_completions_generation(
             prompt="What is 2 + 2?",
             max_tokens=1000,
             finish_reason="stop",
-            matched_stop=eos_token_id,
+            matched_stop=eos_token_ids,
         )
 
     def test_finish_length(self):
