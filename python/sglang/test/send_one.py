@@ -12,6 +12,7 @@ import dataclasses
 import json
 
 import requests
+import tabulate
 
 from sglang.profiler import run_profile
 
@@ -161,8 +162,6 @@ def send_one_prompt(args):
         print(ret)
         return 0, 0
 
-    latency = ret["meta_info"]["e2e_latency"]
-
     if "spec_verify_ct" in ret["meta_info"] and ret["meta_info"]["spec_verify_ct"] > 0:
         acc_length = (
             ret["meta_info"]["completion_tokens"] / ret["meta_info"]["spec_verify_ct"]
@@ -170,12 +169,18 @@ def send_one_prompt(args):
     else:
         acc_length = 1.0
 
+    latency = ret["meta_info"]["e2e_latency"]
     speed = ret["meta_info"]["completion_tokens"] / latency
+    tokens = ret["meta_info"]["completion_tokens"]
 
-    print(ret["text"])
+    if not args.stream:
+        print(ret["text"])
+
     print()
-    print(f"{acc_length=:.2f}")
-    print(f"{speed=:.2f} token/s")
+    headers = ["Latency (s)", "Tokens", "Acc Length", "Speed (token/s)"]
+    rows = [[f"{latency:.3f}", f"{tokens}", f"{acc_length:.3f}", f"{speed:.2f}"]]
+    msg = tabulate.tabulate(rows, headers=headers, tablefmt="pretty")
+    print(msg)
 
     return acc_length, speed
 
