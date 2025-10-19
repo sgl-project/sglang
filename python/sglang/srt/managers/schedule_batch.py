@@ -761,7 +761,7 @@ class Req:
         return False
 
     def _check_token_based_finish(self, new_accepted_tokens: List[int]) -> bool:
-        if not self.sampling_params.ignore_eos:
+        if self.sampling_params.ignore_eos:
             return False
 
         # Check stop token ids
