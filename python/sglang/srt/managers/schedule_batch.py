@@ -523,6 +523,11 @@ class Req:
 
         # Memory pool info
         self.req_pool_idx: Optional[int] = None
+        
+        # KVPress: Actual KV cache length after compression
+        # This is used to correctly free memory when the request finishes
+        # Format: prefix_len + compressed_len + decode_len
+        self.actual_kv_len: Optional[int] = None
 
         # Check finish
         self.tokenizer = None
@@ -1495,11 +1500,33 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.offload_kv_cache(
                 self.req_to_token_pool, self.token_to_kv_pool_allocator
             )
+        
+        # KVPress: Calculate actual length for memory release
+        # If KVPress was applied, actual_kv_len tracks the compressed length
+        # Otherwise, use the logical seq_lens_cpu[idx]
+        if req.actual_kv_len is not None:
+            # actual_kv_len = prefix_len + compressed_len (set during prefill)
+            # Now we add decode length: len(output_ids)
+            actual_len = req.actual_kv_len + len(req.output_ids)
+        else:
+            # Normal request without compression
+            actual_len = seq_lens_cpu[idx]
+        
         if isinstance(self.tree_cache, ChunkCache):
             # ChunkCache does not have eviction
             token_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : seq_lens_cpu[idx]
+                req.req_pool_idx, : actual_len
             ]
+            # Debug: log what we're about to free
+            logger.info(
+                f"[KVPress Debug] release_req for {req.rid}: "
+                f"actual_len={actual_len}, token_indices_before_filter={token_indices.tolist()[:10]}"
+            )
+            # Filter out zeros (compressed/pruned slots)
+            token_indices = token_indices[token_indices != 0]
+            logger.info(
+                f"[KVPress Debug] release_req freeing {len(token_indices)} slots: {token_indices.tolist()}"
+            )
             self.token_to_kv_pool_allocator.free(token_indices)
             self.req_to_token_pool.free(req.req_pool_idx)
         else:
@@ -1508,8 +1535,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 len(req.prefix_indices) // server_args.page_size
             ) * server_args.page_size
             token_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, last_uncached_pos : seq_lens_cpu[idx]
+                req.req_pool_idx, last_uncached_pos : actual_len
             ]
+            # Debug: log what we're about to free
+            logger.info(
+                f"[KVPress Debug] release_req (RadixCache) for {req.rid}: "
+                f"actual_len={actual_len}, last_uncached_pos={last_uncached_pos}, "
+                f"token_indices_before_filter={token_indices.tolist()[:10]}"
+            )
+            # Filter out zeros (compressed/pruned slots)
+            token_indices = token_indices[token_indices != 0]
+            logger.info(
+                f"[KVPress Debug] release_req (RadixCache) freeing {len(token_indices)} slots: {token_indices.tolist()}"
+            )
             self.token_to_kv_pool_allocator.free(token_indices)
             self.req_to_token_pool.free(req.req_pool_idx)
 
@@ -1552,7 +1590,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
-
+        
         if self.is_v2_eagle:
             # FIXME(lsyin): make this sync optional
             self.allocate_for_eagle_v2()

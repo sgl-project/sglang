@@ -54,6 +54,9 @@ CI_MODELS = [
     ModelCase("google/gemma-2-2b"),
 ]
 
+# KVPress test model
+KVPRESS_TEST_MODEL = ModelCase("TinyLlama/TinyLlama-1.1B-Chat-v1.0", skip_long_prompt=True)
+
 # the complete set of models to test sglang's generation model
 ALL_MODELS = [
     *CI_MODELS,
@@ -186,6 +189,32 @@ class TestGenerationModels(CustomTestCase):
                 self.assert_close_logits_and_output_strs(
                     prompts, model_case, torch_dtype
                 )
+
+    def test_kvpress_basic(self):
+        """Test KVPress with TinyLlama model."""
+        model_case = KVPRESS_TEST_MODEL
+        torch_dtype = torch.float16
+        prompts = [p for p in DEFAULT_PROMPTS if len(p) < 1000]
+        
+        # Just test that KVPress runs without errors
+        # Don't compare with baseline since compression changes outputs
+        with SRTRunner(
+            model_case.model_path,
+            tp_size=model_case.tp_size,
+            torch_dtype=torch_dtype,
+            model_type="generation",
+            trust_remote_code=model_case.trust_remote_code,
+            disable_radix_cache=True,
+            enable_kvpress=True,
+            kvpress_compression_ratio=0.3,
+        ) as srt_runner:
+            srt_outputs = srt_runner.forward(prompts, max_new_tokens=32)
+            
+            # Basic sanity checks
+            self.assertEqual(len(srt_outputs), len(prompts))
+            for output in srt_outputs:
+                self.assertIn("text", output)
+                self.assertGreater(len(output["text"]), 0)
 
 
 if __name__ == "__main__":

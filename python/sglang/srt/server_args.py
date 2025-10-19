@@ -395,6 +395,10 @@ class ServerArgs:
 
     # Optimization/debug options
     disable_radix_cache: bool = False
+    
+    # KVPress: KV cache compression
+    enable_kvpress: bool = False
+    kvpress_compression_ratio: float = 0.3
     cuda_graph_max_bs: Optional[int] = None
     cuda_graph_bs: Optional[List[int]] = None
     disable_cuda_graph: bool = False
@@ -2562,6 +2566,17 @@ class ServerArgs:
             "--disable-radix-cache",
             action="store_true",
             help="Disable RadixAttention for prefix caching.",
+        )
+        parser.add_argument(
+            "--enable-kvpress",
+            action="store_true",
+            help="Enable KVPress for KV cache compression.",
+        )
+        parser.add_argument(
+            "--kvpress-compression-ratio",
+            type=float,
+            default=ServerArgs.kvpress_compression_ratio,
+            help="KVPress compression ratio (0.0-1.0). Higher values mean more aggressive compression.",
         )
         parser.add_argument(
             "--cuda-graph-max-bs",

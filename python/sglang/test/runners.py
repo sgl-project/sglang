@@ -519,6 +519,8 @@ class SRTRunner:
         lora_target_modules: Optional[List[str]] = None,
         enable_lora: Optional[bool] = None,
         max_loaded_loras: Optional[int] = None,
+        enable_kvpress: bool = False,
+        kvpress_compression_ratio: float = 0.3,
     ):
         self.model_type = model_type
         self.is_generation = model_type == "generation"
@@ -565,6 +567,8 @@ class SRTRunner:
             lora_target_modules=lora_target_modules,
             enable_lora=enable_lora,
             max_loaded_loras=max_loaded_loras,
+            enable_kvpress=enable_kvpress,
+            kvpress_compression_ratio=kvpress_compression_ratio,
             **spec_kwargs,
         )
 

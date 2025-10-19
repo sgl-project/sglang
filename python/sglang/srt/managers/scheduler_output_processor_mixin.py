@@ -174,7 +174,9 @@ class SchedulerOutputProcessorMixin:
                                     last_prefill_chunk=False,
                                 )
                             logprob_pt += num_input_logprobs
-
+            if self.enable_kvpress:
+                self._kvpress_compress_and_free(batch)
+                
         else:  # embedding or reward model
             embeddings = result.embeddings.tolist()
 
