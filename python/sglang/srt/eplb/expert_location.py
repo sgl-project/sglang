@@ -331,8 +331,8 @@ def _compute_logical_to_all_physical_map(
             )
 
     if gpu_id is not None:
-        num_local_gpu_physical_experts = num_physical_experts // num_gpus
         num_gpus_per_node = server_args.ep_size // server_args.nnodes
+        num_local_gpu_physical_experts = num_physical_experts // num_gpus
         num_local_node_physical_experts = (
             num_local_gpu_physical_experts * num_gpus_per_node
         )
@@ -468,22 +468,24 @@ def _find_nearest_expert(
         )
         == gpu_id
     ]
+    # 1. Prefer same-GPU experts
     if len(same_gpu_physical_expert_ids) > 0:
-        # 1. Prefer same-GPU experts
         return same_gpu_physical_expert_ids[0]
-    else:
-        # 2. Otherwise, prefer same-node experts
-        node_id = gpu_id // num_gpus_per_node
-        same_node_physical_expert_ids = [
-            physical_expert_id
-            for physical_expert_id in candidate_physical_expert_ids
-            if _compute_node_id_of_physical_expert(
-                physical_expert_id, num_local_node_physical_experts
-            )
-            == node_id
-        ]
-        if len(same_node_physical_expert_ids) > 0:
-            return same_node_physical_expert_ids[0]
+
+    # 2. Otherwise, prefer same-node experts
+    node_id = gpu_id // num_gpus_per_node
+    same_node_physical_expert_ids = [
+        physical_expert_id
+        for physical_expert_id in candidate_physical_expert_ids
+        if _compute_node_id_of_physical_expert(
+            physical_expert_id, num_local_node_physical_experts
+        )
+        == node_id
+    ]
+    if len(same_node_physical_expert_ids) > 0:
+        return same_node_physical_expert_ids[0]
+
+    # 3. At last, leave it as -1 to indicate not found.
     return -1
 
 
