@@ -113,7 +113,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.mm_utils import init_embedding_cache
-from sglang.srt.managers.overlap_utils import FutureIndices, FutureMap
+from sglang.srt.managers.overlap_utils import FutureMap
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     ModelWorkerBatch,
