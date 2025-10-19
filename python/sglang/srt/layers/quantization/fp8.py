@@ -58,6 +58,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     input_to_float8,
     normalize_e4m3fn_to_e4m3fnuz,
 )
+from sglang.srt.layers.moe.utils import get_moe_runner_backend
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import (
@@ -525,12 +526,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.quant_config = quant_config
         self.block_quant = self.quant_config.weight_block_size is not None
         self.cutlass_fp8_supported = cutlass_fp8_supported()
-        self.use_cutlass_fused_experts_fp8 = (
-            get_bool_env_var("SGLANG_CUTLASS_MOE")
-            and self.cutlass_fp8_supported
-            and self.block_quant
-            and (is_sm100_supported() or is_sm90_supported())
-        )
 
     def create_weights(
         self,
@@ -638,58 +633,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
             layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
             assert self.quant_config.activation_scheme == "dynamic"
-            if self.use_cutlass_fused_experts_fp8:
-                self.ab_strides1 = torch.full(
-                    (num_experts,),
-                    hidden_size,
-                    device=w13_weight.device,
-                    dtype=torch.int64,
-                )
-                self.c_strides1 = torch.full(
-                    (num_experts,),
-                    2 * intermediate_size_per_partition,
-                    device=w13_weight.device,
-                    dtype=torch.int64,
-                )
-                self.ab_strides2 = torch.full(
-                    (num_experts,),
-                    intermediate_size_per_partition,
-                    device=w2_weight.device,
-                    dtype=torch.int64,
-                )
-                self.c_strides2 = torch.full(
-                    (num_experts,),
-                    hidden_size,
-                    device=w2_weight.device,
-                    dtype=torch.int64,
-                )
-                self.workspace = torch.empty(
-                    90000, device=w13_weight.device, dtype=torch.uint8
-                )
-                self.a_ptr = torch.empty(
-                    num_experts, device=w13_weight.device, dtype=torch.int64
-                )
-                self.b_ptr = torch.empty(
-                    num_experts, device=w13_weight.device, dtype=torch.int64
-                )
-                self.out_ptr = torch.empty(
-                    num_experts, device=w13_weight.device, dtype=torch.int64
-                )
-                self.a_scales_ptr = torch.empty(
-                    num_experts, device=w13_weight.device, dtype=torch.int64
-                )
-                self.b_scales_ptr = torch.empty(
-                    num_experts, device=w13_weight.device, dtype=torch.int64
-                )
-                self.expert_offsets = torch.empty(
-                    num_experts + 1, device=w13_weight.device, dtype=torch.int32
-                )
-                self.problem_sizes1 = torch.empty(
-                    num_experts, 3, device=w13_weight.device, dtype=torch.int32
-                )
-                self.problem_sizes2 = torch.empty(
-                    num_experts, 3, device=w13_weight.device, dtype=torch.int32
-                )
 
         else:
             # Allocate 2 scales for w1 and w3 respectively.
@@ -1079,7 +1022,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             if ret is not None:
                 return StandardCombineInput(hidden_states=ret)
 
-        if self.use_cutlass_fused_experts_fp8:
+        if self._should_use_cutlass_fused_experts():
+            self._ensure_cutlass_buffers_initialized(layer)
             from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
 
             topk_weights, topk_ids, _ = topk_output
@@ -1170,6 +1114,55 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
 
         return self.runner.run(dispatch_output, quant_info)
+
+    def _should_use_cutlass_fused_experts(self) -> bool:
+        """Decide whether to use Cutlass FP8 fused-experts path based on moe runner backend."""
+        backend = get_moe_runner_backend()
+        return (
+            (backend.is_cutlass() or backend.is_flashinfer_cutlass())
+            and self.cutlass_fp8_supported
+            and self.block_quant
+            and (is_sm100_supported() or is_sm90_supported())
+        )
+
+    def _ensure_cutlass_buffers_initialized(self, layer: Module) -> None:
+        if getattr(self, "_cutlass_buffers_ready", False):
+            return
+
+        device = layer.w13_weight.device
+        num_experts = layer.w13_weight.shape[0]
+        hidden_size = layer.w2_weight.shape[1]
+        intermediate_size_per_partition = layer.intermediate_size_per_partition
+
+        self.ab_strides1 = torch.full(
+            (num_experts,), hidden_size, device=device, dtype=torch.int64
+        )
+        self.c_strides1 = torch.full(
+            (num_experts,), 2 * intermediate_size_per_partition, device=device, dtype=torch.int64
+        )
+        self.ab_strides2 = torch.full(
+            (num_experts,), intermediate_size_per_partition, device=device, dtype=torch.int64
+        )
+        self.c_strides2 = torch.full(
+            (num_experts,), hidden_size, device=device, dtype=torch.int64
+        )
+        self.workspace = torch.empty(90000, device=device, dtype=torch.uint8)
+        self.a_ptr = torch.empty(num_experts, device=device, dtype=torch.int64)
+        self.b_ptr = torch.empty(num_experts, device=device, dtype=torch.int64)
+        self.out_ptr = torch.empty(num_experts, device=device, dtype=torch.int64)
+        self.a_scales_ptr = torch.empty(num_experts, device=device, dtype=torch.int64)
+        self.b_scales_ptr = torch.empty(num_experts, device=device, dtype=torch.int64)
+        self.expert_offsets = torch.empty(
+            num_experts + 1, device=device, dtype=torch.int32
+        )
+        self.problem_sizes1 = torch.empty(
+            num_experts, 3, device=device, dtype=torch.int32
+        )
+        self.problem_sizes2 = torch.empty(
+            num_experts, 3, device=device, dtype=torch.int32
+        )
+
+        self._cutlass_buffers_ready = True
 
     def apply_with_router_logits(
         self,

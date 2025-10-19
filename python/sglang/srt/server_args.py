@@ -855,12 +855,12 @@ class ServerArgs:
                         "Enable FlashInfer AllReduce Fusion on sm100 for DeepseekV3ForCausalLM"
                     )
                 if (
-                    self.quantization == "modelopt_fp4"
+                    self.quantization == "modelopt_fp4" or self.quantization == "fp8"
                     and self.moe_runner_backend == "auto"
                 ):
                     self.moe_runner_backend = "flashinfer_trtllm"
                     logger.info(
-                        "Use flashinfer_trtllm as moe runner backend on sm100 for DeepseekV3ForCausalLM"
+                        "Use flashinfer_trtllm as MoE runner backend on sm100 for DeepseekV3ForCausalLM"
                     )
 
         elif model_arch in ["GptOssForCausalLM"]:
