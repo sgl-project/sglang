@@ -760,21 +760,22 @@ class Req:
 
         return False
 
-    def _check_token_based_finish(self, last_token_id: int) -> bool:
+    def _check_token_based_finish(self, new_accepted_tokens: List[int]) -> bool:
         # Check stop token ids
         matched_eos = False
 
-        if self.sampling_params.stop_token_ids:
-            matched_eos = last_token_id in self.sampling_params.stop_token_ids
-        if self.eos_token_ids:
-            matched_eos |= last_token_id in self.eos_token_ids
-        if self.tokenizer is not None:
-            matched_eos |= last_token_id == self.tokenizer.eos_token_id
-            if self.tokenizer.additional_stop_token_ids:
-                matched_eos |= last_token_id in self.tokenizer.additional_stop_token_ids
-        if matched_eos:
-            self.finished_reason = FINISH_MATCHED_TOKEN(matched=last_token_id)
-            return
+        for token_id in new_accepted_tokens:
+            if self.sampling_params.stop_token_ids:
+                matched_eos = token_id in self.sampling_params.stop_token_ids
+            if self.eos_token_ids:
+                matched_eos |= token_id in self.eos_token_ids
+            if self.tokenizer is not None:
+                matched_eos |= token_id == self.tokenizer.eos_token_id
+                if self.tokenizer.additional_stop_token_ids:
+                    matched_eos |= token_id in self.tokenizer.additional_stop_token_ids
+            if matched_eos:
+                self.finished_reason = FINISH_MATCHED_TOKEN(matched=token_id)
+                return
 
     def _check_str_based_finish(self):
         if (
@@ -799,7 +800,19 @@ class Req:
                         )
                         return
 
-    def check_finished(self, num_accepted: int = 1):
+    def _check_vocab_boundary_finish(self, new_accepted_tokens: List[int] = None):
+        for token_id in new_accepted_tokens:
+            if token_id > self.vocab_size or token_id < 0:
+                if self.sampling_params.stop_token_ids:
+                    self.output_ids[-1] = next(
+                        iter(self.sampling_params.stop_token_ids)
+                    )
+                if self.eos_token_ids:
+                    self.output_ids[-1] = next(iter(self.eos_token_ids))
+                self.finished_reason = FINISH_MATCHED_STR(matched="NaN happened")
+                return
+
+    def check_finished(self, new_accepted_len: int = 1):
         if self.finished():
             return
 
@@ -820,18 +833,12 @@ class Req:
                 self.finished_reason = FINISH_MATCHED_TOKEN(matched=self.output_ids[-1])
                 return
 
-        last_token_id = self.output_ids[-1]
-
+        new_accepted_tokens = self.output_ids[-new_accepted_len:]
         if not self.sampling_params.ignore_eos:
-            if self._check_token_based_finish(last_token_id):
+            if self._check_token_based_finish(new_accepted_tokens):
                 return
 
-        if last_token_id > self.vocab_size or last_token_id < 0:
-            if self.sampling_params.stop_token_ids:
-                self.output_ids[-1] = next(iter(self.sampling_params.stop_token_ids))
-            if self.eos_token_ids:
-                self.output_ids[-1] = next(iter(self.eos_token_ids))
-            self.finished_reason = FINISH_MATCHED_STR(matched="NaN happened")
+        if self._check_vocab_boundary_finish(new_accepted_tokens):
             return
 
         if self._check_str_based_finish():
