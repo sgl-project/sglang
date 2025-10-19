@@ -778,12 +778,6 @@ class Req:
         # Check stop token ids
         matched_eos = False
 
-        self.sampling_params.stop_token_ids = [279, 7227]  # The, API
-        stop_token_ids = self.sampling_params.stop_token_ids
-        stop_token = self.tokenizer.convert_ids_to_tokens(stop_token_ids)
-        print(f"[V2 Spec] {stop_token_ids=}")
-        print(f"[V2 Spec] {stop_token=}")
-
         for i, token_id in enumerate(new_accepted_tokens):
             if self.sampling_params.stop_token_ids:
                 matched_eos |= token_id in self.sampling_params.stop_token_ids
@@ -797,9 +791,6 @@ class Req:
                 self.finished_reason = FINISH_MATCHED_TOKEN(matched=token_id)
                 matched_pos = len(self.output_ids) - len(new_accepted_tokens) + i
                 self.finished_len = matched_pos + 1
-                print(
-                    f"[V2 Spec] Finished token ids: {self.output_ids[:self.finished_len]}"
-                )
                 return True
 
         return False
