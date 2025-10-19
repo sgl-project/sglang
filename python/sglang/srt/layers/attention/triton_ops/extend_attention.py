@@ -767,10 +767,8 @@ def _fwd_kernel_unified(
         # Compute mask
         final_mask = mask_m[:, None] & mask_n[None, :]
 
-        # Apply custom mask if provided (for speculative decoding tree attention)
+        # Apply custom mask if provided
         if USE_CUSTOM_MASK:
-            # Custom mask shape: [num_draft_tokens, total_seq_len]
-            # We index by: q_position_in_extend * total_kv_len + kv_position_in_total
             custom_mask = tl.load(
                 mask_ptr
                 + cur_seq_mask_start_idx
