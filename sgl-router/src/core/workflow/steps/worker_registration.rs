@@ -337,6 +337,18 @@ impl StepExecutor for DiscoverMetadataStep {
 
         info!("Recreated worker {} with merged labels", config.url);
 
+        // Re-register worker with new labels to update the registry
+        let worker_id = app_context
+            .worker_registry
+            .register(Arc::clone(&new_worker));
+
+        info!(
+            "Re-registered worker {} with ID {:?} and {} labels",
+            config.url,
+            worker_id,
+            final_labels.len()
+        );
+
         // Replace worker in context with new one
         context.set("worker", new_worker);
         context.set("labels", final_labels);
