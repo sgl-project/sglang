@@ -34,7 +34,7 @@ from sglang.test.runners import (
     SRTRunner,
     check_close_model_outputs,
 )
-from sglang.test.test_utils import CustomTestCase, is_in_ci
+from sglang.test.test_utils import CustomTestCase, is_in_ci, calculate_rouge_l
 
 
 @dataclasses.dataclass
@@ -190,14 +190,12 @@ class TestGenerationModels(CustomTestCase):
                     prompts, model_case, torch_dtype
                 )
 
-    def test_kvpress_basic(self):
-        """Test KVPress with TinyLlama model."""
+    def test_kvpress_quality(self):
+        """Test KVPress quality by comparing with baseline (no compression)."""
         model_case = KVPRESS_TEST_MODEL
         torch_dtype = torch.float16
-        prompts = [p for p in DEFAULT_PROMPTS if len(p) < 1000]
-        
-        # Just test that KVPress runs without errors
-        # Don't compare with baseline since compression changes outputs
+        prompts = [p for p in DEFAULT_PROMPTS if len(p) < 256]        
+        # Baseline: no compression
         with SRTRunner(
             model_case.model_path,
             tp_size=model_case.tp_size,
@@ -205,16 +203,40 @@ class TestGenerationModels(CustomTestCase):
             model_type="generation",
             trust_remote_code=model_case.trust_remote_code,
             disable_radix_cache=True,
+            disable_cuda_graph=True,
+            attention_backend="triton",  # Triton Backend Limited
+            enable_kvpress=False,  # No compression
+        ) as baseline_runner:
+            baseline_outputs = baseline_runner.forward(prompts, max_new_tokens=10)
+            baseline_texts = baseline_outputs.output_strs
+        
+        # Compressed: 30% compression
+        with SRTRunner(
+            model_case.model_path,
+            tp_size=model_case.tp_size,
+            torch_dtype=torch_dtype,
+            model_type="generation",
+            trust_remote_code=model_case.trust_remote_code,
+            disable_radix_cache=True,
+            disable_cuda_graph=True,
+            attention_backend="triton",  # Triton Backend Limited
             enable_kvpress=True,
             kvpress_compression_ratio=0.3,
-        ) as srt_runner:
-            srt_outputs = srt_runner.forward(prompts, max_new_tokens=32)
-            
-            # Basic sanity checks
-            self.assertEqual(len(srt_outputs), len(prompts))
-            for output in srt_outputs:
-                self.assertIn("text", output)
-                self.assertGreater(len(output["text"]), 0)
+        ) as compressed_runner:
+            compressed_outputs = compressed_runner.forward(prompts, max_new_tokens=10)
+            compressed_texts = compressed_outputs.output_strs
+        
+        # Calculate ROUGE-L scores
+        rouge_scores = calculate_rouge_l(baseline_texts, compressed_texts)
+        avg_rouge = sum(rouge_scores) / len(rouge_scores)
+        
+        print(f"Baseline: {baseline_texts[0]}")
+        print(f"Compressed: {compressed_texts[0]}")
+        print(f"ROUGE-L: {avg_rouge:.3f}")
+        
+        # Quality assertions
+        self.assertGreater(avg_rouge, 0.2, f"KVPress quality too low: {avg_rouge:.3f}")
+        self.assertEqual(len(baseline_texts), len(compressed_texts))
 
 
 if __name__ == "__main__":

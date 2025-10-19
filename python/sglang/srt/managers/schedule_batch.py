@@ -528,6 +528,8 @@ class Req:
         # This is used to correctly free memory when the request finishes
         # Format: prefix_len + compressed_len + decode_len
         self.actual_kv_len: Optional[int] = None
+        # KVPress: Store original prefill length for correct position calculation
+        self.original_prefill_len: Optional[int] = None
 
         # Check finish
         self.tokenizer = None
@@ -1645,6 +1647,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.seq_lens_cpu.add_(1)
             self.orig_seq_lens.add_(1)
         self.seq_lens_sum += bs
+        
+        # KVPress: Calculate actual KV cache lengths for compressed requests
+        # actual_kv_lens is used by attention backend to read the correct KV range
+        # seq_lens remains as logical length for position_ids calculation
+        has_compressed = any(req.actual_kv_len is not None for req in self.reqs)
+        if has_compressed:
+            actual_kv_lens_list = []
+            for req in self.reqs:
+                if req.actual_kv_len is not None:
+                    # Compressed request: use physical length
+                    actual_kv_lens_list.append(req.actual_kv_len + len(req.output_ids))
+                else:
+                    # Normal request: physical == logical
+                    actual_kv_lens_list.append(len(req.origin_input_ids) + len(req.output_ids))
+            self.actual_kv_lens = torch.tensor(actual_kv_lens_list, dtype=torch.int32, device=self.device)
+        else:
+            self.actual_kv_lens = None
 
     def maybe_wait_verify_done(self):
         if self.is_v2_eagle:

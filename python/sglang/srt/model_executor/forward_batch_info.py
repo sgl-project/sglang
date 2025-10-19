@@ -182,6 +182,10 @@ class ForwardBatch:
 
     # Optional seq_lens on cpu
     seq_lens_cpu: Optional[torch.Tensor] = None
+    
+    # KVPress: Actual KV cache lengths (may differ from seq_lens after compression)
+    # seq_lens is logical length for position_ids, actual_kv_lens is physical length for attention
+    actual_kv_lens: Optional[torch.Tensor] = None
 
     # For logprob
     return_logprob: bool = False
@@ -329,6 +333,7 @@ class ForwardBatch:
             seq_lens_sum=batch.seq_lens_sum,
             seq_lens_cpu=batch.seq_lens_cpu,
             orig_seq_lens=batch.orig_seq_lens,
+            actual_kv_lens=getattr(batch, 'actual_kv_lens', None),
             return_logprob=batch.return_logprob,
             top_logprobs_nums=batch.top_logprobs_nums,
             token_ids_logprobs=batch.token_ids_logprobs,

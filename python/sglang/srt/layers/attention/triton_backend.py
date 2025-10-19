@@ -229,15 +229,20 @@ class TritonAttnBackend(AttentionBackend):
 
         if forward_batch.forward_mode.is_decode_or_idle():
             if spec_info is None:
-                kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
+                # KVPress: Use actual_kv_lens for reading KV cache (physical length)
+                # while seq_lens remains as logical length for position_ids
+                kv_lens = forward_batch.actual_kv_lens if forward_batch.actual_kv_lens is not None else forward_batch.seq_lens
+                kv_lens_sum = kv_lens.sum().item() if forward_batch.actual_kv_lens is not None else forward_batch.seq_lens_sum
+                
+                kv_indptr[1 : bs + 1] = torch.cumsum(kv_lens, dim=0)
                 kv_indptr = kv_indptr[: bs + 1]
                 kv_indices = torch.empty(
-                    forward_batch.seq_lens_sum, dtype=torch.int64, device=self.device
+                    kv_lens_sum, dtype=torch.int64, device=self.device
                 )
                 create_flashinfer_kv_indices_triton[(bs,)](
                     self.req_to_token,
                     forward_batch.req_pool_indices,
-                    forward_batch.seq_lens,
+                    kv_lens,
                     kv_indptr,
                     None,
                     kv_indices,
@@ -253,7 +258,7 @@ class TritonAttnBackend(AttentionBackend):
                             self.window_kv_indptr,
                             self.req_to_token,
                             self.sliding_window_size,
-                            forward_batch.seq_lens,
+                            kv_lens,
                             forward_batch.req_pool_indices,
                             bs,
                             self.device,
@@ -279,7 +284,9 @@ class TritonAttnBackend(AttentionBackend):
                 device=self.device,
             )
             num_kv_splits = torch.empty((bs,), dtype=torch.int32, device=self.device)
-            self.get_num_kv_splits(num_kv_splits, forward_batch.seq_lens)
+            # KVPress: Use actual_kv_lens for num_kv_splits calculation
+            kv_lens_for_split = forward_batch.actual_kv_lens if forward_batch.actual_kv_lens is not None else forward_batch.seq_lens
+            self.get_num_kv_splits(num_kv_splits, kv_lens_for_split)
 
             qo_indptr = None
             custom_mask = None

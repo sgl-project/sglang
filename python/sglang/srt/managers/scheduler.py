@@ -1206,8 +1206,9 @@ class Scheduler(
         new_mapping[:n_kept] = kv_indices[:n_kept]
         self.req_to_token_pool.req_to_token[req.req_pool_idx, :seq_len] = new_mapping
         
-        # 6. Update Req metadata for correct memory release
-        req.actual_kv_len = n_kept
+        # 6. Update Req metadata
+        req.actual_kv_len = n_kept  # Physical length (for memory release)
+        req.original_prefill_len = seq_len  # Logical length (for position calculation)
         
         if self.tp_rank == 0:
             logger.info(
