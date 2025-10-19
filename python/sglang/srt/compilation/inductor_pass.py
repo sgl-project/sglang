@@ -1,5 +1,6 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.10.0/vllm/compilation/inductor_pass.py
 
+import functools
 import hashlib
 import inspect
 import json
@@ -13,6 +14,7 @@ import torch
 from torch import fx
 from torch._dynamo.utils import lazy_format_graph_code
 from torch._inductor.custom_graph_pass import CustomGraphPass
+from torch._subclasses.fake_tensor import FakeTensorMode, unset_fake_temporarily
 
 logger = logging.getLogger(__name__)
 
@@ -138,3 +140,19 @@ class PrinterInductorPass(SGLangInductorPass):
 
     def __call__(self, graph: torch.fx.Graph):
         self.dump_graph(graph, self.name)
+
+
+def enable_fake_mode(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """
+    Applies a FakeTensorMode context. This is useful when you don't want to
+    create or run things with real tensors.
+    """
+
+    @functools.wraps(fn)
+    def fn_new(*args, **kwargs) -> Any:
+        with torch._guards.tracing(None), unset_fake_temporarily(), FakeTensorMode():
+            result = fn(*args, **kwargs)
+
+        return result
+
+    return fn_new
