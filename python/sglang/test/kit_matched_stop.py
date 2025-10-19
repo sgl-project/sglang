@@ -38,15 +38,16 @@ class MatchedStopMixin:
             self.base_url + "/v1/completions",
             json=payload,
         )
-        print(json.dumps(response_completions.json()))
+        res = response_completions.json()
+        print(json.dumps(res))
         print("=" * 100)
 
         assert (
-            response_completions.json()["choices"][0]["finish_reason"] == finish_reason
-        ), f"Expected finish_reason: {finish_reason}, but got: {response_completions.json()['choices'][0]['finish_reason']}"
+            res["choices"][0]["finish_reason"] == finish_reason
+        ), f"Expected finish_reason: {finish_reason}, but got: {res['choices'][0]['finish_reason']}"
         assert (
-            response_completions.json()["choices"][0]["matched_stop"] == matched_stop
-        ), f"Expected matched_stop: {matched_stop}, but got: {response_completions.json()['choices'][0]['matched_stop']}"
+            res["choices"][0]["matched_stop"] == matched_stop
+        ), f"Expected matched_stop: {matched_stop}, but got: {res['choices'][0]['matched_stop']}"
 
     def _run_chat_completions_generation(
         self,
@@ -78,15 +79,16 @@ class MatchedStopMixin:
             self.base_url + "/v1/chat/completions",
             json=chat_payload,
         )
-        print(json.dumps(response_chat.json()))
+        res = response_chat.json()
+        print(json.dumps(res))
         print("=" * 100)
 
         assert (
-            response_chat.json()["choices"][0]["finish_reason"] == finish_reason
-        ), f"Expected finish_reason: {finish_reason}, but got: {response_chat.json()['choices'][0]['finish_reason']}"
+            res["choices"][0]["finish_reason"] == finish_reason
+        ), f"Expected finish_reason: {finish_reason}, but got: {res['choices'][0]['finish_reason']}"
         assert (
-            response_chat.json()["choices"][0]["matched_stop"] == matched_stop
-        ), f"Expected matched_stop: {matched_stop}, but got: {response_chat.json()['choices'][0]['matched_stop']}"
+            res["choices"][0]["matched_stop"] == matched_stop
+        ), f"Expected matched_stop: {matched_stop}, but got: {res['choices'][0]['matched_stop']}"
 
     def test_finish_stop_str(self):
         self._run_completions_generation(
