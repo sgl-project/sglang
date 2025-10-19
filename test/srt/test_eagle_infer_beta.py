@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval
+from sglang.test.kit_matched_stop import MatchedStopMixin
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -11,7 +12,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestEagleServerBase(CustomTestCase):
+class TestEagleServerBase(CustomTestCase, MatchedStopMixin):
     max_running_requests = 64
     attention_backend = "triton"
     spec_steps = 5
