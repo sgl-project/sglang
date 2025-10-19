@@ -79,7 +79,7 @@ CUTEDSL_MOE_SCALAR_INPUT_SCALE = get_bool_env_var(
     "SGLANG_CUTEDSL_MOE_SCALAR_INPUT_SCALE", "true"
 )
 USE_CUTLASS_BACKEND_FOR_FP4_GEMM = get_bool_env_var(
-    "SGLANG_USE_CUTLASS_BACKEND_FOR_FP4_GEMM"
+    "SGLANG_USE_CUTLASS_BACKEND_FOR_FP4_GEMM", "true"
 )
 # TODO make it true by default when the DeepEP PR is merged
 CUTEDSL_MOE_NVFP4_DISPATCH = get_bool_env_var(
