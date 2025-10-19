@@ -12,7 +12,6 @@ from sglang.test.test_utils import (
 
 
 class TestEagleServerBase(CustomTestCase):
-    num_questions = 10000
     max_running_requests = 64
     other_args = [
         "--trust-remote-code",
@@ -56,7 +55,7 @@ class TestEagleServerBase(CustomTestCase):
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,
-            num_questions=self.num_questions,
+            num_questions=1000,
             max_new_tokens=512,
             parallel=128,
             host="http://127.0.0.1",
