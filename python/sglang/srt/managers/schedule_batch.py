@@ -760,7 +760,46 @@ class Req:
 
         return False
 
-    def check_finished(self):
+    def _check_token_based_finish(self, last_token_id: int) -> bool:
+        # Check stop token ids
+        matched_eos = False
+
+        if self.sampling_params.stop_token_ids:
+            matched_eos = last_token_id in self.sampling_params.stop_token_ids
+        if self.eos_token_ids:
+            matched_eos |= last_token_id in self.eos_token_ids
+        if self.tokenizer is not None:
+            matched_eos |= last_token_id == self.tokenizer.eos_token_id
+            if self.tokenizer.additional_stop_token_ids:
+                matched_eos |= last_token_id in self.tokenizer.additional_stop_token_ids
+        if matched_eos:
+            self.finished_reason = FINISH_MATCHED_TOKEN(matched=last_token_id)
+            return
+
+    def _check_str_based_finish(self):
+        if (
+            len(self.sampling_params.stop_strs) > 0
+            or len(self.sampling_params.stop_regex_strs) > 0
+        ):
+            tail_str = self.tail_str()
+
+            # Check stop strings
+            if len(self.sampling_params.stop_strs) > 0:
+                for stop_str in self.sampling_params.stop_strs:
+                    if stop_str in tail_str or stop_str in self.decoded_text:
+                        self.finished_reason = FINISH_MATCHED_STR(matched=stop_str)
+                        return
+
+            # Check stop regex
+            if len(self.sampling_params.stop_regex_strs) > 0:
+                for stop_regex_str in self.sampling_params.stop_regex_strs:
+                    if re.search(stop_regex_str, tail_str):
+                        self.finished_reason = FINISHED_MATCHED_REGEX(
+                            matched=stop_regex_str
+                        )
+                        return
+
+    def check_finished(self, num_accepted: int = 1):
         if self.finished():
             return
 
@@ -784,21 +823,7 @@ class Req:
         last_token_id = self.output_ids[-1]
 
         if not self.sampling_params.ignore_eos:
-            matched_eos = False
-
-            # Check stop token ids
-            if self.sampling_params.stop_token_ids:
-                matched_eos = last_token_id in self.sampling_params.stop_token_ids
-            if self.eos_token_ids:
-                matched_eos |= last_token_id in self.eos_token_ids
-            if self.tokenizer is not None:
-                matched_eos |= last_token_id == self.tokenizer.eos_token_id
-                if self.tokenizer.additional_stop_token_ids:
-                    matched_eos |= (
-                        last_token_id in self.tokenizer.additional_stop_token_ids
-                    )
-            if matched_eos:
-                self.finished_reason = FINISH_MATCHED_TOKEN(matched=last_token_id)
+            if self._check_token_based_finish(last_token_id):
                 return
 
         if last_token_id > self.vocab_size or last_token_id < 0:
@@ -809,27 +834,8 @@ class Req:
             self.finished_reason = FINISH_MATCHED_STR(matched="NaN happened")
             return
 
-        if (
-            len(self.sampling_params.stop_strs) > 0
-            or len(self.sampling_params.stop_regex_strs) > 0
-        ):
-            tail_str = self.tail_str()
-
-            # Check stop strings
-            if len(self.sampling_params.stop_strs) > 0:
-                for stop_str in self.sampling_params.stop_strs:
-                    if stop_str in tail_str or stop_str in self.decoded_text:
-                        self.finished_reason = FINISH_MATCHED_STR(matched=stop_str)
-                        return
-
-            # Check stop regex
-            if len(self.sampling_params.stop_regex_strs) > 0:
-                for stop_regex_str in self.sampling_params.stop_regex_strs:
-                    if re.search(stop_regex_str, tail_str):
-                        self.finished_reason = FINISHED_MATCHED_REGEX(
-                            matched=stop_regex_str
-                        )
-                        return
+        if self._check_str_based_finish():
+            return
 
     def reset_for_retract(self):
         self.prefix_indices = torch.empty((0,), dtype=torch.int64)

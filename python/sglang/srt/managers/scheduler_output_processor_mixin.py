@@ -286,13 +286,16 @@ class SchedulerOutputProcessorMixin:
                     self.token_to_kv_pool_allocator.free(indices_to_free)
                 continue
 
+            num_accepted = 1
             if batch.spec_algorithm.is_none():
                 req.output_ids.append(next_token_id)
             elif batch.is_v2_eagle:
                 # Only v2 eagle's output_ids are updated here.
                 req.output_ids.extend(next_token_id)
+                num_accepted = len(next_token_id)
 
-            req.check_finished()
+            req.check_finished(num_accepted)
+
             if req.finished():
                 if batch.is_v2_eagle and self.cur_batch.forward_mode.is_extend():
                     # FIXME(lsyin): fix the messy logic here
