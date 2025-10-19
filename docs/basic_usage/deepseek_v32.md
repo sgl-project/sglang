@@ -65,10 +65,10 @@ SGLang implements Multi-Token Prediction (MTP) for DeepSeek V3.2 based on [EAGLE
 
 Example usage:
 ```bash
-python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8 --speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --cuda-graph-max-bs 32 --max-running-requests 32
+python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8 --dp 8 --enable-dp-attention --speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4
 ```
 - The best configuration for `--speculative-num-steps`, `--speculative-eagle-topk` and `--speculative-num-draft-tokens` can be searched with [bench_speculative.py](https://github.com/sgl-project/sglang/blob/main/scripts/playground/bench_speculative.py) script for given batch size. The minimum configuration is `--speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2`, which can achieve speedup for larger batch sizes.
-- To enable MTP for large batch sizes (>32), the `--cuda-graph-max-bs` and `--max-running-requests` arguments should be changed to a larger value that matches the batch sizes.
+- TODO: max-running-request set to 48
 
 
 
