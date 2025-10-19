@@ -141,12 +141,16 @@ def send_one_prompt(args):
     )
 
     if args.stream:
+        last_len = 0
         for chunk in response.iter_lines(decode_unicode=False):
             chunk = chunk.decode("utf-8")
             if chunk and chunk.startswith("data:"):
                 if chunk == "data: [DONE]":
                     break
                 ret = json.loads(chunk[5:].strip("\n"))
+                chunk_str = ret["text"][last_len:]
+                last_len = len(ret["text"])
+                print(chunk_str, end="", flush=True)
     else:
         ret = response.json()
 
