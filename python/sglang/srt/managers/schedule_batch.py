@@ -782,7 +782,7 @@ class Req:
 
         for i, token_id in enumerate(new_accepted_tokens):
             if self.sampling_params.stop_token_ids:
-                matched_eos = token_id in self.sampling_params.stop_token_ids
+                matched_eos |= token_id in self.sampling_params.stop_token_ids
             if self.eos_token_ids:
                 matched_eos |= token_id in self.eos_token_ids
             if self.tokenizer is not None:
