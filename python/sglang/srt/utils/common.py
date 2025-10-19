@@ -2354,6 +2354,8 @@ def retry(
         try:
             return fn()
         except Exception as e:
+            traceback.print_exc()
+
             if try_index >= max_retry:
                 raise Exception(f"retry() exceed maximum number of retries.")
 
@@ -2367,7 +2369,6 @@ def retry(
             logger.warning(
                 f"retry() failed once ({try_index}th try, maximum {max_retry} retries). Will delay {delay:.2f}s and retry. Error: {e}"
             )
-            traceback.print_exc()
 
             time.sleep(delay)
 
