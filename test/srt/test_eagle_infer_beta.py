@@ -13,38 +13,48 @@ from sglang.test.test_utils import (
 
 class TestEagleServerBase(CustomTestCase):
     max_running_requests = 64
-    other_args = [
-        "--trust-remote-code",
-        "--attention-backend",
-        "triton",
-        "--enable-beta-spec",
-        "--speculative-algorithm",
-        "EAGLE",
-        "--speculative-draft-model",
-        "lmzheng/sglang-EAGLE-llama2-chat-7B",
-        "--speculative-num-steps",
-        "5",
-        "--speculative-eagle-topk",
-        "1",
-        "--speculative-num-draft-tokens",
-        "6",
-        "--mem-fraction-static",
-        "0.75",
-        "--max-running-requests",
-        str(max_running_requests),
-        "--cuda-graph-bs",
-        *[str(i) for i in range(1, max_running_requests + 1)],
-    ]
+    attention_backend = "triton"
+    spec_steps = 5
+    spec_topk = 1
+    spec_draft_tokens = 6
+    page_size = 1
+    other_launch_args = []
 
     @classmethod
     def setUpClass(cls):
         cls.model = "meta-llama/Llama-2-7b-chat-hf"
+        cls.draft_model = "lmzheng/sglang-EAGLE-llama2-chat-7B"
         cls.base_url = DEFAULT_URL_FOR_TEST
+        launch_args = [
+            "--enable-beta-spec",
+            "--trust-remote-code",
+            "--attention-backend",
+            cls.attention_backend,
+            "--speculative-algorithm",
+            "EAGLE",
+            "--speculative-draft-model",
+            cls.draft_model,
+            "--speculative-num-steps",
+            cls.spec_steps,
+            "--speculative-eagle-topk",
+            cls.spec_topk,
+            "--speculative-num-draft-tokens",
+            cls.spec_draft_tokens,
+            "--page-size",
+            str(cls.page_size),
+            "--mem-fraction-static",
+            "0.75",
+            "--max-running-requests",
+            str(cls.max_running_requests),
+            "--cuda-graph-bs",
+            *[str(i) for i in range(1, cls.max_running_requests + 1)],
+        ]
+        launch_args.extend(cls.other_launch_args)
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=cls.other_args,
+            other_args=launch_args,
         )
 
     @classmethod
