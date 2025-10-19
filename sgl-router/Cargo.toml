@@ -38,6 +38,7 @@ futures-util = "0.3"
 futures = "0.3"
 pyo3 = { version = "0.25.1", features = ["extension-module"] }
 dashmap = "6.1.0"
+blake3 = "1.5"
 http = "1.1.0"
 tokio = { version = "1.42.0", features = ["full"] }
 async-trait = "0.1"
@@ -53,6 +54,7 @@ metrics-exporter-prometheus = "0.17.0"
 uuid = { version = "1.10", features = ["v4", "serde"] }
 ulid = "1.2.1"
 parking_lot = "0.12.4"
+rayon = "1.10"
 thiserror = "2.0.12"
 regex = "1.10"
 url = "2.5.4"
