@@ -35,11 +35,11 @@ _is_hip = is_hip()
 def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
     """
     Get block sizes and configuration for extend attention kernels.
-    
+
     Args:
         Lq: Query head dimension
         Lv: Value head dimension
-    
+
     Returns:
         tuple: (BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV, BLOCK_M, BLOCK_N, num_warps)
     """
@@ -56,7 +56,7 @@ def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
     else:
         BLOCK_DMODEL = triton.next_power_of_2(Lq)
         BLOCK_DPE = 0
-    
+
     BLOCK_DV = triton.next_power_of_2(Lv)
 
     # Determine BLOCK_M, BLOCK_N, and num_warps based on hardware
