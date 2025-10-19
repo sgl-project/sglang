@@ -1630,6 +1630,9 @@ class CustomTestCase(unittest.TestCase):
             max_retry=max_retry,
         )
 
+    def setUp(self):
+        print(f"[Test Method] {self._testMethodName}", flush=True)
+
 
 def dump_bench_raw_result(
     path: str,
