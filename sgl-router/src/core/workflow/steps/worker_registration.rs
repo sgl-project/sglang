@@ -142,7 +142,7 @@ impl StepExecutor for CreateWorkerStep {
 
         // Store worker and config labels in context
         context.set("worker", worker);
-        context.set("config_labels", Arc::new(labels));
+        context.set("config_labels", labels);
 
         Ok(StepResult::Success)
     }
@@ -339,7 +339,7 @@ impl StepExecutor for DiscoverMetadataStep {
 
         // Replace worker in context with new one
         context.set("worker", new_worker);
-        context.set("labels", Arc::new(final_labels));
+        context.set("labels", final_labels);
 
         Ok(StepResult::Success)
     }
@@ -374,7 +374,7 @@ impl StepExecutor for RegisterWorkerStep {
         info!("Registered worker {} with ID {:?}", config.url, worker_id);
 
         // Store worker_id in context
-        context.set("worker_id", Arc::new(worker_id));
+        context.set("worker_id", worker_id);
 
         Ok(StepResult::Success)
     }
