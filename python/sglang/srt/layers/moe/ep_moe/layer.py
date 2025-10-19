@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 import torch
 
 from sglang.srt import single_batch_overlap
+from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe import (
     get_deepep_mode,
     get_moe_a2a_backend,
@@ -19,7 +20,6 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     tma_align_input_scale,
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import FlashInferFusedMoE, FusedMoE
-from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_kernel import (
@@ -170,6 +170,7 @@ class DeepEPMoE(FusedMoE):
         forward_batch: ForwardBatch,
         forward_shared_experts=None,
         alt_stream=None,
+        disable_sbo=False,
     ):
         # We have to call SBO inside MoE to be compatible with hooks used in offloading
         return single_batch_overlap.execute_sbo(
@@ -181,6 +182,7 @@ class DeepEPMoE(FusedMoE):
             experts=self,
             forward_shared_experts=forward_shared_experts,
             alt_stream=alt_stream,
+            disable_sbo=disable_sbo,
         )
 
     def dispatch(

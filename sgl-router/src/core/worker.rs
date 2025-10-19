@@ -10,10 +10,7 @@ use std::{
 use async_trait::async_trait;
 use futures;
 use serde_json;
-use tokio::{
-    sync::{Mutex, RwLock},
-    time,
-};
+use tokio::{sync::RwLock, time};
 
 use super::{CircuitBreaker, WorkerError, WorkerResult};
 use crate::{
@@ -232,7 +229,7 @@ pub trait Worker: Send + Sync + fmt::Debug {
 
     /// Get or create a gRPC client for this worker
     /// Returns None for HTTP workers, Some(client) for gRPC workers
-    async fn get_grpc_client(&self) -> WorkerResult<Option<Arc<Mutex<SglangSchedulerClient>>>>;
+    async fn get_grpc_client(&self) -> WorkerResult<Option<Arc<SglangSchedulerClient>>>;
 
     /// Reset the gRPC client connection (for reconnection scenarios)
     /// No-op for HTTP workers
@@ -367,7 +364,7 @@ pub struct BasicWorker {
     pub consecutive_successes: Arc<AtomicUsize>,
     pub circuit_breaker: CircuitBreaker,
     /// Lazily initialized gRPC client for gRPC workers
-    pub grpc_client: Arc<RwLock<Option<Arc<Mutex<SglangSchedulerClient>>>>>,
+    pub grpc_client: Arc<RwLock<Option<Arc<SglangSchedulerClient>>>>,
 }
 
 impl fmt::Debug for BasicWorker {
@@ -505,7 +502,7 @@ impl Worker for BasicWorker {
         &self.circuit_breaker
     }
 
-    async fn get_grpc_client(&self) -> WorkerResult<Option<Arc<Mutex<SglangSchedulerClient>>>> {
+    async fn get_grpc_client(&self) -> WorkerResult<Option<Arc<SglangSchedulerClient>>> {
         match self.metadata.connection_mode {
             ConnectionMode::Http => Ok(None),
             ConnectionMode::Grpc { .. } => {
@@ -528,7 +525,7 @@ impl Worker for BasicWorker {
                 );
                 match SglangSchedulerClient::connect(&self.metadata.url).await {
                     Ok(client) => {
-                        let client_arc = Arc::new(Mutex::new(client));
+                        let client_arc = Arc::new(client);
                         *client_guard = Some(client_arc.clone());
                         tracing::info!(
                             "Successfully connected gRPC client for worker: {}",
@@ -577,8 +574,7 @@ impl Worker for BasicWorker {
             return Ok(false);
         };
 
-        let client = grpc_client.lock().await;
-        match time::timeout(timeout, client.health_check()).await {
+        match time::timeout(timeout, grpc_client.health_check()).await {
             Ok(Ok(resp)) => {
                 tracing::debug!(
                     "gRPC health OK for {}: healthy={}",
@@ -749,7 +745,7 @@ impl Worker for DPAwareWorker {
         format!("{}{}", self.base_url, route)
     }
 
-    async fn get_grpc_client(&self) -> WorkerResult<Option<Arc<Mutex<SglangSchedulerClient>>>> {
+    async fn get_grpc_client(&self) -> WorkerResult<Option<Arc<SglangSchedulerClient>>> {
         self.base_worker.get_grpc_client().await
     }
 
