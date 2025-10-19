@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Sequence
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -69,15 +69,7 @@ class TritonKernelsQuantInfo(MoeQuantInfo):
     w2_bias: Optional[torch.Tensor] = None
     w13_precision_config: Optional[PrecisionConfig] = None
     w2_precision_config: Optional[PrecisionConfig] = None
-    w13_scale: Optional[torch.Tensor] = None
-    w2_scale: Optional[torch.Tensor] = None
-    a1_scale: Optional[torch.Tensor] = None
-    a2_scale: Optional[torch.Tensor] = None
-    block_shape: Optional[Sequence[int]] = None
-    use_fp8_w8a8: bool = False
-    per_channel_quant: bool = False
     global_num_experts: int = -1
-    expert_map: Optional[torch.Tensor] = None
 
 
 # ---------------------------------------------------------------------------
@@ -108,15 +100,7 @@ class TritonKernelsRunnerCore(MoeRunnerCore):
             inplace=False,
             activation=self.config.activation,
             apply_router_weight_on_input=self.config.apply_router_weight_on_input,
-            use_fp8_w8a8=quant_info.use_fp8_w8a8,
-            per_channel_quant=quant_info.per_channel_quant,
             global_num_experts=quant_info.global_num_experts,
-            expert_map=quant_info.expert_map,
-            w1_scale=quant_info.w13_scale,
-            w2_scale=quant_info.w2_scale,
-            a1_scale=quant_info.a1_scale,
-            a2_scale=quant_info.a2_scale,
-            block_shape=quant_info.block_shape,
         )
 
         has_bias = quant_info.w13_bias is not None or quant_info.w2_bias is not None
@@ -209,15 +193,7 @@ def fused_experts_none_to_triton_kernels(
             b2=quant_info.w2_bias,
             topk_output=topk_output,
             moe_runner_config=runner_config,
-            use_fp8_w8a8=quant_info.use_fp8_w8a8,
-            per_channel_quant=quant_info.per_channel_quant,
             global_num_experts=quant_info.global_num_experts,
-            expert_map=quant_info.expert_map,
-            w1_scale=quant_info.w13_scale,
-            w2_scale=quant_info.w2_scale,
-            a1_scale=quant_info.a1_scale,
-            a2_scale=quant_info.a2_scale,
-            block_shape=quant_info.block_shape,
         )
     else:
         output = triton_kernel_moe_forward(
@@ -227,15 +203,7 @@ def fused_experts_none_to_triton_kernels(
             topk_output=topk_output,
             moe_runner_config=runner_config,
             apply_router_weight_on_input=runner_config.apply_router_weight_on_input,
-            use_fp8_w8a8=quant_info.use_fp8_w8a8,
-            per_channel_quant=quant_info.per_channel_quant,
             global_num_experts=quant_info.global_num_experts,
-            expert_map=quant_info.expert_map,
-            w1_scale=quant_info.w13_scale,
-            w2_scale=quant_info.w2_scale,
-            a1_scale=quant_info.a1_scale,
-            a2_scale=quant_info.a2_scale,
-            block_shape=quant_info.block_shape,
         )
 
     if runner_config.no_combine:
