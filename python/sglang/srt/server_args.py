@@ -1271,9 +1271,18 @@ class ServerArgs:
                 and self.page_size > 1
                 and self.attention_backend != "flashinfer"
             ):
-                raise ValueError(
-                    "speculative_eagle_topk > 1 with page_size > 1 is unstable and produces incorrect results for paged attention backends. This combination is only supported for the 'flashinfer' backend."
-                )
+                if (
+                    self.speculative_algorithm == "EAGLE"
+                    and self.enable_beta_spec
+                    and self.attention_backend == "triton"
+                ):
+                    logger.warning(
+                        "WARNING: Running EAGLE beta spec overlap with topk > 1 and page_size > 1 on triton backend. This combination is experimental and NOT officially supported. May produce incorrect results or crash."
+                    )
+                else:
+                    raise ValueError(
+                        "speculative_eagle_topk > 1 with page_size > 1 is unstable and produces incorrect results for paged attention backends. This combination is only supported for the 'flashinfer' backend."
+                    )
 
         if self.speculative_algorithm == "NGRAM":
             if not self.device.startswith("cuda"):
