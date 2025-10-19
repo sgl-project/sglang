@@ -38,10 +38,6 @@ class TestDeepseekV32MTP(CustomTestCase):
             "1",
             "--speculative-num-draft-tokens",
             "4",
-            "--cuda-graph-max-bs",
-            "32",
-            "--max-running-requests",
-            "32",
             "--mem-frac",
             "0.7",
         ]
