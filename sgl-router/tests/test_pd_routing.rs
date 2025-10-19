@@ -1,13 +1,14 @@
 #[cfg(test)]
 mod test_pd_routing {
     use serde_json::json;
-    use sglang_router_rs::config::{
-        CircuitBreakerConfig, ConnectionMode, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
+    use sglang_router_rs::{
+        config::{
+            CircuitBreakerConfig, ConnectionMode, PolicyConfig, RetryConfig, RouterConfig,
+            RoutingMode,
+        },
+        core::{BasicWorkerBuilder, Worker, WorkerType},
+        routers::{http::pd_types::PDSelectionPolicy, RouterFactory},
     };
-    use sglang_router_rs::core::{BasicWorkerBuilder, Worker, WorkerType};
-    use sglang_router_rs::routers::http::pd_types::get_hostname;
-    use sglang_router_rs::routers::http::pd_types::PDSelectionPolicy;
-    use sglang_router_rs::routers::RouterFactory;
 
     #[derive(Debug)]
     struct PDRequest {
@@ -165,6 +166,7 @@ mod test_pd_routing {
 
         for (mode, policy) in test_cases {
             let config = RouterConfig {
+                chat_template: None,
                 mode,
                 policy,
                 host: "127.0.0.1".to_string(),
@@ -196,12 +198,65 @@ mod test_pd_routing {
                 tokenizer_path: None,
                 history_backend: sglang_router_rs::config::HistoryBackend::Memory,
                 oracle: None,
+                reasoning_parser: None,
+                tool_call_parser: None,
+                tokenizer_cache: sglang_router_rs::config::TokenizerCacheConfig::default(),
             };
 
-            let app_context =
-                sglang_router_rs::server::AppContext::new(config, reqwest::Client::new(), 64, None)
-                    .expect("Failed to create AppContext");
-            let app_context = std::sync::Arc::new(app_context);
+            let app_context = {
+                use std::sync::{Arc, OnceLock};
+
+                use sglang_router_rs::{
+                    core::{LoadMonitor, WorkerRegistry},
+                    data_connector::{
+                        MemoryConversationItemStorage, MemoryConversationStorage,
+                        MemoryResponseStorage,
+                    },
+                    middleware::TokenBucket,
+                    policies::PolicyRegistry,
+                };
+
+                let client = reqwest::Client::new();
+
+                // Initialize rate limiter
+                let rate_limiter = Some(Arc::new(TokenBucket::new(64, 64)));
+
+                // Initialize registries
+                let worker_registry = Arc::new(WorkerRegistry::new());
+                let policy_registry = Arc::new(PolicyRegistry::new(config.policy.clone()));
+
+                // Initialize storage backends
+                let response_storage = Arc::new(MemoryResponseStorage::new());
+                let conversation_storage = Arc::new(MemoryConversationStorage::new());
+                let conversation_item_storage = Arc::new(MemoryConversationItemStorage::new());
+
+                // Initialize load monitor
+                let load_monitor = Some(Arc::new(LoadMonitor::new(
+                    worker_registry.clone(),
+                    policy_registry.clone(),
+                    client.clone(),
+                    config.worker_startup_check_interval_secs,
+                )));
+
+                // Create empty OnceLock for worker job queue
+                let worker_job_queue = Arc::new(OnceLock::new());
+
+                Arc::new(sglang_router_rs::server::AppContext::new(
+                    config,
+                    client,
+                    rate_limiter,
+                    None, // tokenizer
+                    None, // reasoning_parser_factory
+                    None, // tool_parser_factory
+                    worker_registry,
+                    policy_registry,
+                    response_storage,
+                    conversation_storage,
+                    conversation_item_storage,
+                    load_monitor,
+                    worker_job_queue,
+                ))
+            };
             let result = RouterFactory::create_router(&app_context).await;
             assert!(
                 result.is_ok(),
@@ -286,7 +341,7 @@ mod test_pd_routing {
             _ => None,
         };
 
-        single_json["bootstrap_host"] = json!(get_hostname(prefill_worker.url()));
+        single_json["bootstrap_host"] = json!(prefill_worker.bootstrap_host());
         single_json["bootstrap_port"] = json!(bootstrap_port);
         single_json["bootstrap_room"] = json!(12345u64); // Random room ID
 
@@ -301,7 +356,7 @@ mod test_pd_routing {
         });
 
         let batch_size = 3;
-        let hostname = get_hostname(prefill_worker.url());
+        let hostname = prefill_worker.bootstrap_host();
         batch_json["bootstrap_host"] = json!(vec![hostname; batch_size]);
         batch_json["bootstrap_port"] = json!(vec![bootstrap_port; batch_size]);
         batch_json["bootstrap_room"] = json!(vec![111u64, 222u64, 333u64]);
@@ -344,22 +399,6 @@ mod test_pd_routing {
     }
 
     #[test]
-    fn test_hostname_extraction() {
-        let test_cases = vec![
-            ("http://localhost:8080", "localhost"),
-            ("http://10.0.0.1:8080", "10.0.0.1"),
-            ("https://api.example.com:443", "api.example.com"),
-            ("http://prefill-server", "prefill-server"),
-            ("http://[::1]:8080", "["),  // IPv6 edge case
-            ("prefill:8080", "prefill"), // No protocol
-        ];
-
-        for (url, expected_hostname) in test_cases {
-            assert_eq!(get_hostname(url), expected_hostname);
-        }
-    }
-
-    #[test]
     fn test_pd_request_edge_cases() {
         let empty_json = json!({});
         let pd_req = PDRequest::from_json(&empty_json);
@@ -389,6 +428,7 @@ mod test_pd_routing {
     #[tokio::test]
     async fn test_background_load_monitoring() {
         use std::collections::HashMap;
+
         use tokio::sync::watch;
 
         let (tx, rx) = watch::channel(HashMap::new());
@@ -434,6 +474,7 @@ mod test_pd_routing {
     #[tokio::test]
     async fn test_watch_channel_behavior() {
         use std::collections::HashMap;
+
         use tokio::sync::watch;
 
         let (tx, rx1) = watch::channel(HashMap::new());
@@ -644,7 +685,7 @@ mod test_pd_routing {
             _ => None,
         };
         let batch_size = 16;
-        let hostname = get_hostname(prefill_worker.url());
+        let hostname = prefill_worker.bootstrap_host();
 
         benchmark_request["bootstrap_host"] = json!(vec![hostname; batch_size]);
         benchmark_request["bootstrap_port"] = json!(vec![bootstrap_port; batch_size]);
@@ -769,7 +810,7 @@ mod test_pd_routing {
                 WorkerType::Prefill { bootstrap_port } => bootstrap_port,
                 _ => None,
             };
-            let hostname = get_hostname(prefill_worker.url());
+            let hostname = prefill_worker.bootstrap_host();
 
             large_batch_request["bootstrap_host"] = json!(vec![hostname; batch_size]);
             large_batch_request["bootstrap_port"] = json!(vec![bootstrap_port; batch_size]);

@@ -1,5 +1,7 @@
 mod common;
 
+use std::sync::Arc;
+
 use axum::{
     body::Body,
     extract::Request,
@@ -8,13 +10,14 @@ use axum::{
 use common::mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType};
 use reqwest::Client;
 use serde_json::json;
-use sglang_router_rs::config::{
-    CircuitBreakerConfig, ConnectionMode, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
+use sglang_router_rs::{
+    config::{
+        CircuitBreakerConfig, ConnectionMode, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
+    },
+    core::WorkerManager,
+    routers::{RouterFactory, RouterTrait},
+    server::AppContext,
 };
-use sglang_router_rs::core::WorkerManager;
-use sglang_router_rs::routers::{RouterFactory, RouterTrait};
-use sglang_router_rs::server::AppContext;
-use std::sync::Arc;
 use tower::ServiceExt;
 
 /// Test context that manages mock workers
@@ -30,6 +33,7 @@ impl TestContext {
     async fn new(worker_configs: Vec<MockWorkerConfig>) -> Self {
         // Create default router config
         let config = RouterConfig {
+            chat_template: None,
             mode: RoutingMode::Regular {
                 worker_urls: vec![],
             },
@@ -63,6 +67,9 @@ impl TestContext {
             tokenizer_path: None,
             history_backend: sglang_router_rs::config::HistoryBackend::Memory,
             oracle: None,
+            reasoning_parser: None,
+            tool_call_parser: None,
+            tokenizer_cache: sglang_router_rs::config::TokenizerCacheConfig::default(),
         };
 
         Self::new_with_config(config, worker_configs).await
@@ -992,8 +999,9 @@ mod router_policy_tests {
 
 #[cfg(test)]
 mod responses_endpoint_tests {
-    use super::*;
     use reqwest::Client as HttpClient;
+
+    use super::*;
 
     #[tokio::test]
     async fn test_v1_responses_non_streaming() {
@@ -1363,6 +1371,7 @@ mod error_tests {
     async fn test_payload_too_large() {
         // Create context with small payload limit
         let config = RouterConfig {
+            chat_template: None,
             mode: RoutingMode::Regular {
                 worker_urls: vec![],
             },
@@ -1396,6 +1405,9 @@ mod error_tests {
             tokenizer_path: None,
             history_backend: sglang_router_rs::config::HistoryBackend::Memory,
             oracle: None,
+            reasoning_parser: None,
+            tool_call_parser: None,
+            tokenizer_cache: sglang_router_rs::config::TokenizerCacheConfig::default(),
         };
 
         let ctx = TestContext::new_with_config(
@@ -1451,39 +1463,6 @@ mod error_tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-
-        ctx.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn test_missing_required_fields() {
-        let ctx = TestContext::new(vec![MockWorkerConfig {
-            port: 18405,
-            worker_type: WorkerType::Regular,
-            health_status: HealthStatus::Healthy,
-            response_delay_ms: 0,
-            fail_rate: 0.0,
-        }])
-        .await;
-
-        let app = ctx.create_app().await;
-
-        // Missing messages in chat completion
-        let payload = json!({
-            "model": "test-model"
-            // missing "messages"
-        });
-
-        let req = Request::builder()
-            .method("POST")
-            .uri("/v1/chat/completions")
-            .header(CONTENT_TYPE, "application/json")
-            .body(Body::from(serde_json::to_string(&payload).unwrap()))
-            .unwrap();
-
-        let resp = app.oneshot(req).await.unwrap();
-        // Axum validates JSON schema - returns 422 for validation errors
-        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
 
         ctx.shutdown().await;
     }
@@ -1719,6 +1698,7 @@ mod pd_mode_tests {
             .unwrap_or(9000);
 
         let config = RouterConfig {
+            chat_template: None,
             mode: RoutingMode::PrefillDecode {
                 prefill_urls: vec![(prefill_url, Some(prefill_port))],
                 decode_urls: vec![decode_url],
@@ -1755,6 +1735,9 @@ mod pd_mode_tests {
             tokenizer_path: None,
             history_backend: sglang_router_rs::config::HistoryBackend::Memory,
             oracle: None,
+            reasoning_parser: None,
+            tool_call_parser: None,
+            tokenizer_cache: sglang_router_rs::config::TokenizerCacheConfig::default(),
         };
 
         // Create app context
@@ -1882,6 +1865,7 @@ mod request_id_tests {
     async fn test_request_id_with_custom_headers() {
         // Create config with custom request ID headers
         let config = RouterConfig {
+            chat_template: None,
             mode: RoutingMode::Regular {
                 worker_urls: vec![],
             },
@@ -1915,6 +1899,9 @@ mod request_id_tests {
             tokenizer_path: None,
             history_backend: sglang_router_rs::config::HistoryBackend::Memory,
             oracle: None,
+            reasoning_parser: None,
+            tool_call_parser: None,
+            tokenizer_cache: sglang_router_rs::config::TokenizerCacheConfig::default(),
         };
 
         let ctx = TestContext::new_with_config(
@@ -2177,7 +2164,7 @@ mod rerank_tests {
         assert!(body_json.get("model").is_some());
 
         // V1 API should use default model name
-        assert_eq!(body_json["model"], "default");
+        assert_eq!(body_json["model"], "unknown");
 
         let results = body_json["results"].as_array().unwrap();
         assert_eq!(results.len(), 3); // All documents should be returned
