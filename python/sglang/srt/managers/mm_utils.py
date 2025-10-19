@@ -2,6 +2,7 @@
 Multi-modality utils
 """
 
+from collections import defaultdict
 import hashlib
 import pickle
 from abc import abstractmethod
@@ -261,23 +262,46 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
             return input_ids
 
         input_ids_tensor = torch.as_tensor(input_ids)
-
-        # Create mapping of token_ids to pad_values for each modality
-        token_to_pad_mapping = {}
-
+        items_by_modality = defaultdict(list)
         for item in mm_inputs.mm_items:
-            if item.is_image() and mm_inputs.im_token_id is not None:
-                token_to_pad_mapping[mm_inputs.im_token_id] = item.pad_value
-            elif item.is_audio() and mm_inputs.audio_token_id is not None:
-                token_to_pad_mapping[mm_inputs.audio_token_id] = item.pad_value
-            elif item.is_video() and mm_inputs.video_token_id is not None:
-                token_to_pad_mapping[mm_inputs.video_token_id] = item.pad_value
-            else:
-                raise ValueError(f"No multimodal token id provided for {item.modality}")
+            items_by_modality[item.modality].append(item)
 
-        # Apply replacements for all tokens at once
-        for token_id, pad_value in token_to_pad_mapping.items():
-            input_ids_tensor[input_ids_tensor == token_id] = pad_value
+        token_id_map = {
+            Modality.IMAGE: mm_inputs.im_token_id,
+            Modality.MULTI_IMAGES: mm_inputs.im_token_id,
+            Modality.AUDIO: mm_inputs.audio_token_id,
+            Modality.VIDEO: mm_inputs.video_token_id,
+        }
+
+        for modality, items in items_by_modality.items():
+            token_id = token_id_map.get(modality)
+
+            if not items or token_id is None:
+                continue
+
+            indices = (input_ids_tensor == token_id).nonzero(as_tuple=True)[0]
+            num_placeholders = len(indices)
+            num_items = len(items)
+
+            if num_placeholders == 0:
+                continue
+
+            if num_placeholders % num_items != 0:
+                raise ValueError(
+                    f"Mismatch for modality {modality.name}: "
+                    f"Found {num_placeholders} placeholder tokens (ID: {token_id}), "
+                    f"which is not divisible by the number of multimodal items ({num_items})."
+                )
+
+            tokens_per_item = num_placeholders // num_items
+
+            for i, item in enumerate(items):
+                start_index = i * tokens_per_item
+                end_index = (i + 1) * tokens_per_item
+
+                indices_for_this_item = indices[start_index:end_index]
+
+                input_ids_tensor[indices_for_this_item] = item.pad_value
 
         ret_input_ids = input_ids_tensor.tolist()
         return ret_input_ids
@@ -384,16 +408,28 @@ def _get_chunked_prefill_embedding(
         # if all items has been prefixed, we do not need to calculate embedding
         if all([offset_end < prefix_length[i] for _, offset_end in items_offset]):
             continue
-        embedding_per_req = embedding_cache.get(embedding_items_hash)
-        if embedding_per_req is None:
-            embedding_per_req = data_embedding_func(embedding_items_per_req)
-            if not embedding_cache.put(embedding_items_hash, embedding_per_req):
-                print_warning_once(
-                    "Multimodal embedding cache is full. This typically occurs when a single "
-                    "embedding exceeds the cache size limit. Consider increasing the "
-                    "`SGLANG_VLM_CACHE_SIZE_MB` environment variable or reducing the input "
-                    "embedding size."
-                )
+        embeddings_for_this_req = []
+        for item in embedding_items_per_req:
+            item_hash = item.hash
+            embedding_per_item = embedding_cache.get(item_hash)
+            if embedding_per_item is None:
+                # Cache miss: compute embedding for the single item
+                embedding_per_item = data_embedding_func([item])
+                if not embedding_cache.put(item_hash, embedding_per_item):
+                    print_warning_once(
+                        "Multimodal embedding cache is full. This typically occurs when a single "
+                        "embedding exceeds the cache size limit. Consider increasing the "
+                        "`SGLANG_VLM_CACHE_SIZE_MB` environment variable or reducing the input "
+                        "embedding size."
+                    )
+
+            embeddings_for_this_req.append(embedding_per_item)
+
+        if not embeddings_for_this_req:
+            continue
+
+        # Concatenate individual embeddings to form the full embedding for the request
+        embedding_per_req = torch.concat(embeddings_for_this_req, dim=0)
 
         embedding_per_req_chunk, _, _ = get_embedding_chunk(
             embedding=embedding_per_req,

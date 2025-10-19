@@ -309,8 +309,45 @@ class MultimodalInputs:
 
     @staticmethod
     def from_dict(obj: dict):
+        original_mm_items = obj["mm_items"]
+        expanded_mm_items = []
+        for item in original_mm_items:
+            is_bundled = item.offsets is not None and len(item.offsets) > 1
+
+            if is_bundled:
+                num_images = len(item.offsets)
+                image_grid_thw = item.model_specific_data.get("image_grid_thw")
+                if image_grid_thw is None or image_grid_thw.shape[0] != num_images:
+                    expanded_mm_items.append(item)
+                    continue
+
+                patches_per_image = [torch.prod(grid).item() for grid in image_grid_thw]
+
+                slice_indices = [0] + torch.cumsum(torch.tensor(patches_per_image, dtype=torch.long), dim=0).tolist()
+
+                if slice_indices[-1] != item.feature.shape[0]:
+                    expanded_mm_items.append(item)
+                    continue
+
+                for i in range(num_images):
+                    new_item = copy.deepcopy(item)
+
+                    start, end = slice_indices[i], slice_indices[i+1]
+                    new_item.feature = item.feature[start:end]
+
+                    new_item.offsets = [item.offsets[i]]
+
+                    new_item.model_specific_data['image_grid_thw'] = image_grid_thw[i:i+1]
+
+                    new_item.hash = None
+
+                    expanded_mm_items.append(new_item)
+            else:
+                expanded_mm_items.append(item)
+
+        # Now, `expanded_mm_items` contains one item per image.
         ret = MultimodalInputs(
-            mm_items=obj["mm_items"],
+            mm_items=expanded_mm_items,
         )
 
         assert isinstance(ret.mm_items, list)
@@ -680,7 +717,6 @@ class Req:
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
         max_prefix_len = max(max_prefix_len, 0)
         token_ids = self.fill_ids[:max_prefix_len]
-
         if tree_cache is not None:
             (
                 self.prefix_indices,
