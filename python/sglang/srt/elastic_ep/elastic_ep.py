@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import threading
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Callable, Dict, Optional, Union
 
 import torch
 
@@ -12,25 +13,37 @@ from sglang.srt.utils import is_cpu, is_cuda
 
 @dataclass
 class ElasticEPState:
-    active_ranks: Optional[torch.Tensor]
-    last_active_ranks: Optional[torch.Tensor]
-    active_ranks_cpu: Optional[torch.Tensor]
+    _active_ranks: Optional[torch.Tensor]
+    _last_active_ranks: Optional[torch.Tensor]
+    _active_ranks_cpu: Optional[torch.Tensor]
+    on_forward: Optional[Callable] = None
+    rank_status: Optional[torch.Tensor] = None
 
     def is_active_equal_last(self) -> bool:
-        return torch.equal(self.active_ranks, self.last_active_ranks)
+        return torch.equal(self._active_ranks, self._last_active_ranks)
 
     def sync_active_to_cpu(self):
-        if self.active_ranks is not None:
-            self.active_ranks_cpu = self.active_ranks.detach().cpu().clone()
+        if self._active_ranks is not None:
+            self._active_ranks_cpu = self._active_ranks.detach().cpu().clone()
 
     def snapshot_active_to_last(self):
-        if self.active_ranks is not None:
-            self.last_active_ranks = self.active_ranks.clone()
+        if self._active_ranks is not None:
+            self._last_active_ranks = self._active_ranks.clone()
 
 
 class ElasticEPStateManager:
     _instance: Optional[ElasticEPState] = None
     _lock = threading.Lock()
+
+    @staticmethod
+    def on_forward_mooncake(
+        state: ElasticEPState, status: torch.Tensor = None, **kwargs
+    ):
+        state._active_ranks = state.rank_status.to(dtype=torch.int32)
+
+    @staticmethod
+    def on_forward_deepep(state: ElasticEPState, status: torch.Tensor = None, **kwargs):
+        state._active_ranks = 1 - state.rank_status.to(torch.int32)
 
     @classmethod
     def instance(cls) -> ElasticEPState:
@@ -43,7 +56,11 @@ class ElasticEPStateManager:
                 return cls._instance
 
             if server_args.elastic_ep_backend is not None:
-                cls._instance = cls._build_state(ep_size=None, device=None)
+                cls._instance = cls._build_state(
+                    ep_size=None,
+                    device=None,
+                    backend_type=server_args.elastic_ep_backend,
+                )
             return cls._instance
 
     @staticmethod
@@ -57,21 +74,35 @@ class ElasticEPStateManager:
 
     @classmethod
     def _build_state(
-        cls, *, ep_size: Optional[int], device: Optional[torch.device]
+        cls,
+        *,
+        ep_size: Optional[int],
+        device: Optional[torch.device],
+        backend_type: str = "none",
     ) -> ElasticEPState:
 
-        active = cls.healthy_rank_state(ep_size=ep_size, device=device)
+        active = cls.create_rank_state(ep_size=ep_size, device=device, value=1)
+
+        if backend_type == "mooncake":
+            on_forward = cls.on_forward_mooncake
+        elif backend_type == "deepep":
+            on_forward = cls.on_forward_deepep
+        else:
+            on_forward = None
+
         return ElasticEPState(
-            active_ranks=active,
-            last_active_ranks=active.clone(),
-            active_ranks_cpu=active.detach().cpu().clone(),
+            _active_ranks=active,
+            _last_active_ranks=active.clone(),
+            _active_ranks_cpu=active.detach().cpu().clone(),
+            rank_status=active.clone(),
+            on_forward=on_forward,
         )
 
     @classmethod
-    def healthy_rank_state(
-        cls, *, ep_size: Optional[int], device: Optional[torch.device]
+    def create_rank_state(
+        cls, *, ep_size: Optional[int], device: Optional[torch.device], value: int = 1
     ) -> torch.Tensor:
         size = ep_size if ep_size is not None else torch.distributed.get_world_size()
         dev = device if device is not None else cls._select_device()
 
-        return torch.ones(size, dtype=torch.int32, device=dev)
+        return torch.full((size,), value, dtype=torch.int32, device=dev)

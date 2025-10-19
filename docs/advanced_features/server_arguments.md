@@ -134,7 +134,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | Arguments | Description | Defaults |
 |-----------|-------------|----------|
 | `--device` | The device to use ('cuda', 'xpu', 'hpu', 'npu', 'cpu'). Defaults to auto-detection if not specified. | None |
-| `--elastic-ep-backend` | Select the collective communication backend for elastic EP. Currently supports 'mooncake'. | None |
+| `--elastic-ep-backend` | Select the collective communication backend for elastic EP. Supports 'mooncake' and 'deepep'. Use 'none' to disable. | None |
 | `--mooncake-ib-device` | The InfiniBand devices for Mooncake Backend, accepts multiple comma-separated devices. Default is None, which triggers automatic device detection when Mooncake Backend is enabled. | None |
 | `--tp-size` | The tensor parallelism size. | 1 |
 | `--pp-size` | The pipeline parallelism size. | 1 |

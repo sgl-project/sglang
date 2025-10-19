@@ -229,7 +229,7 @@ class ServerArgs:
 
     # Runtime options
     device: Optional[str] = None
-    elastic_ep_backend: Literal[None, "mooncake"] = None
+    elastic_ep_backend: Literal[None, "mooncake", "deepep"] = None
     mooncake_ib_device: Optional[str] = None
     tp_size: int = 1
     pp_size: int = 1
@@ -1764,8 +1764,11 @@ class ServerArgs:
             "--elastic-ep-backend",
             type=str,
             default=ServerArgs.elastic_ep_backend,
-            choices=["none", "mooncake"],
-            help="Specify the collective communication backend for elastic EP. Currently supports 'mooncake'.",
+            choices=["none", "mooncake", "deepep"],
+            help=(
+                "Specify the collective communication backend for elastic EP. "
+                "Supports 'mooncake' and 'deepep'. Use 'none' to disable."
+            ),
         )
         parser.add_argument(
             "--mooncake-ib-device",

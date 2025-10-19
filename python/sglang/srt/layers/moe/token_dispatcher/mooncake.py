@@ -145,7 +145,7 @@ class _MooncakeEPDispatcherImpl:
         self.first_execution = True
         self.timeout_us = 10000000
 
-        self.active_ranks = ElasticEPStateManager.instance().active_ranks
+        self.active_ranks = ElasticEPStateManager.instance().rank_status
 
         self.handle = None
 
