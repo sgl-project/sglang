@@ -108,7 +108,7 @@ impl Default for JobQueueConfig {
     fn default() -> Self {
         Self {
             queue_capacity: 1000,
-            worker_count: 2,
+            worker_count: 10,
         }
     }
 }
@@ -331,182 +331,78 @@ impl JobQueue {
                 let api_key = router_config.api_key.clone();
                 let mut worker_count = 0;
 
-                match &router_config.mode {
-                    RoutingMode::Regular { worker_urls } => {
-                        info!(
-                            "Creating AddWorker jobs for {} regular workers from config",
-                            worker_urls.len()
-                        );
-
-                        for url in worker_urls {
-                            let config = WorkerConfigRequest {
-                                url: url.clone(),
-                                api_key: api_key.clone(),
-                                worker_type: Some("regular".to_string()),
-                                labels: HashMap::new(),
-                                model_id: None,
-                                priority: None,
-                                cost: None,
-                                tokenizer_path: None,
-                                reasoning_parser: None,
-                                tool_parser: None,
-                                chat_template: None,
-                                bootstrap_port: None,
-                                health_check_timeout_secs: router_config.health_check.timeout_secs,
-                                health_check_interval_secs: router_config
-                                    .health_check
-                                    .check_interval_secs,
-                                health_success_threshold: router_config
-                                    .health_check
-                                    .success_threshold,
-                                health_failure_threshold: router_config
-                                    .health_check
-                                    .failure_threshold,
-                                max_connection_attempts: router_config
-                                    .health_check
-                                    .success_threshold
-                                    * 10,
-                            };
-
-                            let job = Job::AddWorker {
-                                config: Box::new(config),
-                            };
-
-                            // Submit AddWorker job to the same queue
-                            if let Some(queue) = context.worker_job_queue.get() {
-                                queue.submit(job).await.map_err(|e| {
-                                    format!("Failed to submit AddWorker job for {}: {}", url, e)
-                                })?;
-                                worker_count += 1;
-                            } else {
-                                return Err("JobQueue not available".to_string());
-                            }
-                        }
-
-                        Ok(format!(
-                            "Submitted {} AddWorker jobs for regular workers",
-                            worker_count
-                        ))
-                    }
+                // Create iterator of (url, worker_type, bootstrap_port) tuples based on mode
+                let workers: Vec<(String, &str, Option<u16>)> = match &router_config.mode {
+                    RoutingMode::Regular { worker_urls } => worker_urls
+                        .iter()
+                        .map(|url| (url.clone(), "regular", None))
+                        .collect(),
                     RoutingMode::PrefillDecode {
                         prefill_urls,
                         decode_urls,
                         ..
                     } => {
-                        info!(
-                            "Creating AddWorker jobs for {} prefill and {} decode workers from config",
-                            prefill_urls.len(),
-                            decode_urls.len()
-                        );
+                        let prefill_workers = prefill_urls
+                            .iter()
+                            .map(|(url, port)| (url.clone(), "prefill", *port));
 
-                        // Create AddWorker jobs for prefill workers
-                        for (url, bootstrap_port) in prefill_urls {
-                            let config = WorkerConfigRequest {
-                                url: url.clone(),
-                                api_key: api_key.clone(),
-                                worker_type: Some("prefill".to_string()),
-                                labels: HashMap::new(),
-                                model_id: None,
-                                priority: None,
-                                cost: None,
-                                tokenizer_path: None,
-                                reasoning_parser: None,
-                                tool_parser: None,
-                                chat_template: None,
-                                bootstrap_port: *bootstrap_port,
-                                health_check_timeout_secs: router_config.health_check.timeout_secs,
-                                health_check_interval_secs: router_config
-                                    .health_check
-                                    .check_interval_secs,
-                                health_success_threshold: router_config
-                                    .health_check
-                                    .success_threshold,
-                                health_failure_threshold: router_config
-                                    .health_check
-                                    .failure_threshold,
-                                max_connection_attempts: router_config
-                                    .health_check
-                                    .success_threshold
-                                    * 10,
-                            };
+                        let decode_workers =
+                            decode_urls.iter().map(|url| (url.clone(), "decode", None));
 
-                            let job = Job::AddWorker {
-                                config: Box::new(config),
-                            };
-
-                            if let Some(queue) = context.worker_job_queue.get() {
-                                queue.submit(job).await.map_err(|e| {
-                                    format!(
-                                        "Failed to submit AddWorker job for prefill {}: {}",
-                                        url, e
-                                    )
-                                })?;
-                                worker_count += 1;
-                            } else {
-                                return Err("JobQueue not available".to_string());
-                            }
-                        }
-
-                        // Create AddWorker jobs for decode workers
-                        for url in decode_urls {
-                            let config = WorkerConfigRequest {
-                                url: url.clone(),
-                                api_key: api_key.clone(),
-                                worker_type: Some("decode".to_string()),
-                                labels: HashMap::new(),
-                                model_id: None,
-                                priority: None,
-                                cost: None,
-                                tokenizer_path: None,
-                                reasoning_parser: None,
-                                tool_parser: None,
-                                chat_template: None,
-                                bootstrap_port: None,
-                                health_check_timeout_secs: router_config.health_check.timeout_secs,
-                                health_check_interval_secs: router_config
-                                    .health_check
-                                    .check_interval_secs,
-                                health_success_threshold: router_config
-                                    .health_check
-                                    .success_threshold,
-                                health_failure_threshold: router_config
-                                    .health_check
-                                    .failure_threshold,
-                                max_connection_attempts: router_config
-                                    .health_check
-                                    .success_threshold
-                                    * 10,
-                            };
-
-                            let job = Job::AddWorker {
-                                config: Box::new(config),
-                            };
-
-                            if let Some(queue) = context.worker_job_queue.get() {
-                                queue.submit(job).await.map_err(|e| {
-                                    format!(
-                                        "Failed to submit AddWorker job for decode {}: {}",
-                                        url, e
-                                    )
-                                })?;
-                                worker_count += 1;
-                            } else {
-                                return Err("JobQueue not available".to_string());
-                            }
-                        }
-
-                        Ok(format!(
-                            "Submitted {} AddWorker jobs ({} prefill, {} decode)",
-                            worker_count,
-                            prefill_urls.len(),
-                            decode_urls.len()
-                        ))
+                        prefill_workers.chain(decode_workers).collect()
                     }
                     RoutingMode::OpenAI { .. } => {
                         info!("OpenAI mode: no workers to initialize");
-                        Ok("OpenAI mode: no workers to initialize".to_string())
+                        return Ok("OpenAI mode: no workers to initialize".to_string());
+                    }
+                };
+
+                info!(
+                    "Creating AddWorker jobs for {} workers from config",
+                    workers.len()
+                );
+
+                // Process all workers with unified loop
+                for (url, worker_type, bootstrap_port) in workers {
+                    let url_for_error = url.clone(); // Clone for error message
+                    let config = WorkerConfigRequest {
+                        url,
+                        api_key: api_key.clone(),
+                        worker_type: Some(worker_type.to_string()),
+                        labels: HashMap::new(),
+                        model_id: None,
+                        priority: None,
+                        cost: None,
+                        tokenizer_path: None,
+                        reasoning_parser: None,
+                        tool_parser: None,
+                        chat_template: None,
+                        bootstrap_port,
+                        health_check_timeout_secs: router_config.health_check.timeout_secs,
+                        health_check_interval_secs: router_config.health_check.check_interval_secs,
+                        health_success_threshold: router_config.health_check.success_threshold,
+                        health_failure_threshold: router_config.health_check.failure_threshold,
+                        max_connection_attempts: router_config.health_check.success_threshold * 10,
+                    };
+
+                    let job = Job::AddWorker {
+                        config: Box::new(config),
+                    };
+
+                    if let Some(queue) = context.worker_job_queue.get() {
+                        queue.submit(job).await.map_err(|e| {
+                            format!(
+                                "Failed to submit AddWorker job for {} worker {}: {}",
+                                worker_type, url_for_error, e
+                            )
+                        })?;
+                        worker_count += 1;
+                    } else {
+                        return Err("JobQueue not available".to_string());
                     }
                 }
+
+                Ok(format!("Submitted {} AddWorker jobs", worker_count))
             }
         }
     }
