@@ -49,9 +49,9 @@ python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8 --ep
 
 ### Configuration Tips
 - **DP Attention**: For DeepSeek V3.2 model, the kernels are customized for the use case of `dp_size=8`. So
-- **Choices of Attention Kernels**: The attention backend is automatically set to `nsa` attention backend for DeepSeek V3.2 model. In this backend, different kernels for sparse prefilling/decoding are implemented, which can be specified by `--nsa-prefill` and `--nsa-decode` server arguments. The choices of nsa prefill/decode attention kernels include:
-  - `flashmla_prefill`: `flash_mla_sparse_fwd` kernel from `flash_mla` library. Can run on both Hopper and Blackwell GPUs.
-  - `flashmla_decode`: `flash_mla_with_kvcache` kernel from `flash_mla` library. Can run on both Hopper and Blackwell GPUs.
+- **Choices of Attention Kernels**: The attention backend is automatically set to `nsa` attention backend for DeepSeek V3.2 model. In this backend, different kernels for sparse prefilling/decoding are implemented, which can be specified by `--nsa-prefill-backend` and `--nsa-decode-backend` server arguments. The choices of nsa prefill/decode attention kernels include:
+  - `flashmla_sparse`: `flash_mla_sparse_fwd` kernel from `flash_mla` library. Can run on both Hopper and Blackwell GPUs.
+  - `flashmla_kv`: `flash_mla_with_kvcache` kernel from `flash_mla` library. Can run on both Hopper and Blackwell GPUs.
   - `fa3`: `flash_attn_with_kvcache` kernel from `flash_attn` library. Can only run on Hopper GPUs.
   - `tilelang`: `tilelang` implementation that can run on GPU, HPU and NPU.
   - `alter`: Alter kernel on AMD HPUs. Can only be used as decode kernel.
@@ -91,4 +91,10 @@ Output throughput: 5226.235 token/s
 Accuracy benchmark on long context can be tested on GPQA-diamond dataset with long output tokens and thinking enabled:
 ```bash
 python3 -m sglang.test.run_eval --port 30000 --eval-name gpqa --num-examples 198 --max-tokens 120000 --repeat 8 --thinking-mode deepseek-v3
+```
+
+The mean accuracy over 8 runs shows 0.797, which matches the number 79.9 in official tech report.
+```bash
+Repeat: 8, mean: 0.797
+Scores: ['0.808', '0.798', '0.808', '0.798', '0.783', '0.788', '0.803', '0.793']
 ```
