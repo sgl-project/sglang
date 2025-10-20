@@ -56,7 +56,6 @@ from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.overlap_utils import FutureIndices
-from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
