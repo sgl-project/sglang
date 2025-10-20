@@ -265,6 +265,11 @@ RUN python3 -m pip install --no-cache-dir setuptools-rust \
     && python3 -m pip install --no-cache-dir . \
     && rm -rf /root/.cache
 
+# Install S3 dependencies
+RUN python3 -m pip install --no-cache-dir --break-system-packages \
+    boto3 \
+    runai-model-streamer \
+    runai-model-streamer-s3
 
 # Add yank script
 COPY --chown=root:root <<-"EOF" /usr/local/bin/yank
