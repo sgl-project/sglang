@@ -113,15 +113,15 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
     ) -> "CompressedTensorsMoEMethod":
         # TODO: @dsikka: refactor this to use schemes as other kernels
         # are supported + check if the layer is being ignored.
-        match = re.search(r"(\d+)\.mlp", prefix)
-        if not match:
-            raise ValueError(
-                f"Unable to extract layer number from prefix '{prefix}'. "
-                f"Expected format: '<layer_number>.mlp'"
-            )
-        layer_number = int(match.group(1))
 
         if envs.SGLANG_KT_MOE_AMX_WEIGHT_PATH.is_set():
+            match = re.search(r"(\d+)\.mlp", prefix)
+            if not match:
+                raise ValueError(
+                    f"Unable to extract layer number from prefix '{prefix}'. "
+                    f"Expected format: '<layer_number>.mlp'"
+                )
+            layer_number = int(match.group(1))
             return CompressedTensorsWNA16AMXEPMoEMethod(quant_config, layer_number)
 
         weight_quant = quant_config.target_scheme_map["Linear"].get("weights")
