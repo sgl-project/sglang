@@ -771,11 +771,9 @@ class ModelRunner:
         get_offloader().post_init()
 
         # Register model for layerwise NVTX profiling if enabled
-        if self.server_args.enable_layerwise_nvtx:
+        if self.server_args.enable_layerwise_nvtx_marker:
             self.pyt_hooks = PytHooks(debug=False)
-            self.pyt_hooks.register_hooks(
-                self.model, module_prefix=self.model_config.model_path
-            )
+            self.pyt_hooks.register_hooks(self.model, module_prefix="model")
 
         if self.server_args.kv_cache_dtype == "fp8_e4m3":
             if self.server_args.quantization_param_path is not None:
