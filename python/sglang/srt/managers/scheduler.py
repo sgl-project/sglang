@@ -37,6 +37,7 @@ from torch.distributed import barrier
 
 from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.mem_cache.kvpress import get_compression_method
 from sglang.srt.constrained.base_grammar_backend import (
     INVALID_GRAMMAR_OBJ,
     create_grammar_backend,
@@ -324,6 +325,19 @@ class Scheduler(
         # KVPress: KV cache compression
         self.enable_kvpress = server_args.enable_kvpress
         self.kvpress_compression_ratio = server_args.kvpress_compression_ratio
+        if self.enable_kvpress:
+            # Initialize compression method from server args
+            self.kvpress_method = get_compression_method(
+                method_name=server_args.kvpress_method,
+                compression_ratio=self.kvpress_compression_ratio
+            )
+            if self.tp_rank == 0:
+                logger.info(
+                    f"[KVPress] Initialized compression method: {server_args.kvpress_method} "
+                    f"with ratio {self.kvpress_compression_ratio}"
+                )
+        else:
+            self.kvpress_method = None
         
         self.enable_metrics_for_all_schedulers = (
             server_args.enable_metrics_for_all_schedulers
@@ -1148,13 +1162,18 @@ class Scheduler(
             k_buffer = kv_pool.k_buffer[layer_id]
             v_buffer = kv_pool.v_buffer[layer_id]
             
-            # 3a. Compute importance scores for this layer
+            # 3a. Compute importance scores for this layer using the compression method
             # Shape: [num_valid_tokens, num_kv_heads, head_dim]
             layer_keys = k_buffer[valid_kv_indices]
+            layer_values = v_buffer[valid_kv_indices]
             
-            # Compute L2 norm across head_dim, then average across num_kv_heads
+            # Use pluggable compression method to compute scores
             # Shape: [num_valid_tokens]
-            layer_scores = layer_keys.norm(dim=-1).mean(dim=-1)
+            layer_scores = self.kvpress_method.score(
+                layer_id=layer_id,
+                keys=layer_keys,
+                values=layer_values
+            )
             
             # Create full score array with -inf for invalid positions
             token_scores = torch.full(
@@ -1166,19 +1185,18 @@ class Scheduler(
             # 3b. Select top-k tokens for this layer
             kept_indices_layer = token_scores.topk(n_kept).indices
             
-            # Sort to preserve original sequence order
-            # This is crucial for maintaining attention semantics
-            kept_indices_layer = torch.sort(kept_indices_layer).values
+            # 3c. Get the slot_ids of selected tokens
+            kept_slots = kv_indices[kept_indices_layer]
             
-            # 3c. Copy selected tokens to temporary buffer
-            # Read from original slots
-            temp_k[:] = k_buffer[kv_indices[kept_indices_layer]]
-            temp_v[:] = v_buffer[kv_indices[kept_indices_layer]]
+            # 3d. Copy selected tokens to temporary buffer
+            temp_k[:] = k_buffer[kept_slots]
+            temp_v[:] = v_buffer[kept_slots]
             
-            # 3d. Write back to the first n_kept slots (in-place)
-            # This breaks the 1:1 correspondence: different layers store different tokens
-            k_buffer[kv_indices[:n_kept]] = temp_k
-            v_buffer[kv_indices[:n_kept]] = temp_v
+            # 3e. Write back to the same slots (in-place)
+            # Note: Since we're writing to the same slots we just read from,
+            # this step is technically a no-op, but kept for clarity
+            k_buffer[kept_slots] = temp_k
+            v_buffer[kept_slots] = temp_v
             
             # Track which slots to free (same across all layers)
             if layer_id == 0:
@@ -1186,11 +1204,10 @@ class Scheduler(
                 pruned_mask = torch.ones(len(kv_indices), dtype=torch.bool, device=self.device)
                 pruned_mask[kept_indices_layer] = False
                 slots_to_free = kv_indices[pruned_mask & valid_mask]
+                # Store kept_slots for updating req_to_token later
+                final_kept_slots = kept_slots
         
-        # 4. Free slots beyond n_kept (all layers are done)
-        # Note: We free slots that were not selected by the first layer
-        # In principle, different layers selected different tokens, but they all
-        # wrote to the first n_kept slots, so we can free the rest
+        # 4. Free pruned slots (all layers are done)
         if self.tp_rank == 0:
             logger.info(
                 f"[KVPress] Freeing {len(slots_to_free)} pruned slots (kept {n_kept} out of {num_valid_tokens}): "
@@ -1200,10 +1217,10 @@ class Scheduler(
         if len(slots_to_free) > 0:
             self.token_to_kv_pool_allocator.free(slots_to_free)
         
-        # 5. Update req_to_token mapping (only keep first n_kept slots)
-        # All layers now use these same n_kept slots, but store different tokens in them
+        # 5. Update req_to_token mapping
+        # Store the selected slot_ids (order doesn't matter for attention)
         new_mapping = torch.zeros_like(kv_indices)
-        new_mapping[:n_kept] = kv_indices[:n_kept]
+        new_mapping[:n_kept] = final_kept_slots
         self.req_to_token_pool.req_to_token[req.req_pool_idx, :seq_len] = new_mapping
         
         # 6. Update Req metadata

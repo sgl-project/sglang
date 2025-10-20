@@ -398,6 +398,7 @@ class ServerArgs:
     
     # KVPress: KV cache compression
     enable_kvpress: bool = False
+    kvpress_method: str = "knorm"
     kvpress_compression_ratio: float = 0.3
     cuda_graph_max_bs: Optional[int] = None
     cuda_graph_bs: Optional[List[int]] = None
@@ -2571,6 +2572,12 @@ class ServerArgs:
             "--enable-kvpress",
             action="store_true",
             help="Enable KVPress for KV cache compression.",
+        )
+        parser.add_argument(
+            "--kvpress-method",
+            type=str,
+            default=ServerArgs.kvpress_method,
+            help="KVPress compression method. Available: 'knorm' (default), 'random', 'streamingllm', 'keydiff', 'lagkv'.",
         )
         parser.add_argument(
             "--kvpress-compression-ratio",
