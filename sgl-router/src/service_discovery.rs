@@ -386,11 +386,15 @@ async fn handle_pod_event(
                 tool_parser: None,
                 chat_template: None,
                 api_key: None,
-                health_check_timeout_secs: 30,
-                health_check_interval_secs: 60,
-                health_success_threshold: 2,
-                health_failure_threshold: 3,
-                max_connection_attempts: 20,
+                health_check_timeout_secs: app_context.router_config.health_check.timeout_secs,
+                health_check_interval_secs: app_context
+                    .router_config
+                    .health_check
+                    .check_interval_secs,
+                health_success_threshold: app_context.router_config.health_check.success_threshold,
+                health_failure_threshold: app_context.router_config.health_check.success_threshold,
+                max_connection_attempts: app_context.router_config.health_check.success_threshold
+                    * 20,
                 dp_aware: false,
             };
 
