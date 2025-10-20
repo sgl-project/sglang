@@ -5,14 +5,12 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import torch
 from torch import nn
 
-from sglang.srt.distributed import (
-    get_pp_group,
-)
-
+from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.layers.utils import get_layer_id
+from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.managers.scheduler import StreamGuardResult
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
@@ -21,7 +19,6 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models.qwen3 import Qwen3Model
 from sglang.srt.utils import add_prefix, is_cuda, is_flashinfer_available
 
-from sglang.srt.managers.scheduler import StreamGuardResult
 Qwen3GuardModelConfig = None
 
 logger = logging.getLogger(__name__)
@@ -29,7 +26,6 @@ _is_flashinfer_available = is_flashinfer_available()
 _is_cuda = is_cuda()
 
 from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeRMSNorm
-
 
 
 class Qwen3ForGuardModel(nn.Module):
@@ -69,19 +65,32 @@ class Qwen3ForGuardModel(nn.Module):
         self.logits_processor = LogitsProcessor(config)
         self.capture_aux_hidden_states = False
         self.norm_class = Qwen3MoeRMSNorm
-        
-        self.risk_level_category_pre = nn.Linear(config.hidden_size,config.guard_inner_size,bias=False)
-        self.risk_level_category_layernorm = self.norm_class(config.guard_inner_size,eps=config.rms_norm_eps)
-        self.risk_level_head = nn.Linear(config.guard_inner_size,config.num_risk_level,bias=False)
-        self.category_head = nn.Linear(config.guard_inner_size,config.num_category,bias=False)
-        self.query_risk_level_category_pre = nn.Linear(config.hidden_size,config.guard_inner_size,bias=False)
-        self.query_risk_level_category_layernorm = self.norm_class(config.guard_inner_size, eps=config.rms_norm_eps)
-        self.query_risk_level_head = nn.Linear(config.guard_inner_size,config.num_query_risk_level,bias=False)
-        self.query_category_head = nn.Linear(config.guard_inner_size,config.num_query_category,bias=False)
-        risk_level_map = config.risk_level_map
-        self.risk_level_map = {int(k): v for k, v in risk_level_map.items()}
-        category_map = config.category_map
-        self.category_map = {int(k): v for k, v in category_map.items()}
+
+        self.risk_level_category_pre = nn.Linear(
+            config.hidden_size, config.guard_inner_size, bias=False
+        )
+        self.risk_level_category_layernorm = self.norm_class(
+            config.guard_inner_size, eps=config.rms_norm_eps
+        )
+        self.risk_level_head = nn.Linear(
+            config.guard_inner_size, config.num_risk_level, bias=False
+        )
+        self.category_head = nn.Linear(
+            config.guard_inner_size, config.num_category, bias=False
+        )
+        self.query_risk_level_category_pre = nn.Linear(
+            config.hidden_size, config.guard_inner_size, bias=False
+        )
+        self.query_risk_level_category_layernorm = self.norm_class(
+            config.guard_inner_size, eps=config.rms_norm_eps
+        )
+        self.query_risk_level_head = nn.Linear(
+            config.guard_inner_size, config.num_query_risk_level, bias=False
+        )
+        self.query_category_head = nn.Linear(
+            config.guard_inner_size, config.num_query_category, bias=False
+        )
+
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.get_input_embeddings()
 
@@ -109,27 +118,42 @@ class Qwen3ForGuardModel(nn.Module):
 
         if self.pp_group.is_last_rank:
             logits_to_keep = None
-            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-            risk_level_category_x = self.risk_level_category_pre(hidden_states[:, slice_indices, :])
-            risk_level_category_x = self.risk_level_category_layernorm(risk_level_category_x)
+            slice_indices = (
+                slice(-logits_to_keep, None)
+                if isinstance(logits_to_keep, int)
+                else logits_to_keep
+            )
+            risk_level_category_x = self.risk_level_category_pre(
+                hidden_states[:, slice_indices, :]
+            )
+            risk_level_category_x = self.risk_level_category_layernorm(
+                risk_level_category_x
+            )
             risk_level_logits = self.risk_level_head(risk_level_category_x)
             category_logits = self.category_head(risk_level_category_x)
-            query_risk_level_category_x = self.query_risk_level_category_pre(hidden_states[:, slice_indices, :])
-            query_risk_level_category_x = self.query_risk_level_category_layernorm(query_risk_level_category_x)
-            query_risk_level_logits = self.query_risk_level_head(query_risk_level_category_x)
-            query_category_logits = self.query_category_head(query_risk_level_category_x)
+            query_risk_level_category_x = self.query_risk_level_category_pre(
+                hidden_states[:, slice_indices, :]
+            )
+            query_risk_level_category_x = self.query_risk_level_category_layernorm(
+                query_risk_level_category_x
+            )
+            query_risk_level_logits = self.query_risk_level_head(
+                query_risk_level_category_x
+            )
+            query_category_logits = self.query_category_head(
+                query_risk_level_category_x
+            )
             loss = None
             return StreamGuardResult(
-                risk_level_logits = risk_level_logits,
-                category_logits = category_logits,
-                query_risk_level_logits = query_risk_level_logits,
-                query_category_logits = query_category_logits,
-                hidden_states = hidden_states,
-                bid = -1,
+                risk_level_logits=risk_level_logits,
+                category_logits=category_logits,
+                query_risk_level_logits=query_risk_level_logits,
+                query_category_logits=query_category_logits,
+                hidden_states=hidden_states,
+                bid=-1,
             )
         else:
             return hidden_states
-    
 
     @property
     def start_layer(self):
@@ -211,11 +235,8 @@ class Qwen3ForGuardModel(nn.Module):
                 else:
                     logger.warning(f"Parameter {name} not found in params_dict")
 
-
-
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         self.model.load_kv_cache_scales(quantization_param_path)
-
 
 
 EntryClass = Qwen3ForGuardModel

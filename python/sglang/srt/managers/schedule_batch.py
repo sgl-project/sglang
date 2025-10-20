@@ -654,6 +654,7 @@ class Req:
         self.tmp_end_idx: int = -1
         self.metadata_buffer_index: int = -1
         self.resumable: bool = resumable
+        self.return_logprob_len = None
 
     @property
     def seqlen(self):

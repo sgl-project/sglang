@@ -193,6 +193,13 @@ class SchedulerOutputProcessorMixin:
                             self.tree_cache.cache_finished_req(req)
                             if req.rid in self.stream_queue:
                                 self.stream_queue.pop(req.rid)
+                        else:
+                            self.tree_cache.cache_unfinished_req(req)
+                            self.tree_cache.req_to_token_pool.free(req.req_pool_idx)
+                            if req.rid in self.stream_queue:
+                                self.stream_queue[req.rid].prefix_indices = (
+                                    req.prefix_indices
+                                )
                     else:
                         self.tree_cache.cache_unfinished_req(req)
                 else:
@@ -815,18 +822,38 @@ class SchedulerOutputProcessorMixin:
         query_category_logits_flatten = result.query_category_logits.tolist()
         for req in reqs:
             req_origin_len = req.extend_input_len
+            return_logprob_len = (
+                req.return_logprob_len
+                if req.return_logprob_len is not None
+                else req_origin_len
+            )
+            assert return_logprob_len <= req_origin_len
             if req.finished():
                 rids.append(req.rid)
                 finished_reasons.append(req.finished_reason.to_json())
                 prompt_tokens.append(len(req.origin_input_ids))
                 cached_tokens.append(req.cached_tokens)
 
-            risk_level_logits.append(risk_level_logits_flatten[:req_origin_len])
-            category_logits.append(category_logits_flatten[:req_origin_len])
-            query_risk_level_logits.append(
-                query_category_logits_flatten[:req_origin_len]
+            risk_level_logits.append(
+                risk_level_logits_flatten[
+                    req_origin_len - return_logprob_len : req_origin_len
+                ]
             )
-            query_category_logits.append(query_category_logits_flatten[:req_origin_len])
+            category_logits.append(
+                category_logits_flatten[
+                    req_origin_len - return_logprob_len : req_origin_len
+                ]
+            )
+            query_risk_level_logits.append(
+                query_risk_level_logits_flatten[
+                    req_origin_len - return_logprob_len : req_origin_len
+                ]
+            )
+            query_category_logits.append(
+                query_category_logits_flatten[
+                    req_origin_len - return_logprob_len : req_origin_len
+                ]
+            )
 
             risk_level_logits_flatten = risk_level_logits_flatten[req_origin_len:]
             category_logits_flatten = category_logits_flatten[req_origin_len:]

@@ -581,6 +581,9 @@ class Scheduler(
         # Init prefill kv split size when deterministic inference is enabled with various attention backends
         self.init_deterministic_inference_config()
 
+        # stream guard
+        self.stream_queue: Dict[str, Req] = {}
+
         # Init request dispatcher
         self._request_dispatcher = TypeBasedDispatcher(
             [
@@ -1238,6 +1241,7 @@ class Scheduler(
         ):
             recv_req.input_ids = recv_req.input_ids[1:]
         existing_req.origin_input_ids.extend(recv_req.input_ids)
+        existing_req.return_logprob_len = len(recv_req.input_ids)
         existing_req.finished_reason = None
         existing_req.output_ids = []
         existing_req.resumable = req.resumable
@@ -1382,8 +1386,6 @@ class Scheduler(
             req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
             return
-
-        self.stream_queue: Dict[str, Req] = {}
 
         # Init grammar cache for this request
         add_to_grammar_queue = False
