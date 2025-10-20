@@ -15,6 +15,7 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutput,
     DispatchOutputFormat,
 )
+from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.dp_attention import get_is_extend_in_batch
 from sglang.srt.layers.moe.utils import (
     DeepEPMode,
@@ -62,9 +63,9 @@ logger = logging.getLogger(__name__)
 class DeepEPNormalOutput(NamedTuple):
     """DeepEP normal dispatch output."""
 
-    hidden_states: torch.Tensor | Tuple[torch.Tensor, torch.Tensor]
-    # hidden_states_scale
-    topk_idx: torch.Tensor
+    hidden_states: torch.Tensor
+    hidden_states_scale: Optional[torch.Tensor]
+    topk_ids: torch.Tensor
     topk_weights: torch.Tensor
     num_recv_tokens_per_expert: List[int]
 
@@ -76,8 +77,9 @@ class DeepEPNormalOutput(NamedTuple):
 class DeepEPLLOutput(NamedTuple):
     """DeepEP low latency dispatch output."""
 
-    hidden_states_fp8: Tuple[torch.Tensor, torch.Tensor]
-    topk_idx: torch.Tensor
+    hidden_states: torch.Tensor
+    hidden_states_scale: Optional[torch.Tensor]
+    topk_ids: torch.Tensor
     topk_weights: torch.Tensor
     masked_m: torch.Tensor
     expected_m: int
@@ -315,9 +317,7 @@ class _DeepEPDispatcherImplBase:
     def dispatch_a(
         self,
         hidden_states: torch.Tensor,
-        input_global_scale: Optional[torch.Tensor],
-        topk_idx: torch.Tensor,
-        topk_weights: torch.Tensor,
+        topk_output: TopKOutput,
     ):
         raise NotImplementedError
 
@@ -327,7 +327,7 @@ class _DeepEPDispatcherImplBase:
     def combine_a(
         self,
         hidden_states: torch.Tensor,
-        topk_idx: torch.Tensor,
+        topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
         overlap_args: Optional["CombineOverlapArgs"],
     ):
@@ -346,15 +346,15 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
 
         self.async_finish = async_finish
         self.src2dst = None
+        self.quant_config = {}
 
     def dispatch_a(
         self,
         hidden_states: torch.Tensor,
-        input_global_scale: Optional[torch.Tensor],
-        topk_idx: torch.Tensor,
-        topk_weights: torch.Tensor,
+        topk_output: TopKOutput,
     ):
-        topk_idx = topk_idx.to(torch.int64)
+        topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
+        topk_ids = topk_ids.to(torch.int64)
         if (
             deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
             and not get_moe_runner_backend().is_cutlass()
@@ -368,25 +368,31 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                 scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
             )
         previous_event = Buffer.capture() if self.async_finish else None
-        return hidden_states, topk_idx, topk_weights, previous_event
+        return hidden_states, topk_ids, topk_weights, previous_event
 
-    def dispatch_b(self, hidden_states, topk_idx, topk_weights, previous_event):
+    def dispatch_b(self, hidden_states, topk_ids, topk_weights, previous_event):
         (
             hidden_states,
-            topk_idx,
+            topk_ids,
             topk_weights,
             num_recv_tokens_per_expert,
             event,
-        ) = self._dispatch_core(hidden_states, topk_idx, topk_weights, previous_event)
+        ) = self._dispatch_core(hidden_states, topk_ids, topk_weights, previous_event)
         event.current_stream_wait() if self.async_finish else ()
+        
+        if isinstance(hidden_states, tuple):
+            hidden_states, hidden_states_scale = hidden_states
+        else:
+            hidden_states_scale = None
+
         return DeepEPNormalOutput(
-            hidden_states, topk_idx, topk_weights, num_recv_tokens_per_expert
+            hidden_states, hidden_states_scale, topk_ids, topk_weights, num_recv_tokens_per_expert
         )
 
     def _dispatch_core(
         self,
         x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
-        topk_idx: torch.Tensor,
+        topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
         previous_event,
     ):
@@ -398,7 +404,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             is_token_in_rank,
             previous_event,
         ) = buffer.get_dispatch_layout(
-            topk_idx,
+            topk_ids,
             self.num_experts,
             previous_event=previous_event,
             async_finish=self.async_finish,
@@ -410,14 +416,14 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
 
         (
             recv_x,
-            recv_topk_idx,
+            recv_topk_ids,
             recv_topk_weights,
             num_recv_tokens_per_expert,
             self.handle,
             event,
         ) = buffer.dispatch(
             x,
-            topk_idx=topk_idx,
+            topk_idx=topk_ids,
             topk_weights=topk_weights,
             num_tokens_per_rank=num_tokens_per_rank,
             num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
@@ -438,7 +444,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
 
         return (
             recv_x,
-            recv_topk_idx,
+            recv_topk_ids,
             recv_topk_weights,
             num_recv_tokens_per_expert,
             event,
@@ -447,7 +453,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
     def combine_a(
         self,
         hidden_states: torch.Tensor,
-        topk_idx: torch.Tensor,
+        topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
         overlap_args: Optional["CombineOverlapArgs"],
     ):
@@ -469,7 +475,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                     hidden_states,
                     output,
                     self.src2dst,
-                    topk_idx,
+                    topk_ids,
                     topk_weights,
                     self.router_topk,
                     hidden_states.shape[1],
@@ -514,6 +520,9 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             self.num_max_dispatch_tokens_per_rank,
             self.num_experts,
         )
+    
+    def set_quant_config(self, quant_config: dict):
+        self.quant_config = quant_config
 
 
 class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
@@ -526,28 +535,27 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         """
         self.return_recv_hook = return_recv_hook
         self.device_module = torch.get_device_module()
+        self.quant_config = {}
 
     def dispatch_a(
         self,
         hidden_states: torch.Tensor,
-        input_global_scale: Optional[torch.Tensor],
-        topk_idx: torch.Tensor,
-        topk_weights: torch.Tensor,
+        topk_output: TopKOutput,
     ):
         buffer = self._get_buffer()
-        topk_idx = topk_idx.to(torch.int64)
+        topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
+        topk_ids = topk_ids.to(torch.int64)
         expected_m = (
-            hidden_states.shape[0] * buffer.group_size * topk_idx.shape[1]
+            hidden_states.shape[0] * buffer.group_size * topk_ids.shape[1]
             + self.num_experts
         ) // self.num_experts
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,
-            input_global_scale,
-            topk_idx,
+            topk_ids,
         )
         return (
             hidden_states,
-            topk_idx,
+            topk_ids,
             topk_weights,
             masked_m,
             expected_m,
@@ -558,7 +566,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
     def dispatch_b(
         self,
         hidden_states,
-        topk_idx,
+        topk_ids,
         topk_weights,
         masked_m,
         expected_m,
@@ -571,9 +579,15 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             masked_m
         )
 
+        if isinstance(hidden_states, tuple):
+            hidden_states, hidden_states_scale = hidden_states
+        else:
+            hidden_states_scale = None
+
         deepep_output = DeepEPLLOutput(
             hidden_states,
-            topk_idx,
+            hidden_states_scale,
+            topk_ids,
             topk_weights,
             masked_m,
             expected_m,
@@ -583,10 +597,10 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
     def _dispatch_core(
         self,
         hidden_states: torch.Tensor,
-        input_global_scale: Optional[torch.Tensor],
-        topk_idx: torch.Tensor,
+        topk_ids: torch.Tensor,
     ):
         use_nvfp4 = use_fp8 = False
+        input_global_scale = self.quant_config.get("input_global_scale", None)
         if input_global_scale is not None:
             use_nvfp4 = True
         elif not get_bool_env_var("SGLANG_DEEPEP_BF16_DISPATCH"):
@@ -596,7 +610,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
             buffer.low_latency_dispatch(
                 hidden_states,
-                topk_idx,
+                topk_ids,
                 self.num_max_dispatch_tokens_per_rank,
                 self.num_experts,
                 use_fp8=use_fp8,
@@ -619,13 +633,13 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
     def combine_a(
         self,
         hidden_states: torch.Tensor,
-        topk_idx: torch.Tensor,
+        topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
         overlap_args: Optional["CombineOverlapArgs"],
     ):
         hidden_states, event, hook = self._combine_core(
             hidden_states,
-            topk_idx,
+            topk_ids,
             topk_weights,
             overlap_args=overlap_args,
         )
@@ -645,7 +659,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
     def _combine_core(
         self,
         hidden_states: torch.Tensor,
-        topk_idx: torch.Tensor,
+        topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
         overlap_args: Optional["CombineOverlapArgs"],
     ):
@@ -659,7 +673,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         with ctx:
             combined_hidden_states, event, hook = buffer.low_latency_combine(
                 x=hidden_states,
-                topk_idx=topk_idx,
+                topk_idx=topk_ids,
                 topk_weights=topk_weights,
                 handle=self.handle,
                 async_finish=not self.return_recv_hook,
@@ -688,6 +702,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             self.num_max_dispatch_tokens_per_rank,
             self.num_experts,
         )
+    
+    def set_quant_config(self, quant_config: dict):
+        self.quant_config = quant_config
 
 
 @dataclass
@@ -746,16 +763,12 @@ class DeepEPDispatcher(BaseDispatcher):
     def dispatch_a(
         self,
         hidden_states: torch.Tensor,
-        input_global_scale: Optional[torch.Tensor],
-        topk_idx: torch.Tensor,
-        topk_weights: torch.Tensor,
+        topk_output: TopKOutput,
     ):
         self._update_stage(_Stage.INITIAL, _Stage.AFTER_DISPATCH_A)
         inner_state = self._get_impl().dispatch_a(
             hidden_states=hidden_states,
-            input_global_scale=input_global_scale,
-            topk_idx=topk_idx,
-            topk_weights=topk_weights,
+            topk_output=topk_output,
         )
         self._dispatch_intermediate_state = inner_state
 
@@ -773,14 +786,14 @@ class DeepEPDispatcher(BaseDispatcher):
     def combine_a(
         self,
         hidden_states: torch.Tensor,
-        topk_idx: torch.Tensor,
+        topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
         overlap_args: Optional["CombineOverlapArgs"] = None,
     ):
         self._update_stage(_Stage.AFTER_DISPATCH_B, _Stage.AFTER_COMBINE_A)
         inner_state = self._get_impl().combine_a(
             hidden_states=hidden_states,
-            topk_idx=topk_idx,
+            topk_ids=topk_ids,
             topk_weights=topk_weights,
             overlap_args=overlap_args,
         )
@@ -805,3 +818,9 @@ class DeepEPDispatcher(BaseDispatcher):
     def _update_stage(self, old_stage, new_stage):
         assert self._stage == old_stage
         self._stage = new_stage
+    
+    def set_quant_config(self, quant_config: dict):
+        if self.deepep_mode.enable_low_latency():
+            self._low_latency_dispatcher.set_quant_config(quant_config)
+        if self.deepep_mode.enable_normal():
+            self._normal_dispatcher.set_quant_config(quant_config)

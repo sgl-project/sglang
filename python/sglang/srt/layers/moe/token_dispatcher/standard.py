@@ -66,7 +66,7 @@ class StandardDispatcher(BaseDispatcher):
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
     ) -> DispatchOutput:
 
-        if self.moe_ep_size > 1 and not self.enable_flashinfer_cutlass_moe:
+        if self.moe_ep_size > 1 and not self.enable_flashinfer_cutlass_moe and TopKOutputChecker.format_is_standard(topk_output):
             if self.local_expert_mapping is None:
                 self.local_expert_mapping = torch.full(
                     (self.num_experts,), -1, dtype=torch.int32, device="cuda"
@@ -98,3 +98,6 @@ class StandardDispatcher(BaseDispatcher):
             # TODO: this branch should be removed in the future
             assert isinstance(combine_input, torch.Tensor)
             return combine_input
+    
+    def set_quant_config(self, quant_config: dict):
+        pass

@@ -941,7 +941,7 @@ class DeepseekV2MoE(nn.Module):
             with get_global_expert_distribution_recorder().with_current_layer(
                 self.layer_id
             ):
-                state.topk_weights_local, state.topk_idx_local, _ = self.topk(
+                state.topk_output = self.topk(
                     hidden_states=hidden_states,
                     router_logits=router_logits,
                     num_token_non_padded=state.forward_batch.num_token_non_padded,
@@ -950,20 +950,13 @@ class DeepseekV2MoE(nn.Module):
                     ),
                 )
         else:
-            state.topk_idx_local = torch.full(
-                (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
-            )
-            state.topk_weights_local = torch.empty(
-                (0, self.top_k), dtype=torch.float32, device=hidden_states.device
-            )
+            state.topk_output = self.topk.empty_topk_output(hidden_states.device)
 
     def op_dispatch_a(self, state):
         if self.ep_size > 1:
             self.experts.dispatcher.dispatch_a(
                 hidden_states=state.hidden_states_mlp_input,
-                input_global_scale=None,
-                topk_idx=state.pop("topk_idx_local"),
-                topk_weights=state.pop("topk_weights_local"),
+                topk_output=state.pop("topk_output"),
                 tbo_subbatch_index=state.get("tbo_subbatch_index"),
             )
 
@@ -985,7 +978,7 @@ class DeepseekV2MoE(nn.Module):
         if self.ep_size > 1:
             self.experts.dispatcher.combine_a(
                 hidden_states=state.pop("hidden_states_experts_output"),
-                topk_idx=state.dispatch_output.topk_idx,
+                topk_ids=state.dispatch_output.topk_ids,
                 topk_weights=state.dispatch_output.topk_weights,
                 tbo_subbatch_index=state.get("tbo_subbatch_index"),
             )

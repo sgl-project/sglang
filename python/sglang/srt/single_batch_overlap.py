@@ -99,9 +99,9 @@ def execute_sbo(
             forward_shared_experts()
 
     hidden_states = experts.dispatcher.combine(
-        hidden_states,
-        dispatch_output.topk_idx,
-        dispatch_output.topk_weights,
+        hidden_states=hidden_states,
+        topk_ids=dispatch_output.topk_ids,
+        topk_weights=dispatch_output.topk_weights,
         overlap_args=combine_overlap_args,
     )
 
@@ -115,9 +115,7 @@ def _compute_overlap_args(dispatch_output, alt_stream, disable_sbo):
     ):
         return None, None, {}
 
-    hidden_states = dispatch_output.hidden_states_fp8
-    if isinstance(hidden_states, tuple):
-        hidden_states = hidden_states[0]
+    hidden_states = dispatch_output.hidden_states
 
     num_local_experts, num_tokens_static, hidden_dim = hidden_states.shape
 
