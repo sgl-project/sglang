@@ -976,7 +976,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         .worker_job_queue
         .set(worker_job_queue)
         .expect("JobQueue should only be initialized once");
-    
+
     let router_manager = RouterManager::from_config(&config, &app_context).await?;
 
     info!(
