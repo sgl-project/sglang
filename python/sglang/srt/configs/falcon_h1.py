@@ -14,17 +14,12 @@
 # limitations under the License.
 """Falcon-H1 model configuration"""
 
-import enum
 
 from transformers.configuration_utils import PretrainedConfig
-from transformers.modeling_rope_utils import rope_config_validation
 from transformers.utils import logging
 
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
-from sglang.srt.layers.dp_attention import (
-    get_attention_tp_size,
-    get_tensor_model_parallel_world_size,
-)
+from sglang.srt.layers.dp_attention import get_tensor_model_parallel_world_size
 
 logger = logging.get_logger(__name__)
 

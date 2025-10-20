@@ -1,3 +1,24 @@
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, OnceLock,
+    },
+    time::Duration,
+};
+
+use axum::{
+    extract::{Path, Query, Request, State},
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    routing::{delete, get, post},
+    serve, Json, Router,
+};
+use reqwest::Client;
+use serde::Deserialize;
+use serde_json::{json, Value};
+use tokio::{net::TcpListener, signal, spawn};
+use tracing::{error, info, warn, Level};
+
 use crate::{
     config::{ConnectionMode, HistoryBackend, RouterConfig, RoutingMode},
     core::{
@@ -15,37 +36,26 @@ use crate::{
     middleware::{self, AuthConfig, QueuedRequest, TokenBucket},
     policies::PolicyRegistry,
     protocols::{
-        spec::{
-            ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest,
-            RerankRequest, ResponsesGetParams, ResponsesRequest, V1RerankReqInput,
-        },
+        chat::ChatCompletionRequest,
+        classify::ClassifyRequest,
+        completion::CompletionRequest,
+        embedding::EmbeddingRequest,
+        generate::GenerateRequest,
+        rerank::{RerankRequest, V1RerankReqInput},
+        responses::{ResponsesGetParams, ResponsesRequest},
         validated::ValidatedJson,
         worker_spec::{WorkerConfigRequest, WorkerErrorResponse, WorkerInfo},
     },
     reasoning_parser::ParserFactory as ReasoningParserFactory,
     routers::{router_manager::RouterManager, RouterTrait},
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
-    tokenizer::{factory as tokenizer_factory, traits::Tokenizer},
+    tokenizer::{
+        cache::{CacheConfig, CachedTokenizer},
+        factory as tokenizer_factory,
+        traits::Tokenizer,
+    },
     tool_parser::ParserFactory as ToolParserFactory,
 };
-use axum::{
-    extract::{Path, Query, Request, State},
-    http::StatusCode,
-    response::{IntoResponse, Response},
-    routing::{delete, get, post},
-    serve, Json, Router,
-};
-use reqwest::Client;
-use serde::Deserialize;
-use serde_json::{json, Value};
-use std::sync::OnceLock;
-use std::{
-    sync::atomic::{AtomicBool, Ordering},
-    sync::Arc,
-    time::Duration,
-};
-use tokio::{net::TcpListener, signal, spawn};
-use tracing::{error, info, warn, Level};
 
 //
 
@@ -223,7 +233,7 @@ async fn v1_completions(
 async fn rerank(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    Json(body): Json<RerankRequest>,
+    ValidatedJson(body): ValidatedJson<RerankRequest>,
 ) -> Response {
     state.router.route_rerank(Some(&headers), &body, None).await
 }
@@ -258,6 +268,17 @@ async fn v1_embeddings(
     state
         .router
         .route_embeddings(Some(&headers), &body, None)
+        .await
+}
+
+async fn v1_classify(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    Json(body): Json<ClassifyRequest>,
+) -> Response {
+    state
+        .router
+        .route_classify(Some(&headers), &body, None)
         .await
 }
 
@@ -525,13 +546,7 @@ async fn get_loads(State(state): State<Arc<AppState>>, _req: Request) -> Respons
         })
         .collect();
 
-    (
-        StatusCode::OK,
-        Json(json!({
-            "workers": loads
-        })),
-    )
-        .into_response()
+    (StatusCode::OK, Json(json!({ "workers": loads }))).into_response()
 }
 
 async fn create_worker(
@@ -698,6 +713,7 @@ pub fn build_app(
         .route("/v1/rerank", post(v1_rerank))
         .route("/v1/responses", post(v1_responses))
         .route("/v1/embeddings", post(v1_embeddings))
+        .route("/v1/classify", post(v1_classify))
         .route("/v1/responses/{response_id}", get(v1_responses_get))
         .route(
             "/v1/responses/{response_id}/cancel",
@@ -859,7 +875,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
                     .to_string()
             })?;
 
-        let tokenizer = Some(
+        let base_tokenizer =
                 tokenizer_factory::create_tokenizer_with_chat_template_blocking(
                     &tokenizer_path,
                     config.router_config.chat_template.as_deref(),
@@ -871,8 +887,23 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
                         or a HuggingFace model ID. For directories, ensure they contain tokenizer files.",
                         tokenizer_path, e
                     )
-                })?,
-            );
+                })?;
+
+        // Conditionally wrap with caching layer if at least one cache is enabled
+        let tokenizer = if config.router_config.tokenizer_cache.enable_l0
+            || config.router_config.tokenizer_cache.enable_l1
+        {
+            let cache_config = CacheConfig {
+                enable_l0: config.router_config.tokenizer_cache.enable_l0,
+                l0_max_entries: config.router_config.tokenizer_cache.l0_max_entries,
+                enable_l1: config.router_config.tokenizer_cache.enable_l1,
+                l1_max_memory: config.router_config.tokenizer_cache.l1_max_memory,
+            };
+            Some(Arc::new(CachedTokenizer::new(base_tokenizer, cache_config)) as Arc<dyn Tokenizer>)
+        } else {
+            // Use base tokenizer directly without caching
+            Some(base_tokenizer)
+        };
         let reasoning_parser_factory = Some(ReasoningParserFactory::new());
         let tool_parser_factory = Some(ToolParserFactory::new());
 
