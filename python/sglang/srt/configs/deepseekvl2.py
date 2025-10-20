@@ -176,7 +176,7 @@ class DeepseekVLV2Processor(ProcessorMixin):
             **kwargs,
         )
 
-    def format_messages_v2(self, messages, pil_images, max_req_input_len=-1):
+    def format_messages_v2(self, messages: str, pil_images, max_req_input_len=-1):
         """play the role of format_messages_v2 and get_images_info in the last version"""
         tokenized_data = []
         masked_tokenized_data = []  # labels
@@ -188,7 +188,7 @@ class DeepseekVLV2Processor(ProcessorMixin):
         image_token_cnt = messages.count(self.image_token)
         tokenized_str, images, seq_mask, spatial_crop = self.tokenize_with_images(
             messages,
-            pil_images[image_index : image_index + image_token_cnt],
+            pil_images[image_index: image_index + image_token_cnt],
             bos=True,
             eos=True,
             cropping=len(pil_images) <= 2,
@@ -284,7 +284,7 @@ class DeepseekVLV2Processor(ProcessorMixin):
             images_list,
             images_seq_mask,
             images_spatial_crop,
-        ) = self.format_messages_v2(conversations, images, max_req_input_len)
+        ) = self.format_messages_v2(conversations or prompt, images, max_req_input_len)
 
         assert (
             len(tokenized_str) == len(images_seq_mask) == len(masked_tokenized_str)
@@ -340,10 +340,14 @@ class DeepseekVLV2Processor(ProcessorMixin):
         inference_mode: bool = True,
         system_prompt: str = "",
         max_req_input_len: int = -1,
+        text: list[str] = None,
         **kwargs,
     ):
+        assert text is None or isinstance(text, list)
+        if text is not None:
+            text = text[0]
         prepare = self.process_one(
-            prompt=prompt,
+            prompt=prompt or text,
             conversations=conversations,
             images=images,
             apply_sft_format=apply_sft_format,
@@ -547,7 +551,6 @@ class DeepseekVL2MlpProjectorConfig(PretrainedConfig):
 
 
 class DeepseekV2Config(PretrainedConfig):
-
     model_type = "deepseek_v2"
     keys_to_ignore_at_inference = ["past_key_values"]
 

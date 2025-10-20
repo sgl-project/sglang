@@ -301,7 +301,7 @@ class MlpProjector(nn.Module):
     def forward(self, x):
         if self.get("token_pooling", False):
             batch_size, wxh, channels = x.shape
-            w = h = int(wxh**0.5)
+            w = h = int(wxh ** 0.5)
             x = x.view(batch_size, w, h, channels)
             x = x.permute(0, 3, 1, 2)
             # import ipdb; ipdb.set_trace()
@@ -329,7 +329,7 @@ class MlpProjector(nn.Module):
 
         if self.projector_type == "hybrid_split_feature_mlp_gelu":
             high_x = x[..., : self.input_dim[0]]
-            low_x = x[..., self.input_dim[0] :]
+            low_x = x[..., self.input_dim[0]:]
             high_x = self.high_up_proj(high_x)
             low_x = self.low_up_proj(low_x)
             x = torch.concat([high_x, low_x], dim=-1)
@@ -461,7 +461,7 @@ class Attention(nn.Module):
         super().__init__()
         self.num_heads = num_heads
         head_dim = dim // num_heads
-        self.scale = head_dim**-0.5
+        self.scale = head_dim ** -0.5
 
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.proj = nn.Linear(dim, dim)
@@ -1198,6 +1198,10 @@ class VitModel(nn.Module):
         for p in self.parameters():
             p.micro_dp = True
 
+    @property
+    def dtype(self):
+        return next(self.parameters()).dtype
+
     def set_input_tensor(self, input_tensor):
         if not isinstance(input_tensor, list):
             input_tensor = [input_tensor]
@@ -1341,10 +1345,10 @@ class DeepseekOCRModel(DeepseekV2Model):
                         print("=====================")
 
                         _, hw, n_dim = global_features.shape
-                        h = w = int(hw**0.5)
+                        h = w = int(hw ** 0.5)
 
                         _2, hw2, n_dim2 = local_features.shape
-                        h2 = w2 = int(hw2**0.5)
+                        h2 = w2 = int(hw2 ** 0.5)
 
                         width_crop_num, height_crop_num = crop_shape[0], crop_shape[1]
 
@@ -1411,7 +1415,7 @@ class DeepseekOCRModel(DeepseekV2Model):
                         print("NO PATCHES")
                         print("=====================")
                         _, hw, n_dim = global_features.shape
-                        h = w = int(hw**0.5)
+                        h = w = int(hw ** 0.5)
 
                         global_features = global_features.view(h, w, n_dim)
 
@@ -1633,10 +1637,10 @@ class DeepseekOCRForCausalLM(nn.Module):
                         print("=====================")
 
                     _, hw, n_dim = global_features.shape
-                    h = w = int(hw**0.5)
+                    h = w = int(hw ** 0.5)
 
                     _2, hw2, n_dim2 = local_features.shape
-                    h2 = w2 = int(hw2**0.5)
+                    h2 = w2 = int(hw2 ** 0.5)
 
                     width_crop_num, height_crop_num = crop_shape[0], crop_shape[1]
 
@@ -1694,7 +1698,7 @@ class DeepseekOCRForCausalLM(nn.Module):
                         print("=====================")
 
                     _, hw, n_dim = global_features.shape
-                    h = w = int(hw**0.5)
+                    h = w = int(hw ** 0.5)
 
                     global_features = global_features.view(h, w, n_dim)
 
@@ -1722,7 +1726,7 @@ class DeepseekOCRForCausalLM(nn.Module):
 
         # pixel_values = mm_items[0].to(torch.bfloat16)
         pixel_values = torch.cat([item.feature for item in mm_items], dim=0).type(
-            self.visual.dtype
+            self.vision_model.dtype
         )
         # print(image_input[1][0].shape)
         # print(type(image_input[1]))
@@ -1731,11 +1735,11 @@ class DeepseekOCRForCausalLM(nn.Module):
         # images_crop = image_input[1].to(torch.bfloat16)
         # images_crop = mm_items[1]
         images_crop = torch.cat([item.images_crop for item in mm_items], dim=0).type(
-            self.visual.dtype
+            self.vision_model.dtype
         )
         images_spatial_crop = torch.cat(
             [item.images_spatial_crop for item in mm_items], dim=0
-        ).type(self.visual.dtype)
+        ).type(self.vision_model.dtype)
 
         # images_crop = image_input[1]
         # images_spatial_crop = mm_items[2].to(dtype=torch.long)
