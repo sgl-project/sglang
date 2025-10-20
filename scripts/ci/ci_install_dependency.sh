@@ -47,7 +47,7 @@ else
 fi
 
 # Install the main package
-$PIP_CMD install -e "python[dev]" --extra-index-url https://download.pytorch.org/whl/test/${CU_VERSION} $PIP_INSTALL_SUFFIX --force-reinstall
+$PIP_CMD install -e "python[dev]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} $PIP_INSTALL_SUFFIX --force-reinstall
 
 # Install router for pd-disagg test
 SGLANG_ROUTER_BUILD_NO_RUST=1 $PIP_CMD install -e "sgl-router" $PIP_INSTALL_SUFFIX
