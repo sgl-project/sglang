@@ -94,7 +94,7 @@ class ThinkingBudgetLogitProcessor(CustomLogitProcessor):
             start_index = cur_ids.index(self.THINKING_START_TOKEN_ID)
 
             # Count the number of tokens after the thinking start token
-            num_tokens_after_start = len(cur_ids) - start_index
+            num_tokens_after_start = len(cur_ids) - start_index - 1
 
             if num_tokens_after_start < thinking_budget:
                 continue
