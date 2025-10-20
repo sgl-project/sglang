@@ -1116,8 +1116,18 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         return self.runner.run(dispatch_output, quant_info)
 
     def _should_use_cutlass_fused_experts(self) -> bool:
-        """Decide whether to use Cutlass FP8 fused-experts path based on moe runner backend."""
+        """Decide whether to use Cutlass FP8 fused-experts path based on moe runner backend,
+        with env var override via `SGLANG_CUTLASS_MOE`.
+        """
         backend = get_moe_runner_backend()
+        env_force = get_bool_env_var("SGLANG_CUTLASS_MOE")
+        # TODO: remove env var in the future, it should be handled by moe runner backend
+        if env_force and (backend.is_cutlass() or backend.is_flashinfer_cutlass()):
+            return (
+                self.cutlass_fp8_supported
+                and self.block_quant
+                and (is_sm100_supported() or is_sm90_supported())
+            )
         return (
             (backend.is_cutlass() or backend.is_flashinfer_cutlass())
             and self.cutlass_fp8_supported
