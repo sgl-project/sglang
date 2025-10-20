@@ -981,6 +981,10 @@ class ModelRunner:
         self.server_args.load_format = load_format
         self.load_config = load_config
 
+        # Recapture device graph after model weight update.
+        if not self.server_args.disable_cuda_graph and self.device == "cuda":
+            self.init_device_graphs()
+
         logger.info("Update weights end.")
         return True, "Succeeded to update model weights."
 
@@ -1567,6 +1571,8 @@ class ModelRunner:
                 self.kv_cache_dtype = torch.float8_e4m3fnuz
             else:
                 self.kv_cache_dtype = torch.float8_e4m3fn
+        elif self.server_args.kv_cache_dtype in ("bf16", "bfloat16"):
+            self.kv_cache_dtype = torch.bfloat16
         else:
             raise ValueError(
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
