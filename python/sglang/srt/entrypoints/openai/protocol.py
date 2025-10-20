@@ -17,7 +17,7 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, List, NamedTuple, Optional, TypeAlias, Union
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple, TypeAlias, Union
 
 from openai.types.responses import (
     ResponseFunctionToolCall,
@@ -37,6 +37,7 @@ from pydantic import (
     model_validator,
 )
 from typing_extensions import Literal
+from xgrammar import StructuralTag
 
 from sglang.utils import convert_json_schema_to_str
 
@@ -128,10 +129,21 @@ class StructuresResponseFormat(BaseModel):
     end: str
 
 
-class StructuralTagResponseFormat(BaseModel):
+# NOTE(dark): keep this for backward compatibility
+class LegacyStructuralTagResponseFormat(BaseModel):
     type: Literal["structural_tag"]
     structures: List[StructuresResponseFormat]
     triggers: List[str]
+
+
+StructuralTagResponseFormat: TypeAlias = Union[
+    LegacyStructuralTagResponseFormat, StructuralTag
+]
+
+ToolCallConstraint: TypeAlias = Union[
+    Tuple[Literal["structural_tag"], StructuralTagResponseFormat],
+    Tuple[Literal["json_schema"], Any],  # json_schema can be dict/str/None
+]
 
 
 class FileRequest(BaseModel):
@@ -583,7 +595,7 @@ class ChatCompletionRequest(BaseModel):
         self,
         stop: List[str],
         model_generation_config: Dict[str, Any],
-        tool_call_constraint: Optional[Any] = None,
+        tool_call_constraint: Optional[ToolCallConstraint] = None,
     ) -> Dict[str, Any]:
         """
         Convert request to sampling parameters.
@@ -649,7 +661,7 @@ class ChatCompletionRequest(BaseModel):
                 )
             elif constraint_type == "json_schema":
                 sampling_params[constraint_type] = convert_json_schema_to_str(
-                    constraint_value
+                    constraint_value  # type: ignore
                 )
             else:
                 sampling_params[constraint_type] = constraint_value
@@ -1177,7 +1189,7 @@ class MessageProcessingResult:
     video_data: Optional[Any]
     modalities: List[str]
     stop: List[str]
-    tool_call_constraint: Optional[Any] = None
+    tool_call_constraint: Optional[ToolCallConstraint] = None
 
 
 class ToolCallProcessingResult(NamedTuple):
