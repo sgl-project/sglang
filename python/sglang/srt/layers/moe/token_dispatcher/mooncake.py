@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import NamedTuple, Optional, Tuple
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.layers.dp_attention import get_is_extend_in_batch
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
     CombineInput,
@@ -12,10 +13,9 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutput,
     DispatchOutputFormat,
 )
-from sglang.srt.layers.moe.utils import DeepEPMode
-from sglang.srt.layers.dp_attention import get_is_extend_in_batch
-from sglang.srt.utils import get_int_env_var
 from sglang.srt.layers.moe.topk import TopKOutput
+from sglang.srt.layers.moe.utils import DeepEPMode
+from sglang.srt.utils import get_int_env_var
 
 try:
     from mooncake.mooncake_ep_buffer import Buffer
@@ -28,8 +28,6 @@ from enum import Enum, auto
 
 import torch
 import torch.distributed as dist
-
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 logger = logging.getLogger(__name__)
 
@@ -391,6 +389,6 @@ class MooncakeEPDispatcher(BaseDispatcher):
     def _update_stage(self, old_stage, new_stage):
         assert self._stage == old_stage
         self._stage = new_stage
-    
+
     def set_quant_config(self, quant_config: dict):
         pass

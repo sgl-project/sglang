@@ -20,17 +20,13 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     tma_align_input_scale,
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import FlashInferFusedMoE, FusedMoE
+from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_kernel import (
     is_fp8_fnuz,
     sglang_per_token_group_quant_fp8,
 )
-from sglang.srt.layers.quantization.modelopt_quant import (
-    CUTEDSL_MOE_NVFP4_DISPATCH,
-    ModelOptNvFp4FusedMoEMethod,
-)
-from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
 from sglang.srt.single_batch_overlap import DownGemmOverlapArgs
 from sglang.srt.utils import ceil_div, dispose_tensor, get_bool_env_var, is_hip, is_npu
@@ -277,9 +273,13 @@ class DeepEPMoE(FusedMoE):
         self,
         dispatch_output: DeepEPNormalOutput,
     ):
-        hidden_states, hidden_states_scale, topk_ids, topk_weights, num_recv_tokens_per_expert = (
-            dispatch_output
-        )
+        (
+            hidden_states,
+            hidden_states_scale,
+            topk_ids,
+            topk_weights,
+            num_recv_tokens_per_expert,
+        ) = dispatch_output
         assert self.quant_method is not None
         assert self.moe_runner_config.activation == "silu"
         if num_recv_tokens_per_expert is None:
@@ -454,7 +454,9 @@ class DeepEPMoE(FusedMoE):
         hidden_states, hidden_states_scale, _, _, masked_m, expected_m = dispatch_output
         assert self.quant_method is not None
         assert self.moe_runner_config.activation == "silu"
-        assert hidden_states_scale.dtype == torch.float32, f"hidden_states_scale.dtype: {hidden_states_scale.dtype}"
+        assert (
+            hidden_states_scale.dtype == torch.float32
+        ), f"hidden_states_scale.dtype: {hidden_states_scale.dtype}"
 
         # GroupGemm-0
         num_groups, m, k = hidden_states.size()
@@ -543,7 +545,9 @@ class DeepEPMoE(FusedMoE):
         def _forward_normal(dispatch_output: DeepEPNormalOutput):
             if TYPE_CHECKING:
                 assert isinstance(dispatch_output, DeepEPNormalOutput)
-            hidden_states, hidden_states_scale, _, _, num_recv_tokens_per_expert = dispatch_output
+            hidden_states, hidden_states_scale, _, _, num_recv_tokens_per_expert = (
+                dispatch_output
+            )
 
             group_list = torch.tensor(num_recv_tokens_per_expert, dtype=torch.int64).to(
                 hidden_states.device
@@ -613,7 +617,14 @@ class DeepEPMoE(FusedMoE):
         def _forward_ll(dispatch_output: DeepEPLLOutput):
             if TYPE_CHECKING:
                 assert isinstance(dispatch_output, DeepEPLLOutput)
-            hidden_states, hidden_states_scale, topk_ids, topk_weights, group_list, _ = dispatch_output
+            (
+                hidden_states,
+                hidden_states_scale,
+                topk_ids,
+                topk_weights,
+                group_list,
+                _,
+            ) = dispatch_output
 
             group_list = group_list.to(torch.int64)
 

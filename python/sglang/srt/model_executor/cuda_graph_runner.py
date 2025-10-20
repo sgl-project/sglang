@@ -37,8 +37,8 @@ from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     get_attention_tp_rank,
     get_attention_tp_size,
-    set_is_extend_in_batch,
     set_dp_buffer_len,
+    set_is_extend_in_batch,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer

@@ -15,8 +15,8 @@ from sglang.srt.model_executor.cuda_graph_runner import (
     get_global_graph_memory_pool,
     model_capture_mode,
     set_global_graph_memory_pool,
-    set_torch_compile_config,
     set_is_extend_in_batch,
+    set_torch_compile_config,
 )
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,

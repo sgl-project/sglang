@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers.dp_attention import get_is_extend_in_batch
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
     BaseDispatcherConfig,
@@ -16,7 +17,6 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutputFormat,
 )
 from sglang.srt.layers.moe.topk import TopKOutput
-from sglang.srt.layers.dp_attention import get_is_extend_in_batch
 from sglang.srt.layers.moe.utils import (
     DeepEPMode,
     get_deepep_config,
@@ -52,8 +52,6 @@ from enum import Enum, IntEnum, auto
 
 import torch
 import torch.distributed as dist
-
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
@@ -379,14 +377,18 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             event,
         ) = self._dispatch_core(hidden_states, topk_ids, topk_weights, previous_event)
         event.current_stream_wait() if self.async_finish else ()
-        
+
         if isinstance(hidden_states, tuple):
             hidden_states, hidden_states_scale = hidden_states
         else:
             hidden_states_scale = None
 
         return DeepEPNormalOutput(
-            hidden_states, hidden_states_scale, topk_ids, topk_weights, num_recv_tokens_per_expert
+            hidden_states,
+            hidden_states_scale,
+            topk_ids,
+            topk_weights,
+            num_recv_tokens_per_expert,
         )
 
     def _dispatch_core(
@@ -461,7 +463,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM or _use_aiter or _is_npu:
             output = hidden_states
         else:
-            raise NotImplementedError() # triton runner was supported but it's temporarily disabled
+            raise NotImplementedError()  # triton runner was supported but it's temporarily disabled
 
         previous_event = Buffer.capture() if self.async_finish else None
         return output, previous_event
@@ -496,7 +498,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             self.num_max_dispatch_tokens_per_rank,
             self.num_experts,
         )
-    
+
     def set_quant_config(self, quant_config: dict):
         self.quant_config = quant_config
 
@@ -678,7 +680,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             self.num_max_dispatch_tokens_per_rank,
             self.num_experts,
         )
-    
+
     def set_quant_config(self, quant_config: dict):
         self.quant_config = quant_config
 
@@ -794,7 +796,7 @@ class DeepEPDispatcher(BaseDispatcher):
     def _update_stage(self, old_stage, new_stage):
         assert self._stage == old_stage
         self._stage = new_stage
-    
+
     def set_quant_config(self, quant_config: dict):
         if self.deepep_mode.enable_low_latency():
             self._low_latency_dispatcher.set_quant_config(quant_config)
