@@ -71,6 +71,11 @@ class SocketMapping:
         self._mapping[ipc_name] = socket
 
     def send_output(self, ipc_name: str, output: Any):
+        if ipc_name is None:
+            # Some unhandled cases
+            logger.warning(f"IPC name is None, output type={type(output)}, skipping...")
+            return
+
         if ipc_name not in self._mapping:
             self._register_ipc_mapping(ipc_name, is_tokenizer=False)
         self._mapping[ipc_name].send_pyobj(output)
