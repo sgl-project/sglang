@@ -30,8 +30,8 @@ from sglang.srt.layers.quantization.modelopt_quant import (
     CUTEDSL_MOE_NVFP4_DISPATCH,
     ModelOptNvFp4FusedMoEMethod,
 )
+from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.single_batch_overlap import DownGemmOverlapArgs
 from sglang.srt.utils import ceil_div, dispose_tensor, get_bool_env_var, is_hip, is_npu
 from sglang.srt.utils.offloader import get_offloader
@@ -113,7 +113,7 @@ class DeepEPMoE(FusedMoE):
         from sglang.srt.distributed.parallel_state import get_tp_group
         from sglang.srt.two_batch_overlap import MaybeTboDeepEPDispatcher
 
-        self.deepep_dispatcher = MaybeTboDeepEPDispatcher(
+        self.dispatcher = MaybeTboDeepEPDispatcher(
             group=get_tp_group().device_group,
             router_topk=self.top_k,
             permute_fusion=True,
@@ -165,8 +165,7 @@ class DeepEPMoE(FusedMoE):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        topk_idx: torch.Tensor,
-        topk_weights: torch.Tensor,
+        topk_output: TopKOutput,
         forward_shared_experts=None,
         alt_stream=None,
         disable_sbo=False,
@@ -174,8 +173,7 @@ class DeepEPMoE(FusedMoE):
         # We have to call SBO inside MoE to be compatible with hooks used in offloading
         return single_batch_overlap.execute_sbo(
             hidden_states=hidden_states,
-            topk_idx=topk_idx,
-            topk_weights=topk_weights,
+            topk_output=topk_output,
             # SBO args
             experts=self,
             forward_shared_experts=forward_shared_experts,
@@ -189,7 +187,7 @@ class DeepEPMoE(FusedMoE):
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
-        return self.deepep_dispatcher.dispatch(
+        return self.dispatcher.dispatch(
             hidden_states=hidden_states,
             topk_idx=topk_idx,
             topk_weights=topk_weights,
@@ -202,7 +200,7 @@ class DeepEPMoE(FusedMoE):
             ),
         )
 
-    def moe_impl(
+    def run_moe_core(
         self,
         dispatch_output: DispatchOutput,
         down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = None,
@@ -240,7 +238,7 @@ class DeepEPMoE(FusedMoE):
         topk_weights: torch.Tensor,
         overlap_args: Optional[Dict[str, Any]] = None,
     ):
-        return self.deepep_dispatcher.combine(
+        return self.dispatcher.combine(
             hidden_states=hidden_states,
             topk_idx=topk_idx,
             topk_weights=topk_weights,

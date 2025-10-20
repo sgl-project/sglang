@@ -237,7 +237,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
     def op_dispatch_a(self, state):
         if self.ep_size > 1:
-            self.experts.deepep_dispatcher.dispatch_a(
+            self.experts.dispatcher.dispatch_a(
                 hidden_states=state.pop("hidden_states_mlp_input"),
                 topk_idx=state.pop("topk_idx_local"),
                 topk_weights=state.pop("topk_weights_local"),
@@ -249,18 +249,18 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             with get_global_expert_distribution_recorder().with_current_layer(
                 self.layer_id
             ):
-                state.dispatch_output = self.experts.deepep_dispatcher.dispatch_b(
+                state.dispatch_output = self.experts.dispatcher.dispatch_b(
                     tbo_subbatch_index=state.get("tbo_subbatch_index"),
                 )
 
     def op_experts(self, state):
-        state.hidden_states_experts_output = self.experts.moe_impl(
+        state.hidden_states_experts_output = self.experts.run_moe_core(
             dispatch_output=state.dispatch_output,
         )
 
     def op_combine_a(self, state):
         if self.ep_size > 1:
-            self.experts.deepep_dispatcher.combine_a(
+            self.experts.dispatcher.combine_a(
                 hidden_states=state.pop("hidden_states_experts_output"),
                 topk_idx=state.dispatch_output.topk_idx,
                 topk_weights=state.dispatch_output.topk_weights,
@@ -271,7 +271,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
     def op_combine_b(self, state):
         if self.ep_size > 1:
             state.hidden_states_after_combine = (
-                self.experts.deepep_dispatcher.combine_b(
+                self.experts.dispatcher.combine_b(
                     tbo_subbatch_index=state.get("tbo_subbatch_index"),
                 )
             )
