@@ -10,7 +10,7 @@ For reporting issues or tracking upcoming features, please refer to this [Roadma
 
 ```bash
 # H200/B200
-docker pull lmsysorg/sglang:v0.5.3-cu129
+docker pull lmsysorg/sglang:latest
 
 # MI350/MI355
 docker pull lmsysorg/sglang:dsv32-rocm
@@ -55,7 +55,12 @@ python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8 --ep
 
 ### Configuration Tips
 - **DP Attention**: For DeepSeek V3.2 model, the kernels are customized for the use case of `dp_size=8`. So
-- **Choices of Attention Kernels**: The attention backend is set to `nsa` attention backend for DeepSeek V3.2 model. In this backend, different kernels for sparse prefilling/decoding are implemented, which can be specified by `--nsa-prefill` and `--nsa-decode` arguments.
+- **Choices of Attention Kernels**: The attention backend is automatically set to `nsa` attention backend for DeepSeek V3.2 model. In this backend, different kernels for sparse prefilling/decoding are implemented, which can be specified by `--nsa-prefill` and `--nsa-decode` arguments. The choices of nsa prefill/decode attention kernels include:
+  - `flashmla_prefill`:
+  - `flashmla_decode`:
+  - `fa3`:
+  - `tilelang`:
+  - `alter`: Alter kernel on AMD GPUs. Can only be used as decode kernel.
 - **FP8/BF16 KV Cache**:
 - Maybe some environmental variables
 
