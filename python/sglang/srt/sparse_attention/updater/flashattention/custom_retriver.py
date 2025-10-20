@@ -190,6 +190,7 @@ class NaiveDecodeSparseRetriver:
                 num_sink_pages=num_sink_pages,
                 num_local_pages=num_local_pages,
                 page_size=self.cache_manager.config.page_size,
+                budget_size=self.budget_per_seq,
         )
         
     

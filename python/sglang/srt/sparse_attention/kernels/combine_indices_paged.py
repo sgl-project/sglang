@@ -23,6 +23,7 @@ def combine_indices_paged_kernel(
     max_seq_len,
     max_pages,
     page_size,
+    budget_size,
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -47,7 +48,9 @@ def combine_indices_paged_kernel(
     
     page_table_offset = cur_req_idx * num_kv_heads * max_pages + kv_head_idx * max_pages
     
-    if is_in_pre_bs:
+    seq_len = tl.load(seq_lens_ptr + batch_idx)
+    
+    if is_in_pre_bs and seq_len >= budget_size:
         cache_offsets = tl.arange(0, BLOCK_SIZE)
         retrived_offset = pre_position * num_kv_heads * cache_len + kv_head_idx * cache_len
         
@@ -78,7 +81,6 @@ def combine_indices_paged_kernel(
                     mask=block_mask
                 )
         
-        seq_len = tl.load(seq_lens_ptr + batch_idx)
         num_pages_per_seq = (seq_len + page_size - 1) // page_size
         stream_len = num_sink_pages + num_local_pages
         
@@ -121,8 +123,6 @@ def combine_indices_paged_kernel(
             new_seq_len = page_size * (cache_len + num_sink_pages + num_local_pages) - diff
             tl.store(new_seq_lens_ptr + batch_idx, new_seq_len)
     else:
-        seq_len = tl.load(seq_lens_ptr + batch_idx)
-        
         num_pages = (seq_len + page_size - 1) // page_size
         
         page_offsets = tl.arange(0, BLOCK_SIZE)
@@ -181,6 +181,7 @@ def combine_indices(
     num_sink_pages: int,
     num_local_pages: int,
     page_size: int,
+    budget_size: int,
 ) -> torch.Tensor:
     cur_bs = cur_req_pool_indices.shape[0]
     max_bs_pre = pre_req_pool_indices.shape[0]
@@ -212,8 +213,8 @@ def combine_indices(
         max_seq_len,
         max_pages,
         page_size,
+        budget_size,
         BLOCK_SIZE=BLOCK_SIZE,
     )
-    
     return new_seq_lens
 
