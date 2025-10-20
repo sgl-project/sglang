@@ -92,9 +92,10 @@ from sglang.srt.layers.quantization.fp8_utils import (
     block_quant_dequant,
     block_quant_to_tensor_quant,
     channel_quant_to_tensor_quant,
-    input_to_float8,
     normalize_e4m3fn_to_e4m3fnuz,
+    quant_weight_ue8m0,
     requant_weight_ue8m0_inplace,
+    transform_scale_ue8m0_inplace,
 )
 from sglang.srt.layers.quantization.int8_utils import (
     block_dequant as int8_block_dequant,
@@ -902,6 +903,8 @@ class DeepseekV2MoE(nn.Module):
                 dict(
                     forward_shared_experts=_forward_shared_experts_and_put_results,
                     alt_stream=self.alt_stream,
+                    # SBO is not yet implemented for NextN
+                    disable_sbo=self.is_nextn,
                 )
                 if self._fuse_shared_experts_inside_sbo
                 else {}
@@ -1096,7 +1099,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 q_lora_rank,
                 self.num_heads * self.qk_head_dim,
                 bias=False,
-                quant_config=quant_config,
+                quant_config=self._get_q_b_proj_quant_config(quant_config),
                 prefix=add_prefix("q_b_proj", prefix),
                 tp_rank=attn_tp_rank,
                 tp_size=attn_tp_size,
@@ -1619,15 +1622,15 @@ class DeepseekV2AttentionMLA(nn.Module):
                     self.w_kc.to(torch.bfloat16) * self.w_scale,
                 )
         elif self.w_kc.dtype == torch.float8_e4m3fn:
-            # TODO fix the per_tensor_quant_mla_fp8 for cublas 12.9
-            if _is_cublas_ge_129:
-                q_nope_val, q_nope_scale = input_to_float8(
-                    q_nope.transpose(0, 1), torch.float8_e4m3fn
-                )
-            else:
-                q_nope_val, q_nope_scale = per_tensor_quant_mla_fp8(
-                    q_nope.transpose(0, 1), zero_allocator.allocate(1)
-                )
+            # fix bmm_fp8 error under cublas12.9 caused by bumpallocator, detail in pr#11612
+            q_nope_val, q_nope_scale = per_tensor_quant_mla_fp8(
+                q_nope.transpose(0, 1),
+                (
+                    torch.zeros((1,), dtype=torch.float32, device=q_nope.device)
+                    if _is_cublas_ge_129
+                    else zero_allocator.allocate(1)
+                ),
+            )
             q_nope_out = bmm_fp8(
                 q_nope_val, self.w_kc, q_nope_scale, self.w_scale, torch.bfloat16
             )
@@ -1768,14 +1771,14 @@ class DeepseekV2AttentionMLA(nn.Module):
                 attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
 
         elif self.w_vc.dtype == torch.float8_e4m3fn:
-            if _is_cublas_ge_129:
-                attn_output_val, attn_output_scale = input_to_float8(
-                    attn_output.transpose(0, 1), torch.float8_e4m3fn
-                )
-            else:
-                attn_output_val, attn_output_scale = per_tensor_quant_mla_fp8(
-                    attn_output.transpose(0, 1), zero_allocator.allocate(1)
-                )
+            attn_output_val, attn_output_scale = per_tensor_quant_mla_fp8(
+                attn_output.transpose(0, 1),
+                (
+                    torch.zeros((1,), dtype=torch.float32, device=attn_output.device)
+                    if _is_cublas_ge_129
+                    else zero_allocator.allocate(1)
+                ),
+            )
             attn_bmm_output = bmm_fp8(
                 attn_output_val,
                 self.w_vc,
@@ -2390,6 +2393,17 @@ class DeepseekV2AttentionMLA(nn.Module):
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
         output, _ = self.o_proj(attn_output)
         return output
+
+    @staticmethod
+    def _get_q_b_proj_quant_config(quant_config):
+        if get_bool_env_var("SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN"):
+            # refer to real DeepSeek V3 quant config
+            return Fp8Config(
+                is_checkpoint_fp8_serialized=True,
+                weight_block_size=[128, 128],
+            )
+        else:
+            return quant_config
 
 
 class DeepseekV2DecoderLayer(nn.Module):
@@ -3128,6 +3142,13 @@ class DeepseekV2ForCausalLM(nn.Module):
         ):
             self._weight_requant_ue8m0(is_nextn)
 
+        # TODO can move weight_requant_ue8m0 and transform_scale_ue8m0 into Fp8LinearMethod.process_weights_after_loading
+        if (
+            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+            and get_bool_env_var("SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN")
+        ):
+            self._transform_scale_ue8m0(is_nextn)
         if is_nextn and enable_nextn_moe_bf16_cast_to_fp8(self.quant_config):
             self._transform_scale_nextn_moe_ue8m0()
 
@@ -3196,6 +3217,25 @@ class DeepseekV2ForCausalLM(nn.Module):
                         module.weight, module.weight_scale_inv, weight_block_size
                     )
 
+    # TODO can move weight_requant_ue8m0 and transform_scale_ue8m0 into Fp8LinearMethod.process_weights_after_loading
+    def _transform_scale_ue8m0(self, is_nextn=False):
+        num_hidden_layers = 1 if is_nextn else self.config.num_hidden_layers
+
+        for layer_id in range(num_hidden_layers):
+            if is_nextn:
+                layer = self.model.decoder
+            else:
+                layer = self.model.layers[layer_id]
+
+            module_list = []
+            if self.config.q_lora_rank is not None:
+                module_list.append(layer.self_attn.q_b_proj)
+
+            for module in module_list:
+                transform_scale_ue8m0_inplace(
+                    module.weight_scale_inv, mn=module.weight.shape[-2]
+                )
+
     # TODO avoid code dup (currently combine from weight_requant_ue8m0 and transform_scale_ue8m0)
     def _transform_scale_nextn_moe_ue8m0(self):
         layer = self.model.decoder
@@ -3233,6 +3273,8 @@ class DeepseekV2ForCausalLM(nn.Module):
             else:
                 raise ValueError("num_nextn_predict_layers is not in the config")
 
+        if get_bool_env_var("SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN"):
+            weights = self._quant_attn_to_fp8_ue8m0(weights, is_nextn=is_nextn)
         if is_nextn and enable_nextn_moe_bf16_cast_to_fp8(self.quant_config):
             weights = self._quant_nextn_moe_to_fp8_ue8m0(
                 weights, nextn_layer_id=nextn_layer_id
@@ -3466,6 +3508,30 @@ class DeepseekV2ForCausalLM(nn.Module):
                 future.result()
 
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
+
+    def _quant_attn_to_fp8_ue8m0(self, weights, is_nextn):
+        weights_dict = dict(weights)
+
+        # temporarily only support DeepSeek V3/R1
+        weight_block_size = [128, 128]
+
+        for layer_id in trange(
+            self.config.num_hidden_layers + int(is_nextn),
+            desc="quant attn to fp8 ue8m0",
+        ):
+            for stem in [
+                # may put tensors like `o_proj` here for DeepSeek FP4 ckpt v1
+                "q_b_proj",
+            ]:
+                partial_name = f"model.layers.{layer_id}.self_attn.{stem}"
+                original_weight = weights_dict[f"{partial_name}.weight"]
+                out_w, out_s = quant_weight_ue8m0(
+                    original_weight, weight_block_size=weight_block_size
+                )
+                weights_dict[f"{partial_name}.weight"] = out_w
+                weights_dict[f"{partial_name}.weight_scale_inv"] = out_s
+
+        return list(weights_dict.items())
 
     # TODO avoid code dup
     def _quant_nextn_moe_to_fp8_ue8m0(self, weights, nextn_layer_id: int):
