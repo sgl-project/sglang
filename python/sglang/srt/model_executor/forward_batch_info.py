@@ -75,6 +75,8 @@ class ForwardMode(IntEnum):
     # Used in speculative decoding: extend a batch in the draft model.
     DRAFT_EXTEND = auto()
 
+    DRAFT_EXTEND_V2 = auto()
+
     # Split Prefill for PD multiplexing
     SPLIT_PREFILL = auto()
 
@@ -107,11 +109,16 @@ class ForwardMode(IntEnum):
     def is_draft_extend(self):
         return self == ForwardMode.DRAFT_EXTEND
 
+    def is_draft_extend_v2(self):
+        # For fixed shape logits output in v2 eagle worker
+        return self == ForwardMode.DRAFT_EXTEND_V2
+
     def is_extend_or_draft_extend_or_mixed(self):
         return (
             self == ForwardMode.EXTEND
             or self == ForwardMode.DRAFT_EXTEND
             or self == ForwardMode.MIXED
+            or self == ForwardMode.SPLIT_PREFILL
         )
 
     def is_cuda_graph(self):
@@ -278,6 +285,9 @@ class ForwardBatch:
     can_run_dp_cuda_graph: bool = False
     global_forward_mode: Optional[ForwardMode] = None
 
+    # Whether this batch is prefill-only (no token generation needed)
+    is_prefill_only: bool = False
+
     # Speculative decoding
     spec_info: Optional[SpecInput] = None
     spec_algorithm: SpeculativeAlgorithm = None
@@ -325,6 +335,7 @@ class ForwardBatch:
             is_extend_in_batch=batch.is_extend_in_batch,
             can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
             global_forward_mode=batch.global_forward_mode,
+            is_prefill_only=batch.is_prefill_only,
             lora_ids=batch.lora_ids,
             sampling_info=batch.sampling_info,
             req_to_token_pool=model_runner.req_to_token_pool,
@@ -389,10 +400,12 @@ class ForwardBatch:
             ret.positions = ret.spec_info.positions
 
         # Init position information
-        if ret.forward_mode.is_decode():
+        if ret.forward_mode.is_decode() or ret.forward_mode.is_target_verify():
             if ret.positions is None:
                 ret.positions = clamp_position(batch.seq_lens)
         else:
+            assert isinstance(batch.extend_seq_lens, list)
+            assert isinstance(batch.extend_prefix_lens, list)
             ret.extend_seq_lens = torch.tensor(
                 batch.extend_seq_lens, dtype=torch.int32
             ).to(device, non_blocking=True)
@@ -723,9 +736,8 @@ class ForwardBatch:
             self.encoder_lens = self._pad_tensor_to_size(self.encoder_lens, bs)
         self.positions = self._pad_tensor_to_size(self.positions, num_tokens)
         self.global_num_tokens_cpu = global_num_tokens
-        self.global_num_tokens_gpu = self.global_num_tokens_gpu.new_tensor(
-            global_num_tokens
-        )
+        global_num_tokens_pinned = torch.tensor(global_num_tokens, pin_memory=True)
+        self.global_num_tokens_gpu.copy_(global_num_tokens_pinned, non_blocking=True)
 
         if self.mrope_positions is not None:
             self.mrope_positions = self._pad_tensor_to_size(self.mrope_positions, bs)

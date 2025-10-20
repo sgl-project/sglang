@@ -3,24 +3,28 @@
 //! This module defines the core pipeline abstraction and individual processing stages
 //! that transform a RequestContext through its lifecycle.
 
+use std::{
+    sync::Arc,
+    time::{Instant, SystemTime, UNIX_EPOCH},
+};
+
 use async_trait::async_trait;
 use axum::response::{IntoResponse, Response};
-use tracing::{debug, error, warn};
-
-use super::context::*;
-use super::processing;
-use super::streaming;
-use super::utils;
-use crate::core::{ConnectionMode, WorkerRegistry, WorkerType};
-use crate::grpc_client::proto;
-use crate::policies::PolicyRegistry;
-use crate::protocols::spec::{
-    ChatCompletionRequest, ChatCompletionResponse, GenerateRequest, InputIds, Usage,
-};
+use proto::DisaggregatedParams;
 use rand::Rng;
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::{debug, error, warn};
 use uuid::Uuid;
+
+use super::{context::*, processing, streaming, utils};
+use crate::{
+    core::{ConnectionMode, Worker, WorkerRegistry, WorkerType},
+    grpc_client::proto,
+    policies::PolicyRegistry,
+    protocols::{chat::ChatCompletionRequest, common::InputIds, generate::GenerateRequest},
+    reasoning_parser::ParserFactory as ReasoningParserFactory,
+    tokenizer::traits::Tokenizer,
+    tool_parser::ParserFactory as ToolParserFactory,
+};
 
 // ============================================================================
 // Pipeline Trait
@@ -51,18 +55,17 @@ pub struct PreparationStage;
 #[async_trait]
 impl PipelineStage for PreparationStage {
     async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
-        debug!("Stage {}: Processing request", self.name());
+        // Clone Arc before match to avoid borrow checker issues
+        // (matching borrows ctx, but prepare_* methods need mutable borrow)
+        // Arc clone is cheap (8 bytes) - avoids full request clone (15KB-200KB)
+        let is_chat = matches!(&ctx.input.request_type, RequestType::Chat(_));
 
-        // Clone the request to avoid borrowing issues
-        match &ctx.input.request_type {
-            RequestType::Chat(request) => {
-                let request_clone = request.clone();
-                self.prepare_chat(ctx, &request_clone).await?;
-            }
-            RequestType::Generate(request) => {
-                let request_clone = request.clone();
-                self.prepare_generate(ctx, &request_clone).await?;
-            }
+        if is_chat {
+            let request_arc = ctx.chat_request_arc();
+            self.prepare_chat(ctx, &request_arc).await?;
+        } else {
+            let request_arc = ctx.generate_request_arc();
+            self.prepare_generate(ctx, &request_arc).await?;
         }
 
         Ok(None)
@@ -103,12 +106,15 @@ impl PreparationStage {
         };
 
         let token_ids = encoding.token_ids().to_vec();
-        debug!("Tokenized {} tokens from input", token_ids.len());
 
         // Step 4: Build tool constraints if needed
-        let tool_call_constraint = body_ref.tools.as_ref().and_then(|tools| {
-            utils::generate_tool_constraints(tools, &request.tool_choice, &request.model)
-        });
+        let tool_call_constraint = if let Some(tools) = body_ref.tools.as_ref() {
+            utils::generate_tool_constraints(tools, &request.tool_choice, &request.model).map_err(
+                |e| utils::bad_request_error(format!("Invalid tool configuration: {}", e)),
+            )?
+        } else {
+            None
+        };
 
         // Step 5: Create stop sequence decoder (build once, reuse in non-stream)
         let stop_decoder = utils::create_stop_decoder(
@@ -150,8 +156,6 @@ impl PreparationStage {
                 return Err(utils::bad_request_error(msg));
             }
         };
-
-        debug!("Resolved input with {} tokens", token_ids.len());
 
         // Create stop sequence decoder for generate requests
         let params = request.sampling_params.as_ref();
@@ -208,7 +212,7 @@ impl PreparationStage {
 
     fn tokenize_single_text(
         &self,
-        tokenizer: &Arc<dyn crate::tokenizer::traits::Tokenizer>,
+        tokenizer: &Arc<dyn Tokenizer>,
         text: &str,
     ) -> Result<(String, Vec<u32>), String> {
         let encoding = tokenizer
@@ -253,8 +257,6 @@ impl WorkerSelectionStage {
 #[async_trait]
 impl PipelineStage for WorkerSelectionStage {
     async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
-        debug!("Stage {}: Selecting workers", self.name());
-
         let prep = ctx
             .state
             .preparation
@@ -302,7 +304,7 @@ impl WorkerSelectionStage {
         &self,
         model_id: Option<&str>,
         text: Option<&str>,
-    ) -> Option<Arc<dyn crate::core::Worker>> {
+    ) -> Option<Arc<dyn Worker>> {
         // Get workers for the specified model, filtered by connection mode
         let workers = self.worker_registry.get_workers_filtered(
             model_id,
@@ -312,7 +314,7 @@ impl WorkerSelectionStage {
         );
 
         // Filter by availability (health + circuit breaker)
-        let available: Vec<Arc<dyn crate::core::Worker>> = workers
+        let available: Vec<Arc<dyn Worker>> = workers
             .iter()
             .filter(|w| w.is_available())
             .cloned()
@@ -337,45 +339,32 @@ impl WorkerSelectionStage {
         &self,
         model_id: Option<&str>,
         text: Option<&str>,
-    ) -> Option<(Arc<dyn crate::core::Worker>, Arc<dyn crate::core::Worker>)> {
-        // Get prefill workers - use None for WorkerType filter to get all types,
-        // then filter manually (since Prefill is a struct variant)
+    ) -> Option<(Arc<dyn Worker>, Arc<dyn Worker>)> {
         let all_workers = self.worker_registry.get_workers_filtered(
             model_id,
-            None, // Get all types
-            Some(ConnectionMode::Grpc { port: None }),
+            None,
+            Some(ConnectionMode::Grpc { port: None }), // Match any gRPC worker
             false,
         );
 
-        let prefill_workers: Vec<_> = all_workers
-            .iter()
-            .filter(|w| matches!(w.metadata().worker_type, WorkerType::Prefill { .. }))
-            .cloned()
-            .collect();
-
-        let available_prefill: Vec<_> = prefill_workers
-            .iter()
-            .filter(|w| w.is_available())
-            .cloned()
-            .collect();
+        let (available_prefill, available_decode): (Vec<_>, Vec<_>) =
+            all_workers
+                .into_iter()
+                .fold((Vec::new(), Vec::new()), |mut acc, w| {
+                    if w.is_available() {
+                        match w.metadata().worker_type {
+                            WorkerType::Prefill { .. } => acc.0.push(w),
+                            WorkerType::Decode => acc.1.push(w),
+                            _ => {}
+                        }
+                    }
+                    acc
+                });
 
         if available_prefill.is_empty() {
             warn!("No available prefill workers");
             return None;
         }
-
-        // Get decode workers from the same all_workers list
-        let decode_workers: Vec<_> = all_workers
-            .iter()
-            .filter(|w| matches!(w.metadata().worker_type, WorkerType::Decode))
-            .cloned()
-            .collect();
-
-        let available_decode: Vec<_> = decode_workers
-            .iter()
-            .filter(|w| w.is_available())
-            .cloned()
-            .collect();
 
         if available_decode.is_empty() {
             warn!("No available decode workers");
@@ -408,8 +397,6 @@ pub struct ClientAcquisitionStage;
 #[async_trait]
 impl PipelineStage for ClientAcquisitionStage {
     async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
-        debug!("Stage {}: Acquiring gRPC clients", self.name());
-
         let workers = ctx
             .state
             .workers
@@ -458,8 +445,6 @@ impl RequestBuildingStage {
 #[async_trait]
 impl PipelineStage for RequestBuildingStage {
     async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
-        debug!("Stage {}: Building proto request", self.name());
-
         let prep = ctx
             .state
             .preparation
@@ -537,10 +522,8 @@ impl RequestBuildingStage {
     fn inject_bootstrap_metadata(
         &self,
         request: &mut proto::GenerateRequest,
-        prefill_worker: &Arc<dyn crate::core::Worker>,
+        prefill_worker: &Arc<dyn Worker>,
     ) {
-        use proto::DisaggregatedParams;
-
         let hostname = prefill_worker.bootstrap_host();
         let bootstrap_port = prefill_worker.bootstrap_port().unwrap_or(8998);
 
@@ -574,8 +557,6 @@ pub struct DispatchMetadataStage;
 #[async_trait]
 impl PipelineStage for DispatchMetadataStage {
     async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
-        debug!("Stage {}: Preparing dispatch metadata", self.name());
-
         let proto_request = ctx
             .state
             .proto_request
@@ -652,8 +633,6 @@ impl RequestExecutionStage {
 #[async_trait]
 impl PipelineStage for RequestExecutionStage {
     async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
-        debug!("Stage {}: Executing gRPC request", self.name());
-
         let proto_request = ctx
             .state
             .proto_request
@@ -708,8 +687,6 @@ impl RequestExecutionStage {
         let (prefill_client, decode_client) = clients
             .dual_mut()
             .ok_or_else(|| utils::internal_error_static("Expected dual clients but got single"))?;
-
-        debug!("Sending concurrent requests to prefill and decode workers");
 
         let prefill_request = proto_request.clone();
         let decode_request = proto_request;
@@ -776,8 +753,6 @@ impl ResponseProcessingStage {
 #[async_trait]
 impl PipelineStage for ResponseProcessingStage {
     async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
-        debug!("Stage {}: Processing response", self.name());
-
         // Delegate to request-type specific processing
         match &ctx.input.request_type {
             RequestType::Chat(_) => return self.process_chat_response(ctx).await,
@@ -805,67 +780,32 @@ impl ResponseProcessingStage {
             .take()
             .ok_or_else(|| utils::internal_error_static("No execution result"))?;
 
-        if is_streaming {
-            // Get dispatch metadata for consistent response fields
-            let dispatch = ctx
-                .state
-                .dispatch
-                .as_ref()
-                .ok_or_else(|| utils::internal_error_static("Dispatch metadata not set"))?;
+        // Get dispatch metadata (needed by both streaming and non-streaming)
+        let dispatch = ctx
+            .state
+            .dispatch
+            .as_ref()
+            .ok_or_else(|| utils::internal_error_static("Dispatch metadata not set"))?
+            .clone();
 
+        if is_streaming {
             // Streaming: Use StreamingProcessor and return SSE response (done)
             return Ok(Some(
                 self.streaming_processor.clone().process_streaming_response(
                     execution_result,
-                    ctx.chat_request().clone(),
-                    dispatch.clone(),
+                    ctx.chat_request_arc(), // Cheap Arc clone (8 bytes)
+                    dispatch,
                 ),
             ));
         }
 
-        // Non-streaming: Extract chat request details before mutable borrows
+        // Non-streaming: Delegate to ResponseProcessor
         let request_logprobs = match &ctx.input.request_type {
             RequestType::Chat(req) => req.logprobs,
             _ => false,
         };
 
-        // Collect all responses from the execution result
-        let all_responses = match execution_result {
-            ExecutionResult::Single { stream } => {
-                utils::collect_stream_responses(stream, "Single").await?
-            }
-            ExecutionResult::Dual { prefill, decode } => {
-                // Collect prefill for input_logprobs
-                let prefill_responses = utils::collect_stream_responses(prefill, "Prefill").await?;
-
-                // Collect decode for actual output
-                let mut decode_responses =
-                    utils::collect_stream_responses(*decode, "Decode").await?;
-
-                // Merge prefill input_logprobs if requested
-                if request_logprobs {
-                    if let Some(prefill_input_logprobs) = prefill_responses
-                        .first()
-                        .and_then(|r| r.input_logprobs.clone())
-                    {
-                        for response in &mut decode_responses {
-                            response.input_logprobs = Some(prefill_input_logprobs.clone());
-                        }
-                    }
-                }
-
-                decode_responses
-            }
-        };
-
-        if all_responses.is_empty() {
-            return Err(utils::internal_error_static("No responses from server"));
-        }
-
-        // Clone chat_request to avoid borrow checker conflict
-        // (ctx.chat_request() borrows ctx, preventing mutable borrow of ctx.state.response.stop_decoder)
-        let chat_request = ctx.chat_request().clone();
-        let history_tool_calls_count = utils::get_history_tool_calls_count(&chat_request);
+        let chat_request = ctx.chat_request_arc();
 
         let stop_decoder = ctx
             .state
@@ -874,58 +814,16 @@ impl ResponseProcessingStage {
             .as_mut()
             .ok_or_else(|| utils::internal_error_static("Stop decoder not initialized"))?;
 
-        let mut choices = Vec::new();
-        for (index, complete) in all_responses.iter().enumerate() {
-            match self
-                .processor
-                .process_single_choice(
-                    complete,
-                    index,
-                    &chat_request,
-                    stop_decoder,
-                    history_tool_calls_count,
-                )
-                .await
-            {
-                Ok(choice) => choices.push(choice),
-                Err(e) => {
-                    return Err(utils::internal_error_message(format!(
-                        "Failed to process choice {}: {}",
-                        index, e
-                    )));
-                }
-            }
-        }
-
-        // Build usage
-        let total_prompt_tokens: u32 = all_responses.iter().map(|r| r.prompt_tokens as u32).sum();
-        let total_completion_tokens: u32 = all_responses
-            .iter()
-            .map(|r| r.completion_tokens as u32)
-            .sum();
-        let usage = Usage {
-            prompt_tokens: total_prompt_tokens,
-            completion_tokens: total_completion_tokens,
-            total_tokens: total_prompt_tokens + total_completion_tokens,
-            completion_tokens_details: None,
-        };
-
-        // Build final ChatCompletionResponse
-        let dispatch = ctx
-            .state
-            .dispatch
-            .as_ref()
-            .ok_or_else(|| utils::internal_error_static("Dispatch metadata not set"))?;
-
-        let response = ChatCompletionResponse {
-            id: dispatch.request_id.clone(),
-            object: "chat.completion".to_string(),
-            created: dispatch.created,
-            model: dispatch.model.clone(),
-            choices,
-            usage: Some(usage),
-            system_fingerprint: dispatch.weight_version.clone(),
-        };
+        let response = self
+            .processor
+            .process_non_streaming_chat_response(
+                execution_result,
+                chat_request,
+                dispatch,
+                stop_decoder,
+                request_logprobs,
+            )
+            .await?;
 
         // Store the final response
         ctx.state.response.final_response = Some(FinalResponse::Chat(response));
@@ -935,40 +833,65 @@ impl ResponseProcessingStage {
 
     async fn process_generate_response(
         &self,
-        _ctx: &mut RequestContext,
+        ctx: &mut RequestContext,
     ) -> Result<Option<Response>, Response> {
-        // TODO(generate): Implement generate response processing
-        //
-        // Required implementation:
-        // 1. Extract execution_result from ctx
-        // 2. Check is_streaming flag
-        // 3. For streaming:
-        //    - Add StreamingProcessor::process_streaming_generate() method
-        //    - Similar to process_streaming_response but WITHOUT tool/reasoning parsing
-        //    - Return Err(sse_response) for early exit
-        // 4. For non-streaming:
-        //    - Collect stream responses using utils::collect_stream_responses()
-        //    - Process through stop decoder (sequential with reset for n>1, like chat)
-        //    - Build GenerateResponse struct (see TODO in protocols/spec.rs)
-        //    - Set ctx.state.response.final_response = Some(FinalResponse::Generate(response))
-        //
-        // Reference implementation: router.rs:297-595
-        // Key differences from chat:
-        //   - No tool parsing
-        //   - No reasoning parsing
-        //   - Different response format (GenerateResponse instead of ChatCompletionResponse)
-        //   - Still needs: stop decoder, logprobs, finish_reason, matched_stop
-        Err((
-            axum::http::StatusCode::NOT_IMPLEMENTED,
-            axum::Json(serde_json::json!({
-                "error": {
-                    "message": "Generate response processing not yet implemented in pipeline",
-                    "type": "not_implemented",
-                    "code": 501
-                }
-            })),
-        )
-            .into_response())
+        let start_time = Instant::now();
+        let is_streaming = ctx.is_streaming();
+
+        // Extract execution result
+        let execution_result = ctx
+            .state
+            .response
+            .execution_result
+            .take()
+            .ok_or_else(|| utils::internal_error_static("No execution result"))?;
+
+        // Get dispatch metadata (needed by both streaming and non-streaming)
+        let dispatch = ctx
+            .state
+            .dispatch
+            .as_ref()
+            .ok_or_else(|| utils::internal_error_static("Dispatch metadata not set"))?
+            .clone();
+
+        if is_streaming {
+            // Streaming: Use StreamingProcessor and return SSE response (done)
+            return Ok(Some(
+                self.streaming_processor.clone().process_streaming_generate(
+                    execution_result,
+                    ctx.generate_request_arc(), // Cheap Arc clone (8 bytes)
+                    dispatch,
+                ),
+            ));
+        }
+
+        // Non-streaming: Delegate to ResponseProcessor
+        let request_logprobs = ctx.generate_request().return_logprob.unwrap_or(false);
+        let generate_request = ctx.generate_request_arc();
+
+        let stop_decoder = ctx
+            .state
+            .response
+            .stop_decoder
+            .as_mut()
+            .ok_or_else(|| utils::internal_error_static("Stop decoder not initialized"))?;
+
+        let result_array = self
+            .processor
+            .process_non_streaming_generate_response(
+                execution_result,
+                generate_request,
+                dispatch,
+                stop_decoder,
+                request_logprobs,
+                start_time,
+            )
+            .await?;
+
+        // Store the final response
+        ctx.state.response.final_response = Some(FinalResponse::Generate(result_array));
+
+        Ok(None)
     }
 }
 
@@ -976,23 +899,44 @@ impl ResponseProcessingStage {
 // Pipeline Orchestrator
 // ============================================================================
 
-/// Complete chat completion pipeline
+/// Generic request pipeline for all request types
 ///
 /// Orchestrates all stages from request preparation to response delivery.
 /// Configured differently for regular vs PD mode.
 #[derive(Clone)]
-pub struct ChatCompletionPipeline {
+pub struct RequestPipeline {
     stages: Arc<Vec<Box<dyn PipelineStage>>>,
 }
 
-impl ChatCompletionPipeline {
+impl RequestPipeline {
     /// Create a regular (single-worker) pipeline
     pub fn new_regular(
         worker_registry: Arc<WorkerRegistry>,
         policy_registry: Arc<PolicyRegistry>,
-        processor: processing::ResponseProcessor,
-        streaming_processor: Arc<streaming::StreamingProcessor>,
+        tokenizer: Arc<dyn Tokenizer>,
+        tool_parser_factory: ToolParserFactory,
+        reasoning_parser_factory: ReasoningParserFactory,
+        configured_tool_parser: Option<String>,
+        configured_reasoning_parser: Option<String>,
     ) -> Self {
+        // Create response processor
+        let processor = processing::ResponseProcessor::new(
+            tokenizer.clone(),
+            tool_parser_factory.clone(),
+            reasoning_parser_factory.clone(),
+            configured_tool_parser.clone(),
+            configured_reasoning_parser.clone(),
+        );
+
+        // Create streaming processor
+        let streaming_processor = Arc::new(streaming::StreamingProcessor::new(
+            tokenizer,
+            tool_parser_factory,
+            reasoning_parser_factory,
+            configured_tool_parser,
+            configured_reasoning_parser,
+        ));
+
         let stages: Vec<Box<dyn PipelineStage>> = vec![
             Box::new(PreparationStage),
             Box::new(WorkerSelectionStage::new(
@@ -1004,10 +948,7 @@ impl ChatCompletionPipeline {
             Box::new(RequestBuildingStage::new(false)), // No PD metadata
             Box::new(DispatchMetadataStage),
             Box::new(RequestExecutionStage::new(ExecutionMode::Single)),
-            Box::new(ResponseProcessingStage::new(
-                processor,
-                streaming_processor.clone(),
-            )),
+            Box::new(ResponseProcessingStage::new(processor, streaming_processor)),
         ];
 
         Self {
@@ -1019,9 +960,30 @@ impl ChatCompletionPipeline {
     pub fn new_pd(
         worker_registry: Arc<WorkerRegistry>,
         policy_registry: Arc<PolicyRegistry>,
-        processor: processing::ResponseProcessor,
-        streaming_processor: Arc<streaming::StreamingProcessor>,
+        tokenizer: Arc<dyn Tokenizer>,
+        tool_parser_factory: ToolParserFactory,
+        reasoning_parser_factory: ReasoningParserFactory,
+        configured_tool_parser: Option<String>,
+        configured_reasoning_parser: Option<String>,
     ) -> Self {
+        // Create response processor
+        let processor = processing::ResponseProcessor::new(
+            tokenizer.clone(),
+            tool_parser_factory.clone(),
+            reasoning_parser_factory.clone(),
+            configured_tool_parser.clone(),
+            configured_reasoning_parser.clone(),
+        );
+
+        // Create streaming processor
+        let streaming_processor = Arc::new(streaming::StreamingProcessor::new(
+            tokenizer,
+            tool_parser_factory,
+            reasoning_parser_factory,
+            configured_tool_parser,
+            configured_reasoning_parser,
+        ));
+
         let stages: Vec<Box<dyn PipelineStage>> = vec![
             Box::new(PreparationStage),
             Box::new(WorkerSelectionStage::new(
@@ -1033,10 +995,7 @@ impl ChatCompletionPipeline {
             Box::new(RequestBuildingStage::new(true)), // Inject PD metadata
             Box::new(DispatchMetadataStage),
             Box::new(RequestExecutionStage::new(ExecutionMode::DualDispatch)),
-            Box::new(ResponseProcessingStage::new(
-                processor,
-                streaming_processor.clone(),
-            )),
+            Box::new(ResponseProcessingStage::new(processor, streaming_processor)),
         ];
 
         Self {
@@ -1047,8 +1006,8 @@ impl ChatCompletionPipeline {
     /// Execute the complete pipeline for a chat request
     pub async fn execute_chat(
         &self,
-        request: ChatCompletionRequest,
-        headers: Option<axum::http::HeaderMap>,
+        request: Arc<ChatCompletionRequest>,
+        headers: Option<http::HeaderMap>,
         model_id: Option<String>,
         components: Arc<SharedComponents>,
     ) -> Response {
@@ -1056,15 +1015,9 @@ impl ChatCompletionPipeline {
 
         // Execute each stage in sequence
         for (idx, stage) in self.stages.iter().enumerate() {
-            debug!("Executing stage {}: {}", idx + 1, stage.name());
             match stage.execute(&mut ctx).await {
                 Ok(Some(response)) => {
                     // Stage completed successfully with a response (e.g., streaming)
-                    debug!(
-                        "Stage {} ({}) completed with response",
-                        idx + 1,
-                        stage.name()
-                    );
                     return response;
                 }
                 Ok(None) => {
@@ -1097,8 +1050,8 @@ impl ChatCompletionPipeline {
     /// Execute the complete pipeline for a generate request
     pub async fn execute_generate(
         &self,
-        request: GenerateRequest,
-        headers: Option<axum::http::HeaderMap>,
+        request: Arc<GenerateRequest>,
+        headers: Option<http::HeaderMap>,
         model_id: Option<String>,
         components: Arc<SharedComponents>,
     ) -> Response {
@@ -1106,15 +1059,9 @@ impl ChatCompletionPipeline {
 
         // Execute each stage in sequence
         for (idx, stage) in self.stages.iter().enumerate() {
-            debug!("Executing stage {}: {}", idx + 1, stage.name());
             match stage.execute(&mut ctx).await {
                 Ok(Some(response)) => {
                     // Stage completed successfully with a response (e.g., streaming)
-                    debug!(
-                        "Stage {} ({}) completed with response",
-                        idx + 1,
-                        stage.name()
-                    );
                     return response;
                 }
                 Ok(None) => {
@@ -1136,7 +1083,7 @@ impl ChatCompletionPipeline {
 
         // Extract final response
         match ctx.state.response.final_response {
-            Some(FinalResponse::Generate(response)) => axum::Json(*response).into_response(),
+            Some(FinalResponse::Generate(response)) => axum::Json(response).into_response(),
             Some(FinalResponse::Chat(_)) => {
                 utils::internal_error_static("Internal error: wrong response type")
             }

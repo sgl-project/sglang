@@ -1,16 +1,7 @@
 //! Shared utilities for gRPC routers
 
-use super::ProcessedMessages;
-use crate::core::Worker;
-use crate::grpc_client::{proto, SglangSchedulerClient};
-use crate::protocols::spec::{
-    ChatCompletionRequest, ChatLogProbs, ChatLogProbsContent, ChatMessage, FunctionCallResponse,
-    StringOrArray, Tool, ToolCall, ToolChoice, ToolChoiceValue, TopLogProb,
-};
-use crate::tokenizer::chat_template::{ChatTemplateContentFormat, ChatTemplateParams};
-use crate::tokenizer::traits::Tokenizer;
-use crate::tokenizer::HuggingFaceTokenizer;
-pub use crate::tokenizer::StopSequenceDecoder;
+use std::{collections::HashMap, sync::Arc};
+
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -18,11 +9,29 @@ use axum::{
 };
 use futures::StreamExt;
 use serde_json::{json, Map, Value};
-use std::collections::HashMap;
-use std::sync::Arc;
-use tonic::codec::Streaming;
-use tracing::{debug, error, warn};
+use tracing::{error, warn};
 use uuid::Uuid;
+
+use super::ProcessedMessages;
+pub use crate::tokenizer::StopSequenceDecoder;
+use crate::{
+    core::Worker,
+    grpc_client::{proto, sglang_scheduler::AbortOnDropStream, SglangSchedulerClient},
+    protocols::{
+        chat::{ChatCompletionRequest, ChatMessage},
+        common::{
+            ChatLogProbs, ChatLogProbsContent, FunctionCallResponse, StringOrArray, Tool, ToolCall,
+            ToolChoice, ToolChoiceValue, TopLogProb,
+        },
+        generate::GenerateFinishReason,
+    },
+    tokenizer::{
+        cache::CachedTokenizer,
+        chat_template::{ChatTemplateContentFormat, ChatTemplateParams},
+        traits::Tokenizer,
+        HuggingFaceTokenizer,
+    },
+};
 
 /// Get gRPC client from worker, returning appropriate error response on failure
 pub async fn get_grpc_client_from_worker(
@@ -34,8 +43,7 @@ pub async fn get_grpc_client_from_worker(
         .map_err(|e| internal_error_message(format!("Failed to get gRPC client: {}", e)))?
         .ok_or_else(|| internal_error_static("Selected worker is not configured for gRPC"))?;
 
-    let client = client_arc.lock().await.clone();
-    Ok(client)
+    Ok((*client_arc).clone())
 }
 
 /// Process tool call arguments in messages
@@ -158,51 +166,54 @@ pub fn generate_tool_constraints(
     tools: &[Tool],
     tool_choice: &Option<ToolChoice>,
     _model: &str,
-) -> Option<(String, String)> {
-    let choice = tool_choice.as_ref()?;
+) -> Result<Option<(String, String)>, String> {
+    let Some(choice) = tool_choice.as_ref() else {
+        return Ok(None);
+    };
 
     match choice {
         // Specific function: Return parameters schema directly
         // tools should already be filtered to contain only the specific function
         ToolChoice::Function { .. } => {
             if tools.is_empty() {
-                return None;
+                return Ok(None);
             }
             let tool = &tools[0];
 
             // Return the tool's parameters schema directly (not wrapped in array)
-            let params_schema = serde_json::to_string(&tool.function.parameters).ok()?;
-            Some(("json_schema".to_string(), params_schema))
+            let params_schema = serde_json::to_string(&tool.function.parameters)
+                .map_err(|e| format!("Failed to serialize tool parameters: {}", e))?;
+            Ok(Some(("json_schema".to_string(), params_schema)))
         }
 
         // Required: Array of tool calls with minItems: 1
         ToolChoice::Value(ToolChoiceValue::Required) => {
             let schema = build_required_array_schema(tools)?;
-            Some(("json_schema".to_string(), schema))
+            Ok(Some(("json_schema".to_string(), schema)))
         }
 
         // AllowedTools with required mode: tools are already filtered
         ToolChoice::AllowedTools { mode, .. } => {
             if mode == "required" {
                 if tools.is_empty() {
-                    return None;
+                    return Ok(None);
                 }
                 let schema = build_required_array_schema(tools)?;
-                Some(("json_schema".to_string(), schema))
+                Ok(Some(("json_schema".to_string(), schema)))
             } else {
                 // "auto" mode - no constraint needed
-                None
+                Ok(None)
             }
         }
 
         // "auto" or "none" - no constraint
-        _ => None,
+        _ => Ok(None),
     }
 }
 
 /// Build JSON schema for required tool calls (array with minItems: 1)
 /// Includes $defs consolidation from all tools (matching Python's behavior)
-pub fn build_required_array_schema(tools: &[Tool]) -> Option<String> {
+pub fn build_required_array_schema(tools: &[Tool]) -> Result<String, String> {
     // Build anyOf schemas for each tool
     let mut any_of_schemas = Vec::new();
     for tool in tools {
@@ -228,11 +239,12 @@ pub fn build_required_array_schema(tools: &[Tool]) -> Option<String> {
                     if let Some(existing) = all_defs.get(def_name) {
                         // Check for conflicts
                         if existing != def_schema {
-                            error!(
-                                "Tool definition '{}' has multiple schemas, which is not supported",
+                            let error_msg = format!(
+                                "Tool definition '{}' has multiple conflicting schemas, which is not supported",
                                 def_name
                             );
-                            return None;
+                            error!("{}", error_msg);
+                            return Err(error_msg);
                         }
                     } else {
                         all_defs.insert(def_name.clone(), def_schema.clone());
@@ -260,7 +272,8 @@ pub fn build_required_array_schema(tools: &[Tool]) -> Option<String> {
         }
     }
 
-    serde_json::to_string(&array_schema).ok()
+    serde_json::to_string(&array_schema)
+        .map_err(|e| format!("Failed to serialize tool schema: {}", e))
 }
 
 /// Filter tools based on tool_choice (shared by both routers)
@@ -305,9 +318,24 @@ pub fn process_chat_messages(
     tokenizer: &dyn Tokenizer,
 ) -> Result<ProcessedMessages, String> {
     // Use the tokenizer's chat template - we require HuggingFace tokenizer for gRPC
-    let formatted_text = if let Some(hf_tokenizer) =
-        tokenizer.as_any().downcast_ref::<HuggingFaceTokenizer>()
-    {
+    // First try direct downcast, then try via CachedTokenizer wrapper
+    let hf_tokenizer = tokenizer
+        .as_any()
+        .downcast_ref::<HuggingFaceTokenizer>()
+        .or_else(|| {
+            // If direct downcast fails, try to get inner tokenizer from CachedTokenizer
+            tokenizer
+                .as_any()
+                .downcast_ref::<CachedTokenizer>()
+                .and_then(|cached| {
+                    cached
+                        .inner()
+                        .as_any()
+                        .downcast_ref::<HuggingFaceTokenizer>()
+                })
+        });
+
+    let formatted_text = if let Some(hf_tokenizer) = hf_tokenizer {
         // Get content format and transform messages accordingly
         let content_format = hf_tokenizer.chat_template_content_format();
         let mut transformed_messages = process_content_format(&request.messages, content_format)?;
@@ -522,7 +550,7 @@ pub fn parse_json_schema_response(
             match serde_json::from_str::<Value>(processed_text) {
                 Ok(params) => {
                     let tool_call = ToolCall {
-                        id: format!("call_{}", uuid::Uuid::new_v4()),
+                        id: format!("call_{}", Uuid::new_v4()),
                         tool_type: "function".to_string(),
                         function: FunctionCallResponse {
                             name: function.name.clone(),
@@ -553,7 +581,7 @@ pub fn parse_json_schema_response(
                             let parameters = obj.get("parameters")?;
 
                             Some(ToolCall {
-                                id: format!("call_{}_{}", i, uuid::Uuid::new_v4()),
+                                id: format!("call_{}_{}", i, Uuid::new_v4()),
                                 tool_type: "function".to_string(),
                                 function: FunctionCallResponse {
                                     name,
@@ -590,7 +618,7 @@ pub fn parse_json_schema_response(
 /// * `Ok(Vec<GenerateComplete>)` - All complete responses collected from the stream
 /// * `Err(Response)` - Error response if the stream fails or returns an error
 pub async fn collect_stream_responses(
-    mut stream: Streaming<proto::GenerateResponse>,
+    stream: &mut AbortOnDropStream,
     worker_name: &str,
 ) -> Result<Vec<proto::GenerateComplete>, Response> {
     use proto::generate_response::Response::*;
@@ -602,29 +630,27 @@ pub async fn collect_stream_responses(
             Ok(gen_response) => {
                 match gen_response.response {
                     Some(Complete(complete)) => {
-                        debug!(
-                        "{} completed: prompt_tokens={}, completion_tokens={}, finish_reason={}",
-                        worker_name, complete.prompt_tokens, complete.completion_tokens, complete.finish_reason
-                    );
                         all_responses.push(complete);
                     }
                     Some(Error(err)) => {
                         error!("{} error: {}", worker_name, err.message);
+                        // Don't mark as completed - let Drop send abort for error cases
                         return Err(internal_error_message(format!(
                             "{} generation failed: {}",
                             worker_name, err.message
                         )));
                     }
-                    Some(Chunk(chunk)) => {
-                        debug!("{} chunk: {} tokens", worker_name, chunk.token_ids.len());
+                    Some(Chunk(_chunk)) => {
+                        // Streaming chunk - no action needed
                     }
                     None => {
-                        debug!("{}: empty response", worker_name);
+                        // Empty response - no action needed
                     }
                 }
             }
             Err(e) => {
                 error!("{} stream error: {:?}", worker_name, e);
+                // Don't mark as completed - let Drop send abort for error cases
                 return Err(internal_error_message(format!(
                     "{} stream failed: {}",
                     worker_name, e
@@ -633,7 +659,6 @@ pub async fn collect_stream_responses(
         }
     }
 
-    debug!("{} stream closed", worker_name);
     Ok(all_responses)
 }
 
@@ -678,17 +703,44 @@ pub fn generate_tool_call_id(
     }
 }
 
+/// Check if a reasoning parser is available for the given model
+pub fn check_reasoning_parser_availability(
+    reasoning_parser_factory: &crate::reasoning_parser::ParserFactory,
+    configured_parser: Option<&String>,
+    model: &str,
+) -> bool {
+    if let Some(parser_name) = configured_parser {
+        reasoning_parser_factory.registry().has_parser(parser_name)
+    } else {
+        reasoning_parser_factory
+            .registry()
+            .has_parser_for_model(model)
+    }
+}
+
+/// Check if a tool parser is available for the given model
+pub fn check_tool_parser_availability(
+    tool_parser_factory: &crate::tool_parser::ParserFactory,
+    configured_parser: Option<&String>,
+    model: &str,
+) -> bool {
+    if let Some(parser_name) = configured_parser {
+        tool_parser_factory.registry().has_parser(parser_name)
+    } else {
+        tool_parser_factory.registry().has_parser_for_model(model)
+    }
+}
+
 /// Get the appropriate reasoning parser for a model
 ///
 /// If a parser name is explicitly configured, use that parser.
 /// Otherwise, auto-detect based on the model name.
+/// Get a pooled reasoning parser (for non-streaming where state doesn't matter)
 pub fn get_reasoning_parser(
-    reasoning_parser_factory: &crate::reasoning_parser::ReasoningParserFactory,
+    reasoning_parser_factory: &crate::reasoning_parser::ParserFactory,
     configured_parser: Option<&String>,
     model: &str,
 ) -> crate::reasoning_parser::PooledParser {
-    use tracing::warn;
-
     if let Some(parser_name) = configured_parser {
         // Use configured parser if specified
         reasoning_parser_factory
@@ -707,17 +759,40 @@ pub fn get_reasoning_parser(
     }
 }
 
+/// Create a fresh reasoning parser instance (for streaming where state isolation is needed)
+pub fn create_reasoning_parser(
+    reasoning_parser_factory: &crate::reasoning_parser::ParserFactory,
+    configured_parser: Option<&String>,
+    model: &str,
+) -> Option<Box<dyn crate::reasoning_parser::ReasoningParser>> {
+    if let Some(parser_name) = configured_parser {
+        // Use configured parser if specified
+        reasoning_parser_factory
+            .registry()
+            .create_parser(parser_name)
+            .or_else(|| {
+                warn!(
+                    "Configured reasoning parser '{}' not found, falling back to model-based selection",
+                    parser_name
+                );
+                reasoning_parser_factory.registry().create_for_model(model)
+            })
+    } else {
+        // Auto-detect based on model
+        reasoning_parser_factory.registry().create_for_model(model)
+    }
+}
+
 /// Get the appropriate tool parser for a model
 ///
 /// If a parser name is explicitly configured, use that parser.
 /// Otherwise, auto-detect based on the model name.
+/// Get a pooled tool parser (for non-streaming where state doesn't matter)
 pub fn get_tool_parser(
-    tool_parser_factory: &crate::tool_parser::ToolParserFactory,
+    tool_parser_factory: &crate::tool_parser::ParserFactory,
     configured_parser: Option<&String>,
     model: &str,
-) -> crate::tool_parser::PooledToolParser {
-    use tracing::warn;
-
+) -> crate::tool_parser::PooledParser {
     if let Some(parser_name) = configured_parser {
         // Use configured parser if specified
         tool_parser_factory
@@ -733,6 +808,30 @@ pub fn get_tool_parser(
     } else {
         // Auto-detect based on model
         tool_parser_factory.get_pooled(model)
+    }
+}
+
+/// Create a fresh tool parser instance (for streaming where state isolation is needed)
+pub fn create_tool_parser(
+    tool_parser_factory: &crate::tool_parser::ParserFactory,
+    configured_parser: Option<&String>,
+    model: &str,
+) -> Option<Box<dyn crate::tool_parser::ToolParser>> {
+    if let Some(parser_name) = configured_parser {
+        // Use configured parser if specified
+        tool_parser_factory
+            .registry()
+            .create_parser(parser_name)
+            .or_else(|| {
+                warn!(
+                    "Configured tool parser '{}' not found, falling back to model-based selection",
+                    parser_name
+                );
+                tool_parser_factory.registry().create_for_model(model)
+            })
+    } else {
+        // Auto-detect based on model
+        tool_parser_factory.registry().create_for_model(model)
     }
 }
 
@@ -809,17 +908,86 @@ pub fn convert_proto_to_openai_logprobs(
     })
 }
 
+/// Convert proto::OutputLogProbs to Generate format Vec<Vec<Option<f64>>>
+///
+/// Generate format: [[logprob, token_id, ...], [logprob, token_id, ...], ...]
+/// Each inner vec contains [logprob (f64), token_id (i32), ...]
+pub fn convert_generate_output_logprobs(
+    proto_logprobs: &proto::OutputLogProbs,
+) -> Vec<Vec<Option<f64>>> {
+    proto_logprobs
+        .token_logprobs
+        .iter()
+        .zip(proto_logprobs.token_ids.iter())
+        .map(|(&logprob, &token_id)| vec![Some(logprob as f64), Some(token_id as f64)])
+        .collect()
+}
+
+/// Convert proto::InputLogProbs to Generate format Vec<Vec<Option<f64>>>
+///
+/// Generate format: [[logprob, token_id, ...], [logprob, token_id, ...], ...]
+/// First token has null logprob: [[null, token_id], [logprob, token_id], ...]
+pub fn convert_generate_input_logprobs(
+    proto_logprobs: &proto::InputLogProbs,
+) -> Vec<Vec<Option<f64>>> {
+    proto_logprobs
+        .token_logprobs
+        .iter()
+        .zip(proto_logprobs.token_ids.iter())
+        .map(|(token_logprob, &token_id)| {
+            // InputTokenLogProb has optional value field
+            let logprob_value = token_logprob.value.map(|v| v as f64);
+            vec![logprob_value, Some(token_id as f64)]
+        })
+        .collect()
+}
+
+/// Parse finish_reason string into GenerateFinishReason enum
+///
+/// Uses serde to deserialize the finish_reason, which handles all tagged variants automatically.
+/// The GenerateFinishReason enum is tagged with `#[serde(tag = "type", rename_all = "lowercase")]`,
+/// so it expects JSON objects like:
+/// - `{"type":"stop"}` -> Stop
+/// - `{"type":"length","length":100}` -> Length { length: 100 }
+/// - Any other JSON -> Other(...)
+///
+/// For backward compatibility, also handles simple string "stop" -> Stop
+pub fn parse_finish_reason(reason_str: &str, completion_tokens: i32) -> GenerateFinishReason {
+    if reason_str == "stop" {
+        return GenerateFinishReason::Stop;
+    }
+
+    if reason_str == "length" {
+        return GenerateFinishReason::Length {
+            length: completion_tokens.max(0) as u32,
+        };
+    }
+
+    match serde_json::from_str::<GenerateFinishReason>(reason_str) {
+        Ok(finish_reason) => finish_reason,
+        Err(_) => match serde_json::from_str::<Value>(reason_str) {
+            Ok(json_value) => GenerateFinishReason::Other(json_value),
+            Err(_) => GenerateFinishReason::Other(Value::String(reason_str.to_string())),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::protocols::spec::{ChatMessage, ContentPart, ImageUrl, UserMessageContent};
-    use crate::tokenizer::chat_template::ChatTemplateContentFormat;
     use serde_json::json;
+
+    use super::*;
+    use crate::{
+        protocols::{
+            chat::{ChatMessage, UserMessageContent},
+            common::{ContentPart, ImageUrl},
+        },
+        tokenizer::chat_template::ChatTemplateContentFormat,
+    };
 
     #[test]
     fn test_transform_messages_string_format() {
         let messages = vec![ChatMessage::User {
-            role: "user".to_string(),
             content: UserMessageContent::Parts(vec![
                 ContentPart::Text {
                     text: "Hello".to_string(),
@@ -853,7 +1021,6 @@ mod tests {
     #[test]
     fn test_transform_messages_openai_format() {
         let messages = vec![ChatMessage::User {
-            role: "user".to_string(),
             content: UserMessageContent::Parts(vec![
                 ContentPart::Text {
                     text: "Describe this image:".to_string(),
@@ -888,7 +1055,6 @@ mod tests {
     #[test]
     fn test_transform_messages_simple_string_content() {
         let messages = vec![ChatMessage::User {
-            role: "user".to_string(),
             content: UserMessageContent::Text("Simple text message".to_string()),
             name: None,
         }];
@@ -909,12 +1075,10 @@ mod tests {
     fn test_transform_messages_multiple_messages() {
         let messages = vec![
             ChatMessage::System {
-                role: "system".to_string(),
                 content: "System prompt".to_string(),
                 name: None,
             },
             ChatMessage::User {
-                role: "user".to_string(),
                 content: UserMessageContent::Parts(vec![
                     ContentPart::Text {
                         text: "User message".to_string(),
@@ -946,7 +1110,6 @@ mod tests {
     #[test]
     fn test_transform_messages_empty_text_parts() {
         let messages = vec![ChatMessage::User {
-            role: "user".to_string(),
             content: UserMessageContent::Parts(vec![ContentPart::ImageUrl {
                 image_url: ImageUrl {
                     url: "https://example.com/image.jpg".to_string(),
@@ -969,12 +1132,10 @@ mod tests {
     fn test_transform_messages_mixed_content_types() {
         let messages = vec![
             ChatMessage::User {
-                role: "user".to_string(),
                 content: UserMessageContent::Text("Plain text".to_string()),
                 name: None,
             },
             ChatMessage::User {
-                role: "user".to_string(),
                 content: UserMessageContent::Parts(vec![
                     ContentPart::Text {
                         text: "With image".to_string(),

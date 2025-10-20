@@ -1,8 +1,7 @@
-import os
-import time
 import unittest
 from types import SimpleNamespace
 
+from sglang.srt.environ import envs
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_disaggregation_utils import TestDisaggregationBase
 from sglang.test.test_utils import (
@@ -10,6 +9,7 @@ from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST_MLA,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     popen_launch_pd_server,
+    try_cached_model,
 )
 
 
@@ -18,10 +18,9 @@ class TestDisaggregationMooncakePrefillLargerTP(TestDisaggregationBase):
     def setUpClass(cls):
         super().setUpClass()
         # Temporarily disable JIT DeepGEMM
-        cls.original_jit_deepgemm = os.environ.get("SGL_ENABLE_JIT_DEEPGEMM")
-        os.environ["SGL_ENABLE_JIT_DEEPGEMM"] = "false"
+        envs.SGLANG_ENABLE_JIT_DEEPGEMM.set(False)
 
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
+        cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST_MLA)
 
         # Non blocking start servers
         cls.start_prefill()
@@ -41,9 +40,8 @@ class TestDisaggregationMooncakePrefillLargerTP(TestDisaggregationBase):
             "prefill",
             "--tp",
             "4",
-            "--disaggregation-ib-device",
-            "mlx5_roce0,mlx5_roce1",
         ]
+        prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
             cls.model,
             cls.prefill_url,
@@ -61,9 +59,8 @@ class TestDisaggregationMooncakePrefillLargerTP(TestDisaggregationBase):
             "2",
             "--base-gpu-id",
             "4",
-            "--disaggregation-ib-device",
-            "mlx5_roce4,mlx5_roce5",
         ]
+        decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
             cls.model,
             cls.decode_url,
@@ -92,10 +89,9 @@ class TestDisaggregationMooncakeDecodeLargerTP(TestDisaggregationBase):
     def setUpClass(cls):
         super().setUpClass()
         # Temporarily disable JIT DeepGEMM
-        cls.original_jit_deepgemm = os.environ.get("SGL_ENABLE_JIT_DEEPGEMM")
-        os.environ["SGL_ENABLE_JIT_DEEPGEMM"] = "false"
+        envs.SGLANG_ENABLE_JIT_DEEPGEMM.set(False)
 
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
+        cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST_MLA)
 
         # Non blocking start servers
         cls.start_prefill()
@@ -115,9 +111,8 @@ class TestDisaggregationMooncakeDecodeLargerTP(TestDisaggregationBase):
             "prefill",
             "--tp",
             "2",
-            "--disaggregation-ib-device",
-            "mlx5_roce0,mlx5_roce1",
         ]
+        prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
             cls.model,
             cls.prefill_url,
@@ -135,9 +130,8 @@ class TestDisaggregationMooncakeDecodeLargerTP(TestDisaggregationBase):
             "4",
             "--base-gpu-id",
             "4",
-            "--disaggregation-ib-device",
-            "mlx5_roce4,mlx5_roce5",
         ]
+        decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
             cls.model,
             cls.decode_url,
@@ -166,10 +160,9 @@ class TestDisaggregationMooncakeMHAPrefillLargerTP(TestDisaggregationBase):
     def setUpClass(cls):
         super().setUpClass()
         # Temporarily disable JIT DeepGEMM
-        cls.original_jit_deepgemm = os.environ.get("SGL_ENABLE_JIT_DEEPGEMM")
-        os.environ["SGL_ENABLE_JIT_DEEPGEMM"] = "false"
+        envs.SGLANG_ENABLE_JIT_DEEPGEMM.set(False)
 
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST)
 
         # Non blocking start servers
         cls.start_prefill()
@@ -189,9 +182,8 @@ class TestDisaggregationMooncakeMHAPrefillLargerTP(TestDisaggregationBase):
             "prefill",
             "--tp",
             "4",
-            "--disaggregation-ib-device",
-            "mlx5_roce0,mlx5_roce1",
         ]
+        prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
             cls.model,
             cls.prefill_url,
@@ -209,9 +201,8 @@ class TestDisaggregationMooncakeMHAPrefillLargerTP(TestDisaggregationBase):
             "2",
             "--base-gpu-id",
             "4",
-            "--disaggregation-ib-device",
-            "mlx5_roce4,mlx5_roce5",
         ]
+        decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
             cls.model,
             cls.decode_url,
@@ -240,10 +231,9 @@ class TestDisaggregationMooncakeMHADecodeLargerTP(TestDisaggregationBase):
     def setUpClass(cls):
         super().setUpClass()
         # Temporarily disable JIT DeepGEMM
-        cls.original_jit_deepgemm = os.environ.get("SGL_ENABLE_JIT_DEEPGEMM")
-        os.environ["SGL_ENABLE_JIT_DEEPGEMM"] = "false"
+        envs.SGLANG_ENABLE_JIT_DEEPGEMM.set(False)
 
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST)
 
         # Non blocking start servers
         cls.start_prefill()
@@ -263,9 +253,8 @@ class TestDisaggregationMooncakeMHADecodeLargerTP(TestDisaggregationBase):
             "prefill",
             "--tp",
             "2",
-            "--disaggregation-ib-device",
-            "mlx5_roce0,mlx5_roce1",
         ]
+        prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
             cls.model,
             cls.prefill_url,
@@ -283,9 +272,8 @@ class TestDisaggregationMooncakeMHADecodeLargerTP(TestDisaggregationBase):
             "4",
             "--base-gpu-id",
             "4",
-            "--disaggregation-ib-device",
-            "mlx5_roce4,mlx5_roce5",
         ]
+        decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
             cls.model,
             cls.decode_url,

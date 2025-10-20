@@ -1,25 +1,35 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, List
 
 import torch
 import triton
 import triton.language as tl
+from huggingface_hub import snapshot_download
 
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
+from sglang.srt.distributed.parallel_state import (
+    GroupCoordinator,
+    patch_tensor_parallel_group,
+)
 from sglang.srt.environ import envs
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.utils import is_cuda, is_hip
+
+if TYPE_CHECKING:
+    from sglang.srt.speculative.eagle_info import EagleVerifyInput
+
 
 if is_cuda():
     from sgl_kernel import fast_topk
 elif is_hip():
     from sgl_kernel import fast_topk
 
-if TYPE_CHECKING:
-    from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
 logger = logging.getLogger(__name__)
 
@@ -435,7 +445,7 @@ def select_top_k_tokens(
     return input_ids, hidden_states, scores, tree_info
 
 
-def _generate_simulated_accept_index(
+def generate_simulated_accept_index(
     accept_index,
     predict,
     accept_length,
@@ -603,3 +613,29 @@ def generate_token_bitmask(
 
     verify_input.grammar = grammar
     return allocate_token_bitmask
+
+
+def load_token_map(token_map_path: str) -> List[int]:
+    if not os.path.exists(token_map_path):
+        cache_dir = snapshot_download(
+            os.path.dirname(token_map_path),
+            ignore_patterns=["*.bin", "*.safetensors"],
+        )
+        token_map_path = os.path.join(cache_dir, os.path.basename(token_map_path))
+    hot_token_id = torch.load(token_map_path, weights_only=True)
+    return torch.tensor(hot_token_id, dtype=torch.int64)
+
+
+@contextmanager
+def draft_tp_context(tp_group: GroupCoordinator):
+    # Draft model doesn't use dp and has its own tp group.
+    # We disable mscclpp now because it doesn't support 2 comm groups.
+    with patch_tensor_parallel_group(tp_group):
+        yield
+
+
+def detect_nan(logits_output: LogitsProcessorOutput):
+    logits = logits_output.next_token_logits
+    if torch.any(torch.isnan(logits)):
+        logger.error("Detected errors during sampling! NaN in the logits.")
+        raise ValueError("Detected errors during sampling! NaN in the logits.")
