@@ -2166,6 +2166,12 @@ class Scheduler(
         batch.prepare_for_decode()
         return batch
 
+    # placeholder for override
+    def update_cache_from_scheduler(
+        self, schedule_batch: ScheduleBatch, batch_result: GenerationBatchResult
+    ):
+        pass
+
     def run_batch(
         self, batch: ScheduleBatch
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
@@ -2242,6 +2248,7 @@ class Scheduler(
                     batch_or_worker_batch
                 )
                 future_indices_or_next_token_ids = batch_result.next_token_ids
+                self.update_cache_from_scheduler(batch, batch_result)
 
             # NOTE: future_indices_or_next_token_ids is used in ScheduleBatch,
             #       which can probably be replaced by future_indices later [TODO(lsyin)].
@@ -2332,6 +2339,7 @@ class Scheduler(
             speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
             require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),
             disable_overlap_schedule=self.server_args.disable_overlap_schedule,
+            offload_tags=self.offload_tags,
         )
 
     @staticmethod
@@ -2346,6 +2354,7 @@ class Scheduler(
         speculative_num_draft_tokens,
         require_mlp_tp_gather: bool,
         disable_overlap_schedule: bool,
+        offload_tags: set[str],
     ):
         # Check if other DP workers have running batches
         if local_batch is None:
@@ -2376,7 +2385,7 @@ class Scheduler(
         )
 
         tbo_preparer = TboDPAttentionPreparer()
-        if disable_overlap_schedule:
+        if len(offload_tags) == 0 and disable_overlap_schedule:
             group = tp_group.device_group
             device = tp_group.device
         else:
