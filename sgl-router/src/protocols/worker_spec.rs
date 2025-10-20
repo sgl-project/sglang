@@ -76,6 +76,10 @@ pub struct WorkerConfigRequest {
     /// Maximum connection attempts during worker registration (default: 20)
     #[serde(default = "default_max_connection_attempts")]
     pub max_connection_attempts: u32,
+
+    /// Enable data parallelism aware scheduling (default: false)
+    #[serde(default)]
+    pub dp_aware: bool,
 }
 
 // Default value functions for serde

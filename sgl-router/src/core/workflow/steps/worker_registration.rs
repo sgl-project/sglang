@@ -5,9 +5,11 @@
 //! Workflow order:
 //! 1. DetectConnectionMode - Probe both HTTP and gRPC to determine connection mode
 //! 2. DiscoverMetadata - Fetch metadata from the worker
-//! 3. CreateWorker - Build worker object with merged config + metadata
-//! 4. RegisterWorker - Register worker in registry (once!)
-//! 5. ActivateWorker - Mark worker as healthy
+//! 3. DiscoverDPInfo - Fetch DP (Data Parallel) information (only for DP-aware workers)
+//! 4. CreateWorker - Build worker object(s) with merged config + metadata
+//! 5. RegisterWorker - Register worker(s) in registry
+//! 6. UpdatePolicies - Update policy registry with worker information
+//! 7. ActivateWorker - Mark worker(s) as healthy
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
@@ -19,8 +21,8 @@ use tracing::{info, warn};
 
 use crate::{
     core::{
-        workflow::*, BasicWorkerBuilder, CircuitBreakerConfig, ConnectionMode, HealthConfig,
-        Worker, WorkerType,
+        workflow::*, BasicWorkerBuilder, CircuitBreakerConfig, ConnectionMode,
+        DPAwareWorkerBuilder, DpInfo, HealthConfig, Worker, WorkerManager, WorkerType,
     },
     grpc_client::SglangSchedulerClient,
     protocols::worker_spec::WorkerConfigRequest,
@@ -290,6 +292,51 @@ impl StepExecutor for DiscoverMetadataStep {
     }
 }
 
+/// Step 2.5: Discover DP (Data Parallel) information (only for DP-aware workers)
+pub struct DiscoverDPInfoStep;
+
+#[async_trait]
+impl StepExecutor for DiscoverDPInfoStep {
+    async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
+        let config: Arc<WorkerConfigRequest> = context
+            .get("worker_config")
+            .ok_or_else(|| WorkflowError::ContextValueNotFound("worker_config".to_string()))?;
+
+        // Skip DP discovery if not DP-aware
+        if !config.dp_aware {
+            info!(
+                "Worker {} is not DP-aware, skipping DP discovery",
+                config.url
+            );
+            return Ok(StepResult::Success);
+        }
+
+        info!("Discovering DP info for {} (DP-aware)", config.url);
+
+        // Get DP info from worker
+        let dp_info = WorkerManager::get_dp_info(&config.url, config.api_key.as_deref())
+            .await
+            .map_err(|e| WorkflowError::StepFailed {
+                step_id: StepId::new("discover_dp_info"),
+                message: format!("Failed to get DP info: {}", e),
+            })?;
+
+        info!(
+            "Discovered DP size {} for {} (model: {})",
+            dp_info.dp_size, config.url, dp_info.model_id
+        );
+
+        // Store DP info in context
+        context.set("dp_info", Arc::new(dp_info));
+
+        Ok(StepResult::Success)
+    }
+
+    fn is_retryable(&self, _error: &WorkflowError) -> bool {
+        true // DP info discovery failures are retryable
+    }
+}
+
 /// Step 3: Create worker object with merged configuration + metadata
 pub struct CreateWorkerStep;
 
@@ -408,40 +455,85 @@ impl StepExecutor for CreateWorkerStep {
             }
         };
 
-        // Build worker with merged labels
-        let mut builder = BasicWorkerBuilder::new(config.url.clone())
-            .worker_type(worker_type)
-            .connection_mode(connection_mode.as_ref().clone())
-            .circuit_breaker_config(circuit_breaker_config)
-            .health_config(health_config);
+        // Handle DP-aware vs non-DP-aware workers
+        if config.dp_aware {
+            // DP-aware path: Create multiple workers (one per rank)
+            let dp_info: Arc<DpInfo> = context
+                .get("dp_info")
+                .ok_or_else(|| WorkflowError::ContextValueNotFound("dp_info".to_string()))?;
 
-        if let Some(ref api_key) = config.api_key {
-            builder = builder.api_key(api_key.clone());
+            info!(
+                "Creating {} DP-aware workers for {} (dp_size: {})",
+                dp_info.dp_size, config.url, dp_info.dp_size
+            );
+
+            let mut workers = Vec::new();
+            for rank in 0..dp_info.dp_size {
+                let mut builder =
+                    DPAwareWorkerBuilder::new(config.url.clone(), rank, dp_info.dp_size)
+                        .worker_type(worker_type.clone())
+                        .connection_mode(connection_mode.as_ref().clone())
+                        .circuit_breaker_config(circuit_breaker_config.clone())
+                        .health_config(health_config.clone());
+
+                if let Some(ref api_key) = config.api_key {
+                    builder = builder.api_key(api_key.clone());
+                }
+
+                if !final_labels.is_empty() {
+                    builder = builder.labels(final_labels.clone());
+                }
+
+                let worker = Arc::new(builder.build()) as Arc<dyn Worker>;
+                worker.set_healthy(false);
+                workers.push(worker);
+
+                info!(
+                    "Created DP-aware worker {}@{}/{} ({:?})",
+                    config.url,
+                    rank,
+                    dp_info.dp_size,
+                    connection_mode.as_ref()
+                );
+            }
+
+            // Store workers (plural) and labels in context
+            context.set("workers", Arc::new(workers));
+            context.set("labels", final_labels);
+
+            Ok(StepResult::Success)
+        } else {
+            // Non-DP-aware path: Create single worker
+            let mut builder = BasicWorkerBuilder::new(config.url.clone())
+                .worker_type(worker_type)
+                .connection_mode(connection_mode.as_ref().clone())
+                .circuit_breaker_config(circuit_breaker_config)
+                .health_config(health_config);
+
+            if let Some(ref api_key) = config.api_key {
+                builder = builder.api_key(api_key.clone());
+            }
+
+            if !final_labels.is_empty() {
+                builder = builder.labels(final_labels.clone());
+            }
+
+            let worker = Arc::new(builder.build()) as Arc<dyn Worker>;
+            worker.set_healthy(false);
+
+            info!(
+                "Created worker object for {} ({:?}) with {} labels",
+                config.url,
+                connection_mode.as_ref(),
+                final_labels.len()
+            );
+
+            // Store worker (singular) and labels in context
+            context.set("worker", worker);
+            context.set("labels", final_labels);
+
+            Ok(StepResult::Success)
         }
-
-        // Add merged labels to worker
-        if !final_labels.is_empty() {
-            builder = builder.labels(final_labels.clone());
-        }
-
-        // Build worker
-        let worker = Arc::new(builder.build()) as Arc<dyn Worker>;
-
-        // Mark as unhealthy initially (will be activated later)
-        worker.set_healthy(false);
-
-        info!(
-            "Created worker object for {} ({:?}) with {} labels",
-            config.url,
-            connection_mode.as_ref(),
-            final_labels.len()
-        );
-
-        // Store worker and labels in context
-        context.set("worker", worker);
-        context.set("labels", final_labels);
-
-        Ok(StepResult::Success)
     }
 
     fn is_retryable(&self, _error: &WorkflowError) -> bool {
@@ -449,7 +541,7 @@ impl StepExecutor for CreateWorkerStep {
     }
 }
 
-/// Step 4: Register worker in registry
+/// Step 4: Register worker(s) in registry
 pub struct RegisterWorkerStep;
 
 #[async_trait]
@@ -458,24 +550,44 @@ impl StepExecutor for RegisterWorkerStep {
         let config: Arc<WorkerConfigRequest> = context
             .get("worker_config")
             .ok_or_else(|| WorkflowError::ContextValueNotFound("worker_config".to_string()))?;
-        let worker: Arc<Arc<dyn Worker>> = context
-            .get("worker")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("worker".to_string()))?;
         let app_context: Arc<AppContext> = context
             .get("app_context")
             .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
 
-        // Register worker in registry (clone the inner Arc<dyn Worker>)
-        let worker_id = app_context
-            .worker_registry
-            .register(Arc::clone(worker.as_ref()));
+        // Check if we have multiple workers (DP-aware) or single worker
+        if config.dp_aware {
+            // DP-aware path: Register multiple workers
+            let workers: Arc<Vec<Arc<dyn Worker>>> = context
+                .get("workers")
+                .ok_or_else(|| WorkflowError::ContextValueNotFound("workers".to_string()))?;
 
-        info!("Registered worker {} with ID {:?}", config.url, worker_id);
+            let mut worker_ids = Vec::new();
+            for worker in workers.iter() {
+                let worker_id = app_context.worker_registry.register(Arc::clone(worker));
+                worker_ids.push(worker_id.clone());
+                info!(
+                    "Registered DP-aware worker {} with ID {:?}",
+                    config.url, worker_id
+                );
+            }
 
-        // Store worker_id in context
-        context.set("worker_id", worker_id);
+            context.set("worker_ids", Arc::new(worker_ids));
+            Ok(StepResult::Success)
+        } else {
+            // Non-DP-aware path: Register single worker
+            let worker: Arc<Arc<dyn Worker>> = context
+                .get("worker")
+                .ok_or_else(|| WorkflowError::ContextValueNotFound("worker".to_string()))?;
 
-        Ok(StepResult::Success)
+            let worker_id = app_context
+                .worker_registry
+                .register(Arc::clone(worker.as_ref()));
+
+            info!("Registered worker {} with ID {:?}", config.url, worker_id);
+            context.set("worker_id", worker_id);
+
+            Ok(StepResult::Success)
+        }
     }
 
     fn is_retryable(&self, _error: &WorkflowError) -> bool {
@@ -492,9 +604,6 @@ impl StepExecutor for UpdatePoliciesStep {
         let config: Arc<WorkerConfigRequest> = context
             .get("worker_config")
             .ok_or_else(|| WorkflowError::ContextValueNotFound("worker_config".to_string()))?;
-        let worker: Arc<Arc<dyn Worker>> = context
-            .get("worker")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("worker".to_string()))?;
         let labels: Arc<HashMap<String, String>> = context
             .get("labels")
             .ok_or_else(|| WorkflowError::ContextValueNotFound("labels".to_string()))?;
@@ -502,29 +611,75 @@ impl StepExecutor for UpdatePoliciesStep {
             .get("app_context")
             .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
 
-        let model_id = worker.model_id().to_string();
         let policy_hint = labels.get("policy").map(|s| s.as_str());
 
-        // Notify policy registry
-        app_context
-            .policy_registry
-            .on_worker_added(&model_id, policy_hint);
+        // Check if we have multiple workers (DP-aware) or single worker
+        if config.dp_aware {
+            // DP-aware path: Update policies for multiple workers
+            let workers: Arc<Vec<Arc<dyn Worker>>> = context
+                .get("workers")
+                .ok_or_else(|| WorkflowError::ContextValueNotFound("workers".to_string()))?;
 
-        // Initialize cache-aware policy if needed
-        let workers = app_context.worker_registry.get_by_model_fast(&model_id);
-        if let Some(policy) = app_context.policy_registry.get_policy(&model_id) {
-            if policy.name() == "cache_aware" {
-                use crate::policies::CacheAwarePolicy;
-                if let Some(cache_aware) = policy.as_any().downcast_ref::<Arc<CacheAwarePolicy>>() {
-                    cache_aware.init_workers(&workers);
+            // Get model_id from first worker (all DP workers have same model)
+            let model_id = workers[0].model_id().to_string();
+
+            // Notify policy registry for each worker
+            for _ in 0..workers.len() {
+                app_context
+                    .policy_registry
+                    .on_worker_added(&model_id, policy_hint);
+            }
+
+            // Initialize cache-aware policy if needed
+            let all_workers = app_context.worker_registry.get_by_model_fast(&model_id);
+            if let Some(policy) = app_context.policy_registry.get_policy(&model_id) {
+                if policy.name() == "cache_aware" {
+                    use crate::policies::CacheAwarePolicy;
+                    if let Some(cache_aware) =
+                        policy.as_any().downcast_ref::<Arc<CacheAwarePolicy>>()
+                    {
+                        cache_aware.init_workers(&all_workers);
+                    }
                 }
             }
-        }
 
-        info!(
-            "Updated policies for worker {} (model: {})",
-            config.url, model_id
-        );
+            info!(
+                "Updated policies for {} DP-aware workers {} (model: {})",
+                workers.len(),
+                config.url,
+                model_id
+            );
+        } else {
+            // Non-DP-aware path: Update policy for single worker
+            let worker: Arc<Arc<dyn Worker>> = context
+                .get("worker")
+                .ok_or_else(|| WorkflowError::ContextValueNotFound("worker".to_string()))?;
+
+            let model_id = worker.model_id().to_string();
+
+            // Notify policy registry
+            app_context
+                .policy_registry
+                .on_worker_added(&model_id, policy_hint);
+
+            // Initialize cache-aware policy if needed
+            let all_workers = app_context.worker_registry.get_by_model_fast(&model_id);
+            if let Some(policy) = app_context.policy_registry.get_policy(&model_id) {
+                if policy.name() == "cache_aware" {
+                    use crate::policies::CacheAwarePolicy;
+                    if let Some(cache_aware) =
+                        policy.as_any().downcast_ref::<Arc<CacheAwarePolicy>>()
+                    {
+                        cache_aware.init_workers(&all_workers);
+                    }
+                }
+            }
+
+            info!(
+                "Updated policies for worker {} (model: {})",
+                config.url, model_id
+            );
+        }
 
         Ok(StepResult::Success)
     }
@@ -534,7 +689,7 @@ impl StepExecutor for UpdatePoliciesStep {
     }
 }
 
-/// Step 6: Activate worker by marking it as healthy
+/// Step 6: Activate worker(s) by marking them as healthy
 pub struct ActivateWorkerStep;
 
 #[async_trait]
@@ -543,14 +698,33 @@ impl StepExecutor for ActivateWorkerStep {
         let config: Arc<WorkerConfigRequest> = context
             .get("worker_config")
             .ok_or_else(|| WorkflowError::ContextValueNotFound("worker_config".to_string()))?;
-        let worker: Arc<Arc<dyn Worker>> = context
-            .get("worker")
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("worker".to_string()))?;
 
-        // Mark worker as healthy
-        worker.set_healthy(true);
+        // Check if we have multiple workers (DP-aware) or single worker
+        if config.dp_aware {
+            // DP-aware path: Activate multiple workers
+            let workers: Arc<Vec<Arc<dyn Worker>>> = context
+                .get("workers")
+                .ok_or_else(|| WorkflowError::ContextValueNotFound("workers".to_string()))?;
 
-        info!("Activated worker {} (marked as healthy)", config.url);
+            for worker in workers.iter() {
+                worker.set_healthy(true);
+            }
+
+            info!(
+                "Activated {} DP-aware workers {} (marked as healthy)",
+                workers.len(),
+                config.url
+            );
+        } else {
+            // Non-DP-aware path: Activate single worker
+            let worker: Arc<Arc<dyn Worker>> = context
+                .get("worker")
+                .ok_or_else(|| WorkflowError::ContextValueNotFound("worker".to_string()))?;
+
+            worker.set_healthy(true);
+
+            info!("Activated worker {} (marked as healthy)", config.url);
+        }
 
         Ok(StepResult::Success)
     }
@@ -596,6 +770,19 @@ pub fn create_worker_registration_workflow() -> WorkflowDefinition {
             })
             .with_timeout(Duration::from_secs(10))
             .with_failure_action(FailureAction::ContinueNextStep), // Metadata discovery is optional
+        )
+        .add_step(
+            StepDefinition::new(
+                "discover_dp_info",
+                "Discover DP Info",
+                Arc::new(DiscoverDPInfoStep),
+            )
+            .with_retry(RetryPolicy {
+                max_attempts: 3,
+                backoff: BackoffStrategy::Fixed(Duration::from_secs(1)),
+            })
+            .with_timeout(Duration::from_secs(10))
+            .with_failure_action(FailureAction::FailWorkflow), // DP info is required for DP-aware workers
         )
         .add_step(
             StepDefinition::new("create_worker", "Create Worker", Arc::new(CreateWorkerStep))

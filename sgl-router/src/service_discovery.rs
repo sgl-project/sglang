@@ -391,6 +391,7 @@ async fn handle_pod_event(
                 health_success_threshold: 2,
                 health_failure_threshold: 3,
                 max_connection_attempts: 20,
+                dp_aware: false,
             };
 
             let job = Job::AddWorker {

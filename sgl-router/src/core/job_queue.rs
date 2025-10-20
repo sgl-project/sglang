@@ -383,6 +383,7 @@ impl JobQueue {
                         health_success_threshold: router_config.health_check.success_threshold,
                         health_failure_threshold: router_config.health_check.failure_threshold,
                         max_connection_attempts: router_config.health_check.success_threshold * 10,
+                        dp_aware: router_config.dp_aware,
                     };
 
                     let job = Job::AddWorker {
