@@ -408,7 +408,7 @@ class Conversation:
     def to_gradio_chatbot(self):
         """Convert the conversation to gradio chatbot format."""
         ret = []
-        for i, (role, msg) in enumerate(self.messages[self.offset :]):
+        for i, (role, msg) in enumerate(self.messages[self.offset:]):
             if i % 2 == 0:
                 ret.append([msg, None])
             else:
@@ -422,7 +422,7 @@ class Conversation:
         else:
             ret = [{"role": "system", "content": self.system_message}]
 
-        for i, (_, msg) in enumerate(self.messages[self.offset :]):
+        for i, (_, msg) in enumerate(self.messages[self.offset:]):
             if i % 2 == 0:
                 ret.append({"role": "user", "content": msg})
             else:
@@ -767,7 +767,7 @@ register_conv_template(
     Conversation(
         name="vicuna_v1.1",
         system_message="A chat between a curious user and an artificial intelligence assistant. "
-        "The assistant gives helpful, detailed, and polite answers to the user's questions.",
+                       "The assistant gives helpful, detailed, and polite answers to the user's questions.",
         roles=("USER", "ASSISTANT"),
         sep_style=SeparatorStyle.ADD_COLON_TWO,
         sep=" ",

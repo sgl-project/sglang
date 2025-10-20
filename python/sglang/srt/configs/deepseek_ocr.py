@@ -2,7 +2,9 @@ from typing import Tuple
 
 import torchvision.transforms as T
 from PIL import Image
-from transformers import PretrainedConfig
+from transformers import (
+    PretrainedConfig,
+)
 
 BASE_SIZE = 1024
 IMAGE_SIZE = 640
