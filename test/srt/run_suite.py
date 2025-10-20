@@ -185,11 +185,11 @@ suites = {
         TestFile("test_deepseek_v32_basic.py", 275),
         TestFile("test_deepseek_v32_mtp.py", 275),
     ],
-    "quant_test": [
+    "vllm_dependency_test": [
         TestFile("quant/test_awq.py", 163),
         TestFile("test_bnb.py", 5),
         TestFile("test_gptqmodel_dynamic.py", 102),
-        TestFile("test_int4_quant.py", 185),
+        TestFile("test_vllm_dependency.py", 185),
         # TestFile("test_gguf.py", 96),
     ],
     # If the test cases take too long, considering adding them to nightly tests instead of per-commit tests

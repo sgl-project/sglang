@@ -1,4 +1,4 @@
-name: Quant Test
+name: VLLM Dependency Test
 
 on:
   push:
@@ -7,23 +7,23 @@ on:
       - "python/**"
       - "scripts/ci/**"
       - "test/**"
-      - ".github/workflows/quant-test.yml"
+      - ".github/workflows/vllm-dependency-test.yml"
   pull_request:
     branches: [ main ]
     paths:
       - "python/**"
       - "scripts/ci/**"
       - "test/**"
-      - ".github/workflows/quant-test.yml"
+      - ".github/workflows/vllm-dependency-test.yml"
     types: [synchronize, labeled]
   workflow_dispatch:
 
 concurrency:
-  group: quant-test-${{ github.ref }}
+  group: vllm-dependency-test-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  quant-test:
+  vllm-dependency-test:
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: 1-gpu-runner
     steps:
@@ -35,8 +35,8 @@ jobs:
           bash scripts/ci/ci_install_dependency.sh
           pip install "bitsandbytes>=0.44.0"
 
-      - name: Run Quant tests
+      - name: Run vLLM dependency tests
         timeout-minutes: 30
         run: |
           cd test/srt
-          python3 run_suite.py --suite quant_test --timeout-per-file 600
+          python3 run_suite.py --suite vllm_dependency_test
