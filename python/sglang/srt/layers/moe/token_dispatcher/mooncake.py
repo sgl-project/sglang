@@ -22,7 +22,7 @@ try:
 except ImportError:
     use_mooncake_ep = False
 
-from enum import Enum, IntEnum, auto
+from enum import Enum, auto
 
 import torch
 import torch.distributed as dist
