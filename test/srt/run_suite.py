@@ -77,6 +77,7 @@ suites = {
         TestFile("test_eval_fp8_accuracy.py", 303),
         TestFile("test_fa3.py", 376),
         # TestFile("test_flashmla.py", 352),
+        TestFile("rotary_embedding/test_mrope.py", 300),
         TestFile("test_function_call_parser.py", 10),
         TestFile("test_fused_moe.py", 30),
         TestFile("test_gpt_oss_1gpu.py", 600),
@@ -169,6 +170,7 @@ suites = {
         TestFile("test_disaggregation_pp.py", 140),
     ],
     "per-commit-4-gpu-b200": [
+        # TestFile("test_flash_attention_4.py"),
         # TestFile("test_gpt_oss_4gpu.py", 600),
         # TestFile("test_deepseek_v3_fp4_4gpu.py", 3600),
     ],
@@ -181,6 +183,7 @@ suites = {
     ],
     "per-commit-8-gpu-h200-deepseek-v32": [
         TestFile("test_deepseek_v32_basic.py", 275),
+        TestFile("test_deepseek_v32_mtp.py", 275),
     ],
     "vllm_dependency_test": [
         TestFile("quant/test_awq.py", 163),
