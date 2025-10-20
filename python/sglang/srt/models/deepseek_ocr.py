@@ -20,7 +20,7 @@ import copy
 import logging
 import math
 from functools import partial
-from typing import Iterable, Optional, Tuple, TypeAlias, Union, List, Type
+from typing import Iterable, List, Optional, Tuple, Type, TypeAlias, Union
 
 import torch
 import torch.nn.functional as F
@@ -28,12 +28,25 @@ from torch import Tensor, nn
 from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.models.vitdet.modeling_vitdet import get_rel_pos
 
-from sglang.srt.compilation.compile import IntermediateTensors
-from sglang.srt.configs.deepseek_ocr import PRINT_NUM_VIS_TOKENS, DeepseekVLV2Config, DeepseekV2Config
+from sglang.srt.configs.deepseek_ocr import (
+    PRINT_NUM_VIS_TOKENS,
+    DeepseekV2Config,
+    DeepseekVLV2Config,
+)
 from sglang.srt.layers.quantization import QuantizationConfig
+from sglang.srt.managers.mm_utils import (
+    MultiModalityDataPaddingPatternMultimodalTokens,
+    general_mm_embed_routine,
+)
+from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek import DeepseekForCausalLM
-from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM, DeepseekV3ForCausalLM, DeepseekV2Model
+from sglang.srt.models.deepseek_v2 import (
+    DeepseekV2ForCausalLM,
+    DeepseekV2Model,
+    DeepseekV3ForCausalLM,
+)
 from sglang.srt.models.transformers import maybe_prefix
 
 NestedTensors: TypeAlias = Union[
@@ -288,7 +301,7 @@ class MlpProjector(nn.Module):
     def forward(self, x):
         if self.get("token_pooling", False):
             batch_size, wxh, channels = x.shape
-            w = h = int(wxh ** 0.5)
+            w = h = int(wxh**0.5)
             x = x.view(batch_size, w, h, channels)
             x = x.permute(0, 3, 1, 2)
             # import ipdb; ipdb.set_trace()
@@ -316,7 +329,7 @@ class MlpProjector(nn.Module):
 
         if self.projector_type == "hybrid_split_feature_mlp_gelu":
             high_x = x[..., : self.input_dim[0]]
-            low_x = x[..., self.input_dim[0]:]
+            low_x = x[..., self.input_dim[0] :]
             high_x = self.high_up_proj(high_x)
             low_x = self.low_up_proj(low_x)
             x = torch.concat([high_x, low_x], dim=-1)
@@ -424,8 +437,6 @@ def add_decomposed_rel_pos(
     return rel_h, rel_w
 
 
-
-
 class Attention(nn.Module):
     """Multi-head Attention block with relative position embeddings."""
 
@@ -467,37 +478,53 @@ class Attention(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, H, W, _ = x.shape
         # qkv with shape (3, B, nHead, H * W, C)
-        qkv = self.qkv(x).reshape(B, H * W, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
+        qkv = (
+            self.qkv(x).reshape(B, H * W, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
+        )
         # q, k, v with shape (B * nHead, H * W, C)
         q, k, v = qkv.reshape(3, B * self.num_heads, H * W, -1).unbind(0)
 
         rel_h, rel_w = None, None
         if self.use_rel_pos:
-            rel_h, rel_w = add_decomposed_rel_pos(q, self.rel_pos_h, self.rel_pos_w, (H, W), (H, W))
+            rel_h, rel_w = add_decomposed_rel_pos(
+                q, self.rel_pos_h, self.rel_pos_w, (H, W), (H, W)
+            )
 
         q = q.view(B, self.num_heads, H * W, -1)
         k = k.view(B, self.num_heads, H * W, -1)
         v = v.view(B, self.num_heads, H * W, -1)
 
         if self.use_rel_pos:
-            rel_h = rel_h.view(B, self.num_heads, rel_h.size(1), rel_h.size(2), rel_h.size(3))
-            rel_w = rel_w.view(B, self.num_heads, rel_w.size(1), rel_w.size(2), rel_w.size(3))
-            attn_bias = (rel_h + rel_w).view(B, self.num_heads, rel_h.size(2), rel_h.size(3) * rel_w.size(4))
-            x = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_bias)
+            rel_h = rel_h.view(
+                B, self.num_heads, rel_h.size(1), rel_h.size(2), rel_h.size(3)
+            )
+            rel_w = rel_w.view(
+                B, self.num_heads, rel_w.size(1), rel_w.size(2), rel_w.size(3)
+            )
+            attn_bias = (rel_h + rel_w).view(
+                B, self.num_heads, rel_h.size(2), rel_h.size(3) * rel_w.size(4)
+            )
+            x = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, attn_mask=attn_bias
+            )
             # x = _attention_rel_h_rel_w(q, k, v, rel_h, rel_w)
         else:
             x = torch.nn.functional.scaled_dot_product_attention(q, k, v)
 
-        x = x.view(B, self.num_heads, H, W, -1).permute(0, 2, 3, 1, 4).reshape(B, H, W, -1)
+        x = (
+            x.view(B, self.num_heads, H, W, -1)
+            .permute(0, 2, 3, 1, 4)
+            .reshape(B, H, W, -1)
+        )
 
         x = self.proj(x)
 
         return x
 
 
-
-
-def window_partition(x: torch.Tensor, window_size: int) -> Tuple[torch.Tensor, Tuple[int, int]]:
+def window_partition(
+    x: torch.Tensor, window_size: int
+) -> Tuple[torch.Tensor, Tuple[int, int]]:
     """
     Partition into non-overlapping windows with padding if needed.
     Args:
@@ -516,12 +543,17 @@ def window_partition(x: torch.Tensor, window_size: int) -> Tuple[torch.Tensor, T
     Hp, Wp = H + pad_h, W + pad_w
 
     x = x.view(B, Hp // window_size, window_size, Wp // window_size, window_size, C)
-    windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
+    windows = (
+        x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
+    )
     return windows, (Hp, Wp)
 
 
 def window_unpartition(
-    windows: torch.Tensor, window_size: int, pad_hw: Tuple[int, int], hw: Tuple[int, int]
+    windows: torch.Tensor,
+    window_size: int,
+    pad_hw: Tuple[int, int],
+    hw: Tuple[int, int],
 ) -> torch.Tensor:
     """
     Window unpartition into original sequences and removing padding.
@@ -536,14 +568,14 @@ def window_unpartition(
     Hp, Wp = pad_hw
     H, W = hw
     B = windows.shape[0] // (Hp * Wp // window_size // window_size)
-    x = windows.view(B, Hp // window_size, Wp // window_size, window_size, window_size, -1)
+    x = windows.view(
+        B, Hp // window_size, Wp // window_size, window_size, window_size, -1
+    )
     x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, Hp, Wp, -1)
 
     if Hp > H or Wp > W:
         x = x[:, :H, :W, :].contiguous()
     return x
-
-
 
 
 class Block(nn.Module):
@@ -589,7 +621,9 @@ class Block(nn.Module):
         )
 
         self.norm2 = norm_layer(dim)
-        self.mlp = MLPBlock(embedding_dim=dim, mlp_dim=int(dim * mlp_ratio), act=act_layer)
+        self.mlp = MLPBlock(
+            embedding_dim=dim, mlp_dim=int(dim * mlp_ratio), act=act_layer
+        )
 
         self.window_size = window_size
 
@@ -610,7 +644,6 @@ class Block(nn.Module):
         x = x + self.mlp(self.norm2(x))
 
         return x
-
 
 
 class PatchEmbed(nn.Module):
@@ -647,9 +680,7 @@ class PatchEmbed(nn.Module):
         return x
 
 
-
 def get_abs_pos_sam(abs_pos, tgt_size):
-
     dtype = abs_pos.dtype
 
     src_size = abs_pos.size(1)
@@ -660,7 +691,7 @@ def get_abs_pos_sam(abs_pos, tgt_size):
         new_pos_embed = F.interpolate(
             old_pos_embed,
             size=(tgt_size, tgt_size),
-            mode='bicubic',
+            mode="bicubic",
             antialias=True,
             align_corners=False,
         ).to(dtype)
@@ -668,8 +699,6 @@ def get_abs_pos_sam(abs_pos, tgt_size):
         return new_pos_embed
     else:
         return abs_pos
-
-
 
 
 # This class and its supporting functions below lightly adapted from the ViTDet backbone available at: https://github.com/facebookresearch/detectron2/blob/main/detectron2/modeling/backbone/vit.py # noqa
@@ -725,7 +754,9 @@ class ImageEncoderViT(nn.Module):
         if use_abs_pos:
             # Initialize absolute positional embedding with pretrain image size.
             self.pos_embed = nn.Parameter(
-                torch.zeros(1, img_size // patch_size, img_size // patch_size, embed_dim)
+                torch.zeros(
+                    1, img_size // patch_size, img_size // patch_size, embed_dim
+                )
             )
 
         self.blocks = nn.ModuleList()
@@ -763,7 +794,9 @@ class ImageEncoderViT(nn.Module):
         )
 
         self.net_2 = nn.Conv2d(256, 512, kernel_size=3, stride=2, padding=1, bias=False)
-        self.net_3 = nn.Conv2d(512, 1024, kernel_size=3, stride=2, padding=1, bias=False)
+        self.net_3 = nn.Conv2d(
+            512, 1024, kernel_size=3, stride=2, padding=1, bias=False
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.patch_embed(x)
@@ -816,8 +849,10 @@ def _build_sam(
         # ocr-anyting
         # image_encoder.load_state_dict(state_dict, strict=True)
         # tob
-        image_encoder.load_state_dict({k[30:]: v for k, v in state_dict.items() if 'vision_tower_high' in k},
-                                      strict=True)
+        image_encoder.load_state_dict(
+            {k[30:]: v for k, v in state_dict.items() if "vision_tower_high" in k},
+            strict=True,
+        )
         print(checkpoint)
     return image_encoder
 
@@ -830,7 +865,6 @@ def build_sam_vit_b(checkpoint=None):
         encoder_global_attn_indexes=[2, 5, 8, 11],
         checkpoint=checkpoint,
     )
-
 
 
 def get_abs_pos(abs_pos, tgt_size):
@@ -846,20 +880,21 @@ def get_abs_pos(abs_pos, tgt_size):
     abs_pos_new = abs_pos.squeeze(0)
     cls_token, old_pos_embed = abs_pos_new[:1], abs_pos_new[1:]
 
-
-
     src_size = int(math.sqrt(abs_pos_new.shape[0] - 1))
     tgt_size = int(math.sqrt(tgt_size))
     dtype = abs_pos.dtype
 
     if src_size != tgt_size:
-        old_pos_embed = old_pos_embed.view(1, src_size, src_size, dim).permute(0, 3, 1,
-                                                                               2).contiguous()
+        old_pos_embed = (
+            old_pos_embed.view(1, src_size, src_size, dim)
+            .permute(0, 3, 1, 2)
+            .contiguous()
+        )
         old_pos_embed = old_pos_embed.to(torch.float32)
         new_pos_embed = F.interpolate(
             old_pos_embed,
             size=(tgt_size, tgt_size),
-            mode='bicubic',
+            mode="bicubic",
             antialias=True,
             align_corners=False,
         ).to(dtype)
@@ -902,7 +937,6 @@ class CLIPVisionEmbeddings(nn.Module):
         #     pixel_values
         # )  # shape = [*, width, grid, grid]
 
-
         if patch_embeds is not None:
             patch_embeds = patch_embeds
             # print(patch_embeds.shape)
@@ -914,16 +948,15 @@ class CLIPVisionEmbeddings(nn.Module):
 
         patch_embeds = patch_embeds.flatten(2).transpose(1, 2)
 
-
         class_embeds = self.class_embedding.expand(batch_size, 1, -1)
         embeddings = torch.cat([class_embeds, patch_embeds], dim=1)
 
         # x = torch.cat([cls_token, x], dim=1)
-        embeddings = embeddings + get_abs_pos(self.position_embedding(self.position_ids), embeddings.size(1))
+        embeddings = embeddings + get_abs_pos(
+            self.position_embedding(self.position_ids), embeddings.size(1)
+        )
         # embeddings = embeddings + self.position_embedding(self.position_ids)
         return embeddings
-
-
 
 
 class NoTPAttention(torch.nn.Module):
@@ -963,7 +996,9 @@ class NoTPAttention(torch.nn.Module):
             xk = xk.permute(0, 2, 1, 3)
             xv = xv.permute(0, 2, 1, 3)
             # with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=False):
-            output = torch.nn.functional.scaled_dot_product_attention(xq, xk, xv, attn_mask=None)
+            output = torch.nn.functional.scaled_dot_product_attention(
+                xq, xk, xv, attn_mask=None
+            )
             output = output.permute(0, 2, 1, 3).reshape(bsz, seqlen, -1)
             # output = output.permute(0, 2, 1, 3).contiguous().view(bsz, seqlen, -1)
         else:
@@ -979,7 +1014,9 @@ class NoTPAttention(torch.nn.Module):
             xk = xk.permute(0, 2, 1, 3)
             xv = xv.permute(0, 2, 1, 3)
             # with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=False):
-            output = torch.nn.functional.scaled_dot_product_attention(xq, xk, xv, attn_mask=None)
+            output = torch.nn.functional.scaled_dot_product_attention(
+                xq, xk, xv, attn_mask=None
+            )
             output = output.permute(0, 2, 1, 3).reshape(bsz, seqlen, -1)
             # output = output.permute(0, 2, 1, 3).contiguous().view(bsz, seqlen, -1)
         output = self.out_proj(output)
@@ -989,8 +1026,6 @@ class NoTPAttention(torch.nn.Module):
 @torch.jit.script
 def quick_gelu(x):
     return x * torch.sigmoid(1.702 * x)
-
-
 
 
 class NoTPFeedForward(nn.Module):
@@ -1008,9 +1043,6 @@ class NoTPFeedForward(nn.Module):
     def forward(self, x):
         output = self.fc2(quick_gelu(self.fc1(x)))
         return output
-
-
-
 
 
 class NoTPTransformerBlock(nn.Module):
@@ -1088,7 +1120,7 @@ class NoTPTransformer(nn.Module):
                 NoTPTransformerBlock(
                     cfg,
                     layer_id + 1,
-                    )
+                )
             )
 
     def forward(
@@ -1118,17 +1150,16 @@ class NoTPTransformer(nn.Module):
 
         return hidden_states
 
+
 class VitModel(nn.Module):
-    def __init__(
-        self,
-        cfg,
-        freeze_embed=False,
-        freeze_pre_norm=False
-    ) -> None:
+    def __init__(self, cfg, freeze_embed=False, freeze_pre_norm=False) -> None:
         super().__init__()
 
-        self.embeddings = CLIPVisionEmbeddings(hidden_size=cfg.hidden_size, image_size=cfg.image_size,
-                                               patch_size=cfg.patch_size)
+        self.embeddings = CLIPVisionEmbeddings(
+            hidden_size=cfg.hidden_size,
+            image_size=cfg.image_size,
+            patch_size=cfg.patch_size,
+        )
 
         if freeze_embed:
             for name, param in self.embeddings.named_parameters():
@@ -1171,11 +1202,7 @@ class VitModel(nn.Module):
     def __str__(self) -> str:
         return "open_clip"
 
-    def forward(
-        self,
-        x,
-        patch_embeds
-    ):
+    def forward(self, x, patch_embeds):
         x = self.embeddings(x, patch_embeds)
         hidden_states = self.pre_layrnorm(x)
 
@@ -1204,7 +1231,7 @@ vit_model_cfg = dict(
     pre_layernorm_epsilon=1e-5,
     image_size=224,
     patch_size=14,
-    recompute_list=[]
+    recompute_list=[],
 )
 
 
@@ -1253,11 +1280,15 @@ class DeepseekOCRModel(DeepseekV2Model):
             # inputs_embeds = self.embed_tokens(input_ids)
             inputs_embeds = self.get_input_embeddings()(input_ids)
 
-        sam_model = getattr(self, 'sam_model', None)
+        sam_model = getattr(self, "sam_model", None)
         # sam_model = self.sam_model
-        vision_model = getattr(self, 'vision_model', None)
+        vision_model = getattr(self, "vision_model", None)
 
-        if sam_model is not None and (input_ids.shape[1] != 1 or self.training) and torch.sum(images[0][1]).item() != 0:
+        if (
+            sam_model is not None
+            and (input_ids.shape[1] != 1 or self.training)
+            and torch.sum(images[0][1]).item() != 0
+        ):
 
             idx = 0
 
@@ -1281,50 +1312,76 @@ class DeepseekOCRModel(DeepseekV2Model):
                         local_features_2 = vision_model(patches, local_features_1)
                         # vit_time = time.time()
                         local_features = torch.cat(
-                            (local_features_2[:, 1:], local_features_1.flatten(2).permute(0, 2, 1)), dim=-1)
+                            (
+                                local_features_2[:, 1:],
+                                local_features_1.flatten(2).permute(0, 2, 1),
+                            ),
+                            dim=-1,
+                        )
                         local_features = self.projector(local_features)
 
                         global_features_1 = sam_model(image_ori)
                         global_features_2 = vision_model(image_ori, global_features_1)
                         global_features = torch.cat(
-                            (global_features_2[:, 1:], global_features_1.flatten(2).permute(0, 2, 1)), dim=-1)
+                            (
+                                global_features_2[:, 1:],
+                                global_features_1.flatten(2).permute(0, 2, 1),
+                            ),
+                            dim=-1,
+                        )
                         global_features = self.projector(global_features)
 
-                        print('=====================')
-                        print('BASE: ', global_features.shape)
-                        print('PATCHES: ', local_features.shape)
-                        print('=====================')
+                        print("=====================")
+                        print("BASE: ", global_features.shape)
+                        print("PATCHES: ", local_features.shape)
+                        print("=====================")
 
                         _, hw, n_dim = global_features.shape
-                        h = w = int(hw ** 0.5)
+                        h = w = int(hw**0.5)
 
                         _2, hw2, n_dim2 = local_features.shape
-                        h2 = w2 = int(hw2 ** 0.5)
+                        h2 = w2 = int(hw2**0.5)
 
                         width_crop_num, height_crop_num = crop_shape[0], crop_shape[1]
 
                         global_features = global_features.view(h, w, n_dim)
 
                         global_features = torch.cat(
-                            [global_features, self.image_newline[None, None, :].expand(h, 1, n_dim)], dim=1
+                            [
+                                global_features,
+                                self.image_newline[None, None, :].expand(h, 1, n_dim),
+                            ],
+                            dim=1,
                         )
 
                         global_features = global_features.view(-1, n_dim)
 
-                        local_features = local_features.view(height_crop_num, width_crop_num, h2, w2, n_dim2).permute(0,
-                                                                                                                      2,
-                                                                                                                      1,
-                                                                                                                      3,
-                                                                                                                      4).reshape(
-                            height_crop_num * h2, width_crop_num * w2, n_dim2)
+                        local_features = (
+                            local_features.view(
+                                height_crop_num, width_crop_num, h2, w2, n_dim2
+                            )
+                            .permute(0, 2, 1, 3, 4)
+                            .reshape(height_crop_num * h2, width_crop_num * w2, n_dim2)
+                        )
                         local_features = torch.cat(
-                            [local_features, self.image_newline[None, None, :].expand(height_crop_num * h2, 1, n_dim2)],
-                            dim=1
+                            [
+                                local_features,
+                                self.image_newline[None, None, :].expand(
+                                    height_crop_num * h2, 1, n_dim2
+                                ),
+                            ],
+                            dim=1,
                         )
                         local_features = local_features.view(-1, n_dim2)
 
                         global_local_features = torch.cat(
-                            [local_features, global_features, self.view_seperator[None, :]], dim=0)
+                            [
+                                local_features,
+                                global_features,
+                                self.view_seperator[None, :],
+                            ],
+                            dim=0,
+                        )
 
                         # end_time = time.time()
 
@@ -1338,24 +1395,35 @@ class DeepseekOCRModel(DeepseekV2Model):
                         global_features_1 = sam_model(image_ori)
                         global_features_2 = vision_model(image_ori, global_features_1)
                         global_features = torch.cat(
-                            (global_features_2[:, 1:], global_features_1.flatten(2).permute(0, 2, 1)), dim=-1)
+                            (
+                                global_features_2[:, 1:],
+                                global_features_1.flatten(2).permute(0, 2, 1),
+                            ),
+                            dim=-1,
+                        )
                         global_features = self.projector(global_features)
-                        print('=====================')
-                        print('BASE: ', global_features.shape)
-                        print('NO PATCHES')
-                        print('=====================')
+                        print("=====================")
+                        print("BASE: ", global_features.shape)
+                        print("NO PATCHES")
+                        print("=====================")
                         _, hw, n_dim = global_features.shape
-                        h = w = int(hw ** 0.5)
+                        h = w = int(hw**0.5)
 
                         global_features = global_features.view(h, w, n_dim)
 
                         global_features = torch.cat(
-                            [global_features, self.image_newline[None, None, :].expand(h, 1, n_dim)], dim=1
+                            [
+                                global_features,
+                                self.image_newline[None, None, :].expand(h, 1, n_dim),
+                            ],
+                            dim=1,
                         )
 
                         global_features = global_features.view(-1, n_dim)
 
-                        global_local_features = torch.cat([global_features, self.view_seperator[None, :]], dim=0)
+                        global_local_features = torch.cat(
+                            [global_features, self.view_seperator[None, :]], dim=0
+                        )
 
                     images_in_this_batch.append(global_local_features)
 
@@ -1365,15 +1433,22 @@ class DeepseekOCRModel(DeepseekV2Model):
                     images_in_this_batch = torch.cat(images_in_this_batch, dim=0)
                     # exit()
 
-                    inputs_embeds[idx].masked_scatter_(images_seq_mask[idx].unsqueeze(-1).cuda(), images_in_this_batch)
+                    inputs_embeds[idx].masked_scatter_(
+                        images_seq_mask[idx].unsqueeze(-1).cuda(), images_in_this_batch
+                    )
 
                 idx += 1
 
         return super(DeepseekOCRModel, self).forward(
-            input_ids=None, attention_mask=attention_mask, past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds, use_cache=use_cache, position_ids=position_ids,
-            output_attentions=output_attentions, output_hidden_states=output_hidden_states,
-            return_dict=return_dict
+            input_ids=None,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            position_ids=position_ids,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
         )
 
 
@@ -1401,7 +1476,6 @@ class DeepseekOCRForCausalLM(DeepseekV2ForCausalLM):
 
         n_embed = 1280
         downsample_ratio: int = 4
-
 
         self.tile_tag = config.tile_tag
         self.global_view_pos = config.global_view_pos
@@ -1541,10 +1615,10 @@ class DeepseekOCRForCausalLM(DeepseekV2ForCausalLM):
                         print("=====================")
 
                     _, hw, n_dim = global_features.shape
-                    h = w = int(hw ** 0.5)
+                    h = w = int(hw**0.5)
 
                     _2, hw2, n_dim2 = local_features.shape
-                    h2 = w2 = int(hw2 ** 0.5)
+                    h2 = w2 = int(hw2**0.5)
 
                     width_crop_num, height_crop_num = crop_shape[0], crop_shape[1]
 
@@ -1602,7 +1676,7 @@ class DeepseekOCRForCausalLM(DeepseekV2ForCausalLM):
                         print("=====================")
 
                     _, hw, n_dim = global_features.shape
-                    h = w = int(hw ** 0.5)
+                    h = w = int(hw**0.5)
 
                     global_features = global_features.view(h, w, n_dim)
 
@@ -1624,19 +1698,29 @@ class DeepseekOCRForCausalLM(DeepseekV2ForCausalLM):
 
         return images_in_this_batch
 
-    def _process_image_input(self, image_input) -> torch.Tensor:
+    def _process_image_input(self, mm_items: List[MultimodalDataItem]) -> torch.Tensor:
 
         # image_input: [pixel_values, images_crop, images_spatial_crop]
 
-        pixel_values = image_input[0].to(torch.bfloat16)
+        # pixel_values = mm_items[0].to(torch.bfloat16)
+        pixel_values = torch.cat([item.feature for item in mm_items], dim=0).type(
+            self.visual.dtype
+        )
         # print(image_input[1][0].shape)
         # print(type(image_input[1]))
         # exit()
 
         # images_crop = image_input[1].to(torch.bfloat16)
-        images_crop = image_input[1]
+        # images_crop = mm_items[1]
+        images_crop = torch.cat([item.images_crop for item in mm_items], dim=0).type(
+            self.visual.dtype
+        )
+        images_spatial_crop = torch.cat(
+            [item.images_spatial_crop for item in mm_items], dim=0
+        ).type(self.visual.dtype)
+
         # images_crop = image_input[1]
-        images_spatial_crop = image_input[2].to(dtype=torch.long)
+        # images_spatial_crop = mm_items[2].to(dtype=torch.long)
 
         # local_start = time.time()
         vision_features = self._pixel_values_to_embedding(
@@ -1682,30 +1766,155 @@ class DeepseekOCRForCausalLM(DeepseekV2ForCausalLM):
 
         return inputs_embeds
 
+    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
+        return pattern.pad_input_tokens(input_ids, mm_inputs)
+
+    def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        vision_embeddings = self._process_image_input(items)
+        return vision_embeddings
+        # sam_model = self.model.sam_model
+        # input_ids
+        # idx = 0
+        #
+        # # sam_model = torch.jit.script(sam_model)
+        #
+        # # start_time = time.time()
+        # for image, crop_shape in zip(images, images_spatial_crop):
+        #     images_in_this_batch = []
+        #
+        #     patches = image[0]
+        #     image_ori = image[1]
+        #
+        #     with torch.no_grad():
+        #         # with torch.inference_mode():
+        #
+        #         if torch.sum(patches).item() != 0:
+        #             # P, C, H, W = patches.shape
+        #             crop_flag = 1
+        #             local_features_1 = sam_model(patches)
+        #
+        #             local_features_2 = vision_model(patches, local_features_1)
+        #             # vit_time = time.time()
+        #             local_features = torch.cat(
+        #                 (local_features_2[:, 1:], local_features_1.flatten(2).permute(0, 2, 1)), dim=-1)
+        #             local_features = self.projector(local_features)
+        #
+        #             global_features_1 = sam_model(image_ori)
+        #             global_features_2 = vision_model(image_ori, global_features_1)
+        #             global_features = torch.cat(
+        #                 (global_features_2[:, 1:], global_features_1.flatten(2).permute(0, 2, 1)), dim=-1)
+        #             global_features = self.projector(global_features)
+        #
+        #             print('=====================')
+        #             print('BASE: ', global_features.shape)
+        #             print('PATCHES: ', local_features.shape)
+        #             print('=====================')
+        #
+        #             _, hw, n_dim = global_features.shape
+        #             h = w = int(hw ** 0.5)
+        #
+        #             _2, hw2, n_dim2 = local_features.shape
+        #             h2 = w2 = int(hw2 ** 0.5)
+        #
+        #             width_crop_num, height_crop_num = crop_shape[0], crop_shape[1]
+        #
+        #             global_features = global_features.view(h, w, n_dim)
+        #
+        #             global_features = torch.cat(
+        #                 [global_features, self.image_newline[None, None, :].expand(h, 1, n_dim)], dim=1
+        #             )
+        #
+        #             global_features = global_features.view(-1, n_dim)
+        #
+        #             local_features = local_features.view(height_crop_num, width_crop_num, h2, w2, n_dim2).permute(0,
+        #                                                                                                           2,
+        #                                                                                                           1,
+        #                                                                                                           3,
+        #                                                                                                           4).reshape(
+        #                 height_crop_num * h2, width_crop_num * w2, n_dim2)
+        #             local_features = torch.cat(
+        #                 [local_features, self.image_newline[None, None, :].expand(height_crop_num * h2, 1, n_dim2)],
+        #                 dim=1
+        #             )
+        #             local_features = local_features.view(-1, n_dim2)
+        #
+        #             global_local_features = torch.cat(
+        #                 [local_features, global_features, self.view_seperator[None, :]], dim=0)
+        #
+        #             # end_time = time.time()
+        #
+        #             # print('sam: ', sam_time - start_time)
+        #             # print('vit: ', vit_time - sam_time)
+        #             # print('all: ', end_time - start_time)
+        #
+        #             # exit()
+        #
+        #         else:
+        #             global_features_1 = sam_model(image_ori)
+        #             global_features_2 = vision_model(image_ori, global_features_1)
+        #             global_features = torch.cat(
+        #                 (global_features_2[:, 1:], global_features_1.flatten(2).permute(0, 2, 1)), dim=-1)
+        #             global_features = self.projector(global_features)
+        #             print('=====================')
+        #             print('BASE: ', global_features.shape)
+        #             print('NO PATCHES')
+        #             print('=====================')
+        #             _, hw, n_dim = global_features.shape
+        #             h = w = int(hw ** 0.5)
+        #
+        #             global_features = global_features.view(h, w, n_dim)
+        #
+        #             global_features = torch.cat(
+        #                 [global_features, self.image_newline[None, None, :].expand(h, 1, n_dim)], dim=1
+        #             )
+        #
+        #             global_features = global_features.view(-1, n_dim)
+        #
+        #             global_local_features = torch.cat([global_features, self.view_seperator[None, :]], dim=0)
+        #
+        #         images_in_this_batch.append(global_local_features)
+        #
+        #     # print(inputs_embeds.shape)
+        #
+        #     if images_in_this_batch:
+        #         images_in_this_batch = torch.cat(images_in_this_batch, dim=0)
+        #         # exit()
+        #
+        #         inputs_embeds[idx].masked_scatter_(images_seq_mask[idx].unsqueeze(-1).cuda(), images_in_this_batch)
+        #
+        #     idx += 1
+        #
+        # return super(DeepseekOCRModel, self).forward(
+        #     input_ids=None, attention_mask=attention_mask, past_key_values=past_key_values,
+        #     inputs_embeds=inputs_embeds, use_cache=use_cache, position_ids=position_ids,
+        #     output_attentions=output_attentions, output_hidden_states=output_hidden_states,
+        #     return_dict=return_dict
+        # )
+
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        intermediate_tensors: Optional[IntermediateTensors] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
+        forward_batch: ForwardBatch,
+        get_embedding: bool = False,
         **kwargs: object,
     ):
 
-        if intermediate_tensors is not None:
-            inputs_embeds = None
-
-        # NOTE: In v1, inputs_embeds is always generated at model runner, this
-        # condition is for v0 compatibility
-        elif inputs_embeds is None:
-            vision_embeddings = self.get_multimodal_embeddings(**kwargs)
-            inputs_embeds = self.get_input_embeddings(input_ids, vision_embeddings)
-            input_ids = None
-
-        hidden_states = self.language_model(
-            input_ids, positions, intermediate_tensors, inputs_embeds=inputs_embeds
+        hidden_states = general_mm_embed_routine(
+            input_ids=input_ids,
+            forward_batch=forward_batch,
+            language_model=super(),
+            multimodal_model=self,
+            positions=positions,
         )
 
-        return hidden_states
+        if not get_embedding:
+            return self.logits_processor(
+                input_ids, hidden_states, self.lm_head, forward_batch
+            )
+        else:
+            return self.pooler(hidden_states, forward_batch)
 
     # def compute_logits(
     #     self,
