@@ -5,7 +5,7 @@ from __future__ import annotations
 import enum
 import logging
 from enum import Enum
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List
 
 import torch
 from compressed_tensors import CompressionFormat
@@ -21,14 +21,7 @@ from sglang.srt.layers.quantization.utils import (
     per_tensor_dequantize,
     replace_parameter,
 )
-from sglang.srt.utils import (
-    get_bool_env_var,
-    is_cpu,
-    is_cuda,
-    is_hip,
-    is_npu,
-    set_weight_attrs,
-)
+from sglang.srt.utils import get_bool_env_var, is_hip, set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -49,7 +42,7 @@ if _use_aiter:
     from sglang.srt.layers.moe.rocm_moe_utils import rocm_fused_experts_tkw1
 
 try:
-    import vllm
+    import vllm  # noqa: F401
 
     VLLM_AVAILABLE = True
 except ImportError:
