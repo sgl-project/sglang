@@ -17,20 +17,15 @@ use rand::Rng;
 use tracing::{debug, error, warn};
 use uuid::Uuid;
 
-use super::{context::*, conversions, processing, streaming, utils};
+use super::{context::*, processing, streaming, utils};
 use crate::{
     core::{ConnectionMode, Worker, WorkerRegistry, WorkerType},
-    data_connector::{
-        ConversationId, ResponseId, SharedConversationItemStorage, SharedConversationStorage,
-        SharedResponseStorage,
-    },
     grpc_client::proto,
     policies::PolicyRegistry,
     protocols::{
         chat::ChatCompletionRequest,
         common::InputIds,
         generate::GenerateRequest,
-        responses::{ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponsesRequest},
     },
     reasoning_parser::ParserFactory as ReasoningParserFactory,
     tokenizer::traits::Tokenizer,
@@ -1104,176 +1099,31 @@ impl RequestPipeline {
         }
     }
 
-    /// Internal method that executes the responses pipeline and returns Result
-    /// This is Send-safe and can be called from background tasks
-    async fn execute_responses_internal(
+    /// Execute chat pipeline for responses endpoint (Result-based for easier composition)
+    ///
+    /// This is used by the responses module and returns Result instead of Response.
+    /// It also supports background mode cancellation via grpc_request_id and background_tasks.
+    pub async fn execute_chat_for_responses(
         &self,
-        request: Arc<ResponsesRequest>,
+        request: Arc<ChatCompletionRequest>,
         headers: Option<http::HeaderMap>,
         model_id: Option<String>,
         components: Arc<SharedComponents>,
-        response_storage: SharedResponseStorage,
-        conversation_storage: SharedConversationStorage,
-        conversation_item_storage: SharedConversationItemStorage,
         grpc_request_id: Option<String>,
         response_id: Option<String>,
         background_tasks: Option<Arc<RwLock<std::collections::HashMap<String, super::router::BackgroundTaskInfo>>>>,
-    ) -> Result<crate::protocols::responses::ResponsesResponse, String> {
-        // Clone request for mutation
-        let mut modified_request = (*request).clone();
+    ) -> Result<crate::protocols::chat::ChatCompletionResponse, String> {
+        let mut ctx = RequestContext::for_chat(request, headers, model_id, components, grpc_request_id);
 
-        // 2. Handle previous_response_id by loading response chain from storage
-        let mut conversation_items: Option<Vec<ResponseInputOutputItem>> = None;
-        if let Some(ref prev_id_str) = modified_request.previous_response_id {
-            let prev_id = ResponseId::from(prev_id_str.as_str());
-            match response_storage.get_response_chain(&prev_id, None).await {
-                Ok(chain) => {
-                    let mut items = Vec::new();
-                    for stored in chain.responses.iter() {
-                        // Convert input to conversation item
-                        items.push(ResponseInputOutputItem::Message {
-                            id: format!("msg_u_{}", stored.id.0.trim_start_matches("resp_")),
-                            role: "user".to_string(),
-                            content: vec![ResponseContentPart::InputText {
-                                text: stored.input.clone(),
-                            }],
-                            status: Some("completed".to_string()),
-                        });
-
-                        // Convert output to conversation items from stored response
-                        if let Some(output_arr) =
-                            stored.raw_response.get("output").and_then(|v| v.as_array())
-                        {
-                            for item in output_arr {
-                                if let Ok(output_item) =
-                                    serde_json::from_value::<ResponseInputOutputItem>(item.clone())
-                                {
-                                    items.push(output_item);
-                                }
-                            }
-                        }
-                    }
-                    conversation_items = Some(items);
-                    modified_request.previous_response_id = None;
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to load previous response chain for {}: {}",
-                        prev_id_str, e
-                    );
-                }
-            }
-        }
-
-        // 3. Handle conversation by loading conversation history from storage
-        if let Some(ref conv_id_str) = request.conversation {
-            let conv_id = ConversationId::from(conv_id_str.as_str());
-
-            // Verify conversation exists
-            if let Ok(None) = conversation_storage.get_conversation(&conv_id).await {
-                return Err("Conversation not found".to_string());
-            }
-
-            // Load conversation history (ascending order for chronological context)
-            const MAX_CONVERSATION_HISTORY_ITEMS: usize = 100;
-            let params = crate::data_connector::conversation_items::ListParams {
-                limit: MAX_CONVERSATION_HISTORY_ITEMS,
-                order: crate::data_connector::conversation_items::SortOrder::Asc,
-                after: None,
-            };
-
-            match conversation_item_storage.list_items(&conv_id, params).await {
-                Ok(stored_items) => {
-                    let mut items: Vec<ResponseInputOutputItem> = Vec::new();
-                    for item in stored_items.into_iter() {
-                        // Only use message items for conversation context
-                        if item.item_type == "message" {
-                            if let Ok(content_parts) =
-                                serde_json::from_value::<Vec<ResponseContentPart>>(
-                                    item.content.clone(),
-                                )
-                            {
-                                items.push(ResponseInputOutputItem::Message {
-                                    id: item.id.0.clone(),
-                                    role: item.role.clone().unwrap_or_else(|| "user".to_string()),
-                                    content: content_parts,
-                                    status: item.status.clone(),
-                                });
-                            }
-                        }
-                    }
-
-                    // Append current request
-                    match &modified_request.input {
-                        ResponseInput::Text(text) => {
-                            items.push(ResponseInputOutputItem::Message {
-                                id: format!("msg_u_{}", conv_id.0),
-                                role: "user".to_string(),
-                                content: vec![ResponseContentPart::InputText {
-                                    text: text.clone(),
-                                }],
-                                status: Some("completed".to_string()),
-                            });
-                        }
-                        ResponseInput::Items(current_items) => {
-                            items.extend_from_slice(current_items);
-                        }
-                    }
-
-                    modified_request.input = ResponseInput::Items(items);
-                }
-                Err(e) => {
-                    warn!("Failed to load conversation history: {}", e);
-                }
-            }
-        }
-
-        // 4. If we have conversation_items from previous_response_id, merge them
-        if let Some(mut items) = conversation_items {
-            // Append current request
-            match &modified_request.input {
-                ResponseInput::Text(text) => {
-                    items.push(ResponseInputOutputItem::Message {
-                        id: format!(
-                            "msg_u_{}",
-                            request
-                                .previous_response_id
-                                .as_ref()
-                                .unwrap_or(&"new".to_string())
-                        ),
-                        role: "user".to_string(),
-                        content: vec![ResponseContentPart::InputText { text: text.clone() }],
-                        status: Some("completed".to_string()),
-                    });
-                }
-                ResponseInput::Items(current_items) => {
-                    items.extend_from_slice(current_items);
-                }
-            }
-
-            modified_request.input = ResponseInput::Items(items);
-        }
-
-        // 5. Convert ResponsesRequest → ChatCompletionRequest (use modified request with history)
-        let chat_request = match conversions::responses_to_chat(&modified_request) {
-            Ok(req) => Arc::new(req),
-            Err(e) => {
-                return Err(format!("Failed to convert request: {}", e));
-            }
-        };
-
-        // 6. Execute chat pipeline stages
-        let mut ctx = RequestContext::for_chat(chat_request, headers, model_id, components, grpc_request_id);
-
+        // Execute each stage in sequence
         for (idx, stage) in self.stages.iter().enumerate() {
             match stage.execute(&mut ctx).await {
                 Ok(Some(_response)) => {
-                    // Stage completed successfully with a response (e.g., streaming)
-                    // TODO: For streaming responses, we need to convert SSE events
-                    return Err("Streaming is not yet supported for background responses".to_string());
+                    // Streaming not supported for responses sync mode
+                    return Err("Streaming is not supported in this context".to_string());
                 }
                 Ok(None) => {
-                    // After ClientAcquisitionStage (stage index 2), store the client for cancellation
+                    // After ClientAcquisitionStage (stage index 2), store client for cancellation
                     if idx == 2 && response_id.is_some() && background_tasks.is_some() {
                         if let Some(ref clients) = ctx.state.clients {
                             let client_to_store = match clients {
@@ -1282,7 +1132,9 @@ impl RequestPipeline {
                             };
 
                             if let Some(ref tasks) = background_tasks {
-                                if let Some(task_info) = tasks.write().await.get_mut(response_id.as_ref().unwrap()) {
+                                if let Some(task_info) =
+                                    tasks.write().await.get_mut(response_id.as_ref().unwrap())
+                                {
                                     *task_info.client.write().await = Some(client_to_store);
                                     debug!("Stored client for response_id: {}", response_id.as_ref().unwrap());
                                 }
@@ -1306,220 +1158,13 @@ impl RequestPipeline {
             }
         }
 
-        // 7. Extract chat response and convert to responses format
+        // Extract final response
         match ctx.state.response.final_response {
-            Some(FinalResponse::Chat(chat_response)) => {
-                // Convert ChatCompletionResponse → ResponsesResponse
-                match conversions::chat_to_responses(&chat_response, &request) {
-                    Ok(responses_response) => {
-                        // 8. Persist response to storage if store=true (default: true)
-                        if request.store.unwrap_or(true) {
-                            // Convert response to JSON for storage
-                            if let Ok(response_json) = serde_json::to_value(&responses_response) {
-                                // Import and use the persist function from openai router
-                                if let Err(e) = crate::routers::openai::conversations::persist_conversation_items(
-                                    conversation_storage,
-                                    conversation_item_storage,
-                                    response_storage,
-                                    &response_json,
-                                    &request,
-                                )
-                                .await
-                                {
-                                    warn!("Failed to persist response: {}", e);
-                                }
-                            }
-                        }
-
-                        Ok(responses_response)
-                    }
-                    Err(e) => Err(format!("Failed to convert to responses format: {}", e)),
-                }
-            }
+            Some(FinalResponse::Chat(response)) => Ok(response),
             Some(FinalResponse::Generate(_)) => {
                 Err("Internal error: wrong response type".to_string())
             }
             None => Err("No response produced".to_string()),
-        }
-    }
-
-    /// Execute the complete pipeline for a responses request using conversion approach
-    ///
-    /// This converts ResponsesRequest → ChatCompletionRequest, executes the chat pipeline,
-    /// then converts back to ResponsesResponse format.
-    pub async fn execute_responses(
-        &self,
-        request: Arc<ResponsesRequest>,
-        headers: Option<http::HeaderMap>,
-        model_id: Option<String>,
-        components: Arc<SharedComponents>,
-        response_storage: SharedResponseStorage,
-        conversation_storage: SharedConversationStorage,
-        conversation_item_storage: SharedConversationItemStorage,
-        background_tasks: Arc<RwLock<std::collections::HashMap<String, super::router::BackgroundTaskInfo>>>,
-    ) -> Response {
-        use axum::http::StatusCode;
-        use crate::protocols::responses::{ResponseStatus, ResponsesResponse};
-        use serde_json::json;
-
-        // 1. Validate mutually exclusive parameters: previous_response_id XOR conversation
-        if request.previous_response_id.is_some() && request.conversation.is_some() {
-            return (
-                StatusCode::BAD_REQUEST,
-                axum::Json(json!({
-                    "error": {
-                        "message": "Mutually exclusive parameters. Ensure you are only providing one of: 'previous_response_id' or 'conversation'.",
-                        "type": "invalid_request_error",
-                        "param": serde_json::Value::Null,
-                        "code": "mutually_exclusive_parameters"
-                    }
-                })),
-            )
-                .into_response();
-        }
-
-        // 2. Handle background mode: spawn async task and return immediately
-        if request.background.unwrap_or(false) {
-            // Generate both response_id and grpc_request_id for Option 2
-            let response_id = format!("resp_{}", Uuid::new_v4());
-            let grpc_request_id = format!("chatcmpl-{}", Uuid::new_v4());
-
-            // Get current timestamp
-            let created_at = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64;
-
-            // Create queued response
-            let queued_response = ResponsesResponse {
-                id: response_id.clone(),
-                object: "response".to_string(),
-                created_at,
-                status: ResponseStatus::Queued,
-                error: None,
-                incomplete_details: None,
-                instructions: request.instructions.clone(),
-                max_output_tokens: request.max_output_tokens,
-                model: request.model.clone().unwrap_or_else(|| "default".to_string()),
-                output: Vec::new(),
-                parallel_tool_calls: request.parallel_tool_calls.unwrap_or(true),
-                previous_response_id: request.previous_response_id.clone(),
-                reasoning: None,
-                store: request.store.unwrap_or(true),
-                temperature: request.temperature,
-                text: None,
-                tool_choice: "auto".to_string(),
-                tools: request.tools.clone().unwrap_or_default(),
-                top_p: request.top_p,
-                truncation: None,
-                usage: None,
-                user: request.user.clone(),
-                metadata: request.metadata.clone().unwrap_or_default(),
-            };
-
-            // Persist queued response to storage
-            if let Ok(response_json) = serde_json::to_value(&queued_response) {
-                if let Err(e) = crate::routers::openai::conversations::persist_conversation_items(
-                    conversation_storage.clone(),
-                    conversation_item_storage.clone(),
-                    response_storage.clone(),
-                    &response_json,
-                    &request,
-                )
-                .await
-                {
-                    warn!("Failed to persist queued response: {}", e);
-                }
-            }
-
-            // Spawn background task to execute pipeline
-            let pipeline = self.clone();
-            let request_clone = request.clone();
-            let headers_clone = headers.clone();
-            let model_id_clone = model_id.clone();
-            let components_clone = components.clone();
-            let response_storage_clone = response_storage.clone();
-            let conversation_storage_clone = conversation_storage.clone();
-            let conversation_item_storage_clone = conversation_item_storage.clone();
-            let response_id_clone = response_id.clone();
-            let grpc_request_id_clone = grpc_request_id.clone();
-
-            // Spawn background task - now using execute_responses_internal which returns Result
-            let background_tasks_clone = background_tasks.clone();
-            let handle = tokio::task::spawn(async move {
-                // Execute the pipeline synchronously (background: false to prevent recursion)
-                let mut background_request = (*request_clone).clone();
-                background_request.background = Some(false);
-                let background_request_arc = Arc::new(background_request);
-
-                match pipeline
-                    .execute_responses_internal(
-                        background_request_arc,
-                        headers_clone,
-                        model_id_clone,
-                        components_clone,
-                        response_storage_clone,
-                        conversation_storage_clone,
-                        conversation_item_storage_clone,
-                        Some(grpc_request_id_clone.clone()),
-                        Some(response_id_clone.clone()),
-                        Some(background_tasks_clone.clone()),
-                    )
-                    .await
-                {
-                    Ok(_) => {
-                        debug!("Background response {} completed successfully", response_id_clone);
-                    }
-                    Err(e) => {
-                        warn!("Background response {} failed: {}", response_id_clone, e);
-                    }
-                }
-
-                // Clean up task handle when done
-                background_tasks_clone.write().await.remove(&response_id_clone);
-            });
-
-            // Store the task info for cancellation support (client will be set later during pipeline execution)
-            background_tasks.write().await.insert(
-                response_id.clone(),
-                super::router::BackgroundTaskInfo {
-                    handle,
-                    grpc_request_id: grpc_request_id.clone(),
-                    client: Arc::new(RwLock::new(None)),
-                },
-            );
-
-            // Return queued response immediately
-            return axum::Json(queued_response).into_response();
-        }
-
-        // 3. For synchronous requests, call internal method and convert Result to Response
-        match self
-            .execute_responses_internal(
-                request,
-                headers,
-                model_id,
-                components,
-                response_storage,
-                conversation_storage,
-                conversation_item_storage,
-                None, // No pre-generated grpc_request_id for synchronous requests
-                None, // No response_id for synchronous requests
-                None, // No background_tasks for synchronous requests
-            )
-            .await
-        {
-            Ok(responses_response) => axum::Json(responses_response).into_response(),
-            Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                axum::Json(json!({
-                    "error": {
-                        "message": e,
-                        "type": "internal_error"
-                    }
-                })),
-            )
-                .into_response(),
         }
     }
 }

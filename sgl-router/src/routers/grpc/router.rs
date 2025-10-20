@@ -27,7 +27,7 @@ pub struct BackgroundTaskInfo {
     pub client: Arc<RwLock<Option<crate::grpc_client::SglangSchedulerClient>>>,
 }
 
-use super::{context::SharedComponents, pipeline::RequestPipeline};
+use super::{context::SharedComponents, pipeline::RequestPipeline, responses};
 use crate::{
     config::types::RetryConfig,
     core::WorkerRegistry,
@@ -276,26 +276,27 @@ impl RouterTrait for GrpcRouter {
         body: &ResponsesRequest,
         model_id: Option<&str>,
     ) -> Response {
-        // Use pipeline for ALL requests (streaming and non-streaming)
-        // Pipeline handles:
+        // Use responses module for ALL requests (streaming and non-streaming)
+        // Responses module handles:
         // - Request validation (previous_response_id XOR conversation)
         // - Loading response chain / conversation history from storage
         // - Conversion: ResponsesRequest → ChatCompletionRequest
         // - Execution through chat pipeline stages
         // - Conversion: ChatCompletionResponse → ResponsesResponse
         // - Response persistence
-        self.pipeline
-            .execute_responses(
-                Arc::new(body.clone()),
-                headers.cloned(),
-                model_id.map(|s| s.to_string()),
-                self.shared_components.clone(),
-                self.response_storage.clone(),
-                self.conversation_storage.clone(),
-                self.conversation_item_storage.clone(),
-                self.background_tasks.clone(),
-            )
-            .await
+        // - MCP tool loop wrapper (future)
+        responses::route_responses(
+            &self.pipeline,
+            Arc::new(body.clone()),
+            headers.cloned(),
+            model_id.map(|s| s.to_string()),
+            self.shared_components.clone(),
+            self.response_storage.clone(),
+            self.conversation_storage.clone(),
+            self.conversation_item_storage.clone(),
+            self.background_tasks.clone(),
+        )
+        .await
     }
 
     async fn get_response(
