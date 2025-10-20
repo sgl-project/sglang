@@ -1,13 +1,16 @@
-use clap::{ArgAction, Parser, ValueEnum};
-use sglang_router_rs::config::{
-    CircuitBreakerConfig, ConfigError, ConfigResult, ConnectionMode, DiscoveryConfig,
-    HealthCheckConfig, HistoryBackend, MetricsConfig, OracleConfig, PolicyConfig, RetryConfig,
-    RouterConfig, RoutingMode,
-};
-use sglang_router_rs::metrics::PrometheusConfig;
-use sglang_router_rs::server::{self, ServerConfig};
-use sglang_router_rs::service_discovery::ServiceDiscoveryConfig;
 use std::collections::HashMap;
+
+use clap::{ArgAction, Parser, ValueEnum};
+use sglang_router_rs::{
+    config::{
+        CircuitBreakerConfig, ConfigError, ConfigResult, ConnectionMode, DiscoveryConfig,
+        HealthCheckConfig, HistoryBackend, MetricsConfig, OracleConfig, PolicyConfig, RetryConfig,
+        RouterConfig, RoutingMode, TokenizerCacheConfig,
+    },
+    metrics::PrometheusConfig,
+    server::{self, ServerConfig},
+    service_discovery::ServiceDiscoveryConfig,
+};
 
 fn parse_prefill_args() -> Vec<(String, Option<u16>)> {
     let args: Vec<String> = std::env::args().collect();
@@ -195,6 +198,15 @@ struct CliArgs {
     #[arg(long, default_value_t = -1)]
     max_concurrent_requests: i32,
 
+    #[arg(long, default_value_t = 100)]
+    queue_size: usize,
+
+    #[arg(long, default_value_t = 60)]
+    queue_timeout_secs: u64,
+
+    #[arg(long)]
+    rate_limit_tokens_per_second: Option<i32>,
+
     #[arg(long, num_args = 0..)]
     cors_allowed_origins: Vec<String>,
 
@@ -254,6 +266,21 @@ struct CliArgs {
 
     #[arg(long)]
     tokenizer_path: Option<String>,
+
+    #[arg(long)]
+    chat_template: Option<String>,
+
+    #[arg(long, default_value_t = false)]
+    tokenizer_cache_enable_l0: bool,
+
+    #[arg(long, default_value_t = 10000)]
+    tokenizer_cache_l0_max_entries: usize,
+
+    #[arg(long, default_value_t = false)]
+    tokenizer_cache_enable_l1: bool,
+
+    #[arg(long, default_value_t = 52428800)]
+    tokenizer_cache_l1_max_memory: usize,
 
     #[arg(long, default_value = "memory", value_parser = ["memory", "none", "oracle"])]
     history_backend: String,
@@ -532,8 +559,8 @@ impl CliArgs {
                 Some(self.request_id_headers.clone())
             },
             max_concurrent_requests: self.max_concurrent_requests,
-            queue_size: 100,
-            queue_timeout_secs: 60,
+            queue_size: self.queue_size,
+            queue_timeout_secs: self.queue_timeout_secs,
             cors_allowed_origins: self.cors_allowed_origins.clone(),
             retry: RetryConfig {
                 max_retries: self.retry_max_retries,
@@ -558,13 +585,20 @@ impl CliArgs {
                 endpoint: self.health_check_endpoint.clone(),
             },
             enable_igw: self.enable_igw,
-            rate_limit_tokens_per_second: None,
+            rate_limit_tokens_per_second: self.rate_limit_tokens_per_second,
             model_path: self.model_path.clone(),
             tokenizer_path: self.tokenizer_path.clone(),
+            chat_template: self.chat_template.clone(),
             history_backend,
             oracle,
             reasoning_parser: self.reasoning_parser.clone(),
             tool_call_parser: self.tool_call_parser.clone(),
+            tokenizer_cache: TokenizerCacheConfig {
+                enable_l0: self.tokenizer_cache_enable_l0,
+                l0_max_entries: self.tokenizer_cache_l0_max_entries,
+                enable_l1: self.tokenizer_cache_enable_l1,
+                l1_max_memory: self.tokenizer_cache_l1_max_memory,
+            },
         })
     }
 

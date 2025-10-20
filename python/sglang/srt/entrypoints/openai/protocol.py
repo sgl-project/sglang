@@ -221,6 +221,7 @@ class CompletionRequest(BaseModel):
     ebnf: Optional[str] = None
     repetition_penalty: float = 1.0
     stop_token_ids: Optional[List[int]] = None
+    stop_regex: Optional[Union[str, List[str]]] = None
     no_stop_trim: bool = False
     ignore_eos: bool = False
     skip_special_tokens: bool = True
@@ -476,6 +477,7 @@ class ChatCompletionRequest(BaseModel):
     ebnf: Optional[str] = None
     repetition_penalty: Optional[float] = None
     stop_token_ids: Optional[List[int]] = None
+    stop_regex: Optional[Union[str, List[str]]] = None
     no_stop_trim: bool = False
     ignore_eos: bool = False
     continue_final_message: bool = False
@@ -608,6 +610,7 @@ class ChatCompletionRequest(BaseModel):
             "min_new_tokens": self.min_tokens,
             "stop": stop,
             "stop_token_ids": self.stop_token_ids,
+            "stop_regex": self.stop_regex,
             "top_p": get_param("top_p"),
             "top_k": get_param("top_k"),
             "min_p": get_param("min_p"),
@@ -765,6 +768,37 @@ class EmbeddingObject(BaseModel):
     object: str = "embedding"
 
 
+ClassifyInput = Union[str, List[str], List[int]]
+
+
+class ClassifyRequest(BaseModel):
+    # OpenAI-compatible classification request
+    model: str = DEFAULT_MODEL_NAME
+    input: ClassifyInput
+    user: Optional[str] = None
+
+    # The request id.
+    rid: Optional[Union[List[str], str]] = None
+    # Priority for the request
+    priority: Optional[int] = None
+
+
+class ClassifyData(BaseModel):
+    index: int
+    label: str
+    probs: List[float]
+    num_classes: int
+
+
+class ClassifyResponse(BaseModel):
+    id: str
+    object: str = "list"
+    created: int
+    model: str
+    data: List[ClassifyData]
+    usage: UsageInfo
+
+
 class EmbeddingResponse(BaseModel):
     data: List[EmbeddingObject]
     model: str
@@ -848,6 +882,7 @@ OpenAIServingRequest = Union[
     ChatCompletionRequest,
     CompletionRequest,
     EmbeddingRequest,
+    ClassifyRequest,
     ScoringRequest,
     V1RerankReqInput,
     TokenizeRequest,

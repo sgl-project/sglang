@@ -3,13 +3,10 @@ from __future__ import annotations
 import logging
 import time
 from collections import defaultdict
-from typing import TYPE_CHECKING, Dict, List, Optional, Union
-
-import torch
+from typing import TYPE_CHECKING, List, Optional
 
 from sglang.srt.disaggregation.kv_events import EventPublisherFactory, KVEventBatch
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
 from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.managers.scheduler import Req, ScheduleBatch
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
@@ -69,7 +66,7 @@ class SchedulerMetricsMixin:
                 kv_events_config, self.attn_dp_rank
             )
 
-    def update_spec_metrics(self, bs: int, num_accepted_tokens: int):
+    def update_spec_metrics(self: Scheduler, bs: int, num_accepted_tokens: int):
         self.spec_num_total_accepted_tokens += num_accepted_tokens + bs
         self.spec_num_total_forward_ct += bs
         self.num_generated_tokens += num_accepted_tokens
@@ -104,6 +101,23 @@ class SchedulerMetricsMixin:
                 f"full token usage: {full_token_usage:.2f}, "
                 f"swa token usage: {swa_token_usage:.2f}, "
             )
+        elif self.is_hybrid_gdn:
+            (
+                full_num_used,
+                _,
+                full_token_usage,
+                mamba_usage,
+                _,
+                _,
+                _,
+                _,
+            ) = self._get_mamba_token_info()
+            num_used = full_num_used
+            token_usage = full_token_usage
+            token_usage_msg = (
+                f"full token usage: {full_token_usage:.2f}, "
+                f"mamba usage: {mamba_usage:.2f}, "
+            )
         else:
             num_used, token_usage, _, _ = self._get_token_info()
             token_usage_msg = f"token usage: {token_usage:.2f}, "
@@ -121,6 +135,7 @@ class SchedulerMetricsMixin:
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             f += f"#prealloc-req: {len(self.disagg_prefill_bootstrap_queue.queue)}, "
             f += f"#inflight-req: {len(self.disagg_prefill_inflight_queue)}, "
+            f += f"input throughput (token/s): {self.last_input_throughput:.2f}, "
 
         logger.info(f)
 
@@ -203,6 +218,25 @@ class SchedulerMetricsMixin:
                 f"#swa token: {swa_num_used}, "
                 f"swa token usage: {swa_token_usage:.2f}, "
             )
+        elif self.is_hybrid_gdn:
+            (
+                full_num_used,
+                mamba_used,
+                full_token_usage,
+                mamba_usage,
+                _,
+                _,
+                _,
+                _,
+            ) = self._get_mamba_token_info()
+            num_used = full_num_used
+            token_usage = full_token_usage
+            token_usage_msg = (
+                f"#full token: {full_num_used}, "
+                f"full token usage: {full_token_usage:.2f}, "
+                f"mamba num: {mamba_used}, "
+                f"mamba usage: {mamba_usage:.2f}, "
+            )
         else:
             num_used, token_usage, _, _ = self._get_token_info()
             token_usage_msg = f"#token: {num_used}, token usage: {token_usage:.2f}, "
@@ -216,14 +250,24 @@ class SchedulerMetricsMixin:
 
         if self.spec_algorithm.is_none():
             spec_accept_length = 0
+            spec_accept_rate = 0
         else:
             spec_accept_length = (
                 self.spec_num_total_accepted_tokens / self.spec_num_total_forward_ct
             )
+            # Calculate acceptance rate: accepted tokens / total draft tokens
+            total_draft_tokens = self.spec_num_total_forward_ct * (
+                (self.server_args.speculative_num_steps or 0) + 1
+            )
+            spec_accept_rate = (
+                self.spec_num_total_accepted_tokens / total_draft_tokens
+                if total_draft_tokens > 0
+                else 0
+            )
             self.cum_spec_accept_length += self.spec_num_total_accepted_tokens
             self.cum_spec_accept_count += self.spec_num_total_forward_ct
             self.spec_num_total_accepted_tokens = self.spec_num_total_forward_ct = 0
-            msg += f"accept len: {spec_accept_length:.2f}, "
+            msg += f"accept len: {spec_accept_length:.2f}, accept rate: {spec_accept_rate:.2f}, "
         cache_hit_rate = 0.0
 
         if self.disaggregation_mode == DisaggregationMode.DECODE:
@@ -251,6 +295,9 @@ class SchedulerMetricsMixin:
             self.stats.num_queue_reqs = len(self.waiting_queue)
             self.stats.num_grammar_queue_reqs = len(self.grammar_queue)
             self.stats.cache_hit_rate = cache_hit_rate
+
+            # Speculative decoding
+            self.stats.spec_accept_rate = spec_accept_rate
             self.stats.spec_accept_length = spec_accept_length
 
             # Retract
