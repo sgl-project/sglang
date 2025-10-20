@@ -101,7 +101,9 @@ class S3Connector(BaseFileConnector):
             return
 
         for file in files:
-            destination_file = os.path.join(self.local_dir, file.removeprefix(f"{base_dir}/"))
+            destination_file = os.path.join(
+                self.local_dir, file.removeprefix(f"{base_dir}/")
+            )
             local_dir = Path(destination_file).parent
             os.makedirs(local_dir, exist_ok=True)
             self.client.download_file(bucket_name, file, destination_file)
