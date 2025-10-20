@@ -471,9 +471,7 @@ impl PipelineStage for RequestBuildingStage {
 
         let mut proto_request = match &ctx.input.request_type {
             RequestType::Chat(request) => {
-                // Use pre-generated request_id if provided (for background tasks), otherwise generate new one
-                let request_id = ctx.input.grpc_request_id.clone()
-                    .unwrap_or_else(|| format!("chatcmpl-{}", Uuid::new_v4()));
+                let request_id = format!("chatcmpl-{}", Uuid::new_v4());
                 let body_ref = prep.filtered_request.as_ref().unwrap_or(request);
 
                 builder_client
@@ -494,9 +492,7 @@ impl PipelineStage for RequestBuildingStage {
                     })?
             }
             RequestType::Generate(request) => {
-                // Use pre-generated request_id if provided, otherwise use rid or generate new one
-                let request_id = ctx.input.grpc_request_id.clone()
-                    .or_else(|| request.rid.clone())
+                let request_id = request.rid.clone()
                     .unwrap_or_else(|| format!("gen-{}", Uuid::new_v4()));
 
                 builder_client
@@ -1019,7 +1015,7 @@ impl RequestPipeline {
         model_id: Option<String>,
         components: Arc<SharedComponents>,
     ) -> Response {
-        let mut ctx = RequestContext::for_chat(request, headers, model_id, components, None);
+        let mut ctx = RequestContext::for_chat(request, headers, model_id, components);
 
         // Execute each stage in sequence
         for (idx, stage) in self.stages.iter().enumerate() {
@@ -1063,7 +1059,7 @@ impl RequestPipeline {
         model_id: Option<String>,
         components: Arc<SharedComponents>,
     ) -> Response {
-        let mut ctx = RequestContext::for_generate(request, headers, model_id, components, None);
+        let mut ctx = RequestContext::for_generate(request, headers, model_id, components);
 
         // Execute each stage in sequence
         for (idx, stage) in self.stages.iter().enumerate() {
@@ -1102,18 +1098,17 @@ impl RequestPipeline {
     /// Execute chat pipeline for responses endpoint (Result-based for easier composition)
     ///
     /// This is used by the responses module and returns Result instead of Response.
-    /// It also supports background mode cancellation via grpc_request_id and background_tasks.
+    /// It also supports background mode cancellation via background_tasks.
     pub async fn execute_chat_for_responses(
         &self,
         request: Arc<ChatCompletionRequest>,
         headers: Option<http::HeaderMap>,
         model_id: Option<String>,
         components: Arc<SharedComponents>,
-        grpc_request_id: Option<String>,
         response_id: Option<String>,
         background_tasks: Option<Arc<RwLock<std::collections::HashMap<String, super::router::BackgroundTaskInfo>>>>,
     ) -> Result<crate::protocols::chat::ChatCompletionResponse, String> {
-        let mut ctx = RequestContext::for_chat(request, headers, model_id, components, grpc_request_id);
+        let mut ctx = RequestContext::for_chat(request, headers, model_id, components);
 
         // Execute each stage in sequence
         for (idx, stage) in self.stages.iter().enumerate() {
@@ -1123,8 +1118,10 @@ impl RequestPipeline {
                     return Err("Streaming is not supported in this context".to_string());
                 }
                 Ok(None) => {
-                    // After ClientAcquisitionStage (stage index 2), store client for cancellation
-                    if idx == 2 && response_id.is_some() && background_tasks.is_some() {
+                    let stage_name = stage.name();
+
+                    // After ClientAcquisitionStage, store client for background task cancellation
+                    if stage_name == "ClientAcquisition" && response_id.is_some() && background_tasks.is_some() {
                         if let Some(ref clients) = ctx.state.clients {
                             let client_to_store = match clients {
                                 ClientSelection::Single { client } => client.clone(),
@@ -1137,6 +1134,22 @@ impl RequestPipeline {
                                 {
                                     *task_info.client.write().await = Some(client_to_store);
                                     debug!("Stored client for response_id: {}", response_id.as_ref().unwrap());
+                                }
+                            }
+                        }
+                    }
+
+                    // After DispatchMetadataStage, store grpc_request_id for background task cancellation
+                    if stage_name == "DispatchMetadata" && response_id.is_some() && background_tasks.is_some() {
+                        if let Some(ref dispatch) = ctx.state.dispatch {
+                            let grpc_request_id = dispatch.request_id.clone();
+
+                            if let Some(ref tasks) = background_tasks {
+                                if let Some(task_info) =
+                                    tasks.write().await.get_mut(response_id.as_ref().unwrap())
+                                {
+                                    task_info.grpc_request_id = grpc_request_id.clone();
+                                    debug!("Stored grpc_request_id for response_id: {}", response_id.as_ref().unwrap());
                                 }
                             }
                         }

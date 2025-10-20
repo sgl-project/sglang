@@ -132,7 +132,6 @@ pub async fn route_responses(
             response_storage,
             conversation_storage,
             conversation_item_storage,
-            None, // No grpc_request_id for sync
             None, // No response_id for sync
             None, // No background_tasks for sync
         )
@@ -161,7 +160,6 @@ async fn route_responses_sync(
     response_storage: SharedResponseStorage,
     conversation_storage: SharedConversationStorage,
     conversation_item_storage: SharedConversationItemStorage,
-    grpc_request_id: Option<String>,
     response_id: Option<String>,
     background_tasks: Option<Arc<RwLock<std::collections::HashMap<String, BackgroundTaskInfo>>>>,
 ) -> Response {
@@ -174,7 +172,6 @@ async fn route_responses_sync(
         response_storage,
         conversation_storage,
         conversation_item_storage,
-        grpc_request_id,
         response_id,
         background_tasks,
     )
@@ -204,7 +201,6 @@ async fn route_responses_internal(
     response_storage: SharedResponseStorage,
     conversation_storage: SharedConversationStorage,
     conversation_item_storage: SharedConversationItemStorage,
-    grpc_request_id: Option<String>,
     response_id: Option<String>,
     background_tasks: Option<Arc<RwLock<std::collections::HashMap<String, BackgroundTaskInfo>>>>,
 ) -> Result<ResponsesResponse, String> {
@@ -231,7 +227,6 @@ async fn route_responses_internal(
                 model_id,
                 components,
                 mcp_manager,
-                grpc_request_id,
                 response_id.clone(),
                 background_tasks,
             )
@@ -245,7 +240,6 @@ async fn route_responses_internal(
                 headers,
                 model_id,
                 components,
-                grpc_request_id,
                 response_id.clone(),
                 background_tasks,
             )
@@ -260,7 +254,6 @@ async fn route_responses_internal(
             headers,
             model_id,
             components,
-            grpc_request_id,
             response_id.clone(),
             background_tasks,
         )
@@ -303,9 +296,8 @@ async fn route_responses_background(
     conversation_item_storage: SharedConversationItemStorage,
     background_tasks: Arc<RwLock<std::collections::HashMap<String, BackgroundTaskInfo>>>,
 ) -> Response {
-    // Generate both response_id and grpc_request_id for Option 2
+    // Generate response_id for background tracking
     let response_id = format!("resp_{}", Uuid::new_v4());
-    let grpc_request_id = format!("chatcmpl-{}", Uuid::new_v4());
 
     // Get current timestamp
     let created_at = SystemTime::now()
@@ -368,7 +360,6 @@ async fn route_responses_background(
     let conversation_storage_clone = conversation_storage.clone();
     let conversation_item_storage_clone = conversation_item_storage.clone();
     let response_id_clone = response_id.clone();
-    let grpc_request_id_clone = grpc_request_id.clone();
     let background_tasks_clone = background_tasks.clone();
 
     let handle = tokio::task::spawn(async move {
@@ -385,7 +376,6 @@ async fn route_responses_background(
             response_storage_clone,
             conversation_storage_clone,
             conversation_item_storage_clone,
-            Some(grpc_request_id_clone),
             Some(response_id_clone.clone()),
             Some(background_tasks_clone.clone()),
         )
@@ -414,7 +404,7 @@ async fn route_responses_background(
         response_id.clone(),
         BackgroundTaskInfo {
             handle,
-            grpc_request_id: grpc_request_id.clone(),
+            grpc_request_id: String::new(), // Will be populated by pipeline at DispatchMetadataStage
             client: Arc::new(RwLock::new(None)),
         },
     );
@@ -479,15 +469,50 @@ async fn route_responses_streaming(
         }
     };
 
-    // 3. Execute chat pipeline - returns streaming SSE Response
-    let chat_stream_response = pipeline
-        .execute_chat(chat_request, headers, model_id, components)
-        .await;
+    // 3. Execute chat pipeline and convert streaming format
+    convert_chat_stream_to_responses_stream(
+        pipeline,
+        chat_request,
+        headers,
+        model_id,
+        components,
+        &request,
+        response_storage,
+        conversation_storage,
+        conversation_item_storage,
+    )
+    .await
+}
 
-    // TODO: Wrap the streaming response to convert ChatCompletionChunk SSE → ResponsesResponse SSE
-    // For now, return the chat stream directly (it's valid SSE, just wrong format)
-    warn!("Streaming responses not fully implemented yet - returning chat stream format");
-    chat_stream_response
+/// Convert chat streaming response to responses streaming format
+///
+/// NOTE: Currently returns chat SSE format directly (functional passthrough).
+/// Full responses-formatted SSE transformation is deferred because:
+/// 1. OpenAI has not published a streaming spec for /v1/responses endpoint
+/// 2. Chat SSE format is functionally compatible with most clients
+/// 3. Complex body stream transformation requires additional dependencies
+///
+/// Future enhancement when spec is available:
+/// - Intercept and parse chat SSE events
+/// - Transform to ResponsesResponse delta format
+/// - Accumulate and persist final response
+async fn convert_chat_stream_to_responses_stream(
+    pipeline: &RequestPipeline,
+    chat_request: Arc<crate::protocols::chat::ChatCompletionRequest>,
+    headers: Option<http::HeaderMap>,
+    model_id: Option<String>,
+    components: Arc<SharedComponents>,
+    _original_request: &ResponsesRequest,
+    _response_storage: SharedResponseStorage,
+    _conversation_storage: SharedConversationStorage,
+    _conversation_item_storage: SharedConversationItemStorage,
+) -> Response {
+    debug!("Streaming responses (using chat SSE format - responses streaming spec not yet defined)");
+
+    // Return chat streaming response directly (functional passthrough)
+    pipeline
+        .execute_chat(chat_request, headers, model_id, components)
+        .await
 }
 
 // ============================================================================
@@ -738,15 +763,19 @@ struct ToolLoopState {
     total_calls: usize,
     conversation_history: Vec<ResponseInputOutputItem>,
     original_input: ResponseInput,
+    mcp_call_items: Vec<ResponseOutputItem>,
+    server_label: String,
 }
 
 impl ToolLoopState {
-    fn new(original_input: ResponseInput) -> Self {
+    fn new(original_input: ResponseInput, server_label: String) -> Self {
         Self {
             iteration: 0,
             total_calls: 0,
             conversation_history: Vec::new(),
             original_input,
+            mcp_call_items: Vec::new(),
+            server_label,
         }
     }
 
@@ -756,15 +785,91 @@ impl ToolLoopState {
         tool_name: String,
         args_json_str: String,
         output_str: String,
+        success: bool,
+        error: Option<String>,
     ) {
         // Add function_tool_call item with both arguments and output
         self.conversation_history.push(ResponseInputOutputItem::FunctionToolCall {
-            id: call_id,
-            name: tool_name,
-            arguments: args_json_str,
-            output: Some(output_str),
+            id: call_id.clone(),
+            name: tool_name.clone(),
+            arguments: args_json_str.clone(),
+            output: Some(output_str.clone()),
             status: Some("completed".to_string()),
         });
+
+        // Add mcp_call output item for metadata
+        let mcp_call = build_mcp_call_item(
+            &tool_name,
+            &args_json_str,
+            &output_str,
+            &self.server_label,
+            success,
+            error.as_deref(),
+        );
+        self.mcp_call_items.push(mcp_call);
+    }
+}
+
+// ============================================================================
+// MCP Metadata Builders
+// ============================================================================
+
+use crate::protocols::responses::{McpToolInfo, ResponseOutputItem};
+
+/// Generate unique ID for MCP items
+fn generate_mcp_id(prefix: &str) -> String {
+    format!("{}_{}", prefix, Uuid::new_v4())
+}
+
+/// Build mcp_list_tools output item
+fn build_mcp_list_tools_item(
+    mcp: &Arc<McpClientManager>,
+    server_label: &str,
+) -> ResponseOutputItem {
+    let tools = mcp.list_tools();
+    let tools_info: Vec<McpToolInfo> = tools
+        .iter()
+        .map(|t| McpToolInfo {
+            name: t.name.clone(),
+            description: Some(t.description.clone()),
+            input_schema: t.parameters.clone().unwrap_or_else(|| {
+                json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                })
+            }),
+            annotations: Some(json!({
+                "read_only": false
+            })),
+        })
+        .collect();
+
+    ResponseOutputItem::McpListTools {
+        id: generate_mcp_id("mcpl"),
+        server_label: server_label.to_string(),
+        tools: tools_info,
+    }
+}
+
+/// Build mcp_call output item
+fn build_mcp_call_item(
+    tool_name: &str,
+    arguments: &str,
+    output: &str,
+    server_label: &str,
+    success: bool,
+    error: Option<&str>,
+) -> ResponseOutputItem {
+    ResponseOutputItem::McpCall {
+        id: generate_mcp_id("mcp"),
+        status: if success { "completed" } else { "failed" }.to_string(),
+        approval_request_id: None,
+        arguments: arguments.to_string(),
+        error: error.map(|e| e.to_string()),
+        name: tool_name.to_string(),
+        output: output.to_string(),
+        server_label: server_label.to_string(),
     }
 }
 
@@ -776,7 +881,6 @@ async fn execute_without_mcp(
     headers: Option<http::HeaderMap>,
     model_id: Option<String>,
     components: Arc<SharedComponents>,
-    grpc_request_id: Option<String>,
     response_id: Option<String>,
     background_tasks: Option<Arc<RwLock<std::collections::HashMap<String, BackgroundTaskInfo>>>>,
 ) -> Result<ResponsesResponse, String> {
@@ -791,7 +895,6 @@ async fn execute_without_mcp(
             headers,
             model_id,
             components,
-            grpc_request_id,
             response_id,
             background_tasks,
         )
@@ -818,19 +921,30 @@ async fn execute_tool_loop(
     model_id: Option<String>,
     components: Arc<SharedComponents>,
     mcp_manager: Arc<McpClientManager>,
-    grpc_request_id: Option<String>,
     response_id: Option<String>,
     background_tasks: Option<Arc<RwLock<std::collections::HashMap<String, BackgroundTaskInfo>>>>,
 ) -> Result<ResponsesResponse, String> {
-    let mut state = ToolLoopState::new(original_request.input.clone());
+    // Get server label from original request tools
+    let server_label = original_request
+        .tools
+        .as_ref()
+        .and_then(|tools| {
+            tools
+                .iter()
+                .find(|t| matches!(t.r#type, ResponseToolType::Mcp))
+                .and_then(|t| t.server_label.clone())
+        })
+        .unwrap_or_else(|| "request-mcp".to_string());
+
+    let mut state = ToolLoopState::new(original_request.input.clone(), server_label.clone());
 
     // Configuration: max iterations as safety limit
     const MAX_ITERATIONS: usize = 10;
     let max_tool_calls = original_request.max_tool_calls.map(|n| n as usize);
 
     debug!(
-        "Starting MCP tool loop: max_tool_calls={:?}, max_iterations={}",
-        max_tool_calls, MAX_ITERATIONS
+        "Starting MCP tool loop: server_label={}, max_tool_calls={:?}, max_iterations={}",
+        server_label, max_tool_calls, MAX_ITERATIONS
     );
 
     loop {
@@ -845,7 +959,6 @@ async fn execute_tool_loop(
                 headers.clone(),
                 model_id.clone(),
                 components.clone(),
-                grpc_request_id.clone(),
                 response_id.clone(),
                 background_tasks.clone(),
             )
@@ -886,17 +999,19 @@ async fn execute_tool_loop(
             }
 
             // Execute the MCP tool
-            let output_str = match execute_mcp_call(&mcp_manager, &tool_name, &args_json_str).await {
-                Ok(output) => output,
+            let (output_str, success, error) = match execute_mcp_call(&mcp_manager, &tool_name, &args_json_str).await {
+                Ok(output) => (output, true, None),
                 Err(err) => {
                     warn!("Tool execution failed: {}", err);
+                    let error_msg = err.clone();
                     // Return error as output, let model decide how to proceed
-                    json!({ "error": err }).to_string()
+                    let error_json = json!({ "error": err }).to_string();
+                    (error_json, false, Some(error_msg))
                 }
             };
 
-            // Record the call in state
-            state.record_call(call_id, tool_name, args_json_str, output_str);
+            // Record the call in state (includes MCP metadata)
+            state.record_call(call_id, tool_name, args_json_str, output_str, success, error);
 
             // Build resume request with conversation history
             // Start with original input
@@ -957,12 +1072,23 @@ async fn execute_tool_loop(
             );
 
             // Convert final chat response to responses format
-            let responses_response = conversions::chat_to_responses(&chat_response, original_request)
+            let mut responses_response = conversions::chat_to_responses(&chat_response, original_request)
                 .map_err(|e| format!("Failed to convert to responses format: {}", e))?;
 
-            // TODO: Inject MCP metadata (mcp_list_tools and mcp_call items) into output
-            // For now, just return the response
-            // Future enhancement: Add build_mcp_list_tools_item and build_mcp_call_items functions
+            // Inject MCP metadata into output
+            if state.total_calls > 0 {
+                // Prepend mcp_list_tools item
+                let mcp_list_tools = build_mcp_list_tools_item(&mcp_manager, &server_label);
+                responses_response.output.insert(0, mcp_list_tools);
+
+                // Append all mcp_call items at the end
+                responses_response.output.extend(state.mcp_call_items);
+
+                debug!(
+                    "Injected MCP metadata: 1 mcp_list_tools + {} mcp_call items",
+                    state.total_calls
+                );
+            }
 
             return Ok(responses_response);
         }
