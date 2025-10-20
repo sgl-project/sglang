@@ -22,7 +22,6 @@ The radix tree data structure for managing the hybrid (full and Mamba) KV cache.
 import heapq
 import time
 from collections import defaultdict
-from functools import partial
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
@@ -33,7 +32,6 @@ from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import (
     RadixKey,
     _key_match_page_size1,
-    _key_match_paged,
     get_child_key,
 )
 
