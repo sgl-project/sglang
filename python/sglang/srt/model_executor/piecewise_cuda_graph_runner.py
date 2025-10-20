@@ -179,7 +179,20 @@ class PiecewiseCudaGraphRunner:
         # Set graph pool id globally to be able to use symmetric memory
         set_graph_pool_id(get_global_graph_memory_pool())
 
-        with patch_model(self.model_runner.model.model) as patched_model:
+        try:
+            model = self.model_runner.model.model
+        except:
+            try:
+                model = self.model_runner.model.language_model.model
+            except:
+                try:
+                    model = self.model_runner.model.language_model
+                except:
+                    raise Exception(
+                        "Cannot get the underlying model for PiecewiseCudaGraphRunner."
+                    )
+
+        with patch_model(model) as patched_model:
             install_torch_compiled(
                 patched_model,
                 fullgraph=True,
