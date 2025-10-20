@@ -1382,7 +1382,7 @@ def create_mm_data_row(
         "vllm",
         "vllm-chat",
         "lmdeploy",
-        "lmdeploy-chat"
+        "lmdeploy-chat",
     ]
     return DatasetRow(
         prompt=text_prompt if use_raw_prompt else prompt_str,
