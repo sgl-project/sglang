@@ -100,7 +100,7 @@ class ThinkingBudgetLogitProcessor(CustomLogitProcessor):
                 continue
 
             # Ensure new line token before thinking end token
-            if req.output_ids[-1] != self.NEW_LINE_TOKEN_ID:
+            if not req.output_ids or req.output_ids[-1] != self.NEW_LINE_TOKEN_ID:
                 logits[i, :] = -float("inf")
                 logits[i, self.NEW_LINE_TOKEN_ID] = 0.0
                 continue
