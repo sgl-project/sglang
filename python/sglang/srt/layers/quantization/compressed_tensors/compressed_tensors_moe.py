@@ -465,7 +465,7 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                         if moe_runner_config.activation == "silu"
                         else ActivationType.Gelu
                     ),
-                    expert_mask=layer.expert_mask_gpu,
+                    #expert_mask=layer.expert_mask_gpu,
                 )
         else:
             quant_info = TritonMoeQuantInfo(
