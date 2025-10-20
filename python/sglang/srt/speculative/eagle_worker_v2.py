@@ -696,3 +696,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
             tgt_cache_loc, accepted_out_cache_loc
         )
+
+    def clear_cache_pool(self):
+        self.req_to_token_pool.clear()
+        self.token_to_kv_pool_allocator.clear()
