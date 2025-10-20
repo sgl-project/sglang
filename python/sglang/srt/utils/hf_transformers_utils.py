@@ -75,7 +75,9 @@ _CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
     DeepseekVLV2Config,
 ]
 
-for cls in _CONFIG_REGISTRY:
+_CONFIG_REGISTRY = {config_cls.model_type: config_cls for config_cls in _CONFIG_REGISTRY}
+
+for name, cls in _CONFIG_REGISTRY.items():
     name = cls.model_type
     with contextlib.suppress(ValueError):
         AutoConfig.register(name, cls)
@@ -194,6 +196,10 @@ def get_config(
         config = AutoConfig.from_pretrained(
             model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
         )
+        print(f"{model=}")
+        if "deepseek-ai/DeepSeek-OCR" in model:
+            config.model_type = "deepseek-ocr"
+
     except ValueError as e:
         if not "deepseek_v32" in str(e):
             raise e
@@ -228,8 +234,11 @@ def get_config(
             if not hasattr(config, key) and getattr(text_config, key, None) is not None:
                 setattr(config, key, val)
 
+    print(f"{config.model_type=}")
+    print(f"{_CONFIG_REGISTRY=}")
     if config.model_type in _CONFIG_REGISTRY:
         config_class = _CONFIG_REGISTRY[config.model_type]
+        print(f"234 {config_class=}")
         config = config_class.from_pretrained(model, revision=revision)
         # NOTE(HandH1998): Qwen2VL requires `_name_or_path` attribute in `config`.
         setattr(config, "_name_or_path", model)
