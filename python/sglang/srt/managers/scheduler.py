@@ -989,6 +989,14 @@ class Scheduler(
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
         self.result_queue: Deque[Tuple[ScheduleBatch, GenerationBatchResult]] = deque()
+        disable_consecutive_prefill_overlap = (
+            envs.SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP.get()
+        )
+
+        def pop_and_process():
+            # Process the results of the last batch
+            tmp_batch, tmp_result = self.result_queue.popleft()
+            self.process_batch_result(tmp_batch, tmp_result)
 
         while True:
             recv_reqs = self.recv_requests()
@@ -997,15 +1005,25 @@ class Scheduler(
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
 
+            disable_overlap_for_batch = (
+                disable_consecutive_prefill_overlap
+                and batch
+                and batch.forward_mode.is_extend()
+                and self.last_batch
+                and self.last_batch.forward_mode.is_extend()
+            )
+
+            if disable_overlap_for_batch:
+                pop_and_process()
+
             batch_result = None
             if batch:
                 batch_result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), batch_result))
 
             if self.last_batch:
-                # Process the results of the last batch
-                tmp_batch, tmp_result = self.result_queue.popleft()
-                self.process_batch_result(tmp_batch, tmp_result)
+                if not disable_overlap_for_batch:
+                    pop_and_process()
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
