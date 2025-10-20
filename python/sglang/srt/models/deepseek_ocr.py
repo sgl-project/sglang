@@ -1452,7 +1452,7 @@ class DeepseekOCRModel(DeepseekV2Model):
         )
 
 
-class DeepseekOCRForCausalLM(DeepseekV2ForCausalLM):
+class DeepseekOCRForCausalLM(nn.Module):
     def __init__(
         self,
         *,
@@ -1460,9 +1460,9 @@ class DeepseekOCRForCausalLM(DeepseekV2ForCausalLM):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
-        super().__init__(config.text_config, quant_config, prefix)
+        super().__init__()
 
-        self.model = DeepseekOCRModel(config)
+        # self.model = DeepseekOCRModel(config)
         # multimodal_config = config.multimodal_config
 
         # config.model_type ='deepseek_vl_v2'
@@ -1497,23 +1497,24 @@ class DeepseekOCRForCausalLM(DeepseekV2ForCausalLM):
                 f"Only 2D tile_tag is supported currently, got: {self.tile_tag}"
             )
 
+        print(f"{self.text_config.topk_method=}")
         if self.text_config.topk_method == "noaux_tc":
             architectures = ["DeepseekV3ForCausalLM"]
-            self.language_model = DeepseekV3ForCausalLM(
+            self.model = DeepseekV3ForCausalLM(
                 config=config.text_config,
                 quant_config=quant_config,
                 prefix=maybe_prefix(prefix, "language"),
             )
         elif not self.text_config.use_mla:
             architectures = ["DeepseekForCausalLM"]
-            self.language_model = DeepseekForCausalLM(
+            self.model = DeepseekForCausalLM(
                 config=config.text_config,
                 quant_config=quant_config,
                 prefix=maybe_prefix(prefix, "language"),
             )
         else:
             architectures = ["DeepseekV2ForCausalLM"]
-            self.language_model = DeepseekV2ForCausalLM(
+            self.model = DeepseekV2ForCausalLM(
                 config=config.text_config,
                 quant_config=quant_config,
                 prefix=maybe_prefix(prefix, "language"),
@@ -1736,7 +1737,7 @@ class DeepseekOCRForCausalLM(DeepseekV2ForCausalLM):
         return vision_features
 
     def get_language_model(self) -> torch.nn.Module:
-        return self.language_model
+        return self.model
 
     def get_multimodal_embeddings(
         self, **kwargs: object
@@ -1753,7 +1754,7 @@ class DeepseekOCRForCausalLM(DeepseekV2ForCausalLM):
         multimodal_embeddings: Optional[MultiModalEmbeddings] = None,
     ) -> torch.Tensor:
 
-        inputs_embeds = self.language_model.get_input_embeddings(input_ids)
+        inputs_embeds = self.model.get_input_embeddings(input_ids)
 
         if multimodal_embeddings is not None:
             inputs_embeds = merge_multimodal_embeddings(
@@ -1904,7 +1905,7 @@ class DeepseekOCRForCausalLM(DeepseekV2ForCausalLM):
         hidden_states = general_mm_embed_routine(
             input_ids=input_ids,
             forward_batch=forward_batch,
-            language_model=super(),
+            language_model=self.model,
             multimodal_model=self,
             positions=positions,
         )
@@ -1938,6 +1939,9 @@ class DeepseekOCRForCausalLM(DeepseekV2ForCausalLM):
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
+
+            if "model." in name:
+                name = name.replace("model.", "model.model.")
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
