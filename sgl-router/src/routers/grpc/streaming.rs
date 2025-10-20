@@ -3,39 +3,47 @@
 //! This module contains shared streaming logic for both Regular and PD routers,
 //! eliminating ~600 lines of duplication.
 
-use axum::response::Response;
-use axum::{body::Body, http::StatusCode};
+use std::{collections::HashMap, io, sync::Arc, time::Instant};
+
+use axum::{body::Body, http::StatusCode, response::Response};
 use bytes::Bytes;
 use http::header::{HeaderValue, CONTENT_TYPE};
+use proto::{
+    generate_complete::MatchedStop::{MatchedStopStr, MatchedTokenId},
+    generate_response::Response::{Chunk, Complete, Error},
+};
 use serde_json::{json, Value};
-use std::collections::HashMap;
-use std::io;
-use std::sync::Arc;
-use tokio::sync::mpsc::UnboundedSender;
-use tokio_stream::wrappers::UnboundedReceiverStream;
-use tokio_stream::StreamExt;
-use tonic::codec::Streaming;
+use tokio::sync::{mpsc, mpsc::UnboundedSender};
+use tokio_stream::{wrappers::UnboundedReceiverStream, StreamExt};
 use tracing::{debug, error, warn};
 
-use super::context;
-use super::utils;
-use crate::grpc_client::proto;
-use crate::protocols::spec::*;
-use crate::reasoning_parser::ReasoningParser;
-use crate::tokenizer::stop::{SequenceDecoderOutput, StopSequenceDecoder};
-use crate::tokenizer::traits::Tokenizer;
-use crate::tool_parser::ToolParser;
-use proto::generate_complete::MatchedStop::{MatchedStopStr, MatchedTokenId};
-use proto::generate_response::Response::{Chunk, Complete, Error};
-use std::time::Instant;
-use tokio::sync::mpsc;
+use super::{context, utils};
+use crate::{
+    grpc_client::proto,
+    protocols::{
+        chat::{
+            ChatCompletionRequest, ChatCompletionStreamResponse, ChatMessageDelta, ChatStreamChoice,
+        },
+        common::{
+            ChatLogProbs, FunctionCallDelta, StringOrArray, Tool, ToolCallDelta, ToolChoice,
+            ToolChoiceValue, Usage,
+        },
+        generate::GenerateRequest,
+    },
+    reasoning_parser::ReasoningParser,
+    tokenizer::{
+        stop::{SequenceDecoderOutput, StopSequenceDecoder},
+        traits::Tokenizer,
+    },
+    tool_parser::ToolParser,
+};
 
 /// Shared streaming processor for both single and dual dispatch modes
 #[derive(Clone)]
 pub struct StreamingProcessor {
     tokenizer: Arc<dyn Tokenizer>,
-    tool_parser_factory: crate::tool_parser::ToolParserFactory,
-    reasoning_parser_factory: crate::reasoning_parser::ReasoningParserFactory,
+    tool_parser_factory: crate::tool_parser::ParserFactory,
+    reasoning_parser_factory: crate::reasoning_parser::ParserFactory,
     configured_tool_parser: Option<String>,
     configured_reasoning_parser: Option<String>,
 }
@@ -43,8 +51,8 @@ pub struct StreamingProcessor {
 impl StreamingProcessor {
     pub fn new(
         tokenizer: Arc<dyn Tokenizer>,
-        tool_parser_factory: crate::tool_parser::ToolParserFactory,
-        reasoning_parser_factory: crate::reasoning_parser::ReasoningParserFactory,
+        tool_parser_factory: crate::tool_parser::ParserFactory,
+        reasoning_parser_factory: crate::reasoning_parser::ParserFactory,
         configured_tool_parser: Option<String>,
         configured_reasoning_parser: Option<String>,
     ) -> Self {
@@ -153,7 +161,7 @@ impl StreamingProcessor {
     /// Process streaming chunks from a single stream (Regular mode)
     pub async fn process_streaming_chunks(
         &self,
-        mut grpc_stream: Streaming<proto::GenerateResponse>,
+        mut grpc_stream: crate::grpc_client::sglang_scheduler::AbortOnDropStream,
         dispatch: context::DispatchMetadata,
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool),
         original_request: Arc<ChatCompletionRequest>,
@@ -194,6 +202,35 @@ impl StreamingProcessor {
         let model = &dispatch.model;
         let created = dispatch.created;
         let system_fingerprint = dispatch.weight_version.as_deref();
+
+        // Check parser availability once upfront (log warning only once per request)
+        let reasoning_parser_available = separate_reasoning
+            && utils::check_reasoning_parser_availability(
+                &self.reasoning_parser_factory,
+                self.configured_reasoning_parser.as_ref(),
+                model,
+            );
+
+        let tool_parser_available = tools.is_some()
+            && utils::check_tool_parser_availability(
+                &self.tool_parser_factory,
+                self.configured_tool_parser.as_ref(),
+                model,
+            );
+
+        if separate_reasoning && !reasoning_parser_available {
+            debug!(
+                "No reasoning parser found for model '{}', skipping reasoning parsing",
+                model
+            );
+        }
+
+        if tools.is_some() && !tool_parser_available {
+            debug!(
+                "No tool parser found for model '{}', skipping tool call parsing",
+                model
+            );
+        }
 
         // Phase 2: Main streaming loop
         while let Some(response) = grpc_stream.next().await {
@@ -276,7 +313,7 @@ impl StreamingProcessor {
                     stream_buffer.push_str(&delta);
 
                     // Reasoning content handling
-                    let in_reasoning = if separate_reasoning {
+                    let in_reasoning = if separate_reasoning && reasoning_parser_available {
                         let (normal_text, reasoning_chunk, in_reasoning) = self
                             .process_reasoning_stream(
                                 &delta,
@@ -303,8 +340,12 @@ impl StreamingProcessor {
                     let tool_choice_enabled =
                         !matches!(tool_choice, Some(ToolChoice::Value(ToolChoiceValue::None)));
 
-                    if !in_reasoning && tool_choice_enabled && tools.is_some() {
-                        let (should_skip, tool_chunks) = self
+                    if !in_reasoning
+                        && tool_choice_enabled
+                        && tools.is_some()
+                        && tool_parser_available
+                    {
+                        let tool_chunks = self
                             .process_tool_calls_stream(
                                 &delta,
                                 index,
@@ -325,10 +366,9 @@ impl StreamingProcessor {
                                 .map_err(|_| "Failed to send tool call chunk".to_string())?;
                         }
 
-                        // Continue to process the next chunk as we have tool chunks
-                        if should_skip {
-                            continue;
-                        }
+                        // Always skip regular content when tool parsing is active
+                        // Parser either emitted chunks or buffered content
+                        continue;
                     }
 
                     // Regular content emission
@@ -527,14 +567,17 @@ impl StreamingProcessor {
             }
         }
 
+        // Mark stream as completed successfully to prevent abort on drop
+        grpc_stream.mark_completed();
+
         Ok(())
     }
 
     /// Process dual streaming chunks (prefill + decode) - PD mode
     pub async fn process_dual_streaming_chunks(
         &self,
-        mut prefill_stream: Streaming<proto::GenerateResponse>,
-        decode_stream: Streaming<proto::GenerateResponse>,
+        mut prefill_stream: crate::grpc_client::sglang_scheduler::AbortOnDropStream,
+        decode_stream: crate::grpc_client::sglang_scheduler::AbortOnDropStream,
         dispatch: context::DispatchMetadata,
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool),
         original_request: Arc<ChatCompletionRequest>,
@@ -559,8 +602,18 @@ impl StreamingProcessor {
         }
 
         // Phase 2-5: Process decode stream (same as single mode)
-        self.process_streaming_chunks(decode_stream, dispatch, stop_params, original_request, tx)
-            .await
+        // Note: decode_stream will be marked completed inside process_streaming_chunks
+        let result = self
+            .process_streaming_chunks(decode_stream, dispatch, stop_params, original_request, tx)
+            .await;
+
+        // Mark prefill stream as completed AFTER decode completes successfully
+        // This ensures that if client disconnects during decode, BOTH streams send abort
+        if result.is_ok() {
+            prefill_stream.mark_completed();
+        }
+
+        result
     }
 
     /// Process streaming generate response and return SSE response
@@ -572,7 +625,7 @@ impl StreamingProcessor {
         generate_request: Arc<GenerateRequest>,
         dispatch: context::DispatchMetadata,
     ) -> Response {
-        let return_logprob = generate_request.return_logprob;
+        let return_logprob = generate_request.return_logprob.unwrap_or(false);
 
         // Create SSE channel
         let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, io::Error>>();
@@ -643,7 +696,7 @@ impl StreamingProcessor {
     /// Process streaming chunks for generate endpoint (no tool/reasoning parsing)
     async fn process_generate_streaming(
         tokenizer: Arc<dyn Tokenizer>,
-        mut stream: Streaming<proto::GenerateResponse>,
+        mut stream: crate::grpc_client::sglang_scheduler::AbortOnDropStream,
         request_id: String,
         weight_version: String,
         _include_logprobs: bool,
@@ -738,14 +791,17 @@ impl StreamingProcessor {
             }
         }
 
+        // Mark stream as completed successfully to prevent abort on drop
+        stream.mark_completed();
+
         Ok(())
     }
 
     /// Process dual streaming for generate endpoint (PD mode with logprobs support)
     async fn process_generate_streaming_dual(
         tokenizer: Arc<dyn Tokenizer>,
-        mut prefill_stream: Streaming<proto::GenerateResponse>,
-        decode_stream: Streaming<proto::GenerateResponse>,
+        mut prefill_stream: crate::grpc_client::sglang_scheduler::AbortOnDropStream,
+        decode_stream: crate::grpc_client::sglang_scheduler::AbortOnDropStream,
         request_id: String,
         weight_version: String,
         return_logprob: bool,
@@ -777,7 +833,8 @@ impl StreamingProcessor {
         };
 
         // Process decode stream with input_logprobs prepended
-        Self::process_generate_streaming_with_input_logprobs(
+        // Note: decode_stream will be marked completed inside the function
+        let result = Self::process_generate_streaming_with_input_logprobs(
             tokenizer,
             decode_stream,
             request_id,
@@ -786,13 +843,21 @@ impl StreamingProcessor {
             input_token_logprobs,
             tx,
         )
-        .await
+        .await;
+
+        // Mark prefill stream as completed AFTER decode completes successfully
+        // This ensures that if client disconnects during decode, BOTH streams send abort
+        if result.is_ok() {
+            prefill_stream.mark_completed();
+        }
+
+        result
     }
 
     /// Process generate streaming with optional input_logprobs
     async fn process_generate_streaming_with_input_logprobs(
         tokenizer: Arc<dyn Tokenizer>,
-        mut stream: Streaming<proto::GenerateResponse>,
+        mut stream: crate::grpc_client::sglang_scheduler::AbortOnDropStream,
         request_id: String,
         weight_version: String,
         _include_logprobs: bool,
@@ -913,6 +978,9 @@ impl StreamingProcessor {
             }
         }
 
+        // Mark stream as completed successfully to prevent abort on drop
+        stream.mark_completed();
+
         Ok(())
     }
 
@@ -963,13 +1031,15 @@ impl StreamingProcessor {
         created: u64,
         system_fingerprint: Option<&str>,
     ) -> (String, Option<ChatCompletionStreamResponse>, bool) {
-        // Get or create parser for this index
+        // Create fresh parser for this index (not pooled, to avoid state pollution)
         reasoning_parsers.entry(index).or_insert_with(|| {
-            utils::get_reasoning_parser(
+            let parser = utils::create_reasoning_parser(
                 &self.reasoning_parser_factory,
                 self.configured_reasoning_parser.as_ref(),
                 model,
             )
+            .expect("Parser should be available - checked upfront");
+            Arc::new(tokio::sync::Mutex::new(parser))
         });
 
         if let Some(pooled_parser) = reasoning_parsers.get(&index) {
@@ -1034,20 +1104,23 @@ impl StreamingProcessor {
         created: u64,
         system_fingerprint: Option<&str>,
         history_tool_calls_count: usize,
-    ) -> (bool, Vec<ChatCompletionStreamResponse>) {
+    ) -> Vec<ChatCompletionStreamResponse> {
         let mut chunks = Vec::new();
 
-        // Get or create parser for this index
+        // Create fresh parser for this index (not pooled, to avoid state pollution)
         tool_parsers.entry(index).or_insert_with(|| {
-            utils::get_tool_parser(
+            let parser = utils::create_tool_parser(
                 &self.tool_parser_factory,
                 self.configured_tool_parser.as_ref(),
                 model,
             )
+            .expect("Parser should be available - checked upfront");
+            Arc::new(tokio::sync::Mutex::new(parser))
         });
 
         if let Some(pooled_parser) = tool_parsers.get(&index) {
             let mut parser = pooled_parser.lock().await;
+
             match parser.parse_incremental(delta, tools).await {
                 Ok(crate::tool_parser::StreamingParseResult { normal_text, calls }) => {
                     // Emit normal text if present
@@ -1129,8 +1202,7 @@ impl StreamingProcessor {
                         });
                     }
 
-                    // If we emitted chunks, skip regular content
-                    return (!chunks.is_empty(), chunks);
+                    return chunks;
                 }
                 Err(e) => {
                     error!("Tool call parsing error: {}", e);
@@ -1138,7 +1210,7 @@ impl StreamingProcessor {
             }
         }
 
-        (false, chunks)
+        chunks
     }
 
     /// Format a response as SSE chunk into a reusable buffer
