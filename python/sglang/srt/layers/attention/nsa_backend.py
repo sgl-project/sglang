@@ -179,8 +179,8 @@ class NativeSparseAttnBackend(AttentionBackend):
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
         global NSA_PREFILL_IMPL, NSA_DECODE_IMPL
-        NSA_PREFILL_IMPL = model_runner.server_args.nsa_prefill
-        NSA_DECODE_IMPL = model_runner.server_args.nsa_decode
+        NSA_PREFILL_IMPL = model_runner.server_args.nsa_prefill_backend
+        NSA_DECODE_IMPL = model_runner.server_args.nsa_decode_backend
 
         self._arange_buf = torch.arange(16384, device=self.device, dtype=torch.int32)
 
