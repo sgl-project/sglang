@@ -634,12 +634,9 @@ impl StepExecutor for UpdatePoliciesStep {
             let all_workers = app_context.worker_registry.get_by_model_fast(&model_id);
             if let Some(policy) = app_context.policy_registry.get_policy(&model_id) {
                 if policy.name() == "cache_aware" {
-                    use crate::policies::CacheAwarePolicy;
-                    if let Some(cache_aware) =
-                        policy.as_any().downcast_ref::<Arc<CacheAwarePolicy>>()
-                    {
-                        cache_aware.init_workers(&all_workers);
-                    }
+                    app_context
+                        .policy_registry
+                        .init_cache_aware_policy(&model_id, &all_workers);
                 }
             }
 
@@ -666,12 +663,9 @@ impl StepExecutor for UpdatePoliciesStep {
             let all_workers = app_context.worker_registry.get_by_model_fast(&model_id);
             if let Some(policy) = app_context.policy_registry.get_policy(&model_id) {
                 if policy.name() == "cache_aware" {
-                    use crate::policies::CacheAwarePolicy;
-                    if let Some(cache_aware) =
-                        policy.as_any().downcast_ref::<Arc<CacheAwarePolicy>>()
-                    {
-                        cache_aware.init_workers(&all_workers);
-                    }
+                    app_context
+                        .policy_registry
+                        .init_cache_aware_policy(&model_id, &all_workers);
                 }
             }
 
