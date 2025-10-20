@@ -36,6 +36,7 @@ from sglang.srt.utils import (
     configure_ipv6,
     get_device,
     get_device_memory_capacity,
+    get_device_sm,
     is_cuda,
     is_flashinfer_available,
     is_hip,
@@ -942,6 +943,31 @@ class ServerArgs:
                 f"Disable hybrid SWA memory for {model_arch} as it is not yet supported."
             )
             self.disable_hybrid_swa_memory = True
+        elif model_arch in ["Olmo2ForCausalLM"]:
+            # FIXME: https://github.com/sgl-project/sglang/pull/7367 is not compatible with Olmo3 model.
+            logger.warning(
+                f"Disabling hybrid SWA memory for {model_arch} as it is not yet supported."
+            )
+            self.disable_hybrid_swa_memory = True
+
+            if self.attention_backend is None:
+                if is_cuda() and is_sm100_supported():
+                    self.attention_backend = "trtllm_mha"
+                elif is_cuda() and get_device_sm() >= 80:
+                    self.attention_backend = "fa3"
+                else:
+                    self.attention_backend = "triton"
+
+            # Flashinfer appears to degrade performance when sliding window attention
+            # is used for the Olmo2 architecture. Olmo2 does not use sliding window attention
+            # but Olmo3 does.
+            assert (
+                self.attention_backend != "flashinfer"
+            ), "FlashInfer backend can significantly degrade the performance of Olmo3 models."
+
+            logger.info(
+                f"Using {self.attention_backend} as attention backend for {model_arch}."
+            )
 
         if is_deepseek_nsa(hf_config):
             if (
@@ -1379,6 +1405,26 @@ class ServerArgs:
                 "Cannot enable both --enable-tokenizer-batch-encode and --enable-dynamic-batch-tokenizer. "
                 "Please choose one tokenizer batching approach."
             )
+
+        if self.skip_tokenizer_init:
+            if self.tokenizer_worker_num != 1:
+                logger.warning(
+                    "skip_tokenizer_init=True disables tokenizer workers; forcing tokenizer_worker_num=1 "
+                    f"(requested {self.tokenizer_worker_num})."
+                )
+                self.tokenizer_worker_num = 1
+
+            if self.enable_tokenizer_batch_encode:
+                logger.warning(
+                    "skip_tokenizer_init=True ignores --enable-tokenizer-batch-encode; disabling it."
+                )
+                self.enable_tokenizer_batch_encode = False
+
+            if self.enable_dynamic_batch_tokenizer:
+                logger.warning(
+                    "skip_tokenizer_init=True ignores --enable-dynamic-batch-tokenizer; disabling it."
+                )
+                self.enable_dynamic_batch_tokenizer = False
 
     def _handle_environment_variables(self):
         os.environ["SGLANG_ENABLE_TORCH_COMPILE"] = (
@@ -3253,7 +3299,6 @@ class ServerArgs:
                     "  Please manually install torch 2.6.x."
                 )
 
-        # Check multi tokenizer
         assert self.tokenizer_worker_num > 0, "Tokenizer worker num must >= 1"
         self.validate_buckets_rule(
             "--prompt-tokens-buckets", self.prompt_tokens_buckets
