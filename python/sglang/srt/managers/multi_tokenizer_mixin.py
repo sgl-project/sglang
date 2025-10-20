@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -21,7 +23,7 @@ import sys
 import threading
 from functools import partialmethod
 from multiprocessing import shared_memory
-from typing import Any, Dict
+from typing import TYPE_CHECKING, Any, Dict
 
 import setproctitle
 import zmq
@@ -41,6 +43,9 @@ from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import get_zmq_socket, kill_process_tree
 from sglang.utils import get_exception_traceback
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.detokenizer_manager import DetokenizerManager
 
 logger = logging.getLogger(__name__)
 
@@ -371,11 +376,11 @@ def get_worker_ids_from_req_rids(rids):
 class MultiHttpWorkerDetokenizerMixin:
     """Mixin class for DetokenizerManager"""
 
-    def maybe_clear_socket_mapping(self):
+    def maybe_clear_socket_mapping(self: DetokenizerManager):
         if hasattr(self, "socket_mapping"):
             self.socket_mapping.clear_all_sockets()
 
-    def multi_http_worker_event_loop(self):
+    def multi_http_worker_event_loop(self: DetokenizerManager):
         """The event loop that handles requests, for multi multi-http-worker mode"""
         self.socket_mapping = SocketMapping()
         while True:
