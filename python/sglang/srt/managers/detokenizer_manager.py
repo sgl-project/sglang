@@ -142,6 +142,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             if output[-1] == 200012 and self.is_tool_call_parser_gpt_oss:
                 return output
             assert len(output) > 0
+            # NOTE: We can always assume the last token is the matched stop token
             return output[:-1]
         return output
 

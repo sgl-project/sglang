@@ -81,6 +81,53 @@ pub struct RouterConfig {
     pub reasoning_parser: Option<String>,
     /// Parser for handling tool-call interactions
     pub tool_call_parser: Option<String>,
+    /// Tokenizer cache configuration
+    #[serde(default)]
+    pub tokenizer_cache: TokenizerCacheConfig,
+}
+
+/// Tokenizer cache configuration
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TokenizerCacheConfig {
+    /// Enable L0 cache (whole-string exact match)
+    #[serde(default = "default_enable_l0")]
+    pub enable_l0: bool,
+    /// Maximum number of entries in L0 cache
+    #[serde(default = "default_l0_max_entries")]
+    pub l0_max_entries: usize,
+    /// Enable L1 cache (prefix matching at fixed boundaries)
+    #[serde(default = "default_enable_l1")]
+    pub enable_l1: bool,
+    /// Maximum memory for L1 cache in bytes
+    #[serde(default = "default_l1_max_memory")]
+    pub l1_max_memory: usize,
+}
+
+fn default_enable_l0() -> bool {
+    false
+}
+
+fn default_l0_max_entries() -> usize {
+    10_000
+}
+
+fn default_enable_l1() -> bool {
+    false
+}
+
+fn default_l1_max_memory() -> usize {
+    50 * 1024 * 1024 // 50MB
+}
+
+impl Default for TokenizerCacheConfig {
+    fn default() -> Self {
+        Self {
+            enable_l0: default_enable_l0(),
+            l0_max_entries: default_l0_max_entries(),
+            enable_l1: default_enable_l1(),
+            l1_max_memory: default_l1_max_memory(),
+        }
+    }
 }
 
 fn default_history_backend() -> HistoryBackend {
@@ -459,6 +506,7 @@ impl Default for RouterConfig {
             oracle: None,
             reasoning_parser: None,
             tool_call_parser: None,
+            tokenizer_cache: TokenizerCacheConfig::default(),
         }
     }
 }
@@ -1004,6 +1052,7 @@ mod tests {
             oracle: None,
             reasoning_parser: None,
             tool_call_parser: None,
+            tokenizer_cache: TokenizerCacheConfig::default(),
         };
 
         assert!(config.mode.is_pd_mode());
@@ -1072,6 +1121,7 @@ mod tests {
             oracle: None,
             reasoning_parser: None,
             tool_call_parser: None,
+            tokenizer_cache: TokenizerCacheConfig::default(),
         };
 
         assert!(!config.mode.is_pd_mode());
@@ -1136,6 +1186,7 @@ mod tests {
             oracle: None,
             reasoning_parser: None,
             tool_call_parser: None,
+            tokenizer_cache: TokenizerCacheConfig::default(),
         };
 
         assert!(config.has_service_discovery());
