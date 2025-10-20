@@ -1201,6 +1201,9 @@ class ServerArgs:
                 )
             if self.max_running_requests is None:
                 self.max_running_requests = 48
+                logger.warning(
+                    "Max running requests is reset to 48 for speculative decoding."
+                )
 
             if self.speculative_algorithm == "EAGLE" and self.enable_beta_spec:
                 self.disable_overlap_schedule = False
