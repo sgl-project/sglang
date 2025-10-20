@@ -245,12 +245,6 @@ from sgl_kernel.elementwise import (
     silu_and_mul,
 )
 from sgl_kernel.expert_specialization import es_fp8_blockwise_scaled_grouped_mm
-from sgl_kernel.flash_mla import (
-    flash_attn_varlen_forward,
-    flash_mla_sparse_fwd,
-    flash_mla_with_kvcache,
-    get_mla_metadata,
-)
 from sgl_kernel.fused_moe import fused_marlin_moe
 from sgl_kernel.gemm import (
     awq_dequantize,
