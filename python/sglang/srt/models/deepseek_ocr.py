@@ -20,7 +20,7 @@ import concurrent
 import concurrent.futures
 import copy
 import logging
-from typing import Dict, Iterable, Optional, Tuple, TypeAlias, Union
+from typing import Iterable, Optional, Tuple, TypeAlias, Union
 
 import torch
 import torch.nn.functional as F
@@ -28,17 +28,14 @@ from torch import Tensor, nn
 
 from sglang.srt.compilation.compile import IntermediateTensors
 from sglang.srt.configs.deepseek_ocr import PRINT_NUM_VIS_TOKENS, DeepseekVLV2Config
-from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization import QuantizationConfig
-from sglang.srt.layers.utils import get_layer_id
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek import DeepseekForCausalLM
 from sglang.srt.models.deepseek_v2 import (
     DeepseekV2ForCausalLM,
     DeepseekV3ForCausalLM,
-    enable_nextn_moe_bf16_cast_to_fp8,
 )
 from sglang.srt.models.transformers import maybe_prefix
-from sglang.srt.utils import get_bool_env_var, log_info_on_rank0
 
 NestedTensors: TypeAlias = Union[
     list["NestedTensors"],
@@ -46,6 +43,8 @@ NestedTensors: TypeAlias = Union[
     "torch.Tensor",
     tuple["torch.Tensor", ...],
 ]
+
+MultiModalEmbeddings: TypeAlias = list[Tensor] | Tensor | tuple[Tensor, ...]
 
 logger = logging.getLogger(__name__)
 
@@ -176,114 +175,119 @@ def merge_multimodal_embeddings(
 
 class MlpProjector(nn.Module):
 
-    def __init__(self, cfg):
+    def __init__(
+        self,
+        projector_type,
+        input_dim,
+        n_embed,
+        depth=1,
+        mlp_ratio=1,
+        downsample_ratio=4,
+    ):
+        self.projector_type = projector_type
+        self.input_dim = input_dim
+        self.n_embed = n_embed
+        self.depth = depth
 
         super().__init__()
 
-        self.cfg = cfg
+        # self.cfg = cfg
 
-        if cfg.projector_type == "identity":
+        if projector_type == "identity":
             modules = nn.Identity()
 
-        elif cfg.projector_type == "linear":
-            modules = nn.Linear(cfg.input_dim, cfg.n_embed)
+        elif projector_type == "linear":
+            modules = nn.Linear(input_dim, n_embed)
 
-        elif cfg.projector_type == "mlp_gelu":
-            mlp_depth = cfg.get("depth", 1)
-            modules = [nn.Linear(cfg.input_dim, cfg.n_embed)]
+        elif projector_type == "mlp_gelu":
+            mlp_depth = depth
+            modules = [nn.Linear(input_dim, n_embed)]
             for _ in range(1, mlp_depth):
                 modules.append(nn.GELU())
-                modules.append(nn.Linear(cfg.n_embed, cfg.n_embed))
+                modules.append(nn.Linear(n_embed, n_embed))
             modules = nn.Sequential(*modules)
 
-        elif cfg.projector_type == "normlayer_downsample_mlp_gelu":
-            mlp_depth = cfg.get("depth", 1)
-            mlp_ratio = cfg.get("mlp_ratio", 1)
+        elif projector_type == "normlayer_downsample_mlp_gelu":
+            mlp_depth = depth
+            mlp_ratio = mlp_ratio
             modules = [
-                nn.LayerNorm(
-                    cfg.input_dim * cfg.downsample_ratio * cfg.downsample_ratio
-                ),
+                nn.LayerNorm(input_dim * downsample_ratio * downsample_ratio),
                 nn.Linear(
-                    cfg.input_dim * cfg.downsample_ratio * cfg.downsample_ratio,
-                    cfg.n_embed * mlp_ratio,
+                    input_dim * downsample_ratio * downsample_ratio,
+                    n_embed * mlp_ratio,
                 ),
             ]
             for _ in range(1, mlp_depth - 1):
                 modules.append(nn.GELU())
-                modules.append(
-                    nn.Linear(cfg.n_embed * mlp_ratio, cfg.n_embed * mlp_ratio)
-                )
+                modules.append(nn.Linear(n_embed * mlp_ratio, n_embed * mlp_ratio))
             modules.append(nn.GELU())
-            modules.append(nn.Linear(cfg.n_embed * mlp_ratio, cfg.n_embed))
+            modules.append(nn.Linear(n_embed * mlp_ratio, n_embed))
             modules = nn.Sequential(*modules)
 
-        elif cfg.projector_type == "downsample_mlp_gelu":
-            mlp_depth = cfg.get("depth", 1)
-            mlp_ratio = cfg.get("mlp_ratio", 1)
+        elif projector_type == "downsample_mlp_gelu":
+            mlp_depth = depth
+            mlp_ratio = mlp_ratio
             modules = [
                 nn.Linear(
-                    cfg.input_dim * cfg.downsample_ratio * cfg.downsample_ratio,
-                    cfg.n_embed * mlp_ratio,
+                    input_dim * downsample_ratio * downsample_ratio,
+                    n_embed * mlp_ratio,
                 )
             ]
             for _ in range(1, mlp_depth - 1):
                 modules.append(nn.GELU())
-                modules.append(
-                    nn.Linear(cfg.n_embed * mlp_ratio, cfg.n_embed * mlp_ratio)
-                )
+                modules.append(nn.Linear(n_embed * mlp_ratio, n_embed * mlp_ratio))
             modules.append(nn.GELU())
-            modules.append(nn.Linear(cfg.n_embed * mlp_ratio, cfg.n_embed))
+            modules.append(nn.Linear(n_embed * mlp_ratio, n_embed))
             modules = nn.Sequential(*modules)
 
-        elif cfg.projector_type == "low_high_hybrid_split_mlp_gelu":
-            mlp_depth = cfg.get("depth", 1)
-            self.high_up_proj = nn.Linear(cfg.input_dim, cfg.n_embed // 2)
-            self.low_up_proj = nn.Linear(cfg.input_dim, cfg.n_embed // 2)
+        elif projector_type == "low_high_hybrid_split_mlp_gelu":
+            mlp_depth = depth
+            self.high_up_proj = nn.Linear(input_dim, n_embed // 2)
+            self.low_up_proj = nn.Linear(input_dim, n_embed // 2)
 
             modules = []
             for _ in range(1, mlp_depth):
                 modules.append(nn.GELU())
-                modules.append(nn.Linear(cfg.n_embed, cfg.n_embed))
+                modules.append(nn.Linear(n_embed, n_embed))
             modules = nn.Sequential(*modules)
 
-        elif cfg.projector_type == "hybrid_split_feature_mlp_gelu":
-            mlp_depth = cfg.get("depth", 1)
-            channel_div = cfg.get("channel_div", 0.5)
-            self.high_up_proj = nn.Linear(
-                cfg.input_dim[0], int(cfg.n_embed * channel_div)
-            )
+        elif projector_type == "hybrid_split_feature_mlp_gelu":
+            mlp_depth = depth
+            channel_div = 0.5
+            self.high_up_proj = nn.Linear(input_dim[0], int(n_embed * channel_div))
             self.low_up_proj = nn.Linear(
-                cfg.input_dim[1], cfg.n_embed - int(cfg.n_embed * channel_div)
+                input_dim[1], n_embed - int(n_embed * channel_div)
             )
 
             modules = []
             for _ in range(1, mlp_depth):
                 modules.append(nn.GELU())
-                modules.append(nn.Linear(cfg.n_embed, cfg.n_embed))
+                modules.append(nn.Linear(n_embed, n_embed))
             modules = nn.Sequential(*modules)
 
-        elif cfg.projector_type == "low_high_split_mlp_gelu":
-            mlp_depth = cfg.get("depth", 1)
+        elif projector_type == "low_high_split_mlp_gelu":
+            mlp_depth = depth
             modules = []
             for _ in range(1, mlp_depth):
                 modules.append(nn.GELU())
-                modules.append(nn.Linear(cfg.n_embed // 2, cfg.n_embed // 2))
+                modules.append(nn.Linear(n_embed // 2, n_embed // 2))
             modules = nn.Sequential(*modules)
             self.high_layers = nn.Sequential(*modules)
             self.low_layers = copy.deepcopy(modules)
 
         else:
-            raise ValueError(f"Unknown projector type: {cfg.projector_type}")
+            raise ValueError(f"Unknown projector type: {projector_type}")
 
-        if cfg.get("token_pooling", False):
-            self.token_pooling_layer = nn.Linear(cfg.input_dim * 4, cfg.input_dim)
+        token_pooling = None
+        # if get("token_pooling", False):
+        #     self.token_pooling_layer = nn.Linear(input_dim * 4, input_dim)
 
-        if cfg.get("conv_fusion_high_low_features", False):
-            self.fusion_layer = nn.Linear(cfg.input_dim, cfg.input_dim)
+        # if get("conv_fusion_high_low_features", False):
+        #     self.fusion_layer = nn.Linear(input_dim, input_dim)
         self.layers = modules
 
     def forward(self, x):
-        if self.cfg.get("token_pooling", False):
+        if self.get("token_pooling", False):
             batch_size, wxh, channels = x.shape
             w = h = int(wxh**0.5)
             x = x.view(batch_size, w, h, channels)
@@ -302,23 +306,23 @@ class MlpProjector(nn.Module):
 
             x = self.token_pooling_layer(patches)
 
-        if self.cfg.get("conv_fusion_high_low_features", False):
+        if self.get("conv_fusion_high_low_features", False):
             x = self.fusion_layer(x[:, 0]) + x[:, 1]
 
-        if self.cfg.projector_type == "low_high_hybrid_split_mlp_gelu":
+        if self.projector_type == "low_high_hybrid_split_mlp_gelu":
             high_x, low_x = x[0], x[1]
             high_x = self.high_up_proj(high_x)
             low_x = self.low_up_proj(low_x)
             x = torch.concat([high_x, low_x], dim=-1)
 
-        if self.cfg.projector_type == "hybrid_split_feature_mlp_gelu":
-            high_x = x[..., : self.cfg.input_dim[0]]
-            low_x = x[..., self.cfg.input_dim[0] :]
+        if self.projector_type == "hybrid_split_feature_mlp_gelu":
+            high_x = x[..., : self.input_dim[0]]
+            low_x = x[..., self.input_dim[0] :]
             high_x = self.high_up_proj(high_x)
             low_x = self.low_up_proj(low_x)
             x = torch.concat([high_x, low_x], dim=-1)
 
-        if self.cfg.projector_type == "low_high_split_mlp_gelu":
+        if self.projector_type == "low_high_split_mlp_gelu":
             high_x, low_x = x[0], x[1]
             high_x = self.high_layers(high_x)
             low_x = self.low_layers(low_x)
@@ -326,15 +330,15 @@ class MlpProjector(nn.Module):
             return x
 
         if (
-            self.cfg.projector_type == "downsample_mlp_gelu"
-            or self.cfg.projector_type == "normlayer_downsample_mlp_gelu"
+            self.projector_type == "downsample_mlp_gelu"
+            or self.projector_type == "normlayer_downsample_mlp_gelu"
         ):
             bs, hw, input_dim = x.shape
             h = w = int((hw) ** 0.5)
 
             """compute padding"""
-            if h % self.cfg.downsample_ratio:
-                pad = self.cfg.downsample_ratio - h % self.cfg.downsample_ratio
+            if h % self.downsample_ratio:
+                pad = self.downsample_ratio - h % self.downsample_ratio
             else:
                 pad = 0
             x = x.reshape(bs, h, w, input_dim)
@@ -345,37 +349,13 @@ class MlpProjector(nn.Module):
             x = x.permute(0, 3, 1, 2)  # B, C, H, W
             x = F.unfold(
                 x,
-                kernel_size=self.cfg.downsample_ratio,
-                stride=self.cfg.downsample_ratio,
+                kernel_size=self.downsample_ratio,
+                stride=self.downsample_ratio,
                 padding=0,
             )  # B, C*4, HW // 4
             x = x.permute(0, 2, 1)
 
         return self.layers(x)
-
-    @staticmethod
-    def get_flops_per_sample(cfg):
-        if cfg.projector_type == "linear":
-            fwd = 2 * cfg.input_dim * cfg.n_embed
-
-        elif "mlp_gelu" in cfg.projector_type:
-            mlp_depth = cfg.get("depth", 1)
-            downsample_ratio = cfg.get("downsample_ratio", 1)
-            input_dim = (
-                sum(cfg.input_dim) if isinstance(cfg.input_dim, list) else cfg.input_dim
-            )
-            input_dim = input_dim * downsample_ratio * downsample_ratio
-            fwd = (
-                2 * input_dim * cfg.n_embed
-                + (mlp_depth - 1) * 2 * cfg.n_embed * cfg.n_embed
-            )
-        else:
-            fwd = 0
-
-        return fwd * 3
-
-
-MultiModalEmbeddings: TypeAlias = list[Tensor] | Tensor | tuple[Tensor, ...]
 
 
 class DeepseekOCRForCausalLM(nn.Module):
@@ -388,20 +368,25 @@ class DeepseekOCRForCausalLM(nn.Module):
     ):
         super().__init__()
 
-        multimodal_config = config.multimodal_config
+        # multimodal_config = config.multimodal_config
 
         # config.model_type ='deepseek_vl_v2'
 
         self.config = config
-        self.multimodal_config = multimodal_config
+        # self.multimodal_config = multimodal_config
 
         self.vision_config = config.vision_config
         self.projector_config = config.projector_config
         self.text_config = config.text_config
 
         n_embed = 1280
+        downsample_ratio: int = 4
+
         self.projector = MlpProjector(
-            Dict(projector_type="linear", input_dim=2048, n_embed=n_embed)
+            projector_type="linear",
+            input_dim=2048,
+            n_embed=n_embed,
+            downsample_ratio=downsample_ratio,
         )
         self.tile_tag = config.tile_tag
         self.global_view_pos = config.global_view_pos
@@ -443,9 +428,11 @@ class DeepseekOCRForCausalLM(nn.Module):
                 prefix=maybe_prefix(prefix, "language"),
             )
 
-        self.make_empty_intermediate_tensors = (
-            self.language_model.make_empty_intermediate_tensors
-        )
+        print(f"{architectures=}")
+
+        # self.make_empty_intermediate_tensors = (
+        #     self.language_model.make_empty_intermediate_tensors
+        # )
 
     def _parse_and_validate_image_input(self, **kwargs: object):
 
@@ -711,256 +698,48 @@ class DeepseekOCRForCausalLM(nn.Module):
     #     return self.language_model.compute_logits(hidden_states,
     #                                               sampling_metadata)
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
-
-        if is_nextn:
-            if hasattr(self.config, "num_nextn_predict_layers"):
-                num_nextn_layers = self.config.num_nextn_predict_layers
-                assert num_nextn_layers == 1, "Only 1 nextn layer is supported"
-                # compatible with old design
-                nextn_layer_id = (
-                    0
-                    if self.config.num_hidden_layers == 1
-                    else self.config.num_hidden_layers
-                )
-            else:
-                raise ValueError("num_nextn_predict_layers is not in the config")
-
-        if get_bool_env_var("SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN"):
-            weights = self._quant_attn_to_fp8_ue8m0(weights, is_nextn=is_nextn)
-        if is_nextn and enable_nextn_moe_bf16_cast_to_fp8(self.quant_config):
-            weights = self._quant_nextn_moe_to_fp8_ue8m0(
-                weights, nextn_layer_id=nextn_layer_id
-            )
-
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
+            ("qkv_proj", "q_proj", "q"),
+            ("qkv_proj", "k_proj", "k"),
+            ("qkv_proj", "v_proj", "v"),
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
         ]
 
-        # Params for weights, fp8 weight scales, fp8 activation scales
-        # (param_name, weight_name, expert_id, shard_id)
-        expert_params_mapping = FusedMoE.make_expert_params_mapping(
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            num_experts=self.config.n_routed_experts + self.num_fused_shared_experts,
-        )
-        # Params for special naming rules in mixed-precision models, for example:
-        # model.layers.xx.mlp.experts.xx.w1.input_scale. For details,
-        # see https://huggingface.co/Barrrrry/DeepSeek-R1-W4AFP8/blob/main.
-        if self.quant_config and self.quant_config.get_name() == "w4afp8":
-            expert_params_mapping += FusedMoE.make_expert_input_scale_params_mapping(
-                num_experts=self.config.n_routed_experts
-            )
-
-        # Fuse q_a_proj and kv_a_proj_with_mqa along output dimension when q_lora_rank is not None
-        fuse_qkv_a_proj = hasattr(self.config, "q_lora_rank") and (
-            self.config.q_lora_rank is not None
-        )
-        cached_a_proj = {} if fuse_qkv_a_proj else None
-
-        if is_nextn:
-            nextn_layer_prefix = f"model.layers.{nextn_layer_id}"
-            nextn_spec_weight_names = [
-                "shared_head.norm",
-                "eh_proj",
-                "enorm",
-                "hnorm",
-            ]
-
-        if self.num_fused_shared_experts > 0:
-            assert self.num_fused_shared_experts == 1
-            log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
-
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            futures = []
-            params_dict = dict(self.named_parameters())
-            weight_names = []
-            for name, loaded_weight in weights:
-                layer_id = get_layer_id(name)
+        params_dict = dict(self.named_parameters())
+        for name, loaded_weight in weights:
+            if "rotary_emb.inv_freq" in name:
+                continue
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+                name = name.replace(weight_name, param_name)
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                # Skip experts that are not assigned to this worker.
                 if (
-                    layer_id is not None
-                    and hasattr(self.model, "start_layer")
-                    and (
-                        layer_id < self.model.start_layer
-                        or layer_id >= self.model.end_layer
-                    )
-                ):
+                    "mlp.experts." in name or "mlp.shared_experts." in name
+                ) and name not in params_dict:
                     continue
-                if self.num_fused_shared_experts > 0 and "mlp.shared_experts" in name:
-                    name = name.replace(
-                        "mlp.shared_experts",
-                        f"mlp.experts.{self.config.n_routed_experts}",
-                    )
-
-                weight_names.append(name)
-
-                if not is_nextn:
-                    if hasattr(self.config, "num_nextn_predict_layers"):
-                        num_nextn_layers = self.config.num_nextn_predict_layers
-                        if num_nextn_layers > 0 and name.startswith("model.layers"):
-                            name_list = name.split(".")
-                            if (
-                                len(name_list) >= 3
-                                and int(name_list[2]) >= self.config.num_hidden_layers
-                            ):
-                                continue
-                else:
-                    if not name.startswith(nextn_layer_prefix):
-                        continue
-
-                    # Use shared head and embed weights from target model
-                    if "shared_head.head" in name or "embed_tokens" in name:
-                        continue
-
-                    is_decoder = True
-                    # For nextn specific weights
-                    for weight_name in nextn_spec_weight_names:
-                        if weight_name in name:
-                            name = name.replace(nextn_layer_prefix, "model")
-                            is_decoder = False
-                            break
-                    # For decoder layer weights
-                    if is_decoder:
-                        name = name.replace(nextn_layer_prefix, "model.decoder")
-
-                if "rotary_emb.inv_freq" in name:
+                param = params_dict[name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, shard_id)
+                break
+            else:
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
                     continue
-                for param_name, weight_name, shard_id in stacked_params_mapping:
-                    # Skip non-stacked layers and experts (experts handled below).
-                    if weight_name not in name:
-                        continue
-                    # We have mlp.experts[0].gate_proj in the checkpoint.
-                    # Since we handle the experts below in expert_params_mapping,
-                    # we need to skip here BEFORE we update the name, otherwise
-                    # name will be updated to mlp.experts[0].gate_up_proj, which
-                    # will then be updated below in expert_params_mapping
-                    # for mlp.experts[0].gate_gate_up_proj, which breaks load.
-                    if ("mlp.experts." in name) and name not in params_dict:
-                        continue
-                    name = name.replace(weight_name, param_name)
-                    # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
-                    param = params_dict[name]
-                    weight_loader = param.weight_loader
-                    futures.append(
-                        executor.submit(weight_loader, param, loaded_weight, shard_id)
-                    )
-                    break
-                else:
-                    for mapping in expert_params_mapping:
-                        param_name, weight_name, expert_id, shard_id = mapping
-                        if weight_name not in name:
-                            continue
-                        name = name.replace(weight_name, param_name)
-                        param = params_dict[name]
-                        weight_loader = param.weight_loader
-                        futures.append(
-                            executor.submit(
-                                weight_loader,
-                                param,
-                                loaded_weight,
-                                name,
-                                shard_id=shard_id,
-                                expert_id=expert_id,
-                            )
-                        )
-                        break
-                    else:
-                        # Skip loading extra bias for GPTQ models.
-                        if name.endswith(".bias") and name not in params_dict:
-                            continue
-                        # Skip loading embed_tokens if not first rank in pipeline parallelism
-                        if ".embed_tokens." in name and not self.pp_group.is_first_rank:
-                            continue
-                        # Skip loading norm if not last rank in pipeline parallelism
-                        if ".norm." in name and not self.pp_group.is_last_rank:
-                            continue
-                        if fuse_qkv_a_proj and (
-                            "q_a_proj" in name or "kv_a_proj_with_mqa" in name
-                        ):
-                            cached_a_proj[name] = loaded_weight
-                            q_a_proj_name = (
-                                name
-                                if "q_a_proj" in name
-                                else name.replace("kv_a_proj_with_mqa", "q_a_proj")
-                            )
-                            kv_a_proj_name = (
-                                name
-                                if "kv_a_proj_with_mqa" in name
-                                else name.replace("q_a_proj", "kv_a_proj_with_mqa")
-                            )
-
-                            # When both q_a_proj and kv_a_proj_with_mqa has been cached, load the fused weight to parameter
-                            if (
-                                q_a_proj_name in cached_a_proj
-                                and kv_a_proj_name in cached_a_proj
-                            ):
-                                q_a_proj_weight = cached_a_proj[q_a_proj_name]
-                                kv_a_proj_weight = cached_a_proj[kv_a_proj_name]
-                                cat_dim = 0
-                                if self.quant_config is not None and (
-                                    self.quant_config.get_name() == "awq"
-                                    or self.quant_config.get_name() == "awq_marlin"
-                                    or self.quant_config.get_name() == "moe_wna16"
-                                ):
-                                    cat_dim = 1
-                                fused_weight = torch.cat(
-                                    [q_a_proj_weight, kv_a_proj_weight], dim=cat_dim
-                                )
-                                param_name = (
-                                    name.replace(
-                                        "q_a_proj", "fused_qkv_a_proj_with_mqa"
-                                    )
-                                    if "q_a_proj" in name
-                                    else name.replace(
-                                        "kv_a_proj_with_mqa",
-                                        "fused_qkv_a_proj_with_mqa",
-                                    )
-                                )
-                                param = params_dict[param_name]
-
-                                weight_loader = getattr(
-                                    param, "weight_loader", default_weight_loader
-                                )
-                                futures.append(
-                                    executor.submit(weight_loader, param, fused_weight)
-                                )
-                                cached_a_proj.pop(q_a_proj_name)
-                                cached_a_proj.pop(kv_a_proj_name)
-                        else:
-                            if (
-                                "k_scale" in name or "v_scale" in name
-                            ) and name not in params_dict:
-                                # modelopt attn kv scale is named differently
-                                for scale in ["k_scale", "v_scale"]:
-                                    if scale in name:
-                                        name = name.replace(
-                                            f"{scale[0]}_proj", "attn_mqa"
-                                        )
-                                        break
-                            if name not in params_dict:
-                                # modelopt ckpt contains not needed weights for MTP module:
-                                # model.decoder.self_attn.attn_mqa.v_scale and
-                                # model.decoder.self_attn.attn_mqa.k_scale
-                                logger.warning(f"{name} not found in params_dict.")
-                                continue
-                            param = params_dict[name]
-                            weight_loader = getattr(
-                                param, "weight_loader", default_weight_loader
-                            )
-                            futures.append(
-                                executor.submit(weight_loader, param, loaded_weight)
-                            )
-
-            # Wait for all tasks to complete and raise any exceptions.
-            for future in concurrent.futures.as_completed(futures):
-                future.result()
-
-        self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
+                # Skip experts that are not assigned to this worker.
+                if (
+                    "mlp.experts." in name or "mlp.shared_experts." in name
+                ) and name not in params_dict:
+                    continue
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
 
 
 EntryClass = [DeepseekOCRForCausalLM]
