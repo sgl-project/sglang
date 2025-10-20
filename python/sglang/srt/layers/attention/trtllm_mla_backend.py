@@ -62,10 +62,14 @@ def pad_draft_extend_query_kernel(
     head_dim,
     BLOCK_SIZE: tl.constexpr,
 ):
-    """Triton kernel for padding draft extended query tensor."""
-    pid = tl.program_id(0)
-    batch_id = pid // max_seq_len
-    seq_pos = pid % max_seq_len
+    """Triton kernel for padding draft extended query tensor with parallelized head and dim processing."""
+    # Use 3D program IDs: (batch_seq, head_block, dim_block)
+    batch_seq_pid = tl.program_id(0)
+    head_pid = tl.program_id(1)
+    dim_pid = tl.program_id(2)
+
+    batch_id = batch_seq_pid // max_seq_len
+    seq_pos = batch_seq_pid % max_seq_len
 
     if batch_id >= batch_size:
         return
@@ -80,43 +84,43 @@ def pad_draft_extend_query_kernel(
     input_start = tl.load(cumsum_ptr + batch_id)
     input_pos = input_start + seq_pos
 
-    # Process all heads and head dimensions
-    for head_id in range(0, num_heads, BLOCK_SIZE):
-        head_end = tl.minimum(head_id + BLOCK_SIZE, num_heads)
-        head_mask = tl.arange(0, BLOCK_SIZE) < (head_end - head_id)
+    # Calculate head and dim block ranges
+    head_start = head_pid * BLOCK_SIZE
+    head_end = tl.minimum(head_start + BLOCK_SIZE, num_heads)
+    head_mask = tl.arange(0, BLOCK_SIZE) < (head_end - head_start)
 
-        for dim_id in range(0, head_dim, BLOCK_SIZE):
-            dim_end = tl.minimum(dim_id + BLOCK_SIZE, head_dim)
-            dim_mask = tl.arange(0, BLOCK_SIZE) < (dim_end - dim_id)
+    dim_start = dim_pid * BLOCK_SIZE
+    dim_end = tl.minimum(dim_start + BLOCK_SIZE, head_dim)
+    dim_mask = tl.arange(0, BLOCK_SIZE) < (dim_end - dim_start)
 
-            # Calculate input offset
-            input_offset = (
-                input_pos * num_heads * head_dim
-                + (head_id + tl.arange(0, BLOCK_SIZE))[:, None] * head_dim
-                + (dim_id + tl.arange(0, BLOCK_SIZE))[None, :]
-            )
+    # Calculate input offset
+    input_offset = (
+        input_pos * num_heads * head_dim
+        + (head_start + tl.arange(0, BLOCK_SIZE))[:, None] * head_dim
+        + (dim_start + tl.arange(0, BLOCK_SIZE))[None, :]
+    )
 
-            # Load data
-            data = tl.load(
-                q_ptr + input_offset,
-                mask=head_mask[:, None] & dim_mask[None, :],
-                other=0.0,
-            )
+    # Load data
+    data = tl.load(
+        q_ptr + input_offset,
+        mask=head_mask[:, None] & dim_mask[None, :],
+        other=0.0,
+    )
 
-            # Calculate output offset
-            output_offset = (
-                batch_id * max_seq_len * num_heads * head_dim
-                + seq_pos * num_heads * head_dim
-                + (head_id + tl.arange(0, BLOCK_SIZE))[:, None] * head_dim
-                + (dim_id + tl.arange(0, BLOCK_SIZE))[None, :]
-            )
+    # Calculate output offset
+    output_offset = (
+        batch_id * max_seq_len * num_heads * head_dim
+        + seq_pos * num_heads * head_dim
+        + (head_start + tl.arange(0, BLOCK_SIZE))[:, None] * head_dim
+        + (dim_start + tl.arange(0, BLOCK_SIZE))[None, :]
+    )
 
-            # Store data
-            tl.store(
-                padded_q_ptr + output_offset,
-                data,
-                mask=head_mask[:, None] & dim_mask[None, :],
-            )
+    # Store data
+    tl.store(
+        padded_q_ptr + output_offset,
+        data,
+        mask=head_mask[:, None] & dim_mask[None, :],
+    )
 
 
 @triton.jit
@@ -131,10 +135,13 @@ def unpad_draft_extend_output_kernel(
     v_head_dim,
     BLOCK_SIZE: tl.constexpr,
 ):
-    """Triton kernel for unpadding draft extended output tensor."""
-    pid = tl.program_id(0)
-    batch_id = pid // token_per_batch
-    seq_pos = pid % token_per_batch
+    """Triton kernel for unpadding draft extended output tensor with parallelized head and dim processing."""
+    batch_seq_pid = tl.program_id(0)
+    head_pid = tl.program_id(1)
+    dim_pid = tl.program_id(2)
+
+    batch_id = batch_seq_pid // token_per_batch
+    seq_pos = batch_seq_pid % token_per_batch
 
     if batch_id >= batch_size:
         return
@@ -149,42 +156,42 @@ def unpad_draft_extend_output_kernel(
     output_start = tl.load(cumsum_ptr + batch_id)
     output_pos = output_start + seq_pos
 
-    # Process heads and head dimensions in blocks
-    for head_start in range(0, tp_q_head_num, BLOCK_SIZE):
-        head_end = tl.minimum(head_start + BLOCK_SIZE, tp_q_head_num)
-        head_mask = tl.arange(0, BLOCK_SIZE) < (head_end - head_start)
+    # Calculate head and dim block ranges
+    head_start = head_pid * BLOCK_SIZE
+    head_end = tl.minimum(head_start + BLOCK_SIZE, tp_q_head_num)
+    head_mask = tl.arange(0, BLOCK_SIZE) < (head_end - head_start)
 
-        for dim_start in range(0, v_head_dim, BLOCK_SIZE):
-            dim_end = tl.minimum(dim_start + BLOCK_SIZE, v_head_dim)
-            dim_mask = tl.arange(0, BLOCK_SIZE) < (dim_end - dim_start)
+    dim_start = dim_pid * BLOCK_SIZE
+    dim_end = tl.minimum(dim_start + BLOCK_SIZE, v_head_dim)
+    dim_mask = tl.arange(0, BLOCK_SIZE) < (dim_end - dim_start)
 
-            # Calculate input offset: (batch_id, seq_pos, head_id, dim_id)
-            input_offset = (
-                batch_id * token_per_batch * tp_q_head_num * v_head_dim
-                + seq_pos * tp_q_head_num * v_head_dim
-                + (head_start + tl.arange(0, BLOCK_SIZE))[:, None] * v_head_dim
-                + (dim_start + tl.arange(0, BLOCK_SIZE))[None, :]
-            )
+    # Calculate input offset: (batch_id, seq_pos, head_id, dim_id)
+    input_offset = (
+        batch_id * token_per_batch * tp_q_head_num * v_head_dim
+        + seq_pos * tp_q_head_num * v_head_dim
+        + (head_start + tl.arange(0, BLOCK_SIZE))[:, None] * v_head_dim
+        + (dim_start + tl.arange(0, BLOCK_SIZE))[None, :]
+    )
 
-            # Load data
-            data = tl.load(
-                raw_out_ptr + input_offset,
-                mask=head_mask[:, None] & dim_mask[None, :],
-                other=0.0,
-            )
+    # Load data
+    data = tl.load(
+        raw_out_ptr + input_offset,
+        mask=head_mask[:, None] & dim_mask[None, :],
+        other=0.0,
+    )
 
-            output_offset = (
-                output_pos * tp_q_head_num * v_head_dim
-                + (head_start + tl.arange(0, BLOCK_SIZE))[:, None] * v_head_dim
-                + (dim_start + tl.arange(0, BLOCK_SIZE))[None, :]
-            )
+    output_offset = (
+        output_pos * tp_q_head_num * v_head_dim
+        + (head_start + tl.arange(0, BLOCK_SIZE))[:, None] * v_head_dim
+        + (dim_start + tl.arange(0, BLOCK_SIZE))[None, :]
+    )
 
-            # Store data
-            tl.store(
-                output_ptr + output_offset,
-                data,
-                mask=head_mask[:, None] & dim_mask[None, :],
-            )
+    # Store data
+    tl.store(
+        output_ptr + output_offset,
+        data,
+        mask=head_mask[:, None] & dim_mask[None, :],
+    )
 
 
 global_zero_init_workspace_buffer = None
@@ -569,12 +576,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 block_kv_indices, max_seq_len_val
             )
             if forward_batch.forward_mode.is_draft_extend():
-                max_seq = max(forward_batch.extend_seq_lens_cpu)
-                sum_seq_lens_q = forward_batch.spec_info.accept_length.sum().item()
-                max_seq_len_q = forward_batch.spec_info.accept_length.max().item()
+                max_seq = forward_batch.seq_lens_cpu.max().item()
+
+                sum_seq_lens_q = sum(forward_batch.extend_seq_lens_cpu)
+                max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
                 cu_seqlens_q = torch.nn.functional.pad(
                     torch.cumsum(
-                        forward_batch.spec_info.accept_length, dim=0, dtype=torch.int32
+                        forward_batch.extend_seq_lens, dim=0, dtype=torch.int32
                     ),
                     (1, 0),
                 )
@@ -582,9 +590,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 self.forward_decode_metadata.max_seq_len_q = max_seq_len_q
                 self.forward_decode_metadata.sum_seq_lens_q = sum_seq_lens_q
                 self.forward_decode_metadata.cu_seqlens_q = cu_seqlens_q
-                self.forward_decode_metadata.seq_lens_q = (
-                    forward_batch.spec_info.accept_length
-                )
+                self.forward_decode_metadata.seq_lens_q = forward_batch.extend_seq_lens
 
             forward_batch.decode_trtllm_mla_metadata = self.forward_decode_metadata
         else:
@@ -684,9 +690,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         num_heads = padded_q.shape[2]
         head_dim = padded_q.shape[3]
 
-        # Launch Triton kernel
+        # Launch Triton kernel with 3D grid for parallelized head and dim processing
         BLOCK_SIZE = 64
-        grid = (batch_size * max_seq_len_q,)
+        num_head_blocks = triton.cdiv(num_heads, BLOCK_SIZE)
+        num_dim_blocks = triton.cdiv(head_dim, BLOCK_SIZE)
+        grid = (batch_size * max_seq_len_q, num_head_blocks, num_dim_blocks)
 
         pad_draft_extend_query_kernel[grid](
             q_ptr=q,
@@ -730,9 +738,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 device=raw_out.device,
             )
 
-        # Launch Triton kernel
+        # Launch Triton kernel with 3D grid for parallelized head and dim processing
         BLOCK_SIZE = 64
-        grid = (batch_size * token_per_batch,)
+        num_head_blocks = triton.cdiv(tp_q_head_num, BLOCK_SIZE)
+        num_dim_blocks = triton.cdiv(v_head_dim, BLOCK_SIZE)
+        grid = (batch_size * token_per_batch, num_head_blocks, num_dim_blocks)
 
         unpad_draft_extend_output_kernel[grid](
             raw_out_ptr=raw_out,
