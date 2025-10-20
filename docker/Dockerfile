@@ -2,13 +2,14 @@ ARG CUDA_VERSION=12.9.1
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04 AS base
 ARG TARGETARCH
 
+ARG GRACE_BLACKWELL=0
 ARG BUILD_TYPE=all
 ARG BRANCH_TYPE=remote
 ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
 ARG FLASHMLA_COMMIT=1408756a88e52a25196b759eaf8db89d2b51b5a1
 ARG FAST_HADAMARD_TRANSFORM_COMMIT=7fd811c2b47f63b0b08d2582619f939e14dad77c
 ARG CMAKE_BUILD_PARALLEL_LEVEL=2
-ARG SGL_KERNEL_VERSION=0.3.12
+ARG SGL_KERNEL_VERSION=0.3.15
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
     GDRCOPY_HOME=/usr/src/gdrdrv-2.4.4/ \
@@ -99,9 +100,9 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5li
 # Download NVSHMEM source files
 # We use Tom's DeepEP fork for GB200 for now
 RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.3.9/source/nvshmem_src_cuda12-all-all-3.3.9.tar.gz && \
-    if [ "$BUILD_TYPE" = "blackwell_aarch64" ]; then \
+    if [ "$GRACE_BLACKWELL" = "1" ]; then \
       git clone https://github.com/fzyzcjy/DeepEP.git \
-      && cd DeepEP && git checkout 1b14ad661c7640137fcfe93cccb2694ede1220b0 && sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && cd .. ; \
+      && cd DeepEP && git checkout 2555874d8713ea758671867a50ebc9883552686d && sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && cd .. ; \
     else \
       git clone https://github.com/deepseek-ai/DeepEP.git \
       && cd DeepEP && git checkout ${DEEPEP_COMMIT} && sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && cd .. ; \
@@ -112,7 +113,7 @@ RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.3.9/sour
 
 # Build and install NVSHMEM
 RUN cd /sgl-workspace/nvshmem && \
-    if [ "$BUILD_TYPE" = "blackwell" ] || [ "$BUILD_TYPE" = "blackwell_aarch" ]; then CUDA_ARCH="90;100;120"; else CUDA_ARCH="90"; fi && \
+    if [ "$GRACE_BLACKWELL" = "1" ]; then CUDA_ARCH="90;100;120"; else CUDA_ARCH="90"; fi && \
     NVSHMEM_SHMEM_SUPPORT=0 \
     NVSHMEM_UCX_SUPPORT=0 \
     NVSHMEM_USE_NCCL=0 \
@@ -157,11 +158,6 @@ RUN if [ "$TARGETARCH" = "amd64" ]; then \
       cd fast-hadamard-transform && \
       git checkout ${FAST_HADAMARD_TRANSFORM_COMMIT} && \
       pip install . ; \
-    fi
-
-# Install tilelang
-RUN if [ "$TARGETARCH" = "amd64" ]; then \
-      pip install tilelang==0.1.6.post1 ; \
     fi
 
 # Python tools

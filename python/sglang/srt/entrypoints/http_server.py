@@ -19,7 +19,6 @@ This file implements HTTP APIs for the inference engine via fastapi.
 
 import asyncio
 import dataclasses
-import json
 import logging
 import multiprocessing as multiprocessing
 import os
@@ -51,6 +50,7 @@ from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationM
 from sglang.srt.entrypoints.engine import _launch_subprocesses
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
+    ClassifyRequest,
     CompletionRequest,
     DetokenizeRequest,
     EmbeddingRequest,
@@ -63,6 +63,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     V1RerankReqInput,
 )
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
+from sglang.srt.entrypoints.openai.serving_classify import OpenAIServingClassify
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
 from sglang.srt.entrypoints.openai.serving_embedding import OpenAIServingEmbedding
 from sglang.srt.entrypoints.openai.serving_rerank import OpenAIServingRerank
@@ -227,6 +228,9 @@ async def lifespan(fast_api_app: FastAPI):
         _global_state.tokenizer_manager, _global_state.template_manager
     )
     fast_api_app.state.openai_serving_embedding = OpenAIServingEmbedding(
+        _global_state.tokenizer_manager, _global_state.template_manager
+    )
+    fast_api_app.state.openai_serving_classify = OpenAIServingClassify(
         _global_state.tokenizer_manager, _global_state.template_manager
     )
     fast_api_app.state.openai_serving_score = OpenAIServingScore(
@@ -555,7 +559,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
 async def generate_from_file_request(file: UploadFile, request: Request):
     """Handle a generate request, this is purely to work with input_embeds."""
     content = await file.read()
-    input_embeds = json.loads(content.decode("utf-8"))
+    input_embeds = orjson.loads(content.decode("utf-8"))
 
     obj = GenerateReqInput(
         input_embeds=input_embeds,
@@ -634,6 +638,7 @@ async def start_profile_async(obj: Optional[ProfileReqInput] = None):
         with_stack=obj.with_stack,
         record_shapes=obj.record_shapes,
         profile_by_stage=obj.profile_by_stage,
+        merge_profiles=obj.merge_profiles,
     )
     return Response(
         content="Start profiling.\n",
@@ -1078,6 +1083,18 @@ async def openai_v1_chat_completions(
 async def openai_v1_embeddings(request: EmbeddingRequest, raw_request: Request):
     """OpenAI-compatible embeddings endpoint."""
     return await raw_request.app.state.openai_serving_embedding.handle_request(
+        request, raw_request
+    )
+
+
+@app.post(
+    "/v1/classify",
+    response_class=ORJSONResponse,
+    dependencies=[Depends(validate_json_request)],
+)
+async def openai_v1_classify(request: ClassifyRequest, raw_request: Request):
+    """OpenAI-compatible classification endpoint."""
+    return await raw_request.app.state.openai_serving_classify.handle_request(
         request, raw_request
     )
 

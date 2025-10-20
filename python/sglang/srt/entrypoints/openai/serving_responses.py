@@ -1061,7 +1061,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 ):
                     function_name = previous_item.recipient[len("browser.") :]
                     action = None
-                    parsed_args = json.loads(previous_item.content[0].text)
+                    parsed_args = ororjson.loads(previous_item.content[0].text)
                     if function_name == "search":
                         action = openai_responses_types.response_function_web_search.ActionSearch(
                             type="search",

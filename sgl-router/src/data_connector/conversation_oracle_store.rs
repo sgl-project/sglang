@@ -1,16 +1,18 @@
-use crate::config::OracleConfig;
-use crate::data_connector::conversations::{
-    Conversation, ConversationId, ConversationMetadata, ConversationStorage,
-    ConversationStorageError, NewConversation, Result,
-};
+use std::{path::Path, sync::Arc, time::Duration};
+
 use async_trait::async_trait;
 use chrono::Utc;
 use deadpool::managed::{Manager, Metrics, Pool, PoolError, RecycleError, RecycleResult};
 use oracle::{sql_type::OracleType, Connection};
 use serde_json::Value;
-use std::path::Path;
-use std::sync::Arc;
-use std::time::Duration;
+
+use crate::{
+    config::OracleConfig,
+    data_connector::conversations::{
+        Conversation, ConversationId, ConversationMetadata, ConversationStorage,
+        ConversationStorageError, NewConversation, Result,
+    },
+};
 
 #[derive(Clone)]
 pub struct OracleConversationStorage {
