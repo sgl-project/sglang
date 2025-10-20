@@ -2,14 +2,15 @@ use async_trait::async_trait;
 use regex::Regex;
 use serde_json::Value;
 
-use crate::protocols::spec::Tool;
-
-use crate::tool_parser::{
-    errors::{ParserError, ParserResult},
-    parsers::helpers,
-    partial_json::PartialJson,
-    traits::ToolParser,
-    types::{FunctionCall, StreamingParseResult, ToolCall, ToolCallItem},
+use crate::{
+    protocols::common::Tool,
+    tool_parser::{
+        errors::{ParserError, ParserResult},
+        parsers::helpers,
+        partial_json::PartialJson,
+        traits::ToolParser,
+        types::{FunctionCall, StreamingParseResult, ToolCall, ToolCallItem},
+    },
 };
 
 /// GPT-OSS format parser for tool calls
@@ -40,12 +41,12 @@ impl GptOssParser {
     pub fn new() -> Self {
         // Pattern for complete function calls with to= parameter
         // Handles optional <|start|>assistant prefix and whitespace after function name
-        let function_call_pattern = r"(?s)(?:<\|start\|>assistant)?<\|channel\|>commentary to=([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*)\s*<\|constrain\|>json<\|message\|>(.*?)<\|call\|>(?:commentary)?";
+        let function_call_pattern = r"(?s)(?:<\|start\|>assistant)?<\|channel\|>commentary to=([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_-]*)*)\s*<\|constrain\|>json<\|message\|>(.*?)<\|call\|>(?:commentary)?";
         let function_call_extractor =
             Regex::new(function_call_pattern).expect("Valid regex pattern");
 
         // Pattern for streaming function calls (incomplete)
-        let streaming_pattern = r"(?s)(?:<\|start\|>assistant)?<\|channel\|>commentary to=([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*)\s*<\|constrain\|>json<\|message\|>(.*)";
+        let streaming_pattern = r"(?s)(?:<\|start\|>assistant)?<\|channel\|>commentary to=([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_-]*)*)\s*<\|constrain\|>json<\|message\|>(.*)";
         let streaming_extractor = Regex::new(streaming_pattern).expect("Valid regex pattern");
 
         Self {

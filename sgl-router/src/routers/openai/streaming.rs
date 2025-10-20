@@ -7,11 +7,8 @@
 //! - MCP tool execution loops within streaming responses
 //! - Event transformation and output index remapping
 
-use crate::data_connector::{
-    SharedConversationItemStorage, SharedConversationStorage, SharedResponseStorage,
-};
-use crate::protocols::spec::{ResponseToolType, ResponsesRequest};
-use crate::routers::header_utils::{apply_request_headers, preserve_response_headers};
+use std::{borrow::Cow, io, sync::Arc};
+
 use axum::{
     body::Body,
     http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode},
@@ -20,22 +17,28 @@ use axum::{
 use bytes::Bytes;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
-use std::{borrow::Cow, io, sync::Arc};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::warn;
 
 // Import from sibling modules
 use super::conversations::persist_conversation_items;
-use super::mcp::{
-    build_resume_payload, execute_streaming_tool_calls, inject_mcp_metadata_streaming,
-    mcp_manager_from_request_tools, prepare_mcp_payload_for_streaming, send_mcp_list_tools_events,
-    McpLoopConfig, ToolLoopState,
+use super::{
+    mcp::{
+        build_resume_payload, execute_streaming_tool_calls, inject_mcp_metadata_streaming,
+        mcp_manager_from_request_tools, prepare_mcp_payload_for_streaming,
+        send_mcp_list_tools_events, McpLoopConfig, ToolLoopState,
+    },
+    responses::{mask_tools_as_mcp, patch_streaming_response_json, rewrite_streaming_block},
+    utils::{event_types, FunctionCallInProgress, OutputIndexMapper, StreamAction},
 };
-use super::responses::{
-    mask_tools_as_mcp, patch_streaming_response_json, rewrite_streaming_block, store_response_impl,
+use crate::{
+    data_connector::{
+        SharedConversationItemStorage, SharedConversationStorage, SharedResponseStorage,
+    },
+    protocols::responses::{ResponseToolType, ResponsesRequest},
+    routers::header_utils::{apply_request_headers, preserve_response_headers},
 };
-use super::utils::{event_types, FunctionCallInProgress, OutputIndexMapper, StreamAction};
 
 // ============================================================================
 // Streaming Response Accumulator
@@ -574,7 +577,7 @@ pub(super) fn apply_event_transformations_inplace(
             .get_mut("response")
             .and_then(|v| v.as_object_mut())
         {
-            let desired_store = Value::Bool(original_request.store);
+            let desired_store = Value::Bool(original_request.store.unwrap_or(false));
             if response_obj.get("store") != Some(&desired_store) {
                 response_obj.insert("store".to_string(), desired_store);
                 changed = true;
@@ -599,8 +602,13 @@ pub(super) fn apply_event_transformations_inplace(
             if response_obj.get("tools").is_some() {
                 let requested_mcp = original_request
                     .tools
-                    .iter()
-                    .any(|t| matches!(t.r#type, ResponseToolType::Mcp));
+                    .as_ref()
+                    .map(|tools| {
+                        tools
+                            .iter()
+                            .any(|t| matches!(t.r#type, ResponseToolType::Mcp))
+                    })
+                    .unwrap_or(false);
 
                 if requested_mcp {
                     if let Some(mcp_tools) = build_mcp_tools_value(original_request) {
@@ -660,8 +668,8 @@ pub(super) fn apply_event_transformations_inplace(
 
 /// Helper to build MCP tools value
 fn build_mcp_tools_value(original_body: &ResponsesRequest) -> Option<Value> {
-    let mcp_tool = original_body
-        .tools
+    let tools = original_body.tools.as_ref()?;
+    let mcp_tool = tools
         .iter()
         .find(|t| matches!(t.r#type, ResponseToolType::Mcp) && t.server_url.is_some())?;
 
@@ -1002,7 +1010,7 @@ pub(super) async fn handle_simple_streaming_passthrough(
 
     let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, io::Error>>();
 
-    let should_store = original_body.store;
+    let should_store = original_body.store.unwrap_or(false);
     let original_request = original_body.clone();
     let persist_needed = original_request.conversation.is_some();
     let previous_response_id = original_previous_response_id.clone();
@@ -1082,26 +1090,17 @@ pub(super) async fn handle_simple_streaming_passthrough(
                     previous_response_id.as_deref(),
                 );
 
-                if persist_needed {
-                    if let Err(err) = persist_conversation_items(
-                        conversation_storage.clone(),
-                        conversation_item_storage.clone(),
-                        response_storage.clone(),
-                        &response_json,
-                        &original_request,
-                    )
-                    .await
-                    {
-                        warn!("Failed to persist conversation items (stream): {}", err);
-                    }
-                } else if should_store {
-                    // Store response only if no conversation (persist_conversation_items already stores it)
-                    if let Err(err) =
-                        store_response_impl(&response_storage, &response_json, &original_request)
-                            .await
-                    {
-                        warn!("Failed to store streaming response: {}", err);
-                    }
+                // Always persist conversation items and response (even without conversation)
+                if let Err(err) = persist_conversation_items(
+                    conversation_storage.clone(),
+                    conversation_item_storage.clone(),
+                    response_storage.clone(),
+                    &response_json,
+                    &original_request,
+                )
+                .await
+                {
+                    warn!("Failed to persist conversation items (stream): {}", err);
                 }
             } else if let Some(error_payload) = encountered_error {
                 warn!("Upstream streaming error payload: {}", error_payload);
@@ -1145,7 +1144,7 @@ pub(super) async fn handle_streaming_with_tool_interception(
     prepare_mcp_payload_for_streaming(&mut payload, active_mcp);
 
     let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, io::Error>>();
-    let should_store = original_body.store;
+    let should_store = original_body.store.unwrap_or(false);
     let original_request = original_body.clone();
     let persist_needed = original_request.conversation.is_some();
     let previous_response_id = original_previous_response_id.clone();
@@ -1172,9 +1171,13 @@ pub(super) async fn handle_streaming_with_tool_interception(
 
         let server_label = original_request
             .tools
-            .iter()
-            .find(|t| matches!(t.r#type, ResponseToolType::Mcp))
-            .and_then(|t| t.server_label.as_deref())
+            .as_ref()
+            .and_then(|tools| {
+                tools
+                    .iter()
+                    .find(|t| matches!(t.r#type, ResponseToolType::Mcp))
+                    .and_then(|t| t.server_label.as_deref())
+            })
             .unwrap_or("mcp");
 
         loop {
@@ -1390,32 +1393,20 @@ pub(super) async fn handle_streaming_with_tool_interception(
                         previous_response_id.as_deref(),
                     );
 
-                    if persist_needed {
-                        if let Err(err) = persist_conversation_items(
-                            conversation_storage.clone(),
-                            conversation_item_storage.clone(),
-                            response_storage.clone(),
-                            &response_json,
-                            &original_request,
-                        )
-                        .await
-                        {
-                            warn!(
-                                "Failed to persist conversation items (stream + MCP): {}",
-                                err
-                            );
-                        }
-                    } else if should_store {
-                        // Store response only if no conversation (persist_conversation_items already stores it)
-                        if let Err(err) = store_response_impl(
-                            &response_storage,
-                            &response_json,
-                            &original_request,
-                        )
-                        .await
-                        {
-                            warn!("Failed to store streaming response: {}", err);
-                        }
+                    // Always persist conversation items and response (even without conversation)
+                    if let Err(err) = persist_conversation_items(
+                        conversation_storage.clone(),
+                        conversation_item_storage.clone(),
+                        response_storage.clone(),
+                        &response_json,
+                        &original_request,
+                    )
+                    .await
+                    {
+                        warn!(
+                            "Failed to persist conversation items (stream + MCP): {}",
+                            err
+                        );
                     }
                 }
 
@@ -1511,7 +1502,11 @@ pub(super) async fn handle_streaming_response(
     original_previous_response_id: Option<String>,
 ) -> Response {
     // Check if MCP is active for this request
-    let req_mcp_manager = mcp_manager_from_request_tools(&original_body.tools).await;
+    let req_mcp_manager = if let Some(ref tools) = original_body.tools {
+        mcp_manager_from_request_tools(tools.as_slice()).await
+    } else {
+        None
+    };
     let active_mcp = req_mcp_manager.as_ref().or(mcp_manager);
 
     // If no MCP is active, use simple pass-through streaming
