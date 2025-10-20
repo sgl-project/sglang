@@ -108,8 +108,6 @@ class Qwen3ForCausalLMEagle(Qwen3ForCausalLM):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         weights = [(add_prefix(k, "model"), v) for k, v in weights]
-        print([w[0] for w in weights])
-        print([k for k, v in self.named_parameters()])
         super().load_weights(weights)
 
 
