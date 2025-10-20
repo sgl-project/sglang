@@ -37,7 +37,7 @@ class MooncakeDispatchOutput(NamedTuple):
 
     hidden_states: torch.Tensor
     hidden_states_scale: torch.Tensor
-    topk_idx: torch.Tensor
+    topk_ids: torch.Tensor
     topk_weights: torch.Tensor
     masked_m: torch.Tensor
     expected_m: int
@@ -167,21 +167,21 @@ class _MooncakeEPDispatcherImpl:
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
     ):
-        topk_idx, topk_weights = topk_output.topk_idx, topk_output.topk_weights
+        topk_ids, topk_weights = topk_output.topk_ids, topk_output.topk_weights
         buffer = self._get_buffer()
-        topk_idx = topk_idx.to(torch.int64)
+        topk_ids = topk_ids.to(torch.int64)
         expected_m = (
-            hidden_states.shape[0] * buffer.group_size * topk_idx.shape[1]
+            hidden_states.shape[0] * buffer.group_size * topk_ids.shape[1]
             + self.num_experts
         ) // self.num_experts
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,
-            topk_idx,
+            topk_ids,
             use_fp8=True,
         )
         return (
             hidden_states,
-            topk_idx,
+            topk_ids,
             topk_weights,
             masked_m,
             expected_m,
@@ -192,7 +192,7 @@ class _MooncakeEPDispatcherImpl:
     def dispatch_b(
         self,
         hidden_states,
-        topk_idx,
+        topk_ids,
         topk_weights,
         masked_m,
         expected_m,
@@ -207,7 +207,7 @@ class _MooncakeEPDispatcherImpl:
 
         return MooncakeDispatchOutput(
             hidden_states,
-            topk_idx,
+            topk_ids,
             topk_weights,
             masked_m,
             expected_m,
@@ -216,14 +216,14 @@ class _MooncakeEPDispatcherImpl:
     def _dispatch_core(
         self,
         hidden_states: torch.Tensor,
-        topk_idx: torch.Tensor,
+        topk_ids: torch.Tensor,
         use_fp8: bool = False,
     ):
         buffer = self._get_buffer()
         packed_recv_hidden, packed_recv_count, self.handle, event, hook = (
             buffer.dispatch(
                 hidden_states,
-                topk_idx,
+                topk_ids,
                 self.active_ranks,
                 self.num_max_dispatch_tokens_per_rank,
                 self.num_experts,
@@ -238,12 +238,12 @@ class _MooncakeEPDispatcherImpl:
     def combine_a(
         self,
         hidden_states: torch.Tensor,
-        topk_idx: torch.Tensor,
+        topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
         hidden_states, event, hook = self._combine_core(
             hidden_states,
-            topk_idx,
+            topk_ids,
             topk_weights,
         )
         return hidden_states, event, hook
@@ -255,13 +255,13 @@ class _MooncakeEPDispatcherImpl:
     def _combine_core(
         self,
         hidden_states: torch.Tensor,
-        topk_idx: torch.Tensor,
+        topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
         buffer = self._get_buffer()
         combined_hidden_states, event, hook = buffer.combine(
             hidden_states,
-            topk_idx,
+            topk_ids,
             topk_weights,
             self.active_ranks,
             -1 if self.first_execution else self.timeout_us,
@@ -335,12 +335,10 @@ class MooncakeEPDispatcher(BaseDispatcher):
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
     ):
-        topk_idx, topk_weights = topk_output.topk_idx, topk_output.topk_weights
         self._update_stage(_Stage.INITIAL, _Stage.AFTER_DISPATCH_A)
         inner_state = self._get_impl().dispatch_a(
             hidden_states=hidden_states,
-            topk_idx=topk_idx,
-            topk_weights=topk_weights,
+            topk_output=topk_output,
         )
         self._dispatch_intermediate_state = inner_state
 
@@ -358,14 +356,14 @@ class MooncakeEPDispatcher(BaseDispatcher):
     def combine_a(
         self,
         hidden_states: torch.Tensor,
-        topk_idx: torch.Tensor,
+        topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
         overlap_args: Optional = None,
     ):
         self._update_stage(_Stage.AFTER_DISPATCH_B, _Stage.AFTER_COMBINE_A)
         inner_state = self._get_impl().combine_a(
             hidden_states=hidden_states,
-            topk_idx=topk_idx,
+            topk_ids=topk_ids,
             topk_weights=topk_weights,
         )
         self._combine_intermediate_state = inner_state

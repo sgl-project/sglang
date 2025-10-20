@@ -193,7 +193,6 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
             topk_output=topk_output,
-            forward_batch=forward_batch,
         )
         return final_hidden_states
 
