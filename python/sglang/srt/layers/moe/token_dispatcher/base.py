@@ -8,7 +8,6 @@ import torch
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
-        AscendDeepEPLLOutput,
         DeepEPLLCombineInput,
         DeepEPLLOutput,
         DeepEPNormalCombineInput,
@@ -47,19 +46,12 @@ class DispatchOutputChecker:
     ) -> TypeGuard[Union[DeepEPNormalOutput, DeepEPLLOutput]]:
         return dispatch_output.format.is_deepep()
 
-    @staticmethod
-    def format_is_ascent_ll(
-        dispatch_output: DispatchOutput,
-    ) -> TypeGuard[AscendDeepEPLLOutput]:
-        return dispatch_output.format.is_ascent_ll()
-
 
 class DispatchOutputFormat(Enum):
 
     STANDARD = "standard"
     DEEPEP_NORMAL = "deepep_normal"
     DEEPEP_LL = "deepep_ll"
-    ASCENT_LL = "ascent_ll"
 
     def is_standard(self) -> bool:
         return self == DispatchOutputFormat.STANDARD
@@ -76,15 +68,12 @@ class DispatchOutputFormat(Enum):
             DispatchOutputFormat.DEEPEP_LL,
         ]
 
-    def is_ascent_ll(self) -> bool:
-        return self == DispatchOutputFormat.ASCENT_LL
-
 
 @runtime_checkable
 class DispatchOutput(Protocol):
     """Protocol for dispatch outputs in different formats."""
 
-    # TODO: add hidden_states to the protocol
+    hidden_states: torch.Tensor
 
     @property
     def format(self) -> DispatchOutputFormat: ...

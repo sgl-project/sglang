@@ -15,8 +15,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  nightly-test:
-    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+  nightly-test-eval-text-models:
+    if: github.repository == 'sgl-project/sglang'
     runs-on: 2-gpu-runner
     steps:
       - name: Checkout code
@@ -26,8 +26,98 @@ jobs:
         run: |
           bash scripts/ci/ci_install_dependency.sh
 
-      - name: Run test
+      - name: Run eval test for text models
         timeout-minutes: 120
         run: |
           cd test/srt
-          python3 run_suite.py --suite nightly --timeout-per-file 3600
+          python3 test_nightly_text_models_gsm8k_eval.py
+
+  nightly-test-perf-text-models:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: 2-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/ci_install_dependency.sh
+
+      - name: Run performance test for text models
+        timeout-minutes: 180
+        env:
+          TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
+          PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
+        run: |
+          rm -rf test/srt/performance_profiles_text_models/
+          python3 test/srt/test_nightly_text_models_perf.py
+
+      - name: Publish traces to storage repo
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          python3 scripts/ci/publish_traces.py
+
+  nightly-test-eval-vlms:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: 2-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/ci_install_dependency.sh
+
+      - name: Run eval test for VLM models (fixed MMMU-100)
+        timeout-minutes: 240
+        run: |
+          cd test/srt
+          python3 test_nightly_vlms_mmmu_eval.py
+
+  nightly-test-perf-vlms:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: 2-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/ci_install_dependency.sh
+
+      - name: Run perf test for VLM models (MMMU)
+        timeout-minutes: 240
+        env:
+          TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
+          PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
+        run: |
+          rm -rf test/srt/performance_profiles_vlms/
+          python3 test/srt/test_nightly_vlms_perf.py
+
+      - name: Publish traces to storage repo
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          python3 scripts/ci/publish_traces.py --vlm
+
+  nightly-test-1-gpu:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: 1-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 10
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite nightly-1-gpu

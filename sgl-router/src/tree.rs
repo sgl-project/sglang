@@ -1,16 +1,12 @@
-use dashmap::mapref::entry::Entry;
-use dashmap::DashMap;
+use std::{
+    cmp::Reverse,
+    collections::{BinaryHeap, HashMap, VecDeque},
+    sync::{Arc, RwLock},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+use dashmap::{mapref::entry::Entry, DashMap};
 use tracing::info;
-
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
-use std::collections::HashMap;
-use std::collections::VecDeque;
-use std::sync::Arc;
-use std::sync::RwLock;
-
-use std::time::Duration;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 type NodeRef = Arc<Node>;
 
@@ -93,7 +89,7 @@ impl Tree {
     Thread-safe multi tenant radix tree
 
     1. Storing data for multiple tenants (the overlap of multiple radix tree)
-    2. Node-level lock to enable concurrent acesss on nodes
+    2. Node-level lock to enable concurrent access on nodes
     3. Leaf LRU eviction based on tenant access time
     */
 
@@ -666,12 +662,12 @@ impl Tree {
 //  Unit tests
 #[cfg(test)]
 mod tests {
-    use rand::distr::Alphanumeric;
-    use rand::distr::SampleString;
-    use rand::rng as thread_rng;
-    use rand::Rng;
-    use std::thread;
-    use std::time::Instant;
+    use std::{thread, time::Instant};
+
+    use rand::{
+        distr::{Alphanumeric, SampleString},
+        rng as thread_rng, Rng,
+    };
 
     use super::*;
 
@@ -679,7 +675,6 @@ mod tests {
     fn test_get_smallest_tenant() {
         let tree = Tree::new();
 
-        // Test empty tree
         assert_eq!(tree.get_smallest_tenant(), "empty");
 
         // Insert data for tenant1 - "ap" + "icot" = 6 chars
@@ -689,7 +684,6 @@ mod tests {
         // Insert data for tenant2 - "cat" = 3 chars
         tree.insert("cat", "tenant2");
 
-        // Test - tenant2 should be smallest with 3 chars vs 6 chars
         assert_eq!(
             tree.get_smallest_tenant(),
             "tenant2",
@@ -702,7 +696,6 @@ mod tests {
         tree.insert("do", "tenant3");
         tree.insert("hi", "tenant4");
 
-        // Test - should return either tenant3 or tenant4 (both have 2 chars)
         let smallest = tree.get_smallest_tenant();
         assert!(
             smallest == "tenant3" || smallest == "tenant4",
@@ -720,7 +713,6 @@ mod tests {
             "Expected tenant3 to be smallest with 2 characters"
         );
 
-        // Test eviction
         tree.evict_tenant_by_size(3); // This should evict tenants with more than 3 chars
 
         let post_eviction_smallest = tree.get_smallest_tenant();
@@ -731,7 +723,6 @@ mod tests {
     fn test_tenant_char_count() {
         let tree = Tree::new();
 
-        // Phase 1: Initial insertions
         tree.insert("apple", "tenant1");
         tree.insert("apricot", "tenant1");
         tree.insert("banana", "tenant1");
@@ -755,7 +746,6 @@ mod tests {
             "Phase 1: Initial insertions"
         );
 
-        // Phase 2: Additional insertions
         tree.insert("apartment", "tenant1");
         tree.insert("appetite", "tenant2");
         tree.insert("ball", "tenant1");
@@ -778,7 +768,6 @@ mod tests {
             "Phase 2: Additional insertions"
         );
 
-        // Phase 3: Overlapping insertions
         tree.insert("zebra", "tenant1");
         tree.insert("zebra", "tenant2");
         tree.insert("zero", "tenant1");
@@ -801,7 +790,6 @@ mod tests {
             "Phase 3: Overlapping insertions"
         );
 
-        // Phase 4: Eviction test
         tree.evict_tenant_by_size(10);
 
         let computed_sizes = tree.get_used_size_per_tenant();
@@ -1088,8 +1076,6 @@ mod tests {
 
         tree.pretty_print();
 
-        // Test sequentially
-
         for (text, tenant) in TEST_PAIRS.iter() {
             let (matched_text, matched_tenant) = tree.prefix_match(text);
             assert_eq!(matched_text, *text);
@@ -1162,7 +1148,6 @@ mod tests {
 
         tree.pretty_print();
 
-        // Verify initial sizes
         let sizes_before = tree.get_used_size_per_tenant();
         assert_eq!(sizes_before.get("tenant1").unwrap(), &5); // "hello" = 5
         assert_eq!(sizes_before.get("tenant2").unwrap(), &10); // "hello" + "world" = 10
@@ -1172,12 +1157,10 @@ mod tests {
 
         tree.pretty_print();
 
-        // Verify sizes after eviction
         let sizes_after = tree.get_used_size_per_tenant();
         assert_eq!(sizes_after.get("tenant1").unwrap(), &5); // Should be unchanged
         assert_eq!(sizes_after.get("tenant2").unwrap(), &5); // Only "world" remains
 
-        // Verify "world" remains for tenant2
         let (matched, tenant) = tree.prefix_match("world");
         assert_eq!(matched, "world");
         assert_eq!(tenant, "tenant2");
@@ -1208,7 +1191,6 @@ mod tests {
 
         // Check sizes after eviction
         let sizes_after = tree.get_used_size_per_tenant();
-        // Verify all tenants are under their size limits
         for (tenant, &size) in sizes_after.iter() {
             assert!(
                 size <= max_size,
@@ -1287,7 +1269,6 @@ mod tests {
         let final_sizes = tree.get_used_size_per_tenant();
         println!("Final sizes after test completion: {:?}", final_sizes);
 
-        // Verify all tenants are under limit
         for (_, &size) in final_sizes.iter() {
             assert!(
                 size <= max_size,
@@ -1364,14 +1345,12 @@ mod tests {
         tree.insert("help", "tenant1"); // tenant1: hel -> p
         tree.insert("helicopter", "tenant2"); // tenant2: hel -> icopter
 
-        // Test tenant1's data
         assert_eq!(tree.prefix_match_tenant("hello", "tenant1"), "hello"); // Full match for tenant1
         assert_eq!(tree.prefix_match_tenant("help", "tenant1"), "help"); // Exclusive to tenant1
         assert_eq!(tree.prefix_match_tenant("hel", "tenant1"), "hel"); // Shared prefix
         assert_eq!(tree.prefix_match_tenant("hello world", "tenant1"), "hello"); // Should stop at tenant1's boundary
         assert_eq!(tree.prefix_match_tenant("helicopter", "tenant1"), "hel"); // Should stop at tenant1's boundary
 
-        // Test tenant2's data
         assert_eq!(tree.prefix_match_tenant("hello", "tenant2"), "hello"); // Full match for tenant2
         assert_eq!(
             tree.prefix_match_tenant("hello world", "tenant2"),
@@ -1384,7 +1363,6 @@ mod tests {
         assert_eq!(tree.prefix_match_tenant("hel", "tenant2"), "hel"); // Shared prefix
         assert_eq!(tree.prefix_match_tenant("help", "tenant2"), "hel"); // Should stop at tenant2's boundary
 
-        // Test non-existent tenant
         assert_eq!(tree.prefix_match_tenant("hello", "tenant3"), ""); // Non-existent tenant
         assert_eq!(tree.prefix_match_tenant("help", "tenant3"), ""); // Non-existent tenant
     }
@@ -1399,7 +1377,6 @@ mod tests {
         tree.insert("hello", "tenant2");
         tree.insert("help", "tenant2");
 
-        // Verify initial state
         let initial_sizes = tree.get_used_size_per_tenant();
         assert_eq!(initial_sizes.get("tenant1").unwrap(), &10); // "hello" + "world"
         assert_eq!(initial_sizes.get("tenant2").unwrap(), &6); // "hello" + "p"
@@ -1407,7 +1384,6 @@ mod tests {
         // Evict tenant1
         tree.remove_tenant("tenant1");
 
-        // Verify after eviction
         let final_sizes = tree.get_used_size_per_tenant();
         assert!(
             !final_sizes.contains_key("tenant1"),
@@ -1419,11 +1395,9 @@ mod tests {
             "tenant2 should be unaffected"
         );
 
-        // Verify tenant1's data is inaccessible
         assert_eq!(tree.prefix_match_tenant("hello", "tenant1"), "");
         assert_eq!(tree.prefix_match_tenant("world", "tenant1"), "");
 
-        // Verify tenant2's data is still accessible
         assert_eq!(tree.prefix_match_tenant("hello", "tenant2"), "hello");
         assert_eq!(tree.prefix_match_tenant("help", "tenant2"), "help");
     }
@@ -1441,7 +1415,6 @@ mod tests {
         tree.insert("banana", "tenant2");
         tree.insert("ball", "tenant2");
 
-        // Verify initial state
         let initial_sizes = tree.get_used_size_per_tenant();
         println!("Initial sizes: {:?}", initial_sizes);
         tree.pretty_print();
@@ -1449,29 +1422,24 @@ mod tests {
         // Evict tenant1
         tree.remove_tenant("tenant1");
 
-        // Verify final state
         let final_sizes = tree.get_used_size_per_tenant();
         println!("Final sizes: {:?}", final_sizes);
         tree.pretty_print();
 
-        // Verify tenant1 is completely removed
         assert!(
             !final_sizes.contains_key("tenant1"),
             "tenant1 should be completely removed"
         );
 
-        // Verify all tenant1's data is inaccessible
         assert_eq!(tree.prefix_match_tenant("apple", "tenant1"), "");
         assert_eq!(tree.prefix_match_tenant("application", "tenant1"), "");
         assert_eq!(tree.prefix_match_tenant("banana", "tenant1"), "");
 
-        // Verify tenant2's data is intact
         assert_eq!(tree.prefix_match_tenant("apple", "tenant2"), "apple");
         assert_eq!(tree.prefix_match_tenant("appetite", "tenant2"), "appetite");
         assert_eq!(tree.prefix_match_tenant("banana", "tenant2"), "banana");
         assert_eq!(tree.prefix_match_tenant("ball", "tenant2"), "ball");
 
-        // Verify the tree structure is still valid for tenant2
         let tenant2_size = final_sizes.get("tenant2").unwrap();
         assert_eq!(tenant2_size, &(5 + 5 + 6 + 2)); // "apple" + "etite" + "banana" + "ll"
     }

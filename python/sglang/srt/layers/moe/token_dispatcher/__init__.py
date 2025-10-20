@@ -9,7 +9,6 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutputFormat,
 )
 from sglang.srt.layers.moe.token_dispatcher.deepep import (
-    AscendDeepEPLLOutput,
     DeepEPConfig,
     DeepEPDispatcher,
     DeepEPLLCombineInput,
@@ -17,13 +16,18 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import (
     DeepEPNormalCombineInput,
     DeepEPNormalOutput,
 )
+from sglang.srt.layers.moe.token_dispatcher.mooncake import (
+    MooncakeCombineInput,
+    MooncakeDispatchOutput,
+    MooncakeEPDispatcher,
+)
 from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardCombineInput,
+    StandardDispatcher,
     StandardDispatchOutput,
 )
 
 __all__ = [
-    "AscendDeepEPLLOutput",
     "BaseDispatcher",
     "BaseDispatcherConfig",
     "CombineInput",
@@ -32,6 +36,10 @@ __all__ = [
     "DispatchOutput",
     "DispatchOutputFormat",
     "DispatchOutputChecker",
+    "MooncakeCombineInput",
+    "MooncakeDispatchOutput",
+    "MooncakeEPDispatcher",
+    "StandardDispatcher",
     "StandardDispatchOutput",
     "StandardCombineInput",
     "DeepEPConfig",
