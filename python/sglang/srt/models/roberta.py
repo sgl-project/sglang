@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 
-import itertools
 import os
 from typing import Iterable, Optional, Tuple
 

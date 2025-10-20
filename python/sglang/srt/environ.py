@@ -113,7 +113,7 @@ class Envs:
 
     # Test & Debug
     SGLANG_IS_IN_CI = EnvBool(False)
-    SGLANG_AMD_CI = EnvBool(False)
+    SGLANG_IS_IN_CI_AMD = EnvBool(False)
     SGLANG_TEST_RETRACT = EnvBool(False)
     SGLANG_SET_CPU_AFFINITY = EnvBool(False)
     SGLANG_PROFILE_WITH_STACK = EnvBool(True)
@@ -128,12 +128,21 @@ class Envs:
     SGLANG_SIMULATE_ACC_METHOD = EnvStr("multinomial")
     SGLANG_TORCH_PROFILER_DIR = EnvStr("/tmp")
 
+    # Scheduler: new token ratio hyperparameters
+    SGLANG_INIT_NEW_TOKEN_RATIO = EnvFloat(0.7)
+    SGLANG_MIN_NEW_TOKEN_RATIO_FACTOR = EnvFloat(0.14)
+    SGLANG_NEW_TOKEN_RATIO_DECAY_STEPS = EnvInt(600)
+    SGLANG_RETRACT_DECODE_STEPS = EnvInt(20)
+
+    # Scheduler: others:
+    SGLANG_EMPTY_CACHE_INTERVAL = EnvFloat(-1)  # in seconds. Set if you observe high memory accumulation over a long serving period.
     # Test: pd-disaggregation
     SGLANG_TEST_PD_DISAGG_BACKEND = EnvStr("mooncake")
     SGLANG_TEST_PD_DISAGG_DEVICES = EnvStr(None)
 
     # Model Parallel
     SGLANG_USE_MESSAGE_QUEUE_BROADCASTER = EnvBool(True)
+    SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS = EnvBool(False)
 
     # Constrained Decoding
     SGLANG_DISABLE_OUTLINES_DISK_CACHE = EnvBool(True)
@@ -159,6 +168,7 @@ class Envs:
     # Flashinfer
     SGLANG_IS_FLASHINFER_AVAILABLE = EnvBool(True)
     SGLANG_ENABLE_FLASHINFER_GEMM = EnvBool(False)
+    SGLANG_FLASHINFER_WORKSPACE_SIZE = EnvInt(384 * 1024 * 1024)
 
     # Triton
     SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS = EnvBool(False)
@@ -171,6 +181,7 @@ class Envs:
     SGLANG_EXPERT_LOCATION_UPDATER_CANARY = EnvBool(False)
     SGLANG_EXPERT_LOCATION_UPDATER_LOG_METRICS = EnvBool(False)
     SGLANG_LOG_EXPERT_LOCATION_METADATA = EnvBool(False)
+    SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR = EnvStr("/tmp")
 
     # TBO
     SGLANG_TBO_DEBUG = EnvBool(False)
@@ -187,12 +198,12 @@ class Envs:
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
 
-    # vLLM dependencies
+    # vLLM dependencies (TODO: they have been deprecated, we can remove them safely)
     USE_VLLM_CUSTOM_ALLREDUCE = EnvBool(False)
     USE_VLLM_CUTLASS_W8A8_FP8_KERNEL = EnvBool(False)
 
     USE_TRITON_W8A8_FP8_KERNEL = EnvBool(False)
-    RETURN_ORIGINAL_LOGPROB = EnvBool(False)
+    SGLANG_RETURN_ORIGINAL_LOGPROB = EnvBool(False)
     SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN = EnvBool(False)
     SGLANG_MOE_PADDING = EnvBool(False)
     SGLANG_CUTLASS_MOE = EnvBool(False)
@@ -210,6 +221,13 @@ class Envs:
     SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE = EnvInt(2048)
     SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE = EnvInt(4096)
     SGLANG_TRITON_DECODE_SPLIT_TILE_SIZE = EnvInt(256)
+
+    # Overlap Spec V2
+    SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
+
+    # VLM
+    SGLANG_IMAGE_MAX_PIXELS = EnvInt(16384 * 28 * 28)
+    SGLANG_RESIZE_RESAMPLE = EnvStr("")
 
     # Sparse Embeddings
     SGLANG_EMBEDDINGS_SPARSE_HEAD = EnvStr(None)
