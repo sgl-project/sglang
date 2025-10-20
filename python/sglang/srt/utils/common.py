@@ -3487,19 +3487,17 @@ def reserve_rope_cache_for_long_sequences(
         or 2048
     )
 
-    # 2) Runtime input capacity (including extra_len from req_to_token_pool)
-    inferred_cap = getattr(req_to_token_pool, "max_context_len", None) or base_ctx
 
-    # 3) Speculative decoding expansion
+    # 2) Speculative decoding expansion
     steps = int(getattr(server_args, "speculative_num_steps", 0) or 0)
     draft = int(getattr(server_args, "speculative_num_draft_tokens", 0) or 0)
-    reserve = inferred_cap + steps * draft * SAFETY_FACTOR + MARGIN
+    reserve = base_ctx + steps * draft * SAFETY_FACTOR + MARGIN
 
-    # 4) Align to reduce reallocation frequency
+    # 3) Align to reduce reallocation frequency
     reserve = (reserve + ALIGN - 1) // ALIGN * ALIGN
 
     logger.info(
-        f"RoPE cache reserve={reserve} (base={base_ctx}, cap={inferred_cap}, steps={steps}, draft={draft}, k={SAFETY_FACTOR}, margin={MARGIN})"
+        f"RoPE cache reserve={reserve} (cap={base_ctx}, steps={steps}, draft={draft}, k={SAFETY_FACTOR}, margin={MARGIN})"
     )
 
     # Recursively expand all RoPE layers
