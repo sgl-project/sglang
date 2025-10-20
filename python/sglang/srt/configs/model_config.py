@@ -867,6 +867,7 @@ multimodal_model_archs = [
     "DotsVLMForCausalLM",
     "DotsOCRForCausalLM",
     "Sarashina2VisionForCausalLM",
+    "DeepseekOCRForCausalLM",
 ]
 
 

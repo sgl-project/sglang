@@ -29,6 +29,7 @@ class DeepseekOCRProcessor(BaseMultimodalProcessor):
             base_output, self.mm_tokens
         )
 
+        print(f"{mm_items=}")
         return {
             "input_ids": input_ids.tolist(),
             "mm_items": mm_items,

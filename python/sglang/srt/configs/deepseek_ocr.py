@@ -807,6 +807,7 @@ class DeepseekVLV2Config(PretrainedConfig):
         self.vocab_size = self.text_config.vocab_size
         self.hidden_size = self.text_config.hidden_size
 
+
 class DeepseekOCRConfig(DeepseekV2Config):
     model_type = "DeepseekOCR"
 
