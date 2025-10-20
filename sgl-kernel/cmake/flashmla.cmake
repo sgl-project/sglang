@@ -15,7 +15,7 @@ set(FLASHMLA_CUDA_FLAGS
     "--use_fast_math"
 )
 
-# The FlashMLA kernels only work on hopper and require CUDA 12.3 or later.
+# The FlashMLA kernels only work on hopper and require CUDA 12.4 or later.
 # Only build FlashMLA kernels if we are building for something compatible with
 # sm90a
 if(${CUDA_VERSION} VERSION_GREATER 12.4)
