@@ -1,7 +1,9 @@
-use sglang_router_rs::protocols::chat::{ChatMessage, UserMessageContent};
-use sglang_router_rs::tokenizer::chat_template::{
-    detect_chat_template_content_format, ChatTemplateContentFormat, ChatTemplateParams,
-    ChatTemplateProcessor,
+use sglang_router_rs::{
+    protocols::chat::{ChatMessage, UserMessageContent},
+    tokenizer::chat_template::{
+        detect_chat_template_content_format, ChatTemplateContentFormat, ChatTemplateParams,
+        ChatTemplateProcessor,
+    },
 };
 
 #[test]

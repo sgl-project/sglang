@@ -1,10 +1,13 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
 use validator::Validate;
 
-use super::common::*;
-use super::sampling_params::{validate_top_k_value, validate_top_p_value};
+use super::{
+    common::*,
+    sampling_params::{validate_top_k_value, validate_top_p_value},
+};
 use crate::protocols::validated::Normalizable;
 
 // ============================================================================
@@ -493,7 +496,6 @@ impl Normalizable for ChatCompletionRequest {
         // Migrate deprecated max_tokens → max_completion_tokens
         #[allow(deprecated)]
         if self.max_completion_tokens.is_none() && self.max_tokens.is_some() {
-            tracing::warn!("max_tokens is deprecated, use max_completion_tokens instead");
             self.max_completion_tokens = self.max_tokens;
             self.max_tokens = None; // Clear deprecated field
         }
@@ -531,13 +533,15 @@ impl Normalizable for ChatCompletionRequest {
 
         // Apply tool_choice defaults
         if self.tool_choice.is_none() {
-            let has_tools = self.tools.as_ref().is_some_and(|t| !t.is_empty());
-
-            self.tool_choice = if has_tools {
-                Some(ToolChoice::Value(ToolChoiceValue::Auto))
-            } else {
-                Some(ToolChoice::Value(ToolChoiceValue::None))
-            };
+            if let Some(tools) = &self.tools {
+                let choice_value = if !tools.is_empty() {
+                    ToolChoiceValue::Auto
+                } else {
+                    ToolChoiceValue::None
+                };
+                self.tool_choice = Some(ToolChoice::Value(choice_value));
+            }
+            // If tools is None, leave tool_choice as None (don't set it)
         }
     }
 }
