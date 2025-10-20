@@ -211,7 +211,7 @@ class LayerCommunicator:
                 context=self._context,
             )
         )
-        
+
         self._speculative_algo = SpeculativeAlgorithm.from_string(
             get_global_server_args().speculative_algorithm
         )
