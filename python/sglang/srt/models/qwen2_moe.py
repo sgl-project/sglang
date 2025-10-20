@@ -228,9 +228,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 ),
             )
         else:
-            topk_output = self.topk.empty_topk_output(
-                hidden_states.device
-            )
+            topk_output = self.topk.empty_topk_output(hidden_states.device)
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
             topk_output=topk_output,

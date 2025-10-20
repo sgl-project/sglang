@@ -380,7 +380,7 @@ class BailingMoESparseMoeBlock(nn.Module):
             if self.num_shared_experts > 0:
                 shared_output = self.shared_experts(hidden_states)
 
-            topk_output= self.topk(
+            topk_output = self.topk(
                 hidden_states,
                 router_logits,
                 num_token_non_padded=forward_batch.num_token_non_padded,
