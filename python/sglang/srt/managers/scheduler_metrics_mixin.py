@@ -124,7 +124,7 @@ class SchedulerMetricsMixin:
 
         f = (
             f"Prefill batch. "
-            f"step #{self.forward_ct + 1}, "
+            f"step #{self.forward_ct}, "
             f"#new-seq: {len(can_run_list)}, "
             f"#new-token: {adder.log_input_tokens}, "
             f"#cached-token: {adder.log_hit_tokens}, "
