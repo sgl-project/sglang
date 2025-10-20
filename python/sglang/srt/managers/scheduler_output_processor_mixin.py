@@ -292,13 +292,10 @@ class SchedulerOutputProcessorMixin:
                     ][start_p:end_p]
 
                 else:
-                    if self.page_size == 1:
+                    if is_rnd1_model(self):
+                        pass  # rnd1 doesn't support KV cache yet
+                    elif self.page_size == 1:
                         # Free the one extra delayed token
-                        if batch.out_cache_loc is not None and not is_rnd1_model(
-                            self
-                        ):  # TODO: hack for now due to lack of KV cache support
-                            indices_to_free = batch.out_cache_loc[i : i + 1]
-                    if batch.spec_algorithm.is_eagle():
                         indices_to_free = batch.out_cache_loc[i : i + 1]
                     else:
                         if (
