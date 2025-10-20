@@ -81,6 +81,7 @@ def resolve_transformers_arch(model_config: ModelConfig, architectures: list[str
 
 def get_model_architecture(model_config: ModelConfig) -> Tuple[Type[nn.Module], str]:
     from sglang.srt.models.registry import ModelRegistry
+
     print(f"{model_config.hf_config=}")
     architectures = getattr(model_config.hf_config, "architectures", [])
     # Special handling for quantized Mixtral.
