@@ -104,7 +104,7 @@ impl BasicWorkerBuilder {
             Arc,
         };
 
-        use tokio::sync::{Mutex, RwLock};
+        use tokio::sync::RwLock;
 
         let bootstrap_host = match url::Url::parse(&self.url) {
             Ok(parsed) => parsed.host_str().unwrap_or("localhost").to_string(),
@@ -145,9 +145,7 @@ impl BasicWorkerBuilder {
             bootstrap_port,
         };
 
-        let grpc_client = Arc::new(RwLock::new(
-            self.grpc_client.map(|client| Arc::new(Mutex::new(client))),
-        ));
+        let grpc_client = Arc::new(RwLock::new(self.grpc_client.map(Arc::new)));
 
         BasicWorker {
             metadata,
