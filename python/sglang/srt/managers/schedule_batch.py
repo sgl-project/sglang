@@ -323,7 +323,9 @@ class MultimodalInputs:
 
                 patches_per_image = [torch.prod(grid).item() for grid in image_grid_thw]
 
-                slice_indices = [0] + torch.cumsum(torch.tensor(patches_per_image, dtype=torch.long), dim=0).tolist()
+                slice_indices = [0] + torch.cumsum(
+                    torch.tensor(patches_per_image, dtype=torch.long), dim=0
+                ).tolist()
 
                 if slice_indices[-1] != item.feature.shape[0]:
                     expanded_mm_items.append(item)
@@ -332,12 +334,14 @@ class MultimodalInputs:
                 for i in range(num_images):
                     new_item = copy.deepcopy(item)
 
-                    start, end = slice_indices[i], slice_indices[i+1]
+                    start, end = slice_indices[i], slice_indices[i + 1]
                     new_item.feature = item.feature[start:end]
 
                     new_item.offsets = [item.offsets[i]]
 
-                    new_item.model_specific_data['image_grid_thw'] = image_grid_thw[i:i+1]
+                    new_item.model_specific_data["image_grid_thw"] = image_grid_thw[
+                        i : i + 1
+                    ]
 
                     new_item.hash = None
 

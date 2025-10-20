@@ -2,10 +2,10 @@
 Multi-modality utils
 """
 
-from collections import defaultdict
 import hashlib
 import pickle
 from abc import abstractmethod
+from collections import defaultdict
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
 import numpy as np
