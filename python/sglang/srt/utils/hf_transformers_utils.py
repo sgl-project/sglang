@@ -19,7 +19,7 @@ import os
 import tempfile
 import warnings
 from pathlib import Path
-from typing import Any, Dict, Optional, Type, Union
+from typing import Any, Dict, List, Optional, Type, Union
 
 import torch
 from huggingface_hub import snapshot_download
@@ -51,29 +51,32 @@ from sglang.srt.configs import (
     Qwen3NextConfig,
     Step3VLConfig,
 )
+from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
 from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.connector import create_remote_connector
 from sglang.srt.utils import is_remote_url, logger, lru_cache_frozenset
 
-_CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
-    ChatGLMConfig.model_type: ChatGLMConfig,
-    DbrxConfig.model_type: DbrxConfig,
-    ExaoneConfig.model_type: ExaoneConfig,
-    DeepseekVL2Config.model_type: DeepseekVL2Config,
-    MultiModalityConfig.model_type: MultiModalityConfig,
-    KimiVLConfig.model_type: KimiVLConfig,
-    InternVLChatConfig.model_type: InternVLChatConfig,
-    Step3VLConfig.model_type: Step3VLConfig,
-    LongcatFlashConfig.model_type: LongcatFlashConfig,
-    Olmo3Config.model_type: Olmo3Config,
-    Qwen3NextConfig.model_type: Qwen3NextConfig,
-    FalconH1Config.model_type: FalconH1Config,
-    DotsVLMConfig.model_type: DotsVLMConfig,
-    DotsOCRConfig.model_type: DotsOCRConfig,
-    NemotronHConfig.model_type: NemotronHConfig,
-}
+_CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
+    ChatGLMConfig,
+    DbrxConfig,
+    ExaoneConfig,
+    DeepseekVL2Config,
+    MultiModalityConfig,
+    KimiVLConfig,
+    InternVLChatConfig,
+    Step3VLConfig,
+    LongcatFlashConfig,
+    Olmo3Config,
+    Qwen3NextConfig,
+    FalconH1Config,
+    DotsVLMConfig,
+    DotsOCRConfig,
+    NemotronHConfig,
+    DeepseekVLV2Config,
+]
 
-for name, cls in _CONFIG_REGISTRY.items():
+for cls in _CONFIG_REGISTRY:
+    name = cls.model_type
     with contextlib.suppress(ValueError):
         AutoConfig.register(name, cls)
 
@@ -213,7 +216,8 @@ def get_config(
             "intermediate_size": 4304,
             "model_type": "siglip_vision_model",
             "num_attention_heads": 16,
-            "num_hidden_layers": 26,  # Model is originally 27-layer, we only need the first 26 layers for feature extraction.
+            "num_hidden_layers": 26,
+            # Model is originally 27-layer, we only need the first 26 layers for feature extraction.
             "patch_size": 14,
         }
         config.vision_config = SiglipVisionConfig(**vision_config)
