@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from contextlib import suppress
 from typing import Any, Dict, List, Literal, NamedTuple, Optional, Tuple, cast
 
@@ -20,6 +19,7 @@ from compressed_tensors.quantization import (
 )
 from pydantic import BaseModel
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.base_config import (
     LinearMethodBase,
     QuantizationConfig,
@@ -135,7 +135,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         if isinstance(layer, LinearBase):
             if CompressedTensorsConfig.DeepSeekFP8Config is not None:
                 return Fp8LinearMethod(CompressedTensorsConfig.DeepSeekFP8Config)
-            if "KT_MOE_AMX_WEIGHT_PATH" in os.environ:
+            if envs.SGLANG_KT_MOE_AMX_WEIGHT_PATH.is_set():
                 return UnquantizedLinearMethod()
             scheme = self.get_scheme(layer=layer, layer_name=prefix)
             if scheme is None:

@@ -44,6 +44,7 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -2864,7 +2865,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
-        if os.environ.get("KT_MOE_AMX_WEIGHT_PATH") is not None:
+        if envs.SGLANG_KT_MOE_AMX_WEIGHT_PATH.is_set():
             CompressedTensorsConfig.DeepSeekFP8Config = Fp8Config(
                 True, "dynamic", None, [128, 128]
             )
