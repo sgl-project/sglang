@@ -14,11 +14,14 @@ use std::{
 };
 
 use axum::{
-    http::{self, StatusCode},
+    body::Body,
+    http::{self, header, StatusCode},
     response::{IntoResponse, Response},
 };
+use bytes::Bytes;
 use serde_json::json;
 use tokio::sync::RwLock;
+use tokio_stream::StreamExt;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -37,8 +40,9 @@ use crate::{
     protocols::{
         chat::ChatCompletionResponse,
         responses::{
-            ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponseStatus,
-            ResponseTool, ResponseToolType, ResponsesRequest, ResponsesResponse,
+            ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponseOutputItem,
+            ResponseStatus, ResponseTool, ResponseToolType, ResponsesRequest, ResponsesResponse,
+            ResponsesUsage,
         },
     },
 };
@@ -486,33 +490,488 @@ async fn route_responses_streaming(
 
 /// Convert chat streaming response to responses streaming format
 ///
-/// NOTE: Currently returns chat SSE format directly (functional passthrough).
-/// Full responses-formatted SSE transformation is deferred because:
-/// 1. OpenAI has not published a streaming spec for /v1/responses endpoint
-/// 2. Chat SSE format is functionally compatible with most clients
-/// 3. Complex body stream transformation requires additional dependencies
-///
-/// Future enhancement when spec is available:
-/// - Intercept and parse chat SSE events
-/// - Transform to ResponsesResponse delta format
-/// - Accumulate and persist final response
+/// This function:
+/// 1. Gets chat SSE stream from pipeline
+/// 2. Intercepts and parses each SSE event
+/// 3. Converts ChatCompletionStreamResponse → ResponsesResponse delta
+/// 4. Accumulates response state for final persistence
+/// 5. Emits transformed SSE events in responses format
 async fn convert_chat_stream_to_responses_stream(
     pipeline: &RequestPipeline,
     chat_request: Arc<crate::protocols::chat::ChatCompletionRequest>,
     headers: Option<http::HeaderMap>,
     model_id: Option<String>,
     components: Arc<SharedComponents>,
-    _original_request: &ResponsesRequest,
-    _response_storage: SharedResponseStorage,
+    original_request: &ResponsesRequest,
+    response_storage: SharedResponseStorage,
     _conversation_storage: SharedConversationStorage,
     _conversation_item_storage: SharedConversationItemStorage,
 ) -> Response {
-    debug!("Streaming responses (using chat SSE format - responses streaming spec not yet defined)");
+    use tokio::sync::mpsc;
+    use tokio_stream::wrappers::UnboundedReceiverStream;
 
-    // Return chat streaming response directly (functional passthrough)
-    pipeline
-        .execute_chat(chat_request, headers, model_id, components)
+    debug!("Converting chat SSE stream to responses SSE format");
+
+    // Get chat streaming response
+    let chat_response = pipeline
+        .execute_chat(chat_request.clone(), headers, model_id, components)
+        .await;
+
+    // Extract body and headers from chat response
+    let (parts, body) = chat_response.into_parts();
+
+    // Create channel for transformed SSE events
+    let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, std::io::Error>>();
+
+    // Spawn background task to transform stream
+    let original_request_clone = original_request.clone();
+    let chat_request_clone = chat_request.clone();
+    let response_storage_clone = response_storage.clone();
+    let conversation_storage_clone = _conversation_storage.clone();
+    let conversation_item_storage_clone = _conversation_item_storage.clone();
+
+    tokio::spawn(async move {
+        if let Err(e) = process_and_transform_sse_stream(
+            body,
+            original_request_clone,
+            chat_request_clone,
+            response_storage_clone,
+            conversation_storage_clone,
+            conversation_item_storage_clone,
+            tx.clone(),
+        )
         .await
+        {
+            warn!("Error transforming SSE stream: {}", e);
+            let error_event = json!({
+                "error": {
+                    "message": e,
+                    "type": "stream_error"
+                }
+            });
+            let _ = tx.send(Ok(Bytes::from(format!("data: {}\n\n", error_event))));
+        }
+
+        // Send final [DONE] event
+        let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
+    });
+
+    // Build SSE response with transformed stream
+    let stream = UnboundedReceiverStream::new(rx);
+    let body = Body::from_stream(stream);
+
+    let mut response = Response::builder()
+        .status(parts.status)
+        .body(body)
+        .unwrap();
+
+    // Copy headers from original chat response
+    *response.headers_mut() = parts.headers;
+
+    // Ensure SSE headers are set
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static("text/event-stream"),
+    );
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-cache"),
+    );
+    response.headers_mut().insert(
+        header::CONNECTION,
+        header::HeaderValue::from_static("keep-alive"),
+    );
+
+    response
+}
+
+/// Process chat SSE stream and transform to responses format
+async fn process_and_transform_sse_stream(
+    body: Body,
+    original_request: ResponsesRequest,
+    _chat_request: Arc<crate::protocols::chat::ChatCompletionRequest>,
+    response_storage: SharedResponseStorage,
+    conversation_storage: SharedConversationStorage,
+    conversation_item_storage: SharedConversationItemStorage,
+    tx: tokio::sync::mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
+) -> Result<(), String> {
+    // Create accumulator for final response
+    let mut accumulator = StreamingResponseAccumulator::new(&original_request);
+
+    // Convert body to data stream
+    let mut stream = body.into_data_stream();
+
+    // Buffer for incomplete SSE events
+    let mut buffer = Vec::new();
+
+    // Process stream chunks
+    while let Some(chunk_result) = stream.next().await {
+        let chunk = chunk_result.map_err(|e| format!("Stream read error: {}", e))?;
+        buffer.extend_from_slice(&chunk);
+
+        // Process all complete SSE events in buffer
+        while let Some(event) = extract_sse_event(&mut buffer) {
+            if event.starts_with("data: [DONE]") {
+                // End of stream marker
+                break;
+            }
+
+            if let Some(json_str) = event.strip_prefix("data: ") {
+                // Try to parse as ChatCompletionStreamResponse
+                match serde_json::from_str::<crate::protocols::chat::ChatCompletionStreamResponse>(
+                    json_str,
+                ) {
+                    Ok(chat_chunk) => {
+                        // Update accumulator
+                        accumulator.process_chunk(&chat_chunk);
+
+                        // Convert to responses delta format
+                        let responses_delta = convert_chat_chunk_to_responses_delta(&chat_chunk);
+
+                        // Emit converted SSE event
+                        let delta_json = serde_json::to_string(&responses_delta)
+                            .map_err(|e| format!("Failed to serialize delta: {}", e))?;
+
+                        if tx
+                            .send(Ok(Bytes::from(format!("data: {}\n\n", delta_json))))
+                            .is_err()
+                        {
+                            return Err("Client disconnected".to_string());
+                        }
+                    }
+                    Err(_) => {
+                        // Not a valid chat chunk - might be error event, pass through
+                        debug!("Non-chunk SSE event, passing through: {}", event);
+                        if tx.send(Ok(Bytes::from(format!("{}\n\n", event)))).is_err() {
+                            return Err("Client disconnected".to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Finalize and persist accumulated response
+    if original_request.store.unwrap_or(true) {
+        let final_response = accumulator.finalize();
+
+        if let Ok(response_json) = serde_json::to_value(&final_response) {
+            if let Err(e) = crate::routers::openai::conversations::persist_conversation_items(
+                conversation_storage,
+                conversation_item_storage,
+                response_storage,
+                &response_json,
+                &original_request,
+            )
+            .await
+            {
+                warn!("Failed to persist streaming response: {}", e);
+            } else {
+                debug!("Persisted streaming response: {}", final_response.id);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Extract next complete SSE event from buffer
+/// Returns the event line (without trailing \n\n) and removes it from buffer
+fn extract_sse_event(buffer: &mut Vec<u8>) -> Option<String> {
+    // Look for double newline marking end of SSE event
+    for i in 0..buffer.len().saturating_sub(1) {
+        if buffer[i] == b'\n' && buffer[i + 1] == b'\n' {
+            // Found complete event
+            let event_bytes = buffer.drain(..=i + 1).collect::<Vec<_>>();
+            let event_str = String::from_utf8_lossy(&event_bytes[..event_bytes.len() - 2]);
+            return Some(event_str.to_string());
+        }
+    }
+    None
+}
+
+/// Response accumulator for streaming responses
+struct StreamingResponseAccumulator {
+    // Response metadata
+    response_id: String,
+    model: String,
+    created_at: i64,
+
+    // Accumulated content
+    content_buffer: String,
+    reasoning_buffer: String,
+    tool_calls: Vec<ResponseOutputItem>,
+
+    // Completion state
+    finish_reason: Option<String>,
+    usage: Option<crate::protocols::common::Usage>,
+
+    // Original request for final response construction
+    original_request: ResponsesRequest,
+}
+
+impl StreamingResponseAccumulator {
+    fn new(original_request: &ResponsesRequest) -> Self {
+        Self {
+            response_id: String::new(),
+            model: String::new(),
+            created_at: 0,
+            content_buffer: String::new(),
+            reasoning_buffer: String::new(),
+            tool_calls: Vec::new(),
+            finish_reason: None,
+            usage: None,
+            original_request: original_request.clone(),
+        }
+    }
+
+    fn process_chunk(&mut self, chunk: &crate::protocols::chat::ChatCompletionStreamResponse) {
+        // Initialize metadata on first chunk
+        if self.response_id.is_empty() {
+            self.response_id = chunk.id.clone();
+            self.model = chunk.model.clone();
+            self.created_at = chunk.created as i64;
+        }
+
+        // Process first choice (responses API doesn't support n>1)
+        if let Some(choice) = chunk.choices.first() {
+            // Accumulate content
+            if let Some(content) = &choice.delta.content {
+                self.content_buffer.push_str(content);
+            }
+
+            // Accumulate reasoning
+            if let Some(reasoning) = &choice.delta.reasoning_content {
+                self.reasoning_buffer.push_str(reasoning);
+            }
+
+            // Process tool call deltas
+            if let Some(tool_call_deltas) = &choice.delta.tool_calls {
+                for delta in tool_call_deltas {
+                    // Use index directly (it's a u32, not Option<u32>)
+                    let index = delta.index as usize;
+
+                    // Ensure we have enough tool calls
+                    while self.tool_calls.len() <= index {
+                        self.tool_calls.push(ResponseOutputItem::FunctionToolCall {
+                            id: String::new(),
+                            name: String::new(),
+                            arguments: String::new(),
+                            output: None,
+                            status: "in_progress".to_string(),
+                        });
+                    }
+
+                    // Update the tool call at this index
+                    if let ResponseOutputItem::FunctionToolCall {
+                        id,
+                        name,
+                        arguments,
+                        ..
+                    } = &mut self.tool_calls[index]
+                    {
+                        if let Some(delta_id) = &delta.id {
+                            id.push_str(delta_id);
+                        }
+                        if let Some(function) = &delta.function {
+                            if let Some(delta_name) = &function.name {
+                                name.push_str(delta_name);
+                            }
+                            if let Some(delta_args) = &function.arguments {
+                                arguments.push_str(delta_args);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Update finish reason
+            if let Some(reason) = &choice.finish_reason {
+                self.finish_reason = Some(reason.clone());
+            }
+        }
+
+        // Update usage
+        if let Some(usage) = &chunk.usage {
+            self.usage = Some(usage.clone());
+        }
+    }
+
+    fn finalize(self) -> ResponsesResponse {
+        let mut output: Vec<ResponseOutputItem> = Vec::new();
+
+        // Add message content if present
+        if !self.content_buffer.is_empty() {
+            output.push(ResponseOutputItem::Message {
+                id: format!("msg_{}", self.response_id),
+                role: "assistant".to_string(),
+                content: vec![ResponseContentPart::OutputText {
+                    text: self.content_buffer,
+                    annotations: vec![],
+                    logprobs: None,
+                }],
+                status: "completed".to_string(),
+            });
+        }
+
+        // Add reasoning if present
+        if !self.reasoning_buffer.is_empty() {
+            output.push(ResponseOutputItem::Reasoning {
+                id: format!("reasoning_{}", self.response_id),
+                summary: vec![],
+                content: vec![
+                    crate::protocols::responses::ResponseReasoningContent::ReasoningText {
+                        text: self.reasoning_buffer,
+                    },
+                ],
+                status: Some("completed".to_string()),
+            });
+        }
+
+        // Add tool calls
+        output.extend(self.tool_calls);
+
+        // Determine final status
+        let status = match self.finish_reason.as_deref() {
+            Some("stop") | Some("length") => ResponseStatus::Completed,
+            Some("tool_calls") => ResponseStatus::InProgress,
+            Some("failed") | Some("error") => ResponseStatus::Failed,
+            _ => ResponseStatus::Completed,
+        };
+
+        // Convert usage
+        let usage = self.usage.as_ref().map(|u| {
+            let usage_info = crate::protocols::common::UsageInfo {
+                prompt_tokens: u.prompt_tokens,
+                completion_tokens: u.completion_tokens,
+                total_tokens: u.total_tokens,
+                reasoning_tokens: u
+                    .completion_tokens_details
+                    .as_ref()
+                    .and_then(|d| d.reasoning_tokens),
+                prompt_tokens_details: None,
+            };
+            ResponsesUsage::Classic(usage_info)
+        });
+
+        ResponsesResponse {
+            id: self.response_id,
+            object: "response".to_string(),
+            created_at: self.created_at,
+            status,
+            error: None,
+            incomplete_details: None,
+            instructions: self.original_request.instructions.clone(),
+            max_output_tokens: self.original_request.max_output_tokens,
+            model: self.model,
+            output,
+            parallel_tool_calls: self.original_request.parallel_tool_calls.unwrap_or(true),
+            previous_response_id: self.original_request.previous_response_id.clone(),
+            reasoning: None,
+            store: self.original_request.store.unwrap_or(true),
+            temperature: self.original_request.temperature,
+            text: None,
+            tool_choice: "auto".to_string(),
+            tools: self.original_request.tools.clone().unwrap_or_default(),
+            top_p: self.original_request.top_p,
+            truncation: None,
+            usage,
+            user: None,
+            metadata: self.original_request.metadata.clone().unwrap_or_default(),
+        }
+    }
+}
+
+/// Convert ChatCompletionStreamResponse to ResponsesResponse delta format
+fn convert_chat_chunk_to_responses_delta(
+    chunk: &crate::protocols::chat::ChatCompletionStreamResponse,
+) -> serde_json::Value {
+    let mut delta = json!({
+        "id": chunk.id,
+        "object": "response.delta",
+        "created_at": chunk.created,
+        "model": chunk.model,
+    });
+
+    if let Some(choice) = chunk.choices.first() {
+        let mut output_deltas = Vec::new();
+
+        // Content delta
+        if let Some(content) = &choice.delta.content {
+            output_deltas.push(json!({
+                "type": "message",
+                "delta": {
+                    "content": [{
+                        "type": "text",
+                        "text": content
+                    }]
+                }
+            }));
+        }
+
+        // Reasoning delta
+        if let Some(reasoning) = &choice.delta.reasoning_content {
+            output_deltas.push(json!({
+                "type": "reasoning",
+                "delta": {
+                    "content": [{
+                        "type": "text",
+                        "text": reasoning
+                    }]
+                }
+            }));
+        }
+
+        // Tool call deltas
+        if let Some(tool_calls) = &choice.delta.tool_calls {
+            for tool_call in tool_calls {
+                let mut tool_delta = json!({
+                    "type": "function_tool_call",
+                    "index": tool_call.index,
+                });
+
+                let mut delta_fields = serde_json::Map::new();
+                if let Some(id) = &tool_call.id {
+                    delta_fields.insert("id".to_string(), json!(id));
+                }
+                if let Some(function) = &tool_call.function {
+                    if let Some(name) = &function.name {
+                        delta_fields.insert("name".to_string(), json!(name));
+                    }
+                    if let Some(args) = &function.arguments {
+                        delta_fields.insert("arguments".to_string(), json!(args));
+                    }
+                }
+
+                tool_delta["delta"] = json!(delta_fields);
+                output_deltas.push(tool_delta);
+            }
+        }
+
+        if !output_deltas.is_empty() {
+            delta["output"] = json!(output_deltas);
+        }
+
+        // Finish reason
+        if let Some(reason) = &choice.finish_reason {
+            delta["status"] = json!(match reason.as_str() {
+                "stop" | "length" => "completed",
+                "tool_calls" => "in_progress",
+                _ => "completed",
+            });
+        }
+    }
+
+    // Usage delta
+    if let Some(usage) = &chunk.usage {
+        delta["usage"] = json!({
+            "prompt_tokens": usage.prompt_tokens,
+            "completion_tokens": usage.completion_tokens,
+            "total_tokens": usage.total_tokens,
+        });
+    }
+
+    delta
 }
 
 // ============================================================================
@@ -814,7 +1273,7 @@ impl ToolLoopState {
 // MCP Metadata Builders
 // ============================================================================
 
-use crate::protocols::responses::{McpToolInfo, ResponseOutputItem};
+use crate::protocols::responses::McpToolInfo;
 
 /// Generate unique ID for MCP items
 fn generate_mcp_id(prefix: &str) -> String {
