@@ -778,7 +778,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             # Update the status to "cancelled"
             response.status = "cancelled"
 
-        # Abort the request
+        # The response_id is the same as the rid used when submitting the request
+        self.tokenizer_manager.abort_request(rid=response_id)
+
         if task := self.background_tasks.get(response_id):
             task.cancel()
             try:
