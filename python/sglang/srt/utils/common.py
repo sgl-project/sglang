@@ -3464,7 +3464,7 @@ def cached_triton_kernel(key_fn=None):
 
 
 def reserve_rope_cache_for_long_sequences(
-    model, server_args, model_config, req_to_token_pool=None, logger=None
+    model, server_args, model_config, logger=None
 ):
     """Pre-expand RoPE cache for long sequences and speculative decoding."""
     from sglang.srt.environ import envs

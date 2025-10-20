@@ -904,7 +904,6 @@ class ModelRunner:
             self.model,
             self.server_args,
             self.model_config,
-            self.req_to_token_pool,
             logger,
         )
 

@@ -151,12 +151,15 @@ class RotaryEmbedding(CustomOp):
 
     def _ensure_cos_sin_cache_length(self, needed_max_pos: int):
         """Ensure cos_sin_cache length > needed_max_pos."""
+        from sglang.srt.environ import envs
+
         cur_len = int(self.cos_sin_cache.shape[0])
         if needed_max_pos < cur_len:
             return
 
-        # Align to 128 to reduce realloc frequency
-        new_len = ((needed_max_pos + 128) // 128) * 128
+        # Align to reduce realloc frequency
+        align = envs.SGLANG_ROPE_CACHE_ALIGN.value
+        new_len = ((needed_max_pos + align) // align) * align
         device = self.cos_sin_cache.device
         dtype = self.cos_sin_cache.dtype
 
