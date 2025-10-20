@@ -56,19 +56,17 @@ class TestPiecewiseCudaGraphBenchmark(CustomTestCase):
 
 
 class TestPiecewiseCudaGraphQwen3MoE(CustomTestCase):
-    """Test piecewise CUDA graph with Qwen3-235B-A22B-FP8 MoE model"""
+    """Test piecewise CUDA graph with Qwen3-Coder-30B-A3B-Instruct MoE model"""
 
     @classmethod
     def setUpClass(cls):
-        cls.model = "Qwen/Qwen3-235B-A22B-FP8"
+        cls.model = "Qwen/Qwen3-Coder-30B-A3B-Instruct"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
-                "--tp",
-                "4",
                 "--enable-piecewise-cuda-graph",
                 "--piecewise-cuda-graph-compiler",
                 "eager",
