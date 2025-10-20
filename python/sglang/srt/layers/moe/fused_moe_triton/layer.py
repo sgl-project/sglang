@@ -28,6 +28,11 @@ from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
 )
+from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe import (
+    CompressedTensorsWNA16AMXEPMoEMethod,
+    CompressedTensorsWNA16AMXMoEMethod,
+    CompressedTensorsWNA16MoEMethod,
+)
 from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
@@ -528,7 +533,14 @@ class FusedMoE(torch.nn.Module):
             if expert_id == -1:
                 return
 
-        if hasattr(self.quant_method, "num_gpu_experts"):
+        if isinstance(
+            self.quant_method,
+            (
+                CompressedTensorsWNA16MoEMethod,
+                CompressedTensorsWNA16AMXMoEMethod,
+                CompressedTensorsWNA16AMXEPMoEMethod,
+            ),
+        ):
             if self.quant_method.num_gpu_experts != -1:
                 if expert_id >= self.quant_method.num_gpu_experts:
                     return
@@ -833,12 +845,12 @@ class FusedMoE(torch.nn.Module):
         )
 
         # TODO: consider using symmetric memory
-
         combine_input = self.quant_method.apply(
             layer=self,
             dispatch_output=dispatch_output,
             **kwargs,
         )
+        
         final_hidden_states = self.dispatcher.combine(combine_input)
 
         final_hidden_states = final_hidden_states[

@@ -195,13 +195,6 @@ class ServerArgs:
     revision: Optional[str] = None
     model_impl: str = "auto"
 
-    # Ktransformers
-    kt_amx_weight_path: Optional[str] = None
-    kt_amx_method: Optional[str] = None
-    kt_cpuinfer: Optional[int] = None
-    kt_threadpool_count: Optional[int] = None
-    kt_num_gpu_experts: Optional[int] = None
-
     # HTTP server
     host: str = "127.0.0.1"
     port: int = 30000
@@ -393,6 +386,13 @@ class ServerArgs:
     hicache_storage_backend_extra_config: Optional[str] = None
     # LMCache
     enable_lmcache: bool = False
+
+    # Ktransformers
+    kt_amx_weight_path: Optional[str] = None
+    kt_amx_method: Optional[str] = None
+    kt_cpuinfer: Optional[int] = None
+    kt_threadpool_count: Optional[int] = None
+    kt_num_gpu_experts: Optional[int] = None
 
     # Double Sparsity
     enable_double_sparsity: bool = False
@@ -1463,35 +1463,6 @@ class ServerArgs:
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
-
-        # Ktransformer server args
-        parser.add_argument(
-            "--kt-amx-weight-path",
-            type=str,
-            help="[ktransformers parameter] The path of the quantized expert weights for amx kernel. A local folder.",
-        )
-        parser.add_argument(
-            "--kt-amx-method",
-            type=str,
-            default="AMXINT4",
-            help="[ktransformers parameter] Quantization formats for CPU execution.",
-        )
-        parser.add_argument(
-            "--kt-cpuinfer",
-            type=int,
-            help="[ktransformers parameter] The number of CPUInfer threads.",
-        )
-        parser.add_argument(
-            "--kt-threadpool-count",
-            type=int,
-            default=2,
-            help="[ktransformers parameter] One-to-one with the number of NUMA nodes (one thread pool per NUMA).",
-        )
-        parser.add_argument(
-            "--kt-num-gpu-experts",
-            type=int,
-            help="[ktransformers parameter] The number of GPU experts.",
-        )
 
         # Model and tokenizer
         parser.add_argument(
@@ -2648,6 +2619,35 @@ class ServerArgs:
             "--enable-lmcache",
             action="store_true",
             help="Using LMCache as an alternative hierarchical cache solution",
+        )
+
+        # Ktransformer server args
+        parser.add_argument(
+            "--kt-amx-weight-path",
+            type=str,
+            help="[ktransformers parameter] The path of the quantized expert weights for amx kernel. A local folder.",
+        )
+        parser.add_argument(
+            "--kt-amx-method",
+            type=str,
+            default="AMXINT4",
+            help="[ktransformers parameter] Quantization formats for CPU execution.",
+        )
+        parser.add_argument(
+            "--kt-cpuinfer",
+            type=int,
+            help="[ktransformers parameter] The number of CPUInfer threads.",
+        )
+        parser.add_argument(
+            "--kt-threadpool-count",
+            type=int,
+            default=2,
+            help="[ktransformers parameter] One-to-one with the number of NUMA nodes (one thread pool per NUMA).",
+        )
+        parser.add_argument(
+            "--kt-num-gpu-experts",
+            type=int,
+            help="[ktransformers parameter] The number of GPU experts.",
         )
 
         # Double Sparsity
