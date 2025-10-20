@@ -876,5 +876,4 @@ mod tests {
             assert_eq!(bucket_guard.boundary[1].range[1], 26);
         }
     }
-
 }
