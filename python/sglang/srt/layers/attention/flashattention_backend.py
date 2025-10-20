@@ -344,7 +344,7 @@ class FlashAttentionBackend(AttentionBackend):
                 num_q_heads=model_runner.model_config.num_attention_heads,
                 q_dtype=model_runner.dtype,
                 use_cuda_graph=not model_runner.server_args.disable_cuda_graph,
-                max_bs=32,
+                max_bs=model_runner.server_args.max_running_requests,
                 page_size=self.page_size,
                 top_k=10,
                 retrive_budget_per_seq=1024,
@@ -1916,7 +1916,7 @@ class FlashAttentionBackend(AttentionBackend):
 
     def get_cuda_graph_seq_len_fill_value(self):
         """Get the fill value for sequence length in CUDA graph."""
-        return 4096
+        return 1
 
     def _init_local_attn_metadata(
         self, forwardbatch: ForwardBatch, metadata: FlashAttentionMetadata, device

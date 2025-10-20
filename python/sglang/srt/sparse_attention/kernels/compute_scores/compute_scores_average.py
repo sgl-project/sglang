@@ -2,18 +2,7 @@ import torch
 import triton
 import triton.language as tl
 
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_SIZE_P': 32}, num_warps=4, num_stages=3),
-        triton.Config({'BLOCK_SIZE_P': 32}, num_warps=2, num_stages=4), 
-        triton.Config({'BLOCK_SIZE_P': 64}, num_warps=4, num_stages=3),
-        triton.Config({'BLOCK_SIZE_P': 64}, num_warps=8, num_stages=4),
-        triton.Config({'BLOCK_SIZE_P': 128}, num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_SIZE_P': 128}, num_warps=8, num_stages=3),
-        triton.Config({'BLOCK_SIZE_P': 256}, num_warps=8, num_stages=2),
-    ],
-    key=['NUM_Q_HEADS', 'NUM_KV_HEADS', 'HEAD_DIM'],
-)
+
 @triton.jit
 def _compute_average_score_kernel(
     Q, K, Out, kv_pages_per_seq,kv_pages_num_per_seq,kv_pages_per_seq_max,
@@ -42,7 +31,8 @@ def _compute_average_score_kernel(
 
     max_page_index = tl.load(kv_pages_per_seq_max + bid)
     max_page_block = tl.cdiv(max_page_index, BLOCK_SIZE_P)
-    if pid_block >= max_page_block:
+    num_valid_pages = tl.load(kv_pages_num_per_seq + bid)
+    if pid_block >= num_valid_pages:
         page_offsets = pid_block * BLOCK_SIZE_P + tl.arange(0, BLOCK_SIZE_P)
         out_ptrs = (Out + bid * scores_stride_b + 
                     kv_hid * scores_stride_h + 
@@ -73,7 +63,7 @@ def _compute_average_score_kernel(
     scores_matrix = tl.dot(q_matrix, tl.trans(k_matrix), out_dtype=tl.float32, allow_tf32=False)
     final_scores = tl.sum(scores_matrix, axis=0)
     
-    num_valid_pages = tl.load(kv_pages_num_per_seq + bid)
+    
     token_base_ptr = kv_pages_per_seq + bid * MAX_NUM_TOKEN_PAGES
     token_page_offsets = tl.arange(0, PADDED_MAX_NUM_TOKEN_PAGES)
     valid_page_ids = tl.load(token_base_ptr + token_page_offsets, 
@@ -132,7 +122,7 @@ def compute_average_score(q: torch.Tensor,
     grid = lambda meta: (
         bs, 
         NUM_KV_HEADS, 
-        triton.cdiv(num_pages, meta['BLOCK_SIZE_P'])
+        triton.cdiv(num_pages, 32)
     )
     _compute_average_score_kernel[grid](
         q, k, out, kv_pages_per_seq, kv_pages_num_per_seq, kv_pages_per_seq_max,
@@ -153,4 +143,7 @@ def compute_average_score(q: torch.Tensor,
         PADDED_HEAD_DIM=PADDED_HEAD_DIM,
         MAX_NUM_TOKEN_PAGES=max_num_token_pages,
         PADDED_MAX_NUM_TOKEN_PAGES=padded_max_num_token_pages,
+        BLOCK_SIZE_P=32,
+        num_warps=2,
+        num_stages=4,
     )

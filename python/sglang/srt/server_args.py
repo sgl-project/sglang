@@ -296,7 +296,7 @@ class ServerArgs:
     enable_flashinfer_mxfp4_moe: bool = False
 
     # Sparse attention
-    is_sparse_attn: bool = True
+    is_sparse_attn: bool = False
     sparse_attn_algo: str = "lserver"
 
     def __post_init__(self):
