@@ -345,9 +345,9 @@ Additionally, if you want to locate the SGLang Python source code through the cu
 
 SGLang provides built-in layerwise NVTX annotations that can be combined with the CUDA Profiler for detailed per-layer profiling in Nsight Systems. This is particularly useful for identifying performance bottlenecks at the layer level.
 
-#### Using `--enable-layerwise-nvtx` with Nsight Systems and `/start_profile`
+#### Using `--enable-layerwise-nvtx-marker` with Nsight Systems and `/start_profile`
 
-The `--enable-layerwise-nvtx` flag automatically adds NVTX markers to every layer in your model. This is particularly powerful when combined with Nsight Systems profiling to see detailed per-layer performance.
+The `--enable-layerwise-nvtx-marker` flag automatically adds NVTX markers to every layer in your model. This is particularly powerful when combined with Nsight Systems profiling to see detailed per-layer performance.
 
 **Method 1: Using `/start_profile` with CUDA_PROFILER (for programmatic control)**
 
@@ -364,7 +364,7 @@ This method allows you to control exactly when profiling starts/stops via HTTP A
      -o layerwise_profile.qdrep \
      python -m sglang.launch_server \
        --model-path meta-llama/Llama-3.1-8B-Instruct \
-       --enable-layerwise-nvtx \
+       --enable-layerwise-nvtx-marker \
        --disable-cuda-graph
    ```
 
@@ -409,7 +409,7 @@ For simpler use cases where you don't need fine-grained control over profiling s
 # Note: --disable-cuda-graph ensures all NVTX markers are emitted
 python -m sglang.launch_server \
   --model-path meta-llama/Llama-3.1-8B-Instruct \
-  --enable-layerwise-nvtx \
+  --enable-layerwise-nvtx-marker \
   --disable-cuda-graph
 
 # Terminal 2: Profile the benchmarking client
