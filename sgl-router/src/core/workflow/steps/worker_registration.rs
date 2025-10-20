@@ -455,6 +455,30 @@ impl StepExecutor for CreateWorkerStep {
             }
         };
 
+        // Normalize URL: add protocol prefix only if missing
+        let normalized_url = if config.url.starts_with("http://")
+            || config.url.starts_with("https://")
+            || config.url.starts_with("grpc://")
+        {
+            // URL already has protocol, use as-is
+            config.url.clone()
+        } else {
+            // Bare IP:port format, add appropriate protocol based on detected mode
+            match connection_mode.as_ref() {
+                ConnectionMode::Http => format!("http://{}", config.url),
+                ConnectionMode::Grpc { .. } => format!("grpc://{}", config.url),
+            }
+        };
+
+        if normalized_url != config.url {
+            info!(
+                "Normalized worker URL: {} -> {} ({:?})",
+                config.url,
+                normalized_url,
+                connection_mode.as_ref()
+            );
+        }
+
         // Handle DP-aware vs non-DP-aware workers
         if config.dp_aware {
             // DP-aware path: Create multiple workers (one per rank)
@@ -470,7 +494,7 @@ impl StepExecutor for CreateWorkerStep {
             let mut workers = Vec::new();
             for rank in 0..dp_info.dp_size {
                 let mut builder =
-                    DPAwareWorkerBuilder::new(config.url.clone(), rank, dp_info.dp_size)
+                    DPAwareWorkerBuilder::new(normalized_url.clone(), rank, dp_info.dp_size)
                         .worker_type(worker_type.clone())
                         .connection_mode(connection_mode.as_ref().clone())
                         .circuit_breaker_config(circuit_breaker_config.clone())
@@ -504,7 +528,7 @@ impl StepExecutor for CreateWorkerStep {
             Ok(StepResult::Success)
         } else {
             // Non-DP-aware path: Create single worker
-            let mut builder = BasicWorkerBuilder::new(config.url.clone())
+            let mut builder = BasicWorkerBuilder::new(normalized_url.clone())
                 .worker_type(worker_type)
                 .connection_mode(connection_mode.as_ref().clone())
                 .circuit_breaker_config(circuit_breaker_config)
