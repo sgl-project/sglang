@@ -175,6 +175,15 @@ def is_blackwell():
 
 
 @lru_cache(maxsize=1)
+def is_sm120_supported(device=None) -> bool:
+    if not is_cuda_alike():
+        return False
+    return (torch.cuda.get_device_capability(device)[0] == 12) and (
+        torch.version.cuda >= "12.8"
+    )
+
+
+@lru_cache(maxsize=1)
 def is_sm100_supported(device=None) -> bool:
     if not is_cuda_alike():
         return False
@@ -2347,6 +2356,8 @@ def retry(
         try:
             return fn()
         except Exception as e:
+            traceback.print_exc()
+
             if try_index >= max_retry:
                 raise Exception(f"retry() exceed maximum number of retries.")
 
@@ -2360,7 +2371,6 @@ def retry(
             logger.warning(
                 f"retry() failed once ({try_index}th try, maximum {max_retry} retries). Will delay {delay:.2f}s and retry. Error: {e}"
             )
-            traceback.print_exc()
 
             time.sleep(delay)
 

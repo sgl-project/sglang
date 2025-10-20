@@ -623,7 +623,7 @@ class ModelRunner:
             server_args.disable_chunked_prefix_cache = True
 
         if not server_args.disable_chunked_prefix_cache:
-            logger.info("Chunked prefix cache is turned on.")
+            log_info_on_rank0(logger, "Chunked prefix cache is turned on.")
 
         if server_args.attention_backend == "aiter":
             if self.model_config.context_len > 8192:
@@ -980,6 +980,10 @@ class ModelRunner:
         self.server_args.model_path = model_path
         self.server_args.load_format = load_format
         self.load_config = load_config
+
+        # Recapture device graph after model weight update.
+        if not self.server_args.disable_cuda_graph and self.device == "cuda":
+            self.init_device_graphs()
 
         logger.info("Update weights end.")
         return True, "Succeeded to update model weights."
@@ -1567,6 +1571,8 @@ class ModelRunner:
                 self.kv_cache_dtype = torch.float8_e4m3fnuz
             else:
                 self.kv_cache_dtype = torch.float8_e4m3fn
+        elif self.server_args.kv_cache_dtype in ("bf16", "bfloat16"):
+            self.kv_cache_dtype = torch.bfloat16
         else:
             raise ValueError(
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
