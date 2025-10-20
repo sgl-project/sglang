@@ -221,14 +221,12 @@ If there is no shared storage accessible across nodes, automatic merging of trac
 curl -X POST <BASE_URL>/start_profile \
   -H "Content-Type: application/json" \
   -d '{
-    "output_dir": "/tmp/profiles",
+    "output_dir": "/tmp/profiles", # where to store profile traces
     "num_steps": 10,
     "activities": ["CPU", "GPU"],
-    "merge_profiles": true
+    "merge_profiles": true # optional argument to merge profile traces (default=False)
   }'
 ```
-
-Note: `merge_profiles` is optional and defaults to `false`. When enabled, profiles from all ranks (TP, DP, PP, EP) will be automatically merged into a single trace file.
 
 #### Command Line Usage
 
@@ -239,7 +237,7 @@ python -m sglang.profiler \
   --cpu \
   --gpu \
   --output-dir /tmp/profiles \
-  --merge-profiles
+  --merge-profiles # optional argument to merge profile traces (default=False)
 ```
 
 #### Output Files
