@@ -2345,7 +2345,7 @@ class Scheduler(
             # This is used to prevent the health check signal being blocked by long context prefill.
             # However, one minor issue is that this code path does not check the status of detokenizer manager.
             self.return_health_check_ct -= 1
-            self.send_to_tokenizer.send_pyobj(HealthCheckOutput())
+            self.send_to_tokenizer.send_output(HealthCheckOutput())
 
     def prepare_mlp_sync_batch(self, local_batch: ScheduleBatch):
         return self.prepare_mlp_sync_batch_raw(
