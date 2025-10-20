@@ -721,6 +721,7 @@ class Req:
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
         max_prefix_len = max(max_prefix_len, 0)
         token_ids = self.fill_ids[:max_prefix_len]
+
         if tree_cache is not None:
             (
                 self.prefix_indices,
