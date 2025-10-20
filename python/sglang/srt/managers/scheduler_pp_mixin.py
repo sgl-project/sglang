@@ -312,7 +312,7 @@ class SchedulerPPMixin:
                 if self.cur_batch:
                     server_is_idle = False
                     # pp_proxy_tensors = self._pp_recv_proxy_tensors()
-                # self._pp_commit_comm_work(send_proxy_work)
+                self._pp_commit_comm_work(send_proxy_work)
                 next_pp_outputs = None
                 next_batch_result = None
                 d2h_event = None
