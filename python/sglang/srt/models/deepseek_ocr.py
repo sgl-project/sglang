@@ -968,8 +968,12 @@ class NoTPAttention(torch.nn.Module):
         self.max_seq_len = cfg["seq_length"]
         self.use_flash_attention = cfg["use_flash_attn"]
 
-        self.qkv_proj = torch.nn.Linear(cfg["hidden_size"], cfg["hidden_size"] * 3, bias=True)
-        self.out_proj = torch.nn.Linear(cfg["hidden_size"], cfg["hidden_size"], bias=True)
+        self.qkv_proj = torch.nn.Linear(
+            cfg["hidden_size"], cfg["hidden_size"] * 3, bias=True
+        )
+        self.out_proj = torch.nn.Linear(
+            cfg["hidden_size"], cfg["hidden_size"], bias=True
+        )
 
         # self.core_attention = CoreAttention(cfg, AttnType.self_attn)
 
@@ -1949,10 +1953,20 @@ class DeepseekOCRForCausalLM(nn.Module):
                 continue
 
             if name.startswith("model."):
-                if "image_newline" in name or ".projector" in name or "vision_model" in name or "sam_model" in name or "view_seperator" in name:
+                if (
+                    "image_newline" in name
+                    or ".projector" in name
+                    or "vision_model" in name
+                    or "sam_model" in name
+                    or "view_seperator" in name
+                ):
                     name = name[6:]
                 elif not (
-                    ".projector" in name or "vision_model" in name or "sam_model" in name or "image_newline" in name):
+                    ".projector" in name
+                    or "vision_model" in name
+                    or "sam_model" in name
+                    or "image_newline" in name
+                ):
                     name = name.replace("model.", "model.model.")
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
