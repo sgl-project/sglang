@@ -55,8 +55,10 @@ python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8 --ep
   - `fa3`: `flash_attn_with_kvcache` kernel from `flash_attn` library. Can only run on Hopper GPUs.
   - `tilelang`: `tilelang` implementation that can run on GPU, HPU and NPU.
   - `alter`: Alter kernel on AMD HPUs. Can only be used as decode kernel.
-- **FP8/BF16 KV Cache**:
-
+- On the basis of performance benchmarks, the default configuration on H200 and B200 are set as follows :
+  - H200: `flashmla_sparse` prefill attention, `fa3` decode attention, `bf16` kv cache dtype.
+  - B200: `flashmla_kv` prefill attention, `flashmla_kv` decode attention, `fp8_e4m3` kv cache dtype.
+  - Currently we don't enable `prefill=flashmla_sparse` with `decode=flashmla_kv` due to latency caused by kv cache quantization operations. In the future we might shift to this setting after attention/quantization kernels are optimized.
 
 ### Multi-token Prediction
 SGLang implements Multi-Token Prediction (MTP) for DeepSeek V3.2 based on [EAGLE speculative decoding](https://docs.sglang.ai/advanced_features/speculative_decoding.html#EAGLE-Decoding). With this optimization, the decoding speed can be improved significantly on small batch sizes.
@@ -66,7 +68,7 @@ Example usage:
 python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8 --dp 8 --enable-dp-attention --speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4
 ```
 - The best configuration for `--speculative-num-steps`, `--speculative-eagle-topk` and `--speculative-num-draft-tokens` can be searched with [bench_speculative.py](https://github.com/sgl-project/sglang/blob/main/scripts/playground/bench_speculative.py) script for given batch size. The minimum configuration is `--speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2`, which can achieve speedup for larger batch sizes.
-- TODO: max-running-request set to 48
+- The default value of  `--max-running-requests` is set to `48` for MTP. For larger batch sizes, this value should be increased beyond the default value.
 
 
 ## Benchmarking Results
