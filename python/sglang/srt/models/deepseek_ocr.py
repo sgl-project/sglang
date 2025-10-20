@@ -200,6 +200,8 @@ class MlpProjector(nn.Module):
         self.input_dim = input_dim
         self.n_embed = n_embed
         self.depth = depth
+        self.token_pooling = False
+        self.conv_fusion_high_low_features = False
 
         super().__init__()
 
@@ -299,9 +301,9 @@ class MlpProjector(nn.Module):
         self.layers = modules
 
     def forward(self, x):
-        if self.get("token_pooling", False):
+        if self.token_pooling:
             batch_size, wxh, channels = x.shape
-            w = h = int(wxh ** 0.5)
+            w = h = int(wxh**0.5)
             x = x.view(batch_size, w, h, channels)
             x = x.permute(0, 3, 1, 2)
             # import ipdb; ipdb.set_trace()
@@ -318,7 +320,7 @@ class MlpProjector(nn.Module):
 
             x = self.token_pooling_layer(patches)
 
-        if self.get("conv_fusion_high_low_features", False):
+        if self.conv_fusion_high_low_features:
             x = self.fusion_layer(x[:, 0]) + x[:, 1]
 
         if self.projector_type == "low_high_hybrid_split_mlp_gelu":
@@ -329,7 +331,7 @@ class MlpProjector(nn.Module):
 
         if self.projector_type == "hybrid_split_feature_mlp_gelu":
             high_x = x[..., : self.input_dim[0]]
-            low_x = x[..., self.input_dim[0]:]
+            low_x = x[..., self.input_dim[0] :]
             high_x = self.high_up_proj(high_x)
             low_x = self.low_up_proj(low_x)
             x = torch.concat([high_x, low_x], dim=-1)
@@ -461,7 +463,7 @@ class Attention(nn.Module):
         super().__init__()
         self.num_heads = num_heads
         head_dim = dim // num_heads
-        self.scale = head_dim ** -0.5
+        self.scale = head_dim**-0.5
 
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.proj = nn.Linear(dim, dim)
@@ -1345,10 +1347,10 @@ class DeepseekOCRModel(DeepseekV2Model):
                         print("=====================")
 
                         _, hw, n_dim = global_features.shape
-                        h = w = int(hw ** 0.5)
+                        h = w = int(hw**0.5)
 
                         _2, hw2, n_dim2 = local_features.shape
-                        h2 = w2 = int(hw2 ** 0.5)
+                        h2 = w2 = int(hw2**0.5)
 
                         width_crop_num, height_crop_num = crop_shape[0], crop_shape[1]
 
@@ -1415,7 +1417,7 @@ class DeepseekOCRModel(DeepseekV2Model):
                         print("NO PATCHES")
                         print("=====================")
                         _, hw, n_dim = global_features.shape
-                        h = w = int(hw ** 0.5)
+                        h = w = int(hw**0.5)
 
                         global_features = global_features.view(h, w, n_dim)
 
@@ -1637,10 +1639,10 @@ class DeepseekOCRForCausalLM(nn.Module):
                         print("=====================")
 
                     _, hw, n_dim = global_features.shape
-                    h = w = int(hw ** 0.5)
+                    h = w = int(hw**0.5)
 
                     _2, hw2, n_dim2 = local_features.shape
-                    h2 = w2 = int(hw2 ** 0.5)
+                    h2 = w2 = int(hw2**0.5)
 
                     width_crop_num, height_crop_num = crop_shape[0], crop_shape[1]
 
@@ -1698,7 +1700,7 @@ class DeepseekOCRForCausalLM(nn.Module):
                         print("=====================")
 
                     _, hw, n_dim = global_features.shape
-                    h = w = int(hw ** 0.5)
+                    h = w = int(hw**0.5)
 
                     global_features = global_features.view(h, w, n_dim)
 
@@ -1725,7 +1727,8 @@ class DeepseekOCRForCausalLM(nn.Module):
         # image_input: [pixel_values, images_crop, images_spatial_crop]
 
         # pixel_values = mm_items[0].to(torch.bfloat16)
-        pixel_values = torch.cat([item.feature for item in mm_items], dim=0).type(
+        # TODO: should we use cat to avoid mem-copy?
+        pixel_values = torch.stack([item.feature for item in mm_items], dim=0).type(
             self.vision_model.dtype
         )
         # print(image_input[1][0].shape)
@@ -1741,14 +1744,18 @@ class DeepseekOCRForCausalLM(nn.Module):
             [item.images_spatial_crop for item in mm_items], dim=0
         ).type(self.vision_model.dtype)
 
+        assert images_spatial_crop.dim() == 3
         # images_crop = image_input[1]
         # images_spatial_crop = mm_items[2].to(dtype=torch.long)
 
         # local_start = time.time()
-        vision_features = self._pixel_values_to_embedding(
+        vision_feature_lists = self._pixel_values_to_embedding(
             pixel_values=pixel_values,
             images_crop=images_crop,
             images_spatial_crop=images_spatial_crop,
+        )
+        vision_features = torch.cat(vision_feature_lists, dim=0).type(
+            self.vision_model.dtype
         )
 
         # local_total_time = time.time() - local_start

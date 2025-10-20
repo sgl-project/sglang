@@ -178,6 +178,7 @@ class BaseMultimodalProcessor(ABC):
             "image_attention_mask": Modality.IMAGE,
             "image_emb_mask": Modality.IMAGE,
             "images_spatial_crop": Modality.IMAGE,
+            "images_crop": Modality.IMAGE,
             "tgt_size": Modality.IMAGE,
             "image_grid_hws": Modality.IMAGE,
             "aspect_ratio_ids": Modality.IMAGE,
@@ -249,6 +250,8 @@ class BaseMultimodalProcessor(ABC):
             return_tensors="pt",
             **kwargs,
         )
+
+        print(f"{result=}")
         if not self.server_args.keep_mm_feature_on_device:
             # move feature tensors to cpu
             for feature_name in self.FEATURE_NAMES:

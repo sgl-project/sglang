@@ -12,18 +12,13 @@ class DeepseekOCRProcessor(BaseMultimodalProcessor):
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
-        print(f"{type(_processor)=}")
-        print(f"{self._processor.image_token_id=}")
         self.mm_tokens = MultimodalSpecialTokens(
-            image_token="<image>",
-            image_token_id=self._processor.image_token_id
-
+            image_token="<image>", image_token_id=self._processor.image_token_id
         ).build(_processor)
 
     async def process_mm_data_async(
         self, image_data: List[Union[str, bytes]], input_text, *args, **kwargs
     ):
-        print(f"{input_text=}")
         base_output = self.load_mm_data(
             prompt=input_text,
             multimodal_tokens=self.mm_tokens,
@@ -33,8 +28,8 @@ class DeepseekOCRProcessor(BaseMultimodalProcessor):
         mm_items, input_ids, _ = self.process_and_combine_mm_data(
             base_output, self.mm_tokens
         )
-
         print(f"{mm_items=}")
+
         return {
             "input_ids": input_ids.tolist(),
             "mm_items": mm_items,

@@ -500,14 +500,14 @@ class DeepseekOCRProcessor(ProcessorMixin):
             )
 
             tokenized_image = (
-                                  [self.image_token_id] * num_queries_base + [self.image_token_id]
-                              ) * num_queries_base
+                [self.image_token_id] * num_queries_base + [self.image_token_id]
+            ) * num_queries_base
             tokenized_image += [self.image_token_id]
             if num_width_tiles > 1 or num_height_tiles > 1:
                 tokenized_image += (
-                                       [self.image_token_id] * (num_queries * num_width_tiles)
-                                       + [self.image_token_id]
-                                   ) * (num_queries * num_height_tiles)
+                    [self.image_token_id] * (num_queries * num_width_tiles)
+                    + [self.image_token_id]
+                ) * (num_queries * num_height_tiles)
             tokenized_str += tokenized_image
             images_seq_mask += [True] * len(tokenized_image)
             num_image_tokens.append(len(tokenized_image))
