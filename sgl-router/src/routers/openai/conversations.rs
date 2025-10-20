@@ -952,7 +952,7 @@ fn item_to_json(item: &crate::data_connector::conversation_items::ConversationIt
 // ============================================================================
 
 /// Persist conversation items (delegates to persist_items_with_storages)
-pub(super) async fn persist_conversation_items(
+pub async fn persist_conversation_items(
     conversation_storage: Arc<dyn ConversationStorage>,
     item_storage: Arc<dyn ConversationItemStorage>,
     response_storage: Arc<dyn ResponseStorage>,

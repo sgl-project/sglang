@@ -1,6 +1,7 @@
 // gRPC Router Implementation
 
 use std::sync::Arc;
+use std::collections::HashMap;
 
 use async_trait::async_trait;
 use axum::{
@@ -9,6 +10,8 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
+use tokio::sync::RwLock;
+use tokio::task::JoinHandle;
 use tracing::debug;
 
 use super::{context::SharedComponents, pipeline::RequestPipeline};
@@ -55,6 +58,8 @@ pub struct GrpcRouter {
     conversation_item_storage: SharedConversationItemStorage,
     // Optional MCP manager for tool execution (enabled via SGLANG_MCP_CONFIG env var)
     mcp_manager: Option<Arc<crate::mcp::McpClientManager>>,
+    // Background task handles for cancellation support
+    background_tasks: Arc<RwLock<HashMap<String, JoinHandle<()>>>>,
 }
 
 impl GrpcRouter {
@@ -140,6 +145,7 @@ impl GrpcRouter {
             conversation_storage,
             conversation_item_storage,
             mcp_manager,
+            background_tasks: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -260,15 +266,21 @@ impl RouterTrait for GrpcRouter {
         // Use pipeline for ALL requests (streaming and non-streaming)
         // Pipeline handles:
         // - Request validation (previous_response_id XOR conversation)
+        // - Loading response chain / conversation history from storage
         // - Conversion: ResponsesRequest → ChatCompletionRequest
         // - Execution through chat pipeline stages
         // - Conversion: ChatCompletionResponse → ResponsesResponse
+        // - Response persistence
         self.pipeline
             .execute_responses(
                 Arc::new(body.clone()),
                 headers.cloned(),
                 model_id.map(|s| s.to_string()),
                 self.shared_components.clone(),
+                self.response_storage.clone(),
+                self.conversation_storage.clone(),
+                self.conversation_item_storage.clone(),
+                self.background_tasks.clone(),
             )
             .await
     }
@@ -276,14 +288,182 @@ impl RouterTrait for GrpcRouter {
     async fn get_response(
         &self,
         _headers: Option<&HeaderMap>,
-        _response_id: &str,
+        response_id: &str,
         _params: &ResponsesGetParams,
     ) -> Response {
-        (StatusCode::NOT_IMPLEMENTED).into_response()
+        use crate::data_connector::ResponseId;
+        use serde_json::json;
+
+        // Convert response_id string to ResponseId
+        let resp_id = ResponseId::from(response_id);
+
+        // Retrieve response from storage
+        match self.response_storage.get_response(&resp_id).await {
+            Ok(Some(stored_response)) => {
+                // Return the stored response JSON directly
+                axum::Json(stored_response.raw_response).into_response()
+            }
+            Ok(None) => {
+                // Response not found
+                (
+                    StatusCode::NOT_FOUND,
+                    axum::Json(json!({
+                        "error": {
+                            "message": format!("Response with id '{}' not found", response_id),
+                            "type": "not_found_error",
+                            "code": "response_not_found"
+                        }
+                    })),
+                )
+                    .into_response()
+            }
+            Err(e) => {
+                // Storage error
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    axum::Json(json!({
+                        "error": {
+                            "message": format!("Failed to retrieve response: {}", e),
+                            "type": "internal_error"
+                        }
+                    })),
+                )
+                    .into_response()
+            }
+        }
     }
 
-    async fn cancel_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
-        (StatusCode::NOT_IMPLEMENTED).into_response()
+    async fn cancel_response(&self, _headers: Option<&HeaderMap>, response_id: &str) -> Response {
+        use crate::data_connector::ResponseId;
+        use serde_json::json;
+
+        // Convert response_id string to ResponseId
+        let resp_id = ResponseId::from(response_id);
+
+        // Retrieve response from storage to check if it exists and get current status
+        match self.response_storage.get_response(&resp_id).await {
+            Ok(Some(stored_response)) => {
+                // Check current status - only queued or in_progress responses can be cancelled
+                let current_status = stored_response
+                    .raw_response
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+
+                match current_status {
+                    "queued" | "in_progress" => {
+                        // Attempt to abort the background task
+                        let mut tasks = self.background_tasks.write().await;
+                        if let Some(handle) = tasks.remove(response_id) {
+                            // Abort the task immediately
+                            handle.abort();
+
+                            // Task was found and aborted
+                            (
+                                StatusCode::OK,
+                                axum::Json(json!({
+                                    "id": response_id,
+                                    "status": "cancelled",
+                                    "message": "Background task has been cancelled"
+                                })),
+                            )
+                                .into_response()
+                        } else {
+                            // Task handle not found (may have already completed)
+                            (
+                                StatusCode::OK,
+                                axum::Json(json!({
+                                    "id": response_id,
+                                    "status": "completed_or_not_found",
+                                    "message": "Task may have already completed before cancellation"
+                                })),
+                            )
+                                .into_response()
+                        }
+                    }
+                    "completed" => {
+                        // Already completed, can't cancel
+                        (
+                            StatusCode::BAD_REQUEST,
+                            axum::Json(json!({
+                                "error": {
+                                    "message": "Cannot cancel completed response",
+                                    "type": "invalid_request_error",
+                                    "code": "response_already_completed"
+                                }
+                            })),
+                        )
+                            .into_response()
+                    }
+                    "failed" => {
+                        // Already failed, can't cancel
+                        (
+                            StatusCode::BAD_REQUEST,
+                            axum::Json(json!({
+                                "error": {
+                                    "message": "Cannot cancel failed response",
+                                    "type": "invalid_request_error",
+                                    "code": "response_already_failed"
+                                }
+                            })),
+                        )
+                            .into_response()
+                    }
+                    "cancelled" => {
+                        // Already cancelled
+                        (
+                            StatusCode::OK,
+                            axum::Json(json!({
+                                "id": response_id,
+                                "status": "cancelled",
+                                "message": "Response was already cancelled"
+                            })),
+                        )
+                            .into_response()
+                    }
+                    _ => {
+                        // Unknown status
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            axum::Json(json!({
+                                "error": {
+                                    "message": format!("Unknown response status: {}", current_status),
+                                    "type": "internal_error"
+                                }
+                            })),
+                        )
+                            .into_response()
+                    }
+                }
+            }
+            Ok(None) => {
+                // Response not found
+                (
+                    StatusCode::NOT_FOUND,
+                    axum::Json(json!({
+                        "error": {
+                            "message": format!("Response with id '{}' not found", response_id),
+                            "type": "not_found_error",
+                            "code": "response_not_found"
+                        }
+                    })),
+                )
+                    .into_response()
+            }
+            Err(e) => {
+                // Storage error
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    axum::Json(json!({
+                        "error": {
+                            "message": format!("Failed to retrieve response: {}", e),
+                            "type": "internal_error"
+                        }
+                    })),
+                )
+                    .into_response()
+            }
+        }
     }
 
     async fn route_classify(

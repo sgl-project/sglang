@@ -7,7 +7,7 @@
 //! - Multi-turn tool execution loops
 //! - SSE (Server-Sent Events) streaming
 
-mod conversations;
+pub mod conversations;
 mod mcp;
 mod responses;
 mod router;
