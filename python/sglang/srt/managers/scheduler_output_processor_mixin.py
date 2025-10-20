@@ -888,7 +888,7 @@ class SchedulerOutputProcessorMixin:
             if self.model_config.is_multimodal_gen:
                 return
 
-            self.send_to_detokenizer.send_pyobj(
+            self.send_to_detokenizer.send_output(
                 BatchTokenIDOutput(
                     finished_reasons,
                     decoded_texts,
@@ -940,7 +940,7 @@ class SchedulerOutputProcessorMixin:
                 embeddings.append(req.embedding)
                 prompt_tokens.append(len(req.origin_input_ids))
                 cached_tokens.append(req.cached_tokens)
-        self.send_to_detokenizer.send_pyobj(
+        self.send_to_detokenizer.send_output(
             BatchEmbeddingOutput(
                 finished_reasons,
                 embeddings,

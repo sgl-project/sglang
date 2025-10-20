@@ -180,6 +180,9 @@ async def init_multi_tokenizer() -> ServerArgs:
         chat_template=server_args.chat_template,
         completion_template=server_args.completion_template,
     )
+    from sglang.srt.managers.tokenizer_communicator_mixin import _Communicator
+
+    _Communicator.http_worker_ipc = port_args.tokenizer_ipc_name
 
     tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
     set_global_state(
