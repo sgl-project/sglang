@@ -12,7 +12,7 @@ from sglang.srt.layers.attention.flashattention_backend import (
     merge_state_v2_wrapper,
     prepare_swa_spec_page_table_triton,
 )
-from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.managers.schedule_batch import get_global_server_args
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
 if TYPE_CHECKING:
@@ -552,7 +552,7 @@ class XPUAttentionBackend(AttentionBackend):
             ):
                 # Do multi-head attention with chunked prefix cache
                 if forward_batch.attn_attend_prefix_cache:
-                    assert not global_server_args_dict["disable_chunked_prefix_cache"]
+                    assert not get_global_server_args().disable_chunked_prefix_cache
                     # MHA for chunked prefix kv cache when running model with MLA
                     assert forward_batch.prefix_chunk_idx is not None
                     assert forward_batch.prefix_chunk_cu_seq_lens is not None
