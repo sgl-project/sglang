@@ -44,6 +44,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
     get_attention_tp_size,
     set_dp_buffer_len,
+    set_is_extend_in_batch,
 )
 from sglang.srt.utils import get_compiler_backend, is_npu, support_triton
 
@@ -688,6 +689,7 @@ class ForwardBatch:
 
         self.global_dp_buffer_len = buffer_len
         set_dp_buffer_len(buffer_len, num_tokens, global_num_tokens)
+        set_is_extend_in_batch(self.is_extend_in_batch)
 
         bs = self.batch_size
 
