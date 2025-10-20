@@ -424,4 +424,7 @@ if __name__ == "__main__":
     BenchArgs.add_cli_args(parser)
     args = parser.parse_args()
 
+    if args.sampling_seed is None:
+        args.sampling_seed = 42
+
     test_deterministic(args)

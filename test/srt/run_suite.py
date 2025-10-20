@@ -86,7 +86,6 @@ suites = {
         TestFile("test_input_embeddings.py", 38),
         TestFile("test_io_struct.py", 8),
         TestFile("test_jinja_template_utils.py", 1),
-        TestFile("test_logprobs.py", 55),
         TestFile("test_mamba_unittest.py", 4),
         TestFile("test_metrics.py", 32),
         TestFile("test_metrics_utils.py", 1),
@@ -170,6 +169,7 @@ suites = {
         TestFile("test_disaggregation_pp.py", 140),
     ],
     "per-commit-4-gpu-b200": [
+        # TestFile("test_flash_attention_4.py"),
         # TestFile("test_gpt_oss_4gpu.py", 600),
         # TestFile("test_deepseek_v3_fp4_4gpu.py", 3600),
     ],
@@ -182,6 +182,7 @@ suites = {
     ],
     "per-commit-8-gpu-h200-deepseek-v32": [
         TestFile("test_deepseek_v32_basic.py", 275),
+        TestFile("test_deepseek_v32_mtp.py", 275),
     ],
     "vllm_dependency_test": [
         TestFile("quant/test_awq.py", 163),

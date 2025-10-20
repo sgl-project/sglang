@@ -170,6 +170,7 @@ class DeepEPMoE(FusedMoE):
         forward_batch: ForwardBatch,
         forward_shared_experts=None,
         alt_stream=None,
+        disable_sbo=False,
     ):
         # We have to call SBO inside MoE to be compatible with hooks used in offloading
         return single_batch_overlap.execute_sbo(
@@ -181,6 +182,7 @@ class DeepEPMoE(FusedMoE):
             experts=self,
             forward_shared_experts=forward_shared_experts,
             alt_stream=alt_stream,
+            disable_sbo=disable_sbo,
         )
 
     def dispatch(
