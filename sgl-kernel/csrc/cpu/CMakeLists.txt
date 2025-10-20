@@ -24,6 +24,7 @@ include_directories(
     ${Python_INCLUDE_DIRS}
     ${CMAKE_CURRENT_SOURCE_DIR}/../../csrc
     ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
 # Platform-specific library directory
@@ -56,7 +57,7 @@ if(DEFINED ENV{CONDA_PREFIX})
     endif()
 endif()
 
-file(GLOB SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
+file(GLOB_RECURSE SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
 
 if(NOT DEFINED ENV{SGLANG_CPU_FP8_CVT_FTZ})
     set(ENV{SGLANG_CPU_FP8_CVT_FTZ} "1")
