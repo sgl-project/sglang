@@ -1071,6 +1071,16 @@ class ServerArgs:
             self.enable_mixed_chunk = False
             self.disable_radix_cache = True
 
+        if self.attention_backend == "fa4" or self.decode_attention_backend == "fa4":
+            raise ValueError(
+                "FA4 backend is only supported for prefill. Please use `--prefill-attention-backend fa4` instead."
+            )
+        if self.prefill_attention_backend == "fa4":
+            logger.warning(
+                f"FA4 backend only supports page size 128, changing page_size from {self.page_size} to 128."
+            )
+            self.page_size = 128
+
     def _handle_page_size(self):
         if self.page_size is None:
             self.page_size = 1
@@ -1201,6 +1211,9 @@ class ServerArgs:
                 )
             if self.max_running_requests is None:
                 self.max_running_requests = 48
+                logger.warning(
+                    "Max running requests is reset to 48 for speculative decoding."
+                )
 
             if self.speculative_algorithm == "EAGLE" and self.enable_beta_spec:
                 self.disable_overlap_schedule = False
@@ -1431,8 +1444,8 @@ class ServerArgs:
                     f"but you explicitly specified '{self.attention_backend}'."
                 )
 
-            # Currently, only FA3 supports radix cache. Support for other backends is in progress
-            if self.attention_backend != "fa3":
+            # Currently, only FA3 and Triton supports radix cache. Support for other backends is in progress
+            if self.attention_backend not in ["fa3", "triton"]:
                 self.disable_radix_cache = True
                 logger.warning(
                     f"Currently radix cache is not compatible with {self.attention_backend} attention backend for deterministic inference. It will be supported in the future."
