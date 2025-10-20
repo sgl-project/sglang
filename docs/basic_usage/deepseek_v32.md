@@ -49,14 +49,13 @@ python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8 --ep
 
 ### Configuration Tips
 - **DP Attention**: For DeepSeek V3.2 model, the kernels are customized for the use case of `dp_size=8`. So
-- **Choices of Attention Kernels**: The attention backend is automatically set to `nsa` attention backend for DeepSeek V3.2 model. In this backend, different kernels for sparse prefilling/decoding are implemented, which can be specified by `--nsa-prefill` and `--nsa-decode` arguments. The choices of nsa prefill/decode attention kernels include:
-  - `flashmla_prefill`:
-  - `flashmla_decode`:
-  - `fa3`:
-  - `tilelang`:
-  - `alter`: Alter kernel on AMD GPUs. Can only be used as decode kernel.
+- **Choices of Attention Kernels**: The attention backend is automatically set to `nsa` attention backend for DeepSeek V3.2 model. In this backend, different kernels for sparse prefilling/decoding are implemented, which can be specified by `--nsa-prefill` and `--nsa-decode` server arguments. The choices of nsa prefill/decode attention kernels include:
+  - `flashmla_prefill`: `flash_mla_sparse_fwd` kernel from `flash_mla` library. Can run on both Hopper and Blackwell GPUs.
+  - `flashmla_decode`: `flash_mla_with_kvcache` kernel from `flash_mla` library. Can run on both Hopper and Blackwell GPUs.
+  - `fa3`: `flash_attn_with_kvcache` kernel from `flash_attn` library. Can only run on Hopper GPUs.
+  - `tilelang`: `tilelang` implementation that can run on GPU, HPU and NPU.
+  - `alter`: Alter kernel on AMD HPUs. Can only be used as decode kernel.
 - **FP8/BF16 KV Cache**:
-- Maybe some environmental variables
 
 
 ### Multi-token Prediction
@@ -70,17 +69,26 @@ python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8 --dp
 - TODO: max-running-request set to 48
 
 
-
 ## Benchmarking Results
 
 ### Accuracy Test with `gsm8k`
-
+A simple accuracy benchmark can be tested with `gsm8k` dataset:
 ```bash
 python3 benchmark/gsm8k/bench_sglang.py --num-shots 8 --num-questions 1319 --parallel 1319
 ```
 
+The result is 0.956, which matches our expectation:
+```bash
+Accuracy: 0.956
+Invalid: 0.000
+Latency: 25.109 s
+Output throughput: 5226.235 token/s
+```
+
+
 ### Accuracy Test with `gpqa-diamond`
 
+Accuracy benchmark on long context can be tested on GPQA-diamond dataset with long output tokens and thinking enabled:
 ```bash
-python3 -m sglang.test.run_eval --port 30000 --eval-name gpqa --num-examples 198 --max-tokens 4096 --repeat 10 --thinking-mode deepseek-v3
+python3 -m sglang.test.run_eval --port 30000 --eval-name gpqa --num-examples 198 --max-tokens 120000 --repeat 8 --thinking-mode deepseek-v3
 ```
