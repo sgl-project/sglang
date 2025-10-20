@@ -33,13 +33,15 @@ class QuarkConfig(QuantizationConfig):
         kv_cache_config: Optional[dict[str, Any]] = None,
         pack_method: str = "reorder",
     ):
-        super().__init__(packed_modules_mapping=quant_config["packed_modules_mapping"])
+        super().__init__()
         if kv_cache_group is None:
             kv_cache_group = []
         self.quant_config = quant_config
         self.kv_cache_group = kv_cache_group
         self.kv_cache_config = kv_cache_config
         self.pack_method = pack_method
+
+        self.packed_modules_mapping = self.quant_config["packed_modules_mapping"]
 
     def get_linear_method(self) -> "QuarkLinearMethod":
         return QuarkLinearMethod(self)

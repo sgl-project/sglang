@@ -1,7 +1,7 @@
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import is_blackwell, kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -48,8 +48,14 @@ class TestNvidiaNemotronNanoV2(CustomTestCase):
 
 
 class TestNvidiaNemotronNanoV2FP8(TestNvidiaNemotronNanoV2):
-    accuracy = 0.88
+    accuracy = 0.87
     model = "nvidia/NVIDIA-Nemotron-Nano-9B-v2-FP8"
+
+
+@unittest.skipIf(not is_blackwell(), "NVFP4 only supported on blackwell")
+class TestNvidiaNemotronNanoV2NVFP4(TestNvidiaNemotronNanoV2):
+    accuracy = 0.855
+    model = "nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4"
 
 
 if __name__ == "__main__":

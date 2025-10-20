@@ -88,7 +88,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         config: Optional[Dict[str, Any]] = None,
         packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
     ):
-        super().__init__(packed_modules_mapping=packed_modules_mapping)
+        super().__init__()
         self.ignore = ignore
         self.quant_format = quant_format
         # Map from [target -> scheme]
@@ -97,6 +97,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         self.sparsity_scheme_map = sparsity_scheme_map
         self.sparsity_ignore_list = sparsity_ignore_list
         self.config = config
+        self.packed_modules_mapping = packed_modules_mapping or {}
 
     def get_linear_method(self) -> CompressedTensorsLinearMethod:
         return CompressedTensorsLinearMethod(self)
