@@ -26,8 +26,11 @@ from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.scheduler import GenerationBatchResult
+
 from sglang.srt.managers.utils import (
-    GenerationBatchResult,
     get_logprob_dict_from_result,
     get_logprob_from_pp_outputs,
 )
@@ -42,7 +45,6 @@ if TYPE_CHECKING:
 
 @dataclass
 class PPBatchMetadata:
-    bid: int
     can_run_cuda_graph: bool
 
 
@@ -52,10 +54,10 @@ class SchedulerPPMixin:
             p2p_work.work.wait()
         work.clear()
 
-    def send_pyobj_to_next_stage(self: Scheduler, data, async_send: bool = False):
+    def _pp_send_pyobj_to_next_stage(self: Scheduler, data, async_send: bool = False):
         p2p_work = []
         if self.attn_tp_rank == 0:
-            dp_offset = self.dp_rank * self.attn_tp_size
+            dp_offset = self.attn_dp_rank * self.attn_tp_size
             p2p_work = point_to_point_pyobj(
                 data,
                 self.pp_rank * self.tp_size + dp_offset,
@@ -107,10 +109,9 @@ class SchedulerPPMixin:
         async_send: bool = True,
     ):
         p2p_work = []
-
         p2p_work.extend(
             self.pp_group.send_tensor_dict(
-                tensor_dict,
+                tensor_dict=tensor_dict,
                 all_gather_group=self.attn_tp_group,
                 async_send=async_send,
             )
@@ -139,6 +140,8 @@ class SchedulerPPMixin:
         mb_metadata: PPBatchMetadata,
         pp_outputs: PPProxyTensors,
     ):
+        from sglang.srt.managers.scheduler import GenerationBatchResult
+
         logits_output = None
         extend_input_len_per_req = None
         extend_logprob_start_len_per_req = None
@@ -156,7 +159,6 @@ class SchedulerPPMixin:
             next_token_ids=pp_outputs["next_token_ids"],
             extend_input_len_per_req=extend_input_len_per_req,
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
-            bid=mb_metadata.bid,
             can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
         )
         return output_result
@@ -224,7 +226,7 @@ class SchedulerPPMixin:
             batch_result = self._pp_prep_batch_result(
                 mbs[next_mb_id], mb_metadata[next_mb_id], next_pp_outputs
             )
-            d2h_event = self.process_batch_result_d2h(mbs[next_mb_id], batch_result)
+            # d2h_event = self.process_batch_result_d2h(mbs[next_mb_id], batch_result)
 
         return next_pp_outputs, batch_result, d2h_event
 
@@ -236,9 +238,8 @@ class SchedulerPPMixin:
         last_rank_comm_queue: deque[Tuple[torch.cuda.Event, PPProxyTensors]],
     ):
         with torch.profiler.record_function("run_batch"):
-            result = self.run_batch(self.cur_batch, pp_proxy_tensors)
+            result = self.run_batch(self.cur_batch)
             mb_metadata[mb_id] = PPBatchMetadata(
-                bid=result.bid,
                 can_run_cuda_graph=result.can_run_cuda_graph,
             )
             event = torch.cuda.Event()
@@ -310,8 +311,8 @@ class SchedulerPPMixin:
                 self.cur_batch: Optional[ScheduleBatch] = mbs[mb_id]
                 if self.cur_batch:
                     server_is_idle = False
-                    pp_proxy_tensors = self._pp_recv_proxy_tensors()
-                self._pp_commit_comm_work(send_proxy_work)
+                    # pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                # self._pp_commit_comm_work(send_proxy_work)
                 next_pp_outputs = None
                 next_batch_result = None
                 d2h_event = None
@@ -328,6 +329,7 @@ class SchedulerPPMixin:
                     )
 
                 if self.cur_batch:
+                    pp_proxy_tensors = None
                     result, event = self._pp_launch_batch(
                         mb_id, pp_proxy_tensors, mb_metadata, last_rank_comm_queue
                     )
@@ -343,7 +345,7 @@ class SchedulerPPMixin:
                         )
                     )
                 if mbs[next_mb_id] is not None:
-                    d2h_event.synchronize()
+                    # d2h_event.synchronize()
                     with torch.profiler.record_function("process_batch_result"):
                         self._pp_process_batch_result(
                             mbs[next_mb_id],
@@ -352,7 +354,7 @@ class SchedulerPPMixin:
                     last_mbs[next_mb_id] = mbs[next_mb_id]
                 if not self.pp_group.is_last_rank:
                     with torch.profiler.record_function("send_reqs_to_next_stage"):
-                        send_req_work = self.send_pyobj_to_next_stage(
+                        send_req_work = self._pp_send_pyobj_to_next_stage(
                             recv_reqs,
                             async_send=True,
                         )
@@ -362,13 +364,13 @@ class SchedulerPPMixin:
                             "send_proxy_dict_to_next_stage"
                         ):
                             send_proxy_work = self._pp_send_dict_to_next_stage(
-                                result.pp_hidden_states_proxy_tensors,
+                                result.pp_hidden_states_proxy_tensors.tensors,
                                 async_send=True,
                             )
 
-                if self.delayed_weight_sync_fn:
-                    self.delayed_weight_sync_fn()
-                    self.delayed_weight_sync_fn = None
+                # if self.delayed_weight_sync_fn:
+                #     self.delayed_weight_sync_fn()
+                #     self.delayed_weight_sync_fn = None
 
                 pp_outputs = next_pp_outputs
 
@@ -409,7 +411,7 @@ class SchedulerPPMixin:
                 [KVPoll.Failed],
             )
         else:
-            # Other ranks, receive the bootstrap reqs info from the previous rank and ensure the concensus
+            # Other ranks, receive the bootstrap reqs info from the previous rank and ensure the consensus
             prev_bootstrapped_rids = self.recv_pyobj_from_prev_stage()
             prev_good_bootstrapped_rids, prev_bad_bootstrapped_rids = (
                 prev_bootstrapped_rids
@@ -444,7 +446,7 @@ class SchedulerPPMixin:
                 self.disagg_prefill_inflight_queue,
                 [KVPoll.Success, KVPoll.Failed],
             )
-            # 3. new concensus rids = intersection(previous concensus rids, transfer finished rids)
+            # 3. new consensus rids = intersection(previous consensus rids, transfer finished rids)
             transferred_rids = list(
                 set(prev_transferred_rids) & set(curr_transferred_rids)
             )
@@ -462,13 +464,13 @@ class SchedulerPPMixin:
         if self.pp_group.is_last_rank:
             if bmbs[next_first_rank_mb_id] is not None:
                 consensus_bootstrapped_rids = bootstrapped_rids
-                send_consensus_bootstrapped_work = self.send_pyobj_to_next_stage(
+                send_consensus_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
                     consensus_bootstrapped_rids, async_send=True
                 )
         # 4 (Release): send the release rids from non last rank to the next rank
         else:
             if consensus_bootstrapped_rids is not None:
-                send_consensus_bootstrapped_work = self.send_pyobj_to_next_stage(
+                send_consensus_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
                     consensus_bootstrapped_rids, async_send=True
                 )
         return send_consensus_bootstrapped_work, consensus_bootstrapped_rids
@@ -484,13 +486,13 @@ class SchedulerPPMixin:
         if self.pp_group.is_last_rank:
             if tmbs[next_first_rank_mb_id] is not None:
                 release_rids = transferred_rids
-                send_release_work = self.send_pyobj_to_next_stage(
+                send_release_work = self._pp_send_pyobj_to_next_stage(
                     release_rids, async_send=True
                 )
         # 4 (Release): send the release rids from non last rank to the next rank
         else:
             if release_rids is not None:
-                send_release_work = self.send_pyobj_to_next_stage(
+                send_release_work = self._pp_send_pyobj_to_next_stage(
                     release_rids, async_send=True
                 )
         return send_release_work, release_rids
@@ -530,7 +532,7 @@ class SchedulerPPMixin:
         There are two additional elements compared to the regular schedule:
 
         Bootstrap Requests + Release Requests:
-        - Both can have local failure and need to be consensus on. PP needs to gurantee eventual consistency of local failure and flush malfunc requests out as soft error.
+        - Both can have local failure and need to be consensus on. PP needs to guarantee eventual consistency of local failure and flush malfunc requests out as soft error.
 
         """
         self.pp_loop_size: int = self.pp_size + self.server_args.pp_async_batch_depth
@@ -544,7 +546,7 @@ class SchedulerPPMixin:
         pp_outputs: Optional[PPProxyTensors] = None
         last_rank_comm_queue: deque[Tuple[torch.cuda.Event, PPProxyTensors]] = deque()
 
-        # PD additionals
+        # PD additional
         consensus_bootstrapped_rids: Optional[List[str]] = None
         transferred_rids: List[str] = []
         release_rids: Optional[List[str]] = None
@@ -644,7 +646,7 @@ class SchedulerPPMixin:
                 self._pp_commit_comm_work(send_release_work)
                 # post-process the coming microbatch
                 if mbs[next_mb_id] is not None:
-                    d2h_event.synchronize()
+                    # d2h_event.synchronize()
                     self._pp_process_batch_result(
                         mbs[next_mb_id],
                         next_batch_result,
@@ -654,19 +656,19 @@ class SchedulerPPMixin:
                 if tmbs[next_mb_id] is not None:
                     self.process_disagg_prefill_inflight_queue(next_release_rids)
                 if not self.pp_group.is_last_rank:
-                    send_req_work = self.send_pyobj_to_next_stage(
+                    send_req_work = self._pp_send_pyobj_to_next_stage(
                         recv_reqs, async_send=True
                     )
-                    send_bootstrapped_work = self.send_pyobj_to_next_stage(
+                    send_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
                         bootstrapped_rids, async_send=True
                     )
-                    send_transfer_work = self.send_pyobj_to_next_stage(
+                    send_transfer_work = self._pp_send_pyobj_to_next_stage(
                         transferred_rids, async_send=True
                     )
                     if self.cur_batch:
                         torch.cuda.current_stream().wait_event(event)
                         send_proxy_work = self._pp_send_dict_to_next_stage(
-                            result.pp_hidden_states_proxy_tensors,
+                            result.pp_hidden_states_proxy_tensors.tensors,
                             async_send=True,
                         )
 
@@ -686,71 +688,3 @@ class SchedulerPPMixin:
                 self.check_tree_cache()
                 self.new_token_ratio = self.init_new_token_ratio
                 self.maybe_sleep_on_idle()
-
-
-
-# Keep this function for xai's PP implementation
-def point_to_point_pyobj(
-    data: List[Any],
-    rank: int,
-    group: Optional[torch.distributed.ProcessGroup] = None,
-    src: int = 0,
-    dst: int = 1,
-    async_send: bool = False,
-):
-    """Send data from src to dst in group."""
-    if async_send:
-        send_func = dist.isend
-    else:
-        send_func = dist.send
-    if rank == src:
-        p2p_works = []
-        if len(data) == 0:
-            tensor_size = torch.tensor(
-                [0],
-                dtype=torch.long,
-            )
-            work = send_func(tensor_size, dst, group=group)
-            if async_send:
-                p2p_works.append(P2PWork(work, tensor_size))
-        else:
-            serialized_data = pickle.dumps(data)
-            size = len(serialized_data)
-            tensor_data = torch.ByteTensor(
-                np.frombuffer(serialized_data, dtype=np.uint8)
-            )
-            tensor_size = torch.tensor([size], dtype=torch.long)
-
-            work = send_func(tensor_size, dst, group=group)
-            if async_send:
-                p2p_works.append(P2PWork(work, tensor_size))
-            work = send_func(tensor_data, dst, group=group)
-            if async_send:
-                p2p_works.append(P2PWork(work, tensor_data))
-        return p2p_works
-
-    elif rank == dst:
-        tensor_size = torch.tensor(
-            [0],
-            dtype=torch.long,
-        )
-        work = dist.irecv(tensor_size, src=src, group=group)
-        work.wait()
-        size = tensor_size.item()
-
-        if size == 0:
-            return []
-
-        tensor_data = torch.empty(
-            size,
-            dtype=torch.uint8,
-        )
-        work = dist.irecv(tensor_data, src=src, group=group)
-        work.wait()
-
-        serialized_data = bytes(tensor_data.cpu().numpy())
-        data = pickle.loads(serialized_data)
-        return data
-
-    # Other ranks in pp_group do nothing
-    return []
