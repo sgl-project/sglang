@@ -1324,7 +1324,9 @@ def parse_image_resolution(image_resolution: str) -> Tuple[int, int]:
     )
 
 
-def create_mm_data_row(text_prompt, images: list, images_base64, output_len, processor, backend):
+def create_mm_data_row(
+    text_prompt, images: list, images_base64, output_len, processor, backend
+):
     try:
         if type(processor).__name__ == "Phi4MMProcessor":
             # <|endoftext10|> is the image token used in the phi-4-multimodal model.
@@ -1374,10 +1376,16 @@ def create_mm_data_row(text_prompt, images: list, images_base64, output_len, pro
     # Vision tokens = total tokens - text tokens
     vision_prompt_len = prompt_len - text_prompt_len
 
-    wrap_prompt = backend in ["sglang-oai", "vllm", "lmdeploy", "sglang-oai-chat", "vllm-chat", "lmdeploy-chat"]
-
+    use_raw_prompt = backend in [
+        "sglang-oai",
+        "sglang-oai-chat",
+        "vllm",
+        "vllm-chat",
+        "lmdeploy",
+        "lmdeploy-chat"
+    ]
     return DatasetRow(
-        prompt=prompt_str if wrap_prompt else text_prompt,
+        prompt=text_prompt if use_raw_prompt else prompt_str,
         prompt_len=prompt_len,
         output_len=output_len,
         text_prompt_len=text_prompt_len,
