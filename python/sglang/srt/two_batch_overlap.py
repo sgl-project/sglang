@@ -1000,3 +1000,7 @@ class MaybeTboDeepEPDispatcher:
 
     def combine_b(self, **kwargs):
         return self._execute("combine_b", **kwargs)
+
+    def set_quant_config(self, quant_config: dict):
+        for inner in self._inners:
+            inner.set_quant_config(quant_config)
