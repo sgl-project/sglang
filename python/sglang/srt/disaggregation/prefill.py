@@ -20,7 +20,6 @@ Life cycle of a request in the prefill server
 from __future__ import annotations
 
 import logging
-import threading
 import time
 from collections import deque
 from http import HTTPStatus
@@ -54,7 +53,7 @@ from sglang.srt.mem_cache.memory_pool import (
     NSATokenToKVPool,
     SWAKVPool,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.utils import (
     DynamicGradMode,
     broadcast_pyobj,
@@ -431,24 +430,12 @@ class SchedulerDisaggregationPrefillMixin:
                 self.tree_cache.cache_unfinished_req(req)  # update the tree and lock
                 req.add_latency(RequestStage.PREFILL_FORWARD)
                 self.disagg_prefill_inflight_queue.append(req)
-                if (
-                    logits_output is not None
-                    and logits_output.hidden_states is not None
-                ):
-                    last_hidden_index = (
-                        hidden_state_offset + extend_input_len_per_req[i] - 1
-                    )
+                if self.spec_algorithm.is_eagle() and batch.spec_info is not None:
                     req.output_topk_p = batch.spec_info.topk_p[i]
                     req.output_topk_index = batch.spec_info.topk_index[i]
-                    if self.spec_algorithm.is_eagle3():
-                        req.hidden_states_tensor = (
-                            batch.spec_info.hidden_states[i].cpu().clone()
-                        )
-                    else:
-                        req.hidden_states_tensor = (
-                            logits_output.hidden_states[last_hidden_index].cpu().clone()
-                        )
-                    hidden_state_offset += extend_input_len_per_req[i]
+                    req.hidden_states_tensor = (
+                        batch.spec_info.hidden_states[i].cpu().clone()
+                    )
                 else:
                     req.hidden_states_tensor = None
                 if req.return_logprob:
