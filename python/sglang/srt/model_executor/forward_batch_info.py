@@ -405,6 +405,8 @@ class ForwardBatch:
             if ret.positions is None:
                 ret.positions = clamp_position(batch.seq_lens)
         else:
+            assert isinstance(batch.extend_seq_lens, list)
+            assert isinstance(batch.extend_prefix_lens, list)
             ret.extend_seq_lens = torch.tensor(
                 batch.extend_seq_lens, dtype=torch.int32
             ).to(device, non_blocking=True)
@@ -735,9 +737,8 @@ class ForwardBatch:
             self.encoder_lens = self._pad_tensor_to_size(self.encoder_lens, bs)
         self.positions = self._pad_tensor_to_size(self.positions, num_tokens)
         self.global_num_tokens_cpu = global_num_tokens
-        self.global_num_tokens_gpu = self.global_num_tokens_gpu.new_tensor(
-            global_num_tokens
-        )
+        global_num_tokens_pinned = torch.tensor(global_num_tokens, pin_memory=True)
+        self.global_num_tokens_gpu.copy_(global_num_tokens_pinned, non_blocking=True)
 
         if self.mrope_positions is not None:
             self.mrope_positions = self._pad_tensor_to_size(self.mrope_positions, bs)

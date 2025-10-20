@@ -1,17 +1,10 @@
 //! OpenAI router - main coordinator that delegates to specialized modules
 
-use crate::config::CircuitBreakerConfig;
-use crate::core::{CircuitBreaker, CircuitBreakerConfig as CoreCircuitBreakerConfig};
-use crate::data_connector::{
-    conversation_items::ListParams, conversation_items::SortOrder, ConversationId, ResponseId,
-    SharedConversationItemStorage, SharedConversationStorage, SharedResponseStorage,
+use std::{
+    any::Any,
+    sync::{atomic::AtomicBool, Arc},
 };
-use crate::protocols::spec::{
-    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest,
-    ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponsesGetParams,
-    ResponsesRequest,
-};
-use crate::routers::header_utils::apply_request_headers;
+
 use axum::{
     body::Body,
     extract::Request,
@@ -21,13 +14,9 @@ use axum::{
 };
 use futures_util::StreamExt;
 use serde_json::{json, to_value, Value};
-use std::{
-    any::Any,
-    sync::{atomic::AtomicBool, Arc},
-};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tracing::{info, warn};
+use tracing::warn;
 
 // Import from sibling modules
 use super::conversations::{
@@ -35,12 +24,36 @@ use super::conversations::{
     get_conversation, get_conversation_item, list_conversation_items, persist_conversation_items,
     update_conversation,
 };
-use super::mcp::{
-    execute_tool_loop, mcp_manager_from_request_tools, prepare_mcp_payload_for_streaming,
-    McpLoopConfig,
+use super::{
+    mcp::{
+        execute_tool_loop, mcp_manager_from_request_tools, prepare_mcp_payload_for_streaming,
+        McpLoopConfig,
+    },
+    responses::{mask_tools_as_mcp, patch_streaming_response_json},
+    streaming::handle_streaming_response,
 };
-use super::responses::{mask_tools_as_mcp, patch_streaming_response_json};
-use super::streaming::handle_streaming_response;
+use crate::{
+    config::CircuitBreakerConfig,
+    core::{CircuitBreaker, CircuitBreakerConfig as CoreCircuitBreakerConfig},
+    data_connector::{
+        conversation_items::{ListParams, SortOrder},
+        ConversationId, ResponseId, SharedConversationItemStorage, SharedConversationStorage,
+        SharedResponseStorage,
+    },
+    protocols::{
+        chat::ChatCompletionRequest,
+        classify::ClassifyRequest,
+        completion::CompletionRequest,
+        embedding::EmbeddingRequest,
+        generate::GenerateRequest,
+        rerank::RerankRequest,
+        responses::{
+            ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponsesGetParams,
+            ResponsesRequest,
+        },
+    },
+    routers::header_utils::apply_request_headers,
+};
 
 // ============================================================================
 // OpenAIRouter Struct
@@ -197,6 +210,11 @@ impl OpenAIRouter {
                 Ok(r) => r,
                 Err(e) => {
                     self.circuit_breaker.record_failure();
+                    tracing::error!(
+                        url = %url,
+                        error = %e,
+                        "Failed to forward request to OpenAI"
+                    );
                     return (
                         StatusCode::BAD_GATEWAY,
                         format!("Failed to forward request to OpenAI: {}", e),
@@ -518,12 +536,6 @@ impl crate::routers::RouterTrait for OpenAIRouter {
     ) -> Response {
         let url = format!("{}/v1/responses", self.base_url);
 
-        info!(
-            requested_store = body.store,
-            is_streaming = body.stream,
-            "openai_responses_request"
-        );
-
         // Validate mutually exclusive params: previous_response_id and conversation
         // TODO: this validation logic should move the right place, also we need a proper error message module
         if body.previous_response_id.is_some() && body.conversation.is_some() {
@@ -817,7 +829,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                 .into_response(),
             Err(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("Failed to get response: {}", e)})),
+                Json(json!({ "error": format!("Failed to get response: {}", e) })),
             )
                 .into_response(),
         }
@@ -869,6 +881,15 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         _model_id: Option<&str>,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED, "Rerank not supported").into_response()
+    }
+
+    async fn route_classify(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _body: &ClassifyRequest,
+        _model_id: Option<&str>,
+    ) -> Response {
+        (StatusCode::NOT_IMPLEMENTED, "Classify not supported").into_response()
     }
 
     async fn create_conversation(&self, _headers: Option<&HeaderMap>, body: &Value) -> Response {

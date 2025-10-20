@@ -427,19 +427,18 @@ class SWARadixCache(BasePrefixCache):
 
         return self._insert_helper(self.root_node, key, value, prev_prefix_len)
 
-    def cache_finished_req(self, req: Req) -> None:
+    def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:
         """Cache request when it finishes."""
+        all_token_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx,
-                : len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0),
+                req.req_pool_idx, :all_token_len
             ]
             self.token_to_kv_pool_allocator.free(kv_indices)
             self.req_to_token_pool.free(req.req_pool_idx)
             return
 
-        token_ids = (req.origin_input_ids + req.output_ids)[:-1]
-        all_token_len = len(token_ids)
+        token_ids = (req.origin_input_ids + req.output_ids)[:all_token_len]
         # For EAGLE radix cache, we will convert the key to bigram key, e.g. [1,2,3,4] -> [(1,2), (2,3), (3,4)], the length will -1. ((len([(1,2), (2,3), (3,4)]) = len([1,2,3,4]) - 1))
         # So for the corresponding kv length should also -1. Then we get the actual_kv_len, and use it to do later calculation and slicing.
         actual_kv_len = all_token_len - 1 if self.is_eagle else all_token_len
@@ -452,7 +451,6 @@ class SWARadixCache(BasePrefixCache):
             page_aligned_kv_indices = kv_indices[:page_aligned_len].to(
                 dtype=torch.int64, copy=True
             )
-            self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
         else:
             page_aligned_len = actual_kv_len
             page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
@@ -472,11 +470,19 @@ class SWARadixCache(BasePrefixCache):
         # Radix Cache takes one ref in memory pool
         # insert the token_ids and kv_indices into the radix tree
         # Note: the insert function already frees the overlapped kv_indices
-        new_prefix_len = self.insert(
-            RadixKey(token_ids[:page_aligned_token_len], req.extra_key),
-            page_aligned_kv_indices,
-            old_prefix_len,
-        )
+        if is_insert:
+            new_prefix_len = self.insert(
+                RadixKey(token_ids[:page_aligned_token_len], req.extra_key),
+                page_aligned_kv_indices,
+                old_prefix_len,
+            )
+        else:
+            self.token_to_kv_pool_allocator.free(
+                kv_indices[old_prefix_len:page_aligned_len]
+            )
+
+        # free the unaligned tail
+        self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
 
         # Remove req slot release the cache lock
         self.req_to_token_pool.free(req.req_pool_idx)

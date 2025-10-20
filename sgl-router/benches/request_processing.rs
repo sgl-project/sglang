@@ -1,13 +1,18 @@
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use serde_json::{from_str, to_string, to_value, to_vec};
 use std::time::Instant;
 
-use sglang_router_rs::core::{BasicWorker, BasicWorkerBuilder, Worker, WorkerType};
-use sglang_router_rs::protocols::spec::{
-    ChatCompletionRequest, ChatMessage, CompletionRequest, GenerateRequest, SamplingParams,
-    StringOrArray, UserMessageContent,
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use serde_json::{from_str, to_string, to_value, to_vec};
+use sglang_router_rs::{
+    core::{BasicWorker, BasicWorkerBuilder, Worker, WorkerType},
+    protocols::{
+        chat::{ChatCompletionRequest, ChatMessage, UserMessageContent},
+        common::StringOrArray,
+        completion::CompletionRequest,
+        generate::GenerateRequest,
+        sampling_params::SamplingParams,
+    },
+    routers::http::pd_types::{generate_room_id, RequestWithBootstrap},
 };
-use sglang_router_rs::routers::http::pd_types::{generate_room_id, RequestWithBootstrap};
 
 fn create_test_worker() -> BasicWorker {
     BasicWorkerBuilder::new("http://test-server:8000")
@@ -28,15 +33,38 @@ fn get_bootstrap_info(worker: &BasicWorker) -> (String, Option<u16>) {
 fn default_generate_request() -> GenerateRequest {
     GenerateRequest {
         text: None,
-        prompt: None,
         input_ids: None,
-        stream: false,
+        input_embeds: None,
+        image_data: None,
+        video_data: None,
+        audio_data: None,
         sampling_params: None,
-        return_logprob: false,
-        // SGLang Extensions
-        lora_path: None,
-        session_params: None,
+        return_logprob: None,
+        logprob_start_len: None,
+        top_logprobs_num: None,
+        token_ids_logprob: None,
+        return_text_in_logprobs: false,
+        stream: false,
+        log_metrics: true,
         return_hidden_states: false,
+        modalities: None,
+        session_params: None,
+        lora_path: None,
+        lora_id: None,
+        custom_logit_processor: None,
+        bootstrap_host: None,
+        bootstrap_port: None,
+        bootstrap_room: None,
+        bootstrap_pair_key: None,
+        data_parallel_rank: None,
+        background: false,
+        conversation_id: None,
+        priority: None,
+        extra_key: None,
+        no_logs: false,
+        custom_labels: None,
+        return_bytes: false,
+        return_entropy: false,
         rid: None,
     }
 }
@@ -101,6 +129,7 @@ fn create_sample_generate_request() -> GenerateRequest {
     GenerateRequest {
         text: Some("Write a story about artificial intelligence".to_string()),
         sampling_params: Some(SamplingParams {
+            max_new_tokens: Some(100),
             temperature: Some(0.8),
             top_p: Some(0.9),
             top_k: Some(50),
