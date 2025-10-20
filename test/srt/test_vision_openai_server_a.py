@@ -150,6 +150,10 @@ class TestQwen2AudioServer(AudioOpenAITestMixin):
     model = "Qwen/Qwen2-Audio-7B-Instruct"
 
 
+class TestDeepseekServer(ImageOpenAITestMixin):
+    model = "deepseek-ai/DeepSeek-OCR"
+
+
 if __name__ == "__main__":
     del (
         TestOpenAIMLLMServerBase,

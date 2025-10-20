@@ -31,7 +31,7 @@ AUDIO_BIRD_SONG_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-fi
 class TestOpenAIMLLMServerBase(CustomTestCase):
     model: str
     extra_args: list = []
-    fixed_args: list = ["--trust-remote-code", "--enable-multimodal"]
+    fixed_args: list = ["--enable-multimodal"]
 
     @classmethod
     def setUpClass(cls):
