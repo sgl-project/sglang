@@ -11,7 +11,7 @@ from transformers import (
     ProcessorMixin,
 )
 
-from sglang.srt.configs.utils import register_processor
+from sglang.srt.configs.utils import register_image_processor, register_processor
 
 BASE_SIZE = 1024
 IMAGE_SIZE = 640
@@ -775,7 +775,8 @@ class DeepseekV2Config(PretrainedConfig):
 
 
 class DeepseekVLV2Config(PretrainedConfig):
-    model_type = "deepseek_vl_v2"
+    # model_type = "deepseek_vl_v2"
+    model_type = "deepseek-ocr"
     vision_config: VisionEncoderConfig
     projector_config: MlpProjectorConfig
 
@@ -813,4 +814,4 @@ class DeepseekOCRConfig(DeepseekV2Config):
 
 
 register_processor(DeepseekVLV2Config, DeepseekOCRProcessor)
-# register_image_processor(DeepseekVLV2Config, ImageP)
+register_image_processor(DeepseekVLV2Config, DeepseekOCRProcessor)
