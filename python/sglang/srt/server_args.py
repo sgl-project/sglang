@@ -322,7 +322,7 @@ class ServerArgs:
     grammar_backend: Optional[str] = None
     mm_attention_backend: Optional[str] = None
     nsa_prefill_backend: str = "flashmla_sparse"
-    nsa_decode_backend: str = "flashmla_kv"
+    nsa_decode_backend: str = "fa3"
 
     # Speculative decoding
     enable_beta_spec: bool = False
