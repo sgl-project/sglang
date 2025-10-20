@@ -2,6 +2,7 @@ from typing import Optional
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.utils import DynamicGradMode, point_to_point_pyobj
 
