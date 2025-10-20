@@ -19,6 +19,7 @@ class DeepseekOCRProcessor(BaseMultimodalProcessor):
     async def process_mm_data_async(
         self, image_data: List[Union[str, bytes]], input_text, *args, **kwargs
     ):
+        print(f"{input_text=}")
         base_output = self.load_mm_data(
             prompt=input_text,
             multimodal_tokens=self.mm_tokens,
