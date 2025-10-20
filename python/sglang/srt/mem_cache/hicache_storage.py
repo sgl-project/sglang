@@ -31,6 +31,9 @@ class HiCacheStorageConfig:
     is_mla_model: bool
     is_page_first_layout: bool
     model_name: Optional[str]
+    prefill_tp_size: Optional[int] = None
+    decode_tp_size: Optional[int] = None
+    is_decode_side: bool = False
     extra_config: Optional[dict] = None
 
 
