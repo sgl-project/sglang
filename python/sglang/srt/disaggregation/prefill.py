@@ -53,13 +53,7 @@ from sglang.srt.mem_cache.memory_pool import (
     NSATokenToKVPool,
     SWAKVPool,
 )
-from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
-from sglang.srt.utils import (
-    DynamicGradMode,
-    broadcast_pyobj,
-    point_to_point_pyobj,
-    require_mlp_sync,
-)
+from sglang.srt.utils import broadcast_pyobj, point_to_point_pyobj, require_mlp_sync
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
