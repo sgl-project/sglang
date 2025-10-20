@@ -3,7 +3,6 @@ Mixin class providing multiplexing scheduling logic
 """
 
 import logging
-import time
 
 import torch
 import torch.distributed as dist
