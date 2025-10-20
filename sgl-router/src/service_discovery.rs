@@ -393,7 +393,7 @@ async fn handle_pod_event(
                     .health_check
                     .check_interval_secs,
                 health_success_threshold: app_context.router_config.health_check.success_threshold,
-                health_failure_threshold: app_context.router_config.health_check.success_threshold,
+                health_failure_threshold: app_context.router_config.health_check.failure_threshold,
                 max_connection_attempts: app_context.router_config.health_check.success_threshold
                     * 20,
                 dp_aware: false,
