@@ -773,6 +773,9 @@ class Glm4MoeModel(nn.Module):
         else:
             self.norm = PPMissingLayer(return_tuple=True)
 
+    def get_input_embeddings(self) -> torch.Tensor:
+        return self.embed_tokens
+
     def forward(
         self,
         input_ids: torch.Tensor,
