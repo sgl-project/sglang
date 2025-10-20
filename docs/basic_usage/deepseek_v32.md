@@ -34,12 +34,6 @@ git clone https://github.com/deepseek-ai/FlashMLA.git flash-mla
 cd flash-mla
 git submodule update --init --recursive
 pip install -v .
-
-# Install fast_hadamard_transform
-# To be removed after integration into sgl-kernel
-git clone https://github.com/Dao-AILab/fast-hadamard-transform.git
-cd fast-hadamard-transform
-pip install .
 ```
 ## Launch DeepSeek V3.2 with SGLang
 
