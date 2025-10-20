@@ -152,14 +152,6 @@ RUN if [ "$TARGETARCH" = "amd64" ]; then \
       pip install -v . ; \
     fi
 
-# Install fast-hadamard-transform
-RUN if [ "$TARGETARCH" = "amd64" ]; then \
-      git clone https://github.com/Dao-AILab/fast-hadamard-transform && \
-      cd fast-hadamard-transform && \
-      git checkout ${FAST_HADAMARD_TRANSFORM_COMMIT} && \
-      pip install . ; \
-    fi
-
 # Python tools
 RUN python3 -m pip install --no-cache-dir \
     datamodel_code_generator \
