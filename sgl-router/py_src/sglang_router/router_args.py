@@ -1,6 +1,7 @@
 import argparse
 import dataclasses
 import logging
+import os
 from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -86,8 +87,25 @@ class RouterArgs:
     model_path: Optional[str] = None
     tokenizer_path: Optional[str] = None
     chat_template: Optional[str] = None
+    # Tokenizer cache configuration
+    tokenizer_cache_enable_l0: bool = False
+    tokenizer_cache_l0_max_entries: int = 10000
+    tokenizer_cache_enable_l1: bool = False
+    tokenizer_cache_l1_max_memory: int = 50 * 1024 * 1024  # 50MB
     reasoning_parser: Optional[str] = None
     tool_call_parser: Optional[str] = None
+    # Backend selection
+    backend: str = "sglang"
+    # History backend configuration
+    history_backend: str = "memory"
+    oracle_wallet_path: Optional[str] = None
+    oracle_tns_alias: Optional[str] = None
+    oracle_connect_descriptor: Optional[str] = None
+    oracle_username: Optional[str] = None
+    oracle_password: Optional[str] = None
+    oracle_pool_min: int = 1
+    oracle_pool_max: int = 16
+    oracle_pool_timeout_secs: int = 30
 
     @staticmethod
     def add_cli_args(
@@ -455,6 +473,30 @@ class RouterArgs:
             help="Chat template path (optional)",
         )
         parser.add_argument(
+            f"--{prefix}tokenizer-cache-enable-l0",
+            action="store_true",
+            default=RouterArgs.tokenizer_cache_enable_l0,
+            help="Enable L0 (whole-string exact match) tokenizer cache (default: False)",
+        )
+        parser.add_argument(
+            f"--{prefix}tokenizer-cache-l0-max-entries",
+            type=int,
+            default=RouterArgs.tokenizer_cache_l0_max_entries,
+            help="Maximum number of entries in L0 tokenizer cache (default: 10000)",
+        )
+        parser.add_argument(
+            f"--{prefix}tokenizer-cache-enable-l1",
+            action="store_true",
+            default=RouterArgs.tokenizer_cache_enable_l1,
+            help="Enable L1 (prefix matching) tokenizer cache (default: False)",
+        )
+        parser.add_argument(
+            f"--{prefix}tokenizer-cache-l1-max-memory",
+            type=int,
+            default=RouterArgs.tokenizer_cache_l1_max_memory,
+            help="Maximum memory for L1 tokenizer cache in bytes (default: 50MB)",
+        )
+        parser.add_argument(
             f"--{prefix}reasoning-parser",
             type=str,
             default=None,
@@ -465,6 +507,73 @@ class RouterArgs:
             type=str,
             default=None,
             help="Specify the parser for handling tool-call interactions",
+        )
+        # Backend selection
+        parser.add_argument(
+            f"--{prefix}backend",
+            type=str,
+            default=RouterArgs.backend,
+            choices=["sglang", "openai"],
+            help="Backend runtime to use (default: sglang)",
+        )
+        # History backend configuration
+        parser.add_argument(
+            f"--{prefix}history-backend",
+            type=str,
+            default=RouterArgs.history_backend,
+            choices=["memory", "none", "oracle"],
+            help="History storage backend for conversations and responses (default: memory)",
+        )
+        # Oracle configuration
+        parser.add_argument(
+            f"--{prefix}oracle-wallet-path",
+            type=str,
+            default=os.getenv("ATP_WALLET_PATH"),
+            help="Path to Oracle ATP wallet directory (env: ATP_WALLET_PATH)",
+        )
+        parser.add_argument(
+            f"--{prefix}oracle-tns-alias",
+            type=str,
+            default=os.getenv("ATP_TNS_ALIAS"),
+            help="Oracle TNS alias from tnsnames.ora (env: ATP_TNS_ALIAS).",
+        )
+        parser.add_argument(
+            f"--{prefix}oracle-connect-descriptor",
+            type=str,
+            default=os.getenv("ATP_DSN"),
+            help="Oracle connection descriptor/DSN (full connection string) (env: ATP_DSN)",
+        )
+        parser.add_argument(
+            f"--{prefix}oracle-username",
+            type=str,
+            default=os.getenv("ATP_USER"),
+            help="Oracle database username (env: ATP_USER)",
+        )
+        parser.add_argument(
+            f"--{prefix}oracle-password",
+            type=str,
+            default=os.getenv("ATP_PASSWORD"),
+            help="Oracle database password (env: ATP_PASSWORD)",
+        )
+        parser.add_argument(
+            f"--{prefix}oracle-pool-min",
+            type=int,
+            default=int(os.getenv("ATP_POOL_MIN", RouterArgs.oracle_pool_min)),
+            help="Minimum Oracle connection pool size (default: 1, env: ATP_POOL_MIN)",
+        )
+        parser.add_argument(
+            f"--{prefix}oracle-pool-max",
+            type=int,
+            default=int(os.getenv("ATP_POOL_MAX", RouterArgs.oracle_pool_max)),
+            help="Maximum Oracle connection pool size (default: 16, env: ATP_POOL_MAX)",
+        )
+        parser.add_argument(
+            f"--{prefix}oracle-pool-timeout-secs",
+            type=int,
+            default=int(
+                os.getenv("ATP_POOL_TIMEOUT_SECS", RouterArgs.oracle_pool_timeout_secs)
+            ),
+            help="Oracle connection pool timeout in seconds (default: 30, env: ATP_POOL_TIMEOUT_SECS)",
         )
 
     @classmethod

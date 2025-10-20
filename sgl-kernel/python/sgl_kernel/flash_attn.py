@@ -6,7 +6,9 @@ import torch
 try:
     from sgl_kernel import flash_ops
 except:
-    raise ImportError("Can not import sgl_kernel. Please check your installation.")
+    raise ImportError(
+        "Can not import FA3 in sgl_kernel. Please check your installation."
+    )
 
 try:
     from ._fa4_interface import flash_attn_varlen_func as flash_attn_varlen_func_v4
@@ -265,10 +267,11 @@ def flash_attn_varlen_func(
     v,
     cu_seqlens_q,
     cu_seqlens_k,
-    max_seqlen_q,
-    max_seqlen_k,
+    max_seqlen_q=None,
+    max_seqlen_k=None,
     seqused_q=None,
     seqused_k=None,
+    page_table=None,
     softmax_scale=None,
     causal=False,
     qv=None,
@@ -276,7 +279,7 @@ def flash_attn_varlen_func(
     k_descale=None,
     v_descale=None,
     window_size=(-1, -1),
-    attention_chunk: Optional[int] = None,
+    attention_chunk=0,
     softcap=0.0,
     num_splits=1,
     pack_gqa=None,
@@ -296,31 +299,28 @@ def flash_attn_varlen_func(
             q,
             k,
             v,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            # max_seqlen_q,
-            # max_seqlen_k,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
             seqused_q=seqused_q,
             seqused_k=seqused_k,
+            page_table=page_table,
             softmax_scale=softmax_scale,
             causal=causal,
-            # qv=qv,
-            # q_descale=q_descale,
-            # k_descale=k_descale,
-            # v_descale=v_descale,
             window_size=window_size,
             softcap=softcap,
-            # num_splits=num_splits,
             pack_gqa=pack_gqa,
-            # sm_margin=sm_margin,
-            return_softmax_lse=return_softmax_lse,
             learnable_sink=sinks,
+            return_softmax_lse=return_softmax_lse,
         )
 
     if not is_fa3_supported():
         raise NotImplementedError(
             "flash_attn at sgl-kernel is only supported on sm90 and above"
         )
+
+    # FA3 requires max_seqlen_q and max_seqlen_k
+    if max_seqlen_q is None or max_seqlen_k is None:
+        raise ValueError("max_seqlen_q and max_seqlen_k are required for FA3")
 
     if softmax_scale is None:
         softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (

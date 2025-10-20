@@ -201,6 +201,7 @@ class CommonKVSender(BaseKVSender):
     def send(
         self,
         kv_indices: npt.NDArray[np.int32],
+        state_indices: Optional[List[int]] = None,
     ):
         pass
 
@@ -245,6 +246,7 @@ class CommonKVReceiver(BaseKVReceiver):
                     f"Could not fetch prefill parallel info from bootstrap_addr: {self.bootstrap_addr}",
                 )
                 self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                self.bootstrap_infos = None
                 return
             else:
                 logger.debug(
