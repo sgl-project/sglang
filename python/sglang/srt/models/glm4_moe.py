@@ -349,12 +349,10 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
-        is_nextn: bool = False,
     ):
         nn.Module.__init__(self)
         self.top_k = config.num_experts_per_tok
         self.tp_size = get_tensor_model_parallel_world_size()
-        self.ep_size = get_moe_expert_parallel_world_size()
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
         self.config = config
@@ -406,7 +404,13 @@ class Glm4MoeSparseMoeBlock(nn.Module):
                 quant_config=quant_config,
                 reduce_results=False,
                 prefix=add_prefix("shared_experts", prefix),
-                **(dict(tp_rank=0, tp_size=1) if self.ep_size > 1 else {}),
+                **(
+                    dict(tp_rank=0, tp_size=1)
+                    if get_moe_a2a_backend().is_deepep()
+                    or get_moe_a2a_backend().is_mooncake()
+                    or should_use_flashinfer_cutlass_moe_fp4_allgather()
+                    else {}
+                ),
             )
 
         if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
@@ -483,6 +487,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
+
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
         shared_output = self._forward_shared_experts(hidden_states)
@@ -494,28 +499,21 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             final_hidden_states = self.experts(hidden_states, topk_output)
             if not _is_cuda:
                 final_hidden_states *= self.routed_scaling_factor
-        current_stream.wait_stream(self.alt_stream)
 
-        if self.ep_size > 1:
-            if (
-                self.tp_size > 1
-                and not should_allreduce_fusion
-                and not use_reduce_scatter
-            ):
-                final_hidden_states = tensor_model_parallel_all_reduce(
-                    final_hidden_states
-                )
-            final_hidden_states += shared_output
-        else:
-            final_hidden_states += shared_output
-            if (
-                self.tp_size > 1
-                and not should_allreduce_fusion
-                and not use_reduce_scatter
-            ):
-                final_hidden_states = tensor_model_parallel_all_reduce(
-                    final_hidden_states
-                )
+        current_stream.wait_stream(self.alt_stream)
+        with use_symmetric_memory(parallel_state.get_tp_group()) as sm:
+            final_hidden_states_out = torch.empty_like(final_hidden_states)
+
+        torch.add(final_hidden_states, shared_output, out=final_hidden_states_out)
+        final_hidden_states = final_hidden_states_out
+        sm.tag(final_hidden_states)
+        if (
+            self.tp_size > 1
+            and not should_allreduce_fusion
+            and not use_reduce_scatter
+            and not should_use_flashinfer_cutlass_moe_fp4_allgather()
+        ):
+            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
 
     def forward_normal(
@@ -666,7 +664,6 @@ class Glm4MoeDecoderLayer(nn.Module):
                 prefix=add_prefix("mlp", prefix),
                 layer_id=self.layer_id,
                 alt_stream=alt_stream,
-                is_nextn=is_nextn,
             )
         else:
             if enable_moe_dense_fully_dp():
