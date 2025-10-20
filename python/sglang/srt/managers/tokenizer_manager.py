@@ -733,6 +733,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 obj.token_ids_logprob,
                 obj.stream,
                 rid=obj.rid,
+                http_worker_ipc=obj.http_worker_ipc,
                 bootstrap_host=obj.bootstrap_host,
                 bootstrap_port=obj.bootstrap_port,
                 bootstrap_room=obj.bootstrap_room,
@@ -744,7 +745,6 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 data_parallel_rank=obj.data_parallel_rank,
                 priority=obj.priority,
                 extra_key=obj.extra_key,
-                http_worker_ipc=obj.http_worker_ipc,
             )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(

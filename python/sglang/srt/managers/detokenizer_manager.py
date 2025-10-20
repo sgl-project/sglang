@@ -257,6 +257,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         outputs = self.tokenizer.detokenize(recv_obj)
         return BatchMultimodalOutput(
             rids=recv_obj.rids,
+            http_worker_ipcs=recv_obj.http_worker_ipcs,
             finished_reasons=recv_obj.finished_reasons,
             outputs=outputs,
             prompt_tokens=recv_obj.prompt_tokens,
