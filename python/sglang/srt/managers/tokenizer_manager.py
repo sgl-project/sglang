@@ -46,6 +46,7 @@ from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchT
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
     AbortReq,
+    BaseReq,
     BatchEmbeddingOutput,
     BatchMultimodalOutput,
     BatchStrOutput,
@@ -256,9 +257,18 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         )
         if self.server_args.tokenizer_worker_num > 1:
             # Use tokenizer_worker_ipc_name in multi-tokenizer mode
-            self.send_to_scheduler = get_zmq_socket(
+            send_to_scheduler = get_zmq_socket(
                 context, zmq.PUSH, port_args.tokenizer_worker_ipc_name, False
             )
+
+            class SenderWrapper:
+                def send_pyobj(self, obj):
+                    if isinstance(obj, BaseReq):
+                        obj.http_worker_ipc = port_args.tokenizer_ipc_name
+                    send_to_scheduler.send_pyobj(obj)
+
+            # Make sure that each request carries the tokenizer_ipc_name for response routing
+            self.send_to_scheduler = SenderWrapper()
         else:
             self.send_to_scheduler = get_zmq_socket(
                 context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
