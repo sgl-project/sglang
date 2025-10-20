@@ -3,26 +3,28 @@
 //! This module defines the core pipeline abstraction and individual processing stages
 //! that transform a RequestContext through its lifecycle.
 
+use std::{
+    sync::Arc,
+    time::{Instant, SystemTime, UNIX_EPOCH},
+};
+
 use async_trait::async_trait;
 use axum::response::{IntoResponse, Response};
-use tracing::{debug, error, warn};
-
-use super::context::*;
-use super::processing;
-use super::streaming;
-use super::utils;
-use crate::core::{ConnectionMode, Worker, WorkerRegistry, WorkerType};
-use crate::grpc_client::proto;
-use crate::policies::PolicyRegistry;
-use crate::protocols::spec::{ChatCompletionRequest, GenerateRequest, InputIds};
-use crate::reasoning_parser::ParserFactory as ReasoningParserFactory;
-use crate::tokenizer::traits::Tokenizer;
-use crate::tool_parser::ParserFactory as ToolParserFactory;
 use proto::DisaggregatedParams;
 use rand::Rng;
-use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use tracing::{debug, error, warn};
 use uuid::Uuid;
+
+use super::{context::*, processing, streaming, utils};
+use crate::{
+    core::{ConnectionMode, Worker, WorkerRegistry, WorkerType},
+    grpc_client::proto,
+    policies::PolicyRegistry,
+    protocols::{chat::ChatCompletionRequest, common::InputIds, generate::GenerateRequest},
+    reasoning_parser::ParserFactory as ReasoningParserFactory,
+    tokenizer::traits::Tokenizer,
+    tool_parser::ParserFactory as ToolParserFactory,
+};
 
 // ============================================================================
 // Pipeline Trait
@@ -338,44 +340,31 @@ impl WorkerSelectionStage {
         model_id: Option<&str>,
         text: Option<&str>,
     ) -> Option<(Arc<dyn Worker>, Arc<dyn Worker>)> {
-        // Get prefill workers - use None for WorkerType filter to get all types,
-        // then filter manually (since Prefill is a struct variant)
         let all_workers = self.worker_registry.get_workers_filtered(
             model_id,
-            None, // Get all types
-            Some(ConnectionMode::Grpc { port: None }),
+            None,
+            Some(ConnectionMode::Grpc { port: None }), // Match any gRPC worker
             false,
         );
 
-        let prefill_workers: Vec<_> = all_workers
-            .iter()
-            .filter(|w| matches!(w.metadata().worker_type, WorkerType::Prefill { .. }))
-            .cloned()
-            .collect();
-
-        let available_prefill: Vec<_> = prefill_workers
-            .iter()
-            .filter(|w| w.is_available())
-            .cloned()
-            .collect();
+        let (available_prefill, available_decode): (Vec<_>, Vec<_>) =
+            all_workers
+                .into_iter()
+                .fold((Vec::new(), Vec::new()), |mut acc, w| {
+                    if w.is_available() {
+                        match w.metadata().worker_type {
+                            WorkerType::Prefill { .. } => acc.0.push(w),
+                            WorkerType::Decode => acc.1.push(w),
+                            _ => {}
+                        }
+                    }
+                    acc
+                });
 
         if available_prefill.is_empty() {
             warn!("No available prefill workers");
             return None;
         }
-
-        // Get decode workers from the same all_workers list
-        let decode_workers: Vec<_> = all_workers
-            .iter()
-            .filter(|w| matches!(w.metadata().worker_type, WorkerType::Decode))
-            .cloned()
-            .collect();
-
-        let available_decode: Vec<_> = decode_workers
-            .iter()
-            .filter(|w| w.is_available())
-            .cloned()
-            .collect();
 
         if available_decode.is_empty() {
             warn!("No available decode workers");
