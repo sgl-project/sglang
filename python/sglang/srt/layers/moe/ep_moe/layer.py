@@ -167,7 +167,6 @@ class DeepEPMoE(FusedMoE):
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
-        forward_batch: ForwardBatch,
         forward_shared_experts=None,
         alt_stream=None,
         disable_sbo=False,
@@ -177,7 +176,6 @@ class DeepEPMoE(FusedMoE):
             hidden_states=hidden_states,
             topk_idx=topk_idx,
             topk_weights=topk_weights,
-            forward_batch=forward_batch,
             # SBO args
             experts=self,
             forward_shared_experts=forward_shared_experts,
@@ -190,13 +188,11 @@ class DeepEPMoE(FusedMoE):
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
-        forward_batch: ForwardBatch,
     ):
         return self.deepep_dispatcher.dispatch(
             hidden_states=hidden_states,
             topk_idx=topk_idx,
             topk_weights=topk_weights,
-            forward_batch=forward_batch,
             input_global_scale=(
                 self.w13_input_scale_quant
                 if isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
@@ -242,14 +238,12 @@ class DeepEPMoE(FusedMoE):
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
-        forward_batch: ForwardBatch,
         overlap_args: Optional[Dict[str, Any]] = None,
     ):
         return self.deepep_dispatcher.combine(
             hidden_states=hidden_states,
             topk_idx=topk_idx,
             topk_weights=topk_weights,
-            forward_batch=forward_batch,
             overlap_args=overlap_args,
         )
 

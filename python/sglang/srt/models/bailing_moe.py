@@ -410,7 +410,6 @@ class BailingMoESparseMoeBlock(nn.Module):
                 hidden_states,
                 topk_idx,
                 topk_weights,
-                forward_batch=forward_batch,
             )
 
         final_hidden_states = self.experts(
@@ -429,7 +428,6 @@ class BailingMoESparseMoeBlock(nn.Module):
                 final_hidden_states,
                 topk_idx,
                 topk_weights,
-                forward_batch=forward_batch,
             )
 
         final_hidden_states *= self.routed_scaling_factor

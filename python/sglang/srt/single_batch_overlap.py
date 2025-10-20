@@ -58,12 +58,11 @@ def execute_sbo(
     hidden_states: torch.Tensor,
     topk_idx: torch.Tensor,
     topk_weights: torch.Tensor,
-    forward_batch: ForwardBatch,
     alt_stream: Optional = None,
     disable_sbo: bool = False,
 ):
     dispatch_output = experts.dispatch(
-        hidden_states, topk_idx, topk_weights, forward_batch
+        hidden_states, topk_idx, topk_weights
     )
 
     combine_overlap_args, down_gemm_overlap_args, meta_overlap_args = (
@@ -87,7 +86,6 @@ def execute_sbo(
         hidden_states,
         dispatch_output.topk_idx,
         dispatch_output.topk_weights,
-        forward_batch,
         overlap_args=combine_overlap_args,
     )
 
