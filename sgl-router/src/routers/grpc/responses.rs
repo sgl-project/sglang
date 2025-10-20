@@ -601,50 +601,50 @@ async fn process_and_transform_sse_stream(
     // Convert body to data stream
     let mut stream = body.into_data_stream();
 
-    // Buffer for incomplete SSE events
-    let mut buffer = Vec::new();
-
-    // Process stream chunks
+    // Process stream chunks (each chunk is a complete SSE event)
     while let Some(chunk_result) = stream.next().await {
         let chunk = chunk_result.map_err(|e| format!("Stream read error: {}", e))?;
-        buffer.extend_from_slice(&chunk);
 
-        // Process all complete SSE events in buffer
-        while let Some(event) = extract_sse_event(&mut buffer) {
-            if event.starts_with("data: [DONE]") {
-                // End of stream marker
-                break;
-            }
+        // Convert chunk to string
+        let event_str = String::from_utf8_lossy(&chunk);
+        let event = event_str.trim();
 
-            if let Some(json_str) = event.strip_prefix("data: ") {
-                // Try to parse as ChatCompletionStreamResponse
-                match serde_json::from_str::<crate::protocols::chat::ChatCompletionStreamResponse>(
-                    json_str,
-                ) {
-                    Ok(chat_chunk) => {
-                        // Update accumulator
-                        accumulator.process_chunk(&chat_chunk);
+        // Check for end of stream
+        if event == "data: [DONE]" {
+            break;
+        }
 
-                        // Convert to responses delta format
-                        let responses_delta = convert_chat_chunk_to_responses_delta(&chat_chunk);
+        // Parse SSE event (format: "data: {...}\n\n" or "data: {...}")
+        if let Some(json_str) = event.strip_prefix("data: ") {
+            let json_str = json_str.trim();
 
-                        // Emit converted SSE event
-                        let delta_json = serde_json::to_string(&responses_delta)
-                            .map_err(|e| format!("Failed to serialize delta: {}", e))?;
+            // Try to parse as ChatCompletionStreamResponse
+            match serde_json::from_str::<crate::protocols::chat::ChatCompletionStreamResponse>(
+                json_str,
+            ) {
+                Ok(chat_chunk) => {
+                    // Update accumulator
+                    accumulator.process_chunk(&chat_chunk);
 
-                        if tx
-                            .send(Ok(Bytes::from(format!("data: {}\n\n", delta_json))))
-                            .is_err()
-                        {
-                            return Err("Client disconnected".to_string());
-                        }
+                    // Convert to responses delta format
+                    let responses_delta = convert_chat_chunk_to_responses_delta(&chat_chunk);
+
+                    // Emit converted SSE event
+                    let delta_json = serde_json::to_string(&responses_delta)
+                        .map_err(|e| format!("Failed to serialize delta: {}", e))?;
+
+                    if tx
+                        .send(Ok(Bytes::from(format!("data: {}\n\n", delta_json))))
+                        .is_err()
+                    {
+                        return Err("Client disconnected".to_string());
                     }
-                    Err(_) => {
-                        // Not a valid chat chunk - might be error event, pass through
-                        debug!("Non-chunk SSE event, passing through: {}", event);
-                        if tx.send(Ok(Bytes::from(format!("{}\n\n", event)))).is_err() {
-                            return Err("Client disconnected".to_string());
-                        }
+                }
+                Err(_) => {
+                    // Not a valid chat chunk - might be error event, pass through
+                    debug!("Non-chunk SSE event, passing through: {}", event);
+                    if tx.send(Ok(Bytes::from(format!("{}\n\n", event)))).is_err() {
+                        return Err("Client disconnected".to_string());
                     }
                 }
             }
@@ -673,21 +673,6 @@ async fn process_and_transform_sse_stream(
     }
 
     Ok(())
-}
-
-/// Extract next complete SSE event from buffer
-/// Returns the event line (without trailing \n\n) and removes it from buffer
-fn extract_sse_event(buffer: &mut Vec<u8>) -> Option<String> {
-    // Look for double newline marking end of SSE event
-    for i in 0..buffer.len().saturating_sub(1) {
-        if buffer[i] == b'\n' && buffer[i + 1] == b'\n' {
-            // Found complete event
-            let event_bytes = buffer.drain(..=i + 1).collect::<Vec<_>>();
-            let event_str = String::from_utf8_lossy(&event_bytes[..event_bytes.len() - 2]);
-            return Some(event_str.to_string());
-        }
-    }
-    None
 }
 
 /// Response accumulator for streaming responses
