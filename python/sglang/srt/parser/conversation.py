@@ -840,6 +840,19 @@ register_conv_template(
 
 register_conv_template(
     Conversation(
+        name="deepseek-ocr",
+        system_message="",
+        system_template="",
+        roles=("", ""),
+        sep="",
+        sep_style=SeparatorStyle.ADD_NEW_LINE_SINGLE,
+        stop_str=[""],
+        image_token="<image>",
+    )
+)
+
+register_conv_template(
+    Conversation(
         name="deepseek-vl2",
         system_template="{system_message}",
         # system_message="You are a helpful assistant. Please answer truthfully and write out your "
