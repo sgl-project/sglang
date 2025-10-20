@@ -90,7 +90,6 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
-    MultiTokenizerRegisterReq,
     OpenSessionReqInput,
     OpenSessionReqOutput,
     ProfileReq,
@@ -646,7 +645,6 @@ class Scheduler(
                 (ExpertDistributionReq, self.expert_distribution_handle),
                 (LoadLoRAAdapterReqInput, self.load_lora_adapter),
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
-                (MultiTokenizerRegisterReq, self.register_multi_tokenizer),
                 (GetLoadReqInput, self.get_load),
             ]
         )
@@ -1359,6 +1357,7 @@ class Scheduler(
                 metrics_collector=(
                     self.metrics_collector if self.enable_metrics else None
                 ),
+                http_worker_ipc=recv_req.http_worker_ipc,
             )
             req.tokenizer = self.tokenizer
 
@@ -1613,6 +1612,7 @@ class Scheduler(
             recv_req.sampling_params,
             token_type_ids=recv_req.token_type_ids,
             priority=recv_req.priority,
+            http_worker_ipc=recv_req.http_worker_ipc,
         )
         req.tokenizer = self.tokenizer
 
@@ -2844,10 +2844,6 @@ class Scheduler(
 
         result = self.tp_worker.unload_lora_adapter(recv_req)
         return result
-
-    def register_multi_tokenizer(self, recv_req: MultiTokenizerRegisterReq):
-        self.send_to_detokenizer.send_pyobj(recv_req)
-        return recv_req
 
     def init_weights_send_group_for_remote_instance(
         self, recv_req: InitWeightsSendGroupForRemoteInstanceReqInput

@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import copy
 import logging
-import os
 import time
 import uuid
 from collections import deque
@@ -81,8 +80,6 @@ logger = logging.getLogger(__name__)
 
 class _Communicator(Generic[T]):
     """Note: The communicator now only run up to 1 in-flight request at any time."""
-
-    enable_multi_tokenizer = False
 
     def __init__(self, sender: zmq.Socket, fan_out: int, mode="queueing"):
         self._sender = sender

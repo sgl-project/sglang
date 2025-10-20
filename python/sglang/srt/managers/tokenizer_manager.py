@@ -87,7 +87,6 @@ from sglang.srt.utils import (
     dataclass_to_string_truncated,
     freeze_gc,
     get_bool_env_var,
-    get_origin_rid,
     get_zmq_socket,
     kill_process_tree,
 )
@@ -375,13 +374,10 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         obj.normalize_batch_and_arguments()
 
         if self.server_args.tokenizer_worker_num > 1:
-            # Modify rid, add worker_id
-            if isinstance(obj.rid, list):
-                # If it's an array, add worker_id prefix to each element
-                obj.rid = [f"{self.worker_id}_{rid}" for rid in obj.rid]
-            else:
-                # If it's a single value, add worker_id prefix
-                obj.rid = f"{self.worker_id}_{obj.rid}"
+            from sglang.srt.managers.multi_tokenizer_mixin import TokenizerWorker
+
+            assert isinstance(self, TokenizerWorker)
+            self._attach_multi_http_worker_info(obj)
 
         if self.enable_trace:
             self._trace_request_start(obj, created_time)
@@ -738,6 +734,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 data_parallel_rank=obj.data_parallel_rank,
                 priority=obj.priority,
                 extra_key=obj.extra_key,
+                http_worker_ipc=obj.http_worker_ipc,
             )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(
@@ -748,6 +745,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 sampling_params,
                 rid=obj.rid,
                 priority=obj.priority,
+                http_worker_ipc=obj.http_worker_ipc,
             )
 
         return tokenized_obj
@@ -1346,12 +1344,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 )
                 continue
 
-            origin_rid = rid
-            if self.server_args.tokenizer_worker_num > 1:
-                origin_rid = get_origin_rid(rid)
             # Build meta_info and return value
             meta_info = {
-                "id": origin_rid,
+                "id": rid,
                 "finish_reason": recv_obj.finished_reasons[i],
                 "prompt_tokens": recv_obj.prompt_tokens[i],
                 "weight_version": self.server_args.weight_version,
@@ -1705,9 +1700,6 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         if is_health_check_generate_req(recv_obj):
             return
         state = self.rid_to_state[recv_obj.rid]
-        origin_rid = recv_obj.rid
-        if self.server_args.tokenizer_worker_num > 1:
-            origin_rid = get_origin_rid(origin_rid)
         state.finished = True
         if recv_obj.finished_reason:
             out = {
@@ -1720,7 +1712,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             out = {
                 "text": "",
                 "meta_info": {
-                    "id": origin_rid,
+                    "id": recv_obj.rid,
                     "finish_reason": {
                         "type": "abort",
                         "message": "Abort before prefill",
