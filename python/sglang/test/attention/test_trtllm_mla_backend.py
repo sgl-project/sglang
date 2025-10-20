@@ -1265,7 +1265,6 @@ class TestTRTLLMMLA(CustomTestCase):
 
     def test_draft_extend_padding_unpadding_kernels(self):
         """Test TRTLLM MLA Triton kernels: pad_draft_extend_query_kernel and unpad_draft_extend_output_kernel."""
-        print(f"\nRunning TRTLLM MLA kernel tests...")
 
         # Import the kernels
         from sglang.srt.layers.attention.trtllm_mla_backend import (
