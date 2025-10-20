@@ -2,6 +2,7 @@ import logging
 from functools import lru_cache
 from typing import Iterable, Optional, Tuple
 
+import torch
 import torch.nn as nn
 from transformers.models.glm4v_moe.configuration_glm4v_moe import Glm4vMoeConfig
 
