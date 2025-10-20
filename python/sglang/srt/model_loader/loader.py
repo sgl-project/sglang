@@ -538,16 +538,15 @@ class DefaultModelLoader(BaseModelLoader):
             **model_kwargs,
             trust_remote_code=True,
         )
-        rank0_log(f"ModelOpt quantization requested: {model_config.modelopt_quant}")
         # Handle both legacy modelopt_quant and unified quantization flags
-        if model_config.modelopt_quant:
+        if hasattr(model_config, "modelopt_quant") and model_config.modelopt_quant:
             # Legacy approach
             quant_choice_str = model_config.modelopt_quant
-            logger.info(f"ModelOpt quantization requested (legacy): {quant_choice_str}")
+            rank0_log(f"ModelOpt quantization requested (legacy): {quant_choice_str}")
         else:
             # Unified approach - extract quantization type
             quant_choice_str = model_config._get_modelopt_quant_type()
-            logger.info(
+            rank0_log(
                 f"ModelOpt quantization requested (unified): {model_config.quantization} -> {quant_choice_str}"
             )
 
@@ -1971,7 +1970,7 @@ class ModelOptModelLoader(DefaultModelLoader):
             raise
 
         # Handle both old modelopt_quant and new unified quantization flags
-        if model_config.modelopt_quant:
+        if hasattr(model_config, "modelopt_quant") and model_config.modelopt_quant:
             # Legacy modelopt_quant flag
             quant_choice_str = model_config.modelopt_quant
         else:
@@ -1998,9 +1997,15 @@ class ModelOptModelLoader(DefaultModelLoader):
             f"Quantizing model with ModelOpt using config: mtq.{quant_cfg_name}"
         )
 
-        quantized_ckpt_restore_path = model_config.modelopt_checkpoint_restore_path
-        quantized_ckpt_save_path = model_config.modelopt_checkpoint_save_path
-        export_path = model_config.modelopt_export_path
+        # Get ModelOpt configuration from LoadConfig
+        modelopt_config = self.load_config.modelopt_config
+        quantized_ckpt_restore_path = (
+            modelopt_config.checkpoint_restore_path if modelopt_config else None
+        )
+        quantized_ckpt_save_path = (
+            modelopt_config.checkpoint_save_path if modelopt_config else None
+        )
+        export_path = modelopt_config.export_path if modelopt_config else None
         tokenizer = AutoTokenizer.from_pretrained(
             model_config.model_path, use_fast=True
         )
@@ -2026,12 +2031,11 @@ def get_model_loader(
 ) -> BaseModelLoader:
     """Get a model loader based on the load format."""
 
-    if (
-        model_config
-        and hasattr(model_config, "modelopt_quant")
-        and model_config.modelopt_quant
+    if model_config and (
+        (hasattr(model_config, "modelopt_quant") and model_config.modelopt_quant)
+        or model_config.quantization in ["modelopt_fp8", "modelopt_fp4", "modelopt"]
     ):
-        logger.info("Using ModelOptModelLoader due to 'modelopt_quant' config.")
+        logger.info("Using ModelOptModelLoader due to ModelOpt quantization config.")
         return ModelOptModelLoader(load_config)
 
     # Use ModelOptModelLoader for unified quantization flags

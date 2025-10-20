@@ -71,7 +71,7 @@ class TestModelOptModelLoader(CustomTestCase):
         # Create a basic model config with unified quantization flag
         self.model_config = ModelConfig(
             model_path=self.model_path,
-            modelopt_quant="fp8",  # Keep legacy for backward compatibility tests
+            quantization="modelopt_fp8",  # Use unified quantization approach
         )
 
         # Also create a unified quantization config for new tests
@@ -120,7 +120,7 @@ class TestModelOptModelLoader(CustomTestCase):
             model = self.mock_base_model
 
             # Simulate the quantization config lookup
-            quant_choice_str = model_config.modelopt_quant
+            quant_choice_str = model_config._get_modelopt_quant_type()
             quant_cfg_name = QUANT_CFG_CHOICES.get(quant_choice_str)
 
             if not quant_cfg_name:
@@ -278,11 +278,15 @@ class TestModelOptModelLoader(CustomTestCase):
         # Create model config with checkpoint restore path
         config_with_restore = ModelConfig(
             model_path=self.model_path,
-            modelopt_quant="fp8",
-            modelopt_checkpoint_restore_path="/path/to/quantized/checkpoint",
+            quantization="modelopt_fp8",
         )
 
-        loader = ModelOptModelLoader(self.load_config)
+        # Create load config with checkpoint restore path
+        load_config_with_restore = LoadConfig(
+            modelopt_checkpoint_restore_path="/path/to/quantized/checkpoint"
+        )
+
+        loader = ModelOptModelLoader(load_config_with_restore)
 
         # Mock tokenizer
         mock_tokenizer = MagicMock()
@@ -341,6 +345,8 @@ class TestModelOptModelLoader(CustomTestCase):
                     # Verify the setup was called with restore path
                     mock_setup.assert_called_once()
                     call_args = mock_setup.call_args
+                    # Check that the restore path was passed correctly
+                    self.assertIn("quantized_ckpt_restore_path", call_args[1])
                     self.assertEqual(
                         call_args[1]["quantized_ckpt_restore_path"],
                         "/path/to/quantized/checkpoint",
@@ -363,11 +369,15 @@ class TestModelOptModelLoader(CustomTestCase):
         # Create model config with checkpoint save path
         config_with_save = ModelConfig(
             model_path=self.model_path,
-            modelopt_quant="fp8",
-            modelopt_checkpoint_save_path="/path/to/save/checkpoint",
+            quantization="modelopt_fp8",
         )
 
-        loader = ModelOptModelLoader(self.load_config)
+        # Create load config with checkpoint save path
+        load_config_with_save = LoadConfig(
+            modelopt_checkpoint_save_path="/path/to/save/checkpoint"
+        )
+
+        loader = ModelOptModelLoader(load_config_with_save)
 
         # Mock tokenizer
         mock_tokenizer = MagicMock()
@@ -432,6 +442,8 @@ class TestModelOptModelLoader(CustomTestCase):
                     # Verify the setup was called with save path
                     mock_setup.assert_called_once()
                     call_args = mock_setup.call_args
+                    # Check that the save path was passed correctly
+                    self.assertIn("quantized_ckpt_save_path", call_args[1])
                     self.assertEqual(
                         call_args[1]["quantized_ckpt_save_path"],
                         "/path/to/save/checkpoint",
