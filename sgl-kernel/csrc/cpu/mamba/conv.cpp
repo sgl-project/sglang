@@ -31,7 +31,7 @@ inline void print_16x32(const __m512 x) {
 //
 // lda : leading dimension of `input` and `out`
 //
-template <typename scalar_t, int K, int BLOCK_N, bool has_bias>
+template <typename scalar_t, int K, int BLOCK_N, bool has_bias, bool has_silu>
 struct tinygemm_kernel {
   static inline void apply(
       const scalar_t* __restrict__ A,
@@ -48,8 +48,8 @@ struct tinygemm_kernel {
 };
 
 #if defined(CPU_CAPABILITY_AVX512)
-template <int K, int BLOCK_N, bool has_bias>
-struct tinygemm_kernel<at::BFloat16, K, BLOCK_N, has_bias> {
+template <int K, int BLOCK_N, bool has_bias, bool has_silu>
+struct tinygemm_kernel<at::BFloat16, K, BLOCK_N, has_bias, has_silu> {
   static inline void apply(
       const at::BFloat16* __restrict__ A,
       const at::BFloat16* __restrict__ B,
@@ -61,8 +61,9 @@ struct tinygemm_kernel<at::BFloat16, K, BLOCK_N, has_bias> {
       int64_t lda,
       bool is_first_token) {
     // std::cout << "### tinygemm_kernel: M = " << M << "; lda = " << lda << "; K = " << K << "; BLOCK_N = " << BLOCK_N
-    // << "; is_first_token: " << (is_first_token ? "true" : "false") << std::endl; std::cout << "### has_initial_state:
-    // " << (has_initial_state ? "true" : "false") << std::endl;
+    //   << "; is_first_token: " << (is_first_token ? "true" : "false") << std::endl;
+    // std::cout << "### has_initial_state: " << (has_initial_state ? "true" : "false") << std::endl;
+    // std::cout << "has_silu: " << (has_silu ? "true" : "false") << std::endl;
 
     assert(K == 4);
     constexpr int ROWS = K;
@@ -104,7 +105,6 @@ struct tinygemm_kernel<at::BFloat16, K, BLOCK_N, has_bias> {
       va[1 * COLS + col] = MM512_LOAD_A(m - 3);
       va[2 * COLS + col] = MM512_LOAD_A(m - 2);
       va[3 * COLS + col] = MM512_LOAD_A(m - 1);
-      ;
     };
     Unroll<COLS>{}(preloada);
 
@@ -125,8 +125,6 @@ struct tinygemm_kernel<at::BFloat16, K, BLOCK_N, has_bias> {
       vb[row * COLS + col] = (__m512bh)(_mm512_loadu_si512(B + col * ldb + row * 32));
     };
     Unroll<ROWS * COLS>{}(loadb);
-
-    // std::cout << "### after loadb ..." << std::endl;
 
     // [NB] accumulates 4x32 bfloat16 blocks
     //
@@ -175,13 +173,12 @@ struct tinygemm_kernel<at::BFloat16, K, BLOCK_N, has_bias> {
       constexpr int col = i;
       fVec x0 = fVec(vc[col * 2 + 0]);
       fVec x1 = fVec(vc[col * 2 + 1]);
-      // print_16x32(vc[col * 2 + 0]);
-      // print_16x32(vc[col * 2 + 1]);
-      x0 = x0 / (one + x0.neg().exp_u20());
-      x1 = x1 / (one + x1.neg().exp_u20());
+      if constexpr (has_silu) {
+        x0 = x0 / (one + x0.neg().exp_u20());
+        x1 = x1 / (one + x1.neg().exp_u20());
+      }
       bVec out_vec = convert_from_float_ext<at::BFloat16>(x0, x1);
       out_vec.store(C + m * lda + col * 32);
-      // print_32x16(__m512bh((__m512i)(out_vec)));
     };
 
     for (int64_t m = 0; m < M; ++m) {
@@ -197,7 +194,7 @@ struct tinygemm_kernel<at::BFloat16, K, BLOCK_N, has_bias> {
 #endif
 
 #define LAUNCH_TINYGEMM_KERNEL(K, NB_SIZE)                                     \
-  tinygemm_kernel<scalar_t, K, NB_SIZE, has_bias>::apply(                      \
+  tinygemm_kernel<scalar_t, K, NB_SIZE, has_bias, has_silu>::apply(            \
       input + bs * seqlen * dim + mb_start * dim + nb_start,                   \
       weight + nb_start * width,                                               \
       out + bs * seqlen * dim + mb_start * dim + nb_start,                     \
@@ -215,19 +212,16 @@ void causal_conv1d_fwd_kernel_impl(
     const scalar_t* __restrict__ weight,
     const scalar_t* __restrict__ bias,
     scalar_t* __restrict__ conv_states,
-    const int32_t* __restrict__ query_start_loc,
-    const int32_t* __restrict__ cache_indices,
     const bool* __restrict__ has_initial_state,
     bool silu_activation,
-    int64_t pad_slot_id,
     int64_t batch,
     int64_t dim,
     int64_t seqlen,
     int64_t width,
     int64_t num_seq_blocks) {
   // std::cout << "### causal_conv1d_fwd_kernel_impl: batch = " << batch << "; dim = " << dim << "; seqlen = " << seqlen
-  // << "; width = " << width << std::endl; std::cout << "### causal_conv1d_fwd_kernel_impl: num_seq_blocks = " <<
-  // num_seq_blocks << std::endl;
+  //   << "; width = " << width << std::endl; std::cout << "### causal_conv1d_fwd_kernel_impl: num_seq_blocks = " <<
+  //   num_seq_blocks << std::endl;
 
   // handle 32 x 64 per block
   constexpr int64_t BLOCK_M = block_size_m();
@@ -239,37 +233,36 @@ void causal_conv1d_fwd_kernel_impl(
 
   // parallel on [batch, seq, NB]
   AT_DISPATCH_BOOL(bias != nullptr, has_bias, [&] {
-    at::parallel_for(0, num_seq_blocks * NB, 0, [&](int64_t begin, int64_t end) {
-      int64_t mb{0}, nb{0};
-      data_index_init(begin, mb, num_seq_blocks, nb, NB);
+    AT_DISPATCH_BOOL(silu_activation, has_silu, [&] {
+      at::parallel_for(0, num_seq_blocks * NB, 0, [&](int64_t begin, int64_t end) {
+        int64_t mb{0}, nb{0};
+        data_index_init(begin, mb, num_seq_blocks, nb, NB);
 
-      for (int64_t i = begin; i < end; ++i) {
-        int64_t bs = mb / num_blocks_per_seq;
+        for (int64_t i = begin; i < end; ++i) {
+          int64_t bs = mb / num_blocks_per_seq;
 
-        int64_t mb_start = (mb % num_blocks_per_seq) * BLOCK_M;
-        int64_t mb_size = std::min(seqlen - mb_start, BLOCK_M);
-        int64_t nb_start = nb * BLOCK_N;
-        int64_t nb_size = std::min(dim - nb_start, BLOCK_N);
+          int64_t mb_start = (mb % num_blocks_per_seq) * BLOCK_M;
+          int64_t mb_size = std::min(seqlen - mb_start, BLOCK_M);
+          int64_t nb_start = nb * BLOCK_N;
+          int64_t nb_size = std::min(dim - nb_start, BLOCK_N);
 
-        // std::cout << "### bs = " << bs << "; mb_start = " << mb_start << "; nb_start = " << nb_start << "; nb_size =
-        // " << nb_size << std::endl;
+          const bool has_initial_states_value = has_conv_states ? has_initial_state[bs] : false;
 
-        const bool has_initial_states_value = has_conv_states ? has_initial_state[bs] : false;
+          switch (width << 4 | nb_size >> 4) {
+            case 0x42:
+              LAUNCH_TINYGEMM_KERNEL(4, 32);
+              break;
+            case 0x44:
+              LAUNCH_TINYGEMM_KERNEL(4, 64);
+              break;
+            default:
+              TORCH_CHECK(false, "Unexpected block size, ", width, " x ", nb_size);
+          }
 
-        switch (width << 4 | nb_size >> 4) {
-          case 0x42:
-            LAUNCH_TINYGEMM_KERNEL(4, 32);
-            break;
-          case 0x44:
-            LAUNCH_TINYGEMM_KERNEL(4, 64);
-            break;
-          default:
-            TORCH_CHECK(false, "Unexpected block size, ", width, " x ", nb_size);
+          // move to the next index
+          data_index_step(mb, num_seq_blocks, nb, NB);
         }
-
-        // move to the next index
-        data_index_step(mb, num_seq_blocks, nb, NB);
-      }
+      });
     });
   });
 
@@ -287,6 +280,75 @@ void causal_conv1d_fwd_kernel_impl(
       }
     });
   }
+}
+
+#define LAUNCH_TINYGEMM_VARLEN_KERNEL(K, NB_SIZE)                   \
+  tinygemm_kernel<scalar_t, K, NB_SIZE, has_bias, has_silu>::apply( \
+      input + batch_offset * dim + mb_start * dim + nb_start,       \
+      weight + nb_start * width,                                    \
+      out + batch_offset * dim + mb_start * dim + nb_start,         \
+      has_bias ? bias + nb_start : nullptr,                         \
+      nullptr,                                                      \
+      false,                                                        \
+      mb_size,                                                      \
+      dim,                                                          \
+      mb_start == 0);
+
+// TODO: add `conv_states` support for varlen kernel
+template <typename scalar_t>
+void causal_conv1d_fwd_varlen_kernel_impl(
+    scalar_t* __restrict__ out,
+    const scalar_t* __restrict__ input,
+    const scalar_t* __restrict__ weight,
+    const scalar_t* __restrict__ bias,
+    const int32_t* __restrict__ query_start_loc,
+    const int32_t* __restrict__ indices,
+    bool silu_activation,
+    int64_t dim,
+    int64_t width,
+    int64_t num_seq_blocks) {
+  // std::cout << "### causal_conv1d_fwd_varlen_ernel_impl: " << std::endl;
+  // std::cout << "dim = " << dim << "; width = " << width << "; num_seq_blocks = " << num_seq_blocks << std::endl;
+
+  // handle 32 x 64 per block
+  constexpr int64_t BLOCK_M = block_size_m();
+  constexpr int64_t BLOCK_N = block_size_n() * 2;
+  const int64_t NB = div_up(dim, BLOCK_N);
+
+  // parallel on [batch, seq, NB]
+  AT_DISPATCH_BOOL(bias != nullptr, has_bias, [&] {
+    AT_DISPATCH_BOOL(silu_activation, has_silu, [&] {
+      at::parallel_for(0, num_seq_blocks * NB, 0, [&](int64_t begin, int64_t end) {
+        int64_t mb{0}, nb{0};
+        data_index_init(begin, mb, num_seq_blocks, nb, NB);
+
+        for (int64_t i = begin; i < end; ++i) {
+          int32_t bs = indices[mb * 2 + 0];
+          int32_t batch_offset = query_start_loc[bs];
+          int32_t seqlen = query_start_loc[bs + 1] - query_start_loc[bs];
+
+          int64_t mb_start = indices[mb * 2 + 1] * BLOCK_M;
+          int64_t mb_size = std::min(seqlen - mb_start, BLOCK_M);
+          int64_t nb_start = nb * BLOCK_N;
+          int64_t nb_size = std::min(dim - nb_start, BLOCK_N);
+
+          switch (width << 4 | nb_size >> 4) {
+            case 0x42:
+              LAUNCH_TINYGEMM_VARLEN_KERNEL(4, 32);
+              break;
+            case 0x44:
+              LAUNCH_TINYGEMM_VARLEN_KERNEL(4, 64);
+              break;
+            default:
+              TORCH_CHECK(false, "Unexpected block size, ", width, " x ", nb_size);
+          }
+
+          // move to the next index
+          data_index_step(mb, num_seq_blocks, nb, NB);
+        }
+      });
+    });
+  });
 }
 
 }  // anonymous namespace
@@ -349,14 +411,17 @@ int64_t get_block_count(const std::optional<at::Tensor>& offsets, int64_t batch,
 }
 
 template <int BLOCK_M>
-void get_block_indices(
-    at::Tensor& indices, const std::optional<at::Tensor>& offsets, int64_t batch, int64_t num_seq_blocks) {
+at::Tensor get_block_indices(const std::optional<at::Tensor>& offsets, int64_t num_seq_blocks) {
   if (!offsets.has_value()) {
-    return;
+    return at::Tensor();
   }
 
-  const int32_t* offsets_data = offsets.value().data_ptr<int32_t>();
-  indices.resize_({num_seq_blocks * 2});
+  const at::Tensor& offsets_ = offsets.value();
+  at::Tensor indices = at::empty({num_seq_blocks, 2}, offsets_.options());
+  ;
+  int64_t batch = offsets_.size(0) - 1;
+
+  const int32_t* offsets_data = offsets_.data_ptr<int32_t>();
   int32_t* indices_data = indices.data_ptr<int32_t>();
 
   int64_t idx = 0;
@@ -369,6 +434,7 @@ void get_block_indices(
       idx++;
     }
   }
+  return indices;
 }
 
 // API aligned with GPUs
@@ -400,8 +466,6 @@ at::Tensor causal_conv1d_fwd_cpu(
   auto packed_w = is_vnni ? weight : causal_conv1d_weight_pack(weight);
 
   const bool is_var_seqlen = query_start_loc.has_value();
-  TORCH_CHECK(!is_var_seqlen, "causal_conv1d_fwd_cpu: doesn't support variant sequence lengths.");
-
   const int64_t input_ndim = is_var_seqlen ? 2 : 3;
   TORCH_CHECK(x.dim() == input_ndim, "causal_conv1d_fwd_cpu: expect x to be ", input_ndim, "D tensor.");
   TORCH_CHECK(x.stride(-2) == 1 && x.stride(-1) == x.size(-2), "causal_conv1d_fwd_cpu: expect x to be transposed.");
@@ -419,9 +483,6 @@ at::Tensor causal_conv1d_fwd_cpu(
   CHECK_OPTIONAL_SHAPE_DTYPE(has_initial_state, batch, at::kBool);
 
   if (conv_states.has_value()) {
-    // std::cout << "### conv_states.value().sizes(): " << conv_states.value().sizes() << "; " <<
-    // conv_states.value().strides() << std::endl; std::cout << conv_states.value() << std::endl;
-
     auto& conv_states_val = conv_states.value();
     CHECK_EQ(conv_states_val.scalar_type(), scalar_type);
     CHECK_EQ(conv_states_val.size(0), batch);
@@ -430,40 +491,52 @@ at::Tensor causal_conv1d_fwd_cpu(
 
     // adjust `conv_states` to be contiguous on `dim`
     if (conv_states_val.stride(-2) != 1) {
-      std::cout << "### conv_states_val.stride on dim is not 1 ..." << std::endl;
       auto conv_states_copy = conv_states_val.clone();
       conv_states_val.as_strided_({batch, dim, width - 1}, {(width - 1) * dim, 1, dim});
       conv_states_val.copy_(conv_states_copy);
     }
-    // std::cout << "### conv_states.value().sizes() after: " << conv_states.value().sizes() << "; "
-    // <<conv_states.value().strides() << std::endl; std::cout << conv_states.value() << std::endl;
   }
 
+  // block size for sequence blocks, 32
   constexpr int64_t BLOCK_M = block_size_m();
 
   // total number of sequence blocks
   int64_t num_seq_blocks = get_block_count<BLOCK_M>(query_start_loc, batch, seqlen);
 
-  // record seq blocks in Coordinate format, aka [num_seq_blocks, 2]
-
   at::Tensor out = at::empty_like(x);
   AT_DISPATCH_REDUCED_FLOATING_TYPES(scalar_type, "causal_conv1d_fwd_kernel_impl", [&] {
-    causal_conv1d_fwd_kernel_impl<scalar_t>(
-        out.data_ptr<scalar_t>(),
-        x.data_ptr<scalar_t>(),
-        packed_w.data_ptr<scalar_t>(),
-        conditional_data_ptr<scalar_t>(bias),
-        conditional_data_ptr<scalar_t>(conv_states),
-        conditional_data_ptr<int32_t>(query_start_loc),
-        conditional_data_ptr<int32_t>(cache_indices),
-        conditional_data_ptr<bool>(has_initial_state),
-        silu_activation,
-        pad_slot_id,
-        batch,
-        dim,
-        seqlen,
-        width,
-        num_seq_blocks);
+    if (is_var_seqlen) {
+      TORCH_CHECK(!conv_states.has_value(), "CPU doesn't support variant sequence lengths with conv_states.");
+
+      // record seq blocks in Coordinate format, aka [num_seq_blocks, 2]
+      at::Tensor indices = get_block_indices<BLOCK_M>(query_start_loc, num_seq_blocks);
+
+      causal_conv1d_fwd_varlen_kernel_impl(
+          out.data_ptr<scalar_t>(),
+          x.data_ptr<scalar_t>(),
+          packed_w.data_ptr<scalar_t>(),
+          conditional_data_ptr<scalar_t>(bias),
+          conditional_data_ptr<int32_t>(query_start_loc),
+          indices.data_ptr<int32_t>(),
+          silu_activation,
+          dim,
+          width,
+          num_seq_blocks);
+    } else {
+      causal_conv1d_fwd_kernel_impl<scalar_t>(
+          out.data_ptr<scalar_t>(),
+          x.data_ptr<scalar_t>(),
+          packed_w.data_ptr<scalar_t>(),
+          conditional_data_ptr<scalar_t>(bias),
+          conditional_data_ptr<scalar_t>(conv_states),
+          conditional_data_ptr<bool>(has_initial_state),
+          silu_activation,
+          batch,
+          dim,
+          seqlen,
+          width,
+          num_seq_blocks);
+    }
   });
   return out;
 }
