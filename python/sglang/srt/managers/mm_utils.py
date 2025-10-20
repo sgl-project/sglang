@@ -17,6 +17,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalInputs,
     global_server_args_dict,
+    CudaIpcTensorTransportProxy,
 )
 from sglang.srt.mem_cache.multimodal_cache import MultiModalCache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -34,6 +35,7 @@ _is_npu = is_npu()
 # cuda_ipc: for intranode tensor sharing
 TensorTransportMode = Literal["cuda_ipc", "auto", "default"]
 
+import traceback
 
 class TransportProxyTensor(torch.Tensor):
     """
@@ -77,7 +79,8 @@ class TransportProxyTensor(torch.Tensor):
             "tensor_data": None,
             "ipc_extra": None,
         }
-
+        # print("get_state trace back---------->")
+        # traceback.print_stack()
         transport_mode = self._metadata.get("transport_mode", "default")
 
         if transport_mode == "cuda_ipc" and self.is_cuda:
@@ -108,6 +111,8 @@ class TransportProxyTensor(torch.Tensor):
         """
         Called during unpickling. Implements the deserialization logic.
         """
+        # print("set_state trace back---------->")
+        # traceback.print_stack()
         self._metadata = state["metadata"]
 
         transport_mode = self._metadata.get("transport_mode", "default")
@@ -811,4 +816,7 @@ def hash_feature(f):
         return data_hash(arr_bytes)
     elif isinstance(f, torch.Tensor):
         return tensor_hash([f])
+    elif isinstance(f, CudaIpcTensorTransportProxy):
+        reconstruct_t = f.reconstruct_on_target_device(torch.cuda.current_device())
+        return tensor_hash([reconstruct_t])
     return data_hash(f)

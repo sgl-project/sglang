@@ -264,10 +264,11 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             base_output.videos = [
                 await preprocess_video(video) for video in base_output.videos
             ]
-
-        mm_items, input_ids, ret = self.process_and_combine_mm_data(
-            base_output, self.mm_tokens
-        )
+        
+        async with self._cache_lock:
+            mm_items, input_ids, ret = self.process_and_combine_mm_data(
+                base_output, self.mm_tokens
+            )
 
         input_ids = input_ids.flatten()
         mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(

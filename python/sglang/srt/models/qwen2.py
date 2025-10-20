@@ -50,6 +50,7 @@ from sglang.srt.model_loader.weight_utils import (
     kv_cache_scales_loader,
 )
 from sglang.srt.utils import add_prefix, make_layers
+import time
 
 Qwen2Config = None
 
@@ -319,6 +320,8 @@ class Qwen2Model(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        # torch.cuda.synchronize()
+        # s_time = time.time()
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -329,7 +332,8 @@ class Qwen2Model(nn.Module):
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
-
+        
+        # print("forward shape {}".format(hidden_states.shape[0]))
         aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
             if i in self.layers_to_capture:
@@ -357,9 +361,12 @@ class Qwen2Model(nn.Module):
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
 
+        # torch.cuda.synchronize()
+        # e_time = time.time()
+        # print("llm cost time {} ms".format((e_time - s_time) * 1000))
         if len(aux_hidden_states) == 0:
             return hidden_states
-
+      
         return hidden_states, aux_hidden_states
 
     # If this function is called, it should always initialize KV cache scale
