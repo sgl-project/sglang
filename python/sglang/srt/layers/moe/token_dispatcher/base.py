@@ -73,7 +73,7 @@ class DispatchOutputFormat(Enum):
 class DispatchOutput(Protocol):
     """Protocol for dispatch outputs in different formats."""
 
-    # TODO: add hidden_states to the protocol
+    hidden_states: torch.Tensor
 
     @property
     def format(self) -> DispatchOutputFormat: ...
