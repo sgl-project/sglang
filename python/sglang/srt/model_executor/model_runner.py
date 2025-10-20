@@ -327,19 +327,7 @@ class ModelRunner:
             and self.can_run_piecewise_cuda_graph()
         ):
             self.attention_layers = []
-
-            try:
-                layers = self.model.model.layers
-            except:
-                try:
-                    layers = self.model.language_model.model.layers
-                except:
-                    try:
-                        layers = self.model.language_model.layers
-                    except:
-                        self.piecewise_cuda_graph_runner = None
-                        return
-            for layer in layers:
+            for layer in self.model.model.layers:
                 if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "attn"):
                     self.attention_layers.append(layer.self_attn.attn)
             if len(self.attention_layers) < self.model_config.num_hidden_layers:
