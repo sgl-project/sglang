@@ -668,14 +668,15 @@ class Scheduler(
         class SenderWrapper:
             def __init__(self, socket: zmq.Socket):
                 self.socket = socket
-                if socket is None:
-                    self.send_output = lambda _, __: None
 
             def send_output(
                 self,
                 output: Union[BaseReq, BaseBatchReq],
                 recv_obj: Optional[Union[BaseReq, BaseBatchReq]] = None,
             ):
+                if self.socket is None:
+                    return
+
                 if (
                     isinstance(recv_obj, BaseReq)
                     and recv_obj.http_worker_ipc is not None
