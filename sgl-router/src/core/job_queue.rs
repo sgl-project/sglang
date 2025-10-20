@@ -352,6 +352,20 @@ impl JobQueue {
                                 tool_parser: None,
                                 chat_template: None,
                                 bootstrap_port: None,
+                                health_check_timeout_secs: router_config.health_check.timeout_secs,
+                                health_check_interval_secs: router_config
+                                    .health_check
+                                    .check_interval_secs,
+                                health_success_threshold: router_config
+                                    .health_check
+                                    .success_threshold,
+                                health_failure_threshold: router_config
+                                    .health_check
+                                    .failure_threshold,
+                                max_connection_attempts: router_config
+                                    .health_check
+                                    .success_threshold
+                                    * 10,
                             };
 
                             let job = Job::AddWorker {
@@ -400,6 +414,20 @@ impl JobQueue {
                                 tool_parser: None,
                                 chat_template: None,
                                 bootstrap_port: *bootstrap_port,
+                                health_check_timeout_secs: router_config.health_check.timeout_secs,
+                                health_check_interval_secs: router_config
+                                    .health_check
+                                    .check_interval_secs,
+                                health_success_threshold: router_config
+                                    .health_check
+                                    .success_threshold,
+                                health_failure_threshold: router_config
+                                    .health_check
+                                    .failure_threshold,
+                                max_connection_attempts: router_config
+                                    .health_check
+                                    .success_threshold
+                                    * 10,
                             };
 
                             let job = Job::AddWorker {
@@ -434,6 +462,20 @@ impl JobQueue {
                                 tool_parser: None,
                                 chat_template: None,
                                 bootstrap_port: None,
+                                health_check_timeout_secs: router_config.health_check.timeout_secs,
+                                health_check_interval_secs: router_config
+                                    .health_check
+                                    .check_interval_secs,
+                                health_success_threshold: router_config
+                                    .health_check
+                                    .success_threshold,
+                                health_failure_threshold: router_config
+                                    .health_check
+                                    .failure_threshold,
+                                max_connection_attempts: router_config
+                                    .health_check
+                                    .success_threshold
+                                    * 10,
                             };
 
                             let job = Job::AddWorker {

@@ -18,7 +18,11 @@ use rustls;
 use tokio::{task, time};
 use tracing::{debug, error, info, warn};
 
-use crate::{core::WorkerManager, protocols::worker_spec::WorkerConfigRequest, server::AppContext};
+use crate::{
+    core::{Job, WorkerManager},
+    protocols::worker_spec::WorkerConfigRequest,
+    server::AppContext,
+};
 
 #[derive(Debug, Clone)]
 pub struct ServiceDiscoveryConfig {
@@ -157,7 +161,7 @@ impl PodInfo {
     }
 
     pub fn worker_url(&self, port: u16) -> String {
-        format!("http://{}:{}", self.ip, port)
+        format!("{}:{}", self.ip, port)
     }
 }
 
@@ -382,10 +386,13 @@ async fn handle_pod_event(
                 tool_parser: None,
                 chat_template: None,
                 api_key: None,
+                health_check_timeout_secs: 30,
+                health_check_interval_secs: 60,
+                health_success_threshold: 2,
+                health_failure_threshold: 3,
+                max_connection_attempts: 20,
             };
 
-            // Submit job for async worker addition
-            use crate::core::Job;
             let job = Job::AddWorker {
                 config: Box::new(config.clone()),
             };
@@ -814,19 +821,6 @@ mod tests {
             bootstrap_port: None,
         };
         assert!(!not_running_pod.is_healthy());
-    }
-
-    #[test]
-    fn test_pod_info_worker_url() {
-        let pod_info = PodInfo {
-            name: "p1".into(),
-            ip: "1.2.3.4".into(),
-            status: "Running".into(),
-            is_ready: true,
-            pod_type: None,
-            bootstrap_port: None,
-        };
-        assert_eq!(pod_info.worker_url(8080), "http://1.2.3.4:8080");
     }
 
     #[test]

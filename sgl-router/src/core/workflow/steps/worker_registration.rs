@@ -44,17 +44,13 @@ fn strip_protocol(url: &str) -> String {
 }
 
 /// Helper: Try HTTP health check
-async fn try_http_health_check(url: &str) -> Result<(), String> {
+async fn try_http_health_check(url: &str, timeout_secs: u64) -> Result<(), String> {
     let clean_url = strip_protocol(url);
-    let health_url = if clean_url.starts_with("http://") || clean_url.starts_with("https://") {
-        format!("{}/health", clean_url)
-    } else {
-        format!("http://{}/health", clean_url)
-    };
+    let health_url = format!("http://{}/health", clean_url);
 
     HTTP_CLIENT
         .get(&health_url)
-        .timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(timeout_secs))
         .send()
         .await
         .map_err(|e| format!("HTTP health check failed: {}", e))?;
@@ -63,20 +59,23 @@ async fn try_http_health_check(url: &str) -> Result<(), String> {
 }
 
 /// Helper: Try gRPC health check
-async fn try_grpc_health_check(url: &str) -> Result<(), String> {
+async fn try_grpc_health_check(url: &str, timeout_secs: u64) -> Result<(), String> {
     let grpc_url = if url.starts_with("grpc://") {
         url.to_string()
     } else {
         format!("grpc://{}", strip_protocol(url))
     };
 
-    let client = SglangSchedulerClient::connect(&grpc_url)
+    let connect_future = SglangSchedulerClient::connect(&grpc_url);
+    let client = tokio::time::timeout(Duration::from_secs(timeout_secs), connect_future)
         .await
+        .map_err(|_| "gRPC connection timeout".to_string())?
         .map_err(|e| format!("gRPC connection failed: {}", e))?;
 
-    client
-        .health_check()
+    let health_future = client.health_check();
+    tokio::time::timeout(Duration::from_secs(timeout_secs), health_future)
         .await
+        .map_err(|_| "gRPC health check timeout".to_string())?
         .map_err(|e| format!("gRPC health check failed: {}", e))?;
 
     Ok(())
@@ -201,12 +200,18 @@ impl StepExecutor for DetectConnectionModeStep {
             .get("worker_config")
             .ok_or_else(|| WorkflowError::ContextValueNotFound("worker_config".to_string()))?;
 
-        info!("Detecting connection mode for {}", config.url);
+        info!(
+            "Detecting connection mode for {} (timeout: {}s, max_attempts: {})",
+            config.url, config.health_check_timeout_secs, config.max_connection_attempts
+        );
 
-        // Try both protocols in parallel
+        // Try both protocols in parallel using configured timeout
         let url = config.url.clone();
-        let (http_result, grpc_result) =
-            tokio::join!(try_http_health_check(&url), try_grpc_health_check(&url));
+        let timeout = config.health_check_timeout_secs;
+        let (http_result, grpc_result) = tokio::join!(
+            try_http_health_check(&url, timeout),
+            try_grpc_health_check(&url, timeout)
+        );
 
         let connection_mode = match (http_result, grpc_result) {
             (Ok(_), _) => {
@@ -556,6 +561,10 @@ impl StepExecutor for ActivateWorkerStep {
 }
 
 /// Create worker registration workflow definition
+///
+/// Note: Actual health check timeouts and retry attempts are configured per-worker
+/// via WorkerConfigRequest (populated from router config). The timeouts and retry
+/// policies here serve as workflow-level bounds to prevent infinite waiting.
 pub fn create_worker_registration_workflow() -> WorkflowDefinition {
     WorkflowDefinition::new("worker_registration", "Worker Registration")
         .add_step(
@@ -565,13 +574,14 @@ pub fn create_worker_registration_workflow() -> WorkflowDefinition {
                 Arc::new(DetectConnectionModeStep),
             )
             .with_retry(RetryPolicy {
-                max_attempts: 20,
+                max_attempts: 100,
                 backoff: BackoffStrategy::Linear {
                     increment: Duration::from_secs(1),
                     max: Duration::from_secs(5),
                 },
             })
-            .with_timeout(Duration::from_secs(30))
+            // Workflow-level timeout (upper bound); step uses config.health_check_timeout_secs
+            .with_timeout(Duration::from_secs(7200)) // 2 hours max
             .with_failure_action(FailureAction::FailWorkflow),
         )
         .add_step(
