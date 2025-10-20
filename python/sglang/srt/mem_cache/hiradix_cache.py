@@ -23,6 +23,9 @@ from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.metrics.collector import StorageMetricsCollector
 from sglang.srt.tracing.trace import (
     trace_event,
+    trace_req_finish,
+    trace_req_start,
+    trace_set_thread_info,
     trace_slice_end,
     trace_slice_start,
 )
@@ -429,6 +432,9 @@ class HiRadixCache(RadixCache):
         self, node: TreeNode, mem_quota: Optional[int] = None
     ) -> Optional[torch.Tensor]:
         # todo: more loading policies
+        # Create a unique request ID for load back operations
+        load_back_req_id = f"load_back_{node.id}_{time.monotonic_ns()}"
+        trace_req_start(load_back_req_id, None)
 
         last_hit_node = node
         nodes_to_load = []
@@ -451,6 +457,7 @@ class HiRadixCache(RadixCache):
         ):
             # skip loading back if the total size is too small or exceeding the memory quota
             self.dec_lock_ref(ancester_node)
+            trace_req_finish(load_back_req_id)
             return None
 
         device_indices = self.cache_controller.load(
@@ -464,6 +471,7 @@ class HiRadixCache(RadixCache):
         self.dec_lock_ref(ancester_node)
         if device_indices is None:
             # no sufficient GPU memory to load back KV caches
+            trace_req_finish(load_back_req_id)
             return None
 
         self.ongoing_load_back[last_hit_node.id] = last_hit_node
@@ -474,6 +482,7 @@ class HiRadixCache(RadixCache):
         self.evictable_size_ += len(device_indices)
         self.inc_lock_ref(last_hit_node)
 
+        trace_req_finish(load_back_req_id)
         return device_indices
 
     def init_load_back(
