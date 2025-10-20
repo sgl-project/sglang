@@ -25,7 +25,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Type, Union
+from typing import TYPE_CHECKING, List, Optional, Tuple, Type, Union
 
 import torch
 from torch.distributed import ProcessGroup
@@ -48,10 +48,7 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, RequestStage, ScheduleBatch
-from sglang.srt.mem_cache.allocator import (
-    BaseTokenToKVPoolAllocator,
-    SWATokenToKVPoolAllocator,
-)
+from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
@@ -61,7 +58,6 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
     SWAKVPool,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import get_int_env_var, require_mlp_sync
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
