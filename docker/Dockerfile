@@ -102,7 +102,7 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5li
 RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.3.9/source/nvshmem_src_cuda12-all-all-3.3.9.tar.gz && \
     if [ "$GRACE_BLACKWELL" = "1" ]; then \
       git clone https://github.com/fzyzcjy/DeepEP.git \
-      && cd DeepEP && git checkout 1b14ad661c7640137fcfe93cccb2694ede1220b0 && sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && cd .. ; \
+      && cd DeepEP && git checkout 2555874d8713ea758671867a50ebc9883552686d && sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && cd .. ; \
     else \
       git clone https://github.com/deepseek-ai/DeepEP.git \
       && cd DeepEP && git checkout ${DEEPEP_COMMIT} && sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && cd .. ; \
