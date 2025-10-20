@@ -301,7 +301,7 @@ class MlpProjector(nn.Module):
     def forward(self, x):
         if self.get("token_pooling", False):
             batch_size, wxh, channels = x.shape
-            w = h = int(wxh**0.5)
+            w = h = int(wxh ** 0.5)
             x = x.view(batch_size, w, h, channels)
             x = x.permute(0, 3, 1, 2)
             # import ipdb; ipdb.set_trace()
@@ -329,7 +329,7 @@ class MlpProjector(nn.Module):
 
         if self.projector_type == "hybrid_split_feature_mlp_gelu":
             high_x = x[..., : self.input_dim[0]]
-            low_x = x[..., self.input_dim[0] :]
+            low_x = x[..., self.input_dim[0]:]
             high_x = self.high_up_proj(high_x)
             low_x = self.low_up_proj(low_x)
             x = torch.concat([high_x, low_x], dim=-1)
@@ -461,7 +461,7 @@ class Attention(nn.Module):
         super().__init__()
         self.num_heads = num_heads
         head_dim = dim // num_heads
-        self.scale = head_dim**-0.5
+        self.scale = head_dim ** -0.5
 
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.proj = nn.Linear(dim, dim)
@@ -962,18 +962,18 @@ class CLIPVisionEmbeddings(nn.Module):
 class NoTPAttention(torch.nn.Module):
     def __init__(self, cfg):
         super().__init__()
-        self.num_heads = cfg.num_attention_heads
-        self.n_local_heads = cfg.num_attention_heads
-        self.head_dim = cfg.hidden_size // cfg.num_attention_heads
-        self.max_seq_len = cfg.seq_length
-        self.use_flash_attention = cfg.use_flash_attn
+        self.num_heads = cfg["num_attention_heads"]
+        self.n_local_heads = cfg["num_attention_heads"]
+        self.head_dim = cfg["hidden_size"] // cfg["num_attention_heads"]
+        self.max_seq_len = cfg["seq_length"]
+        self.use_flash_attention = cfg["use_flash_attn"]
 
-        self.qkv_proj = torch.nn.Linear(cfg.hidden_size, cfg.hidden_size * 3, bias=True)
-        self.out_proj = torch.nn.Linear(cfg.hidden_size, cfg.hidden_size, bias=True)
+        self.qkv_proj = torch.nn.Linear(cfg["hidden_size"], cfg["hidden_size"] * 3, bias=True)
+        self.out_proj = torch.nn.Linear(cfg["hidden_size"], cfg["hidden_size"], bias=True)
 
         # self.core_attention = CoreAttention(cfg, AttnType.self_attn)
 
-        self.attn_drop = cfg.attention_dropout
+        self.attn_drop = cfg["attention_dropout"]
 
     def forward(
         self,
@@ -1049,19 +1049,19 @@ class NoTPTransformerBlock(nn.Module):
     def __init__(self, cfg, layer_id: int, multiple_of=256):
         super().__init__()
 
-        self.n_heads = cfg.num_attention_heads
-        self.dim = cfg.hidden_size
-        self.head_dim = cfg.hidden_size // cfg.num_attention_heads
+        self.n_heads = cfg["num_attention_heads"]
+        self.dim = cfg["hidden_size"]
+        self.head_dim = cfg["hidden_size"] // cfg["num_attention_heads"]
         self.self_attn = NoTPAttention(cfg)
         self.mlp = NoTPFeedForward(
-            cfg, dim=cfg.hidden_size, hidden_dim=cfg.ffn_hidden_size
+            cfg, dim=cfg["hidden_size"], hidden_dim=cfg["ffn_hidden_size"]
         )
         self.layer_id = layer_id
         self.layer_norm1 = torch.nn.LayerNorm(
-            cfg.hidden_size, eps=cfg.layernorm_epsilon
+            cfg["hidden_size"], eps=cfg["layernorm_epsilon"]
         )
         self.layer_norm2 = torch.nn.LayerNorm(
-            cfg.hidden_size, eps=cfg.layernorm_epsilon
+            cfg["hidden_size"], eps=cfg["layernorm_epsilon"]
         )
 
     def forward(self, x: torch.Tensor):
@@ -1084,19 +1084,19 @@ class NoTPTransformerBlock(nn.Module):
     def __init__(self, cfg, layer_id: int, multiple_of=256):
         super().__init__()
 
-        self.n_heads = cfg.num_attention_heads
-        self.dim = cfg.hidden_size
-        self.head_dim = cfg.hidden_size // cfg.num_attention_heads
+        self.n_heads = cfg["num_attention_heads"]
+        self.dim = cfg["hidden_size"]
+        self.head_dim = cfg["hidden_size"] // cfg["num_attention_heads"]
         self.self_attn = NoTPAttention(cfg)
         self.mlp = NoTPFeedForward(
-            cfg, dim=cfg.hidden_size, hidden_dim=cfg.ffn_hidden_size
+            cfg, dim=cfg["hidden_size"], hidden_dim=cfg["ffn_hidden_size"]
         )
         self.layer_id = layer_id
         self.layer_norm1 = torch.nn.LayerNorm(
-            cfg.hidden_size, eps=cfg.layernorm_epsilon
+            cfg["hidden_size"], eps=cfg["layernorm_epsilon"]
         )
         self.layer_norm2 = torch.nn.LayerNorm(
-            cfg.hidden_size, eps=cfg.layernorm_epsilon
+            cfg["hidden_size"], eps=cfg["layernorm_epsilon"]
         )
 
     def forward(self, x: torch.Tensor):
@@ -1111,8 +1111,8 @@ class NoTPTransformer(nn.Module):
         super().__init__()
 
         self.cfg = cfg
-        # self.recompute_list = self.cfg.get("recompute_list", [])
-        self.num_layers = cfg.num_layers  # _get_num_layers(cfg)
+        # self.recompute_list = self.cfg["get("recompute_list", [])
+        self.num_layers = cfg["num_layers"]  # _get_num_layers(cfg)
 
         self.layers = torch.nn.ModuleList()
         for layer_id in range(self.num_layers):
@@ -1156,9 +1156,9 @@ class VitModel(nn.Module):
         super().__init__()
 
         self.embeddings = CLIPVisionEmbeddings(
-            hidden_size=cfg.hidden_size,
-            image_size=cfg.image_size,
-            patch_size=cfg.patch_size,
+            hidden_size=cfg["hidden_size"],
+            image_size=cfg["image_size"],
+            patch_size=cfg["patch_size"],
         )
 
         if freeze_embed:
@@ -1170,18 +1170,18 @@ class VitModel(nn.Module):
         if cfg.get("fp32norm", False):
             logger.info("Load fp32 layernorm for ViT.")
             self.pre_layrnorm = LayerNormfp32(
-                cfg.hidden_size,
+                cfg["hidden_size"],
                 eps=cfg.get("pre_layernorm_epsilon", 1e-5),
             )
         else:
             self.pre_layrnorm = torch.nn.LayerNorm(
-                cfg.hidden_size,
+                cfg["hidden_size"],
                 eps=cfg.get("pre_layernorm_epsilon", 1e-5),
             )
 
         # self.pre_layrnorm = RMSNorm(
-        #     cfg.hidden_size,
-        #     eps=cfg.get("pre_layernorm_epsilon", 1e-5),
+        #     cfg["hidden_size,
+        #     eps=cfg["get("pre_layernorm_epsilon", 1e-5),
         #     sequence_parallel=False,
         #     use_fp32=True,
         #     use_optimus=True,
@@ -1337,10 +1337,10 @@ class DeepseekOCRModel(DeepseekV2Model):
                         print("=====================")
 
                         _, hw, n_dim = global_features.shape
-                        h = w = int(hw**0.5)
+                        h = w = int(hw ** 0.5)
 
                         _2, hw2, n_dim2 = local_features.shape
-                        h2 = w2 = int(hw2**0.5)
+                        h2 = w2 = int(hw2 ** 0.5)
 
                         width_crop_num, height_crop_num = crop_shape[0], crop_shape[1]
 
@@ -1407,7 +1407,7 @@ class DeepseekOCRModel(DeepseekV2Model):
                         print("NO PATCHES")
                         print("=====================")
                         _, hw, n_dim = global_features.shape
-                        h = w = int(hw**0.5)
+                        h = w = int(hw ** 0.5)
 
                         global_features = global_features.view(h, w, n_dim)
 
@@ -1462,7 +1462,6 @@ class DeepseekOCRForCausalLM(nn.Module):
     ):
         super().__init__()
 
-        # self.model = DeepseekOCRModel(config)
         # multimodal_config = config.multimodal_config
 
         # config.model_type ='deepseek_vl_v2'
@@ -1519,6 +1518,20 @@ class DeepseekOCRForCausalLM(nn.Module):
                 quant_config=quant_config,
                 prefix=maybe_prefix(prefix, "language"),
             )
+
+        # self.model = DeepseekOCRModel(config)
+        self.sam_model = build_sam_vit_b()
+        self.vision_model = build_clip_l()
+        # self.conv_2 = nn.Conv2d(in_channels=1024, out_channels=2048, kernel_size=2, stride=2)
+        n_embed = 1280
+        self.projector = MlpProjector(
+            projector_type="linear",
+            input_dim=2048,
+            n_embed=n_embed,
+        )
+        embed_std = 1 / torch.sqrt(torch.tensor(n_embed, dtype=torch.float32))
+        self.image_newline = nn.Parameter(torch.randn(n_embed) * embed_std)
+        self.view_seperator = nn.Parameter(torch.randn(n_embed) * embed_std)
 
         print(f"{architectures=}")
 
@@ -1616,10 +1629,10 @@ class DeepseekOCRForCausalLM(nn.Module):
                         print("=====================")
 
                     _, hw, n_dim = global_features.shape
-                    h = w = int(hw**0.5)
+                    h = w = int(hw ** 0.5)
 
                     _2, hw2, n_dim2 = local_features.shape
-                    h2 = w2 = int(hw2**0.5)
+                    h2 = w2 = int(hw2 ** 0.5)
 
                     width_crop_num, height_crop_num = crop_shape[0], crop_shape[1]
 
@@ -1677,7 +1690,7 @@ class DeepseekOCRForCausalLM(nn.Module):
                         print("=====================")
 
                     _, hw, n_dim = global_features.shape
-                    h = w = int(hw**0.5)
+                    h = w = int(hw ** 0.5)
 
                     global_features = global_features.view(h, w, n_dim)
 
@@ -1910,12 +1923,7 @@ class DeepseekOCRForCausalLM(nn.Module):
             positions=positions,
         )
 
-        if not get_embedding:
-            return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch
-            )
-        else:
-            return self.pooler(hidden_states, forward_batch)
+        return hidden_states
 
     # def compute_logits(
     #     self,
@@ -1928,11 +1936,11 @@ class DeepseekOCRForCausalLM(nn.Module):
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
+            (".qkv_proj", ".q_proj", "q"),
+            (".qkv_proj", ".k_proj", "k"),
+            (".qkv_proj", ".v_proj", "v"),
+            (".gate_up_proj", ".gate_proj", 0),
+            (".gate_up_proj", ".up_proj", 1),
         ]
 
         params_dict = dict(self.named_parameters())
@@ -1940,8 +1948,13 @@ class DeepseekOCRForCausalLM(nn.Module):
             if "rotary_emb.inv_freq" in name:
                 continue
 
-            if "model." in name:
-                name = name.replace("model.", "model.model.")
+            if name.startswith("model."):
+                if "image_newline" in name or ".projector" in name or "vision_model" in name or "sam_model" in name or "view_seperator" in name:
+                    name = name[6:]
+                elif not (
+                    ".projector" in name or "vision_model" in name or "sam_model" in name or "image_newline" in name):
+                    name = name.replace("model.", "model.model.")
+
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
