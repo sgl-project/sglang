@@ -30,7 +30,6 @@ class ElasticEPState:
 
 class ElasticEPStateManager:
     _instance: Optional[ElasticEPState] = None
-    _lock = threading.Lock()
 
     @classmethod
     def instance(cls) -> ElasticEPState:
@@ -38,13 +37,12 @@ class ElasticEPStateManager:
 
     @classmethod
     def init(cls, server_args: ServerArgs):
-        with cls._lock:
-            if cls._instance is not None:
-                return cls._instance
-
-            if server_args.elastic_ep_backend is not None:
-                cls._instance = cls._build_state(ep_size=None, device=None)
+        if cls._instance is not None:
             return cls._instance
+
+        if server_args.elastic_ep_backend is not None:
+            cls._instance = cls._build_state(ep_size=None, device=None)
+        return cls._instance
 
     @staticmethod
     def _select_device() -> torch.device:
@@ -57,7 +55,7 @@ class ElasticEPStateManager:
 
     @classmethod
     def _build_state(
-        cls, *, ep_size: Optional[int], device: Optional[torch.device]
+        cls, *, ep_size: Optional[int] = None, device: Optional[torch.device] = None
     ) -> ElasticEPState:
 
         active = cls.healthy_rank_state(ep_size=ep_size, device=device)
@@ -69,7 +67,7 @@ class ElasticEPStateManager:
 
     @classmethod
     def healthy_rank_state(
-        cls, *, ep_size: Optional[int], device: Optional[torch.device]
+        cls, *, ep_size: Optional[int] = None, device: Optional[torch.device] = None
     ) -> torch.Tensor:
         size = ep_size if ep_size is not None else torch.distributed.get_world_size()
         dev = device if device is not None else cls._select_device()
