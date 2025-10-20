@@ -3487,7 +3487,6 @@ def reserve_rope_cache_for_long_sequences(
         or 2048
     )
 
-
     # 2) Speculative decoding expansion
     steps = int(getattr(server_args, "speculative_num_steps", 0) or 0)
     draft = int(getattr(server_args, "speculative_num_draft_tokens", 0) or 0)
