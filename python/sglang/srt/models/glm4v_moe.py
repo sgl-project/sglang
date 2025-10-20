@@ -206,6 +206,10 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
                         # This is an expert weight but not mapped to this rank, skip all remaining processing
                         continue
 
+                    if "visual" in name:
+                        # adapt to VisionAttention for GLM-V
+                        name = name.replace(r"attn.qkv.", r"attn.qkv_proj.")
+
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue
