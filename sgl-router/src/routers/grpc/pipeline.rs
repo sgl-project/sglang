@@ -15,12 +15,17 @@ use rand::Rng;
 use tracing::{debug, error, warn};
 use uuid::Uuid;
 
-use super::{context::*, processing, streaming, utils};
+use super::{context::*, conversions, processing, streaming, utils};
 use crate::{
     core::{ConnectionMode, Worker, WorkerRegistry, WorkerType},
     grpc_client::proto,
     policies::PolicyRegistry,
-    protocols::{chat::ChatCompletionRequest, common::InputIds, generate::GenerateRequest},
+    protocols::{
+        chat::ChatCompletionRequest,
+        common::InputIds,
+        generate::GenerateRequest,
+        responses::ResponsesRequest,
+    },
     reasoning_parser::ParserFactory as ReasoningParserFactory,
     tokenizer::traits::Tokenizer,
     tool_parser::ParserFactory as ToolParserFactory,
@@ -1085,6 +1090,110 @@ impl RequestPipeline {
         match ctx.state.response.final_response {
             Some(FinalResponse::Generate(response)) => axum::Json(response).into_response(),
             Some(FinalResponse::Chat(_)) => {
+                utils::internal_error_static("Internal error: wrong response type")
+            }
+            None => utils::internal_error_static("No response produced"),
+        }
+    }
+
+    /// Execute the complete pipeline for a responses request using conversion approach
+    ///
+    /// This converts ResponsesRequest → ChatCompletionRequest, executes the chat pipeline,
+    /// then converts back to ResponsesResponse format.
+    pub async fn execute_responses(
+        &self,
+        request: Arc<ResponsesRequest>,
+        headers: Option<http::HeaderMap>,
+        model_id: Option<String>,
+        components: Arc<SharedComponents>,
+    ) -> Response {
+        use axum::http::StatusCode;
+        use serde_json::json;
+
+        // 1. Validate mutually exclusive parameters: previous_response_id XOR conversation
+        if request.previous_response_id.is_some() && request.conversation.is_some() {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(json!({
+                    "error": {
+                        "message": "Mutually exclusive parameters. Ensure you are only providing one of: 'previous_response_id' or 'conversation'.",
+                        "type": "invalid_request_error",
+                        "param": serde_json::Value::Null,
+                        "code": "mutually_exclusive_parameters"
+                    }
+                })),
+            )
+                .into_response();
+        }
+
+        // TODO: Handle previous_response_id (load response chain from storage)
+        // TODO: Handle conversation (load conversation history from storage)
+
+        // 2. Convert ResponsesRequest → ChatCompletionRequest
+        let chat_request = match conversions::responses_to_chat(&request) {
+            Ok(req) => Arc::new(req),
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    axum::Json(json!({
+                        "error": {
+                            "message": format!("Failed to convert request: {}", e),
+                            "type": "invalid_request_error"
+                        }
+                    })),
+                )
+                    .into_response();
+            }
+        };
+
+        // 3. Execute chat pipeline stages
+        let mut ctx = RequestContext::for_chat(chat_request, headers, model_id, components);
+
+        for (idx, stage) in self.stages.iter().enumerate() {
+            match stage.execute(&mut ctx).await {
+                Ok(Some(response)) => {
+                    // Stage completed successfully with a response (e.g., streaming)
+                    // TODO: For streaming responses, we need to convert SSE events
+                    return response;
+                }
+                Ok(None) => {
+                    // Continue to next stage
+                    continue;
+                }
+                Err(response) => {
+                    // Error occurred
+                    error!(
+                        "Stage {} ({}) failed with status {}",
+                        idx + 1,
+                        stage.name(),
+                        response.status()
+                    );
+                    return response;
+                }
+            }
+        }
+
+        // 4. Extract chat response and convert to responses format
+        match ctx.state.response.final_response {
+            Some(FinalResponse::Chat(chat_response)) => {
+                // Convert ChatCompletionResponse → ResponsesResponse
+                match conversions::chat_to_responses(&chat_response, &request) {
+                    Ok(responses_response) => {
+                        // TODO: Persist response to storage if store=true
+                        axum::Json(responses_response).into_response()
+                    }
+                    Err(e) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        axum::Json(json!({
+                            "error": {
+                                "message": format!("Failed to convert to responses format: {}", e)
+                            }
+                        })),
+                    )
+                        .into_response(),
+                }
+            }
+            Some(FinalResponse::Generate(_)) => {
                 utils::internal_error_static("Internal error: wrong response type")
             }
             None => utils::internal_error_static("No response produced"),

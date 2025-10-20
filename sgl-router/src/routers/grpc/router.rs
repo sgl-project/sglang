@@ -15,6 +15,7 @@ use super::{context::SharedComponents, pipeline::RequestPipeline};
 use crate::{
     config::types::RetryConfig,
     core::WorkerRegistry,
+    data_connector::{SharedConversationItemStorage, SharedConversationStorage, SharedResponseStorage},
     policies::PolicyRegistry,
     protocols::{
         chat::ChatCompletionRequest,
@@ -48,6 +49,12 @@ pub struct GrpcRouter {
     configured_tool_parser: Option<String>,
     pipeline: RequestPipeline,
     shared_components: Arc<SharedComponents>,
+    // Storage backends for /v1/responses support
+    response_storage: SharedResponseStorage,
+    conversation_storage: SharedConversationStorage,
+    conversation_item_storage: SharedConversationItemStorage,
+    // Optional MCP manager for tool execution (enabled via SGLANG_MCP_CONFIG env var)
+    mcp_manager: Option<Arc<crate::mcp::McpClientManager>>,
 }
 
 impl GrpcRouter {
@@ -72,6 +79,31 @@ impl GrpcRouter {
 
         let worker_registry = ctx.worker_registry.clone();
         let policy_registry = ctx.policy_registry.clone();
+
+        // Extract storage backends from context
+        let response_storage = ctx.response_storage.clone();
+        let conversation_storage = ctx.conversation_storage.clone();
+        let conversation_item_storage = ctx.conversation_item_storage.clone();
+
+        // Optional MCP manager activation via env var path (config-driven gate)
+        let mcp_manager = match std::env::var("SGLANG_MCP_CONFIG").ok() {
+            Some(path) if !path.trim().is_empty() => {
+                match crate::mcp::McpConfig::from_file(&path).await {
+                    Ok(cfg) => match crate::mcp::McpClientManager::new(cfg).await {
+                        Ok(mgr) => Some(Arc::new(mgr)),
+                        Err(err) => {
+                            tracing::warn!("Failed to initialize MCP manager: {}", err);
+                            None
+                        }
+                    },
+                    Err(err) => {
+                        tracing::warn!("Failed to load MCP config from '{}': {}", path, err);
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
 
         // Create shared components for pipeline
         let shared_components = Arc::new(SharedComponents {
@@ -104,6 +136,10 @@ impl GrpcRouter {
             configured_tool_parser: ctx.configured_tool_parser.clone(),
             pipeline,
             shared_components,
+            response_storage,
+            conversation_storage,
+            conversation_item_storage,
+            mcp_manager,
         })
     }
 
@@ -217,11 +253,24 @@ impl RouterTrait for GrpcRouter {
 
     async fn route_responses(
         &self,
-        _headers: Option<&HeaderMap>,
-        _body: &ResponsesRequest,
-        _model_id: Option<&str>,
+        headers: Option<&HeaderMap>,
+        body: &ResponsesRequest,
+        model_id: Option<&str>,
     ) -> Response {
-        (StatusCode::NOT_IMPLEMENTED).into_response()
+        // Use pipeline for ALL requests (streaming and non-streaming)
+        // Pipeline handles:
+        // - Request validation (previous_response_id XOR conversation)
+        // - Conversion: ResponsesRequest → ChatCompletionRequest
+        // - Execution through chat pipeline stages
+        // - Conversion: ChatCompletionResponse → ResponsesResponse
+        self.pipeline
+            .execute_responses(
+                Arc::new(body.clone()),
+                headers.cloned(),
+                model_id.map(|s| s.to_string()),
+                self.shared_components.clone(),
+            )
+            .await
     }
 
     async fn get_response(
