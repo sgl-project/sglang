@@ -42,6 +42,7 @@ class TestMamba(unittest.TestCase):
             full_attention_layer_ids=full_attention_layer_ids,
             enable_kvcache_transpose=False,
             device=device,
+            enable_memory_saver=True,
             mamba_pool=None,
         )
         assert pool._transfer_full_attention_id(global_interval - 1) == 0
