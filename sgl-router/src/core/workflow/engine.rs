@@ -338,7 +338,7 @@ impl WorkflowEngine {
                 Ok(Ok(StepResult::Failure)) | Ok(Err(_)) | Err(_) => {
                     let (error_msg, should_retry) = match result {
                         Ok(Err(e)) => {
-                            let msg = format!("{:?}", e);
+                            let msg = format!("{}", e);
                             let retryable = step.executor.is_retryable(&e);
                             (msg, retryable)
                         }
