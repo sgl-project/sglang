@@ -36,6 +36,7 @@ from sglang.srt.utils import (
     configure_ipv6,
     get_device,
     get_device_memory_capacity,
+    get_device_sm,
     is_cuda,
     is_flashinfer_available,
     is_hip,
@@ -942,6 +943,31 @@ class ServerArgs:
                 f"Disable hybrid SWA memory for {model_arch} as it is not yet supported."
             )
             self.disable_hybrid_swa_memory = True
+        elif model_arch in ["Olmo2ForCausalLM"]:
+            # FIXME: https://github.com/sgl-project/sglang/pull/7367 is not compatible with Olmo3 model.
+            logger.warning(
+                f"Disabling hybrid SWA memory for {model_arch} as it is not yet supported."
+            )
+            self.disable_hybrid_swa_memory = True
+
+            if self.attention_backend is None:
+                if is_cuda() and is_sm100_supported():
+                    self.attention_backend = "trtllm_mha"
+                elif is_cuda() and get_device_sm() >= 80:
+                    self.attention_backend = "fa3"
+                else:
+                    self.attention_backend = "triton"
+
+            # Flashinfer appears to degrade performance when sliding window attention
+            # is used for the Olmo2 architecture. Olmo2 does not use sliding window attention
+            # but Olmo3 does.
+            assert (
+                self.attention_backend != "flashinfer"
+            ), "FlashInfer backend can significantly degrade the performance of Olmo3 models."
+
+            logger.info(
+                f"Using {self.attention_backend} as attention backend for {model_arch}."
+            )
 
         if is_deepseek_nsa(hf_config):
             if (
