@@ -164,8 +164,8 @@ class HiCacheHF3FS(HiCacheStorage):
         is_mla_model: bool = False,
         is_page_first_layout: bool = False,
         use_mock_client: bool = False,
+        should_split_heads: bool = False,
         attn_tp_info: Optional[Tuple[int, int, bool]] = None,
-        mem_pool_host: Optional[HostKVCache] = None,
     ):
         self.rank = rank
         self.file_path_prefix = file_path_prefix
@@ -180,7 +180,7 @@ class HiCacheHF3FS(HiCacheStorage):
         self.is_page_first_layout = is_page_first_layout
         self.skip_backup = False
         self.use_mock_client = use_mock_client
-        self.mem_pool_host = mem_pool_host
+        self.should_split_heads = should_split_heads
         if self.is_mla_model and self.rank != 0:
             self.skip_backup = True
             self.rank = 0
@@ -200,7 +200,7 @@ class HiCacheHF3FS(HiCacheStorage):
         )
         self.lock = threading.RLock()
 
-        if self._should_split_heads():
+        if self.should_split_heads:
             self.split_factor = self.prefill_tp_size // self.decode_tp_size
             base_rank = self.rank * self.split_factor
             self.target_ranks = [base_rank + i for i in range(self.split_factor)]
@@ -234,15 +234,6 @@ class HiCacheHF3FS(HiCacheStorage):
             f"file_size={self.file_size / (2 ** 30):.2f} GB, "
             f"num_pages={self.num_pages}, "
             f"is_mla_model={self.is_mla_model}"
-        )
-
-    def _should_split_heads(self):
-        return (
-            not self.is_mla_model
-            and self.mem_pool_host is not None
-            and self.mem_pool_host.layout == "page_head"
-            and self.is_decode_side
-            and self.decode_tp_size < self.prefill_tp_size
         )
 
     def _init_target_rank_clients(self):

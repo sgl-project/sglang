@@ -400,6 +400,11 @@ class HiCacheController:
         if config.is_decode_side:
             config.prefill_tp_size = storage_backend_extra_config.get("prefill_tp_size")
             config.decode_tp_size = self.tp_size
+            config.should_split_heads = (
+                not config.is_mla_model
+                and self.mem_pool_host.layout == "page_head"
+                and config.decode_tp_size < config.prefill_tp_size
+            )
 
         return config
 

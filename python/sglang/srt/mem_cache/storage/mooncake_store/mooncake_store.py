@@ -188,6 +188,7 @@ class MooncakeStore(HiCacheStorage):
             else:
                 self.is_mla_backend = False
                 self.local_rank = 0
+            self.storage_config = storage_config
 
         except ValueError as e:
             logger.error("Configuration loading failed: %s", e)
@@ -230,6 +231,23 @@ class MooncakeStore(HiCacheStorage):
         assert len(key_list) == len(ptr_list)
         return key_list, ptr_list, element_size_list
 
+    def _get_mha_split_heads_buffer_meta(self, keys, indices):
+        split_factor = (
+            self.storage_config.prefill_tp_size // self.storage_config.decode_tp_size
+        )
+        ptr_list, element_size_list = (
+            self.mem_pool_host.get_split_heads_page_buffer_meta(indices, split_factor)
+        )
+        key_list = []
+        base_rank = self.local_rank * split_factor
+        target_ranks = [base_rank + i for i in range(self.split_factor)]
+        for key_ in keys:
+            for target_rank in target_ranks:
+                key_list.append(f"{key_}_{target_rank}_k")
+                key_list.append(f"{key_}_{target_rank}_v")
+        assert len(key_list) == len(ptr_list)
+        return key_list, ptr_list, element_size_list
+
     def _get_mla_buffer_meta(self, keys, indices):
         ptr_list, element_size_list = self.mem_pool_host.get_page_buffer_meta(indices)
         key_list = []
@@ -244,7 +262,10 @@ class MooncakeStore(HiCacheStorage):
         if self.is_mla_backend:
             return self._get_mla_buffer_meta(keys, host_indices)
         else:
-            return self._get_mha_buffer_meta(keys, host_indices)
+            if self.storage_config.should_split_heads:
+                return self._get_mha_split_heads_buffer_meta(keys, host_indices)
+            else:
+                return self._get_mha_buffer_meta(keys, host_indices)
 
     def _batch_postprocess(self, results: List[int], is_set_operate=False):
         """
