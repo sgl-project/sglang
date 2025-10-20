@@ -200,6 +200,7 @@ mod test_pd_routing {
                 oracle: None,
                 reasoning_parser: None,
                 tool_call_parser: None,
+                tokenizer_cache: sglang_router_rs::config::TokenizerCacheConfig::default(),
             };
 
             let app_context = {
