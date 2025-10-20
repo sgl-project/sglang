@@ -12,6 +12,7 @@ class DeepseekOCRProcessor(BaseMultimodalProcessor):
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
+        print(f"{type(_processor)=}")
         self.mm_tokens = MultimodalSpecialTokens(image_token="<image>").build(
             _processor
         )
