@@ -362,7 +362,7 @@ class DeepseekOCRProcessor(ProcessorMixin):
     def __call__(
         self,
         *,
-        prompt: str,
+        text: str,
         images: List,
         inference_mode: bool = True,
         **kwargs,
@@ -384,7 +384,7 @@ class DeepseekOCRProcessor(ProcessorMixin):
         """
 
         prepare = self.process_one(
-            prompt=prompt,
+            prompt=text,
             images=images,
             inference_mode=inference_mode,
         )
@@ -500,14 +500,14 @@ class DeepseekOCRProcessor(ProcessorMixin):
             )
 
             tokenized_image = (
-                [self.image_token_id] * num_queries_base + [self.image_token_id]
-            ) * num_queries_base
+                                  [self.image_token_id] * num_queries_base + [self.image_token_id]
+                              ) * num_queries_base
             tokenized_image += [self.image_token_id]
             if num_width_tiles > 1 or num_height_tiles > 1:
                 tokenized_image += (
-                    [self.image_token_id] * (num_queries * num_width_tiles)
-                    + [self.image_token_id]
-                ) * (num_queries * num_height_tiles)
+                                       [self.image_token_id] * (num_queries * num_width_tiles)
+                                       + [self.image_token_id]
+                                   ) * (num_queries * num_height_tiles)
             tokenized_str += tokenized_image
             images_seq_mask += [True] * len(tokenized_image)
             num_image_tokens.append(len(tokenized_image))

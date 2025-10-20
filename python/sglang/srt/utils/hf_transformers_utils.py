@@ -458,23 +458,23 @@ def get_processor(
                 **kwargs,
             )
         else:
-            print(f"{tokenizer_name=}")
-            if tokenizer_name == "deepseek-ai/DeepSeek-OCR":
-                processor = DeepseekOCRProcessor.from_pretrained(
-                    tokenizer_name,
-                    *args,
-                    trust_remote_code=trust_remote_code,
-                    revision=revision,
-                    **kwargs,
-                )
-            else:
-                processor = AutoProcessor.from_pretrained(
-                    tokenizer_name,
-                    *args,
-                    trust_remote_code=trust_remote_code,
-                    revision=revision,
-                    **kwargs,
-                )
+            # print(f"{tokenizer_name=}")
+            # if tokenizer_name == "deepseek-ai/DeepSeek-OCR":
+            #     processor = DeepseekOCRProcessor.from_pretrained(
+            #         tokenizer_name,
+            #         *args,
+            #         trust_remote_code=trust_remote_code,
+            #         revision=revision,
+            #         **kwargs,
+            #     )
+            # else:
+            processor = AutoProcessor.from_pretrained(
+                tokenizer_name,
+                *args,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+                **kwargs,
+            )
 
     except ValueError as e:
         error_message = str(e)
