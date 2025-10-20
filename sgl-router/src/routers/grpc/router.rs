@@ -12,7 +12,20 @@ use axum::{
 };
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
-use tracing::debug;
+use tracing::{debug, warn};
+
+/// Information stored for background tasks to enable end-to-end cancellation
+///
+/// This struct enables cancelling both the Rust task AND the Python scheduler processing.
+/// The client field is lazily initialized during pipeline execution.
+pub struct BackgroundTaskInfo {
+    /// Tokio task handle for aborting the Rust task
+    pub handle: JoinHandle<()>,
+    /// gRPC request_id sent to Python scheduler (chatcmpl-* prefix)
+    pub grpc_request_id: String,
+    /// gRPC client for sending abort requests to Python (set after client acquisition)
+    pub client: Arc<RwLock<Option<crate::grpc_client::SglangSchedulerClient>>>,
+}
 
 use super::{context::SharedComponents, pipeline::RequestPipeline};
 use crate::{
@@ -58,8 +71,8 @@ pub struct GrpcRouter {
     conversation_item_storage: SharedConversationItemStorage,
     // Optional MCP manager for tool execution (enabled via SGLANG_MCP_CONFIG env var)
     mcp_manager: Option<Arc<crate::mcp::McpClientManager>>,
-    // Background task handles for cancellation support
-    background_tasks: Arc<RwLock<HashMap<String, JoinHandle<()>>>>,
+    // Background task handles for cancellation support (includes gRPC client for Python abort)
+    background_tasks: Arc<RwLock<HashMap<String, BackgroundTaskInfo>>>,
 }
 
 impl GrpcRouter {
@@ -354,9 +367,24 @@ impl RouterTrait for GrpcRouter {
                     "queued" | "in_progress" => {
                         // Attempt to abort the background task
                         let mut tasks = self.background_tasks.write().await;
-                        if let Some(handle) = tasks.remove(response_id) {
-                            // Abort the task immediately
-                            handle.abort();
+                        if let Some(task_info) = tasks.remove(response_id) {
+                            // Abort the Rust task immediately
+                            task_info.handle.abort();
+
+                            // Abort the Python/scheduler request via gRPC (if client is available)
+                            let client_opt = task_info.client.read().await;
+                            if let Some(ref client) = *client_opt {
+                                if let Err(e) = client.abort_request(
+                                    task_info.grpc_request_id.clone(),
+                                    "User cancelled via API".to_string()
+                                ).await {
+                                    warn!("Failed to abort Python request {}: {}", task_info.grpc_request_id, e);
+                                } else {
+                                    debug!("Successfully aborted Python request: {}", task_info.grpc_request_id);
+                                }
+                            } else {
+                                debug!("Client not yet available for abort, request may not have started yet");
+                            }
 
                             // Task was found and aborted
                             (

@@ -8,6 +8,8 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
+use tokio::sync::RwLock;
+
 use async_trait::async_trait;
 use axum::response::{IntoResponse, Response};
 use proto::DisaggregatedParams;
@@ -474,7 +476,9 @@ impl PipelineStage for RequestBuildingStage {
 
         let mut proto_request = match &ctx.input.request_type {
             RequestType::Chat(request) => {
-                let request_id = format!("chatcmpl-{}", Uuid::new_v4());
+                // Use pre-generated request_id if provided (for background tasks), otherwise generate new one
+                let request_id = ctx.input.grpc_request_id.clone()
+                    .unwrap_or_else(|| format!("chatcmpl-{}", Uuid::new_v4()));
                 let body_ref = prep.filtered_request.as_ref().unwrap_or(request);
 
                 builder_client
@@ -495,9 +499,9 @@ impl PipelineStage for RequestBuildingStage {
                     })?
             }
             RequestType::Generate(request) => {
-                let request_id = request
-                    .rid
-                    .clone()
+                // Use pre-generated request_id if provided, otherwise use rid or generate new one
+                let request_id = ctx.input.grpc_request_id.clone()
+                    .or_else(|| request.rid.clone())
                     .unwrap_or_else(|| format!("gen-{}", Uuid::new_v4()));
 
                 builder_client
@@ -1020,7 +1024,7 @@ impl RequestPipeline {
         model_id: Option<String>,
         components: Arc<SharedComponents>,
     ) -> Response {
-        let mut ctx = RequestContext::for_chat(request, headers, model_id, components);
+        let mut ctx = RequestContext::for_chat(request, headers, model_id, components, None);
 
         // Execute each stage in sequence
         for (idx, stage) in self.stages.iter().enumerate() {
@@ -1064,7 +1068,7 @@ impl RequestPipeline {
         model_id: Option<String>,
         components: Arc<SharedComponents>,
     ) -> Response {
-        let mut ctx = RequestContext::for_generate(request, headers, model_id, components);
+        let mut ctx = RequestContext::for_generate(request, headers, model_id, components, None);
 
         // Execute each stage in sequence
         for (idx, stage) in self.stages.iter().enumerate() {
@@ -1111,6 +1115,9 @@ impl RequestPipeline {
         response_storage: SharedResponseStorage,
         conversation_storage: SharedConversationStorage,
         conversation_item_storage: SharedConversationItemStorage,
+        grpc_request_id: Option<String>,
+        response_id: Option<String>,
+        background_tasks: Option<Arc<RwLock<std::collections::HashMap<String, super::router::BackgroundTaskInfo>>>>,
     ) -> Result<crate::protocols::responses::ResponsesResponse, String> {
         // Clone request for mutation
         let mut modified_request = (*request).clone();
@@ -1256,7 +1263,7 @@ impl RequestPipeline {
         };
 
         // 6. Execute chat pipeline stages
-        let mut ctx = RequestContext::for_chat(chat_request, headers, model_id, components);
+        let mut ctx = RequestContext::for_chat(chat_request, headers, model_id, components, grpc_request_id);
 
         for (idx, stage) in self.stages.iter().enumerate() {
             match stage.execute(&mut ctx).await {
@@ -1266,6 +1273,23 @@ impl RequestPipeline {
                     return Err("Streaming is not yet supported for background responses".to_string());
                 }
                 Ok(None) => {
+                    // After ClientAcquisitionStage (stage index 2), store the client for cancellation
+                    if idx == 2 && response_id.is_some() && background_tasks.is_some() {
+                        if let Some(ref clients) = ctx.state.clients {
+                            let client_to_store = match clients {
+                                ClientSelection::Single { client } => client.clone(),
+                                ClientSelection::Dual { decode, .. } => decode.clone(),
+                            };
+
+                            if let Some(ref tasks) = background_tasks {
+                                if let Some(task_info) = tasks.write().await.get_mut(response_id.as_ref().unwrap()) {
+                                    *task_info.client.write().await = Some(client_to_store);
+                                    debug!("Stored client for response_id: {}", response_id.as_ref().unwrap());
+                                }
+                            }
+                        }
+                    }
+
                     // Continue to next stage
                     continue;
                 }
@@ -1332,7 +1356,7 @@ impl RequestPipeline {
         response_storage: SharedResponseStorage,
         conversation_storage: SharedConversationStorage,
         conversation_item_storage: SharedConversationItemStorage,
-        background_tasks: Arc<tokio::sync::RwLock<std::collections::HashMap<String, tokio::task::JoinHandle<()>>>>,
+        background_tasks: Arc<RwLock<std::collections::HashMap<String, super::router::BackgroundTaskInfo>>>,
     ) -> Response {
         use axum::http::StatusCode;
         use crate::protocols::responses::{ResponseStatus, ResponsesResponse};
@@ -1356,8 +1380,9 @@ impl RequestPipeline {
 
         // 2. Handle background mode: spawn async task and return immediately
         if request.background.unwrap_or(false) {
-            // Generate response ID
+            // Generate both response_id and grpc_request_id for Option 2
             let response_id = format!("resp_{}", Uuid::new_v4());
+            let grpc_request_id = format!("chatcmpl-{}", Uuid::new_v4());
 
             // Get current timestamp
             let created_at = SystemTime::now()
@@ -1417,6 +1442,7 @@ impl RequestPipeline {
             let conversation_storage_clone = conversation_storage.clone();
             let conversation_item_storage_clone = conversation_item_storage.clone();
             let response_id_clone = response_id.clone();
+            let grpc_request_id_clone = grpc_request_id.clone();
 
             // Spawn background task - now using execute_responses_internal which returns Result
             let background_tasks_clone = background_tasks.clone();
@@ -1435,6 +1461,9 @@ impl RequestPipeline {
                         response_storage_clone,
                         conversation_storage_clone,
                         conversation_item_storage_clone,
+                        Some(grpc_request_id_clone.clone()),
+                        Some(response_id_clone.clone()),
+                        Some(background_tasks_clone.clone()),
                     )
                     .await
                 {
@@ -1450,8 +1479,15 @@ impl RequestPipeline {
                 background_tasks_clone.write().await.remove(&response_id_clone);
             });
 
-            // Store the task handle for cancellation support
-            background_tasks.write().await.insert(response_id.clone(), handle);
+            // Store the task info for cancellation support (client will be set later during pipeline execution)
+            background_tasks.write().await.insert(
+                response_id.clone(),
+                super::router::BackgroundTaskInfo {
+                    handle,
+                    grpc_request_id: grpc_request_id.clone(),
+                    client: Arc::new(RwLock::new(None)),
+                },
+            );
 
             // Return queued response immediately
             return axum::Json(queued_response).into_response();
@@ -1467,6 +1503,9 @@ impl RequestPipeline {
                 response_storage,
                 conversation_storage,
                 conversation_item_storage,
+                None, // No pre-generated grpc_request_id for synchronous requests
+                None, // No response_id for synchronous requests
+                None, // No background_tasks for synchronous requests
             )
             .await
         {

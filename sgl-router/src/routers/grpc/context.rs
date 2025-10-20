@@ -46,6 +46,8 @@ pub struct RequestInput {
     pub request_type: RequestType,
     pub headers: Option<HeaderMap>,
     pub model_id: Option<String>,
+    /// Optional pre-generated gRPC request_id (for background tasks with cancellation)
+    pub grpc_request_id: Option<String>,
 }
 
 /// Request type variants
@@ -187,12 +189,14 @@ impl RequestContext {
         headers: Option<HeaderMap>,
         model_id: Option<String>,
         components: Arc<SharedComponents>,
+        grpc_request_id: Option<String>,
     ) -> Self {
         Self {
             input: RequestInput {
                 request_type: RequestType::Chat(request),
                 headers,
                 model_id,
+                grpc_request_id,
             },
             components,
             state: ProcessingState::default(),
@@ -205,12 +209,14 @@ impl RequestContext {
         headers: Option<HeaderMap>,
         model_id: Option<String>,
         components: Arc<SharedComponents>,
+        grpc_request_id: Option<String>,
     ) -> Self {
         Self {
             input: RequestInput {
                 request_type: RequestType::Generate(request),
                 headers,
                 model_id,
+                grpc_request_id,
             },
             components,
             state: ProcessingState::default(),
