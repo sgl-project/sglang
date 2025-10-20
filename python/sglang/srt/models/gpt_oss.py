@@ -85,7 +85,7 @@ _is_sm100_supported = is_cuda() and is_sm100_supported()
 
 
 if _is_cuda:
-    from sgl_kernel import FusedSetKVBufferArg
+    from sgl_kernel import FusedSetKVBufferArg  # noqa: F401
 
 
 class GptOssConfig(PretrainedConfig):
