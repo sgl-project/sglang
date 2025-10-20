@@ -90,17 +90,6 @@ class DeepEPMoE(FusedMoE):
             routed_scaling_factor=routed_scaling_factor,
         )
 
-        # if (
-        #     _use_aiter
-        #     or _is_npu
-        #     or isinstance(quant_config, W4AFp8Config)
-        #     or get_moe_runner_backend().is_flashinfer_cutedsl()
-        # ):
-        #     self.has_refactored_flag = False
-        # else:
-        #     self.has_refactored_flag = True
-        #     return
-
         if isinstance(quant_config, Fp8Config):
             self.use_block_quant = getattr(self.quant_method, "block_quant", False)
             self.use_fp8_w8a8 = True
@@ -161,9 +150,6 @@ class DeepEPMoE(FusedMoE):
         disable_sbo=False,
     ):
 
-        # if self.has_refactored_flag:
-        #     return super().forward(hidden_states, topk_output)
-
         # We have to call SBO inside MoE to be compatible with hooks used in offloading
         return single_batch_overlap.execute_sbo(
             hidden_states=hidden_states,
@@ -192,9 +178,6 @@ class DeepEPMoE(FusedMoE):
     ):
         from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
 
-        # if self.has_refactored_flag:
-        #     return super().run_moe_core(dispatch_output)
-
         if _use_aiter:
             assert DispatchOutputChecker.format_is_deepep(dispatch_output)
             # in forward_aiter, we skip token permutation and unpermutation, which have been fused inside aiter kernel
@@ -205,7 +188,6 @@ class DeepEPMoE(FusedMoE):
         if DispatchOutputChecker.format_is_deepep_normal(dispatch_output):
             if self.use_w4afp8:
                 return self.forward_cutlass_w4afp8(dispatch_output)
-            # raise ValueError("This should not happen")
             assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8
             return self.forward_deepgemm_contiguous(dispatch_output)
         elif DispatchOutputChecker.format_is_deepep_ll(dispatch_output):
@@ -213,7 +195,6 @@ class DeepEPMoE(FusedMoE):
                 return self.forward_flashinfer_cutedsl(
                     dispatch_output, down_gemm_overlap_args=down_gemm_overlap_args
                 )
-            # raise ValueError("This should not happen")
             assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8
             return self.forward_deepgemm_masked(dispatch_output)
         else:
