@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib.util
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
@@ -30,8 +29,6 @@ if TYPE_CHECKING:
         CombineInput,
         StandardDispatchOutput,
     )
-
-has_triton_kernels = importlib.util.find_spec("triton_kernels") is not None
 
 
 _is_cpu_amx_available = cpu_has_amx_support()
