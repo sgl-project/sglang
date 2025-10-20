@@ -163,7 +163,6 @@ from sglang.srt.tracing.trace import (
 )
 from sglang.srt.two_batch_overlap import TboDPAttentionPreparer
 from sglang.srt.utils import (
-    DEFAULT_DETERMINISTIC_INFERENCE_BACKEND_SIZE_CONFIG,
     DynamicGradMode,
     broadcast_pyobj,
     configure_gc_logger,
@@ -216,10 +215,10 @@ class GenerationBatchResult:
     delay_sample_func: Optional[callable] = None
     future_indices: Optional[FutureIndices] = None
 
-    # FIXME(lsyin): maybe move to <BetterPlace> ?
+    # FIXME(lsyin): maybe move to a better place?
     # sync path: forward stream -> output processor
     accept_lens: Optional[torch.Tensor] = None
-    last_batch_allocate_lens: Optional[torch.Tensor] = None
+    allocate_lens: Optional[torch.Tensor] = None
 
     # relay path: forward stream -> next step forward
     next_draft_input: Optional[EagleDraftInput] = None
@@ -247,10 +246,8 @@ class GenerationBatchResult:
         if self.accept_lens is not None:
             self.accept_lens = self.accept_lens.to("cpu", non_blocking=True)
 
-        if self.last_batch_allocate_lens is not None:
-            self.last_batch_allocate_lens = self.last_batch_allocate_lens.to(
-                "cpu", non_blocking=True
-            )
+        if self.allocate_lens is not None:
+            self.allocate_lens = self.allocate_lens.to("cpu", non_blocking=True)
 
         self.copy_done.record()
 
@@ -658,6 +655,12 @@ class Scheduler(
     def launch_draft_worker(
         self, gpu_id, tp_rank, moe_ep_rank, server_args, port_args, dp_rank
     ):
+        if server_args.speculative_draft_load_format is not None:
+            server_args.load_format = server_args.speculative_draft_load_format
+            logger.info(
+                f"Using draft model load_format: '{server_args.speculative_draft_load_format}'"
+            )
+
         if self.spec_algorithm.is_eagle():
             from sglang.srt.speculative.eagle_worker import EAGLEWorker
             from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
@@ -706,7 +709,11 @@ class Scheduler(
             self.truncation_align_size = None
             return
 
-        env_var, default_size = DEFAULT_DETERMINISTIC_INFERENCE_BACKEND_SIZE_CONFIG.get(
+        backend_sizes = {
+            "flashinfer": ("SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE", 4096),
+            "triton": ("SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE", 4096),
+        }
+        env_var, default_size = backend_sizes.get(
             self.server_args.attention_backend, (None, None)
         )
         self.truncation_align_size = (
@@ -801,9 +808,6 @@ class Scheduler(
                     self.tree_cache.cache_controller.layer_done_counter
                 )
             elif self.is_hybrid:
-                assert (
-                    self.server_args.disaggregation_mode == "null"
-                ), "Hybrid mode does not support disaggregation yet"
                 self.tree_cache = SWARadixCache(
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
@@ -813,9 +817,6 @@ class Scheduler(
                     is_eagle=self.spec_algorithm.is_eagle(),
                 )
             elif self.is_hybrid_gdn:
-                assert (
-                    self.server_args.disaggregation_mode == "null"
-                ), "Hybrid GDN mode does not support disaggregation yet"
                 self.tree_cache = MambaRadixCache(
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
@@ -846,7 +847,6 @@ class Scheduler(
                     disable=server_args.disable_radix_cache,
                     enable_kv_cache_events=self.enable_kv_cache_events,
                     eviction_policy=server_args.radix_eviction_policy,
-                    enable_deterministic_inference=server_args.enable_deterministic_inference,
                     is_eagle=self.spec_algorithm.is_eagle(),
                 )
 
@@ -2166,6 +2166,12 @@ class Scheduler(
         batch.prepare_for_decode()
         return batch
 
+    # placeholder for override
+    def update_cache_from_scheduler(
+        self, schedule_batch: ScheduleBatch, batch_result: GenerationBatchResult
+    ):
+        pass
+
     def run_batch(
         self, batch: ScheduleBatch
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
@@ -2242,6 +2248,7 @@ class Scheduler(
                     batch_or_worker_batch
                 )
                 future_indices_or_next_token_ids = batch_result.next_token_ids
+                self.update_cache_from_scheduler(batch, batch_result)
 
             # NOTE: future_indices_or_next_token_ids is used in ScheduleBatch,
             #       which can probably be replaced by future_indices later [TODO(lsyin)].
@@ -2332,6 +2339,7 @@ class Scheduler(
             speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
             require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),
             disable_overlap_schedule=self.server_args.disable_overlap_schedule,
+            offload_tags=self.offload_tags,
         )
 
     @staticmethod
@@ -2346,6 +2354,7 @@ class Scheduler(
         speculative_num_draft_tokens,
         require_mlp_tp_gather: bool,
         disable_overlap_schedule: bool,
+        offload_tags: set[str],
     ):
         # Check if other DP workers have running batches
         if local_batch is None:
@@ -2376,7 +2385,7 @@ class Scheduler(
         )
 
         tbo_preparer = TboDPAttentionPreparer()
-        if disable_overlap_schedule:
+        if len(offload_tags) == 0 and disable_overlap_schedule:
             group = tp_group.device_group
             device = tp_group.device
         else:
