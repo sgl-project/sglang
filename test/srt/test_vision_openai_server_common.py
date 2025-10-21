@@ -191,6 +191,7 @@ class ImageOpenAITestMixin(TestOpenAIMLLMServerBase):
                 {"role": "user", "content": content},
             ],
             temperature=0,
+            max_tokens=128,
             **(self.get_vision_request_kwargs()),
         )
 

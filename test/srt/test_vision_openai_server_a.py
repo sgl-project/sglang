@@ -136,11 +136,11 @@ class TestKimiVLServer(ImageOpenAITestMixin):
         pass
 
 
-# class TestGLM41VServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
-#     model = "zai-org/GLM-4.1V-9B-Thinking"
-#     extra_args = [
-#         "--reasoning-parser=glm45",
-#     ]
+class TestGLM41VServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
+    model = "zai-org/GLM-4.1V-9B-Thinking"
+    extra_args = [
+        "--reasoning-parser=glm45",
+    ]
 
 
 class TestQwen2AudioServer(AudioOpenAITestMixin):
