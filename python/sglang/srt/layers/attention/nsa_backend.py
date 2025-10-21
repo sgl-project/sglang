@@ -1199,8 +1199,8 @@ class NativeSparseAttnBackend(AttentionBackend):
             cu_seqlens_q = metadata.cu_seqlens_q
         else:
             cu_seqlens_q = metadata.cu_seqlens_q
-            cu_seqlens_k = metadata.cu_seqlens_k
-            max_seqlen_k = metadata.max_seq_len_k
+            cu_seqlens_k = metadata.cu_seqlens_q
+            max_seqlen_k = metadata.max_seq_len_q
             causal = True
 
         # Verify batch sizes match (length of cu_seqlens should be batch_size + 1)
