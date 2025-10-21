@@ -150,6 +150,12 @@ class RouterManager:
                     r = s.get(f"{base_url}/workers/{encoded_url}", timeout=2)
                     if r.status_code == 200:
                         data = r.json()
+                        # Check if registration job failed
+                        job_status = data.get("job_status")
+                        if job_status and job_status.get("state") == "failed":
+                            raise RuntimeError(
+                                f"Worker registration failed: {job_status.get('message', 'Unknown error')}"
+                            )
                         # Check if worker is healthy and registered (not just in job queue)
                         if data.get("is_healthy", False):
                             return
@@ -182,7 +188,15 @@ class RouterManager:
                     if r.status_code == 404:
                         # Worker successfully removed
                         return
-                    # Worker still exists or being processed, continue polling
+                    elif r.status_code == 200:
+                        # Check if removal job failed
+                        data = r.json()
+                        job_status = data.get("job_status")
+                        if job_status and job_status.get("state") == "failed":
+                            raise RuntimeError(
+                                f"Worker removal failed: {job_status.get('message', 'Unknown error')}"
+                            )
+                    # Worker still being processed, continue polling
                 except requests.RequestException:
                     pass
                 time.sleep(0.1)
