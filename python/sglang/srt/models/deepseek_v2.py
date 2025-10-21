@@ -415,16 +415,20 @@ def handle_attention_nsa(attn, forward_batch):
     if _is_extend_without_speculative(forward_batch):
         NSA_THRESHOLD = getattr(attn, "nsa_seq_len_threshold", 2048)
 
-        if forward_batch.extend_prefix_lens_cpu is not None and forward_batch.extend_seq_lens_cpu is not None:
+        if (
+            forward_batch.extend_prefix_lens_cpu is not None
+            and forward_batch.extend_seq_lens_cpu is not None
+        ):
             # Compute max_kv_len = max(prefix_len + extend_len) using CPU data
             max_kv_len = max(
-                p + e for p, e in zip(
+                p + e
+                for p, e in zip(
                     forward_batch.extend_prefix_lens_cpu,
-                    forward_batch.extend_seq_lens_cpu
+                    forward_batch.extend_seq_lens_cpu,
                 )
             )
         elif forward_batch.seq_lens_cpu is not None:
-            max_kv_len = max(forward_batch.seq_lens_cpu.tolist()) if isinstance(forward_batch.seq_lens_cpu, torch.Tensor) else max(forward_batch.seq_lens_cpu)
+            max_kv_len = forward_batch.seq_lens_cpu.max().item()
         else:
             max_kv_len = 0
 
