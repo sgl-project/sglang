@@ -137,9 +137,5 @@ docker run --rm \
     rm -rf CMakeLists.txt && mv CMakeLists_rocm.txt CMakeLists.txt && \
     ${PYTHON_ROOT_PATH}/python rocm_hipify.py && \
     ${PYTHON_ROOT_PATH}/python -m uv build --wheel -Cbuild-dir=build . --color=always --no-build-isolation && \
-
-   cd /sgl-kernel && \
-   /opt/venv/bin/python rocm_hipify.py && \
-   /opt/venv/bin/python -m uv build --wheel -Cbuild-dir=build . --color=always --no-build-isolation && \
    ./rename_wheels_rocm.sh
 "
