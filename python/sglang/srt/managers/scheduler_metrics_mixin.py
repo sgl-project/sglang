@@ -129,7 +129,7 @@ class SchedulerMetricsMixin:
             f"#cached-token: {adder.log_hit_tokens}, "
             f"{token_usage_msg}"
             f"#running-req: {running_bs}, "
-            f"#queue-req: {len(self.waiting_queue)}, "
+            f"#queue-size: {len(self.waiting_queue)}, "
         )
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -279,7 +279,7 @@ class SchedulerMetricsMixin:
         msg += (
             f"{'cuda graph' if self.device == 'cuda' else 'cpu graph'}: {can_run_cuda_graph}, "
             f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
-            f"#queue-req: {len(self.waiting_queue)}, "
+            f"#queue-size: {len(self.waiting_queue)}, "
         )
 
         logger.info(msg)
