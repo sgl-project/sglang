@@ -36,7 +36,11 @@ def _build_sglang_argv_from_env() -> list[str]:
 
     argv: list[str] = []
 
+    k2_preset = _env_truthy(os.environ.get("K2_PRESET"), False)
+
     model_path = _get_env_or_cfg("MODEL_PATH", cfg, ["model_id", "model_path"]) or ""
+    if not model_path and k2_preset:
+        model_path = "moonshotai/Kimi-K2-Instruct"
     if not model_path:
         raise RuntimeError("MODEL_PATH is required (or provide model_id in DEPLOYMENT_CONFIG_JSON)")
 
@@ -63,8 +67,17 @@ def _build_sglang_argv_from_env() -> list[str]:
 
     # Optional arguments (kept minimal, parity with native entrypoint)
     quantization = _get_env_or_cfg("QUANTIZATION", cfg, ["quantization"], None)
+    if not quantization and k2_preset:
+        quantization = "fp8"
     if quantization:
         argv += ["--quantization", str(quantization)]
+
+    # Context length (K2 and long-context models)
+    context_length = _get_env_or_cfg("CONTEXT_LENGTH", cfg, ["context_length", "max_context_length"], None)
+    if not context_length and k2_preset:
+        context_length = "8192"
+    if context_length:
+        argv += ["--context-length", str(context_length)]
 
     # Context length (K2 and long-context models)
     context_length = _get_env_or_cfg(
@@ -97,7 +110,7 @@ def _build_sglang_argv_from_env() -> list[str]:
     if chat_template:
         argv += ["--chat-template", str(chat_template)]
 
-    tool_call_parser = os.environ.get("TOOL_CALL_PARSER")
+    tool_call_parser = os.environ.get("TOOL_CALL_PARSER") or ("kimi_k2" if k2_preset else None)
     if tool_call_parser:
         argv += ["--tool-call-parser", str(tool_call_parser)]
 
@@ -119,7 +132,7 @@ def _build_sglang_argv_from_env() -> list[str]:
     # Metrics and trust-remote-code
     if _env_truthy(os.environ.get("ENABLE_METRICS"), True):
         argv += ["--enable-metrics"]
-    if _env_truthy(os.environ.get("TRUST_REMOTE_CODE"), False):
+    if _env_truthy(os.environ.get("TRUST_REMOTE_CODE"), False) or k2_preset:
         argv += ["--trust-remote-code"]
 
     # Memory saver (only if explicitly requested)

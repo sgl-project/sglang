@@ -72,6 +72,7 @@ export SPECULATIVE_NUM_STEPS="${SPECULATIVE_NUM_STEPS:-}"
 export DISAGGREGATION_DECODE_TP="${DISAGGREGATION_DECODE_TP:-}"
 export DISAGGREGATION_PREFILL_PP="${DISAGGREGATION_PREFILL_PP:-}"
 export HF_TOKEN="${HF_TOKEN:-}"
+export K2_PRESET="${K2_PRESET:-}"
 
 log "Launching Hathora SGLang"
 # Optional multi-node (K2) support
