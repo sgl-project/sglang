@@ -274,10 +274,15 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_to_swa_index_mapping[free_index] = 0
 
     def backup_state(self):
-        raise NotImplementedError
+        return [
+            self.full_attn_allocator.backup_state(),
+            self.swa_attn_allocator.backup_state(),
+        ]
 
     def restore_state(self, state):
-        raise NotImplementedError
+        assert len(state) == 2
+        self.full_attn_allocator.restore_state(state[0])
+        self.swa_attn_allocator.restore_state(state[1])
 
     def clear(self):
         self.swa_attn_allocator.clear()
@@ -493,7 +498,11 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)
 
-        num_new_pages = get_num_new_pages(prefix_lens_cpu, seq_lens_cpu, self.page_size)
+        num_new_pages = get_num_new_pages(
+            seq_lens=seq_lens_cpu,
+            page_size=self.page_size,
+            prefix_lens=prefix_lens_cpu,
+        )
         if num_new_pages > len(self.free_pages):
             return None
 
@@ -529,7 +538,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             assert len(torch.unique(out_indices)) == len(out_indices)
 
         num_new_pages = get_num_new_pages(
-            seq_lens_cpu - 1, seq_lens_cpu, self.page_size, decode=True
+            seq_lens=seq_lens_cpu,
+            page_size=self.page_size,
+            decode=True,
         )
         if num_new_pages > len(self.free_pages):
             return None

@@ -19,11 +19,13 @@ from compressed_tensors.quantization import (
 )
 from pydantic import BaseModel
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.base_config import (
     LinearMethodBase,
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.compressed_tensors import WNA16_SUPPORTED_BITS
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa: E501
     CompressedTensorsMoEMethod,
 )
@@ -38,6 +40,7 @@ from sglang.srt.layers.quantization.compressed_tensors.utils import (
     is_activation_quantization_format,
     should_ignore_layer,
 )
+from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
 try:
@@ -76,6 +79,7 @@ class DeviceCapability(NamedTuple):
 
 
 class CompressedTensorsConfig(QuantizationConfig):
+    DeepSeekFP8Config = None
 
     def __init__(
         self,
@@ -86,7 +90,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         sparsity_ignore_list: List[str],
         kv_cache_scheme: Optional[Dict[str, Any]] = None,
         config: Optional[Dict[str, Any]] = None,
-        packed_modules_mapping: Dict[str, List[str]] = {},
+        packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
     ):
         super().__init__()
         self.ignore = ignore
@@ -97,7 +101,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         self.sparsity_scheme_map = sparsity_scheme_map
         self.sparsity_ignore_list = sparsity_ignore_list
         self.config = config
-        self.packed_modules_mapping = packed_modules_mapping
+        self.packed_modules_mapping = packed_modules_mapping or {}
 
     def get_linear_method(self) -> CompressedTensorsLinearMethod:
         return CompressedTensorsLinearMethod(self)
@@ -129,6 +133,10 @@ class CompressedTensorsConfig(QuantizationConfig):
         ):
             return UnquantizedLinearMethod()
         if isinstance(layer, LinearBase):
+            if CompressedTensorsConfig.DeepSeekFP8Config is not None:
+                return Fp8LinearMethod(CompressedTensorsConfig.DeepSeekFP8Config)
+            if envs.SGLANG_KT_MOE_AMX_WEIGHT_PATH.is_set():
+                return UnquantizedLinearMethod()
             scheme = self.get_scheme(layer=layer, layer_name=prefix)
             if scheme is None:
                 return UnquantizedLinearMethod()
@@ -137,7 +145,8 @@ class CompressedTensorsConfig(QuantizationConfig):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, FusedMoE):
-            return CompressedTensorsMoEMethod.get_moe_method(self)
+            # Ktransformers use CompressedTensorsWNA16AMXMOEMethod if AMX weights are provided
+            return CompressedTensorsMoEMethod.get_moe_method(self, layer, prefix)
         return None
 
     @classmethod

@@ -133,6 +133,7 @@ class SchedulerStats:
     num_running_reqs: int = 0
     num_used_tokens: int = 0
     token_usage: float = 0.0
+    pending_prealloc_token_usage: float = 0.0
     swa_token_usage: float = 0.0
     gen_throughput: float = 0.0
     num_queue_reqs: int = 0
@@ -142,6 +143,7 @@ class SchedulerStats:
 
     # Speculative decoding
     spec_accept_length: float = 0.0
+    spec_accept_rate: float = 0.0
 
     # Retract
     num_retracted_reqs: int = 0
@@ -163,6 +165,9 @@ class SchedulerStats:
     engine_startup_time: float = 0.0
     engine_load_weights_time: float = 0.0
     new_token_ratio: float = 0.0
+
+    # CUDA graph
+    is_cuda_graph: float = 0.0
 
 
 class SchedulerMetricsCollector:
@@ -192,6 +197,12 @@ class SchedulerMetricsCollector:
         self.token_usage = Gauge(
             name="sglang:token_usage",
             documentation="The token usage.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.pending_prealloc_token_usage = Gauge(
+            name="sglang:pending_prealloc_token_usage",
+            documentation="The token usage for pending preallocated tokens (not preallocated yet).",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -236,6 +247,12 @@ class SchedulerMetricsCollector:
         self.spec_accept_length = Gauge(
             name="sglang:spec_accept_length",
             documentation="The average acceptance length of speculative decoding.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.spec_accept_rate = Gauge(
+            name="sglang:spec_accept_rate",
+            documentation="The average acceptance rate of speculative decoding (`accepted tokens / total draft tokens` in batch).",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -504,6 +521,13 @@ class SchedulerMetricsCollector:
             labelnames=list(labels.keys()) + ["stage"],
         )
 
+        self.is_cuda_graph = Gauge(
+            name="sglang:is_cuda_graph",
+            documentation="Whether the batch is using CUDA graph.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
         self.new_token_ratio = Gauge(
             name="sglang:new_token_ratio",
             documentation="The new token ratio.",
@@ -535,6 +559,9 @@ class SchedulerMetricsCollector:
         self._log_gauge(self.num_running_reqs, stats.num_running_reqs)
         self._log_gauge(self.num_used_tokens, stats.num_used_tokens)
         self._log_gauge(self.token_usage, stats.token_usage)
+        self._log_gauge(
+            self.pending_prealloc_token_usage, stats.pending_prealloc_token_usage
+        )
         self._log_gauge(self.swa_token_usage, stats.swa_token_usage)
         self._log_gauge(self.gen_throughput, stats.gen_throughput)
         self._log_gauge(self.num_queue_reqs, stats.num_queue_reqs)
@@ -546,6 +573,7 @@ class SchedulerMetricsCollector:
 
         # Speculative decoding
         self._log_gauge(self.spec_accept_length, stats.spec_accept_length)
+        self._log_gauge(self.spec_accept_rate, stats.spec_accept_rate)
 
         # PD disaggregation
         self._log_gauge(
@@ -560,7 +588,6 @@ class SchedulerMetricsCollector:
         self._log_gauge(
             self.num_decode_transfer_queue_reqs, stats.num_decode_transfer_queue_reqs
         )
-        self._log_gauge(self.new_token_ratio, stats.new_token_ratio)
         self._log_gauge(self.kv_transfer_speed_gb_s, stats.kv_transfer_speed_gb_s)
         self._log_gauge(self.kv_transfer_latency_ms, stats.kv_transfer_latency_ms)
 
@@ -583,6 +610,9 @@ class SchedulerMetricsCollector:
                 self.engine_load_weights_time, stats.engine_load_weights_time
             )
         self._log_gauge(self.new_token_ratio, stats.new_token_ratio)
+
+        # CUDA graph
+        self._log_gauge(self.is_cuda_graph, stats.is_cuda_graph)
 
         self.last_log_time = time.perf_counter()
 
@@ -837,13 +867,13 @@ class TokenizerMetricsCollector:
     def check_time_to_first_token_straggler(self, value: float) -> bool:
         his = self.histogram_time_to_first_token.labels(**self.labels)
         total_observations = sum(bucket._value for bucket in his._buckets)
-        if total_observations < 100:
+        if total_observations < 1000:
             return False
-        p99_threshold = total_observations * 0.99
+        p999_threshold = total_observations * 0.999
         cumulative_count = 0
         for i, bucket in enumerate(his._buckets):
             cumulative_count += bucket._value
-            if cumulative_count > p99_threshold:
+            if cumulative_count > p999_threshold:
                 return value >= his._upper_bounds[i]
         return False
 

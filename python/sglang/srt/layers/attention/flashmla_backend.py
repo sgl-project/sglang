@@ -201,9 +201,10 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 self.req_to_token.stride(0),
                 self.cuda_graph_kv_indices.stride(0),
             )
+            num_q_heads = self.num_q_heads * (self.num_draft_tokens or 1)
             mla_metadata, num_splits = get_mla_metadata(
                 seq_lens.to(torch.int32),
-                self.num_q_heads,
+                num_q_heads,
                 1,
             )
             self.cuda_graph_mla_metadata.copy_(mla_metadata)
@@ -275,9 +276,10 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 self.req_to_token.stride(0),
                 self.cuda_graph_kv_indices.stride(0),
             )
+            num_q_heads = self.num_q_heads * (self.num_draft_tokens or 1)
             mla_metadata, num_splits = get_mla_metadata(
                 seq_lens.to(torch.int32),
-                self.num_q_heads,
+                num_q_heads,
                 1,
             )
             self.cuda_graph_mla_metadata.copy_(mla_metadata)
@@ -476,7 +478,7 @@ class FlashMLAMultiStepDraftBackend:
         )
 
         self.attn_backends = []
-        for i in range(self.speculative_num_steps):
+        for i in range(self.speculative_num_steps - 1):
             self.attn_backends.append(
                 FlashMLABackend(
                     model_runner,
@@ -504,7 +506,7 @@ class FlashMLAMultiStepDraftBackend:
         self.common_template(forward_batch, call_fn)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
-        for i in range(self.speculative_num_steps):
+        for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_cuda_graph_state(
                 max_bs, max_num_tokens, block_kv_indices=None
             )
