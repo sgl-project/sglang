@@ -16,6 +16,10 @@ if __name__ == "__main__":
             from sglang.srt.entrypoints.grpc_server import serve_grpc
 
             asyncio.run(serve_grpc(server_args))
+        elif server_args.mm_only:
+            from sglang.srt.entrypoints.encode_server import launch_server
+
+            launch_server(server_args)
         else:
             # Handle HTTP server
             from sglang.srt.entrypoints.http_server import launch_server
