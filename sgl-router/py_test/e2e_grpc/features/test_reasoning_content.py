@@ -12,25 +12,24 @@ python3 -m unittest openai_server.features.test_reasoning_content.TestReasoningC
 import json
 import unittest
 
+import openai
+import requests
+
 # CHANGE: Import router launcher instead of server launcher
 import sys
 from pathlib import Path
 _TEST_DIR = Path(__file__).parent
 sys.path.insert(0, str(_TEST_DIR.parent))
 from fixtures import popen_launch_grpc_router
-
-
-import openai
-import requests
-
-from sglang.srt.utils import kill_process_tree
-from sglang.test.test_utils import (
-    DEFAULT_REASONING_MODEL_NAME_FOR_TEST,
+from util import (
+    CustomTestCase,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
-    CustomTestCase,
-    popen_launch_server,
+    kill_process_tree,
 )
+
+# Model constant (originally from sglang.test.test_utils)
+DEFAULT_REASONING_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
 
 
 class TestReasoningContentAPI(CustomTestCase):

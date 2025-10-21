@@ -18,20 +18,19 @@ import unittest
 import openai
 import requests
 
-from sglang.srt.utils import kill_process_tree
-from sglang.srt.utils.hf_transformers_utils import get_tokenizer
-from sglang.test.test_utils import (
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    DEFAULT_URL_FOR_TEST,
-    CustomTestCase,
-)
-
 # CHANGE: Import router launcher instead of server launcher
 import sys
 from pathlib import Path
 _TEST_DIR = Path(__file__).parent
 sys.path.insert(0, str(_TEST_DIR.parent))
 from fixtures import popen_launch_grpc_router
+from util import (
+    CustomTestCase,
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    DEFAULT_URL_FOR_TEST,
+    get_tokenizer,
+    kill_process_tree,
+)
 
 
 class TestOpenAIServer(CustomTestCase):
