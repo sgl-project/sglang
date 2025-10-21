@@ -739,6 +739,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 data_parallel_rank=obj.data_parallel_rank,
                 priority=obj.priority,
                 extra_key=obj.extra_key,
+                custom_labels=obj.custom_labels,
             )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(
@@ -1328,8 +1329,6 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 "finish_reason": recv_obj.finished_reasons[i],
                 "prompt_tokens": recv_obj.prompt_tokens[i],
                 "weight_version": self.server_args.weight_version,
-                "user_id": getattr(state.obj, "user_id", None),
-                "external_request_id": getattr(state.obj, "external_request_id", None),
             }
 
             if getattr(state.obj, "return_logprob", False):
@@ -1391,6 +1390,14 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     "embedding": recv_obj.embeddings[i],
                     "meta_info": meta_info,
                 }
+
+            # Add custom labels as top-level fields if enabled
+            if (
+                self.server_args.tokenizer_metrics_include_log_requests
+                and hasattr(state.obj, "custom_labels")
+                and state.obj.custom_labels
+            ):
+                out_dict.update(state.obj.custom_labels)
 
             state.finished = recv_obj.finished_reasons[i] is not None
             if state.finished:

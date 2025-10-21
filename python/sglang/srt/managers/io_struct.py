@@ -125,12 +125,6 @@ class GenerateReqInput(BaseReq):
     # Whether to return hidden states
     return_hidden_states: Union[List[bool], bool] = False
 
-    # The user ID for the request, as provided by external caller.
-    user_id: Optional[Union[List[str], str]] = None
-    # The request ID for the request, as provided by external caller.
-    # `rid` is a SGLang internal request ID, whereas `request_id` is the request ID provided by external caller.
-    external_request_id: Optional[Union[List[str], str]] = None
-
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
     # Session info for continual prompting
@@ -299,8 +293,6 @@ class GenerateReqInput(BaseReq):
         # Expand input based on type
         self._expand_inputs(num)
         self._normalize_rid(num)
-        self._normalize_external_request_id(num)
-        self._normalize_user_id(num)
         self._normalize_lora_paths(num)
         self._normalize_image_data(num)
         self._normalize_video_data(num)
@@ -425,40 +417,6 @@ class GenerateReqInput(BaseReq):
         else:
             raise ValueError("The rid should be a string or a list of strings.")
 
-    def _normalize_external_request_id(self, num):
-        """Normalize external request IDs for batch processing."""
-        if self.external_request_id is None:
-            self.external_request_id = [None] * num
-        elif isinstance(self.external_request_id, str):
-            self.external_request_id = [self.external_request_id] * num
-        elif isinstance(self.external_request_id, list):
-            if len(self.external_request_id) != self.batch_size:
-                raise ValueError(
-                    "The specified external_request_id length mismatch with the batch_size for batch processing."
-                )
-            self.external_request_id = (
-                self.external_request_id * self.parallel_sample_num
-            )
-        else:
-            raise ValueError(
-                "The external_request_id should be a string or a list of strings."
-            )
-
-    def _normalize_user_id(self, num):
-        """Normalize user_id for batch processing."""
-        if self.user_id is None:
-            self.user_id = [None] * num
-        elif isinstance(self.user_id, str):
-            self.user_id = [self.user_id] * num
-        elif isinstance(self.user_id, list):
-            if len(self.user_id) != self.batch_size:
-                raise ValueError(
-                    "The specified user_id length mismatch with the batch_size for batch processing."
-                )
-            self.user_id = self.user_id * self.parallel_sample_num
-        else:
-            raise ValueError("The user_id should be a string or a list of strings.")
-
     def _normalize_logprob_params(self, num):
         """Normalize logprob-related parameters for batch processing."""
 
@@ -572,12 +530,6 @@ class GenerateReqInput(BaseReq):
             return_text_in_logprobs=self.return_text_in_logprobs,
             stream=self.stream,
             log_metrics=self.log_metrics,
-            user_id=self.user_id[i] if self.user_id is not None else None,
-            external_request_id=(
-                self.external_request_id[i]
-                if self.external_request_id is not None
-                else None
-            ),
             return_hidden_states=(
                 self.return_hidden_states[i]
                 if isinstance(self.return_hidden_states, list)
@@ -678,6 +630,9 @@ class TokenizedGenerateReqInput(BaseReq):
     # tracing context
     trace_context: Optional[Dict] = None
 
+    # For custom metric labels
+    custom_labels: Optional[Dict[str, str]] = None
+
     # (Internal) Whether to return bytes for image generation
     return_bytes: bool = False
 
@@ -730,12 +685,6 @@ class EmbeddingReqInput(BaseReq):
     # For background responses (OpenAI responses API)
     background: bool = False
 
-    # The user ID for the request, as optionally provided by the external caller via `x-user-id` header field.
-    user_id: Optional[Union[List[str], str]] = None
-    # The external request ID for the request, as optionally provided by the external caller via `x-request-id` header field.
-    # This differs from `rid`, the SGLang internal request ID.
-    external_request_id: Optional[Union[List[str], str]] = None
-
     # tracing context
     trace_context: Optional[Dict] = None
 
@@ -782,28 +731,6 @@ class EmbeddingReqInput(BaseReq):
                 self.rid = [uuid.uuid4().hex for _ in range(self.batch_size)]
             else:
                 assert isinstance(self.rid, list), "The rid should be a list."
-
-            if self.external_request_id is None:
-                self.external_request_id = [
-                    f"unknown_request_id_{i}" for i in range(self.batch_size)
-                ]
-            elif isinstance(self.external_request_id, str):
-                self.external_request_id = [
-                    f"{self.external_request_id}_{i}" for i in range(self.batch_size)
-                ]
-            elif isinstance(self.external_request_id, list):
-                assert (
-                    len(self.external_request_id) == self.batch_size
-                ), "The external_request_id list length should match batch_size."
-
-            if self.user_id is None:
-                self.user_id = ["unknown_user"] * self.batch_size
-            elif isinstance(self.user_id, str):
-                self.user_id = [self.user_id] * self.batch_size
-            elif isinstance(self.user_id, list):
-                assert (
-                    len(self.user_id) == self.batch_size
-                ), "The user list length should match batch_size."
 
             if self.sampling_params is None:
                 self.sampling_params = [{}] * self.batch_size

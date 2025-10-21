@@ -244,6 +244,7 @@ class ServerArgs:
     enable_metrics_for_all_schedulers: bool = False
     tokenizer_metrics_custom_labels_header: str = "x-custom-labels"
     tokenizer_metrics_allowed_custom_labels: Optional[List[str]] = None
+    tokenizer_metrics_include_log_requests: bool = False
     bucket_time_to_first_token: Optional[List[float]] = None
     bucket_inter_token_latency: Optional[List[float]] = None
     bucket_e2e_request_latency: Optional[List[float]] = None
@@ -1771,6 +1772,13 @@ class ServerArgs:
             help="The custom labels allowed for tokenizer metrics. The labels are specified via a dict in "
             "'--tokenizer-metrics-custom-labels-header' field in HTTP requests, e.g., {'label1': 'value1', 'label2': "
             "'value2'} is allowed if '--tokenizer-metrics-allowed-custom-labels label1 label2' is set.",
+        )
+        parser.add_argument(
+            "--tokenizer-metrics-include-log-requests",
+            action="store_true",
+            default=ServerArgs.tokenizer_metrics_include_log_requests,
+            help="Include custom labels from headers in request-level logs (Finish: ...). "
+            "Requires --tokenizer-metrics-custom-labels-header and --tokenizer-metrics-allowed-custom-labels to be set.",
         )
         parser.add_argument(
             "--bucket-time-to-first-token",

@@ -60,8 +60,6 @@ class OpenAIServingCompletion(OpenAIServingBase):
         self,
         request: CompletionRequest,
         raw_request: Request = None,
-        user_id: Optional[str] = None,
-        external_request_id: Optional[str] = None,
     ) -> tuple[GenerateReqInput, CompletionRequest]:
         """Convert OpenAI completion request to internal format"""
         # NOTE: with openai API, the prompt's logprobs are always not computed
@@ -92,8 +90,10 @@ class OpenAIServingCompletion(OpenAIServingBase):
         else:
             prompt_kwargs = {"input_ids": prompt}
 
-        # Extract custom labels from raw request headers
-        custom_labels = self.extract_custom_labels(raw_request)
+        # Use custom labels passed from base class (extracted from headers if enabled)
+        # Fallback to extracting from raw request headers for backward compatibility
+        if custom_labels is None:
+            custom_labels = self.extract_custom_labels(raw_request)
 
         adapted_request = GenerateReqInput(
             **prompt_kwargs,
@@ -109,8 +109,6 @@ class OpenAIServingCompletion(OpenAIServingBase):
             bootstrap_room=request.bootstrap_room,
             return_hidden_states=request.return_hidden_states,
             rid=request.rid,
-            user_id=user_id,
-            external_request_id=external_request_id,
             extra_key=self._compute_extra_key(request),
             priority=request.priority,
             custom_labels=custom_labels,
