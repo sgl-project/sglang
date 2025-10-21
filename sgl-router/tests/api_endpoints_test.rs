@@ -976,7 +976,7 @@ mod router_policy_tests {
     #[tokio::test]
     async fn test_worker_selection() {
         let ctx = TestContext::new(vec![MockWorkerConfig {
-            port: 18203,
+            port: 18207,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
