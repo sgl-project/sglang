@@ -412,12 +412,11 @@ pub(super) fn send_mcp_list_tools_events(
     }
 
     // Event 2: response.mcp_list_tools.in_progress
-    let event2_payload = json!({
-        "type": event_types::MCP_LIST_TOOLS_IN_PROGRESS,
-        "sequence_number": *sequence_number,
-        "output_index": output_index,
-        "item_id": item_id
-    });
+    let event2_payload = crate::routers::common::mcp_events::build_mcp_list_tools_in_progress(
+        output_index,
+        item_id,
+        *sequence_number,
+    );
     *sequence_number += 1;
     let event2 = format!(
         "event: {}\ndata: {}\n\n",
@@ -429,12 +428,18 @@ pub(super) fn send_mcp_list_tools_events(
     }
 
     // Event 3: response.mcp_list_tools.completed
-    let event3_payload = json!({
-        "type": event_types::MCP_LIST_TOOLS_COMPLETED,
-        "sequence_number": *sequence_number,
-        "output_index": output_index,
-        "item_id": item_id
-    });
+    // Note: We need to extract the tools array from tools_item_full for the common builder
+    let tools_array = tools_item_full
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let event3_payload = crate::routers::common::mcp_events::build_mcp_list_tools_completed(
+        output_index,
+        item_id,
+        *sequence_number,
+        &tools_array,
+    );
     *sequence_number += 1;
     let event3 = format!(
         "event: {}\ndata: {}\n\n",
@@ -491,12 +496,11 @@ pub(super) fn send_mcp_call_completion_events_with_error(
         .unwrap_or("");
 
     // Event 1: response.mcp_call.completed
-    let completed_payload = json!({
-        "type": event_types::MCP_CALL_COMPLETED,
-        "sequence_number": *sequence_number,
-        "output_index": effective_output_index,
-        "item_id": item_id
-    });
+    let completed_payload = crate::routers::common::mcp_events::build_mcp_call_completed(
+        effective_output_index,
+        item_id,
+        *sequence_number,
+    );
     *sequence_number += 1;
 
     let completed_event = format!(

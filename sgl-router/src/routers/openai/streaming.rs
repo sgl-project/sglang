@@ -759,14 +759,15 @@ pub(super) fn forward_streaming_event(
                 };
 
                 // Emit a synthetic MCP arguments delta event before the done event
-                let mut delta_event = json!({
-                    "type": event_types::MCP_CALL_ARGUMENTS_DELTA,
-                    "sequence_number": *sequence_number,
-                    "output_index": assigned_index,
-                    "item_id": mcp_item_id,
-                    "delta": arguments_value,
-                });
+                let mut delta_event =
+                    crate::routers::common::mcp_events::build_mcp_call_arguments_delta(
+                        assigned_index,
+                        &mcp_item_id,
+                        *sequence_number,
+                        &arguments_value,
+                    );
 
+                // Add optional obfuscation field if present
                 if let Some(obfuscation) = call.last_obfuscation.as_ref() {
                     if let Some(obj) = delta_event.as_object_mut() {
                         obj.insert(
@@ -876,12 +877,13 @@ pub(super) fn forward_streaming_event(
                     item.get("id").and_then(|v| v.as_str()),
                     parsed_data.get("output_index").and_then(|v| v.as_u64()),
                 ) {
-                    let in_progress_event = json!({
-                        "type": event_types::MCP_CALL_IN_PROGRESS,
-                        "sequence_number": *sequence_number,
-                        "output_index": output_index,
-                        "item_id": item_id
-                    });
+                    // Use common MCP event builder
+                    let in_progress_event =
+                        crate::routers::common::mcp_events::build_mcp_call_in_progress(
+                            output_index as usize,
+                            item_id,
+                            *sequence_number,
+                        );
                     *sequence_number += 1;
                     let in_progress_block = format!(
                         "event: {}\ndata: {}\n\n",
