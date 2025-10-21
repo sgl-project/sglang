@@ -222,8 +222,8 @@ def popen_launch_workers_and_router(
 
     # Give workers a moment to start binding to ports
     # The router will check worker health when it starts
-    print(f"\nWaiting for {num_workers} workers to initialize (30s)...")
-    time.sleep(30)
+    print(f"\nWaiting for {num_workers} workers to initialize (20s)...")
+    time.sleep(20)
 
     # Quick check: make sure worker processes are still alive
     for i, worker in enumerate(workers):

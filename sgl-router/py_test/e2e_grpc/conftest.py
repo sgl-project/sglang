@@ -21,21 +21,6 @@ if str(_E2E_GRPC_DIR) not in sys.path:
     sys.path.insert(0, str(_E2E_GRPC_DIR))
 
 
-@pytest.fixture(scope="session")
-def e2e_model():
-    """Default model for e2e testing."""
-    # Override to use llama-3.1-8b-instruct instead of the small model
-    return "/home/ubuntu/models/llama-3.1-8b-instruct"
-
-
-@pytest.fixture(scope="session")
-def e2e_timeout():
-    """Default timeout for server launches."""
-    from util import DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
-
-    return DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
-
-
 # Pytest markers for test organization
 def pytest_configure(config):
     config.addinivalue_line("markers", "e2e: end-to-end tests with real workers")

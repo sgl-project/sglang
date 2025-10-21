@@ -136,6 +136,12 @@ jobs:
           pip install fastapi uvicorn orjson
           pytest -q -m integration
 
+      - name: Run Python E2E gRPC tests
+        run: |
+          bash scripts/killall_sglang.sh "nuk_gpus"
+          cd sgl-router
+          SHOW_ROUTER_LOGS=1 ROUTER_LOCAL_MODEL_PATH="/home/ubuntu/models" pytest py_test/e2e_grpc -s -vv -o log_cli=true --log-cli-level=INFO
+
       - name: Run Python E2E tests
         run: |
           bash scripts/killall_sglang.sh "nuk_gpus"
