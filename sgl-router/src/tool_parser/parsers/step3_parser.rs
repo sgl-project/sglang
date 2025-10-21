@@ -1,15 +1,17 @@
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use regex::Regex;
 use serde_json::Value;
-use std::collections::HashMap;
 
-use crate::protocols::common::Tool;
-
-use crate::tool_parser::{
-    errors::{ParserError, ParserResult},
-    parsers::helpers,
-    traits::ToolParser,
-    types::{FunctionCall, StreamingParseResult, ToolCall, ToolCallItem},
+use crate::{
+    protocols::common::Tool,
+    tool_parser::{
+        errors::{ParserError, ParserResult},
+        parsers::helpers,
+        traits::ToolParser,
+        types::{FunctionCall, StreamingParseResult, ToolCall, ToolCallItem},
+    },
 };
 
 /// Step3 format parser for tool calls

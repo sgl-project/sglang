@@ -8,19 +8,20 @@
 //! - Payload transformation for MCP tool interception
 //! - Metadata injection for MCP operations
 
-use crate::mcp::McpClientManager;
-use crate::protocols::responses::{
-    ResponseInput, ResponseTool, ResponseToolType, ResponsesRequest,
-};
-use crate::routers::header_utils::apply_request_headers;
+use std::{io, sync::Arc};
+
 use axum::http::HeaderMap;
 use bytes::Bytes;
 use serde_json::{json, to_value, Value};
-use std::{io, sync::Arc};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use super::utils::event_types;
+use crate::{
+    mcp::McpClientManager,
+    protocols::responses::{ResponseInput, ResponseTool, ResponseToolType, ResponsesRequest},
+    routers::header_utils::apply_request_headers,
+};
 
 // ============================================================================
 // Configuration and State Types

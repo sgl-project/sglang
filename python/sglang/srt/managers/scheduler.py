@@ -215,10 +215,10 @@ class GenerationBatchResult:
     delay_sample_func: Optional[callable] = None
     future_indices: Optional[FutureIndices] = None
 
-    # FIXME(lsyin): maybe move to <BetterPlace> ?
+    # FIXME(lsyin): maybe move to a better place?
     # sync path: forward stream -> output processor
     accept_lens: Optional[torch.Tensor] = None
-    last_batch_allocate_lens: Optional[torch.Tensor] = None
+    allocate_lens: Optional[torch.Tensor] = None
 
     # relay path: forward stream -> next step forward
     next_draft_input: Optional[EagleDraftInput] = None
@@ -246,10 +246,8 @@ class GenerationBatchResult:
         if self.accept_lens is not None:
             self.accept_lens = self.accept_lens.to("cpu", non_blocking=True)
 
-        if self.last_batch_allocate_lens is not None:
-            self.last_batch_allocate_lens = self.last_batch_allocate_lens.to(
-                "cpu", non_blocking=True
-            )
+        if self.allocate_lens is not None:
+            self.allocate_lens = self.allocate_lens.to("cpu", non_blocking=True)
 
         self.copy_done.record()
 
@@ -308,6 +306,9 @@ class Scheduler(
         self.dp_size = server_args.dp_size
         self.schedule_policy = server_args.schedule_policy
         self.enable_priority_scheduling = server_args.enable_priority_scheduling
+        self.abort_on_priority_when_disabled = (
+            server_args.abort_on_priority_when_disabled
+        )
         self.schedule_low_priority_values_first = (
             server_args.schedule_low_priority_values_first
         )
@@ -1562,7 +1563,11 @@ class Scheduler(
                 req.priority = sys.maxsize
             else:
                 req.priority = -sys.maxsize - 1
-        elif not self.enable_priority_scheduling and req.priority is not None:
+        elif (
+            not self.enable_priority_scheduling
+            and req.priority is not None
+            and self.abort_on_priority_when_disabled
+        ):
             abort_req = AbortReq(
                 finished_reason={
                     "type": "abort",
@@ -2168,6 +2173,12 @@ class Scheduler(
         batch.prepare_for_decode()
         return batch
 
+    # placeholder for override
+    def update_cache_from_scheduler(
+        self, schedule_batch: ScheduleBatch, batch_result: GenerationBatchResult
+    ):
+        pass
+
     def run_batch(
         self, batch: ScheduleBatch
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
@@ -2244,6 +2255,7 @@ class Scheduler(
                     batch_or_worker_batch
                 )
                 future_indices_or_next_token_ids = batch_result.next_token_ids
+                self.update_cache_from_scheduler(batch, batch_result)
 
             # NOTE: future_indices_or_next_token_ids is used in ScheduleBatch,
             #       which can probably be replaced by future_indices later [TODO(lsyin)].
@@ -2334,6 +2346,7 @@ class Scheduler(
             speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
             require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),
             disable_overlap_schedule=self.server_args.disable_overlap_schedule,
+            offload_tags=self.offload_tags,
         )
 
     @staticmethod
@@ -2348,6 +2361,7 @@ class Scheduler(
         speculative_num_draft_tokens,
         require_mlp_tp_gather: bool,
         disable_overlap_schedule: bool,
+        offload_tags: set[str],
     ):
         # Check if other DP workers have running batches
         if local_batch is None:
@@ -2378,7 +2392,7 @@ class Scheduler(
         )
 
         tbo_preparer = TboDPAttentionPreparer()
-        if disable_overlap_schedule:
+        if len(offload_tags) == 0 and disable_overlap_schedule:
             group = tp_group.device_group
             device = tp_group.device
         else:
