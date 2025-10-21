@@ -5,7 +5,7 @@ import logging
 import socket
 import threading
 from functools import cache
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -37,9 +37,6 @@ from sglang.srt.utils import (
     is_valid_ipv6_address,
     maybe_wrap_ipv6_address,
 )
-
-if TYPE_CHECKING:
-    from sglang.srt.disaggregation.mooncake.conn import TransferInfo
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +77,7 @@ class CommonKVManager(BaseKVManager):
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._register_to_bootstrap()
-            self.transfer_infos: Dict[int, Dict[str, TransferInfo]] = {}
+            self.transfer_infos = {}
             self.decode_kv_args_table = {}
             self.pp_group = get_pp_group()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
