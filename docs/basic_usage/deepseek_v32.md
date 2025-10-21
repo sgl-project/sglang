@@ -61,7 +61,7 @@ python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8 --ep
   - Currently we don't enable `prefill=flashmla_sparse` with `decode=flashmla_kv` due to latency caused by kv cache quantization operations. In the future we might shift to this setting after attention/quantization kernels are optimized.
 
 ### Multi-token Prediction
-SGLang implements Multi-Token Prediction (MTP) for DeepSeek V3.2 based on [EAGLE speculative decoding](https://docs.sglang.ai/advanced_features/speculative_decoding.html#EAGLE-Decoding). With this optimization, the decoding speed can be improved significantly on small batch sizes.
+SGLang implements Multi-Token Prediction (MTP) for DeepSeek V3.2 based on [EAGLE speculative decoding](https://docs.sglang.ai/advanced_features/speculative_decoding.html#EAGLE-Decoding). With this optimization, the decoding speed can be improved significantly on small batch sizes. Please look at [this PR](https://github.com/sgl-project/sglang/pull/11652) for more information.
 
 Example usage:
 ```bash
@@ -73,6 +73,50 @@ python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8 --dp
 
 # Function Calling and Reasoning Parser
 The usage of function calling and reasoning parser is the same as DeepSeek V3.1. Please refer to [Reasoning Parser](https://docs.sglang.ai/advanced_features/separate_reasoning.html) and [Tool Parser](https://docs.sglang.ai/advanced_features/tool_parser.html) documents.
+
+# PD Disaggregation
+
+Prefill Command:
+```bash
+python -m sglang.launch_server \
+        --model-path deepseek-ai/DeepSeek-V3.2-Exp \
+        --disaggregation-mode prefill \
+        --host $LOCAL_IP \
+        --port $PORT \
+        --tp 8 \
+        --dp 8 \
+        --enable-dp-attention \
+        --dist-init-addr ${HOST}:${DIST_PORT} \
+        --trust-remote-code \
+        --disaggregation-bootstrap-port 8998 \
+        --mem-fraction-static 0.9 \
+```
+
+Decode command:
+```bash
+python -m sglang.launch_server \
+        --model-path deepseek-ai/DeepSeek-V3.2-Exp \
+        --disaggregation-mode decode \
+        --host $LOCAL_IP \
+        --port $PORT \
+        --tp 8 \
+        --dp 8 \
+        --enable-dp-attention \
+        --dist-init-addr ${HOST}:${DIST_PORT} \
+        --trust-remote-code \
+        --mem-fraction-static 0.9 \
+```
+
+Router command:
+```bash
+python -m sglang_router.launch_router --pd-disaggregation \
+  --prefill $PREFILL_ADDR 8998 \
+  --decode $DECODE_ADDR \
+  --host 127.0.0.1 \
+  --port 8000 \
+```
+
+Please refer to [this PR](https://github.com/sgl-project/sglang/pull/10912) for more information.
 
 
 ## Benchmarking Results
