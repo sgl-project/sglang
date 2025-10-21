@@ -40,7 +40,7 @@ if TYPE_CHECKING:
         CombineInput,
     )
 
-from sglang.srt.utils import is_cuda, is_hip, is_xpu, is_npu
+from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
