@@ -14,7 +14,6 @@ use sglang_router_rs::{
     config::{
         CircuitBreakerConfig, ConnectionMode, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
     },
-    core::WorkerManager,
     routers::{RouterFactory, RouterTrait},
     server::AppContext,
 };
@@ -111,13 +110,6 @@ impl TestContext {
 
         // Create app context
         let app_context = common::create_test_context(config.clone());
-
-        // Initialize workers in the registry before creating router
-        if !worker_urls.is_empty() {
-            WorkerManager::initialize_workers(&config, &app_context.worker_registry, None)
-                .await
-                .expect("Failed to initialize workers");
-        }
 
         // Create router
         let router = RouterFactory::create_router(&app_context).await.unwrap();

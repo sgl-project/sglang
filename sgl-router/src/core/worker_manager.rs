@@ -6,8 +6,6 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use futures::future;
-use once_cell::sync::Lazy;
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::{
     sync::{watch, Mutex},
@@ -16,20 +14,9 @@ use tokio::{
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    config::types::{
-        ConnectionMode as ConfigConnectionMode,
-        HealthCheckConfig, RoutingMode,
-    },
-    core::{
-        BasicWorkerBuilder, CircuitBreakerConfig, ConnectionMode, DPAwareWorkerBuilder,
-        HealthConfig, WorkerFactory, WorkerRegistry, WorkerType,
-    },
-    grpc_client::SglangSchedulerClient,
+    core::{ConnectionMode, WorkerRegistry, WorkerType},
     policies::PolicyRegistry,
-    protocols::worker_spec::{
-        FlushCacheResult, WorkerConfigRequest, WorkerLoadInfo, WorkerLoadsResult,
-    },
-    server::AppContext,
+    protocols::worker_spec::{FlushCacheResult, WorkerLoadInfo, WorkerLoadsResult},
 };
 
 /// Unified worker management
