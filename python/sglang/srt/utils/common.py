@@ -56,6 +56,7 @@ from json import JSONDecodeError
 from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
 from typing import (
+    TYPE_CHECKING,
     Any,
     Callable,
     Dict,
@@ -91,8 +92,10 @@ from torch.utils._contextlib import _DecoratorContextManager
 from typing_extensions import Literal
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.quantization.base_config import QuantizeMethodBase
 from sglang.srt.metrics.func_timer import enable_func_timer
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.quantization.base_config import QuantizeMethodBase
 
 logger = logging.getLogger(__name__)
 
