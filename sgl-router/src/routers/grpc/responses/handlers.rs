@@ -24,8 +24,8 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
-use super::conversions;
 use super::{
+    conversions,
     streaming::ResponseStreamEventEmitter,
     tool_loop::{create_mcp_manager_from_request, execute_tool_loop, execute_tool_loop_streaming},
     types::BackgroundTaskInfo,
