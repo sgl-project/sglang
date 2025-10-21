@@ -40,14 +40,14 @@ class OpenAIServingBase(ABC):
         self, request: OpenAIServingRequest, raw_request: Request
     ) -> Union[Any, StreamingResponse, ErrorResponse]:
         """Handle the specific request type with common pattern"""
+        adapted_request: Optional[GenerateReqInput] = None
+        http_status: str = "200"  # Default to success
+
         try:
             # Validate request
             error_msg = self._validate_request(request)
             if error_msg:
-                # Increment received requests metric for validation failures
-                self._label_and_observe_one_received_request(
-                    raw_request, http_status="400"
-                )
+                http_status = "400"
                 return self.create_error_response(error_msg)
 
             # Convert to internal format
@@ -65,43 +65,40 @@ class OpenAIServingBase(ABC):
                     adapted_request, processed_request, raw_request
                 )
 
-            self._label_and_observe_one_received_request(
-                raw_request,
-                (
-                    adapted_request
-                    if isinstance(adapted_request, GenerateReqInput)
-                    else None
-                ),
-                http_status="200",
-            )
-
             return response
+
         except HTTPException as e:
-            error_response = self.create_error_response(
+            http_status = str(e.status_code)
+            return self.create_error_response(
                 message=e.detail, err_type=str(e.status_code), status_code=e.status_code
             )
-            self._label_and_observe_one_received_request(
-                raw_request,
-                http_status=str(e.status_code),
-            )
-            return error_response
+
         except ValueError as e:
-            error_response = self.create_error_response(
+            http_status = "400"
+            return self.create_error_response(
                 message=str(e),
                 err_type="BadRequest",
                 status_code=400,
             )
-            self._label_and_observe_one_received_request(raw_request, http_status="400")
-            return error_response
+
         except Exception as e:
+            http_status = "500"
             logger.exception(f"Error in request: {e}")
-            error_response = self.create_error_response(
+            return self.create_error_response(
                 message=f"Internal server error: {str(e)}",
                 err_type="InternalServerError",
                 status_code=500,
             )
-            self._label_and_observe_one_received_request(raw_request, http_status="500")
-            return error_response
+
+        finally:
+            adapted_for_metrics = (
+                adapted_request
+                if isinstance(adapted_request, GenerateReqInput)
+                else None
+            )
+            self._label_and_observe_one_received_request(
+                raw_request, adapted_for_metrics, http_status
+            )
 
     @abstractmethod
     def _request_id_prefix(self) -> str:
