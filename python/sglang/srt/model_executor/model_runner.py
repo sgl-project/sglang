@@ -772,7 +772,7 @@ class ModelRunner:
 
         # Register model for layerwise NVTX profiling if enabled
         if self.server_args.enable_layerwise_nvtx_marker:
-            self.pyt_hooks = PytHooks(debug=False)
+            self.pyt_hooks = PytHooks()
             self.pyt_hooks.register_hooks(self.model, module_prefix="model")
 
         if self.server_args.kv_cache_dtype == "fp8_e4m3":

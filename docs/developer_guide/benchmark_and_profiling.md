@@ -361,7 +361,7 @@ This method allows you to control exactly when profiling starts/stops via HTTP A
      --cuda-graph-trace=node \
      --capture-range=cudaProfilerApi \
      --capture-range-end=stop \
-     -o layerwise_profile.qdrep \
+     -o layerwise_profile \
      python -m sglang.launch_server \
        --model-path meta-llama/Llama-3.1-8B-Instruct \
        --enable-layerwise-nvtx-marker \
@@ -415,7 +415,7 @@ python -m sglang.launch_server \
 # Terminal 2: Profile the benchmarking client
 nsys profile --trace-fork-before-exec=true \
   --cuda-graph-trace=node \
-  -o layerwise_profile.qdrep \
+  -o layerwise_profile \
   python -m sglang.bench_serving --backend sglang --num-prompts 10
 ```
 
