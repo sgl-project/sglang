@@ -8,6 +8,7 @@ import torch
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.managers.diffusion_handler import diffusion_generation, is_rnd1_model
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOutput,
@@ -81,98 +82,117 @@ class SchedulerOutputProcessorMixin:
 
                 if self.is_mixed_chunk and self.enable_overlap and req.finished():
                     # Free the one delayed token for the mixed decode batch
-                    j = len(batch.out_cache_loc) - len(batch.reqs) + i
-                    self.token_to_kv_pool_allocator.free(batch.out_cache_loc[j : j + 1])
+                    # Diffusion sampling: generate all tokens at once, skip autoregressive
+                    if batch.out_cache_loc is not None and not is_rnd1_model(self):
+                        j = len(batch.out_cache_loc) - len(batch.reqs) + i
+                        self.token_to_kv_pool_allocator.free(
+                            batch.out_cache_loc[j : j + 1]
+                        )
                     continue
 
                 if req.is_chunked <= 0:
-                    # req output_ids are set here
-                    req.output_ids.append(next_token_id)
-                    req.check_finished()
+
+                    if is_rnd1_model(self) and len(req.output_ids) == 0:
+                        # For RND1/diffusion models, skip the first auto-generated token and use diffusion instead
+                        # Generate all tokens using diffusion sampling (don't include next_token_id)
+                        generated_tokens = diffusion_generation(self, req)
+                        # Add all generated tokens to output
+                        req.output_ids.extend(generated_tokens)
+                        req.check_finished()
+                        # RND1 doesn't use KV cache - no allocation/freeing needed
+                    else:
+                        # Standard autoregressive: add the next token
+                        req.output_ids.append(next_token_id)
+                        req.check_finished()
 
                     if req.finished():
-                        self.tree_cache.cache_finished_req(req)
+                        # Skip tree caching for RND1 (no KV cache to store)
+                        if is_rnd1_model(self):
+                            # For RND1, manually free req_pool_idx since we skip tree caching
+                            if req.req_pool_idx is not None:
+                                self.req_to_token_pool.free(req.req_pool_idx)
+                        else:
+                            self.tree_cache.cache_finished_req(req)
                         req.time_stats.completion_time = time.perf_counter()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         # This updates radix so others can match
-                        self.tree_cache.cache_unfinished_req(req)
+                        if not is_rnd1_model(self):
+                            self.tree_cache.cache_unfinished_req(req)
+            # RND1 doesn't use KV cache - no allocation/freeing needed
 
-                    if batch.return_logprob:
-                        assert extend_logprob_start_len_per_req is not None
-                        assert extend_input_len_per_req is not None
-                        extend_logprob_start_len = extend_logprob_start_len_per_req[i]
-                        extend_input_len = extend_input_len_per_req[i]
+            if batch.return_logprob:
+                assert extend_logprob_start_len_per_req is not None
+                assert extend_input_len_per_req is not None
+                extend_logprob_start_len = extend_logprob_start_len_per_req[i]
+                extend_input_len = extend_input_len_per_req[i]
 
+                num_input_logprobs = self._calculate_num_input_logprobs(
+                    req, extend_input_len, extend_logprob_start_len
+                )
+
+                if req.return_logprob:
+                    self.add_logprob_return_values(
+                        i,
+                        req,
+                        logprob_pt,
+                        next_token_ids,
+                        num_input_logprobs,
+                        logits_output,
+                    )
+                logprob_pt += num_input_logprobs
+
+            if req.return_hidden_states and logits_output.hidden_states is not None:
+                req.hidden_states.append(
+                    logits_output.hidden_states[
+                        hidden_state_offset : (
+                            hidden_state_offset := hidden_state_offset
+                            + len(req.origin_input_ids)
+                        )
+                    ]
+                    .cpu()
+                    .clone()
+                    .tolist()
+                )
+
+            if req.grammar is not None:
+                # FIXME: this try-except block is for handling unexpected xgrammar issue.
+                try:
+                    req.grammar.accept_token(next_token_id)
+                except ValueError as e:
+                    # Grammar accept_token can raise ValueError if the token is not in the grammar.
+                    # This can happen if the grammar is not set correctly or the token is invalid.
+                    logger.error(
+                        f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
+                    )
+                    self.abort_request(AbortReq(rid=req.rid))
+                req.grammar.finished = req.finished()
+            else:
+                # being chunked reqs' prefill is not finished
+                req.is_chunked -= 1
+                # There is only at most one request being currently chunked.
+                # Because this request does not finish prefill,
+                # we don't want to stream the request currently being chunked.
+                skip_stream_req = req
+
+                # Incrementally update input logprobs.
+                if batch.return_logprob:
+                    extend_logprob_start_len = extend_logprob_start_len_per_req[i]
+                    extend_input_len = extend_input_len_per_req[i]
+                    if extend_logprob_start_len < extend_input_len:
+                        # Update input logprobs.
                         num_input_logprobs = self._calculate_num_input_logprobs(
                             req, extend_input_len, extend_logprob_start_len
                         )
-
                         if req.return_logprob:
-                            self.add_logprob_return_values(
+                            self.add_input_logprob_return_values(
                                 i,
                                 req,
-                                logprob_pt,
-                                next_token_ids,
-                                num_input_logprobs,
                                 logits_output,
+                                logprob_pt,
+                                num_input_logprobs,
+                                last_prefill_chunk=False,
                             )
                         logprob_pt += num_input_logprobs
-
-                    if (
-                        req.return_hidden_states
-                        and logits_output.hidden_states is not None
-                    ):
-                        req.hidden_states.append(
-                            logits_output.hidden_states[
-                                hidden_state_offset : (
-                                    hidden_state_offset := hidden_state_offset
-                                    + len(req.origin_input_ids)
-                                )
-                            ]
-                            .cpu()
-                            .clone()
-                            .tolist()
-                        )
-
-                    if req.grammar is not None:
-                        # FIXME: this try-except block is for handling unexpected xgrammar issue.
-                        try:
-                            req.grammar.accept_token(next_token_id)
-                        except ValueError as e:
-                            # Grammar accept_token can raise ValueError if the token is not in the grammar.
-                            # This can happen if the grammar is not set correctly or the token is invalid.
-                            logger.error(
-                                f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
-                            )
-                            self.abort_request(AbortReq(rid=req.rid))
-                        req.grammar.finished = req.finished()
-                else:
-                    # being chunked reqs' prefill is not finished
-                    req.is_chunked -= 1
-                    # There is only at most one request being currently chunked.
-                    # Because this request does not finish prefill,
-                    # we don't want to stream the request currently being chunked.
-                    skip_stream_req = req
-
-                    # Incrementally update input logprobs.
-                    if batch.return_logprob:
-                        extend_logprob_start_len = extend_logprob_start_len_per_req[i]
-                        extend_input_len = extend_input_len_per_req[i]
-                        if extend_logprob_start_len < extend_input_len:
-                            # Update input logprobs.
-                            num_input_logprobs = self._calculate_num_input_logprobs(
-                                req, extend_input_len, extend_logprob_start_len
-                            )
-                            if req.return_logprob:
-                                self.add_input_logprob_return_values(
-                                    i,
-                                    req,
-                                    logits_output,
-                                    logprob_pt,
-                                    num_input_logprobs,
-                                    last_prefill_chunk=False,
-                                )
-                            logprob_pt += num_input_logprobs
 
         else:  # embedding or reward model
             embeddings = result.embeddings.tolist()
@@ -272,7 +292,9 @@ class SchedulerOutputProcessorMixin:
                     ][start_p:end_p]
 
                 else:
-                    if self.page_size == 1:
+                    if is_rnd1_model(self):
+                        pass  # rnd1 doesn't support KV cache yet
+                    elif self.page_size == 1:
                         # Free the one extra delayed token
                         indices_to_free = batch.out_cache_loc[i : i + 1]
                     else:

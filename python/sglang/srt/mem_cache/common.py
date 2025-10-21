@@ -341,39 +341,59 @@ def alloc_for_extend(
     req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
     req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
 
-    # Allocate KV cache (throws exception on failure)
-    if batch.tree_cache.page_size == 1:
-        out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
-    else:
-        # Paged allocation - build last_loc
-        last_loc = [
-            (t[-1:] if len(t) > 0 else torch.tensor([-1], device=batch.device))
-            for t in prefix_tensors
-        ]
-        out_cache_loc = alloc_paged_token_slots_extend(
-            tree_cache=batch.tree_cache,
-            prefix_lens=prefix_lens_device,
-            prefix_lens_cpu=prefix_lens_cpu,
-            seq_lens=batch.seq_lens,
-            seq_lens_cpu=batch.seq_lens_cpu,
-            last_loc=torch.cat(last_loc),
-            extend_num_tokens=batch.extend_num_tokens,
-        )
-
-    # Write to req_to_token_pool
-    write_cache_indices(
-        out_cache_loc,
-        req_pool_indices_device,
-        req_pool_indices_cpu,
-        prefix_lens_device,
-        prefix_lens_cpu,
-        batch.seq_lens,
-        batch.seq_lens_cpu,
-        extend_lens_device,
-        extend_lens_cpu,
-        prefix_tensors,
-        batch.req_to_token_pool,
+    # Special-case: RND1 is bidirectional and does not use KV cache.
+    # We still allocate req_pool_indices (above) but skip token KV allocations
+    # by returning an empty out_cache_loc and not writing cache indices.
+    is_rnd1 = (
+        getattr(batch, "model_config", None) is not None
+        and hasattr(batch.model_config, "hf_text_config")
+        and getattr(batch.model_config.hf_text_config, "model_type", None) == "rnd1"
     )
+
+    if is_rnd1:
+        # Provide a dummy out_cache_loc with the correct length to satisfy downstream
+        # components (e.g., cuda graph runner), but do not actually allocate KV cache.
+        out_cache_loc = torch.full(
+            (batch.extend_num_tokens,), -1, dtype=torch.int64, device=batch.device
+        )
+    else:
+        # Allocate KV cache (throws exception on failure)
+        if batch.tree_cache.page_size == 1:
+            out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
+        else:
+            # Paged allocation - build last_loc
+            last_loc = [
+                (
+                    t[-1:]
+                    if len(t) > 0
+                    else torch.tensor([-1], device=batch.tree_cache.device)
+                )
+                for t in prefix_tensors
+            ]
+            out_cache_loc = alloc_paged_token_slots_extend(
+                tree_cache=batch.tree_cache,
+                prefix_lens=prefix_lens_device,
+                prefix_lens_cpu=prefix_lens_cpu,
+                seq_lens=batch.seq_lens,
+                seq_lens_cpu=batch.seq_lens_cpu,
+                last_loc=torch.cat(last_loc),
+                extend_num_tokens=batch.extend_num_tokens,
+            )
+
+        # Write to req_to_token_pool
+        write_cache_indices(
+            out_cache_loc,
+            req_pool_indices_device,
+            req_pool_indices_cpu,
+            prefix_lens_device,
+            prefix_lens_cpu,
+            batch.seq_lens,
+            batch.seq_lens_cpu,
+            extend_lens_device,
+            extend_lens_cpu,
+            prefix_tensors,
+            batch.req_to_token_pool,
+        )
 
     return out_cache_loc, req_pool_indices_device, req_pool_indices
 
@@ -420,24 +440,38 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
                 req, req.seqlen - 1, batch.model_config.attention_chunk_size
             )
 
-    bs = batch.seq_lens.shape[0]
+    # RND1: do not allocate KV cache during decode
+    is_rnd1 = (
+        getattr(batch, "model_config", None) is not None
+        and hasattr(batch.model_config, "hf_text_config")
+        and getattr(batch.model_config.hf_text_config, "model_type", None) == "rnd1"
+    )
 
-    if batch.tree_cache.page_size == 1:
-        # Non-paged allocation
-        out_cache_loc = alloc_token_slots(batch.tree_cache, bs * token_per_req)
-    else:
-        # Paged allocation
-        last_loc = batch.req_to_token_pool.req_to_token[
-            batch.req_pool_indices, batch.seq_lens - 1
-        ]
-        seq_lens_next = batch.seq_lens + token_per_req
-        out_cache_loc = alloc_paged_token_slots_decode(
-            tree_cache=batch.tree_cache,
-            seq_lens=seq_lens_next,
-            seq_lens_cpu=batch.seq_lens_cpu + token_per_req,
-            last_loc=last_loc,
-            token_per_req=token_per_req,
+    if is_rnd1:
+        # Provide a dummy out_cache_loc with the correct length to satisfy downstream
+        bs = batch.seq_lens.shape[0]
+        out_cache_loc = torch.full(
+            (bs * token_per_req,), -1, dtype=torch.int64, device=batch.device
         )
+    else:
+        bs = batch.seq_lens.shape[0]
+
+        if batch.tree_cache.page_size == 1:
+            # Non-paged allocation
+            out_cache_loc = alloc_token_slots(batch.tree_cache, bs * token_per_req)
+        else:
+            # Paged allocation
+            last_loc = batch.req_to_token_pool.req_to_token[
+                batch.req_pool_indices, batch.seq_lens - 1
+            ]
+            seq_lens_next = batch.seq_lens + token_per_req
+            out_cache_loc = alloc_paged_token_slots_decode(
+                tree_cache=batch.tree_cache,
+                seq_lens=seq_lens_next,
+                seq_lens_cpu=batch.seq_lens_cpu + token_per_req,
+                last_loc=last_loc,
+                token_per_req=token_per_req,
+            )
 
     # Write to req_to_token_pool
     if batch.model_config.is_encoder_decoder:
@@ -445,9 +479,11 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     else:
         locs = batch.seq_lens.clone()
 
-    batch.req_to_token_pool.write(
-        (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
-    )
+    # Only write indices when we actually allocated real KV cache locations
+    if out_cache_loc.numel() > 0 and (out_cache_loc >= 0).any():
+        batch.req_to_token_pool.write(
+            (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
+        )
 
     return out_cache_loc
 
