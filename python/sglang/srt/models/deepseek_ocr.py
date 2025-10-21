@@ -28,7 +28,6 @@ from torch import Tensor, nn
 from transformers.models.vitdet.modeling_vitdet import get_rel_pos
 
 from sglang.srt.configs.deepseek_ocr import (
-    PRINT_NUM_VIS_TOKENS,
     DeepseekVLV2Config,
 )
 from sglang.srt.layers.quantization import QuantizationConfig
@@ -294,12 +293,12 @@ class MlpProjector(nn.Module):
             x = x.permute(0, 3, 1, 2)
             patches = x.unfold(2, 2, 2).unfold(3, 2, 2)
             batch_size, channels, h_patches, w_patches, _, _ = patches.size()
-            # 在通道维度上拼接
+            # Concatenate on channel dimension
             patches = patches.contiguous().view(
                 batch_size, channels, h_patches * w_patches, -1
             )
 
-            # 通过线性层
+            # Pass through linear layer
             patches = patches.permute(0, 2, 1, 3).contiguous()
             patches = patches.view(batch_size, h_patches * w_patches, channels * 4)
 
@@ -810,7 +809,6 @@ def _build_sam(
     prompt_embed_dim = 256
     image_size = 1024
     vit_patch_size = 16
-    image_embedding_size = image_size // vit_patch_size
     image_encoder = ImageEncoderViT(
         depth=encoder_depth,
         embed_dim=encoder_embed_dim,
@@ -1062,7 +1060,7 @@ class NoTPTransformer(nn.Module):
         hidden_states,
     ):
 
-        for lid, layer in enumerate(self.layers):
+        for layer in self.layers:
             hidden_states = layer(hidden_states)
 
         return hidden_states
@@ -1079,7 +1077,7 @@ class VitModel(nn.Module):
         )
 
         if freeze_embed:
-            for name, param in self.embeddings.named_parameters():
+            for _, param in self.embeddings.named_parameters():
                 param.requires_grad = False
 
         self.transformer = NoTPTransformer(cfg=cfg)
@@ -1097,7 +1095,7 @@ class VitModel(nn.Module):
             )
 
         if freeze_pre_norm:
-            for name, param in self.pre_layrnorm.named_parameters():
+            for _, param in self.pre_layrnorm.named_parameters():
                 param.requires_grad = False
 
         for p in self.parameters():
@@ -1170,7 +1168,6 @@ class DeepseekOCRForCausalLM(nn.Module):
         self.text_config = config.text_config
 
         n_embed = 1280
-        downsample_ratio: int = 4
 
         self.tile_tag = config.tile_tag
         self.global_view_pos = config.global_view_pos
@@ -1431,7 +1428,6 @@ class DeepseekOCRForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        get_embedding: bool = False,
         **kwargs: object,
     ):
         hidden_states = general_mm_embed_routine(
