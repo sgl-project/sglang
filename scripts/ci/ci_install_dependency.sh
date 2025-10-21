@@ -96,14 +96,6 @@ if [ "$RUN_DEEPSEEK_V32" = "1" ]; then
     git submodule update --init --recursive
     FLASH_MLA_DISABLE_SM100=${FLASH_MLA_DISABLE_SM100} $PIP_CMD install -v . $PIP_INSTALL_SUFFIX --no-build-isolation
     cd ..
-
-    # Install fast-hadamard-transform
-    FAST_HADAMARD_TRANSFORM_COMMIT="7fd811c2b47f63b0b08d2582619f939e14dad77c"
-    git clone https://github.com/Dao-AILab/fast-hadamard-transform
-    cd fast-hadamard-transform
-    git checkout ${FAST_HADAMARD_TRANSFORM_COMMIT}
-    $PIP_CMD install . $PIP_INSTALL_SUFFIX --no-build-isolation
-    cd ..
 fi
 
 # Show current packages
