@@ -2103,8 +2103,12 @@ class MultiprocessingSerializer:
             data = pybase64.b64decode(data, validate=True)
 
         class SafeUnpickler(pickle.Unpickler):
-            @staticmethod
-            def find_class(module, name):
+            def find_class(self, module, name):
+                # Allowlist of safe-to-load modules.
+                if module.startswith(("torch", "collections")):
+                    return super().find_class(module, name)
+
+                # Block everything else.
                 raise RuntimeError(
                     f"Blocked unsafe class loading ({module}.{name}), "
                     f"to prevent exploitation of CVE-2025-10164"
