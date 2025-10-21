@@ -107,7 +107,36 @@ impl RouterManager {
                 }
             }
 
-            // TODO: Add gRPC routers once we have dynamic tokenizer loading
+            match RouterFactory::create_grpc_router(app_context).await {
+                Ok(grpc_regular) => {
+                    info!("Created gRPC Regular router");
+                    manager.register_router(
+                        RouterId::new("grpc-regular".to_string()),
+                        Arc::from(grpc_regular),
+                    );
+                }
+                Err(e) => {
+                    warn!("Failed to create gRPC Regular router: {e}");
+                }
+            }
+
+            match RouterFactory::create_grpc_pd_router(
+                None,
+                None,
+                &config.router_config.policy,
+                app_context,
+            )
+            .await
+            {
+                Ok(grpc_pd) => {
+                    info!("Created gRPC PD router");
+                    manager
+                        .register_router(RouterId::new("grpc-pd".to_string()), Arc::from(grpc_pd));
+                }
+                Err(e) => {
+                    warn!("Failed to create gRPC PD router: {e}");
+                }
+            }
 
             info!(
                 "RouterManager initialized with {} routers for multi-router mode",
