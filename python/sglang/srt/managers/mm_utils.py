@@ -35,8 +35,6 @@ _is_npu = is_npu()
 # cuda_ipc: for intranode tensor sharing
 TensorTransportMode = Literal["cuda_ipc", "auto", "default"]
 
-import traceback
-
 class TransportProxyTensor(torch.Tensor):
     """
     A convenient torch.Tensor subclass that carries extra metadata and supports
@@ -79,8 +77,6 @@ class TransportProxyTensor(torch.Tensor):
             "tensor_data": None,
             "ipc_extra": None,
         }
-        # print("get_state trace back---------->")
-        # traceback.print_stack()
         transport_mode = self._metadata.get("transport_mode", "default")
 
         if transport_mode == "cuda_ipc" and self.is_cuda:
@@ -111,8 +107,6 @@ class TransportProxyTensor(torch.Tensor):
         """
         Called during unpickling. Implements the deserialization logic.
         """
-        # print("set_state trace back---------->")
-        # traceback.print_stack()
         self._metadata = state["metadata"]
 
         transport_mode = self._metadata.get("transport_mode", "default")

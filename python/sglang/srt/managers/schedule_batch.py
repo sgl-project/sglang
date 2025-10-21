@@ -159,17 +159,10 @@ class MmItemMemoryPool:
         
   
     def return_a_slice_tensor(self, src_tensor : torch.Tensor):
-        self.print_available_chunk()
-        self.print_occupied_chunk()
         self.recyle_chunks()
         self.merge_chunks()
-        self.print_available_chunk()
-        self.print_occupied_chunk()
         available_chunk =  self.get_available_chunk(src_tensor)
-        print("src tensor shape {}. src tensor dtype {}  available_chunk {}".format(src_tensor.shape, src_tensor.dtype, available_chunk))
-        self.print_available_chunk()
-        self.print_occupied_chunk()
-        
+        # logger.info("src tensor shape {}. src tensor dtype {}  available_chunk {}".format(src_tensor.shape, src_tensor.dtype, available_chunk))
         if available_chunk:
             return self.memory_pool[available_chunk[0]: available_chunk[1]]
         
@@ -181,12 +174,11 @@ class MmItemMemoryPool:
         for chunk in self.occupied_chunks:
             accessed_tensor = self.memory_pool[chunk[0] : chunk[1]]
             if  torch.equal(accessed_tensor[-MM_ITEM_VERIFY_BYTES:], self.verify_tensor):
-                print("can recyle")
                 self.occupied_chunks.remove(chunk)
                 self.available_chunks.append(chunk)
-            else:
-                print("can not recyle")
-                print(accessed_tensor[-MM_ITEM_VERIFY_BYTES:])
+            # else:
+            #     logger.info("can not recyle")
+            #     logger.info(accessed_tensor[-MM_ITEM_VERIFY_BYTES:])
       
                 
                 
@@ -207,17 +199,17 @@ class MmItemMemoryPool:
         self.available_chunks = merged_chunks
         
     def print_available_chunk(self, des : str = ""):
-        print("check available chunks @ {}:----->".format(des))
+        logger.info("check available chunks @ {}:----->".format(des))
         for chunk in self.available_chunks:
-            print("[{}, {}]".format(chunk[0], chunk[1]))
+            logger.info("[{}, {}]".format(chunk[0], chunk[1]))
         
-        print("-----------check finish------------")
+        logger.info("-----------check finish------------")
     
     def print_occupied_chunk(self, des: str = ""):
-        print("occupied chunks @ {}:----->".format(des))
+        logger.info("occupied chunks @ {}:----->".format(des))
         for chunk in self.occupied_chunks:
-            print("[{}, {}]".format(chunk[0], chunk[1]))
-        print("-----------check finish------------")
+            logger.info("[{}, {}]".format(chunk[0], chunk[1]))
+        logger.info("-----------check finish------------")
 
 class BaseFinishReason:
     def __init__(self, is_error: bool = False):
@@ -354,7 +346,7 @@ class CudaIpcTensorTransportProxy:
                     slice_tensor[-MM_ITEM_VERIFY_BYTES:]*=0 
                     
             except Exception as e:
-                print(f"Error: Failed to deserialize from CUDA IPC handle ({e}).")
+                logger.info(f"Error: Failed to deserialize from CUDA IPC handle ({e}).")
                 raise e
         elif isinstance(self.proxy_state["tensor_data"], torch.Tensor):
             reconstructed_tensor = self.proxy_state["tensor_data"].to(rebuild_device, non_blocking= True)
@@ -1414,7 +1406,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 continue
             for mm_item in mm_input.mm_items:
                 pixel_values = getattr(mm_item, "feature", None)
-                # print("pixel_value.device :{} vs self.device {}".format(pixel_values.device, torch.cuda.current_device()))
+                # logger.info("pixel_value.device :{} vs self.device {}".format(pixel_values.device, torch.cuda.current_device()))
                 if isinstance(pixel_values, torch.Tensor):
                     mm_item.feature = pixel_values.to(self.device, non_blocking=True)
                 elif isinstance(pixel_values, CudaIpcTensorTransportProxy):

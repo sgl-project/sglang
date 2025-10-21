@@ -19,7 +19,7 @@ from sglang.srt.utils import is_npu, load_audio, load_image, load_video, logger
 
 _is_npu = is_npu()
 
-SGL_USE_CUDA_IPC = 0
+SGL_USE_CUDA_IPC = 1
 
 @dataclasses.dataclass
 class BaseMultiModalProcessorOutput:

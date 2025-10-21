@@ -405,28 +405,14 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         async with self.is_pause_cond:
             await self.is_pause_cond.wait_for(lambda: not self.is_pause)
         
-        show_time  = lambda x,y,z : print("{} cost {} ms".format(z, (y-x) * 1000)) 
         async with self.model_update_lock.reader_lock:
             if self.server_args.enable_lora and obj.lora_path:
                 # Look up the LoRA ID from the registry and start tracking ongoing LoRA requests.
                 obj.lora_id = await self.lora_registry.acquire(obj.lora_path)
 
             if obj.is_single:
-                s_time = time.time()
                 tokenized_obj = await self._tokenize_one_request(obj)
-                e_time = time.time()
-                show_time(s_time, e_time, "tokenize")
-                
-                s_time = time.time()
-                # print("obj.  {}".format(obj))
-                try:
-                    print("tokenized_obj {}".format(type(tokenized_obj.mm_inputs['mm_items'][0].feature)))
-                except:
-                    pass
-                state = self._send_one_request(obj, tokenized_obj, created_time)
-                e_time = time.time()
-                show_time(s_time, e_time, "send_one_request")
-                
+                state = self._send_one_request(obj, tokenized_obj, created_time)                
                 async for response in self._wait_one_response(obj, state, request):
                     yield response
             else:
@@ -839,10 +825,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
     ):
         trace_slice_start("dispatch", obj.rid)
         tokenized_obj.trace_context = trace_get_proc_propagate_context(obj.rid)
-        s_time = time.time()
         self.send_to_scheduler.send_pyobj(tokenized_obj)
-        e_time = time.time()
-        print("cost {} ms".format((e_time - s_time) * 1000))
         state = ReqState([], False, asyncio.Event(), obj, created_time=created_time)
         self.rid_to_state[obj.rid] = state
         trace_slice_end("dispatch", obj.rid, thread_finish_flag=True)
@@ -861,11 +844,8 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             batch_req = BatchTokenizedGenerateReqInput(batch=tokenized_objs)
         else:
             batch_req = BatchTokenizedEmbeddingReqInput(batch=tokenized_objs)
-        
-        s_time = time.time()
+
         self.send_to_scheduler.send_pyobj(batch_req)
-        e_time = time.time()
-        print("cost {} ms".format((e_time - s_time) * 1000))
         # Create states for each individual request in the batch
         for i, tokenized_obj in enumerate(tokenized_objs):
             tmp_obj = obj[i]
