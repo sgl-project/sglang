@@ -41,7 +41,6 @@ from sglang.srt.utils import (
     is_triton_kernels_available,
     log_info_on_rank0,
     mxfp_supported,
-    next_power_of_2,
     round_up,
     set_weight_attrs,
 )

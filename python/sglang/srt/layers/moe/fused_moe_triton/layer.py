@@ -49,7 +49,6 @@ from sglang.srt.utils import (
     is_cpu,
     is_flashinfer_available,
     is_hip,
-    next_power_of_2,
     round_up,
 )
 
@@ -70,7 +69,6 @@ if should_use_flashinfer_trtllm_moe():
         trtllm_fp4_block_scale_moe = None
 
 logger = logging.getLogger(__name__)
-
 
 
 def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
