@@ -220,7 +220,7 @@ class SchedulerPPMixin:
         last_rank_comm_queue: deque[Tuple[torch.cuda.Event, PPProxyTensors]],
     ):
         with torch.profiler.record_function("run_batch"):
-            result = self.run_batch(self.cur_batch)
+            result = self.run_batch(self.cur_batch, pp_proxy_tensors)
             mb_metadata[mb_id] = PPBatchMetadata(
                 can_run_cuda_graph=result.can_run_cuda_graph,
             )
@@ -293,7 +293,7 @@ class SchedulerPPMixin:
                 self.cur_batch: Optional[ScheduleBatch] = mbs[mb_id]
                 if self.cur_batch:
                     server_is_idle = False
-                    # pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                    pp_proxy_tensors = self._pp_recv_proxy_tensors()
                 self._pp_commit_comm_work(send_proxy_work)
                 next_pp_outputs = None
                 next_batch_result = None
@@ -311,7 +311,6 @@ class SchedulerPPMixin:
                     )
 
                 if self.cur_batch:
-                    pp_proxy_tensors = None
                     result, event = self._pp_launch_batch(
                         mb_id, pp_proxy_tensors, mb_metadata, last_rank_comm_queue
                     )
