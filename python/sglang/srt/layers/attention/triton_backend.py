@@ -86,6 +86,9 @@ class TritonAttnBackend(AttentionBackend):
         self.token_to_kv_pool_allocator = model_runner.token_to_kv_pool_allocator
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
         self.speculative_num_steps = model_runner.server_args.speculative_num_steps
+        self.enable_overlap_schedule = (
+            not model_runner.server_args.disable_overlap_schedule
+        )
         self.num_head = (
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
         )
@@ -347,7 +350,10 @@ class TritonAttnBackend(AttentionBackend):
             attn_logits = None
             attn_lse = None
 
-        elif forward_batch.forward_mode.is_draft_extend():
+        elif (
+            forward_batch.forward_mode.is_draft_extend()
+            and not self.enable_overlap_schedule
+        ):
             kv_indices, kv_indptr, qo_indptr, custom_mask = (
                 spec_info.generate_attn_arg_prefill(
                     forward_batch.req_pool_indices,

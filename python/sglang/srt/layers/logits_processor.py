@@ -256,6 +256,10 @@ class LogitsProcessor(nn.Module):
             get_global_server_args().debug_tensor_dump_output_folder
         )
 
+        self.enable_overlap_schedule = (
+            not get_global_server_args().disable_overlap_schedule
+        )
+
     def compute_logprobs_for_multi_item_scoring(
         self,
         input_ids,
@@ -380,7 +384,10 @@ class LogitsProcessor(nn.Module):
         if (
             logits_metadata.forward_mode.is_decode_or_idle()
             or logits_metadata.forward_mode.is_target_verify()
-            or logits_metadata.forward_mode.is_draft_extend_v2()
+            or (
+                logits_metadata.forward_mode.is_draft_extend()
+                and self.enable_overlap_schedule
+            )
         ):
             pruned_states = hidden_states
             if aux_hidden_states is not None:

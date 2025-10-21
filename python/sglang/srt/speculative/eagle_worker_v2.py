@@ -17,9 +17,6 @@ from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
 )
-from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
-    EAGLEDraftExtendCudaGraphRunner,
-)
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_info_v2 import (
     assign_extend_cache_locs,
@@ -222,19 +219,10 @@ class EagleDraftWorker(BaseDraftWorker):
                 f"Capture draft cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
             )
 
-        # Capture extend
+        # TODO: add draft extend cuda graph support
         if self.draft_extend_attn_backend:
-            tic = time.perf_counter()
-            before_mem = get_available_gpu_memory(self.device, self.gpu_id)
-            logger.info(
-                f"Capture draft extend cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
-            )
-            self.cuda_graph_runner_for_draft_extend = EAGLEDraftExtendCudaGraphRunner(
-                self
-            )
-            after_mem = get_available_gpu_memory(self.device, self.gpu_id)
-            logger.info(
-                f"Capture draft extend cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
+            logger.warning(
+                "Draft extend cuda graph is not supported yet. Running draft extend without cuda graph."
             )
 
     def draft(self, model_worker_batch: ModelWorkerBatch):

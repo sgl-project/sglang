@@ -181,7 +181,7 @@ class EagleDraftInputV2Mixin:
         batch.extend_prefix_lens = seq_lens_cpu_.tolist()
         batch.extend_num_tokens = extend_num_tokens
         batch.capture_hidden_mode = CaptureHiddenMode.FULL
-        batch.forward_mode = ForwardMode.DRAFT_EXTEND_V2
+        batch.forward_mode = ForwardMode.DRAFT_EXTEND
         forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
         draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
         return forward_batch
