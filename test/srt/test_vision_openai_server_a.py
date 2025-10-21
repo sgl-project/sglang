@@ -152,6 +152,37 @@ class TestQwen2AudioServer(AudioOpenAITestMixin):
 
 class TestDeepseekServer(ImageOpenAITestMixin):
     model = "deepseek-ai/DeepSeek-OCR"
+    extra_args = ["--disable-cuda-graph"]
+
+    def test_single_image_chat_completion(self):
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+
+        response = client.chat.completions.create(
+            model="default",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": IMAGE_MAN_IRONING_URL},
+                        },
+                        {
+                            "type": "text",
+                            "text": "<|grounding|>Convert the document to markdown.",
+                        },
+                    ],
+                },
+            ],
+            temperature=0,
+            **(self.get_vision_request_kwargs()),
+        )
+
+        print("-" * 30)
+        print(f"Single image response:\n{response.choices[0].message.content}")
+        print("-" * 30)
+
+        self.verify_single_image_response(response)
 
 
 if __name__ == "__main__":

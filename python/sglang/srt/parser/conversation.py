@@ -104,6 +104,8 @@ class Conversation:
 
     def get_prompt(self) -> str:
         """Get the prompt for generation."""
+        print(f'{self.sep_style=}')
+        print(f'{self.messages=}')
         system_prompt = self.system_template.format(system_message=self.system_message)
         if self.sep_style == SeparatorStyle.ADD_COLON_SINGLE:
             ret = system_prompt + self.sep
@@ -845,7 +847,7 @@ register_conv_template(
         system_template="",
         roles=("", ""),
         sep="",
-        sep_style=SeparatorStyle.ADD_NEW_LINE_SINGLE,
+        sep_style=SeparatorStyle.NO_COLON_SINGLE,
         stop_str=[""],
         image_token="<image>",
     )
