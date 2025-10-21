@@ -75,6 +75,7 @@ Its core features include:
    platforms/tpu.md
    platforms/nvidia_jetson.md
    platforms/ascend_npu.md
+   platforms/xpu.md
 
 .. toctree::
    :maxdepth: 1

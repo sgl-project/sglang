@@ -223,7 +223,7 @@ class SchedulerOutputProcessorMixin:
 
         next_token_ids = result.next_token_ids.tolist()
         accept_lens = result.accept_lens.tolist()
-        result.num_accepted_tokens = sum(accept_lens)
+        result.num_accepted_tokens = sum(accept_lens) - len(batch.reqs)
 
         predict_tokens = []
         stride = self.draft_worker.speculative_num_draft_tokens
@@ -259,7 +259,7 @@ class SchedulerOutputProcessorMixin:
             accept_lens_list = result.accept_lens.tolist()
 
         self.num_generated_tokens += len(batch.reqs)
-        if not self.spec_algorithm.is_none():
+        if not batch.spec_algorithm.is_none():
             self.update_spec_metrics(batch.batch_size(), result.num_accepted_tokens)
 
         self.token_to_kv_pool_allocator.free_group_begin()
@@ -697,6 +697,7 @@ class SchedulerOutputProcessorMixin:
         skip_req: Optional[Req] = None,
     ):
         rids = []
+        http_worker_ipcs = []
         finished_reasons: List[BaseFinishReason] = []
 
         decoded_texts = []
@@ -785,6 +786,7 @@ class SchedulerOutputProcessorMixin:
                     req.send_output_token_logprobs_offset
                 )
                 rids.append(req.rid)
+                http_worker_ipcs.append(req.http_worker_ipc)
                 finished_reasons.append(
                     req.finished_reason.to_json() if req.finished_reason else None
                 )
@@ -901,7 +903,7 @@ class SchedulerOutputProcessorMixin:
             if self.model_config.is_multimodal_gen:
                 return
 
-            self.send_to_detokenizer.send_pyobj(
+            self.send_to_detokenizer.send_output(
                 BatchTokenIDOutput(
                     finished_reasons,
                     decoded_texts,
@@ -931,6 +933,7 @@ class SchedulerOutputProcessorMixin:
                     output_token_entropy_val=None,
                     output_hidden_states=output_hidden_states,
                     rids=rids,
+                    http_worker_ipcs=http_worker_ipcs,
                     placeholder_tokens_idx=None,
                     placeholder_tokens_val=None,
                 )
@@ -938,6 +941,7 @@ class SchedulerOutputProcessorMixin:
 
     def stream_output_embedding(self: Scheduler, reqs: List[Req]):
         rids = []
+        http_worker_ipcs = []
         finished_reasons: List[BaseFinishReason] = []
 
         embeddings = []
@@ -946,17 +950,19 @@ class SchedulerOutputProcessorMixin:
         for req in reqs:
             if req.finished():
                 rids.append(req.rid)
+                http_worker_ipcs.append(req.http_worker_ipc)
                 finished_reasons.append(req.finished_reason.to_json())
                 embeddings.append(req.embedding)
                 prompt_tokens.append(len(req.origin_input_ids))
                 cached_tokens.append(req.cached_tokens)
-        self.send_to_detokenizer.send_pyobj(
+        self.send_to_detokenizer.send_output(
             BatchEmbeddingOutput(
                 finished_reasons,
                 embeddings,
                 prompt_tokens,
                 cached_tokens,
                 rids=rids,
+                http_worker_ipcs=http_worker_ipcs,
                 placeholder_tokens_idx=None,
                 placeholder_tokens_val=None,
             )
