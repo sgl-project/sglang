@@ -77,6 +77,44 @@ class FileRequestMetricsExporter(RequestMetricsExporter):
         self.export_dir = getattr(server_args, "export_metrics_to_file_dir")
         os.makedirs(self.export_dir, exist_ok=True)
 
+        # File handler state management
+        self._current_file_handler = None
+        self._current_hour_suffix = None
+
+    def _ensure_file_handler(self, hour_suffix: str):
+        """Ensure the file handler is open for the current hour suffix."""
+        if self._current_hour_suffix != hour_suffix:
+            # Close previous file handler if it exists
+            if self._current_file_handler is not None:
+                try:
+                    self._current_file_handler.close()
+                except Exception as e:
+                    logger.warning(f"Failed to close previous file handler: {e}")
+
+            # Open new file handler
+            log_filename = f"sglang-request-metrics-{hour_suffix}.log"
+            log_filepath = os.path.join(self.export_dir, log_filename)
+
+            try:
+                self._current_file_handler = open(log_filepath, "a", encoding="utf-8")
+                self._current_hour_suffix = hour_suffix
+            except Exception as e:
+                logger.error(f"Failed to open log file {log_filepath}: {e}")
+                self._current_file_handler = None
+                self._current_hour_suffix = None
+                raise
+
+    def close(self):
+        """Close the current file handler."""
+        if self._current_file_handler is not None:
+            try:
+                self._current_file_handler.close()
+            except Exception as e:
+                logger.warning(f"Failed to close file handler: {e}")
+            finally:
+                self._current_file_handler = None
+                self._current_hour_suffix = None
+
     async def write_record(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput], out_dict: dict
     ):
@@ -88,15 +126,19 @@ class FileRequestMetricsExporter(RequestMetricsExporter):
             # Get the log file path for the current time.
             current_time = datetime.now()
             hour_suffix = current_time.strftime("%Y%m%d_%H")
-            log_filename = f"sglang-request-metrics-{hour_suffix}.log"
-            log_filepath = os.path.join(self.export_dir, log_filename)
+
+            # Ensure correct file handler is open for current hour
+            self._ensure_file_handler(hour_suffix)
+
+            if self._current_file_handler is None:
+                return
 
             metrics_data = self._format_output_data(obj, out_dict)
 
             def write_file():
-                with open(log_filepath, "a", encoding="utf-8") as f:
-                    json.dump(metrics_data, f)
-                    f.write("\n")
+                json.dump(metrics_data, self._current_file_handler)
+                self._current_file_handler.write("\n")
+                self._current_file_handler.flush()
 
             await asyncio.to_thread(write_file)
         except Exception as e:
