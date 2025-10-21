@@ -5,7 +5,7 @@ ROCM_VERSION=$1
 if [ "$ROCM_VERSION" = "700" ]; then
   PYTHON_ROOT_PATH="/opt/venv/bin"
   AMDGPU_TARGET="gfx942;gfx950"
-  TORCH_INSTALL_CMD="${PYTHON_ROOT_PATH}/pip install --index-url https://download.pytorch.org/whl/nightly/rocm7.0 torch==2.10.0.dev20251009+rocm7.0 torchvision==0.25.0.dev20251010+rocm7.0"
+  TORCH_INSTALL_CMD="${PYTHON_ROOT_PATH}/pip install --index-url https://download.pytorch.org/whl/nightly/rocm7.0 torch==2.10.0.dev20251011+rocm7.0 torchvision==0.25.0.dev20251012+rocm7.0"
 else
   PYTHON_ROOT_PATH="/usr/bin"
   AMDGPU_TARGET="gfx942"
