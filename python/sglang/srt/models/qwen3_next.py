@@ -408,8 +408,10 @@ class Qwen3GatedDeltaNet(nn.Module):
             current_stream.wait_stream(self.alt_stream)
         else:
             projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
-            projected_states_ba = self._compile_ba(hidden_states)
-            # projected_states_ba, _ = self.in_proj_ba(hidden_states)
+            if self.in_proj_ba.use_intel_amx_backend:
+                projected_states_ba, _ = self.in_proj_ba(hidden_states)
+            else:
+                projected_states_ba = self._compile_ba(hidden_states)
         return projected_states_qkvz, projected_states_ba
 
     def forward(
