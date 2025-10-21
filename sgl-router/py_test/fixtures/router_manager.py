@@ -135,14 +135,19 @@ class RouterManager:
 
     def add_worker(self, base_url: str, worker_url: str) -> None:
         r = requests.post(f"{base_url}/workers", json={"url": worker_url})
-        assert r.status_code == 202, f"add_worker failed: {r.status_code} {r.text}"  # ACCEPTED status
+        assert (
+            r.status_code == 202
+        ), f"add_worker failed: {r.status_code} {r.text}"  # ACCEPTED status
 
     def remove_worker(self, base_url: str, worker_url: str) -> None:
         # URL encode the worker_url for path parameter
         from urllib.parse import quote
-        encoded_url = quote(worker_url, safe='')
+
+        encoded_url = quote(worker_url, safe="")
         r = requests.delete(f"{base_url}/workers/{encoded_url}")
-        assert r.status_code == 202, f"remove_worker failed: {r.status_code} {r.text}"  # ACCEPTED status
+        assert (
+            r.status_code == 202
+        ), f"remove_worker failed: {r.status_code} {r.text}"  # ACCEPTED status
 
     def list_workers(self, base_url: str) -> list[str]:
         r = requests.get(f"{base_url}/workers")
