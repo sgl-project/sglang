@@ -10,7 +10,7 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-from sglang.srt.layers.quantization.utils import get_scalar_types, replace_parameter
+from sglang.srt.layers.quantization.utils import get_scalar_types
 
 ScalarType, scalar_types = get_scalar_types()
 
