@@ -79,6 +79,16 @@ __device__ __forceinline__ float castToFloat(srcDtype val) {
   return amdgpu::cast<srcDtype, float>(val);
 }
 
+template <typename srcDtype>
+__device__ __forceinline__ __hip_bfloat16 castToBFloat16(srcDtype val) {
+  return amdgpu::cast<srcDtype, __hip_bfloat16>(val);
+}
+
+template <typename srcDtype>
+__device__ __forceinline__ __half castToHalf(srcDtype val) {
+  return amdgpu::cast<srcDtype, __half>(val);
+}
+
 template <typename dstDtype>
 __device__ __forceinline__ dstDtype castFromFloat(float val) {
   return amdgpu::cast<float, dstDtype>(val);

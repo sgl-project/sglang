@@ -3,10 +3,20 @@
 #if USE_ROCM
 
 #include <hip/hip_common.h>
+#include <hip/hip_math_def.h>
 
 // Adapted from flashinfer-rocm [PR#491](https://github.com/flashinfer-ai/flashinfer/pull/491)
 
 namespace sgl_hip {
+
+  template<typename T, int vec_size>
+SGL_HIP_INLINE void cast_from_impl_float(vec_t<float, vec_size>& data, const vec_t<T, vec_size>& src) {
+    float* f_data = reinterpret_cast<float*>(data);
+    #pragma unroll
+    for (size_t i = 0; i < vec_size; ++i) {
+      f_data[i] = castToFloat(src[i]);
+    }
+}
 
 template <>
 struct vec_t<float, 1> {
@@ -25,7 +35,7 @@ struct vec_t<float, 1> {
   SGL_HIP_INLINE void store(float* ptr) const;
   template <typename T>
   SGL_HIP_INLINE void cast_from(const vec_t<T, 1>& src) {
-    cast_from_impl(*this, src);
+    cast_from_impl_float(*this, src);
   }
   template <typename T>
   SGL_HIP_INLINE void cast_load(const T* ptr) {
@@ -112,7 +122,11 @@ struct vec_t<float, vec_size> {
   }
   template <typename T>
   SGL_HIP_INLINE void cast_from(const vec_t<T, vec_size>& src) {
-    cast_from_impl(*this, src);
+    float* f_data = reinterpret_cast<float*>(data);
+    #pragma unroll
+    for (size_t i = 0; i < vec_size; ++i) {
+      f_data[i] = castToFloat(src[i]);
+    }
   }
   template <typename T>
   SGL_HIP_INLINE void cast_load(const T* ptr) {
