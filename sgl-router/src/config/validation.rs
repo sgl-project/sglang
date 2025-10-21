@@ -29,9 +29,72 @@ impl ConfigValidator {
         Self::validate_retry(&retry_cfg)?;
         Self::validate_circuit_breaker(&cb_cfg)?;
 
-        if config.history_backend == HistoryBackend::Oracle && config.oracle.is_none() {
+        // Validate Oracle configuration if enabled
+        if config.history_backend == HistoryBackend::Oracle {
+            if config.oracle.is_none() {
+                return Err(ConfigError::MissingRequired {
+                    field: "oracle".to_string(),
+                });
+            }
+            // Validate Oracle configuration details
+            if let Some(oracle) = &config.oracle {
+                Self::validate_oracle(oracle)?;
+            }
+        }
+
+        // Validate tokenizer cache configuration
+        Self::validate_tokenizer_cache(&config.tokenizer_cache)?;
+
+        Ok(())
+    }
+
+    /// Validate Oracle configuration
+    fn validate_oracle(oracle: &OracleConfig) -> ConfigResult<()> {
+        // Validate username is not empty
+        if oracle.username.is_empty() {
             return Err(ConfigError::MissingRequired {
-                field: "oracle".to_string(),
+                field: "oracle.username".to_string(),
+            });
+        }
+
+        // Validate password is not empty
+        if oracle.password.is_empty() {
+            return Err(ConfigError::MissingRequired {
+                field: "oracle.password".to_string(),
+            });
+        }
+
+        // Validate connect_descriptor is not empty
+        if oracle.connect_descriptor.is_empty() {
+            return Err(ConfigError::MissingRequired {
+                field: "oracle_dsn or oracle_tns_alias".to_string(),
+            });
+        }
+
+        // Validate pool_min is at least 1
+        if oracle.pool_min < 1 {
+            return Err(ConfigError::InvalidValue {
+                field: "oracle.pool_min".to_string(),
+                value: oracle.pool_min.to_string(),
+                reason: "Must be at least 1".to_string(),
+            });
+        }
+
+        // Validate pool_max is greater than or equal to pool_min
+        if oracle.pool_max < oracle.pool_min {
+            return Err(ConfigError::InvalidValue {
+                field: "oracle.pool_max".to_string(),
+                value: oracle.pool_max.to_string(),
+                reason: "Must be >= oracle.pool_min".to_string(),
+            });
+        }
+
+        // Validate pool_timeout_secs is greater than 0
+        if oracle.pool_timeout_secs == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "oracle.pool_timeout_secs".to_string(),
+                value: oracle.pool_timeout_secs.to_string(),
+                reason: "Must be > 0".to_string(),
             });
         }
 
@@ -205,6 +268,24 @@ impl ConfigValidator {
             });
         }
 
+        if config.queue_size > 0 && config.queue_timeout_secs == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "queue_timeout_secs".to_string(),
+                value: config.queue_timeout_secs.to_string(),
+                reason: "Must be > 0 when queue_size > 0".to_string(),
+            });
+        }
+
+        if let Some(tokens_per_second) = config.rate_limit_tokens_per_second {
+            if tokens_per_second <= 0 {
+                return Err(ConfigError::InvalidValue {
+                    field: "rate_limit_tokens_per_second".to_string(),
+                    value: tokens_per_second.to_string(),
+                    reason: "Must be > 0 when specified".to_string(),
+                });
+            }
+        }
+
         if config.worker_startup_timeout_secs == 0 {
             return Err(ConfigError::InvalidValue {
                 field: "worker_startup_timeout_secs".to_string(),
@@ -365,6 +446,29 @@ impl ConfigValidator {
                 reason: "Must be > 0".to_string(),
             });
         }
+        Ok(())
+    }
+
+    /// Validate tokenizer cache configuration
+    fn validate_tokenizer_cache(cache: &TokenizerCacheConfig) -> ConfigResult<()> {
+        // Validate L0 max entries when L0 is enabled
+        if cache.enable_l0 && cache.l0_max_entries == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "tokenizer_cache.l0_max_entries".to_string(),
+                value: cache.l0_max_entries.to_string(),
+                reason: "Must be > 0 when L0 cache is enabled".to_string(),
+            });
+        }
+
+        // Validate L1 max memory when L1 is enabled
+        if cache.enable_l1 && cache.l1_max_memory == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "tokenizer_cache.l1_max_memory".to_string(),
+                value: cache.l1_max_memory.to_string(),
+                reason: "Must be > 0 when L1 cache is enabled".to_string(),
+            });
+        }
+
         Ok(())
     }
 
@@ -670,7 +774,6 @@ mod tests {
 
     #[test]
     fn test_validate_pd_mode_with_separate_policies() {
-        // Test PD mode with different policies for prefill and decode
         let config = RouterConfig::new(
             RoutingMode::PrefillDecode {
                 prefill_urls: vec![
@@ -701,7 +804,6 @@ mod tests {
 
     #[test]
     fn test_validate_pd_mode_power_of_two_insufficient_workers() {
-        // Test that power-of-two policy requires at least 2 workers
         let config = RouterConfig::new(
             RoutingMode::PrefillDecode {
                 prefill_urls: vec![("http://prefill1:8000".to_string(), None)], // Only 1 prefill
@@ -726,7 +828,6 @@ mod tests {
 
     #[test]
     fn test_validate_grpc_requires_tokenizer() {
-        // Test that gRPC connection mode requires tokenizer configuration
         let mut config = RouterConfig::new(
             RoutingMode::Regular {
                 worker_urls: vec!["grpc://worker:50051".to_string()],
@@ -748,7 +849,6 @@ mod tests {
 
     #[test]
     fn test_validate_grpc_with_model_path() {
-        // Test that gRPC works with model_path
         let mut config = RouterConfig::new(
             RoutingMode::Regular {
                 worker_urls: vec!["grpc://worker:50051".to_string()],
@@ -765,7 +865,6 @@ mod tests {
 
     #[test]
     fn test_validate_grpc_with_tokenizer_path() {
-        // Test that gRPC works with tokenizer_path
         let mut config = RouterConfig::new(
             RoutingMode::Regular {
                 worker_urls: vec!["grpc://worker:50051".to_string()],

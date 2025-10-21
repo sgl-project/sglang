@@ -1,28 +1,12 @@
 from __future__ import annotations
 
-import importlib
-import sys
 from types import MappingProxyType
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    Callable,
-    Dict,
-    List,
-    Mapping,
-    Optional,
-    Tuple,
-    Union,
-    cast,
-)
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Tuple, Union, cast
 
 import torch
 from torch.nn.parameter import Parameter
 
-from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
+from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
@@ -393,12 +377,22 @@ class W8A8Int8LinearMethod(LinearMethodBase):
                 x.dtype,
                 True,  # is_vnni
             )
-
         x_q, x_scale = per_token_quant_int8(x)
 
-        return int8_scaled_mm(
-            x_q, layer.weight, x_scale, layer.weight_scale, out_dtype=x.dtype, bias=bias
+        x_q_2d = x_q.view(-1, x_q.shape[-1])
+        x_scale_2d = x_scale.view(-1, x_scale.shape[-1])
+        output_shape = [*x_q.shape[:-1], layer.weight.shape[1]]
+
+        output = int8_scaled_mm(
+            x_q_2d,
+            layer.weight,
+            x_scale_2d,
+            layer.weight_scale,
+            out_dtype=x.dtype,
+            bias=bias,
         )
+
+        return output.view(output_shape)
 
 
 class W8A8Int8MoEMethod(FusedMoEMethodBase):
