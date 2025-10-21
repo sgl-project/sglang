@@ -1609,13 +1609,16 @@ def get_cpu_memory_capacity():
         for numa_id in range(n_numa_node):
             file_meminfo = f"node{numa_id}/meminfo"
             with open(os.path.join(file_prefix, file_meminfo), "r") as f:
+                # MemTotal info is at the 1st line
                 line = f.readline()
                 # Expected format: "Node 0 MemTotal:       100000000 kB"
                 parts = line.split()
                 if len(parts) >= 4 and parts[2] == "MemTotal:":
                     numa_mem_list.append(int(parts[3]))
                 else:
-                    raise ValueError(f"Unexpected format in {file_meminfo}: {line.strip()}")
+                    raise ValueError(
+                        f"Unexpected format in {file_meminfo}: {line}"
+                    )
         # Retrieved value in KB, need MB
         numa_mem = float(min(numa_mem_list) // 1024)
         return numa_mem
